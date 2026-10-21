@@ -47,7 +47,7 @@ pub fn load_fresh(wb: &mut Workbook, eng: &mut Engine) {
 /// `RAND`, ...) is one Excel recalculates when it opens, and that counts as a
 /// change (closing asks to save). True for such a workbook; a manual one is
 /// already calculated in full by [`load_fresh`] and is no change (#805).
-pub fn volatile_on_open(wb: &Workbook, eng: &mut Engine) -> bool {
+pub fn volatile_on_open(wb: &Workbook, eng: &Engine) -> bool {
     wb.calc.mode != CalcMode::Manual && eng.has_volatile()
 }
 

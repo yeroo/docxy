@@ -12486,7 +12486,7 @@ fn sheet_load(
                 // calculation of what the full one just did (#805).
                 let recalculated = if has_uncached_formula(&pkg.workbook) {
                     engine.recalc_all(&mut pkg.workbook);
-                    fresh_volatile && gridcore::calc::volatile_on_open(&pkg.workbook, &mut engine)
+                    fresh_volatile && gridcore::calc::volatile_on_open(&pkg.workbook, &engine)
                 } else {
                     gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
                     fresh_volatile && gridcore::calc::open_volatile(&mut pkg.workbook, &mut engine)

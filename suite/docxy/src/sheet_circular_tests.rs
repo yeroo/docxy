@@ -31,7 +31,8 @@ impl Book {
         Self(path)
     }
 
-    /// The workbook opened as File › Open opens it.
+    /// The workbook loaded as File › Open loads it, but without the volatile
+    /// recalculation of an open (#805), so these tests' loads stay as they were.
     fn open(&self) -> DocTab {
         sheet_tab_from_path(&self.0, false, false)
     }

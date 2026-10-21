@@ -367,7 +367,10 @@ placeholder would be painful to retrofit):
   Shift+F9; other sheets' dependents stay stale). With iteration on, each
   manual Calculate runs one pass per circle. A manual-mode file opens
   with a full calculation (nothing stale; the hosts' open step,
-  `calc::load_fresh`); an automatic file keeps its cached values (the wasm
+  `calc::load_fresh`); an automatic file keeps its cached values, except
+  that a user's Open outside Protected View recalculates its volatile formulas
+  (`NOW`, `RAND`, ..., not a D-function) and what reads them and counts as a
+  change, as Excel's does (`calc::open_volatile`, #805; the wasm
   bridge calculates every file on open). A save keeps `fullCalcOnLoad="1"`. Set precision as displayed (`gridcore::calc`) rounds
   every constant whose format shows fixed decimals (not General, dates, text,
   fractions or scientific) after "Data will permanently lose accuracy.", then

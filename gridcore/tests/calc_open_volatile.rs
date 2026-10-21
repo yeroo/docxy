@@ -3,7 +3,7 @@
 
 use gridcore::calc::{open_volatile, volatile_on_open};
 use gridcore::engine::Engine;
-use gridcore::sheet::{CalcMode, Cell, CellValue, Sheet, Workbook, parse_cell_name};
+use gridcore::sheet::{CalcMode, Cell, CellValue, DefinedName, Sheet, Workbook, parse_cell_name};
 
 fn num(wb: &Workbook, name: &str) -> f64 {
     let (r, c) = parse_cell_name(name).unwrap();
@@ -42,7 +42,7 @@ fn stale_book(mode: CalcMode) -> (Workbook, Engine) {
 fn open_refreshes_now_and_its_dependent() {
     for mode in [CalcMode::Auto, CalcMode::AutoNoTable] {
         let (mut wb, mut eng) = stale_book(mode);
-        assert!(volatile_on_open(&wb, &mut eng));
+        assert!(volatile_on_open(&wb, &eng));
         assert!(open_volatile(&mut wb, &mut eng));
         assert!(num(&wb, "A1") >= 50000.5);
         assert_eq!(num(&wb, "B1"), num(&wb, "A1") + 1.0);
@@ -52,7 +52,7 @@ fn open_refreshes_now_and_its_dependent() {
 #[test]
 fn a_manual_workbook_is_no_change_and_keeps_its_values() {
     let (mut wb, mut eng) = stale_book(CalcMode::Manual);
-    assert!(!volatile_on_open(&wb, &mut eng));
+    assert!(!volatile_on_open(&wb, &eng));
     assert!(!open_volatile(&mut wb, &mut eng));
     assert_eq!(num(&wb, "A1"), 100.0);
 }
@@ -72,4 +72,46 @@ fn no_volatile_formula_is_no_change() {
     wb.sheets[0].cells.get_mut(&(1, 0)).unwrap().value = CellValue::Number(1.0);
     assert!(!open_volatile(&mut wb, &mut eng));
     assert_eq!(num(&wb, "A2"), 1.0);
+}
+
+fn with_formulas(formulas: &[(&str, &str)], names: &[(&str, &str)]) -> (Workbook, Engine) {
+    let mut wb = Workbook {
+        sheets: vec![Sheet {
+            name: "Sheet1".into(),
+            ..Sheet::default()
+        }],
+        ..Workbook::default()
+    };
+    for (n, def) in names {
+        wb.defined_names.push(DefinedName {
+            name: n.to_string(),
+            scope: None,
+            formula: def.to_string(),
+        });
+    }
+    let mut eng = Engine::new(&wb);
+    for (name, f) in formulas {
+        let (r, c) = parse_cell_name(name).unwrap();
+        assert!(eng.set_cell(&mut wb, (0, r, c), Cell::formula(f)));
+    }
+    (wb, eng)
+}
+
+#[test]
+fn a_d_function_alone_is_not_volatile() {
+    let (mut wb, mut eng) = with_formulas(&[("A1", "DSUM(B1:C3,\"x\",E1:E2)")], &[]);
+    assert!(!volatile_on_open(&wb, &eng));
+    assert!(!open_volatile(&mut wb, &mut eng));
+}
+
+#[test]
+fn now_behind_a_defined_name_is_volatile() {
+    let (wb, eng) = with_formulas(&[("A1", "Stamp+1")], &[("Stamp", "NOW()")]);
+    assert!(volatile_on_open(&wb, &eng));
+}
+
+#[test]
+fn now_beside_a_d_function_is_volatile() {
+    let (wb, eng) = with_formulas(&[("A1", "DSUM(B1:C3,\"x\",E1:E2)"), ("A2", "NOW()")], &[]);
+    assert!(volatile_on_open(&wb, &eng));
 }
