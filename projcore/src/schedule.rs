@@ -10947,6 +10947,17 @@ mod tests {
             assert_eq!(lv.start(3), Some(at(3, 8)), "C Tuesday under {order:?}");
             assert_eq!(lv.start(1), Some(at(4, 8)), "A Wednesday under {order:?}");
         }
+        // ID order (r19): both ready on Tuesday, the lower ID goes first, so
+        // A takes Tuesday and C waits for Wednesday.
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                order: crate::leveling::LevelOrder::IdOnly,
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(1), Some(at(3, 8)), "A Tuesday under ID order");
+        assert_eq!(lv.start(3), Some(at(4, 8)), "C Wednesday under ID order");
     }
 
     /// #1594 r7: a stored delay counts towards the timeline's horizon, so a
