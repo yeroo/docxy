@@ -6372,6 +6372,9 @@ struct RulerProbe {
     caret_block: Option<usize>,
     pointer: Option<(f32, f32)>,
     draft: bool,
+    /// A header/footer is open: the ruler shows its paragraph, laid out at
+    /// the page owner's margins, so no later band is followed.
+    hf_open: bool,
     painted: Option<HRulerGeom>,
 }
 
@@ -6524,7 +6527,10 @@ fn page_needs_scroll(probe: &RulerProbe, page: usize) -> bool {
 /// The section and geometry of the page the ruler currently tracks, from
 /// the shown body's flow (#745): the page's owning section drives the
 /// margin handles' refusal, the drag starts from the final section's raw
-/// margins (see `PageFlow::drag_geom`). `None` when nothing is tracked yet
+/// margins (see `PageFlow::drag_geom`). The refusing section is the followed
+/// band's (`ruler_band`: the caret's band on its page, else the first; the
+/// first while a header/footer is open); the sheet size stays the page
+/// owner's. `None` when nothing is tracked yet
 /// or the tab is not a document.
 fn tracked_page_geom(
     tab: &DocTab,
@@ -6561,10 +6567,14 @@ fn print_caret_page(
 
 /// The band of `page` the ruler follows: the first band whose column ranges
 /// hold the caret's block when the caret is on `page`, else the first band
-/// (a pointer or top-of-view page has no caret). An empty `(s, s)` range
+/// (a pointer or top-of-view page has no caret), and always the first while
+/// a header/footer is open (its caret is not the body's). An empty `(s, s)` range
 /// holds nothing. The caret block is the live body's index against the shown
 /// body's ranges, as in `tracked_page` and `print_caret_page`.
 fn ruler_band(probe: &RulerProbe, page: usize) -> usize {
+    if probe.hf_open {
+        return 0;
+    }
     let Some(block) = probe.caret_block else {
         return 0;
     };
@@ -7218,6 +7228,18 @@ mod ruler_geom_tests {
         let (_, p) = two_band_probe(Some(0));
         assert_eq!(ruler_band(&p, 0), 0);
         assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 100.0);
+    }
+
+    #[test]
+    fn an_open_header_keeps_the_ruler_on_the_owners_band() {
+        let (tab, mut p) = two_band_probe(Some(1));
+        p.hf_open = true;
+        assert_eq!(ruler_band(&p, 0), 0);
+        assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 100.0);
+        assert_eq!(tracked_page_geom(&tab, MarkupView::All, &p).unwrap().0, 0);
+        p.hf_open = false;
+        assert_eq!(ruler_band(&p, 0), 1);
+        assert_eq!(tracked_page_geom(&tab, MarkupView::All, &p).unwrap().0, 1);
     }
 
     #[test]
@@ -25007,7 +25029,8 @@ impl Docxy {
         let Some(indent) = self.tabs.get(self.active).and_then(ruler_drag_indent) else {
             return;
         };
-        // The tracked page's own section (page view, #745); when the tracked
+        // The followed band's section on the tracked page (page view, #745,
+        // #1254: the caret's band, else the first); when the tracked
         // page is unknown, the final section's geometry (the pre-#745 shape).
         // The margin handles edit the final section only, so a drag starting
         // on an earlier section's page is refused with a hint. Both sides of
@@ -32757,11 +32780,11 @@ fn tab_page_flow(tab: &DocTab, body: &[Block]) -> page_flow::PageFlow {
 }
 
 /// A tab's print-layout pages over the live editor body: each page's column
-/// block ranges. Header/footer navigation and the status-bar page count
-/// share it, so Next and Previous walk the pages the person sees. The render
-/// — and `scroll_to_caret`, which must land on the sheet the person sees —
-/// flow the shown markup-view body instead, whose revision filters can make
-/// it shorter than the live body.
+/// block ranges. Only the status-bar page count uses it. Header/footer slots
+/// (`hf_tab::tab_page_slots`, #1254), the render and `scroll_to_caret` flow
+/// the shown markup-view body instead, whose revision filters can make it
+/// shorter than the live body, so under Simple Markup the count can differ
+/// from what Next and Previous walk.
 fn page_ranges(tab: &DocTab) -> Vec<Vec<(usize, usize)>> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
@@ -39415,6 +39438,7 @@ impl Render for Docxy {
                             probe.ranges = pages.clone();
                             probe.caret_block = editor.caret.path.first().copied();
                             probe.draft = false;
+                            probe.hf_open = tab.hf_edit.is_some();
                             probe.painted = None;
                         }
                         // Line numbers are rebuilt with the sheets each frame:
@@ -39687,8 +39711,10 @@ impl Render for Docxy {
                                     )
                                 };
                                 // One child per band, each with its own
-                                // section's left/right margins; the first band
-                                // carries the ruler's content probe.
+                                // section's left/right margins; every band
+                                // carries a ruler probe (its rect lands in
+                                // `bands[pi][bi]`), and the first band's also
+                                // fills `contents[pi]` for the vertical ruler.
                                 let band_els: Vec<AnyElement> = page
                                     .bands
                                     .iter()
@@ -40069,6 +40095,7 @@ impl Render for Docxy {
                             probe.ranges.clear();
                             probe.caret_block = editor.caret.path.first().copied();
                             probe.draft = true;
+                            probe.hf_open = false;
                             probe.draft_column = None;
                             probe.painted = None;
                         }
