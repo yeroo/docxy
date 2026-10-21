@@ -468,6 +468,30 @@ pub(crate) fn heading_numbers(
     out
 }
 
+/// [`heading_numbers`] by top-level body block: `(block index, heading level,
+/// chapter number or `None` when unnumbered)` in document order. Only
+/// top-level headings are listed: a heading in a table cell still moves the
+/// numbering, but never sets a page's chapter (export.rs flattens a table's
+/// cells without announcing their headings). For hosts that place pages by
+/// body block and cannot hold the paragraph addresses the map is keyed by.
+pub fn heading_chapters(
+    doc: &Document,
+    num: &Numbering,
+    styles: &StyleSheet,
+) -> Vec<(usize, u8, Option<String>)> {
+    let map = heading_numbers(doc, num, styles);
+    doc.body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| match block {
+            Block::Paragraph(p) => map
+                .get(&(p as *const Paragraph))
+                .map(|(level, text)| (i, *level, text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +633,41 @@ mod tests {
     /// A heading with no number.
     fn bare(level: u8) -> Option<(u8, Option<String>)> {
         Some((level, None))
+    }
+
+    #[test]
+    fn heading_chapters_list_top_level_headings_by_block() {
+        let table = Block::Table(crate::model::Table {
+            rows: vec![crate::model::Row {
+                cells: vec![crate::model::Cell {
+                    blocks: vec![styled("Heading1", Some(1))],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let doc = Document {
+            body: vec![
+                styled("Normal", None),
+                styled("Heading1", Some(1)),
+                table,
+                styled("Heading2", Some(2)),
+                styled("Plain", Some(1)),
+            ],
+        };
+        let num = parse_numbering_xml(OUTLINE_XML);
+        let styles = crate::styles::parse_styles_xml(OUTLINE_STYLES);
+        assert_eq!(
+            heading_chapters(&doc, &num, &styles),
+            vec![
+                (1, 1, Some("1".to_string())),
+                // The table's heading (numbered 2) is not listed, but moved
+                // the counter.
+                (3, 2, Some("2.1".to_string())),
+                (4, 1, None),
+            ]
+        );
     }
 
     #[test]

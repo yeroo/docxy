@@ -79,6 +79,7 @@ mod menu;
 mod open_mode;
 #[cfg(test)]
 mod open_mode_tests;
+mod page_fields;
 mod page_flow;
 mod page_number;
 mod page_setup;
@@ -8316,6 +8317,9 @@ struct RenderCtx<'a> {
     cell_run: Option<&'a docxcore::table_styles::RunLook>,
     /// The story's inline pictures (#1432); `None` draws their frames only.
     pics: Option<pictures::Scope<'a>>,
+    /// The page a header or footer is drawn on: its PAGE, NUMPAGES and
+    /// SECTIONPAGES fields show these (#1437); `None` draws the cached text.
+    page_vals: Option<&'a page_fields::PageVals>,
 }
 
 /// What drawing a table needs beyond the table: the package's styles part
@@ -32058,6 +32062,36 @@ impl Measurer {
     }
 }
 
+/// What `inline_width` and `frame_content_w` need of a [`Measurer`], so a test
+/// can measure without a window.
+trait TextWidth {
+    fn width_in(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        family: Option<&str>,
+    ) -> f32;
+
+    fn width(&self, text: &str, size: f32, bold: bool, italic: bool) -> f32 {
+        self.width_in(text, size, bold, italic, None)
+    }
+}
+
+impl TextWidth for Measurer {
+    fn width_in(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        family: Option<&str>,
+    ) -> f32 {
+        Measurer::width_in(self, text, size, bold, italic, family)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_words(
     out: &mut Vec<AnyElement>,
@@ -32516,12 +32550,15 @@ fn hf_els(
     hf_width: f32,
     sheet: Option<&docxcore::styles::StyleSheet>,
     pics: Option<pictures::Scope>,
+    page_vals: Option<&page_fields::PageVals>,
 ) -> Vec<AnyElement> {
     docxcore::frame::split_framed(blocks)
         .0
         .into_iter()
         .filter_map(|(_, b)| match b {
-            Block::Paragraph(p) => Some(hf_para_el(p, pal, meas, hf_width, 1.0, sheet, pics)),
+            Block::Paragraph(p) => Some(hf_para_el(
+                p, pal, meas, hf_width, 1.0, sheet, pics, page_vals,
+            )),
             _ => None,
         })
         .collect()
@@ -32554,9 +32591,32 @@ fn field_shown<'a>(raw: &str, text: &'a str, codes: bool) -> std::borrow::Cow<'a
     }
 }
 
+/// [`field_shown`], with a header or footer's PAGE, NUMPAGES and SECTIONPAGES
+/// showing the value of the page they are drawn on (#1437) instead of the
+/// cached result. Field codes still show the code, and only the drawn text
+/// changes: the field stays the one offset its cached result makes.
+fn field_live<'a>(
+    raw: &str,
+    text: &'a str,
+    codes: bool,
+    live: Option<&'a page_fields::PageVals>,
+) -> std::borrow::Cow<'a, str> {
+    if !codes {
+        if let Some(vals) = live {
+            let kind = docxcore::field::instr_of(raw)
+                .as_deref()
+                .and_then(docxcore::page_num::page_field_kind);
+            if let Some(kind) = kind {
+                return vals.value(kind).into();
+            }
+        }
+    }
+    field_shown(raw, text, codes)
+}
+
 #[cfg(test)]
 mod field_shown_tests {
-    use super::field_shown;
+    use super::{TextWidth, field_live, field_shown, frame_content_w};
 
     const PAGE: &str =
         r#"<w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>3</w:t></w:r></w:fldSimple>"#;
@@ -32573,16 +32633,70 @@ mod field_shown_tests {
         let nested = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>            <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r>            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>2</w:t></w:r>            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
         assert_eq!(field_shown(nested, "2", true), "2");
     }
+
+    #[test]
+    fn page_fields_show_the_page_they_are_drawn_on_1437() {
+        use crate::page_fields::PageVals;
+        let vals = PageVals {
+            page: "iii".into(),
+            num_pages: "9".into(),
+            section_pages: "4".into(),
+        };
+        let live = Some(&vals);
+        let field = |instr: &str| format!("<w:fldSimple w:instr=\" {instr} \"/>");
+        assert_eq!(field_live(PAGE, "3", false, live), "iii");
+        assert_eq!(field_live(&field("NUMPAGES"), "1", false, live), "9");
+        assert_eq!(field_live(&field("sectionpages"), "1", false, live), "4");
+        // An empty cached result still shows the value, and nothing changes
+        // without a page (the body) ...
+        assert_eq!(field_live(&field("PAGE"), "", false, live), "iii");
+        assert_eq!(field_live(PAGE, "3", false, None), "3");
+        // ... other fields keep their result, codes still show the code.
+        assert_eq!(field_live(&field("DATE"), "today", false, live), "today");
+        assert_eq!(
+            field_live(PAGE, "3", true, live),
+            r"{ PAGE \* MERGEFORMAT }"
+        );
+    }
+
+    #[test]
+    fn an_auto_width_frame_is_measured_with_the_live_value_1437() {
+        use crate::page_fields::PageVals;
+        let blocks = crate::hf::tests::body_blocks(
+            "<w:p><w:pPr><w:framePr w:hAnchor=\"text\" w:vAnchor=\"text\" w:xAlign=\"right\" w:wrap=\"around\"/></w:pPr>\
+             <w:fldSimple w:instr=\" PAGE \"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>",
+        );
+        let (_, groups) = docxcore::frame::split_framed(&blocks);
+        assert_eq!(groups.len(), 1, "one frame group");
+        /// Seven px a character, whatever the size.
+        struct Fixed;
+        impl TextWidth for Fixed {
+            fn width_in(&self, text: &str, _: f32, _: bool, _: bool, _: Option<&str>) -> f32 {
+                7.0 * text.chars().count() as f32
+            }
+        }
+        let meas = Fixed;
+        let vals = PageVals {
+            page: "xviii".into(),
+            num_pages: "18".into(),
+            section_pages: "18".into(),
+        };
+        let cached = frame_content_w(&groups[0], &meas, 1.0, None, None);
+        let live = frame_content_w(&groups[0], &meas, 1.0, None, Some(&vals));
+        assert!(live > cached, "{live} vs {cached}");
+    }
 }
 
 /// A frame group's content width in twips, measured as `hf_para_el` draws
 /// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
-/// it to its content): the widest paragraph, plus a space of slack.
+/// it to its content): the widest paragraph, plus a space of slack. `page_vals`
+/// are the page's live field values, measured as drawn (#1437).
 fn frame_content_w(
     g: &docxcore::frame::FrameGroup,
-    meas: &Measurer,
+    meas: &dyn TextWidth,
     zoom: f32,
     sheet: Option<&docxcore::styles::StyleSheet>,
+    page_vals: Option<&page_fields::PageVals>,
 ) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
@@ -32596,7 +32710,7 @@ fn frame_content_w(
         .for_paragraph(p.props.style_id.as_deref());
         let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false))
+            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false, page_vals))
             .sum();
         items + meas.width(" ", base, false, false)
     };
@@ -32701,9 +32815,10 @@ fn inline_width(
     it: &Inline,
     base: f32,
     zoom: f32,
-    m: &Measurer,
+    m: &dyn TextWidth,
     styler: run_look::RunStyler,
     field_codes: bool,
+    live: Option<&page_fields::PageVals>,
 ) -> f32 {
     match it {
         Inline::Run(r) => {
@@ -32711,10 +32826,11 @@ fn inline_width(
             let sz = run_look::run_size_px(&props, base, zoom);
             m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
         }
-        // Its shown text ([`field_shown`]) and its 2 px padding each side.
+        // Its shown text ([`field_live`]: the result, or a header/footer page
+        // field's live value, #1437) and its 2 px padding each side.
         Inline::Field { raw, text } => {
             m.width(
-                &field_shown(raw, text, field_codes),
+                &field_live(raw, text, field_codes, live),
                 field_size(raw, base, zoom),
                 false,
                 false,
@@ -32737,6 +32853,7 @@ fn hf_para_el(
     zoom: f32,
     sheet: Option<&docxcore::styles::StyleSheet>,
     pics: Option<pictures::Scope>,
+    page_vals: Option<&page_fields::PageVals>,
 ) -> AnyElement {
     paragraph_el(
         p,
@@ -32760,6 +32877,7 @@ fn hf_para_el(
             ..Default::default()
         },
         pics,
+        page_vals,
     )
 }
 
@@ -33106,6 +33224,7 @@ fn paragraph_el(
     overlay: Option<AnyElement>,
     styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
+    page_vals: Option<&page_fields::PageVals>,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let styler = styler.for_paragraph(p.props.style_id.as_deref());
@@ -33174,7 +33293,7 @@ fn paragraph_el(
     // other inlines with no measurable text contribute 0.
     let inline_w = |it: &Inline| -> f32 {
         m.map_or(0.0, |m| {
-            inline_width(it, base, zoom, m, styler, field_codes)
+            inline_width(it, base, zoom, m, styler, field_codes, page_vals)
         })
     };
     // Total width of content from index `from` up to the next tab, alignment
@@ -33321,12 +33440,13 @@ fn paragraph_el(
                 }
             }
             Inline::Field { raw, text } => {
-                // Show the field's cached value with a subtle shade so it reads as a
+                // Show the field's result (a header/footer page field's live value,
+                // #1437: `field_live`) with a subtle shade so it reads as a
                 // field, not plain text. A field showing a result is ONE char in the
                 // engine (#642), edited as a unit: it takes the caret before it, a
                 // click, and the selection highlight like a tab does. An empty one
                 // takes no offset.
-                let shown = field_shown(raw, text, field_codes).into_owned();
+                let shown = field_live(raw, text, field_codes, page_vals).into_owned();
                 let width = caret_advance(inline);
                 let pos = idx;
                 if width == 1 && caret == Some(pos) {
@@ -34000,6 +34120,7 @@ fn block_el_numbered(
                     pstyle: None,
                 },
                 ctx.pics,
+                ctx.page_vals,
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
@@ -39434,6 +39555,7 @@ impl Render for Docxy {
                         field_codes: tab.field_codes,
                         cell_run: None,
                         pics: pictures::scope(pictures.as_ref(), Some("word/document.xml")),
+                        page_vals: None,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -39513,6 +39635,19 @@ impl Render for Docxy {
                         // so the filler shows the previous section's header/footer,
                         // like the PDF exporter (export.rs new_page(i-1, false, true)).
                         let slots = hf::slots_of(editor, &pf, even_odd);
+                        // Each page's own PAGE, NUMPAGES and SECTIONPAGES (#1437).
+                        // The chapter headings are numbered only when a section
+                        // prefixes its page numbers with one.
+                        let page_vals = {
+                            // Numbered over the document the flow was made from.
+                            let headings = page_fields::chapter_headings(
+                                &shown,
+                                &pf,
+                                pkg.and_then(|p| p.part("word/numbering.xml")),
+                                &styles,
+                            );
+                            page_fields::page_values(&pf, &headings)
+                        };
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
                             std::collections::HashMap::new();
                         if let Some(p) = pkg {
@@ -39703,6 +39838,7 @@ impl Render for Docxy {
                                     field_codes: false,
                                     cell_run: None,
                                     pics: pictures::scope(pictures.as_ref(), Some(&h.part_name)),
+                                    page_vals: page_vals.get(pi),
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -39733,6 +39869,7 @@ impl Render for Docxy {
                                                         pictures.as_ref(),
                                                         Some(h.part_name.as_str()),
                                                     ),
+                                                    page_vals.get(pi),
                                                 );
                                             }
                                         }
@@ -39744,6 +39881,7 @@ impl Render for Docxy {
                                         hf_w,
                                         tbl.sheet.as_deref(),
                                         pictures::scope(pictures.as_ref(), page_part(pi, is_h)),
+                                        page_vals.get(pi),
                                     )
                                 };
                                 // One child per band, each with its own
@@ -39979,7 +40117,7 @@ impl Render for Docxy {
                                         top: sb.top,
                                         bottom: sb.bottom,
                                         band_top,
-                                        even: (pi + 1).is_multiple_of(2),
+                                        even: pf.pages[pi].number % 2 == 0,
                                     };
                                     let margins = (
                                         zoom * sb.left as f32 / 15.0,
@@ -39999,6 +40137,7 @@ impl Render for Docxy {
                                                 &measurer,
                                                 zoom,
                                                 tbl.sheet.as_deref(),
+                                                page_vals.get(pi),
                                             ),
                                             g.content_h(),
                                         );
@@ -40030,6 +40169,7 @@ impl Render for Docxy {
                                                             None => page_part(pi, is_h),
                                                         },
                                                     ),
+                                                    page_vals.get(pi),
                                                 ),
                                             }
                                         });

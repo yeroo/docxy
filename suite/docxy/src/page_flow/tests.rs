@@ -413,14 +413,14 @@ fn filler_pages_are_flagged_and_never_take_first() {
         slot(HeaderVariant::First),
         slot(HeaderVariant::Default),
     ];
-    crate::hf::demote_filler_firsts(&mut slots, &flags, false);
+    crate::hf::demote_filler_firsts(&mut slots, &flags, &[1, 2, 3], false);
     assert_eq!(slots[1].variant, HeaderVariant::Default);
     let mut slots = vec![
         slot(HeaderVariant::Default),
         slot(HeaderVariant::First),
         slot(HeaderVariant::Default),
     ];
-    crate::hf::demote_filler_firsts(&mut slots, &flags, true);
+    crate::hf::demote_filler_firsts(&mut slots, &flags, &[1, 2, 3], true);
     assert_eq!(
         slots[1].variant,
         HeaderVariant::Even,
@@ -764,4 +764,25 @@ fn drag_geom_names_the_band_section_and_keeps_the_sheet_owners_size() {
     // A band past the last takes the first.
     assert_eq!(pf.drag_geom(Some(0), 9, "").unwrap().0, 0);
     assert!(pf.drag_geom(Some(5), 0, "").is_none());
+}
+
+#[test]
+fn pages_carry_their_numbers_fillers_included() {
+    let odd4 = letter(r#"<w:type w:val="oddPage"/><w:pgNumType w:start="4"/>"#);
+    let body = body_blocks(&format!("{}{}", para("One", Some(&letter(""))), odd4));
+    let pf = flow(&body, &odd4, false);
+    assert_eq!(pf.numbers(), vec![1, 2, 4]);
+    assert_eq!(pf.fillers(), vec![false, true, false]);
+    // A restart in the middle, then counting on; a negative start clamps.
+    let five = letter(r#"<w:pgNumType w:start="5"/>"#);
+    let neg = letter(r#"<w:pgNumType w:start="-2"/>"#);
+    let body = body_blocks(&format!(
+        "{}{}{}{}",
+        para("a", Some(&letter(""))),
+        para("b", Some(&five)),
+        para("c", Some(&neg)),
+        letter("")
+    ));
+    let pf = flow(&body, &letter(""), false);
+    assert_eq!(pf.numbers(), vec![1, 5, 0, 1]);
 }
