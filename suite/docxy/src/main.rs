@@ -4151,7 +4151,14 @@ impl SheetView {
             StructOp::InsertRow | StructOp::InsertCol => "Insert Cells",
             StructOp::DeleteRow | StructOp::DeleteCol => "Delete",
         });
-        self.push_undo_at(s, target, step);
+        // Notes live in the package's parts, so a sheet that has any takes a
+        // package step: the workbook alone could not bring one back.
+        let notes = self.pkg.comments().iter().any(|c| c.sheet == s);
+        if notes {
+            self.push_undo_snapshot(self.snapshot_package().targeting(s, target), step);
+        } else {
+            self.push_undo_at(s, target, step);
+        }
         let wb = &mut self.pkg.workbook;
         let shift = match op {
             StructOp::InsertRow => {
@@ -4180,6 +4187,9 @@ impl SheetView {
             at: shift.1,
             delta: shift.2,
         };
+        if notes {
+            self.pkg.shift_comments(s, shift.rows, shift.at, shift.delta);
+        }
         // Every authored chart, not just the ones ON the edited sheet: a
         // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)
         // and has to follow them. `home` is what keeps the UNqualified refs
