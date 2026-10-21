@@ -393,7 +393,10 @@ fn an_insert_that_would_push_a_note_off_the_sheet_is_refused() {
     v.select_rows();
     let (steps, before) = (v.undo.len(), notes(&v));
     assert!(!v.structural_edit(StructOp::InsertRow));
-    assert_eq!(v.entry_error.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(gridcore::edit::SHIFT_OFF_SHEET)
+    );
     assert_eq!(v.undo.len(), steps);
     assert_eq!(notes(&v), before);
     // A delete is still fine, and takes the note along when it is the row.
