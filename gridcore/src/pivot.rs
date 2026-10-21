@@ -289,7 +289,13 @@ pub(crate) fn parse_pivot_cache_xml(xml: &str, date1904: bool) -> Option<CacheIn
             Event::Start => match local_name(p.name()) {
                 "worksheetSource" => {
                     let name = decode(p.attr("name"));
-                    if !name.is_empty() {
+                    // An `r:id` (any prefix) points at another workbook: the
+                    // range is not ours to shift, patch or rename, so the pivot
+                    // keeps the unparsed-cache placeholder source and its cache.
+                    if p.attrs().iter().any(|a| local_name(a.name) == "id") {
+                        unsupported = true;
+                        source = Some(PivotSource::Table(String::new()));
+                    } else if !name.is_empty() {
                         source = Some(PivotSource::Table(name));
                     } else if let Some(rect) = parse_range_name(p.attr("ref")) {
                         source = Some(PivotSource::Range {

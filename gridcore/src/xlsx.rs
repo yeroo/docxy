@@ -17906,6 +17906,27 @@ b",
         assert!(def.contains(r#"<location ref="A5:B7""#), "{def}");
     }
 
+    /// A source in another workbook (`r:id` on `worksheetSource`) is not a
+    /// local range: a row inserted on a same-named local sheet leaves its
+    /// saved ref alone, and the pivot keeps its cache only.
+    #[test]
+    fn an_external_source_range_is_not_shifted_by_a_local_edit() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource ref="A1:C5" sheet="Data" r:id="rId1"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let mut pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        assert!(pkg.workbook.pivots[0].unsupported);
+        crate::edit::insert_rows(&mut pkg.workbook, 0, 0, 1);
+        crate::edit::rename_sheet(&mut pkg.workbook, 0, "Facts");
+        let saved = save_xlsx(&pkg);
+        let saved_cache = saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml");
+        assert!(
+            saved_cache.contains(r#"ref="A1:C5" sheet="Data""#),
+            "{saved_cache}"
+        );
+    }
+
     /// A row inserted inside the output would change its size, which the
     /// saved row items cannot follow: the pivot keeps its cache only and its
     /// `<location ref>` stays as loaded.

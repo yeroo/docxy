@@ -1955,7 +1955,8 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`App::precision_on`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
-    /// Each PivotTable's source: a table rename moves it.
+    /// Each PivotTable's source: a table or sheet rename, or a row/column
+    /// edit (a range's rect), moves it.
     pivot_sources: Vec<gridcore::pivot::PivotSource>,
     /// Each PivotTable's output region: a row/column edit shifts it.
     pivot_locations: Vec<(u32, u32, u32, u32)>,
@@ -1972,7 +1973,9 @@ struct WbSnapshot {
     /// step's `after`) or found it (its `before`), for undo and redo to put
     /// back.
     clip_edit: Option<ClipEdit>,
-    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    /// Each PivotTable's `unsupported` flag: deleting its table, or a
+    /// row/column edit that deletes or cuts through its output or source,
+    /// sets it.
     pivot_unsupported: Vec<bool>,
     /// A Resize Table step: undo and redo leave the model and the pending
     /// copy alone, as the step did.

@@ -2176,7 +2176,19 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
     for piv in &mut wb.pivots {
         if piv.sheet == idx {
             let (r1, c1, r2, c2) = piv.location;
-            match shift_rect(piv.location, shift) {
+            // Report filters sit above the body, one per row (`page.len()`
+            // stands in for `rowPageCount`) with a blank row between: a row
+            // edit inside that block cuts the layout as one in the body does.
+            let in_page_area = shift.rows && !piv.page.is_empty() && {
+                let top = r1.saturating_sub(1 + piv.page.len() as u32);
+                if shift.delta > 0 {
+                    top < shift.at && shift.at < r1
+                } else {
+                    let end = i64::from(shift.at) - shift.delta;
+                    shift.at < r1 && end > i64::from(top)
+                }
+            };
+            match shift_rect(piv.location, shift).filter(|_| !in_page_area) {
                 Some(moved) if moved.2 - moved.0 == r2 - r1 && moved.3 - moved.1 == c2 - c1 => {
                     piv.location = moved
                 }
@@ -5387,6 +5399,36 @@ mod table_tests {
         insert_cols(&mut wb, 1, 2, 1);
         assert!(!wb.pivots[0].unsupported);
         assert_eq!(wb.pivots[0].location, (2, 0, 4, 1));
+    }
+
+    #[test]
+    fn a_row_edit_in_the_page_filter_area_leaves_the_pivot_unsupported() {
+        let page = |wb: &mut Workbook| {
+            let mut p = range_pivot(1, (6, 0, 8, 1), "Sheet1", (0, 0, 3, 2));
+            p.page = vec![(0, None)]; // filter in row 4, blank row 5
+            wb.pivots.push(p);
+        };
+        for (ins, at) in [(true, 5), (false, 4), (false, 5)] {
+            let mut wb = sales();
+            page(&mut wb);
+            if ins {
+                insert_rows(&mut wb, 1, at, 1);
+            } else {
+                delete_rows(&mut wb, 1, at, 1);
+            }
+            assert!(wb.pivots[0].unsupported, "{ins} {at}");
+            assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
+        }
+        // Wholly above the filter block: a translation.
+        let mut wb = sales();
+        page(&mut wb);
+        insert_rows(&mut wb, 1, 2, 1);
+        insert_rows(&mut wb, 1, 5, 0);
+        assert!(!wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (7, 0, 9, 1));
+        delete_rows(&mut wb, 1, 0, 2);
+        assert!(!wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (5, 0, 7, 1));
     }
 
     #[test]
