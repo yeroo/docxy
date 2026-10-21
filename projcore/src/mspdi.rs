@@ -1572,8 +1572,7 @@ pub fn write_mspdi(proj: &Project) -> String {
     // A plan with no StartDate schedules from its earliest stored start, and
     // a save that writes dates moves that: it pins the anchor it scheduled
     // from, as Project always states one (#701).
-    let anchor = (proj.start_date.is_none() && dates.iter().any(Option::is_some))
-        .then_some(sched.raw_project_start);
+    let anchor = pinned_start_date(proj, &sched, &dates);
     for &name in PROJECT_HEADER {
         if let Some(text) = header_text(proj, name, anchor) {
             tag(&mut s, 1, name, &text);
@@ -1795,6 +1794,17 @@ fn scheduled_dates(
             sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
         })
         .collect()
+}
+
+/// The `StartDate` a save adds to a plan that states none: the anchor the
+/// schedule counted from, when the save writes any scheduled date (#701).
+fn pinned_start_date(
+    proj: &Project,
+    sched: &crate::schedule::Schedule,
+    dates: &[Option<(DateTime, DateTime)>],
+) -> Option<DateTime> {
+    (proj.start_date.is_none() && dates.iter().any(Option::is_some))
+        .then_some(sched.raw_project_start)
 }
 
 /// Whether nothing in the plan is an input Project schedules by and docxy's
@@ -2751,9 +2761,7 @@ fn stamped(proj: &Project, replace_stored: bool) -> Project {
     let mut out = proj.clone();
     let sched = crate::schedule::schedule(proj);
     let dates = scheduled_dates(proj, &sched);
-    if proj.start_date.is_none() && dates.iter().any(Option::is_some) {
-        out.start_date = Some(sched.raw_project_start);
-    }
+    out.start_date = out.start_date.or(pinned_start_date(proj, &sched, &dates));
     for (t, d) in out.tasks.iter_mut().zip(dates) {
         if let Some((start, finish)) = d.filter(|_| replace_stored || t.stored_start.is_none()) {
             t.stored_start = Some(start);
@@ -5067,6 +5075,13 @@ mod tests {
     #[test]
     fn a_plan_without_a_start_date_saves_the_anchor_it_was_scheduled_from() {
         // A TBD manual root (never written) with an auto successor.
+        let tbd = read_mspdi(
+            "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Manual>1</Manual><Duration>PT8H0M0S</Duration></Task>\
+             <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>\
+             <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task></Tasks></Project>",
+        )
+        .unwrap();
+        assert!(write_mspdi(&tbd).contains("<StartDate>2020-01-06T08:00:00</StartDate>"));
         assert_save_is_stable(
             "<Task><UID>1</UID><ID>1</ID><Manual>1</Manual><Duration>PT8H0M0S</Duration></Task>\
              <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>\
@@ -5121,6 +5136,27 @@ mod tests {
             ),
             "",
         );
+        // Inactive tasks: every leaf inactive with a stored start, and an
+        // inactive task stored before and after the active anchor, unlinked
+        // and linked.
+        assert_save_is_stable(
+            "<Task><UID>1</UID><ID>1</ID><Active>0</Active><Duration>PT8H0M0S</Duration>\
+             <Start>2026-03-02T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish></Task>",
+            "",
+        );
+        for stored in ["2026-02-02T08:00:00", "2026-04-06T08:00:00"] {
+            for link in [String::new(), lead_link(1, 0)] {
+                assert_save_is_stable(
+                    &format!(
+                        "<Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration>\
+                         <Start>2026-03-02T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish></Task>\
+                         <Task><UID>2</UID><ID>2</ID><Active>0</Active><Duration>PT8H0M0S</Duration>\
+                         <Start>{stored}</Start><Finish>{stored}</Finish>{link}</Task>"
+                    ),
+                    "",
+                );
+            }
+        }
         // A 24-hour task beside a default-calendar one.
         let night = include_str!("../../corpus/mspdi/16-24-hour-calendar.xml");
         let tasks = "<Task><UID>1</UID><ID>1</ID><Duration>PT24H0M0S</Duration>\
