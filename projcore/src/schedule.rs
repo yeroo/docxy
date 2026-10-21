@@ -141,6 +141,12 @@ pub struct Schedule {
     /// Project start snapped on the default calendar. An unlinked task on
     /// another calendar may start earlier.
     pub project_start: DateTime,
+    /// The anchor before snapping: what a plan with no start date counts
+    /// from (the earliest stored, pinned (manual) or actual start of its
+    /// scheduled tasks, else 2020-01-06 08:00; of its inactive tasks when none
+    /// is active). Stating
+    /// it as the start date gives the same anchor to every pass.
+    pub raw_project_start: DateTime,
     pub project_finish: DateTime,
 }
 
@@ -2258,6 +2264,7 @@ impl<'a> Scheduler<'a> {
             rollups,
             delay_driven,
             project_start: DateTime::from_minutes(self.anchor),
+            raw_project_start: DateTime::from_minutes(self.raw_anchor),
             project_finish: DateTime::from_minutes(project_finish_abs),
         }
     }
@@ -3157,6 +3164,7 @@ fn schedule_local(proj: &Project) -> Schedule {
     let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &main);
     if dormant_bounds {
         main.project_start = other.project_start;
+        main.raw_project_start = other.raw_project_start;
         main.project_finish = other.project_finish;
         for (uid, start, finish) in place_empty_summaries(&active, &main, other.project_start) {
             if let Some(r) = main.results.get_mut(&uid) {

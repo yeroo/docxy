@@ -594,11 +594,19 @@ fn save_policy_preserves_binding_history_and_source_on_refusal() {
     let target = dir.join("converted");
     call(&mut tabs, 0, "proj.save", path_args(&target)).unwrap();
     assert_eq!(tabs[0].path, Some(target.with_extension("yppx")));
+    // A save writes each auto task's scheduled Start/Finish (#701), so the
+    // reloaded plan carries dates the open one never stamped: compare the
+    // plans without them (projcore's tests pin the dates themselves).
+    let unstamped = |ed: &projcore::editor::Editor| {
+        let mut project = ed.project().clone();
+        for t in &mut project.tasks {
+            (t.stored_start, t.stored_finish) = (None, None);
+        }
+        project
+    };
     assert_eq!(
-        view(&project_tab_from_path(tabs[0].path.as_ref().unwrap()))
-            .ed
-            .project(),
-        view(&tabs[0]).ed.project()
+        unstamped(&view(&project_tab_from_path(tabs[0].path.as_ref().unwrap())).ed),
+        unstamped(&view(&tabs[0]).ed)
     );
     for path in [None, Some(dir.join("original.mpp"))] {
         if let Some(p) = &path {

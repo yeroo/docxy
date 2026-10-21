@@ -3191,7 +3191,16 @@ mod tests {
             "Project schedules can only be saved as .yppx or .xml (MSPDI)";
         let dir = std::env::temp_dir().join(format!("yppxy-save-formats-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let project = new_project();
+        // A save writes each auto task's scheduled dates (#701), so the plan
+        // reloads carrying them: stamp them to compare.
+        let mut project = new_project();
+        let sched = projcore::schedule::schedule(&project);
+        for t in &mut project.tasks {
+            if let Some(r) = sched.get(t.uid) {
+                t.stored_start = Some(r.early_start);
+                t.stored_finish = Some(r.early_finish);
+            }
+        }
         for name in ["plan.mpp", "plan.MPP", "plan.txt"] {
             let path = dir.join(name);
             std::fs::write(&path, b"original binary schedule").unwrap();
