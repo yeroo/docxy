@@ -2791,7 +2791,7 @@ fn parse_worksheet_with(
                             },
                         );
                         // A whole-column hyperlink applies only to its anchor.
-                        for cell in hyperlinks::link_cells(rect) {
+                        for cell in crate::sheet::hyperlink_cells(rect) {
                             sheet.hyperlinks.insert(cell, t.clone());
                         }
                     }

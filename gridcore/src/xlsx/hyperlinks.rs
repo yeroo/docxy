@@ -13,12 +13,12 @@ use super::{
     parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
     remove_worksheet_child, start_tag, worksheet_child_span, worksheet_takes,
 };
-use crate::sheet::{Sheet, cell_name, parse_cell_name, parse_range_name};
+use crate::sheet::{
+    Sheet, cell_name, hyperlink_cells as link_cells, parse_cell_name, parse_range_name,
+};
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
 type Rect = (u32, u32, u32, u32);
-
-use crate::sheet::HYPERLINK_SPREAD_LIMIT as SPREAD_LIMIT;
 
 /// External hyperlink targets keyed by relationship id, from a worksheet's
 /// parsed rels.
@@ -51,19 +51,6 @@ pub(super) fn hyperlink_of(
     Some((rect, target))
 }
 
-/// The cells a link over `rect` sets: all of them, or only the anchor past
-/// [`SPREAD_LIMIT`].
-pub(super) fn link_cells(rect: Rect) -> impl Iterator<Item = (u32, u32)> {
-    let (r1, c1, r2, c2) = rect;
-    let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-    let (r2, c2) = if cells > SPREAD_LIMIT {
-        (r1, c1)
-    } else {
-        (r2, c2)
-    };
-    (r1..=r2).flat_map(move |r| (c1..=c2).map(move |c| (r, c)))
-}
-
 /// A `<hyperlink>` element of the block: its span in the block, and what
 /// [`hyperlink_of`] reads from it.
 struct Item {
@@ -72,7 +59,7 @@ struct Item {
     /// The span of its `ref` value in the block.
     ref_value: Option<(usize, usize)>,
     /// Where an edit since the load moved its range: the `ref` to write in
-    /// place (set by `write_hyperlinks`, and `link` then holds this rect).
+    /// place (set by [`relocate`], and `link` then holds this rect).
     moved_to: Option<Rect>,
 }
 
@@ -119,8 +106,10 @@ fn replay<'a>(items: impl Iterator<Item = &'a Item>) -> HashMap<(u32, u32), &'a 
 }
 
 /// Bring the worksheet's `<hyperlinks>` in line with `sheet.hyperlinks`:
-/// a loaded element whose cells the model changed goes (its relationship
-/// stays, unreferenced, which OPC allows), and each model cell the
+/// a loaded element whose range an edit moved is rewritten in place with its
+/// new `ref`, every other attribute kept ([`relocate`]); one whose cells the
+/// model changed goes (its relationship stays, unreferenced, which OPC allows),
+/// and each model cell the
 /// remaining elements don't give its target gets a `<hyperlink>` of its
 /// own, an external target through a `TargetMode="External"` relationship
 /// in the sheet's rels part (created when missing). A sheet whose links

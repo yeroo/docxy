@@ -2274,8 +2274,10 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
 /// cell by cell that the edit stretches, shrinks or removes is forgotten, and
 /// its cells carry on as the single-cell links they already are in
 /// `hyperlinks`. A range too big to spread is held by its anchor alone, so it
-/// stretches and re-anchors with the edit instead. `hyperlinks_removed` names
-/// elements of the loaded file, so it stays.
+/// stretches and re-anchors with the edit instead. The loaded `ref` of every
+/// range forgotten goes to `hyperlinks_removed`, so the save strikes its
+/// element; the list itself names elements of the loaded file and is never
+/// shifted.
 fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
     let axis = |r: u32, c: u32| if shift.rows { r } else { c };
     let with_axis = |rect: Area, lo: u32, hi: u32| {
@@ -2285,22 +2287,22 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
             (rect.0, lo, rect.2, hi)
         }
     };
-    let cells = |r: Area| (r.2 - r.0 + 1) as u64 * (r.3 - r.1 + 1) as u64;
-    let big = |r: Area| cells(r) > crate::sheet::HYPERLINK_SPREAD_LIMIT;
 
     let refs = std::mem::take(&mut sheet.hyperlink_refs);
     let mut kept = BTreeMap::new();
     // A big range's anchor may be the deleted cell: its link lands on the new
     // anchor below.
     let mut reanchored: Vec<(Area, String)> = Vec::new();
+    let mut forgotten: Vec<Area> = Vec::new();
     for l in refs.into_values() {
         let now = l.now;
         let (a, b) = (axis(now.0, now.1), axis(now.2, now.3));
-        let moved = if big(now) {
+        let moved = if !crate::sheet::hyperlink_spreads(now) {
             // Pushed off by an insert, or deleted whole: gone.
             let Some((lo, hi)) =
                 span(a, b, shift).filter(|_| point(a, shift).is_some() || shift.delta < 0)
             else {
+                forgotten.push(l.loaded);
                 continue;
             };
             let rect = with_axis(now, lo, hi);
@@ -2310,9 +2312,11 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
             rect
         } else {
             let (Some(lo), Some(hi)) = (point(a, shift), point(b, shift)) else {
+                forgotten.push(l.loaded);
                 continue;
             };
             if hi - lo != b - a {
+                forgotten.push(l.loaded);
                 continue;
             }
             with_axis(now, lo, hi)
@@ -2323,6 +2327,13 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
         );
     }
     sheet.hyperlink_refs = kept;
+    // The file's elements for the ranges forgotten here go at the save; a
+    // cut range's remaining cells are written as links of their own.
+    for rect in forgotten {
+        if !sheet.hyperlinks_removed.contains(&rect) {
+            sheet.hyperlinks_removed.push(rect);
+        }
+    }
 
     let links = std::mem::take(&mut sheet.hyperlinks);
     sheet.hyperlinks = links
@@ -2335,14 +2346,7 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
     for (rect, target) in reanchored {
         // A range that shrank to what spreads gets all its cells, as a load
         // would give it.
-        let spread = if big(rect) {
-            vec![(rect.0, rect.1)]
-        } else {
-            (rect.0..=rect.2)
-                .flat_map(|r| (rect.1..=rect.3).map(move |c| (r, c)))
-                .collect()
-        };
-        for rc in spread {
+        for rc in crate::sheet::hyperlink_cells(rect) {
             sheet.hyperlinks.entry(rc).or_insert_with(|| target.clone());
         }
     }

@@ -616,3 +616,20 @@ fn removing_a_moved_link_strikes_its_own_element_only() {
     });
     assert_eq!(got, "<hyperlink ref=\"A4:B4\"/>");
 }
+
+#[test]
+fn a_deleted_link_does_not_survive_beside_the_one_that_moved_onto_it() {
+    let x = "<hyperlink ref=\"A1\" r:id=\"rId1\" display=\"X\"/>";
+    let y = "<hyperlink ref=\"A2\" location=\"Sheet1!B2\" tooltip=\"Y\"/>";
+    let want = "<hyperlink ref=\"A1\" location=\"Sheet1!B2\" tooltip=\"Y\"/>";
+    let del_row = |wb: &mut Workbook| crate::edit::delete_rows(wb, 0, 0, 1);
+    assert_eq!(block_after(&format!("{x}{y}"), del_row), want);
+    // The deleted element later in the block.
+    assert_eq!(block_after(&format!("{y}{x}"), del_row), want);
+    // The same over columns.
+    let x = "<hyperlink ref=\"A1\" r:id=\"rId1\" display=\"X\"/>";
+    let y = "<hyperlink ref=\"B1\" location=\"Sheet1!B2\" tooltip=\"Y\"/>";
+    let del_col = |wb: &mut Workbook| crate::edit::delete_cols(wb, 0, 0, 1);
+    assert_eq!(block_after(&format!("{x}{y}"), del_col), want);
+    assert_eq!(block_after(&format!("{y}{x}"), del_col), want);
+}
