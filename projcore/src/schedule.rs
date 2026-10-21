@@ -141,6 +141,10 @@ pub struct Schedule {
     /// Project start snapped on the default calendar. An unlinked task on
     /// another calendar may start earlier.
     pub project_start: DateTime,
+    /// The anchor before snapping: what a plan with no start date counts
+    /// from (its earliest stored start, else 2020-01-06 08:00). Stating it as
+    /// the start date reproduces the schedule.
+    pub raw_project_start: DateTime,
     pub project_finish: DateTime,
 }
 
@@ -2258,6 +2262,7 @@ impl<'a> Scheduler<'a> {
             rollups,
             delay_driven,
             project_start: DateTime::from_minutes(self.anchor),
+            raw_project_start: DateTime::from_minutes(self.raw_anchor),
             project_finish: DateTime::from_minutes(project_finish_abs),
         }
     }

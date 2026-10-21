@@ -1534,6 +1534,12 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// elapsed task `DurationFormat`, or a work resource whose calendar differs
 /// from its task's. See `scheduled_dates` and `schedule_reproduces`.
 ///
+/// A plan with no `StartDate` is scheduled from its earliest stored start, so
+/// a save that writes any scheduled date also writes `<StartDate>` as the
+/// anchor it scheduled from: otherwise the written dates would move the
+/// anchor, and the plan, on reload. A plan that states one keeps it, and a
+/// plan where no date is written gains none.
+///
 /// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
 /// whatever the source said: the saved `<Duration>`s are docxy's own and
 /// authoritative, and without it Project recomputes them from Start/Finish.
@@ -1561,8 +1567,15 @@ pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
+    let sched = crate::schedule::schedule(proj);
+    let dates = scheduled_dates(proj, &sched);
+    // A plan with no StartDate schedules from its earliest stored start, and
+    // a save that writes dates moves that: it pins the anchor it scheduled
+    // from, as Project always states one (#701).
+    let anchor = (proj.start_date.is_none() && dates.iter().any(Option::is_some))
+        .then_some(sched.raw_project_start);
     for &name in PROJECT_HEADER {
-        if let Some(text) = header_text(proj, name) {
+        if let Some(text) = header_text(proj, name, anchor) {
             tag(&mut s, 1, name, &text);
         }
     }
@@ -1593,9 +1606,7 @@ pub fn write_mspdi(proj: &Project) -> String {
     }
 
     s.push_str("  <Tasks>\n");
-    let sched = crate::schedule::schedule(proj);
     let numbers = outline_numbers(&proj.tasks);
-    let dates = scheduled_dates(proj, &sched);
     for ((t, number), &dates) in proj.tasks.iter().zip(&numbers).zip(&dates) {
         let computed = Computed {
             outline_number: number.as_deref(),
@@ -1707,13 +1718,14 @@ const PROJECT_HEADER: &[&str] = &[
 
 /// The text a save writes for one header element: the modeled value (never
 /// `None` for the fields always written), else the option stored verbatim.
-fn header_text(proj: &Project, name: &str) -> Option<String> {
+/// `anchor` is the start date a plan with none gets (see `write_mspdi`).
+fn header_text(proj: &Project, name: &str, anchor: Option<DateTime>) -> Option<String> {
     let flag = |on: bool| Some(if on { "1" } else { "0" }.to_string());
     let stored = || proj.option(name).map(str::to_string);
     match name {
         "Name" => Some(proj.name.clone()),
         "Title" => (!proj.title.is_empty()).then(|| proj.title.clone()),
-        "StartDate" => proj.start_date.map(|d| d.to_mspdi()),
+        "StartDate" => proj.start_date.or(anchor).map(|d| d.to_mspdi()),
         "CalendarUID" => Some(proj.default_calendar_uid.to_string()),
         "MinutesPerDay" => Some(((proj.hours_per_day * 60.0).round() as i64).to_string()),
         "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
@@ -1760,10 +1772,6 @@ struct Computed<'a> {
 /// - a manual task's are what it is pinned to (and a TBD one's absent Start is
 ///   what keeps it TBD on reload);
 /// - a task the schedule skips has none;
-/// - an unstamped task that starts before the schedule's anchor in a plan with
-///   no `StartDate` (a lead or an FF/SF link, a linked constraint): the
-///   anchor is the earliest stored start, so writing it would move the plan
-///   on every reload (#701);
 /// - an auto summary with nothing scheduled below it spans its own stored
 ///   dates, which the schedule only clamps;
 /// - every task of a plan the schedule is known not to reproduce, where
@@ -1784,16 +1792,7 @@ fn scheduled_dates(
             if t.summary && sched.rolled_up(t.uid).is_none() {
                 return None;
             }
-            let r = sched.get(t.uid)?;
-            // Without a StartDate the schedule anchors on the earliest stored
-            // start: one written before the anchor would move it on reload.
-            if proj.start_date.is_none()
-                && t.stored_start.is_none()
-                && r.early_start < sched.project_start
-            {
-                return None;
-            }
-            Some((r.early_start, r.early_finish))
+            sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
         })
         .collect()
 }
@@ -2750,7 +2749,11 @@ pub(crate) fn with_rescheduled_dates(proj: &Project) -> Project {
 #[cfg(test)]
 fn stamped(proj: &Project, replace_stored: bool) -> Project {
     let mut out = proj.clone();
-    let dates = scheduled_dates(proj, &crate::schedule::schedule(proj));
+    let sched = crate::schedule::schedule(proj);
+    let dates = scheduled_dates(proj, &sched);
+    if proj.start_date.is_none() && dates.iter().any(Option::is_some) {
+        out.start_date = Some(sched.raw_project_start);
+    }
     for (t, d) in out.tasks.iter_mut().zip(dates) {
         if let Some((start, finish)) = d.filter(|_| replace_stored || t.stored_start.is_none()) {
             t.stored_start = Some(start);
@@ -5025,67 +5028,130 @@ mod tests {
         }
     }
 
-    /// A plan with no `StartDate` is anchored on its earliest stored start, so
-    /// an unstamped linked task the schedule starts before that anchor (an FS
-    /// lead, an FF link, a linked constraint) stays absent: stamping it would
-    /// move the anchor, and the plan, on every reload.
+    /// Asserts a plan with no `StartDate` saves stably (#701): the saved file
+    /// reloads to the same schedule (every task and the anchor) and a second
+    /// save writes the same file. Without a `StartDate` the schedule anchors on
+    /// the earliest stored start, so the save must pin the anchor it used.
+    fn assert_save_is_stable(tasks: &str, calendars: &str) {
+        let source = format!("<Project><Tasks>{tasks}</Tasks>{calendars}</Project>");
+        let proj = read_mspdi(&source).unwrap();
+        assert!(proj.start_date.is_none(), "{source}");
+        let sched = crate::schedule::schedule(&proj);
+        let xml = write_mspdi(&proj);
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.start_date, Some(sched.raw_project_start), "{source}");
+        let again = crate::schedule::schedule(&back);
+        assert_eq!(again.project_start, sched.project_start, "{source}");
+        for t in &proj.tasks {
+            let (x, y) = (sched.get(t.uid).unwrap(), again.get(t.uid).unwrap());
+            assert_eq!(
+                (x.early_start, x.early_finish),
+                (y.early_start, y.early_finish),
+                "task {} of {source}",
+                t.uid
+            );
+        }
+        assert_eq!(write_mspdi(&back), xml, "{source}");
+    }
+
+    fn lead_link(kind: i32, lag: i32) -> String {
+        format!(
+            "<PredecessorLink><PredecessorUID>1</PredecessorUID><Type>{kind}</Type>\
+             <LinkLag>{lag}</LinkLag><LagFormat>7</LagFormat></PredecessorLink>"
+        )
+    }
+
+    /// A plan with no `StartDate` whose written starts leave nothing at the
+    /// anchor, or put a task before it, would move on every reload; the save
+    /// writes the `StartDate` it scheduled from.
     #[test]
-    fn an_unstamped_task_starting_before_the_anchor_stays_absent_without_a_start_date() {
-        let link = |kind: i32, lag: i32| {
-            format!(
-                "<PredecessorLink><PredecessorUID>1</PredecessorUID><Type>{kind}</Type>\
-                 <LinkLag>{lag}</LinkLag><LagFormat>7</LagFormat></PredecessorLink>"
-            )
-        };
-        let plans = [
-            // FS with a five-day lead on a three-day task.
+    fn a_plan_without_a_start_date_saves_the_anchor_it_was_scheduled_from() {
+        // A TBD manual root (never written) with an auto successor.
+        assert_save_is_stable(
+            "<Task><UID>1</UID><ID>1</ID><Manual>1</Manual><Duration>PT8H0M0S</Duration></Task>\
+             <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>\
+             <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task>",
+            "",
+        );
+        // An empty summary beside a task held later by a constraint.
+        assert_save_is_stable(
+            "<Task><UID>1</UID><ID>1</ID><OutlineLevel>1</OutlineLevel><Summary>1</Summary></Task>\
+             <Task><UID>2</UID><ID>2</ID><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration>\
+             <ConstraintType>4</ConstraintType><ConstraintDate>2026-05-04T08:00:00</ConstraintDate></Task>",
+            "",
+        );
+        // An FS lead, an FF link and a linked Must Start On, each starting
+        // task 2 before the anchor: written with dates, the anchor pinned.
+        for tasks in [
             format!(
                 "<Task><UID>1</UID><ID>1</ID><Duration>PT24H0M0S</Duration></Task>\
                  <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>{}</Task>",
-                link(1, -24000)
+                lead_link(1, -24000)
             ),
-            // FF: a five-day task finishing with a one-day one.
             format!(
                 "<Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task>\
                  <Task><UID>2</UID><ID>2</ID><Duration>PT40H0M0S</Duration>{}</Task>",
-                link(0, 0)
+                lead_link(0, 0)
             ),
-            // A linked Must Start On before the anchor.
             format!(
                 "<Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task>\
                  <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>\
                  <ConstraintType>2</ConstraintType>\
                  <ConstraintDate>2019-12-02T08:00:00</ConstraintDate>{}</Task>",
-                link(1, 0)
+                lead_link(1, 0)
             ),
-        ];
-        for tasks in plans {
+        ] {
             let proj = read_mspdi(&format!("<Project><Tasks>{tasks}</Tasks></Project>")).unwrap();
-            assert!(proj.start_date.is_none());
             let sched = crate::schedule::schedule(&proj);
-            assert!(
-                sched.get(2).unwrap().early_start < sched.project_start,
-                "task 2 starts before the anchor: {tasks}"
-            );
+            assert!(sched.get(2).unwrap().early_start < sched.project_start);
             let xml = write_mspdi(&proj);
-            let a = one_task_xml(&xml, 1);
-            assert!(a.contains("<Start>") && a.contains("<Finish>"), "{a}");
             let b = one_task_xml(&xml, 2);
-            assert!(!b.contains("<Start>") && !b.contains("<Finish>"), "{b}");
-            let back = read_mspdi(&xml).unwrap();
-            let again = crate::schedule::schedule(&back);
-            assert_eq!(again.project_start, sched.project_start, "{tasks}");
-            for t in &proj.tasks {
-                let (x, y) = (sched.get(t.uid).unwrap(), again.get(t.uid).unwrap());
-                assert_eq!(
-                    (x.early_start, x.early_finish),
-                    (y.early_start, y.early_finish),
-                    "task {} of {tasks}",
-                    t.uid
-                );
-            }
-            assert_eq!(write_mspdi(&back), xml);
+            assert!(b.contains("<Start>") && b.contains("<Finish>"), "{b}");
+            assert_save_is_stable(&tasks, "");
         }
+        // A stamped task a lead schedules before the anchor (its stored date
+        // is stale).
+        assert_save_is_stable(
+            &format!(
+                "<Task><UID>1</UID><ID>1</ID><Duration>PT24H0M0S</Duration>\
+                 <Start>2026-03-02T08:00:00</Start><Finish>2026-03-04T17:00:00</Finish></Task>\
+                 <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration>\
+                 <Start>2026-03-09T08:00:00</Start><Finish>2026-03-09T17:00:00</Finish>{}</Task>",
+                lead_link(1, -24000)
+            ),
+            "",
+        );
+        // A 24-hour task beside a default-calendar one.
+        let night = include_str!("../../corpus/mspdi/16-24-hour-calendar.xml");
+        let tasks = "<Task><UID>1</UID><ID>1</ID><Duration>PT24H0M0S</Duration>\
+                     <CalendarUID>3</CalendarUID></Task>\
+                     <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration></Task>";
+        let calendars =
+            &night[night.find("<Calendars>").unwrap()..night.find("</Calendars>").unwrap() + 12];
+        assert_save_is_stable(tasks, calendars);
+    }
+
+    /// A plan with a `StartDate` writes the same one as before; a plan where
+    /// nothing is written (all manual) gains none.
+    #[test]
+    fn the_start_date_is_pinned_only_when_a_date_is_written_and_none_was_set() {
+        let with = read_mspdi(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>\
+             <Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task></Tasks></Project>",
+        )
+        .unwrap();
+        assert!(write_mspdi(&with).contains("<StartDate>2026-03-02T08:00:00</StartDate>"));
+        let mut manual = read_mspdi(
+            "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task></Tasks></Project>",
+        )
+        .unwrap();
+        manual.tasks[0].manual = true;
+        assert!(!write_mspdi(&manual).contains("<StartDate>"));
+        let auto = read_mspdi(
+            "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task></Tasks></Project>",
+        )
+        .unwrap();
+        assert!(write_mspdi(&auto).contains("<StartDate>"));
     }
 
     /// An unstamped auto summary with scheduled children gets its rolled-up
