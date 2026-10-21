@@ -32062,6 +32062,36 @@ impl Measurer {
     }
 }
 
+/// What `inline_width` and `frame_content_w` need of a [`Measurer`], so a test
+/// can measure without a window.
+trait TextWidth {
+    fn width_in(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        family: Option<&str>,
+    ) -> f32;
+
+    fn width(&self, text: &str, size: f32, bold: bool, italic: bool) -> f32 {
+        self.width_in(text, size, bold, italic, None)
+    }
+}
+
+impl TextWidth for Measurer {
+    fn width_in(
+        &self,
+        text: &str,
+        size: f32,
+        bold: bool,
+        italic: bool,
+        family: Option<&str>,
+    ) -> f32 {
+        Measurer::width_in(self, text, size, bold, italic, family)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_words(
     out: &mut Vec<AnyElement>,
@@ -32586,7 +32616,7 @@ fn field_live<'a>(
 
 #[cfg(test)]
 mod field_shown_tests {
-    use super::{field_live, field_shown};
+    use super::{TextWidth, field_live, field_shown, frame_content_w};
 
     const PAGE: &str =
         r#"<w:fldSimple w:instr=" PAGE \* MERGEFORMAT "><w:r><w:t>3</w:t></w:r></w:fldSimple>"#;
@@ -32628,16 +32658,45 @@ mod field_shown_tests {
             r"{ PAGE \* MERGEFORMAT }"
         );
     }
+
+    #[test]
+    fn an_auto_width_frame_is_measured_with_the_live_value_1437() {
+        use crate::page_fields::PageVals;
+        let blocks = crate::hf::tests::body_blocks(
+            "<w:p><w:pPr><w:framePr w:hAnchor=\"text\" w:vAnchor=\"text\" w:xAlign=\"right\" w:wrap=\"around\"/></w:pPr>\
+             <w:fldSimple w:instr=\" PAGE \"><w:r><w:t>1</w:t></w:r></w:fldSimple></w:p>",
+        );
+        let (_, groups) = docxcore::frame::split_framed(&blocks);
+        assert_eq!(groups.len(), 1, "one frame group");
+        /// Seven px a character, whatever the size.
+        struct Fixed;
+        impl TextWidth for Fixed {
+            fn width_in(&self, text: &str, _: f32, _: bool, _: bool, _: Option<&str>) -> f32 {
+                7.0 * text.chars().count() as f32
+            }
+        }
+        let meas = Fixed;
+        let vals = PageVals {
+            page: "xviii".into(),
+            num_pages: "18".into(),
+            section_pages: "18".into(),
+        };
+        let cached = frame_content_w(&groups[0], &meas, 1.0, None, None);
+        let live = frame_content_w(&groups[0], &meas, 1.0, None, Some(&vals));
+        assert!(live > cached, "{live} vs {cached}");
+    }
 }
 
 /// A frame group's content width in twips, measured as `hf_para_el` draws
 /// it at `zoom` (1 px = 15 / zoom twips), for a frame with no `w` (Word sizes
-/// it to its content): the widest paragraph, plus a space of slack.
+/// it to its content): the widest paragraph, plus a space of slack. `page_vals`
+/// are the page's live field values, measured as drawn (#1437).
 fn frame_content_w(
     g: &docxcore::frame::FrameGroup,
-    meas: &Measurer,
+    meas: &dyn TextWidth,
     zoom: f32,
     sheet: Option<&docxcore::styles::StyleSheet>,
+    page_vals: Option<&page_fields::PageVals>,
 ) -> i32 {
     if g.frame.w.is_some_and(|w| w > 0) {
         return 0; // frame_rect takes `w`.
@@ -32651,7 +32710,7 @@ fn frame_content_w(
         .for_paragraph(p.props.style_id.as_deref());
         let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false, None))
+            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false, page_vals))
             .sum();
         items + meas.width(" ", base, false, false)
     };
@@ -32756,7 +32815,7 @@ fn inline_width(
     it: &Inline,
     base: f32,
     zoom: f32,
-    m: &Measurer,
+    m: &dyn TextWidth,
     styler: run_look::RunStyler,
     field_codes: bool,
     live: Option<&page_fields::PageVals>,
@@ -32767,7 +32826,8 @@ fn inline_width(
             let sz = run_look::run_size_px(&props, base, zoom);
             m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
         }
-        // Its shown text ([`field_shown`]) and its 2 px padding each side.
+        // Its shown text ([`field_live`]: the result, or a header/footer page
+        // field's live value, #1437) and its 2 px padding each side.
         Inline::Field { raw, text } => {
             m.width(
                 &field_live(raw, text, field_codes, live),
@@ -33380,7 +33440,8 @@ fn paragraph_el(
                 }
             }
             Inline::Field { raw, text } => {
-                // Show the field's cached value with a subtle shade so it reads as a
+                // Show the field's result (a header/footer page field's live value,
+                // #1437: `field_live`) with a subtle shade so it reads as a
                 // field, not plain text. A field showing a result is ONE char in the
                 // engine (#642), edited as a unit: it takes the caret before it, a
                 // click, and the selection highlight like a tab does. An empty one
@@ -39578,20 +39639,13 @@ impl Render for Docxy {
                         // The chapter headings are numbered only when a section
                         // prefixes its page numbers with one.
                         let page_vals = {
-                            let headings = if pf.sections.iter().any(|s| s.chapter.is_some()) {
-                                let numbering = docxcore::numbering::parse_numbering_xml(
-                                    &pkg.and_then(|p| p.part("word/numbering.xml"))
-                                        .map(|b| String::from_utf8_lossy(b).into_owned())
-                                        .unwrap_or_default(),
-                                );
-                                docxcore::numbering::heading_chapters(
-                                    &editor.doc,
-                                    &numbering,
-                                    &styles,
-                                )
-                            } else {
-                                Vec::new()
-                            };
+                            let numbering_xml = pkg
+                                .and_then(|p| p.part("word/numbering.xml"))
+                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                                .unwrap_or_default();
+                            // Numbered over the document the flow was made from.
+                            let headings =
+                                page_fields::chapter_headings(&shown, &pf, &numbering_xml, &styles);
                             page_fields::page_values(&pf, &headings)
                         };
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =
@@ -40083,6 +40137,7 @@ impl Render for Docxy {
                                                 &measurer,
                                                 zoom,
                                                 tbl.sheet.as_deref(),
+                                                page_vals.get(pi),
                                             ),
                                             g.content_h(),
                                         );

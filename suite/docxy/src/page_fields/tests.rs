@@ -216,3 +216,38 @@ fn value_picks_the_field() {
     assert_eq!(v.value(PageField::NumPages), "9");
     assert_eq!(v.value(PageField::SectionPages), "4");
 }
+
+/// #1437 r1: the chapters are numbered over the document the flow was made
+/// from. A rejected insertion shifts the blocks of the Original view, so
+/// numbering the live body would put a chapter on the wrong page.
+#[test]
+fn chapters_are_numbered_over_the_document_that_was_flowed() {
+    use docxcore::markup::MarkupView;
+    let ch = sect(r#"<w:pgNumType w:chapStyle="1"/>"#);
+    let inserted = "<w:p><w:pPr><w:rPr><w:ins w:id=\"1\" w:author=\"A\"/></w:rPr></w:pPr>\
+        <w:ins w:id=\"2\" w:author=\"A\"><w:r><w:t>new</w:t></w:r></w:ins></w:p>";
+    let xml = format!(
+        "{inserted}{}{}",
+        heading("One", "Heading1", Some(&ch)),
+        heading("Two", "Heading1", None),
+    );
+    let body = body_blocks(&format!("{xml}{ch}"));
+    let live = Document { body };
+    let shown = live.markup_view(MarkupView::Original);
+    assert_ne!(shown.body.len(), live.body.len(), "the view drops a block");
+    let pf = flow(&shown.body, &ch, false);
+    let styles = parse_styles_xml(STYLES);
+    let vals = |doc: &Document| {
+        let heads = chapter_headings(doc, &pf, NUMBERING, &styles);
+        pages(&page_values(&pf, &heads))
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    // What the page view shows for chapters 1 and 2 (one section: one page
+    // per its own flow, so compare against the shown document's labels).
+    let right = vals(&shown);
+    let wrong = vals(&live);
+    assert_ne!(right, wrong, "numbering the live body lands on other pages");
+    assert!(right[0].starts_with("1-"), "{right:?}");
+}

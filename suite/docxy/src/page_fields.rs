@@ -5,7 +5,9 @@
 //! of it would.
 
 use crate::page_flow::PageFlow;
+use docxcore::model::Document;
 use docxcore::page_num::{PageField, page_chapters, page_text};
+use docxcore::styles::StyleSheet;
 
 /// What the page-dependent fields show on one page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,23 @@ impl PageVals {
             PageField::SectionPages => &self.section_pages,
         }
     }
+}
+
+/// The chapter headings `page_values` needs, numbered over `doc`: the document
+/// `pf` was flowed over (the markup view shown, whose block count can differ
+/// from the live body's). Empty, with no parse, when no section prefixes its
+/// page numbers with a chapter.
+pub(crate) fn chapter_headings(
+    doc: &Document,
+    pf: &PageFlow,
+    numbering_xml: &str,
+    styles: &StyleSheet,
+) -> Vec<(usize, u8, Option<String>)> {
+    if !pf.sections.iter().any(|s| s.chapter.is_some()) {
+        return Vec::new();
+    }
+    let numbering = docxcore::numbering::parse_numbering_xml(numbering_xml);
+    docxcore::numbering::heading_chapters(doc, &numbering, styles)
 }
 
 /// The values of every page of `pf`. `headings` are the body's headings as

@@ -369,8 +369,11 @@
   `field_live`, which changes only the drawn text and width (the cached
   result, the field's one offset and the caret are untouched). Field codes
   still show the code, body fields keep their cached text (`None`), and the
-  chapter pass (numbering part parse, `heading_chapters`) runs per frame only
-  when some section has `chapStyle`.
+  chapter pass (`page_fields::chapter_headings`: numbering part parse,
+  `heading_chapters`) runs per frame only when some section has `chapStyle`,
+  over the markup view the flow was made from (its block count can differ
+  from the live body's). An auto-width frame is measured with the live value
+  too (`frame_content_w`, through the `TextWidth` seam).
 - Different Odd & Even headers (`hf::page_slots`, `demote_filler_firsts`) and
   `FrameGeom.even` use the page's number, not its place in the document, as
   export.rs does, so `w:start="2"` makes the first page even. No harness verb
