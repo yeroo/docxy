@@ -3851,7 +3851,8 @@ impl Scheduler<'_> {
     ) -> i64 {
         let (start, finish) = leveled;
         let cpm_start = cpm.early_start.minutes();
-        let honored = |c| self.proj.honor_constraints && t.constraint == c;
+        let honored =
+            |c| self.proj.honor_constraints && t.constraint == c && t.constraint_date.is_some();
         if honored(ConstraintType::MustFinishOn) || honored(ConstraintType::MustStartOn) {
             return cpm_start;
         }
@@ -4290,7 +4291,11 @@ impl Scheduler<'_> {
             // the forward pass compares them (r11).
             let honored = self.proj.honor_constraints;
             let (driven_now_abs, base_idx) = match (link_now, t.constraint) {
-                (_, ConstraintType::MustStartOn | ConstraintType::MustFinishOn) if honored => {
+                (_, ConstraintType::MustStartOn | ConstraintType::MustFinishOn)
+                    if honored && t.constraint_date.is_some() =>
+                {
+                    // An imported Must Start/Finish On without a date holds
+                    // nothing, as in the forward pass (r17).
                     (before_delay_abs, before_delay_idx)
                 }
                 (
@@ -10548,6 +10553,53 @@ mod tests {
                 "{constraint:?}"
             );
         }
+    }
+
+    /// #1594 r17: an imported Must Start On without a date holds nothing: the
+    /// task follows its links in the leveler as in the forward pass. X and
+    /// P (one day each) share R1; T (one day, R2) follows P under a dateless
+    /// Must Start On; H (held, R2) holds Tuesday. P levels to Tuesday, T
+    /// follows to Wednesday with no delay, as committed.
+    #[test]
+    fn a_dateless_must_start_on_holds_nothing_in_the_leveler() {
+        let mut t = task(3, "T", 480);
+        t.predecessors.push(fs(2));
+        t.constraint = ConstraintType::MustStartOn;
+        let mut h = task(4, "H", 480);
+        h.constraint = ConstraintType::StartNoEarlierThan;
+        h.constraint_date = Some(at(3, 8));
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "X", 480), task(2, "P", 480), t, h],
+            resources: vec![worker(1, "R1", 1.0), worker(2, "R2", 1.0)],
+            assignments: vec![
+                assign(1, 1, 1, 1.0),
+                assign(2, 2, 1, 1.0),
+                assign(3, 3, 2, 1.0),
+                assign(4, 4, 2, 1.0),
+            ],
+            ..Project::default()
+        };
+        assert_eq!(
+            schedule(&proj).get(3).unwrap().early_start,
+            at(3, 8),
+            "T Tuesday before"
+        );
+        let three: std::collections::HashSet<i32> = [1, 2, 3].into_iter().collect();
+        let lv = level_with(
+            &proj,
+            &LevelScope {
+                movable: Some(&three),
+                ..LevelScope::default()
+            },
+        );
+        assert_eq!(lv.start(2), Some(at(3, 8)), "P Tuesday");
+        assert_eq!(lv.start(3), Some(at(4, 8)), "T Wednesday");
+        assert_eq!(lv.delay_min(3), Some(0), "T takes no delay");
+        let mut written = proj.clone();
+        written.tasks[1].leveling_delay = Some(1440 * 10);
+        written.tasks[1].leveling_delay_format = Some(8);
+        assert_eq!(schedule(&written).get(3).unwrap().early_start, at(4, 8));
     }
 
     /// #1594 r9: an honored Must Start On keeps its date whatever the links

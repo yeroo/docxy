@@ -159,6 +159,8 @@ impl Editor {
             });
             (over, sched.project_finish)
         };
+        // The culprit probes below read the finish alone (r17).
+        let finish_of = |p: &crate::model::Project| schedule(p).project_finish;
         let (mut before, finish_at_start) = pressure(&trial);
         let mut seen = vec![before.conflicts.clone()];
         // The lightest plan the rounds reach: a trade may leave a heavier
@@ -237,8 +239,8 @@ impl Editor {
                         let mut alone = trial.clone();
                         alone.tasks[i].leveling_delay = round.tasks[i].leveling_delay;
                         alone.tasks[i].leveling_delay_format = round.tasks[i].leveling_delay_format;
-                        (pressure(&restored).1 <= finish_at_start
-                            || pressure(&alone).1 > finish_at_start)
+                        (finish_of(&restored) <= finish_at_start
+                            || finish_of(&alone) > finish_at_start)
                             .then_some(round.tasks[i].uid)
                     })
                     .collect();

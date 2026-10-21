@@ -4736,6 +4736,17 @@ mod tests {
         let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
         assert_eq!(back.task(4).unwrap().predecessors, edited);
         assert_eq!(back.task(4).unwrap().leveling_delay, Some(4800));
+        // The save writes the committed dates, delay included, over the
+        // stale stored ones (#1594 r17): the writer no longer refuses a plan
+        // with a leveling delay as one it cannot reproduce.
+        assert_eq!(
+            back.task(4).unwrap().stored_start,
+            Some(DateTime::from_ymd_hm(2026, 3, 5, 16, 0))
+        );
+        assert_eq!(
+            back.task(4).unwrap().stored_finish,
+            Some(ed.schedule().get(4).unwrap().early_finish)
+        );
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
         added.push(links[1].clone());
