@@ -570,6 +570,18 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
     Ok(pkg)
 }
 
+/// Blank what the engine computes for a formula cell (its value, spill and
+/// dynamic mark), leaving the formula text and everything the file holds.
+fn without_computed(sheet: &mut Sheet) {
+    for cell in sheet.cells.values_mut().filter(|c| c.formula.is_some()) {
+        cell.value = CellValue::Empty;
+        cell.spill = None;
+        if let Some(meta) = cell.meta.as_deref_mut() {
+            meta.dynamic = false;
+        }
+    }
+}
+
 /// Is a sheet relationship type an Excel 4.0 macro sheet?
 fn is_macro_rel(ty: &str) -> bool {
     ty.ends_with("/xlMacrosheet") || ty.ends_with("/xlIntlMacrosheet")
@@ -4109,12 +4121,17 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             .is_some_and(|ty| ty.ends_with("/chartsheet") || ty.ends_with("/dialogsheet"));
         // An Excel 4.0 macro sheet nothing was done to keeps its part's bytes:
         // the worksheet writer would normalise it and drop what it does not
-        // model (#616). Only a tab-selection change still lands.
+        // model (#616). Only a tab-selection or transition-evaluation change
+        // still lands. A recalculation does not count as an edit: formula
+        // cells compare without what the engine computes.
         let untouched = pkg.macro_loaded.get(part_name).is_some_and(|loaded| {
             let mut same = loaded.clone();
             same.name.clone_from(&sheet.name);
             same.hidden = sheet.hidden;
-            same == *sheet
+            without_computed(&mut same);
+            let mut now = sheet.clone();
+            without_computed(&mut now);
+            same == now
         });
         let source_text = if untouched {
             source.clone()
@@ -4132,7 +4149,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             // Links made in-session, and retyped ones, with their relationships.
             hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns())
         };
-        let updated = if wb.calc.transition_eval_changed && !cellless && !untouched {
+        let updated = if wb.calc.transition_eval_changed && !cellless {
             set_transition_evaluation(updated, wb.calc.transition_eval)
         } else {
             updated
@@ -19273,6 +19290,43 @@ mod kind_tests {
             ISSUE_MACROSHEET.as_bytes()
         );
         assert!(out.workbook.sheets[0].cells.contains_key(&(5, 5)));
+    }
+
+    #[test]
+    fn recalculating_does_not_make_a_macro_sheet_edited() {
+        let body = ISSUE_MACROSHEET.replace("RETURN(1)", "1+1");
+        let mut pkg = issue_macro_book(&body);
+        let mut engine = crate::engine::Engine::new(&pkg.workbook);
+        engine.recalc_all(&mut pkg.workbook);
+        assert_eq!(
+            pkg.workbook.sheets[1].cells[&(0, 0)].value,
+            CellValue::Number(2.0)
+        );
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert_eq!(
+            out.part("xl/macrosheets/sheet2.xml").unwrap(),
+            body.as_bytes()
+        );
+        // A change to the formula text still counts.
+        let mut cell = pkg.workbook.sheets[1].cells[&(0, 0)].clone();
+        cell.formula = Some("2+2".into());
+        pkg.workbook.sheets[1].set_cell(0, 0, cell);
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert!(part_text(&out, "xl/macrosheets/sheet2.xml").contains("2+2"));
+    }
+
+    #[test]
+    fn the_transition_option_reaches_an_untouched_macro_sheet() {
+        let body = ISSUE_MACROSHEET.replace(
+            "<dimension",
+            "<sheetPr transitionEvaluation=\"1\"/><dimension",
+        );
+        let mut pkg = issue_macro_book(&body);
+        assert!(pkg.workbook.calc.transition_eval);
+        pkg.workbook.calc.set_transition_eval(false);
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert!(!part_text(&out, "xl/macrosheets/sheet2.xml").contains("transitionEvaluation"));
+        assert!(!out.workbook.calc.transition_eval);
     }
 
     #[test]
