@@ -651,10 +651,12 @@ impl<'o> Compare<'o> {
                 end += 1;
             }
             let mut content = Vec::new();
+            // Markers inside inserted words: (index in `content`, marker).
+            let mut marks = Vec::new();
             for step in &steps[k..end] {
                 match step {
                     Op::Equal(_, j) | Op::Insert(j) => {
-                        push_atom(&mut content, &revised[*j], kind.is_some())
+                        push_atom(&mut content, &revised[*j], kind.is_some(), &mut marks)
                     }
                     Op::Delete(i) => self.push_deleted_atom(&mut content, &original[*i]),
                 }
@@ -662,7 +664,21 @@ impl<'o> Compare<'o> {
             match kind {
                 None => out.extend(content),
                 Some(_) if content.is_empty() => {}
-                Some(kind) => out.push(self.revision(kind, content)),
+                Some(kind) => {
+                    // A marker stays outside the revision, as an anchor does:
+                    // rejecting the insertion must not drop half a pair.
+                    let mut from = 0;
+                    for (at, marker) in marks {
+                        if at > from {
+                            out.push(self.revision(kind, content[from..at].to_vec()));
+                        }
+                        out.push(marker);
+                        from = at;
+                    }
+                    if from < content.len() {
+                        out.push(self.revision(kind, content[from..].to_vec()));
+                    }
+                }
             }
             k = end;
         }
@@ -989,10 +1005,11 @@ fn atoms(paragraph: &Paragraph) -> (Vec<Atom>, Vec<Hyperlink>) {
             let (mut end, mut scan) = (k, k);
             while scan < segments.len()
                 && segments[scan].link == link
-                && matches!(
-                    segments[scan].kind,
-                    SegKind::Text(..) | SegKind::Anchor(Inline::Raw(_))
-                )
+                && match &segments[scan].kind {
+                    SegKind::Text(..) => true,
+                    SegKind::Anchor(inline) => joinable(inline),
+                    _ => false,
+                }
             {
                 scan += 1;
                 if matches!(segments[scan - 1].kind, SegKind::Text(..)) {
@@ -1021,6 +1038,14 @@ fn atoms(paragraph: &Paragraph) -> (Vec<Atom>, Vec<Hyperlink>) {
         k += 1;
     }
     (atoms, links)
+}
+
+/// Whether a word runs on across `inline`: a self-contained zero-width marker
+/// (`editor::is_marker`: bookmark, proofing, comment range, smart tag
+/// boundary). The halves of an inline content control are not, and keep
+/// ending the token.
+fn joinable(inline: &Inline) -> bool {
+    crate::editor::is_marker(inline)
 }
 
 #[derive(Clone)]
@@ -1188,8 +1213,15 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
     anchors(out, &mut pending);
 }
 
-/// Append a revised atom; `in_revision` when it goes inside a `w:ins`.
-fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool) {
+/// Append a revised atom; `in_revision` when it goes inside a `w:ins`, where
+/// the markers inside a word are not put in `content` but noted in `marks` with
+/// the index they would take, for the caller to place outside the revision.
+fn push_atom(
+    content: &mut Vec<Inline>,
+    atom: &Atom,
+    in_revision: bool,
+    marks: &mut Vec<(usize, Inline)>,
+) {
     match &atom.kind {
         AtomKind::Object(Inline::Field { raw, text }) if in_revision => {
             content.push(Inline::Field {
@@ -1198,13 +1230,13 @@ fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool) {
             })
         }
         AtomKind::Text(pieces) => {
-            let mut marks = atom.marks.iter().peekable();
+            let mut inner = atom.marks.iter().peekable();
             let mut at = 0;
             for (text, props) in pieces {
                 let mut rest = text.as_str();
                 loop {
                     let room = rest.chars().count();
-                    match marks.next_if(|(offset, _)| *offset <= at + room) {
+                    match inner.next_if(|(offset, _)| *offset <= at + room) {
                         Some((offset, inline)) => {
                             let cut = rest
                                 .char_indices()
@@ -1213,12 +1245,18 @@ fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool) {
                             if cut > 0 {
                                 push_text(content, &rest[..cut], props.clone());
                             }
-                            content.push(inline.clone());
+                            if in_revision {
+                                marks.push((content.len(), inline.clone()));
+                            } else {
+                                content.push(inline.clone());
+                            }
                             at = *offset;
                             rest = &rest[cut..];
                         }
                         None => {
-                            push_text(content, rest, props.clone());
+                            if !rest.is_empty() {
+                                push_text(content, rest, props.clone());
+                            }
                             at += room;
                             break;
                         }

@@ -913,23 +913,90 @@ fn a_marker_at_a_word_boundary_stays_where_it_was_1220() {
 }
 
 #[test]
-fn a_marker_inside_a_changed_word_is_kept_1220() {
-    let original = pkg(&p("cat"));
+fn a_marker_inside_a_changed_word_is_kept_outside_the_revision_1220() {
+    let original = pkg(&p("cat dog"));
+    // Only the start is inside the changed word; its end is after `dog`.
     let revised = marked(
         "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
-         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r>",
+         <w:r><w:t xml:space=\"preserve\">ot dog</w:t></w:r><w:bookmarkEnd w:id=\"3\"/>",
     );
     let result = compare(&original, &revised);
-    assert_eq!((result.insertions, result.deletions), (1, 1));
+    assert!(result.insertions > 0);
     for accept in [true, false] {
         let xml = document_to_xml(&resolved(&result.package.document, accept));
-        if accept {
-            assert_eq!(xml.matches("<w:bookmarkStart").count(), 1, "{xml}");
-            assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{xml}");
-        }
+        assert_eq!(
+            xml.matches("<w:bookmarkStart").count(),
+            1,
+            "{accept}: {xml}"
+        );
+        assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{accept}: {xml}");
     }
-    assert_eq!(texts(&resolved(&result.package.document, true)), ["cot"]);
-    assert_eq!(texts(&resolved(&result.package.document, false)), ["cat"]);
+    assert_eq!(
+        texts(&resolved(&result.package.document, true)),
+        ["cot dog"]
+    );
+    assert_eq!(
+        texts(&resolved(&result.package.document, false)),
+        ["cat dog"]
+    );
+    let xml = document_to_xml(&result.package.document);
+    let start = xml.find("<w:bookmarkStart").unwrap();
+    let ins_open = xml[..start].rfind("<w:ins ");
+    let ins_close = xml[..start].rfind("</w:ins>");
+    assert!(
+        ins_open.is_none() || ins_close > ins_open,
+        "outside w:ins: {xml}"
+    );
+}
+
+#[test]
+fn a_content_control_half_still_splits_a_word_1220() {
+    let original = pkg(&p("FY2023 report"));
+    let revised = marked(
+        "<w:r><w:t>FY</w:t></w:r><w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>2024</w:t></w:r>\
+         </w:sdtContent></w:sdt><w:r><w:t xml:space=\"preserve\"> report</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    let xml = document_to_xml(&result.package.document);
+    assert!(result.insertions > 0, "{xml}");
+    // Well formed and nested: reload it and write it again.
+    let again = document_to_xml(&parse_document_xml(&xml, &Relationships::default()));
+    assert_eq!(xml.matches("<w:sdt>").count(), 1, "{xml}");
+    assert_eq!(xml.matches("</w:sdt>").count(), 1, "{xml}");
+    assert_eq!(again.matches("<w:sdtContent>").count(), 1, "{again}");
+    let (sdt, end) = (xml.find("<w:sdt>").unwrap(), xml.find("</w:sdt>").unwrap());
+    let ins_inside =
+        xml[sdt..end].matches("<w:ins ").count() == xml[sdt..end].matches("</w:ins>").count();
+    assert!(ins_inside, "no w:ins crosses the control: {xml}");
+}
+
+#[test]
+fn a_smart_tag_inside_a_changed_word_nests_properly_1220() {
+    let original = pkg(&p("cat"));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:smartTag w:uri=\"u\" w:element=\"e\">\
+         <w:r><w:t>ot</w:t></w:r></w:smartTag>",
+    );
+    let result = compare(&original, &revised);
+    assert!(result.insertions > 0);
+    let xml = document_to_xml(&result.package.document);
+    assert_eq!(xml.matches("<w:smartTag ").count(), 1, "{xml}");
+    assert_eq!(xml.matches("</w:smartTag>").count(), 1, "{xml}");
+    let (open, close) = (
+        xml.find("<w:smartTag ").unwrap(),
+        xml.find("</w:smartTag>").unwrap(),
+    );
+    let span = &xml[open..close];
+    assert_eq!(
+        span.matches("<w:ins ").count(),
+        span.matches("</w:ins>").count(),
+        "{xml}"
+    );
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        assert_eq!(xml.matches("<w:smartTag ").count(), 1, "{xml}");
+        assert_eq!(xml.matches("</w:smartTag>").count(), 1, "{xml}");
+    }
 }
 
 #[test]
@@ -945,7 +1012,9 @@ fn a_marker_between_differently_formatted_runs_keeps_both_formats_1220() {
     let xml = document_to_xml(&result.package.document);
     assert!(
         xml.contains("ca</w:t></w:r><w:bookmarkStart")
-            && xml.contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">t</w:t>"),
+            && xml.contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">t</w:t>")
+            && !xml.contains("<w:t xml:space=\"preserve\"></w:t>")
+            && !xml.contains("<w:t/>"),
         "{xml}"
     );
 }

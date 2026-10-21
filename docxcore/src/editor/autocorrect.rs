@@ -119,16 +119,18 @@ fn first_run(content: &[Inline]) -> (usize, RunProps) {
 
 /// Whether editor offsets `start..end` of `content` are all text of plain,
 /// unrecorded runs, with nothing zero-width (a tracked deletion) between
-/// them. With `markers`, a plain `Inline::Raw` marker (a bookmark, a smart tag
-/// boundary, a proofing mark) may sit between them: a correction leaves it
-/// right after the replacement text, as `replace_range_in_content` inserts
-/// the new text before it and deletes the old characters only.
+/// them. With `markers`, an `is_marker` inline (a bookmark, a smart tag
+/// boundary, a proofing or comment mark) may sit between them; the halves of a
+/// content control, a `w:ptab` or an anchored drawing may not. A correction
+/// leaves the marker right after the replacement text, as
+/// `replace_range_in_content` inserts the new text before it and deletes the
+/// old characters only.
 fn plain_text(content: &[Inline], start: usize, end: usize, markers: bool) -> bool {
     let mut at = 0;
     for inline in content {
         let len = inline_len(inline);
         if len == 0 {
-            if start < at && at < end && !(markers && matches!(inline, Inline::Raw(_))) {
+            if start < at && at < end && !(markers && super::is_marker(inline)) {
                 return false;
             }
             continue;
@@ -547,5 +549,21 @@ mod tests {
         assert!(!plain_text(&content, 0, 3, false));
         // At the range's edge a marker never mattered.
         assert!(plain_text(&content, 0, 2, false));
+    }
+
+    #[test]
+    fn a_smart_tag_boundary_is_allowed_a_content_control_half_is_not_1220() {
+        let smart = Inline::Raw("<w:smartTag w:uri=\"u\" w:element=\"e\">".into());
+        let sdt = Inline::Raw("<w:sdt><w:sdtPr/><w:sdtContent>".into());
+        let a = vec![run("te"), smart, run("h")];
+        let b = vec![run("te"), sdt, run("h")];
+        assert!(
+            plain_text(&a, 0, 3, true),
+            "smart tags are the issue's case"
+        );
+        assert!(!plain_text(&b, 0, 3, true));
+        let mut ed = editor(b);
+        type_keys(&mut ed, " ");
+        assert_eq!(text(&ed), "teh ");
     }
 }
