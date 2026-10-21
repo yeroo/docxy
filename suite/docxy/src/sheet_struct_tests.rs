@@ -304,3 +304,102 @@ fn delete_col_on_whole_rows_deletes_every_column() {
     assert!(v.undo_step());
     assert_eq!(value(&v, "C3"), num(3));
 }
+
+fn notes(v: &SheetView) -> Vec<(String, String)> {
+    v.pkg
+        .comments()
+        .into_iter()
+        .map(|c| (gridcore::sheet::cell_name(c.row, c.col), c.text))
+        .collect()
+}
+
+fn note_at(name: &str, text: &str) -> (String, String) {
+    (name.to_string(), text.to_string())
+}
+
+#[test]
+fn a_note_moves_with_its_row_and_undo_brings_it_back() {
+    // The issue's repro: a note on A3, row 1 selected, Insert Row.
+    let mut v = view();
+    let (r, c) = at("A3");
+    assert!(v.pkg.set_comment(v.active, r, c, "Ann", "check"));
+    select(&mut v, "A1", "A1");
+    v.select_rows();
+    assert!(v.structural_edit(StructOp::InsertRow));
+    assert_eq!(notes(&v), vec![note_at("A4", "check")]);
+    assert!(v.undo_step());
+    assert_eq!(notes(&v), vec![note_at("A3", "check")]);
+    assert!(v.redo_step());
+    assert_eq!(notes(&v), vec![note_at("A4", "check")]);
+}
+
+#[test]
+fn deleting_a_notes_row_drops_it_and_undo_restores_it() {
+    let mut v = view();
+    for (name, text) in [("A3", "gone"), ("B5", "moves")] {
+        let (r, c) = at(name);
+        assert!(v.pkg.set_comment(v.active, r, c, "Ann", text));
+    }
+    select(&mut v, "A3", "A3");
+    v.select_rows();
+    assert!(v.structural_edit(StructOp::DeleteRow));
+    assert_eq!(notes(&v), vec![note_at("B4", "moves")]);
+    assert!(v.undo_step());
+    assert_eq!(
+        notes(&v),
+        vec![note_at("A3", "gone"), note_at("B5", "moves")]
+    );
+    assert!(v.redo_step());
+    assert_eq!(notes(&v), vec![note_at("B4", "moves")]);
+}
+
+#[test]
+fn notes_follow_column_inserts_and_deletes() {
+    let mut v = view();
+    for (name, text) in [("B1", "b"), ("D2", "d")] {
+        let (r, c) = at(name);
+        assert!(v.pkg.set_comment(v.active, r, c, "Ann", text));
+    }
+    select(&mut v, "A1", "A1");
+    assert!(v.structural_edit(StructOp::InsertCol));
+    assert_eq!(notes(&v), vec![note_at("C1", "b"), note_at("E2", "d")]);
+    select(&mut v, "C1", "C1");
+    assert!(v.structural_edit(StructOp::DeleteCol));
+    assert_eq!(notes(&v), vec![note_at("D2", "d")]);
+}
+
+#[test]
+fn a_sheet_without_notes_keeps_the_workbook_step() {
+    let mut v = numbered(3);
+    select(&mut v, "A2", "A2");
+    v.select_rows();
+    assert!(v.structural_edit(StructOp::InsertRow));
+    let step = v.undo.last().expect("a step");
+    assert!(matches!(step.snap.body, SnapshotBody::Workbook(_)));
+    // With a note on the sheet the step holds the package.
+    let (r, c) = at("A9");
+    assert!(v.pkg.set_comment(v.active, r, c, "Ann", "n"));
+    assert!(v.structural_edit(StructOp::InsertRow));
+    let step = v.undo.last().expect("a step");
+    assert!(matches!(step.snap.body, SnapshotBody::Package(_)));
+}
+
+#[test]
+fn an_insert_that_would_push_a_note_off_the_sheet_is_refused() {
+    let mut v = view();
+    let last = gridcore::sheet::MAX_ROWS - 1;
+    assert!(v.pkg.set_comment(v.active, last, 0, "Ann", "edge"));
+    select(&mut v, "A1", "A1");
+    v.select_rows();
+    let (steps, before) = (v.undo.len(), notes(&v));
+    assert!(!v.structural_edit(StructOp::InsertRow));
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(gridcore::edit::SHIFT_OFF_SHEET)
+    );
+    assert_eq!(v.undo.len(), steps);
+    assert_eq!(notes(&v), before);
+    // A delete is still fine, and takes the note along when it is the row.
+    assert!(v.structural_edit(StructOp::DeleteRow));
+    assert_eq!(notes(&v), vec![note_at(&format!("A{last}"), "edge")]);
+}
