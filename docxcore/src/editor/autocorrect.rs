@@ -43,7 +43,7 @@ impl Editor {
         let text: Vec<char> = editor_text(&p.content).chars().collect();
         let caret = self.caret.offset;
         if let Some(kind) = auto_list(&text, caret, ch, p.props.num_id.is_some(), opts) {
-            if !plain_text(&p.content, 0, text.len()) {
+            if !plain_text(&p.content, 0, text.len(), false) {
                 return 0;
             }
             let Some(num_id) = list(kind) else {
@@ -88,7 +88,7 @@ impl Editor {
     /// false, with nothing changed, when its text is not plain run text.
     fn apply_fix(&mut self, path: &[usize], fix: &Fix) -> bool {
         let ok = resolve_para(&self.doc.body, path)
-            .is_some_and(|p| plain_text(&p.content, fix.start, fix.end));
+            .is_some_and(|p| plain_text(&p.content, fix.start, fix.end, true));
         if !ok {
             return false;
         }
@@ -118,14 +118,17 @@ fn first_run(content: &[Inline]) -> (usize, RunProps) {
 }
 
 /// Whether editor offsets `start..end` of `content` are all text of plain,
-/// unrecorded runs, with nothing zero-width (a tracked deletion, a bookmark)
-/// between them.
-fn plain_text(content: &[Inline], start: usize, end: usize) -> bool {
+/// unrecorded runs, with nothing zero-width (a tracked deletion) between
+/// them. With `markers`, a plain `Inline::Raw` marker (a bookmark, a smart tag
+/// boundary, a proofing mark) may sit between them: a correction leaves it
+/// right after the replacement text, as `replace_range_in_content` inserts
+/// the new text before it and deletes the old characters only.
+fn plain_text(content: &[Inline], start: usize, end: usize, markers: bool) -> bool {
     let mut at = 0;
     for inline in content {
         let len = inline_len(inline);
         if len == 0 {
-            if start < at && at < end {
+            if start < at && at < end && !(markers && matches!(inline, Inline::Raw(_))) {
                 return false;
             }
             continue;
@@ -497,5 +500,52 @@ mod tests {
         let mut ed = editor(vec![run("so "), link]);
         type_keys(&mut ed, " ");
         assert_eq!(text(&ed), "so teh ");
+    }
+
+    fn marker() -> Inline {
+        Inline::Raw("<w:bookmarkStart w:id=\"3\" w:name=\"b\"/>".into())
+    }
+
+    fn markers(ed: &Editor) -> usize {
+        para(ed)
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Raw(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_word_across_a_bookmark_is_corrected_1220() {
+        let mut ed = editor(vec![run("te"), marker(), run("h")]);
+        type_keys(&mut ed, " ");
+        assert_eq!(text(&ed), "The ");
+        assert_eq!(markers(&ed), 1);
+        // The marker comes right after the corrected word.
+        let content = &para(&ed).content;
+        let at = content.iter().position(|i| matches!(i, Inline::Raw(_)));
+        let before: usize = content[..at.unwrap()].iter().map(inline_len).sum();
+        assert_eq!(before, 3);
+        // Two corrections at the start (the word, then its capital), then
+        // the typing: undone one step each.
+        assert_eq!(undos(&mut ed), ["the ", "teh ", "teh"]);
+        assert_eq!(markers(&ed), 1);
+    }
+
+    #[test]
+    fn a_list_trigger_across_a_marker_is_left_alone_1220() {
+        let mut ed = editor(vec![run("1"), marker(), run(".")]);
+        type_keys(&mut ed, " ");
+        assert_eq!(text(&ed), "1. ");
+        assert_eq!(para(&ed).props.num_id, None);
+        assert_eq!(markers(&ed), 1);
+    }
+
+    #[test]
+    fn a_marker_is_allowed_inside_a_range_only_when_asked_1220() {
+        let content = vec![run("te"), marker(), run("h")];
+        assert!(plain_text(&content, 0, 3, true));
+        assert!(!plain_text(&content, 0, 3, false));
+        // At the range's edge a marker never mattered.
+        assert!(plain_text(&content, 0, 2, false));
     }
 }

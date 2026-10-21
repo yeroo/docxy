@@ -949,6 +949,10 @@ struct Atom {
     kind: AtomKind,
     /// Index of the enclosing hyperlink in the paragraph's link table.
     link: Option<usize>,
+    /// Zero-width markers inside a text token, as (char offset in `key`,
+    /// marker): a bookmark in the middle of a word does not split it, and the
+    /// revised side keeps it at that offset. Never at 0 or `key`'s end.
+    marks: Vec<(usize, Inline)>,
 }
 
 enum AtomKind {
@@ -980,12 +984,20 @@ fn atoms(paragraph: &Paragraph) -> (Vec<Atom>, Vec<Hyperlink>) {
     while k < segments.len() {
         let link = segments[k].link;
         if matches!(segments[k].kind, SegKind::Text(..)) {
-            let mut end = k;
-            while end < segments.len()
-                && segments[end].link == link
-                && matches!(segments[end].kind, SegKind::Text(..))
+            // Text, and the plain zero-width markers between its runs, up to
+            // the last text of the stretch: a word spans such markers.
+            let (mut end, mut scan) = (k, k);
+            while scan < segments.len()
+                && segments[scan].link == link
+                && matches!(
+                    segments[scan].kind,
+                    SegKind::Text(..) | SegKind::Anchor(Inline::Raw(_))
+                )
             {
-                end += 1;
+                scan += 1;
+                if matches!(segments[scan - 1].kind, SegKind::Text(..)) {
+                    end = scan;
+                }
             }
             tokenize(&segments[k..end], link, &mut atoms);
             k = end;
@@ -1000,7 +1012,12 @@ fn atoms(paragraph: &Paragraph) -> (Vec<Atom>, Vec<Hyperlink>) {
             SegKind::NoteRef(key, inline) => (key, AtomKind::NoteRef(inline)),
             SegKind::Anchor(inline) => (String::new(), AtomKind::Anchor(inline)),
         };
-        atoms.push(Atom { key, kind, link });
+        atoms.push(Atom {
+            key,
+            kind,
+            link,
+            marks: Vec::new(),
+        });
         k += 1;
     }
     (atoms, links)
@@ -1099,16 +1116,37 @@ fn char_class(c: char) -> CharClass {
 }
 
 /// Split consecutive text segments into tokens; a token may span runs, and
-/// keeps one piece per run it touches.
+/// keeps one piece per run it touches. Plain zero-width markers between the
+/// segments sit inside the token they fall in, or beside it as anchors when
+/// they fall on a token edge.
 fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
     let mut key = String::new();
+    let mut len = 0;
     let mut pieces: Vec<(String, RunProps)> = Vec::new();
+    let mut marks: Vec<(usize, Inline)> = Vec::new();
+    // Markers seen since the last character.
+    let mut pending: Vec<Inline> = Vec::new();
     // The segment the last piece came from.
     let mut piece_segment = None;
     let mut class = None;
+    let anchors = |out: &mut Vec<Atom>, pending: &mut Vec<Inline>| {
+        for inline in pending.drain(..) {
+            out.push(Atom {
+                key: String::new(),
+                kind: AtomKind::Anchor(inline),
+                link,
+                marks: Vec::new(),
+            });
+        }
+    };
     for (index, segment) in segments.iter().enumerate() {
-        let SegKind::Text(text, props) = &segment.kind else {
-            continue;
+        let (text, props) = match &segment.kind {
+            SegKind::Text(text, props) => (text, props),
+            SegKind::Anchor(inline) => {
+                pending.push(inline.clone());
+                continue;
+            }
+            _ => continue,
         };
         for c in text.chars() {
             let this = char_class(c);
@@ -1117,11 +1155,19 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
                     key: std::mem::take(&mut key),
                     kind: AtomKind::Text(std::mem::take(&mut pieces)),
                     link,
+                    marks: std::mem::take(&mut marks),
                 });
+                len = 0;
                 piece_segment = None;
+            }
+            if key.is_empty() {
+                anchors(out, &mut pending);
+            } else {
+                marks.extend(pending.drain(..).map(|inline| (len, inline)));
             }
             class = Some(this);
             key.push(c);
+            len += 1;
             match pieces.last_mut() {
                 Some((piece, _)) if piece_segment == Some(index) => piece.push(c),
                 _ => {
@@ -1136,8 +1182,10 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
             key,
             kind: AtomKind::Text(pieces),
             link,
+            marks,
         });
     }
+    anchors(out, &mut pending);
 }
 
 /// Append a revised atom; `in_revision` when it goes inside a `w:ins`.
@@ -1150,8 +1198,32 @@ fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool) {
             })
         }
         AtomKind::Text(pieces) => {
+            let mut marks = atom.marks.iter().peekable();
+            let mut at = 0;
             for (text, props) in pieces {
-                push_text(content, text, props.clone());
+                let mut rest = text.as_str();
+                loop {
+                    let room = rest.chars().count();
+                    match marks.next_if(|(offset, _)| *offset <= at + room) {
+                        Some((offset, inline)) => {
+                            let cut = rest
+                                .char_indices()
+                                .nth(offset - at)
+                                .map_or(rest.len(), |(b, _)| b);
+                            if cut > 0 {
+                                push_text(content, &rest[..cut], props.clone());
+                            }
+                            content.push(inline.clone());
+                            at = *offset;
+                            rest = &rest[cut..];
+                        }
+                        None => {
+                            push_text(content, rest, props.clone());
+                            at += room;
+                            break;
+                        }
+                    }
+                }
             }
         }
         AtomKind::Tab(props) => content.push(Inline::Tab(props.clone())),
@@ -1660,5 +1732,29 @@ mod tests {
         };
         assert_eq!(pieces.len(), 2, "'ca' plain + 't' bold");
         assert!(!pieces[0].1.bold && pieces[1].1.bold);
+    }
+
+    #[test]
+    fn paragraph_key_ignores_inner_markers_1220() {
+        let run = |t: &str| {
+            Inline::Run(Run {
+                text: t.into(),
+                props: RunProps::default(),
+            })
+        };
+        let para = |content| Paragraph {
+            props: ParProps::default(),
+            content,
+        };
+        let marker = Inline::Raw("<w:bookmarkStart w:id=\"1\" w:name=\"b\"/>".into());
+        let split = para(vec![run("ca"), marker.clone(), run("t")]);
+        assert_eq!(
+            paragraph_key(&split),
+            paragraph_key(&para(vec![run("cat")]))
+        );
+        let (atoms, _) = atoms(&split);
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0].marks.len(), 1);
+        assert_eq!(atoms[0].marks[0].0, 2);
     }
 }

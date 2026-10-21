@@ -870,3 +870,93 @@ fn a_dropped_tables_index_counts_paired_paragraphs() {
         "M, the table cell, Q"
     );
 }
+
+fn marked(runs: &str) -> Package {
+    pkg(&format!("<w:p>{runs}</w:p>"))
+}
+
+#[test]
+fn a_word_split_by_a_marker_is_unchanged_1220() {
+    let original = pkg(&p("cat dog"));
+    for marker in [
+        "<w:bookmarkStart w:id=\"3\" w:name=\"b\"/>",
+        "<w:proofErr w:type=\"spellStart\"/>",
+    ] {
+        let revised = marked(&format!(
+            "<w:r><w:t>ca</w:t></w:r>{marker}<w:r><w:t xml:space=\"preserve\">t dog</w:t></w:r>"
+        ));
+        let result = compare(&original, &revised);
+        assert_eq!((result.insertions, result.deletions), (0, 0), "{marker}");
+        let xml = document_to_xml(&result.package.document);
+        let at = xml
+            .find(marker)
+            .unwrap_or_else(|| panic!("{marker}: {xml}"));
+        assert_eq!(xml.matches(marker).count(), 1, "{xml}");
+        assert!(
+            xml[..at].ends_with("ca</w:t></w:r>"),
+            "marker stays between 'ca' and 't': {xml}"
+        );
+    }
+}
+
+#[test]
+fn a_marker_at_a_word_boundary_stays_where_it_was_1220() {
+    let original = pkg(&p("cat dog"));
+    let revised = marked(
+        "<w:r><w:t>cat</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t xml:space=\"preserve\"> dog</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    assert_eq!((result.insertions, result.deletions), (0, 0));
+    let xml = document_to_xml(&result.package.document);
+    assert!(xml.contains("cat</w:t></w:r><w:bookmarkStart"), "{xml}");
+}
+
+#[test]
+fn a_marker_inside_a_changed_word_is_kept_1220() {
+    let original = pkg(&p("cat"));
+    let revised = marked(
+        "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    assert_eq!((result.insertions, result.deletions), (1, 1));
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        if accept {
+            assert_eq!(xml.matches("<w:bookmarkStart").count(), 1, "{xml}");
+            assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{xml}");
+        }
+    }
+    assert_eq!(texts(&resolved(&result.package.document, true)), ["cot"]);
+    assert_eq!(texts(&resolved(&result.package.document, false)), ["cat"]);
+}
+
+#[test]
+fn a_marker_between_differently_formatted_runs_keeps_both_formats_1220() {
+    let original =
+        pkg("<w:p><w:r><w:t>ca</w:t></w:r><w:r><w:rPr><w:b/></w:rPr><w:t>t</w:t></w:r></w:p>");
+    let revised = marked(
+        "<w:r><w:t>ca</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:rPr><w:b/></w:rPr><w:t>t</w:t></w:r>",
+    );
+    let result = compare(&original, &revised);
+    assert_eq!((result.insertions, result.deletions), (0, 0));
+    let xml = document_to_xml(&result.package.document);
+    assert!(
+        xml.contains("ca</w:t></w:r><w:bookmarkStart")
+            && xml.contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">t</w:t>"),
+        "{xml}"
+    );
+}
+
+#[test]
+fn a_word_does_not_join_across_a_hyperlink_edge_1220() {
+    let original = pkg(&p("cat"));
+    let revised = marked(
+        "<w:r><w:t>ca</w:t></w:r><w:hyperlink w:anchor=\"x\"><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>t</w:t></w:r></w:hyperlink>",
+    );
+    let result = compare(&original, &revised);
+    assert!(result.insertions + result.deletions > 0);
+}
