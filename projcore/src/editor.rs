@@ -2989,13 +2989,13 @@ mod tests {
         let xml = crate::mspdi::write_mspdi(ed.project());
         assert_eq!(
             crate::mspdi::read_mspdi(&xml).unwrap().tasks,
-            ed.project().tasks
+            crate::mspdi::with_scheduled_dates(ed.project()).tasks
         );
         assert_eq!(
             crate::yppx::read_yppx(&crate::yppx::write_yppx(ed.project()).unwrap())
                 .unwrap()
                 .tasks,
-            ed.project().tasks
+            crate::mspdi::with_scheduled_dates(ed.project()).tasks
         );
     }
 
@@ -4604,7 +4604,7 @@ mod tests {
         assert!(!xml.contains("<IsNull>1</IsNull>"), "{xml}");
         assert_eq!(
             &crate::mspdi::read_mspdi(&xml).unwrap().tasks,
-            &ed.project().tasks
+            &crate::mspdi::with_scheduled_dates(ed.project()).tasks
         );
         // One undo step restores the blank row.
         assert_eq!(ed.undo_depth(), 1);

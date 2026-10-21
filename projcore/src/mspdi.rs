@@ -1523,7 +1523,7 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 ///
 /// An auto-scheduled task's stored `Start`/`Finish` are written as the dates
 /// docxy schedules it to (its `EarlyStart`/`EarlyFinish`), not the ones it was
-/// read with (one it was read without stays absent), so a scheduled project
+/// read with (or none, for one never stamped), so a scheduled project
 /// exports with dates Project can display without recalculating. The stored
 /// dates are kept, written when present, for manual tasks, blank rows,
 /// external placeholders, tasks the schedule skips and auto summaries with
@@ -1746,7 +1746,8 @@ struct Computed<'a> {
     outline_number: Option<&'a str>,
     result: Option<&'a TaskResult>,
     /// The `Start`/`Finish` the schedule places the task at, written in place
-    /// of its stored dates; `None` keeps the stored ones.
+    /// of its stored dates, or when it has none; `None` keeps the stored ones
+    /// (an absent one stays absent).
     dates: Option<(DateTime, DateTime)>,
 }
 
@@ -1941,12 +1942,10 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     opt_text(s, "Priority", t.priority);
-    // A scheduled date replaces a stored one; an absent one stays absent.
+    // A scheduled date replaces a stored one, and is written when none was
+    // stored (#701), as Project always writes both.
     let (start, finish) = match computed.dates {
-        Some((start, finish)) => (
-            t.stored_start.and(Some(start)),
-            t.stored_finish.and(Some(finish)),
-        ),
+        Some((start, finish)) => (Some(start), Some(finish)),
         None => (t.stored_start, t.stored_finish),
     };
     opt_date(s, "Start", start);
@@ -2718,6 +2717,22 @@ fn fmt_f(x: f64) -> String {
     }
 }
 
+/// `proj` as a save and reload leaves it: each auto task a save writes
+/// scheduled dates for carries them as its stored `Start`/`Finish` (#701),
+/// what the tests that compare a re-read plan with the original expect.
+#[cfg(test)]
+pub(crate) fn with_scheduled_dates(proj: &Project) -> Project {
+    let mut out = proj.clone();
+    let dates = scheduled_dates(proj, &crate::schedule::schedule(proj));
+    for (t, d) in out.tasks.iter_mut().zip(dates) {
+        if let Some((start, finish)) = d {
+            t.stored_start = Some(start);
+            t.stored_finish = Some(finish);
+        }
+    }
+    out
+}
+
 /// Issue #385's plan: two tasks entered in weeks (`DurationFormat` 9), one in
 /// hours (5), the rest in days (7), on the default Standard calendar.
 #[cfg(test)]
@@ -2796,10 +2811,13 @@ mod tests {
             assert!(block.contains("        <TimephasedData>\n"));
             assert!(block.find("<TimephasedData>").unwrap() < block.find("<Number>").unwrap());
         }
-        assert_eq!(read_mspdi(&written).unwrap(), project);
+        assert_eq!(
+            read_mspdi(&written).unwrap(),
+            with_scheduled_dates(&project)
+        );
         assert_eq!(
             crate::yppx::read_yppx(&crate::yppx::write_yppx(&project).unwrap()).unwrap(),
-            project
+            with_scheduled_dates(&project)
         );
     }
 
@@ -2819,7 +2837,10 @@ mod tests {
             a.assignments[0].baseline(1).unwrap().timephased_data[0].kind,
             4
         );
-        assert_eq!(read_mspdi(&write_mspdi(&a)).unwrap(), a);
+        assert_eq!(
+            read_mspdi(&write_mspdi(&a)).unwrap(),
+            with_scheduled_dates(&a)
+        );
 
         let later = "<TimephasedData><Type>5</Type><Value>2.5</Value></TimephasedData>";
         let duplicate = assignment_project(&format!(
@@ -2854,7 +2875,10 @@ mod tests {
         );
         assert_eq!(project.tasks[4].predecessors[0].uid, 0);
         assert_eq!(project.assignments[0].task_uid, 40);
-        assert_eq!(read_mspdi(&write_mspdi(&project)).unwrap(), project);
+        assert_eq!(
+            read_mspdi(&write_mspdi(&project)).unwrap(),
+            with_scheduled_dates(&project)
+        );
         let package = opccore::zipwrite::write_zip(&[(
             crate::yppx::MAIN_PART.into(),
             xml.as_bytes().to_vec(),
@@ -2995,9 +3019,12 @@ mod tests {
         assert!(xml.contains("<Manual>1</Manual>"));
         assert!(xml.contains("<ManualStart>2026-03-02T08:00:00</ManualStart>"));
         assert!(xml.contains("<ManualDuration>PT8H0M0S</ManualDuration>"));
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
         assert!(package.new_tasks_are_manual);
     }
 
@@ -3926,7 +3953,7 @@ mod tests {
         assert_eq!(back.name, orig.name);
         assert_eq!(back.hours_per_day, orig.hours_per_day);
         assert_eq!(back.tasks.len(), orig.tasks.len());
-        for (a, b) in orig.tasks.iter().zip(&back.tasks) {
+        for (a, b) in with_scheduled_dates(&orig).tasks.iter().zip(&back.tasks) {
             assert_eq!(a.uid, b.uid);
             assert_eq!(a.name, b.name); // '&' survives escape round-trip
             assert_eq!(a.duration_min, b.duration_min);
@@ -4452,7 +4479,7 @@ mod tests {
         assert!(xml.contains("<OutlineNumber>1</OutlineNumber>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
     }
 
     #[test]
@@ -4469,7 +4496,10 @@ mod tests {
         for name in ["Hyperlink", "HyperlinkAddress", "HyperlinkSubAddress"] {
             assert!(xml.contains(&format!("<{name}></{name}>")));
         }
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
     }
 
     #[test]
@@ -4503,7 +4533,10 @@ mod tests {
         for name in names {
             assert!(xml.contains(&format!("<{name}></{name}>")), "{name}: {xml}");
         }
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
     }
 
     #[test]
@@ -4515,9 +4548,12 @@ mod tests {
         assert_eq!(proj.tasks[0].notes.as_deref(), Some(expected));
         let xml = write_mspdi(&proj);
         assert!(xml.contains("<Notes>Line 1\nLine 2 &amp; &lt;x&gt;</Notes>"));
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
     }
 
     /// Issue #185: entity references inside a CDATA section are literal
@@ -4734,7 +4770,10 @@ mod tests {
             assert_eq!(proj.tasks[0].task_type.map(TaskType::code), Some(code));
             let xml = write_mspdi(&proj);
             assert!(xml.contains(&format!("<Type>{code}</Type>")));
-            assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+            assert_eq!(
+                read_mspdi(&xml).unwrap().tasks,
+                with_scheduled_dates(&proj).tasks
+            );
         }
         for (text, value) in [("1", true), ("true", true), ("0", false), ("false", false)] {
             let proj = task_project(&format!(
@@ -4742,7 +4781,10 @@ mod tests {
             ));
             assert_eq!(proj.tasks[0].active, Some(value));
             assert_eq!(proj.tasks[0].estimated, Some(value));
-            assert_eq!(read_mspdi(&write_mspdi(&proj)).unwrap().tasks, proj.tasks);
+            assert_eq!(
+                read_mspdi(&write_mspdi(&proj)).unwrap().tasks,
+                with_scheduled_dates(&proj).tasks
+            );
         }
     }
 
@@ -4890,6 +4932,153 @@ mod tests {
             one_task_xml(&xml, 2).contains("<Start>2026-03-11T08:00:00</Start>"),
             "{xml}"
         );
+    }
+
+    /// `02-link-fs.xml` with its tasks' Start/Finish removed: A, then B
+    /// finish-to-start after it, neither ever stamped with a date.
+    fn unstamped_link_fs() -> String {
+        include_str!("../../corpus/mspdi/02-link-fs.xml")
+            .replacen(
+                "<Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish>",
+                "",
+                1,
+            )
+            .replacen(
+                "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+                "",
+                1,
+            )
+    }
+
+    /// Issue #701: an auto task read or created without Start/Finish saves
+    /// the dates it is scheduled to, as Project always writes both, and the
+    /// saved plan reloads to the same schedule.
+    #[test]
+    fn an_unstamped_auto_task_saves_its_scheduled_dates() {
+        for source in [
+            unstamped_link_fs(),
+            unstamped_link_fs().replacen("<StartDate>2026-03-02T08:00:00</StartDate>", "", 1),
+        ] {
+            let proj = read_mspdi(&source).unwrap();
+            assert!(proj.tasks.iter().all(|t| t.stored_start.is_none()));
+            assert!(proj.tasks.iter().all(|t| t.stored_finish.is_none()));
+            let sched = crate::schedule::schedule(&proj);
+            let xml = write_mspdi(&proj);
+            for uid in [1, 2] {
+                let t = one_task_xml(&xml, uid);
+                let early = sched.get(uid).unwrap();
+                let (start, finish) = (early.early_start.to_mspdi(), early.early_finish.to_mspdi());
+                assert!(t.contains(&format!("<Start>{start}</Start>")), "{t}");
+                assert!(t.contains(&format!("<Finish>{finish}</Finish>")), "{t}");
+            }
+            if source.contains("<StartDate>") {
+                let (a, b) = (sched.get(1).unwrap(), sched.get(2).unwrap());
+                assert_eq!(a.early_start.to_mspdi(), "2026-03-02T08:00:00");
+                assert_eq!(a.early_finish.to_mspdi(), "2026-03-03T17:00:00");
+                assert_eq!(b.early_start.to_mspdi(), "2026-03-04T08:00:00");
+                assert_eq!(b.early_finish.to_mspdi(), "2026-03-05T17:00:00");
+            }
+            let back = read_mspdi(&xml).unwrap();
+            for t in &back.tasks {
+                let r = sched.get(t.uid).unwrap();
+                assert_eq!(t.stored_start, Some(r.early_start), "task {}", t.uid);
+                assert_eq!(t.stored_finish, Some(r.early_finish), "task {}", t.uid);
+            }
+            // Reload stability: the stamped plan schedules as the unstamped
+            // one did, and a second save writes the same file.
+            let again = crate::schedule::schedule(&back);
+            for t in &proj.tasks {
+                let (a, b) = (sched.get(t.uid).unwrap(), again.get(t.uid).unwrap());
+                assert_eq!(
+                    (a.early_start, a.early_finish),
+                    (b.early_start, b.early_finish)
+                );
+            }
+            assert_eq!(write_mspdi(&back), xml);
+        }
+    }
+
+    /// An unstamped auto summary with scheduled children gets its rolled-up
+    /// dates; an inactive task and a milestone write a date exactly where the
+    /// schedule has one.
+    #[test]
+    fn an_unstamped_summary_milestone_and_inactive_task_follow_the_schedule() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><OutlineLevel>1</OutlineLevel><Summary>1</Summary></Task>\
+             <Task><UID>2</UID><ID>2</ID><OutlineLevel>2</OutlineLevel><Duration>PT16H0M0S</Duration></Task>\
+             <Task><UID>3</UID><ID>3</ID><OutlineLevel>2</OutlineLevel><Milestone>1</Milestone></Task>\
+             <Task><UID>4</UID><ID>4</ID><OutlineLevel>1</OutlineLevel><Active>0</Active><Duration>PT8H0M0S</Duration></Task>",
+        );
+        let sched = crate::schedule::schedule(&proj);
+        let summary = sched.get(1).unwrap();
+        assert!(sched.rolled_up(1).is_some());
+        let xml = write_mspdi(&proj);
+        let s = one_task_xml(&xml, 1);
+        assert!(
+            s.contains(&format!(
+                "<Start>{}</Start>",
+                summary.early_start.to_mspdi()
+            )),
+            "{s}"
+        );
+        assert!(
+            s.contains(&format!(
+                "<Finish>{}</Finish>",
+                summary.early_finish.to_mspdi()
+            )),
+            "{s}"
+        );
+        for uid in 2..=4 {
+            let t = one_task_xml(&xml, uid);
+            match sched.get(uid) {
+                Some(r) => {
+                    assert!(
+                        t.contains(&format!("<Start>{}</Start>", r.early_start.to_mspdi())),
+                        "{t}"
+                    );
+                    assert!(
+                        t.contains(&format!("<Finish>{}</Finish>", r.early_finish.to_mspdi())),
+                        "{t}"
+                    );
+                }
+                None => assert!(!t.contains("<Start>") && !t.contains("<Finish>"), "{t}"),
+            }
+        }
+        let milestone = one_task_xml(&xml, 3);
+        if let Some(r) = sched.get(3) {
+            assert_eq!(r.early_start, r.early_finish);
+        }
+        assert!(
+            milestone.contains("<Milestone>1</Milestone>"),
+            "{milestone}"
+        );
+    }
+
+    /// Where the schedule is not trusted, or the task is not placed by it, an
+    /// absent date stays absent: a plan scheduled from its finish, a TBD
+    /// manual task and a blank row.
+    #[test]
+    fn unstamped_tasks_the_schedule_does_not_place_stay_absent() {
+        let source = unstamped_link_fs().replacen(
+            "<Name>link-fs</Name>",
+            "<Name>link-fs</Name><ScheduleFromStart>0</ScheduleFromStart>",
+            1,
+        );
+        let proj = read_mspdi(&source).unwrap();
+        let xml = write_mspdi(&proj);
+        assert!(
+            !xml.contains("<Start>") && !xml.contains("<Finish>"),
+            "{xml}"
+        );
+
+        let mut proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Duration>PT8H0M0S</Duration></Task>\
+             <Task><UID>2</UID><ID>2</ID><IsNull>1</IsNull></Task>",
+        );
+        proj.tasks[0].manual = true;
+        let xml = write_mspdi(&proj);
+        assert!(!one_task_xml(&xml, 1).contains("<Start>"), "{xml}");
+        assert!(!one_task_xml(&xml, 2).contains("<Start>"), "{xml}");
     }
 
     /// A resource calendar with Mondays off, unlike Standard.
@@ -5138,7 +5327,10 @@ mod tests {
             );
         }
         assert!(xml.contains("<IsNull>0</IsNull>"));
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
     }
 
     #[test]
@@ -5556,9 +5748,12 @@ mod tests {
             [2, 99]
         );
         let saved = write_mspdi(&proj);
-        assert_eq!(read_mspdi(&saved).unwrap().tasks[0], *task);
+        assert_eq!(
+            read_mspdi(&saved).unwrap().tasks[0],
+            with_scheduled_dates(&proj).tasks[0]
+        );
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks[0], *task);
+        assert_eq!(package.tasks[0], with_scheduled_dates(&proj).tasks[0]);
 
         let absent = task_project(
             "<Task><UID>1</UID><ID>1</ID><Name>Invalid</Name>\
@@ -5804,9 +5999,12 @@ mod tests {
             written(&xml, 4, "EarlyStart").as_deref(),
             Some("2026-03-04T08:00:00")
         );
-        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks,
+            with_scheduled_dates(&proj).tasks
+        );
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
     }
 
     /// The `<Project>` header of a written file: each child up to the first
@@ -6831,10 +7029,10 @@ mod tests {
         assert!(slot_three.contains("<BCWS>5</BCWS>"));
         assert!(!slot_three.contains("<BCWP>"));
         let back = read_mspdi(&xml).unwrap();
-        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.tasks, with_scheduled_dates(&proj).tasks);
         assert_eq!(back.assignments, proj.assignments);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
-        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
         assert_eq!(package.assignments, proj.assignments);
     }
 
@@ -6902,7 +7100,7 @@ mod tests {
             );
         }
         let back = read_mspdi(&xml).unwrap();
-        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.tasks, with_scheduled_dates(&proj).tasks);
         assert_eq!(back.assignments, proj.assignments);
     }
 

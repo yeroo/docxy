@@ -238,7 +238,7 @@ fn set_notes_survive_mspdi_save() {
     assert!(xml.contains("<Notes>Line 1\nLine 2 &amp; &lt;x&gt;</Notes>"));
     assert_eq!(
         crate::mspdi::read_mspdi(&xml).unwrap().tasks,
-        ed.project().tasks
+        crate::mspdi::with_scheduled_dates(ed.project()).tasks
     );
     // Clearing the notes drops the element again.
     ed.set_notes(10, "").unwrap();
