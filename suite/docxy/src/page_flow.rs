@@ -89,21 +89,25 @@ impl PageFlow {
         self.pages.iter().map(|p| p.filler).collect()
     }
 
-    /// The section and drag geometry of page `tracked`: the sheet size from
-    /// the page's owning section, the margins raw from `margins_sect` (the
-    /// final section's sectPr — the ruler's margin handles edit it), so a
-    /// gutter is not double-counted and a negative margin is not absolutized
-    /// by a drag.
+    /// The section and drag geometry of page `tracked`, band `band` (the one
+    /// holding the caret; out of range takes the first): the section is the
+    /// band's, which decides whether the margin handles may edit it; the
+    /// sheet size always comes from the page's owning section (the first
+    /// band's), the margins raw from `margins_sect` (the final section's
+    /// sectPr — the ruler's margin handles edit it), so a gutter is not
+    /// double-counted and a negative margin is not absolutized by a drag.
     pub(crate) fn drag_geom(
         &self,
         tracked: Option<usize>,
+        band: usize,
         margins_sect: &str,
     ) -> Option<(usize, docxcore::model::PageGeom)> {
-        let section = self.pages.get(tracked?)?.bands.first()?.section;
-        let sb = self.sections.get(section)?;
+        let bands = &self.pages.get(tracked?)?.bands;
+        let owner = self.sections.get(bands.first()?.section)?;
+        let section = bands.get(band).unwrap_or(&bands[0]).section;
         let mut geom = docxcore::model::PageGeom::from_sect_pr(margins_sect);
-        geom.w = sb.w;
-        geom.h = sb.h;
+        geom.w = owner.w;
+        geom.h = owner.h;
         Some((section, geom))
     }
 }

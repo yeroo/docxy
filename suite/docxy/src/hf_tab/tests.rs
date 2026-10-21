@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::hf::tests::{
-    caret_in, ed, ed_mut, edited_text, part_text, saved, saved_hf, saved_sections, three_sections,
-    three_sections_docx, tmp_dir,
+    body_blocks, caret_in, ed, ed_mut, edited_text, para, part_text, saved, saved_hf,
+    saved_sections, sect, three_sections, three_sections_docx, tmp_dir,
 };
 use core::prelude::v1::test;
 use docxcore::model::TabAlign;
@@ -14,7 +14,7 @@ use docxcore::model::TabAlign;
 /// as Insert › Header › Edit Header does.
 fn edit_at(t: &mut DocTab, block: usize, is_header: bool) {
     caret_in(t, block);
-    hf_apply(t, HfAct::Edit(is_header)).unwrap();
+    hf_apply(t, MarkupView::All, HfAct::Edit(is_header)).unwrap();
     assert!(t.hf_edit.is_some(), "{}", t.status);
 }
 
@@ -143,7 +143,7 @@ fn link_to_previous_unlinks_with_a_copy_and_relinks_by_dropping_the_reference() 
     edit_at(&mut t, 1, true);
     let inherited = t.hf_edit.as_ref().unwrap().part_name.clone();
     assert!(hf_checked(&t, HfAct::LinkToPrevious));
-    hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::LinkToPrevious).unwrap();
     assert!(!linked(&t), "the label goes");
     assert!(!hf_checked(&t, HfAct::LinkToPrevious));
     assert_eq!(edited_text(&t), "Header A", "the text is unchanged");
@@ -158,7 +158,7 @@ fn link_to_previous_unlinks_with_a_copy_and_relinks_by_dropping_the_reference() 
     assert_eq!(saved_hf(&pkg, 1, true), "2Header A");
     assert_eq!(saved_hf(&pkg, 2, true), "Header C");
     // Relink: no reference again, and the section shows section 1's header.
-    hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::LinkToPrevious).unwrap();
     assert!(linked(&t));
     assert_eq!(edited_text(&t), "Header A");
     let pkg = saved(&mut t);
@@ -185,13 +185,13 @@ fn link_to_previous_unlinks_with_a_copy_and_relinks_by_dropping_the_reference() 
 fn link_to_previous_is_refused_in_the_first_section_and_links_per_variant() {
     let mut t = three_sections("link-variants", true);
     edit_at(&mut t, 0, true);
-    assert!(hf_apply(&mut t, HfAct::LinkToPrevious).is_err());
+    assert!(hf_apply(&mut t, MarkupView::All, HfAct::LinkToPrevious).is_err());
     exit_hf_tab(&mut t);
     // Section 2's first-page header unlinks on its own: the default one stays linked.
     caret_in(&mut t, 1);
-    hf_apply(&mut t, HfAct::DifferentFirst).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentFirst).unwrap();
     assert!(crate::hf::open(&mut t, 1, true, HeaderVariant::First));
-    hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::LinkToPrevious).unwrap();
     let sect = &ed(&t).sections()[1];
     assert!(hf_reference(sect, true, "first").is_some(), "{sect}");
     assert!(hf_reference(sect, true, "default").is_none(), "{sect}");
@@ -202,27 +202,27 @@ fn link_to_previous_is_refused_in_the_first_section_and_links_per_variant() {
 fn go_to_and_next_previous_walk_the_pages_slots() {
     let mut t = three_sections("nav", true);
     edit_at(&mut t, 1, true);
-    hf_apply(&mut t, HfAct::GoTo(false)).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::GoTo(false)).unwrap();
     assert_eq!(slot(&t), (1, HeaderVariant::Default, false));
     assert_eq!(edited_text(&t), "Footer A");
-    hf_apply(&mut t, HfAct::GoTo(true)).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::GoTo(true)).unwrap();
     assert_eq!(slot(&t), (1, HeaderVariant::Default, true));
-    hf_apply(&mut t, HfAct::Next).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Next).unwrap();
     assert_eq!(slot(&t), (2, HeaderVariant::Default, true));
     assert_eq!(edited_text(&t), "Header C");
-    hf_apply(&mut t, HfAct::Next).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Next).unwrap();
     assert_eq!(slot(&t), (2, HeaderVariant::Default, true), "the last one");
-    hf_apply(&mut t, HfAct::Previous).unwrap();
-    hf_apply(&mut t, HfAct::Previous).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Previous).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Previous).unwrap();
     assert_eq!(slot(&t), (0, HeaderVariant::Default, true));
-    hf_apply(&mut t, HfAct::Previous).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Previous).unwrap();
     assert_eq!(slot(&t), (0, HeaderVariant::Default, true), "the first one");
     // With a first page in section 2, Next from section 1 goes to it.
     exit_hf_tab(&mut t);
     caret_in(&mut t, 1);
-    hf_apply(&mut t, HfAct::DifferentFirst).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentFirst).unwrap();
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::Next).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Next).unwrap();
     assert_eq!(slot(&t), (1, HeaderVariant::First, true));
 }
 
@@ -233,11 +233,11 @@ fn next_does_nothing_in_a_one_page_document_with_odd_and_even_pages() {
     );
     let mut t = base;
     assert_eq!(page_ranges(&t).len(), 1);
-    hf_apply(&mut t, HfAct::Edit(true)).unwrap();
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Edit(true)).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     assert!(hf_checked(&t, HfAct::DifferentOddEven));
     let before = slot(&t);
-    hf_apply(&mut t, HfAct::Next).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Next).unwrap();
     assert_eq!(slot(&t), before);
     assert_eq!(edit_label(&t).as_deref(), Some("Odd Page Header"));
 }
@@ -248,10 +248,10 @@ fn show_document_text_is_view_state_kept_while_navigating_and_reset_on_exit() {
     let mut t = three_sections("show-text", true);
     edit_at(&mut t, 0, true);
     assert!(hf_checked(&t, HfAct::ShowText));
-    hf_apply(&mut t, HfAct::ShowText).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::ShowText).unwrap();
     assert!(!hf_checked(&t, HfAct::ShowText));
     assert!(!t.dirty, "view state only");
-    hf_apply(&mut t, HfAct::Next).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Next).unwrap();
     assert!(!t.hf_edit.as_ref().unwrap().show_text);
     exit_hf_tab(&mut t);
     edit_at(&mut t, 0, true);
@@ -266,6 +266,7 @@ fn header_from_top_and_footer_from_bottom_edit_the_section_undoably() {
     assert_eq!(distance_of(&t, true), Some(720));
     hf_apply(
         &mut t,
+        MarkupView::All,
         HfAct::Distance {
             is_header: true,
             twips: 432,
@@ -306,6 +307,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
     caret_in(&mut t, 1);
     hf_apply(
         &mut t,
+        MarkupView::All,
         HfAct::Design {
             is_header: true,
             index: 0,
@@ -320,6 +322,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
     assert!(!saved_sections(&pkg)[1].contains("headerReference"));
     hf_apply(
         &mut t,
+        MarkupView::All,
         HfAct::Design {
             is_header: true,
             index: 1,
@@ -342,6 +345,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
     caret_in(&mut t, 2);
     hf_apply(
         &mut t,
+        MarkupView::All,
         HfAct::Design {
             is_header: false,
             index: 0,
@@ -350,7 +354,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
     .unwrap();
     assert!(hf_reference(&ed(&t).sections()[0], false, "default").is_some());
     // Remove Footer empties the part and keeps the reference.
-    hf_apply(&mut t, HfAct::Remove(false)).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Remove(false)).unwrap();
     assert_eq!(edited_text(&t), "");
     let pkg = saved(&mut t);
     assert!(hf_reference(&saved_sections(&pkg)[0], false, "default").is_some());
@@ -358,7 +362,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
     // Remove Header in section 3 of the headed document: its own part.
     let mut t = three_sections("remove", true);
     caret_in(&mut t, 2);
-    hf_apply(&mut t, HfAct::Remove(true)).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::Remove(true)).unwrap();
     let pkg = saved(&mut t);
     assert!(hf_reference(&saved_sections(&pkg)[2], true, "default").is_some());
     assert_eq!(saved_hf(&pkg, 2, true), "");
@@ -370,7 +374,7 @@ fn header_designs_fill_the_section_part_and_remove_empties_it_keeping_the_refere
 fn a_page_maps_to_its_section_and_variant() {
     let mut t = three_sections("page-slot", true);
     let got: Vec<Option<(usize, HeaderVariant)>> = (0..4)
-        .map(|p| page_slot(&t, p).map(|s| (s.section, s.variant)))
+        .map(|p| page_slot(&t, MarkupView::All, p).map(|s| (s.section, s.variant)))
         .collect();
     assert_eq!(
         got,
@@ -382,10 +386,76 @@ fn a_page_maps_to_its_section_and_variant() {
         ]
     );
     // Opening page 2's area edits section 2's (inherited) header.
-    let s = page_slot(&t, 1).unwrap();
+    let s = page_slot(&t, MarkupView::All, 1).unwrap();
     assert!(crate::hf::open(&mut t, s.section, true, s.variant));
     assert_eq!(edited_text(&t), "Header A");
     assert!(linked(&t));
+}
+
+/// Section 0 holds a long tracked deletion (two live pages, one under Simple
+/// Markup) and section 1 starts a new page with its own header (#1254).
+fn deletion_then_header_section(name: &str) -> DocTab {
+    let dir = tmp_dir(name);
+    let path = dir.join("in.docx");
+    let base = tab_from_path(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+    );
+    let mut pkg = base.pkg.clone().unwrap();
+    pkg.ensure_styles(&["Header"]);
+    let (b, _) = pkg
+        .create_hf_part(
+            true,
+            "<w:p><w:pPr><w:pStyle w:val=\"Header\"/></w:pPr><w:r><w:t>Header B</w:t></w:r></w:p>",
+        )
+        .unwrap();
+    // Twenty paragraphs of deleted text: a few pages live, one line each shown.
+    let words = "word ".repeat(100);
+    let del = |i: usize| {
+        format!(
+            "<w:p><w:del w:id=\"{i}\" w:author=\"A\"><w:r><w:delText>{words}</w:delText></w:r></w:del></w:p>"
+        )
+    };
+    let mut deleted: String = (1..20).map(del).collect();
+    deleted.push_str(&format!(
+        "<w:p><w:pPr>{}</w:pPr><w:del w:id=\"20\" w:author=\"A\"><w:r><w:delText>{words}</w:delText></w:r></w:del></w:p>",
+        sect("", "")
+    ));
+    let refs = format!("<w:headerReference w:type=\"default\" r:id=\"{b}\"/>");
+    let body = format!("{deleted}{}{}", para("Two", None), sect(&refs, ""));
+    let doc = docxcore::model::Document {
+        body: body_blocks(&body),
+    };
+    std::fs::write(&path, doc_to_docx(&doc, &[], Some(&pkg))).unwrap();
+    let t = tab_from_path(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(ed(&t).sections().len(), 2);
+    t
+}
+
+/// #1254: the slots follow the pagination the render draws (the shown markup
+/// view), so a double-click or Next on sheet 2 reaches section 1's header.
+#[test]
+fn a_page_maps_to_its_section_under_the_shown_markup_view() {
+    let t = deletion_then_header_section("page-slot-markup");
+    let sections =
+        |view| -> Vec<usize> { tab_page_slots(&t, view).iter().map(|s| s.section).collect() };
+    // The live body's deletion fills several pages before section 1's page.
+    let all = sections(MarkupView::All);
+    assert!(all.len() >= 3, "{all:?}");
+    assert_eq!(all.last(), Some(&1));
+    assert!(all[..all.len() - 1].iter().all(|&s| s == 0), "{all:?}");
+    // Simple Markup hides it: one page of section 0, then section 1.
+    assert_eq!(sections(MarkupView::Simple), vec![0, 1]);
+    assert_eq!(page_slot(&t, MarkupView::All, 1).unwrap().section, 0);
+    assert_eq!(page_slot(&t, MarkupView::Simple, 1).unwrap().section, 1);
+    assert!(page_slot(&t, MarkupView::Simple, 2).is_none());
+    let nav = |view| -> Vec<usize> { nav_slots(&t, view).iter().map(|s| s.section).collect() };
+    assert_eq!(nav(MarkupView::Simple), vec![0, 1]);
+    // Next from section 0's header lands on section 1 in either view.
+    let mut t = t;
+    hf_apply(&mut t, MarkupView::Simple, HfAct::Edit(true)).unwrap();
+    hf_apply(&mut t, MarkupView::Simple, HfAct::Next).unwrap();
+    assert_eq!(slot(&t).0, 1);
 }
 
 /// Criterion 13 / PAG-068: a new header paragraph shows the Header style's
@@ -450,7 +520,7 @@ fn the_menus_list_the_gallery_then_edit_and_remove() {
 fn saved_links_survive_a_reload() {
     let mut t = three_sections("reload", true);
     edit_at(&mut t, 1, true);
-    hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::LinkToPrevious).unwrap();
     exit_hf_tab(&mut t);
     let pkg = saved(&mut t);
     let part = hf_part_name_typed(&pkg, &saved_sections(&pkg)[1], true, "default").unwrap();
@@ -644,7 +714,7 @@ fn clearing_odd_even_drops_even_references_in_every_section() {
     let defaults = default_refs(&ed(&t).sections());
     assert_eq!(even_refs(&ed(&t).sections()), LOADED_EVEN);
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     assert!(!hf_checked(&t, HfAct::DifferentOddEven));
     assert!(!t.pkg.as_ref().unwrap().has_even_odd());
     assert_eq!(even_refs(&ed(&t).sections()), NO_EVEN);
@@ -666,7 +736,7 @@ fn save_drops_cleared_even_header_but_undo_keeps_it() {
     let header = resolved_part(&t, 0, true, HeaderVariant::Even).unwrap();
     let footer = resolved_part(&t, 0, false, HeaderVariant::Even).unwrap();
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     exit_hf_tab(&mut t);
     let pkg = saved(&mut t);
     let rels = pkg.part_text("word/_rels/document.xml.rels").unwrap();
@@ -698,7 +768,7 @@ fn a_converted_tab_keeps_cleared_parts_for_undo_after_save() {
     t.access.converted = Some(crate::open_mode::Converted::Rtf);
     let header = resolved_part(&t, 0, true, HeaderVariant::Even).unwrap();
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     exit_hf_tab(&mut t);
     let dir = tmp_dir("odd-even-converted-save");
     let path = dir.join("saved.docx");
@@ -728,8 +798,8 @@ fn odd_even_on_again_starts_with_empty_even_headers() {
     let mut t = odd_even("odd-even-again");
     let old = resolved_part(&t, 0, true, HeaderVariant::Even).unwrap();
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     assert!(hf_checked(&t, HfAct::DifferentOddEven));
     assert_eq!(t.status.as_ref(), "Different Odd & Even Pages: on");
     assert_eq!(even_refs(&ed(&t).sections()), NO_EVEN);
@@ -747,7 +817,7 @@ fn odd_even_on_again_starts_with_empty_even_headers() {
 fn odd_even_toggle_is_one_undo_step() {
     let mut t = odd_even("odd-even-undo");
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     exit_hf_tab(&mut t);
     assert_eq!(
         ed(&t).undo_names(),
@@ -765,7 +835,7 @@ fn odd_even_toggle_is_one_undo_step() {
     // Turning it on is one step too.
     let mut t = three_sections("odd-even-on", true);
     edit_at(&mut t, 0, true);
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     assert!(hf_checked(&t, HfAct::DifferentOddEven));
     exit_hf_tab(&mut t);
     assert_eq!(
@@ -799,7 +869,7 @@ fn clearing_odd_even_in_an_even_header_reopens_the_odd_one() {
     assert!(crate::hf::open(&mut t, 0, true, HeaderVariant::Even));
     assert_eq!(edited_text(&t), "Even A");
     type_at_start(&mut t, "typed ");
-    hf_apply(&mut t, HfAct::DifferentOddEven).unwrap();
+    hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap();
     assert_eq!(slot(&t), (0, HeaderVariant::Default, true));
     assert_eq!(edited_text(&t), "Header A");
     exit_hf_tab(&mut t);
@@ -820,7 +890,7 @@ fn odd_even_refuses_a_settings_part_it_cannot_change() {
         b"<w:settings xmlns:w=\"w\"><w:evenAndOddHeaders/>\xff</w:settings>".to_vec(),
     ));
     assert!(!hf_checked(&t, HfAct::DifferentOddEven));
-    let err = hf_apply(&mut t, HfAct::DifferentOddEven).unwrap_err();
+    let err = hf_apply(&mut t, MarkupView::All, HfAct::DifferentOddEven).unwrap_err();
     assert!(err.starts_with("Could not change"), "{err}");
     assert!(!hf_checked(&t, HfAct::DifferentOddEven));
     assert!(ed(&t).undo_names().is_empty());
