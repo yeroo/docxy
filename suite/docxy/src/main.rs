@@ -6365,11 +6365,22 @@ struct RulerProbe {
     /// Layout (#767), one per frame group.
     frames: Vec<FrameProbe>,
     contents: Vec<Option<ScreenRect>>,
+    /// Per page, each band's column ranges and painted content rect;
+    /// `contents` is the first band's.
+    bands: Vec<Vec<BandProbe>>,
     ranges: Vec<Vec<(usize, usize)>>,
     caret_block: Option<usize>,
     pointer: Option<(f32, f32)>,
     draft: bool,
     painted: Option<HRulerGeom>,
+}
+
+/// A band of a page as Print Layout drew it (#1254): its column ranges and
+/// its content rect (None until painted).
+#[derive(Clone, Debug)]
+struct BandProbe {
+    blocks: Vec<(usize, usize)>,
+    rect: Option<ScreenRect>,
 }
 
 /// A frame of framed header/footer paragraphs (one group: adjacent
@@ -6525,7 +6536,9 @@ fn tracked_page_geom(
     };
     let shown = ed.doc.markup_view(markup);
     let pf = tab_page_flow(tab, &shown.body);
-    let (section, geom) = pf.drag_geom(tracked_page(probe), final_sect_pr(tab).unwrap_or(""))?;
+    let tracked = tracked_page(probe);
+    let band = tracked.map_or(0, |page| ruler_band(probe, page));
+    let (section, geom) = pf.drag_geom(tracked, band, final_sect_pr(tab).unwrap_or(""))?;
     Some((section, geom, pf.sections.len()))
 }
 
@@ -6544,6 +6557,40 @@ fn print_caret_page(
     // `block` addresses the live body; the view-only markup modes can merge
     // paragraphs, so a merged block lands on the last page.
     page_of_block(&ranges, block).unwrap_or(ranges.len().saturating_sub(1))
+}
+
+/// The band of `page` the ruler follows: the first band whose column ranges
+/// hold the caret's block when the caret is on `page`, else the first band
+/// (a pointer or top-of-view page has no caret). An empty `(s, s)` range
+/// holds nothing. The caret block is the live body's index against the shown
+/// body's ranges, as in `tracked_page` and `print_caret_page`.
+fn ruler_band(probe: &RulerProbe, page: usize) -> usize {
+    let Some(block) = probe.caret_block else {
+        return 0;
+    };
+    if page_of_block(&probe.ranges, block) != Some(page) {
+        return 0;
+    }
+    probe
+        .bands
+        .get(page)
+        .and_then(|bands| {
+            bands
+                .iter()
+                .position(|b| b.blocks.iter().any(|&(s, e)| s <= block && block < e))
+        })
+        .unwrap_or(0)
+}
+
+/// The content rect the horizontal ruler measures on `page`: the followed
+/// band's, else the first band's (`contents`).
+fn ruler_text_rect(probe: &RulerProbe, page: usize) -> Option<ScreenRect> {
+    probe
+        .bands
+        .get(page)
+        .and_then(|bands| bands.get(ruler_band(probe, page)))
+        .and_then(|b| b.rect)
+        .or(probe.contents.get(page).copied().flatten())
 }
 
 fn tracked_page(probe: &RulerProbe) -> Option<usize> {
@@ -6583,11 +6630,12 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        Block, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal, Paragraph, RulerChange,
-        RulerDrag, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent,
-        hruler_geom, hruler_hit, leading_items, next_tab_stop, page_flow, page_needs_scroll,
-        page_of_block, paragraph_indent_layout, print_caret_page, px_tw, ruler_colors,
-        ruler_drag_result, tracked_page, tw_px, vruler_geom,
+        BandProbe, Block, DocTab, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal,
+        Paragraph, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect, Surface,
+        doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items,
+        next_tab_stop, page_flow, page_needs_scroll, page_of_block, paragraph_indent_layout,
+        print_caret_page, px_tw, ruler_band, ruler_colors, ruler_drag_result, ruler_text_rect,
+        tab_from_path, tab_page_flow, tracked_page, tracked_page_geom, tw_px, vruler_geom,
     };
     use docxcore::model::{
         PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop,
@@ -7105,6 +7153,99 @@ mod ruler_geom_tests {
             );
             near(mr.guide, d.page_right - 1.0 - tw_px(1080, zoom));
         }
+    }
+
+    /// Two continuous sections on one sheet: block 0 in band 0 (1" margins),
+    /// block 1 in band 1 (0.5"), and a probe painted as the render does.
+    fn two_band_probe(caret_block: Option<usize>) -> (DocTab, RulerProbe) {
+        use crate::hf::tests::{para, sect, tmp_dir};
+        let dir = tmp_dir("ruler-band");
+        let path = dir.join("in.docx");
+        let narrow = r#"<w:sectPr><w:type w:val="continuous"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="720" w:bottom="1440" w:left="720" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr>"#;
+        let body = format!(
+            "{}{}{narrow}",
+            para("One", Some(&sect("", ""))),
+            para("Two", None)
+        );
+        let doc = Document {
+            body: crate::hf::tests::body_blocks(&body),
+        };
+        std::fs::write(&path, doc_to_docx(&doc, &[], None)).unwrap();
+        let tab = tab_from_path(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Surface::Doc(ed) = &tab.surface else {
+            panic!("a document")
+        };
+        let pf = tab_page_flow(&tab, &ed.doc.body);
+        assert_eq!(pf.pages.len(), 1);
+        assert_eq!(pf.pages[0].bands.len(), 2, "{:?}", pf.ranges());
+        let rect = |x: f32, y: f32| ScreenRect {
+            x,
+            y,
+            w: 400.0,
+            h: 100.0,
+        };
+        let probe = RulerProbe {
+            viewport: Some(rect(0.0, 0.0)),
+            pages: vec![Some(ScreenRect {
+                h: 500.0,
+                ..rect(0.0, 0.0)
+            })],
+            contents: vec![Some(rect(100.0, 0.0))],
+            bands: vec![
+                pf.pages[0]
+                    .bands
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| BandProbe {
+                        blocks: b.cols.clone(),
+                        rect: Some(rect(100.0 - 50.0 * i as f32, 100.0 * i as f32)),
+                    })
+                    .collect(),
+            ],
+            ranges: pf.ranges(),
+            caret_block,
+            ..RulerProbe::default()
+        };
+        (tab, probe)
+    }
+
+    #[test]
+    fn ruler_band_follows_the_caret_block_on_its_page() {
+        let (_, p) = two_band_probe(Some(1));
+        assert_eq!(ruler_band(&p, 0), 1);
+        assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 50.0);
+        let (_, p) = two_band_probe(Some(0));
+        assert_eq!(ruler_band(&p, 0), 0);
+        assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 100.0);
+    }
+
+    #[test]
+    fn ruler_band_defaults_to_the_first_band_off_the_caret_page() {
+        let (_, mut p) = two_band_probe(None);
+        assert_eq!(ruler_band(&p, 0), 0);
+        // A caret on another page, or in no range, keeps band 0.
+        p.caret_block = Some(1);
+        assert_eq!(ruler_band(&p, 1), 0);
+        p.caret_block = Some(99);
+        assert_eq!(ruler_band(&p, 0), 0);
+        // A band with only an empty column never holds the caret.
+        p.caret_block = Some(1);
+        p.bands[0][1].blocks = vec![(1, 1)];
+        assert_eq!(ruler_band(&p, 0), 0);
+        // No painted band rect falls back to the page's content rect.
+        p.bands[0][0].rect = None;
+        assert_eq!(ruler_text_rect(&p, 0).unwrap().x, 100.0);
+    }
+
+    #[test]
+    fn tracked_page_geom_takes_the_section_of_the_caret_band() {
+        let (tab, p) = two_band_probe(Some(1));
+        let (section, geom, n) = tracked_page_geom(&tab, MarkupView::All, &p).unwrap();
+        assert_eq!((section, n), (1, 2));
+        assert_eq!((geom.w, geom.h), (12240, 15840));
+        let (tab, p) = two_band_probe(Some(0));
+        assert_eq!(tracked_page_geom(&tab, MarkupView::All, &p).unwrap().0, 0);
     }
 
     #[test]
@@ -25009,7 +25150,8 @@ impl Docxy {
                         state.painted = None;
                         return;
                     };
-                    let (Some(page), Some(text)) = (state.pages[i], state.contents[i]) else {
+                    let (Some(page), Some(text)) = (state.pages[i], ruler_text_rect(&state, i))
+                    else {
                         state.painted = None;
                         return;
                     };
@@ -39257,6 +39399,19 @@ impl Render for Docxy {
                             probe.pages = vec![None; pages.len()];
                             probe.frames.clear();
                             probe.contents = vec![None; pages.len()];
+                            probe.bands = pf
+                                .pages
+                                .iter()
+                                .map(|p| {
+                                    p.bands
+                                        .iter()
+                                        .map(|b| BandProbe {
+                                            blocks: b.cols.clone(),
+                                            rect: None,
+                                        })
+                                        .collect()
+                                })
+                                .collect();
                             probe.ranges = pages.clone();
                             probe.caret_block = editor.caret.path.first().copied();
                             probe.draft = false;
@@ -39541,25 +39696,30 @@ impl Render for Docxy {
                                     .map(|(bi, band)| {
                                         let bsect = &pf.sections[band.section];
                                         let inner = build_band(band, bsect, pi);
-                                        let el = if bi == 0 {
-                                            div()
-                                                .relative()
-                                                .w_full()
-                                                .child(inner)
-                                                .child(ruler_probe_el(
-                                                    &self.ruler_probe,
-                                                    move |state, rect| {
+                                        let el = div()
+                                            .relative()
+                                            .w_full()
+                                            .child(inner)
+                                            .child(ruler_probe_el(
+                                                &self.ruler_probe,
+                                                move |state, rect| {
+                                                    if bi == 0 {
                                                         if let Some(slot) =
                                                             state.contents.get_mut(pi)
                                                         {
                                                             *slot = Some(rect);
                                                         }
-                                                    },
-                                                ))
-                                                .into_any_element()
-                                        } else {
-                                            inner
-                                        };
+                                                    }
+                                                    if let Some(b) = state
+                                                        .bands
+                                                        .get_mut(pi)
+                                                        .and_then(|bands| bands.get_mut(bi))
+                                                    {
+                                                        b.rect = Some(rect);
+                                                    }
+                                                },
+                                            ))
+                                            .into_any_element();
                                         div()
                                             .w_full()
                                             .pl(tw(bsect.left))
@@ -39905,6 +40065,7 @@ impl Render for Docxy {
                             probe.pages.clear();
                             probe.frames.clear();
                             probe.contents.clear();
+                            probe.bands.clear();
                             probe.ranges.clear();
                             probe.caret_block = editor.caret.path.first().copied();
                             probe.draft = true;

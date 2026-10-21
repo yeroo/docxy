@@ -447,7 +447,7 @@ fn drag_geom_keeps_the_gutter_out_of_the_margins() {
         pf.sections[0].left, 2160,
         "the drawn margin holds the gutter"
     );
-    let (_, geom) = pf.drag_geom(Some(0), &sect).unwrap();
+    let (_, geom) = pf.drag_geom(Some(0), 0, &sect).unwrap();
     assert_eq!(geom.ml, 1440, "the drag starts from the raw w:left");
     assert_eq!((geom.w, geom.h), (12240, 15840));
     // A left-margin drag then only adds its delta to w:left (360 twips = 24px
@@ -473,7 +473,7 @@ fn drag_geom_keeps_the_gutter_out_of_the_margins() {
     assert_eq!(moved.guide, 144.0 + 24.0);
     // gutterAtTop: the top margin the drag writes is the raw w:top.
     let pf = flow(&body, &sect, true);
-    let (_, geom) = pf.drag_geom(Some(0), &sect).unwrap();
+    let (_, geom) = pf.drag_geom(Some(0), 0, &sect).unwrap();
     assert_eq!(geom.mt, 1440);
 }
 
@@ -734,4 +734,34 @@ fn section_box_carries_line_numbering() {
     let body = body_blocks(&para("One", Some(&plain)));
     let pf = flow(&body, &plain, false);
     assert!(pf.sections[0].line_numbers.is_none());
+}
+
+#[test]
+fn drag_geom_names_the_band_section_and_keeps_the_sheet_owners_size() {
+    let body = body_blocks(&format!(
+        "{}{}",
+        para("One", Some(&letter(""))),
+        para(
+            "Two",
+            Some(&geom_sect(
+                12240,
+                15840,
+                1440,
+                720,
+                1440,
+                720,
+                0,
+                r#"<w:type w:val="continuous"/>"#
+            ))
+        )
+    ));
+    let pf = flow(&body, "", false);
+    assert_eq!(pf.pages[0].bands.len(), 2);
+    let (section, geom) = pf.drag_geom(Some(0), 1, "").unwrap();
+    assert_eq!(section, 1, "the band's section decides the refusal");
+    assert_eq!((geom.w, geom.h), (pf.sections[0].w, pf.sections[0].h));
+    assert_eq!(pf.drag_geom(Some(0), 0, "").unwrap().0, 0);
+    // A band past the last takes the first.
+    assert_eq!(pf.drag_geom(Some(0), 9, "").unwrap().0, 0);
+    assert!(pf.drag_geom(Some(5), 0, "").is_none());
 }
