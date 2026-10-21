@@ -4764,6 +4764,11 @@ impl App {
         } else {
             &self.footers.default
         };
+        // An empty part is seeded with one default paragraph on open.
+        if stored.is_empty() {
+            let seed = [Block::Paragraph(docxcore::model::Paragraph::default())];
+            return self.editor.doc.body.as_slice() != seed;
+        }
         stored.as_ref() != &self.editor.doc.body
     }
 
@@ -6807,7 +6812,7 @@ impl App {
             // A failed save keeps the app open, its error the status (#1223).
             "wq" | "x" => self.try_save().is_ok(),
             "q" => {
-                if self.modified {
+                if self.modified || self.hf_edit_unsaved() {
                     self.status = Some("unsaved changes (:q! to discard)".to_string());
                     false
                 } else {
@@ -12211,6 +12216,38 @@ mod tests {
         app.modified = false;
         assert!(app.hf_edit.is_some());
         assert_eq!(exit_prompt(&mut app), "Exit docxy?");
+    }
+
+    /// An empty stored header is seeded with one empty paragraph: an
+    /// untouched edit is not a change, a typed one is.
+    #[test]
+    fn request_exit_treats_the_seed_of_an_empty_part_as_unchanged() {
+        for act in [ribbon::Act::EditHeader, ribbon::Act::EditFooter] {
+            let mut app = app_with(&["body"]);
+            app.headers.default = Rc::new(Vec::new());
+            app.footers.default = Rc::new(Vec::new());
+            app.run_act(act);
+            app.modified = false;
+            assert!(app.hf_edit.is_some());
+            assert_eq!(exit_prompt(&mut app), "Exit docxy?");
+            app.editor.doc.body = header_link_body("https://a.example/");
+            assert!(exit_prompt(&mut app).contains("Unsaved changes will be lost"));
+        }
+    }
+
+    #[test]
+    fn request_exit_vim_q_refuses_with_a_changed_hf_edit() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.modified = false;
+        assert!(app.vim_run_command("q"), "unchanged edit quits");
+        app.editor.doc.body = header_link_body("https://a.example/");
+        assert!(!app.vim_run_command("q"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("unsaved changes (:q! to discard)")
+        );
+        assert!(app.vim_run_command("q!"));
     }
 
     #[test]
