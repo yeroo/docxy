@@ -59,7 +59,10 @@ const CLEAR_FIRST: &str = "LevelClearBeforeLeveling";
 pub struct LevelOptions {
     pub order: LevelOrder,
     /// Level only within available slack: a task is never delayed past its
-    /// total slack (left overallocated instead).
+    /// total slack (left overallocated instead), nor so that the project
+    /// finish moves or a task's total slack turns negative (a task whose
+    /// delay would do either, through a summary's percentage lag, is held,
+    /// overallocated).
     pub within_slack: bool,
     /// Leveling can adjust individual assignments on a task (kept as the
     /// plan's setting; the leveler delays whole tasks).

@@ -538,10 +538,11 @@
   that would carry the pair into a later stretch of more capacity is dropped
   the same way, a known limit: select the follower too), ends
   on the lightest plan it reached (within slack a task whose own delay would
-  move the project finish, a written delay stretching a summary's span and a
-  percentage lag on the summary's link with it, is held at its earliest
-  start and the round rerun without it; a move no task explains alone or by
-  its restoration drops the round), and reports a conflict that remains as
+  move the project finish or turn a task's total slack negative, a written
+  delay stretching a summary's span and a percentage lag on the summary's
+  link with it, is held at its earliest start and the round rerun without
+  it; a break no task explains alone or by its restoration drops the round),
+  and reports a conflict that remains as
   overallocated: a later pass resolves it only with the
   follower in its scope or with `clear_first` off, the default rebuilding the
   same cleared plan); an ALAP task is neither delayed nor

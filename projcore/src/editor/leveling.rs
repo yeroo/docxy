@@ -73,9 +73,11 @@ impl Editor {
     /// rebuilds the same cleared plan). Within slack a task whose own delay
     /// would move the project finish (a written delay stretches its
     /// summary's span, and a percentage lag on the summary's link grows
-    /// with it) is held at its earliest start, overallocated, and the round
-    /// runs again without it; a move no task explains alone or by its
-    /// restoration drops the round. An ALAP task is never delayed nor
+    /// with it), or would turn a task's total slack negative (a deadline or
+    /// an honored late bound missed, the same way), is held at its earliest
+    /// start, overallocated, and the round runs again without it; a break no
+    /// task explains alone or by its restoration drops the round. An ALAP
+    /// task is never delayed nor
     /// booked (Project 2024 refuses a delay on one; its late dates float
     /// with the finish), so an overallocation it causes stays. Only the
     /// delays the leveler asks for are written: a task a constraint or
@@ -154,14 +156,31 @@ impl Editor {
         // The overallocation a plan holds on its committed schedule.
         let pressure = |p: &crate::model::Project| {
             let sched = schedule(p);
-            let over = overallocation(p, |uid| {
+            overallocation(p, |uid| {
                 sched.get(uid).map(|r| (r.early_start, r.early_finish))
-            });
-            (over, sched.project_finish)
+            })
         };
-        // The culprit probes below read the finish alone (r17).
-        let finish_of = |p: &crate::model::Project| schedule(p).project_finish;
-        let (mut before, finish_at_start) = pressure(&trial);
+        // What within slack must not worsen (r14, r18): the project finish,
+        // and the set of leaves whose total slack is negative (a deadline
+        // or an honored late bound missed); `holds` says a plan keeps both
+        // as the pass's plan had them.
+        let bounds_of = |p: &crate::model::Project| {
+            let sched = schedule(p);
+            let late: std::collections::BTreeSet<i32> = p
+                .tasks
+                .iter()
+                .filter(|t| is_leaf(t))
+                .filter(|t| sched.get(t.uid).is_some_and(|r| r.total_slack_min < 0))
+                .map(|t| t.uid)
+                .collect();
+            (sched.project_finish, late)
+        };
+        let (finish_at_start, late_at_start) = bounds_of(&trial);
+        let holds = |p: &crate::model::Project| {
+            let (finish, late) = bounds_of(p);
+            finish <= finish_at_start && late.is_subset(&late_at_start)
+        };
+        let mut before = pressure(&trial);
         let mut seen = vec![before.conflicts.clone()];
         // The lightest plan the rounds reach: a trade may leave a heavier
         // conflict than it resolved, and the pass never ends worse than
@@ -212,26 +231,27 @@ impl Editor {
             if moved.is_empty() {
                 break;
             }
-            let (after, finish) = pressure(&round);
-            // Within slack the project finish never moves (#1594 r14): a
-            // written delay stretches its summary's span, and a percentage
-            // lag on the summary's link grows with it, past the slack the
-            // leaf alone had. The tasks whose delay did it (each one whose
-            // kept delay, restored, brings the finish back, or whose delay
-            // alone moves it) are held and the round runs again without them
-            // (r15, r16); a move no task explains alone or by its restoration
+            let after = pressure(&round);
+            // Within slack the project finish never moves and no task's
+            // total slack turns negative (#1594 r14, r18): a written delay
+            // stretches its summary's span, and a percentage lag on the
+            // summary's link grows with it, past the slack the leaf alone
+            // had. The tasks whose delay did it (each one whose kept delay,
+            // restored, brings the bounds back, or whose delay alone breaks
+            // them) are held and the round runs again without them (r15,
+            // r16); a break no task explains alone or by its restoration
             // drops the round, and the held tasks stay at their earliest
             // start, overallocated, as the option promises.
-            if options.within_slack && finish > finish_at_start {
+            if options.within_slack && !holds(&round) {
                 let culprits: Vec<i32> = moved
                     .iter()
                     .filter_map(|&i| {
-                        // Two probes (r16): restored to its kept delay, does
-                        // the finish come back (the delay was the one move)?
+                        // Two probes (r16): restored to its kept delay, do
+                        // the bounds come back (the delay was the one break)?
                         // Applied alone to the pass's plan, does its delay
-                        // move the finish (one of several moves)? Either
-                        // holds the task, so two tasks that each move the
-                        // finish are both held and the rest still level.
+                        // break them (one of several)? Either holds the task,
+                        // so two tasks that each break a bound are both held
+                        // and the rest still level.
                         let mut restored = round.clone();
                         restored.tasks[i].leveling_delay = trial.tasks[i].leveling_delay;
                         restored.tasks[i].leveling_delay_format =
@@ -239,9 +259,7 @@ impl Editor {
                         let mut alone = trial.clone();
                         alone.tasks[i].leveling_delay = round.tasks[i].leveling_delay;
                         alone.tasks[i].leveling_delay_format = round.tasks[i].leveling_delay_format;
-                        (finish_of(&restored) <= finish_at_start
-                            || finish_of(&alone) > finish_at_start)
-                            .then_some(round.tasks[i].uid)
+                        (holds(&restored) || !holds(&alone)).then_some(round.tasks[i].uid)
                     })
                     .collect();
                 if culprits.is_empty() {
@@ -1243,6 +1261,85 @@ mod tests {
             DateTime::from_minutes(anchor.minutes() + 3 * 1440),
             "Thursday"
         );
+    }
+
+    /// #1594 r18: within slack no task's total slack turns negative either.
+    /// The r14 plan with D at five days (the finish is Friday) and a
+    /// Thursday 17:00 deadline on C: B's delay would double C's lag and miss
+    /// the deadline while the finish stands, so B is held and C keeps the
+    /// day it has before the deadline.
+    #[test]
+    fn within_slack_never_misses_a_deadline_through_a_summarys_percent_lag() {
+        let mut p = untitled_project();
+        let anchor = p.start_date.unwrap();
+        let day = |n: i64, min: i64| DateTime::from_minutes(anchor.minutes() + n * 1440 + min);
+        let leaf = |uid: i32, name: &str, level: u32, minutes: i64| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level: level,
+            duration_min: minutes,
+            ..Task::default()
+        };
+        p.tasks.push(Task {
+            summary: true,
+            ..leaf(1, "S", 1, 0)
+        });
+        p.tasks.push(leaf(2, "A", 2, 480));
+        p.tasks.push(leaf(3, "B", 2, 480));
+        let mut c = leaf(4, "C", 1, 480);
+        c.predecessors.push(Predecessor {
+            lag: 100,
+            lag_format: crate::model::LagFormat::from_code(19).unwrap(),
+            ..Predecessor::fs(1)
+        });
+        c.deadline = Some(day(3, 9 * 60));
+        p.tasks.push(c);
+        p.tasks.push(leaf(5, "D", 1, 5 * 480));
+        p.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Ann".into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        for uid in [2, 3] {
+            p.assignments.push(Assignment {
+                uid,
+                task_uid: uid,
+                resource_uid: 1,
+                units: 1.0,
+                ..Assignment::default()
+            });
+        }
+        let friday = day(4, 9 * 60);
+        let mut ed = Editor::new(p);
+        assert_eq!(ed.schedule().project_finish, friday);
+        assert_eq!(
+            ed.schedule().get(4).unwrap().total_slack_min,
+            480,
+            "C has a day before its deadline"
+        );
+        ed.set_level_options(&LevelOptions {
+            within_slack: true,
+            ..LevelOptions::default()
+        })
+        .unwrap();
+        let out = ed
+            .level_tasks(&LevelTarget::Selection(vec![2, 3, 4]))
+            .unwrap();
+        assert_eq!((out.changed, out.delayed, out.overallocated), (0, 0, 1));
+        assert_eq!(
+            ed.project().task(3).unwrap().leveling_delay,
+            None,
+            "B is held"
+        );
+        assert_eq!(
+            ed.schedule().get(4).unwrap().total_slack_min,
+            480,
+            "C keeps its day"
+        );
+        assert_eq!(ed.schedule().project_finish, friday);
     }
 
     /// #1594 r16: two tasks whose delays each move the finish are both held,

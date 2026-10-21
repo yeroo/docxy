@@ -341,9 +341,9 @@ options and `level.options {order?, within_slack?, adjust_assignments?,
 split?, clear_first?}` sets them, one undo step: `order` is `ID`, `Standard`
 (the default: dependencies, then the plan's row order) or `Priority` (the
 highest priority first; priority 1000 is never leveled); `within_slack` never
-delays a task past its total slack nor moves the project finish (a task whose
-delay would move it through a summary's percentage lag stays put,
-overallocated);
+delays a task past its total slack nor moves the project finish or turns a
+task's total slack negative (a task whose delay would do either, through a
+summary's percentage lag, stays put, overallocated);
 `clear_first` (default true) drops the
 targeted tasks' stored delays before a pass, else the pass builds on them;
 `adjust_assignments` and `split` are kept with the plan, the leveler delaying

@@ -41,7 +41,7 @@
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
 //! | `level.selection` | `{uids: [uid…], options?}` | `{changed, delayed, overallocated, tasks: [{uid, leveling_delay_min, start}]}` (#1594): Level Selection as a plan edit. The leveler runs over the plan with only these tasks (a summary stands for its subtasks) free to move, every other task taking no delay of its own and booked at the dates the plan gives it now (an automatic one still follows its links once the delays are written, so the pass repeats while a round still changes the overallocation (a smaller overbooked extent, or conflicts not seen before) and drops a round that leaves the same conflicts; a conflict that remains is reported as overallocated, and a later pass resolves it only with the follower in its scope or with `clear_first` off), and writes each moved task's own `LevelingDelay` (elapsed minutes from the start its leveled predecessors drive it to, stored in tenths of a minute as Project does) and pre-leveled dates, one undo step. `changed` counts the tasks whose stored values changed (0 records no step), `delayed` those left with a delay, `tasks` every targeted leaf with its delay and start after the pass. The plan's Leveling Options apply |
 //! | `level.resource` | `{resource, options?}` | the same reply (#1594): Level Resource, over the tasks the resource (a uid or a name) is assigned to. `options` (both verbs) is a `level.options` object applied to this pass only; the plan's options stay as they are. A task that only follows a delayed predecessor records no delay of its own, as Project does |
-//! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack; `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
+//! | `level.options` | `{order?, within_slack?, adjust_assignments?, split?, clear_first?}` | `{order, within_slack, adjust_assignments, split, clear_first}` (#1594): Project's Leveling Options as plan options, read with `{}`, set as one undo step (an unchanged setting records none). `order` is `ID`, `Standard` (the default: dependencies, then the plan's row order) or `Priority` (the highest priority first; priority 1000 is never leveled); `within_slack` never delays a task past its total slack, nor moves the project finish or turns a task's total slack negative (a task whose delay would do either, through a summary's percentage lag, is held, overallocated); `clear_first` (default true) drops the targeted tasks' stored delays before a pass, else it builds on them; `adjust_assignments` and `split` are kept with the plan, the leveler delaying whole tasks |
 //! | `cal.list` | `{}` | `{count, calendars: [{uid, name, base: {uid, name} \| null, default, resources: [uid…], tasks: [uid…]}]}` (#1605), base calendars first |
 //! | `cal.get` | `{calendar}` | the calendar (`calendar` a uid or a name) with its resolved `week` (`[{day, working, times: [["08:00","12:00"], …], stated}]`), `exceptions: [{index, name, from, to, working, times, recurring}]` and `work_weeks: [{index, name, from, to, week}]` |
 //! | `cal.day` | `{calendar, date}` | `{date, working, times, based_on: {kind: exception \| work_week \| default, calendar, name}}`: Change Working Time's "Working times for" and "Based on" |
@@ -361,7 +361,11 @@ fn level_set(ed: &mut Editor, on: bool) -> Json {
 /// `level.clear`: with `uids` or `all`, Clear Leveling as a plan edit
 /// (#1594); else the overlay off (#1589).
 fn level_clear(ed: &mut Editor, args: &Json) -> Result<Json, String> {
-    let all = args.get("all").and_then(Json::as_bool).unwrap_or(false);
+    let all = match args.get("all") {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err("'all' must be true or false".into()),
+    };
     let uids = match args.get("uids") {
         None | Some(Json::Null) => None,
         Some(Json::Arr(items)) => Some(
@@ -4640,6 +4644,10 @@ it"
         assert!(err.contains("no assignments"), "{err}");
         let err = run(&mut ed, "level.selection", "{}").unwrap_err();
         assert!(err.contains("'uids' is required"), "{err}");
+        assert_eq!(
+            run(&mut ed, "level.clear", r#"{"all":1}"#).unwrap_err(),
+            "'all' must be true or false"
+        );
         let cleared = run(&mut ed, "level.clear", r#"{"all":true}"#).unwrap();
         assert_eq!(num(&cleared, "cleared"), 1.0);
         // A plain level.clear still switches the overlay off, no step.
