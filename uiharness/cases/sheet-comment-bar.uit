@@ -1,7 +1,7 @@
 # The sheet comment bar (#1292): Excel commits a note being edited when the
 # selection moves off it. A grid click (plain, Shift, Ctrl, double), a
-# right-click, a row/column insert or delete and Review › Previous/Next
-# Comment all leave the bar first: a changed buffer commits to the cell the
+# right-click, a row/column insert or delete, Go To / Go To Special (as the
+# dialog opens) and Review › Previous/Next Comment all leave the bar first: a changed buffer commits to the cell the
 # bar opened on (the anchor, `comment_cell`), an untouched one writes nothing,
 # and the bar closes. basic.xlsx has no notes; A1 holds Region.
 
@@ -112,6 +112,7 @@ test go to with an untouched bar writes nothing
   call menu-click {"label":"Go To…"}
   assert dialog is goto
   assert comment_cell is null
+  assert dirty is false
   call dialog-click {"button":"Cancel"}
   click A1
   assert comment is null

@@ -5571,9 +5571,10 @@ struct Docxy {
     sheet_comment_seed: Option<String>,
     // The cell (sheet index, row, col) the bar opened on: the label, Enter,
     // Save and the exit commit all target it. A cell click, right-click, a
-    // Name Box click, Previous/Next Comment or a row/column insert/delete commits a changed
+    // Name Box click, Go To / Go To Special (as the dialog opens),
+    // Previous/Next Comment or a row/column insert/delete commits a changed
     // buffer to it and closes the bar first; the anchor still matters for
-    // moves that leave the bar open (header clicks, Go To) and
+    // moves that leave the bar open (header clicks) and
     // for the exit commit. Set with the seed, cleared with it.
     sheet_comment_cell: Option<(usize, u32, u32)>,
     // Whether the data-validation list dropdown is open on the selected cell.
@@ -19730,9 +19731,10 @@ impl Docxy {
     /// remembers the cell it opened on — the anchor — alongside the seed:
     /// the label, Enter and an exit commit all target the anchor, not the
     /// live selection, and a cell click, right-click, Name Box click,
+    /// Go To / Go To Special (as the dialog opens),
     /// Previous/Next Comment or a row/column insert/delete commits a changed buffer to the anchor
     /// and closes the bar first. Selection moves that leave the bar open
-    /// (header clicks, Go To) still never move the note.
+    /// (header clicks) still never move the note.
     fn sheet_new_comment(&mut self, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet() {
             let cell = (v.active, v.sel.0, v.sel.1);
