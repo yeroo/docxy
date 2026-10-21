@@ -1569,6 +1569,8 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         shift_rules(sheet, s == idx, &target_name, &shift);
     }
 
+    shift_pivots(wb, idx, &target_name, &shift);
+
     // Page breaks (manual and automatic) stay with the row (column) that
     // starts their page.
     let sheet = &mut wb.sheets[idx];
@@ -2154,6 +2156,39 @@ pub(crate) fn point(v: u32, shift: &EditShift) -> Option<u32> {
 }
 
 /// A span through the shift (deletes clamp); None = span fully deleted.
+/// A rect (r1, c1, r2, c2) after a row/column edit, or `None` when a delete
+/// removed all of it.
+fn shift_rect(rect: (u32, u32, u32, u32), shift: &EditShift) -> Option<(u32, u32, u32, u32)> {
+    let (r1, c1, r2, c2) = rect;
+    if shift.rows {
+        span(r1, r2, shift).map(|(lo, hi)| (lo, c1, hi, c2))
+    } else {
+        span(c1, c2, shift).map(|(lo, hi)| (r1, lo, r2, hi))
+    }
+}
+
+/// A PivotTable's output region lives on its sheet and a range source on
+/// another (or the same): both move with the cells. A pivot whose region or
+/// source is deleted whole keeps its cache only, like one whose table went.
+fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditShift) {
+    for piv in &mut wb.pivots {
+        if piv.sheet == idx {
+            match shift_rect(piv.location, shift) {
+                Some(rect) => piv.location = rect,
+                None => piv.unsupported = true,
+            }
+        }
+        if let crate::pivot::PivotSource::Range { sheet, rect } = &mut piv.source {
+            if sheet.eq_ignore_ascii_case(target_name) {
+                match shift_rect(*rect, shift) {
+                    Some(moved) => *rect = moved,
+                    None => piv.unsupported = true,
+                }
+            }
+        }
+    }
+}
+
 fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     let at = shift.at;
     // `point` says `None` for two different things. On a DELETE the coordinate
@@ -5243,6 +5278,87 @@ mod table_tests {
         assert_eq!(wb.tables.len(), 1);
         assert_eq!(wb.tables[0].range, (0, 0, 0, 2));
         assert!(wb.removed_tables.is_empty());
+    }
+
+    fn range_pivot(
+        sheet: usize,
+        location: (u32, u32, u32, u32),
+        src_sheet: &str,
+        rect: (u32, u32, u32, u32),
+    ) -> crate::pivot::Pivot {
+        let mut p = pivot("P", sheet, location, "");
+        p.source = crate::pivot::PivotSource::Range {
+            sheet: src_sheet.into(),
+            rect,
+        };
+        p
+    }
+
+    fn range_of(p: &crate::pivot::Pivot) -> (u32, u32, u32, u32) {
+        match &p.source {
+            crate::pivot::PivotSource::Range { rect, .. } => *rect,
+            other => panic!("not a range source: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pivot_location_follows_row_and_column_edits_on_its_sheet() {
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        insert_rows(&mut wb, 1, 0, 1);
+        assert_eq!(wb.pivots[0].location, (3, 0, 5, 1));
+        delete_cols(&mut wb, 1, 0, 1);
+        assert_eq!(wb.pivots[0].location, (3, 0, 5, 0));
+        assert!(!wb.pivots[0].unsupported);
+        // The source sheet was not edited.
+        assert_eq!(range_of(&wb.pivots[0]), (0, 0, 3, 2));
+    }
+
+    #[test]
+    fn pivot_source_rect_follows_edits_on_the_source_sheet_only() {
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "sheet1", (0, 0, 3, 2)));
+        insert_rows(&mut wb, 0, 0, 2);
+        assert_eq!(range_of(&wb.pivots[0]), (2, 0, 5, 2));
+        insert_cols(&mut wb, 0, 1, 1);
+        assert_eq!(range_of(&wb.pivots[0]), (2, 0, 5, 3));
+        // The output sheet is untouched.
+        assert_eq!(wb.pivots[0].location, (2, 0, 4, 1));
+        // An edit on another sheet leaves the rect alone.
+        insert_rows(&mut wb, 1, 0, 5);
+        assert_eq!(range_of(&wb.pivots[0]), (2, 0, 5, 3));
+    }
+
+    #[test]
+    fn deleting_the_whole_source_or_location_marks_the_pivot_unsupported() {
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_rows(&mut wb, 0, 0, 4);
+        assert!(wb.pivots[0].unsupported);
+        let out = crate::pivot::refresh_pivots(&mut wb);
+        assert_eq!((out.refreshed, out.skipped), (0, 1));
+
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_rows(&mut wb, 1, 2, 3);
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (2, 0, 4, 1), "left as it was");
+    }
+
+    #[test]
+    fn a_table_pivot_source_is_untouched_by_a_shift() {
+        let mut wb = sales();
+        wb.pivots.push(pivot("P", 1, (3, 3, 6, 4), "Sales"));
+        insert_rows(&mut wb, 0, 0, 1);
+        assert_eq!(
+            wb.pivots[0].source,
+            crate::pivot::PivotSource::Table("Sales".into())
+        );
+        assert_eq!(wb.pivots[0].location, (3, 3, 6, 4));
     }
 
     #[test]

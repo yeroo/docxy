@@ -65,8 +65,17 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`Session::ctl_calc_set`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
-    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
-    pivot_unsupported: Vec<bool>,
+    /// Each PivotTable's `unsupported` flag (deleting its table sets it),
+    /// output region and source: a row/column edit moves the first two and a
+    /// sheet rename the last.
+    pivots: Vec<PivotState>,
+}
+
+#[derive(Clone)]
+struct PivotState {
+    unsupported: bool,
+    location: (u32, u32, u32, u32),
+    source: gridcore::pivot::PivotSource,
 }
 
 impl WbSnapshot {
@@ -77,7 +86,15 @@ impl WbSnapshot {
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
             precision: None,
-            pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
+            pivots: wb
+                .pivots
+                .iter()
+                .map(|p| PivotState {
+                    unsupported: p.unsupported,
+                    location: p.location,
+                    source: p.source.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -788,10 +805,12 @@ impl Session {
             (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
         }
         // Pivots aren't added or removed by a structural edit; if their count
-        // changed since, the flags no longer line up and stay as they are.
-        if wb.pivots.len() == snap.pivot_unsupported.len() {
-            for (p, &unsupported) in wb.pivots.iter_mut().zip(&snap.pivot_unsupported) {
-                p.unsupported = unsupported;
+        // changed since, the states no longer line up and stay as they are.
+        if wb.pivots.len() == snap.pivots.len() {
+            for (p, st) in wb.pivots.iter_mut().zip(&snap.pivots) {
+                p.unsupported = st.unsupported;
+                p.location = st.location;
+                p.source = st.source.clone();
             }
         }
         self.rebuild_engine();
@@ -3612,6 +3631,67 @@ mod tests {
         assert!(!s.pkg.workbook.pivots[0].unsupported);
         s.dispatch("redo");
         assert!(s.pkg.workbook.pivots[0].unsupported);
+    }
+
+    fn pivot_source(s: &Session) -> (String, (u32, u32, u32, u32)) {
+        match &s.pkg.workbook.pivots[0].source {
+            gridcore::pivot::PivotSource::Range { sheet, rect } => (sheet.clone(), *rect),
+            other => panic!("not a range source: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undoing_a_source_sheet_rename_restores_the_pivot_source_1191() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        s.ctl(&pivot_create_args(None));
+        let old = s.pkg.workbook.sheets[0].name.clone();
+        s.dispatch("sheet\trename\t0\tData");
+        assert_eq!(pivot_source(&s).0, "Data");
+        s.dispatch("undo");
+        assert_eq!(pivot_source(&s).0, old);
+        s.dispatch("redo");
+        assert_eq!(pivot_source(&s).0, "Data");
+        s.dispatch("undo");
+        assert_eq!(pivot_source(&s).0, old);
+        // The pivot still finds its source: a recalc follows an edit there.
+        s.ctl(r#"{"verb":"cell.set","args":{"ref":"B3","text":"200","sheet":0}}"#);
+        s.ctl(r#"{"verb":"wb.recalc","args":{}}"#);
+        let g = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B5","sheet":1}}"#);
+        assert!(g.contains("\"value\":200"), "{g}");
+        // The save names the original sheet again.
+        let saved = s.save();
+        let pkg = gridcore::xlsx::load_xlsx(&saved).unwrap();
+        assert_eq!(
+            pkg.workbook.pivots[0].source,
+            gridcore::pivot::PivotSource::Range {
+                sheet: old,
+                rect: (0, 0, 3, 1)
+            }
+        );
+    }
+
+    #[test]
+    fn undoing_a_row_insert_restores_the_pivot_location_and_source_1191() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        s.ctl(&pivot_create_args(None));
+        let loc = s.pkg.workbook.pivots[0].location;
+        let (_, rect) = pivot_source(&s);
+        s.active = 0;
+        s.dispatch("insrow\t0\t1");
+        assert_eq!(pivot_source(&s).1, (rect.0 + 1, rect.1, rect.2 + 1, rect.3));
+        s.active = 1;
+        s.dispatch("insrow\t0\t1");
+        assert_eq!(s.pkg.workbook.pivots[0].location.0, loc.0 + 1);
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.pivots[0].location, loc);
+        s.dispatch("undo");
+        assert_eq!(pivot_source(&s).1, rect);
+        s.dispatch("redo");
+        assert_eq!(pivot_source(&s).1, (rect.0 + 1, rect.1, rect.2 + 1, rect.3));
+        s.dispatch("redo");
+        assert_eq!(s.pkg.workbook.pivots[0].location.0, loc.0 + 1);
     }
 
     #[test]
