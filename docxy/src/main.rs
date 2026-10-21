@@ -12224,6 +12224,10 @@ mod tests {
     fn request_exit_treats_the_seed_of_an_empty_part_as_unchanged() {
         for act in [ribbon::Act::EditHeader, ribbon::Act::EditFooter] {
             let mut app = app_with(&["body"]);
+            // Create the part, leave, then empty the stored default (as an
+            // empty or unreadable part loads) before the edit under test.
+            app.run_act(act);
+            app.leave_hf_edit().unwrap();
             app.headers.default = Rc::new(Vec::new());
             app.footers.default = Rc::new(Vec::new());
             app.run_act(act);
