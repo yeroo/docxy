@@ -1055,7 +1055,7 @@ fn a_marker_in_an_inserted_word_splits_the_insertion_at_its_place_1220() {
 }
 
 #[test]
-fn markers_in_a_wholly_inserted_paragraph_keep_their_offsets_1220() {
+fn markers_in_a_paragraph_diffed_against_an_empty_one_keep_their_offsets_1220() {
     let original = pkg(&p(""));
     let revised = marked(
         "<w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
@@ -1075,4 +1075,38 @@ fn markers_in_a_wholly_inserted_paragraph_keep_their_offsets_1220() {
         "'o' between start and end: {xml}"
     );
     assert!(xml[e..].contains(">t</w:t>"), "{xml}");
+}
+
+#[test]
+fn markers_in_a_wholly_inserted_paragraph_keep_their_offsets_1220() {
+    // An inserted paragraph between matched ones goes through
+    // `whole_paragraph`, not the word diff.
+    let original = pkg(&paras(&["A", "B"]));
+    let revised = pkg(&format!(
+        "{}<w:p><w:r><w:t>c</w:t></w:r><w:bookmarkStart w:id=\"3\" w:name=\"b\"/>\
+         <w:r><w:t>o</w:t></w:r><w:bookmarkEnd w:id=\"3\"/><w:r><w:t>t</w:t></w:r></w:p>{}",
+        p("A"),
+        p("B")
+    ));
+    let result = compare(&original, &revised);
+    assert_eq!(result.deletions, 0);
+    let xml = document_to_xml(&result.package.document);
+    let (s, e) = (
+        xml.find("<w:bookmarkStart").expect(&xml),
+        xml.find("<w:bookmarkEnd").expect(&xml),
+    );
+    assert!(
+        xml[..s].contains(">c</w:t>") && !xml[..s].contains(">o</w:t>"),
+        "{xml}"
+    );
+    assert!(
+        xml[s..e].contains(">o</w:t>"),
+        "'o' between start and end: {xml}"
+    );
+    assert!(xml[e..].contains(">t</w:t>"), "{xml}");
+    for accept in [true, false] {
+        let xml = document_to_xml(&resolved(&result.package.document, accept));
+        assert_eq!(xml.matches("<w:bookmarkStart").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<w:bookmarkEnd").count(), 1, "{xml}");
+    }
 }
