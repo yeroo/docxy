@@ -2182,7 +2182,7 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
             let in_page_area = shift.rows && !piv.page.is_empty() && {
                 let top = r1.saturating_sub(1 + piv.page.len() as u32);
                 if shift.delta > 0 {
-                    top < shift.at && shift.at < r1
+                    top < shift.at && shift.at <= r1
                 } else {
                     let end = i64::from(shift.at) - shift.delta;
                     shift.at < r1 && end > i64::from(top)
@@ -5408,7 +5408,7 @@ mod table_tests {
             p.page = vec![(0, None)]; // filter in row 4, blank row 5
             wb.pivots.push(p);
         };
-        for (ins, at) in [(true, 5), (false, 4), (false, 5)] {
+        for (ins, at) in [(true, 5), (true, 6), (false, 4), (false, 5)] {
             let mut wb = sales();
             page(&mut wb);
             if ins {
@@ -5419,6 +5419,13 @@ mod table_tests {
             assert!(wb.pivots[0].unsupported, "{ins} {at}");
             assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
         }
+        // No report filter: an insert at the body's first row translates.
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (6, 0, 8, 1), "Sheet1", (0, 0, 3, 2)));
+        insert_rows(&mut wb, 1, 6, 1);
+        assert!(!wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (7, 0, 9, 1));
         // Wholly above the filter block: a translation.
         let mut wb = sales();
         page(&mut wb);

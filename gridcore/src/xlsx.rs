@@ -4310,10 +4310,13 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                     xml = patch_worksheet_source_sheet(&xml, sheet);
                     xml = patch_worksheet_source_ref(&xml, *rect);
                 }
-                // A renamed source table: the cache names it.
-                crate::pivot::PivotSource::Table(name) => {
+                // A renamed source table: the cache names it. The empty name
+                // is the placeholder of a source we did not parse (external
+                // workbook): its element stays as loaded.
+                crate::pivot::PivotSource::Table(name) if !name.is_empty() => {
                     xml = patch_worksheet_source_name(&xml, name);
                 }
+                crate::pivot::PivotSource::Table(_) => {}
             }
             if piv.edited || piv.refreshed {
                 xml = set_refresh_on_load(&xml);
@@ -17924,6 +17927,23 @@ b",
         assert!(
             saved_cache.contains(r#"ref="A1:C5" sheet="Data""#),
             "{saved_cache}"
+        );
+    }
+
+    /// A named external table source (`name` + `r:id`) loads as the
+    /// placeholder: an unedited save keeps the cache byte for byte.
+    #[test]
+    fn a_named_external_source_saves_byte_identical() {
+        let pivot_table = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="PivotTable1" cacheId="1"><location ref="A3:B5" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow" showAll="0"><items count="3"><item x="0"/><item x="1"/><item t="default"/></items></pivotField><pivotField showAll="0"/><pivotField dataField="1" showAll="0"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><dataFields count="1"><dataField name="Sum of Sales" fld="2" baseField="0" baseItem="0"/></dataFields></pivotTableDefinition>"#;
+        let cache = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"><cacheSource type="worksheet"><worksheetSource name="Table1" r:id="rId1"/></cacheSource><cacheFields count="3"><cacheField name="Region" numFmtId="0"/><cacheField name="Product" numFmtId="0"/><cacheField name="Sales" numFmtId="0"/></cacheFields></pivotCacheDefinition>"#;
+        let pkg = load_xlsx(&pivot_fixture_with("Data", pivot_table, cache)).unwrap();
+        assert!(pkg.workbook.pivots[0].unsupported);
+        let saved = save_xlsx(&pkg);
+        assert_eq!(
+            saved_part(&saved, "xl/pivotCache/pivotCacheDefinition1.xml"),
+            cache
         );
     }
 
