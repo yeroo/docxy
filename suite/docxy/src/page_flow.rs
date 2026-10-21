@@ -4,6 +4,7 @@
 //! every rule here (section splitting, geometry, `w:type` starts, balancing).
 
 use docxcore::model::Block;
+use docxcore::page_num::{PageNumFmt, chapter_prefix, clamp_start};
 use docxcore::sect::{PageNumberFormat, SectionSetup, SectionStart};
 
 /// Word's limit on newspaper columns in a section (export.rs `MAX_COLS`).
@@ -28,6 +29,11 @@ pub(crate) struct SectionBox {
     pub col_gap: Vec<i32>,
     pub sep: bool,
     pub num_start: Option<i32>,
+    /// `w:pgNumType w:fmt` for the section's PAGE fields.
+    pub num_fmt: PageNumFmt,
+    /// `w:chapStyle`/`w:chapSep`: the heading level and separator that prefix
+    /// the section's page numbers.
+    pub chapter: Option<(u8, &'static str)>,
     /// `w:lnNumType` for the section's paragraphs, if the section numbers
     /// its lines (#746).
     pub line_numbers: Option<docxcore::sect::LineNumbering>,
@@ -60,6 +66,9 @@ pub(crate) struct Band {
 pub(crate) struct Page {
     pub bands: Vec<Band>,
     pub filler: bool,
+    /// The page's number (`w:pgNumType w:start` restarts included; a filler
+    /// takes one), as export.rs numbers it.
+    pub number: i32,
 }
 
 /// The sections of a body and the pages they flow into.
@@ -82,6 +91,11 @@ impl PageFlow {
                     .collect()
             })
             .collect()
+    }
+
+    /// Each page's number.
+    pub(crate) fn numbers(&self) -> Vec<i32> {
+        self.pages.iter().map(|p| p.number).collect()
     }
 
     /// Whether each page is a blank filler sheet.
@@ -166,6 +180,7 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
                 .collect(),
         )
     };
+    let numfmt = PageNumberFormat::parse(sect);
     SectionBox {
         start: setup.start,
         w: setup.page.w,
@@ -177,7 +192,9 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
         col_w,
         col_gap,
         sep: cols.sep,
-        num_start: PageNumberFormat::parse(sect).start,
+        num_start: numfmt.start.map(clamp_start),
+        num_fmt: PageNumFmt::from_attr(numfmt.fmt.as_deref()),
+        chapter: chapter_prefix(&numfmt),
         line_numbers: setup.line_numbers,
     }
 }
@@ -243,6 +260,7 @@ impl BandB {
 
 /// A page while its bands are being filled.
 struct PageB {
+    number: i32,
     /// Closed bands; the first owns the sheet.
     bands: Vec<Band>,
     /// The band being filled.
@@ -252,8 +270,9 @@ struct PageB {
 }
 
 impl PageB {
-    fn new(section: usize, pos: usize) -> Self {
+    fn new(number: i32, section: usize, pos: usize) -> Self {
         PageB {
+            number,
             bands: Vec::new(),
             open: BandB::new(section, pos),
             used_h: 0.0,
@@ -343,7 +362,7 @@ impl<'a> Flow<'a> {
             self.next_number
         };
         self.next_number = number.saturating_add(1);
-        self.cur = Some(PageB::new(section, pos));
+        self.cur = Some(PageB::new(number, section, pos));
     }
 
     /// Close the open band into the page's band list; `balanced` when a
@@ -397,6 +416,7 @@ impl<'a> Flow<'a> {
             self.pages.push(Page {
                 bands: page.bands,
                 filler: false,
+                number: page.number,
             });
         }
     }
@@ -540,13 +560,15 @@ pub(crate) fn flow(body: &[Block], last_sect: &str, gutter_at_top: bool) -> Page
                 if (num % 2 == 1) != want_odd {
                     // The filler belongs to the previous section, like
                     // export.rs `new_page(i - 1, false, true)`.
-                    f.next_number = f.next_number.saturating_add(1);
+                    let number = f.next_number;
+                    f.next_number = number.saturating_add(1);
                     f.pages.push(Page {
                         bands: vec![Band {
                             section: i - 1,
                             cols: vec![(range.start, range.start)],
                         }],
                         filler: true,
+                        number,
                     });
                 }
                 f.open_page(i, range.start, true);

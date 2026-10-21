@@ -174,7 +174,7 @@ fn section_breaks_start_pages_unless_the_next_section_is_continuous() {
     let pf = page_flow::flow(body, &last, false);
     assert_eq!(pf.pages.len(), 3, "{:?}", pf.ranges());
     let firsts = page_flow::first_blocks(&pf.ranges());
-    let slots = page_slots(ed(&t), &firsts, false);
+    let slots = page_slots(ed(&t), &firsts, &[1, 2, 3], false);
     let secs: Vec<usize> = slots.iter().map(|s| s.section).collect();
     assert_eq!(secs, vec![0, 1, 2]);
 
@@ -225,7 +225,7 @@ fn every_page_resolves_its_own_sections_header() {
     let t = three_sections("per-page", true);
     let pkg = t.pkg.as_ref().unwrap();
     let parts = resolve(ed(&t), pkg);
-    let slots = page_slots(ed(&t), &[0, 1, 2], false);
+    let slots = page_slots(ed(&t), &[0, 1, 2], &[1, 2, 3], false);
     let shown: Vec<String> = slots
         .iter()
         .map(|s| part_text(pkg, slot_part(&parts, *s, true).unwrap()))
@@ -256,7 +256,7 @@ fn page_variants_follow_title_page_per_section_and_even_pages() {
     let mut t = three_sections("variants", true);
     ed_mut(&mut t).edit_sections(&[1], |raw| docxcore::sect::set_flag(raw, "w:titlePg", true));
     // Pages: s0, s1 (first), s1, s2.
-    let slots = page_slots(ed(&t), &[0, 1, 1, 2], true);
+    let slots = page_slots(ed(&t), &[0, 1, 1, 2], &[1, 2, 3, 4], true);
     let got: Vec<(usize, HeaderVariant)> = slots.iter().map(|s| (s.section, s.variant)).collect();
     assert_eq!(
         got,
@@ -270,8 +270,36 @@ fn page_variants_follow_title_page_per_section_and_even_pages() {
     assert_eq!(edit_page(&slots, 1, HeaderVariant::Default), 2);
     assert_eq!(edit_page(&slots, 2, HeaderVariant::First), 3, "falls back");
     // One page with even/odd on has no even page.
-    let one = page_slots(ed(&t), &[0], true);
+    let one = page_slots(ed(&t), &[0], &[1], true);
     assert_eq!(one[0].variant, HeaderVariant::Default);
+}
+
+/// #1437: the even header follows the page's own number (a `w:start` of 2
+/// makes the first page even, as export.rs counts), not its place in the
+/// document.
+#[test]
+fn even_headers_follow_the_pages_own_number() {
+    let t = three_sections("start-two", true);
+    let even = |numbers: &[i32]| -> Vec<HeaderVariant> {
+        page_slots(ed(&t), &[0, 1, 2], numbers, true)
+            .iter()
+            .map(|s| s.variant)
+            .collect()
+    };
+    use HeaderVariant::{Default as D, Even as E};
+    assert_eq!(even(&[1, 2, 3]), vec![D, E, D]);
+    assert_eq!(even(&[2, 3, 4]), vec![E, D, E]);
+    // A restart in the middle: pages 1, 2 then 5.
+    assert_eq!(even(&[1, 2, 5]), vec![D, E, D]);
+    // A filler keeping its odd/even slot by number, not by position.
+    let mut slots = page_slots(ed(&t), &[0, 1, 2], &[1, 2, 3], false);
+    slots[1].variant = HeaderVariant::First;
+    demote_filler_firsts(&mut slots, &[false, true, false], &[2, 4, 5], true);
+    assert_eq!(slots[1].variant, E);
+    let mut slots = page_slots(ed(&t), &[0, 1, 2], &[1, 2, 3], false);
+    slots[1].variant = HeaderVariant::First;
+    demote_filler_firsts(&mut slots, &[false, true, false], &[1, 3, 4], true);
+    assert_eq!(slots[1].variant, D);
 }
 
 /// PAG-CASE-019 / #640: the caret in "Two" edits the header section 2

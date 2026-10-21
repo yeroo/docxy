@@ -352,6 +352,30 @@
   is Field's). Alt+Shift+D / T insert a DATE / TIME field
   (`doc_fields::doc_insert_key`).
 
+## Live page fields (#1437)
+
+- `docxcore::page_num` is the one rule for a page's PAGE text: `PageNumFmt`
+  (`w:fmt`; roman and letters, anything else decimal), `clamp_start` (0 to
+  32767), `chapter_prefix`, `page_chapters` (the first heading of the
+  chapStyle level on the page, else the last one before it, carried across
+  sections; an unnumbered heading is `None`, so the plain number shows),
+  `page_text` and `page_field_kind`. `export.rs` uses them, and
+  `export::page_labels` is the oracle the suite is tested against.
+  `numbering::heading_chapters` is `heading_numbers` by top-level body block.
+- The suite's `Page` carries its `number` (restarts and fillers included).
+  `page_fields::page_values` turns a `PageFlow` plus the headings into a
+  `PageVals` per page; the page view's headers and footers (the editable one
+  and the read-only copies) draw them through `RenderCtx::page_vals` /
+  `field_live`, which changes only the drawn text and width (the cached
+  result, the field's one offset and the caret are untouched). Field codes
+  still show the code, body fields keep their cached text (`None`), and the
+  chapter pass (numbering part parse, `heading_chapters`) runs per frame only
+  when some section has `chapStyle`.
+- Different Odd & Even headers (`hf::page_slots`, `demote_filler_firsts`) and
+  `FrameGeom.even` use the page's number, not its place in the document, as
+  export.rs does, so `w:start="2"` makes the first page even. No harness verb
+  reads drawn header text, so there is no `.uit` case.
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)

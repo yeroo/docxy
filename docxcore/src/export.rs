@@ -31,6 +31,10 @@ use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
 use crate::numbering::Numbering;
 use crate::package::{HeaderVariant, Package, SectionParts, TextWatermark, section_header_parts};
+use crate::page_num::{
+    MAX_PAGE_START, PageField, PageNumFmt, chapter_prefix, page_chapters, page_field_kind,
+    page_text,
+};
 use crate::pdf_font::{PdfFontProvider, PdfReport};
 use crate::render::{BidiBaseDirection, BidiInputGlyph, BidiProjector, BidiRunDirection};
 use crate::sect::LnRestart;
@@ -166,6 +170,19 @@ pub fn to_pdf(doc: &Document, opts: &PdfOptions) -> Vec<u8> {
     to_pdf_report(doc, opts).0
 }
 
+/// The PAGE text of every page the export lays out, in order (what its footer
+/// shows for `PAGE`: format, restart and chapter prefix applied): the oracle
+/// the suite's page view is held to.
+pub fn page_labels(doc: &Document, opts: &PdfOptions) -> Vec<String> {
+    Pager::run(doc, opts)
+        .into_iter()
+        .map(|p| {
+            let [page, ..] = p.values;
+            page
+        })
+        .collect()
+}
+
 /// [`to_pdf`], and what the export had to leave out (characters no face
 /// covers).
 pub fn to_pdf_report(doc: &Document, opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
@@ -204,15 +221,6 @@ enum PageVAlign {
     Bottom,
     /// Justified: the paragraphs spread to fill the page.
     Both,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumFmt {
-    Decimal,
-    LowerRoman,
-    UpperRoman,
-    LowerLetter,
-    UpperLetter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +266,7 @@ struct SectionLayout {
     col_sep: bool,
     valign: PageVAlign,
     title_pg: bool,
-    num_fmt: NumFmt,
+    num_fmt: PageNumFmt,
     num_start: Option<u32>,
     /// `w:chapStyle`/`w:chapSep`: the heading level whose number prefixes
     /// the page number, and the separator between them.
@@ -315,9 +323,6 @@ fn num_attr(el: &str, key: &str) -> Option<f32> {
 
 /// Word's limit on newspaper columns in a section.
 const MAX_COLS: usize = 45;
-/// Word's largest starting page number (`w:pgNumType w:start`).
-const MAX_PAGE_START: f32 = 32767.0;
-
 /// An on/off element in `xml` (`w:titlePg`, `w:pageBreakBefore`, …).
 fn flag_on(xml: &str, elem: &str) -> bool {
     crate::package::settings_flag_of(xml, elem).unwrap_or(false)
@@ -409,19 +414,14 @@ impl SectionLayout {
             _ => PageVAlign::Top,
         };
         let num_type = start_tag(sect, "w:pgNumType");
-        let num_fmt = match num_type
-            .and_then(|el| xml_attr_value(el, "w:fmt"))
-            .as_deref()
-        {
-            Some("lowerRoman") => NumFmt::LowerRoman,
-            Some("upperRoman") => NumFmt::UpperRoman,
-            Some("lowerLetter") => NumFmt::LowerLetter,
-            Some("upperLetter") => NumFmt::UpperLetter,
-            _ => NumFmt::Decimal,
-        };
+        let num_fmt = PageNumFmt::from_attr(
+            num_type
+                .and_then(|el| xml_attr_value(el, "w:fmt"))
+                .as_deref(),
+        );
         let num_start = num_type
             .and_then(|el| num_attr(el, "w:start"))
-            .map(|n| n.clamp(0.0, MAX_PAGE_START) as u32);
+            .map(|n| n.clamp(0.0, MAX_PAGE_START as f32) as u32);
         let start = match start_tag(sect, "w:type")
             .and_then(|el| xml_attr_value(el, "w:val"))
             .as_deref()
@@ -529,71 +529,6 @@ fn parse_page_borders(sect: &str) -> PageBorders {
     out
 }
 
-/// A section's chapter prefix (`w:chapStyle`, `w:chapSep`): the heading
-/// level, 1 to 9 (any other is ignored), and the separator Word draws for
-/// `w:chapSep`, a hyphen when absent or unknown.
-fn chapter_prefix(format: &crate::sect::PageNumberFormat) -> Option<(u8, &'static str)> {
-    let level = u8::try_from(format.chap_style?)
-        .ok()
-        .filter(|l| (1..=9).contains(l))?;
-    let sep = match format.chap_sep.as_deref() {
-        Some("period") => ".",
-        Some("colon") => ":",
-        Some("emDash") => "\u{2014}",
-        Some("enDash") => "\u{2013}",
-        _ => "-",
-    };
-    Some((level, sep))
-}
-
-fn format_page_number(n: u32, fmt: NumFmt) -> String {
-    match fmt {
-        NumFmt::Decimal => n.to_string(),
-        NumFmt::LowerRoman => roman(n).to_lowercase(),
-        NumFmt::UpperRoman => roman(n),
-        NumFmt::LowerLetter => letters(n).to_lowercase(),
-        NumFmt::UpperLetter => letters(n),
-    }
-}
-
-fn roman(mut n: u32) -> String {
-    if n == 0 {
-        return "0".to_string();
-    }
-    const TABLE: [(u32, &str); 13] = [
-        (1000, "M"),
-        (900, "CM"),
-        (500, "D"),
-        (400, "CD"),
-        (100, "C"),
-        (90, "XC"),
-        (50, "L"),
-        (40, "XL"),
-        (10, "X"),
-        (9, "IX"),
-        (5, "V"),
-        (4, "IV"),
-        (1, "I"),
-    ];
-    let mut out = String::new();
-    for (value, digits) in TABLE {
-        while n >= value {
-            out.push_str(digits);
-            n -= value;
-        }
-    }
-    out
-}
-
-/// Word's letter numbering: A..Z, then AA..ZZ, AAA.. (the letter repeats).
-fn letters(n: u32) -> String {
-    if n == 0 {
-        return "0".to_string();
-    }
-    let letter = char::from(b'A' + ((n - 1) % 26) as u8);
-    std::iter::repeat_n(letter, ((n - 1) / 26 + 1) as usize).collect()
-}
-
 /// Split the body into sections: a paragraph with a `section_break` ends one;
 /// the rest is the final section, described by the trailing sectPr.
 fn split_sections<'d>(
@@ -621,28 +556,6 @@ fn split_sections<'d>(
 }
 
 // ---- layout ----
-
-/// A page-dependent field, substituted when the page is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageField {
-    Page,
-    NumPages,
-    SectionPages,
-}
-
-fn page_field_kind(instr: &str) -> Option<PageField> {
-    match instr
-        .split_whitespace()
-        .next()?
-        .to_ascii_uppercase()
-        .as_str()
-    {
-        "PAGE" => Some(PageField::Page),
-        "NUMPAGES" => Some(PageField::NumPages),
-        "SECTIONPAGES" => Some(PageField::SectionPages),
-        _ => None,
-    }
-}
 
 /// How wide text prints. Layout and the writer both measure through this, so
 /// they agree. Without a font provider the built-in Courier face is a fixed
@@ -1841,23 +1754,12 @@ impl<'a> Pager<'a> {
     /// `None` without such a heading, or when that heading is unnumbered,
     /// and the page shows its plain number.
     fn page_chapters(&self) -> Vec<Option<String>> {
-        let mut last: [Option<&str>; 10] = Default::default();
-        let mut out = Vec::with_capacity(self.pages.len());
-        for page in &self.pages {
-            let chapter = self.sects[page.sect].chapter.and_then(|(level, _)| {
-                match page.chapters.iter().find(|(l, _)| *l == level) {
-                    Some((_, text)) => text.as_deref(),
-                    None => last[usize::from(level)],
-                }
-            });
-            out.push(chapter.map(str::to_string));
-            for (level, text) in &page.chapters {
-                if let Some(slot) = last.get_mut(usize::from(*level)) {
-                    *slot = text.as_deref();
-                }
-            }
-        }
-        out
+        page_chapters(self.pages.iter().map(|page| {
+            (
+                self.sects[page.sect].chapter.map(|(level, _)| level),
+                &page.chapters[..],
+            )
+        }))
     }
 
     fn mark_low(&mut self) {
@@ -1912,12 +1814,8 @@ impl<'a> Pager<'a> {
                 ));
             }
             let section_pages = |sect: usize| per_section.get(&sect).copied().unwrap_or(1);
-            let number = format_page_number(page.number, s.num_fmt);
             page.values = [
-                match (chapter, s.chapter) {
-                    (Some(chapter), Some((_, sep))) => format!("{chapter}{sep}{number}"),
-                    _ => number,
-                },
+                page_text(page.number, s.num_fmt, chapter.as_deref(), s.chapter),
                 total.to_string(),
                 section_pages(page.sect).to_string(),
             ];
@@ -3916,9 +3814,6 @@ mod tests {
         assert_eq!(value(&pages[0]), "1");
         assert_eq!(value(&pages[1]), "v");
         assert_eq!(value(&pages[2]), "vi");
-        assert_eq!(format_page_number(28, NumFmt::UpperLetter), "BB");
-        assert_eq!(format_page_number(3, NumFmt::LowerLetter), "c");
-        assert_eq!(format_page_number(14, NumFmt::UpperRoman), "XIV");
     }
 
     #[test]

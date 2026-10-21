@@ -468,6 +468,43 @@ pub(crate) fn heading_numbers(
     out
 }
 
+/// [`heading_numbers`] by top-level body block: `(block index, heading level,
+/// chapter number or `None` when unnumbered)` in document order. A heading
+/// inside a table belongs to the table's block. For hosts that place pages by
+/// body block and cannot hold the paragraph addresses the map is keyed by.
+pub fn heading_chapters(
+    doc: &Document,
+    num: &Numbering,
+    styles: &StyleSheet,
+) -> Vec<(usize, u8, Option<String>)> {
+    fn paragraphs<'a>(blocks: &'a [Block], out: &mut Vec<&'a Paragraph>) {
+        for block in blocks {
+            match block {
+                Block::Paragraph(p) => out.push(p),
+                Block::Table(t) => {
+                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                        paragraphs(&cell.blocks, out);
+                    }
+                }
+                Block::SectionProperties(_) | Block::Raw(_) => {}
+            }
+        }
+    }
+    let map = heading_numbers(doc, num, styles);
+    let mut out = Vec::new();
+    let mut ps = Vec::new();
+    for (i, block) in doc.body.iter().enumerate() {
+        ps.clear();
+        paragraphs(std::slice::from_ref(block), &mut ps);
+        for p in &ps {
+            if let Some((level, text)) = map.get(&(*p as *const Paragraph)) {
+                out.push((i, *level, text.clone()));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +646,40 @@ mod tests {
     /// A heading with no number.
     fn bare(level: u8) -> Option<(u8, Option<String>)> {
         Some((level, None))
+    }
+
+    #[test]
+    fn heading_chapters_are_by_top_level_block() {
+        let table = Block::Table(crate::model::Table {
+            rows: vec![crate::model::Row {
+                cells: vec![crate::model::Cell {
+                    blocks: vec![styled("Heading1", Some(1))],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let doc = Document {
+            body: vec![
+                styled("Normal", None),
+                styled("Heading1", Some(1)),
+                table,
+                styled("Heading2", Some(2)),
+                styled("Plain", Some(1)),
+            ],
+        };
+        let num = parse_numbering_xml(OUTLINE_XML);
+        let styles = crate::styles::parse_styles_xml(OUTLINE_STYLES);
+        assert_eq!(
+            heading_chapters(&doc, &num, &styles),
+            vec![
+                (1, 1, Some("1".to_string())),
+                (2, 1, Some("2".to_string())),
+                (3, 2, Some("2.1".to_string())),
+                (4, 1, None),
+            ]
+        );
     }
 
     #[test]

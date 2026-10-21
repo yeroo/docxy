@@ -28,9 +28,16 @@ pub(crate) fn resolve(ed: &Editor, pkg: &Package) -> Vec<SectionParts> {
 /// The page slot of each page, given each page's first body block. A page
 /// belongs to the section of its first block; the section's first page shows
 /// the first-page variant when the section has Different First Page
-/// (`w:titlePg`), and with Different Odd & Even Pages every even page number
-/// (counted through the whole document) shows the even variant.
-pub(crate) fn page_slots(ed: &Editor, first_blocks: &[usize], even_odd: bool) -> Vec<PageSlot> {
+/// (`w:titlePg`), and with Different Odd & Even Pages every page whose number
+/// is even shows the even variant. `numbers` are the pages' own numbers
+/// (`w:pgNumType w:start` restarts included, as export.rs counts them); a page
+/// without one counts from the top of the document.
+pub(crate) fn page_slots(
+    ed: &Editor,
+    first_blocks: &[usize],
+    numbers: &[i32],
+    even_odd: bool,
+) -> Vec<PageSlot> {
     let sections = ed.sections();
     let mut out = Vec::with_capacity(first_blocks.len());
     let mut prev_section = None;
@@ -45,7 +52,7 @@ pub(crate) fn page_slots(ed: &Editor, first_blocks: &[usize], even_odd: bool) ->
             .is_some_and(|s| has_flag(s, "w:titlePg"));
         let variant = if first_of_section && title_pg {
             HeaderVariant::First
-        } else if even_odd && (pi + 1).is_multiple_of(2) {
+        } else if even_odd && page_is_even(numbers, pi) {
             HeaderVariant::Even
         } else {
             HeaderVariant::Default
@@ -53,6 +60,16 @@ pub(crate) fn page_slots(ed: &Editor, first_blocks: &[usize], even_odd: bool) ->
         out.push(PageSlot { section, variant });
     }
     out
+}
+
+/// Whether page `pi` carries an even number.
+fn page_is_even(numbers: &[i32], pi: usize) -> bool {
+    numbers
+        .get(pi)
+        .copied()
+        .unwrap_or_else(|| i32::try_from(pi + 1).unwrap_or(i32::MAX))
+        % 2
+        == 0
 }
 
 /// The header (`is_header`) or footer part a page slot shows, if any.
@@ -76,7 +93,7 @@ pub(crate) fn edit_page(slots: &[PageSlot], section: usize, variant: HeaderVaria
 
 /// The blank sheet an oddPage/evenPage section start inserts must not take a
 /// section's First variant (`w:titlePg`): demote any a filler was given to
-/// Default, or to Even under Different Odd & Even when its physical page is
+/// Default, or to Even under Different Odd & Even when its page number is
 /// even. Called on the slots both page-slot consumers build.
 /// The slot each page of `pf` shows: the page's first body block (an empty
 /// range, a blank odd/even filler, takes the previous block) picks the
@@ -88,19 +105,25 @@ pub(crate) fn slots_of(
     even_odd: bool,
 ) -> Vec<PageSlot> {
     let firsts = crate::page_flow::first_blocks(&pf.ranges());
-    let mut slots = page_slots(ed, &firsts, even_odd);
-    demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
+    let numbers = pf.numbers();
+    let mut slots = page_slots(ed, &firsts, &numbers, even_odd);
+    demote_filler_firsts(&mut slots, &pf.fillers(), &numbers, even_odd);
     slots
 }
 
-pub(crate) fn demote_filler_firsts(slots: &mut [PageSlot], fillers: &[bool], even_odd: bool) {
+pub(crate) fn demote_filler_firsts(
+    slots: &mut [PageSlot],
+    fillers: &[bool],
+    numbers: &[i32],
+    even_odd: bool,
+) {
     for (pi, is_filler) in fillers.iter().copied().enumerate() {
         if !is_filler {
             continue;
         }
         if let Some(slot) = slots.get_mut(pi) {
             if slot.variant == HeaderVariant::First {
-                slot.variant = if even_odd && (pi + 1).is_multiple_of(2) {
+                slot.variant = if even_odd && page_is_even(numbers, pi) {
                     HeaderVariant::Even
                 } else {
                     HeaderVariant::Default
