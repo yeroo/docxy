@@ -19757,7 +19757,8 @@ impl Docxy {
     /// anchor cell (the exit commit's rules — an untouched bar, or one whose
     /// text the anchor's note already holds, writes nothing), then the bar
     /// closes. No-op when the bar is closed. A cell click, right-click, a
-    /// Name Box click, Previous/Next Comment and a row/column insert/delete all leave it;
+    /// Name Box click, Go To / Go To Special (as the dialog opens),
+    /// Previous/Next Comment and a row/column insert/delete all leave it;
     /// the window-close exit commit (`commit_dialog_buffers_for_exit`) is
     /// this same leave.
     pub(crate) fn sheet_comment_bar_leave(&mut self) {
@@ -22563,15 +22564,24 @@ impl Docxy {
             SheetAct::Clear(gridcore::edit::ClearWhat::Contents) => self.sheet_clear(cx),
             SheetAct::Clear(what) => self.sheet_clear_what(what, cx),
             SheetAct::GoTo | SheetAct::GoToSpecial => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    let d = if act == SheetAct::GoTo {
+                let built = self.tabs.get_mut(self.active).map(|tab| {
+                    if act == SheetAct::GoTo {
                         sheet_goto::goto_dialog(tab)
                     } else {
                         sheet_goto::special_dialog(tab)
-                    };
-                    match d {
-                        Ok(d) => tab.dialogs.push(d),
-                        Err(e) => tab.status = e.into(),
+                    }
+                });
+                // Go To moves the selection when it is confirmed: the bar
+                // leaves as a cell click does, but only once the dialog really
+                // opens, so a refused Go To keeps the typed text.
+                if matches!(built, Some(Ok(_))) {
+                    self.sheet_comment_bar_leave();
+                }
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    match built {
+                        Some(Ok(d)) => tab.dialogs.push(d),
+                        Some(Err(e)) => tab.status = e.into(),
+                        None => {}
                     }
                 }
                 cx.notify();
