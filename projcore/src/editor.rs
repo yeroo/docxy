@@ -2989,13 +2989,13 @@ mod tests {
         let xml = crate::mspdi::write_mspdi(ed.project());
         assert_eq!(
             crate::mspdi::read_mspdi(&xml).unwrap().tasks,
-            crate::mspdi::with_scheduled_dates(ed.project()).tasks
+            crate::mspdi::with_rescheduled_dates(ed.project()).tasks
         );
         assert_eq!(
             crate::yppx::read_yppx(&crate::yppx::write_yppx(ed.project()).unwrap())
                 .unwrap()
                 .tasks,
-            crate::mspdi::with_scheduled_dates(ed.project()).tasks
+            crate::mspdi::with_rescheduled_dates(ed.project()).tasks
         );
     }
 
