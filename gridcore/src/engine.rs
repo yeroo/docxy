@@ -1431,6 +1431,15 @@ impl Engine {
         );
     }
 
+    /// Whether any formula is volatile (`NOW`, `TODAY`, `RAND`, a volatile
+    /// name, ...); see [`crate::calc::open_volatile`].
+    pub(crate) fn has_volatile(&mut self) -> bool {
+        self.ensure_flagged();
+        self.flagged
+            .as_ref()
+            .is_some_and(|f| !f.volatile.is_empty())
+    }
+
     /// The keys of the volatile formulas and of those with a spill reference,
     /// a pure function of `formulas`; built on first use, dropped by
     /// [`Engine::invalidate_rev`] together with `rev`.

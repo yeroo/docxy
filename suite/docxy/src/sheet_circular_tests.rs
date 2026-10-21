@@ -33,7 +33,7 @@ impl Book {
 
     /// The workbook opened as File › Open opens it.
     fn open(&self) -> DocTab {
-        sheet_tab_from_path(&self.0, false)
+        sheet_tab_from_path(&self.0, false, false)
     }
 }
 

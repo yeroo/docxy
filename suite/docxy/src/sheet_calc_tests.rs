@@ -3,8 +3,9 @@
 //! ribbon and the F9 keys.
 
 use super::*;
-use crate::{Kind, SheetAct, multi_area_ok, new_sheet_surface, protected_view_allows_act};
+use crate::{Kind, OpenMode, tab_from_path_mode, SheetAct, multi_area_ok, new_sheet_surface, protected_view_allows_act};
 use ctlcore::json::Json;
+use crate::trusted::TrustStore;
 use gridcore::sheet::CellValue;
 
 fn tab() -> DocTab {
@@ -590,4 +591,107 @@ fn calculate_now_and_sheet_leave_a_pending_cut_and_the_fill_buttons_alone() {
     assert_eq!(v.edit_gen, before, "no undo step, no edit");
     assert!(!clip.stale_in(v), "the cut is still pending");
     assert!(v.cut_still_live(&clip));
+}
+
+/// A saved workbook: A1 `=NOW()` and B1 `=A1+1` cached at serial 100 (long
+/// stale), A2 a plain `=5*2` cached as 10, in `mode`.
+fn volatile_file(name: &str, mode: CalcMode) -> std::path::PathBuf {
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    pkg.workbook.calc.mode = mode;
+    let sh = &mut pkg.workbook.sheets[0];
+    for (r, f, v) in [(0, "NOW()", 100.0), (1, "5*2", 10.0)] {
+        let mut c = gridcore::sheet::Cell::formula(f);
+        c.value = CellValue::Number(v);
+        sh.set_cell(r, 0, c);
+    }
+    let mut dep = gridcore::sheet::Cell::formula("A1+1");
+    dep.value = CellValue::Number(101.0);
+    sh.set_cell(0, 1, dep);
+    let path = std::env::temp_dir().join(format!("docxy-805-{name}-{}.xlsx", std::process::id()));
+    std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    path
+}
+
+fn number(t: &mut DocTab, cell: &str) -> f64 {
+    match value(t, cell) {
+        CellValue::Number(n) => n,
+        other => panic!("{cell}: {other:?}"),
+    }
+}
+
+fn open_file(path: &std::path::Path, mode: OpenMode) -> DocTab {
+    let tab = tab_from_path_mode(&path.to_path_buf(), mode, &TrustStore::default()).unwrap();
+    let _ = std::fs::remove_file(path);
+    tab
+}
+
+#[test]
+fn opening_a_workbook_with_now_recalculates_it_and_leaves_the_tab_dirty() {
+    let mut t = open_file(&volatile_file("auto", CalcMode::Auto), OpenMode::Normal);
+    assert!(number(&mut t, "A1") > 40000.0, "NOW() is the clock, not 100");
+    assert_eq!(number(&mut t, "B1"), number(&mut t, "A1") + 1.0);
+    assert!(t.dirty);
+}
+
+#[test]
+fn a_read_only_open_with_now_is_dirty_too() {
+    let t = open_file(&volatile_file("ro", CalcMode::Auto), OpenMode::ReadOnly);
+    assert!(t.dirty);
+}
+
+#[test]
+fn a_workbook_with_no_volatile_formula_opens_clean() {
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    let mut c = gridcore::sheet::Cell::formula("5*2");
+    c.value = CellValue::Number(99.0);
+    pkg.workbook.sheets[0].set_cell(0, 0, c);
+    let path = std::env::temp_dir().join(format!("docxy-805-plain-{}.xlsx", std::process::id()));
+    std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    let mut t = open_file(&path, OpenMode::Normal);
+    assert_eq!(number(&mut t, "A1"), 99.0, "an automatic file keeps its cache");
+    assert!(!t.dirty);
+}
+
+#[test]
+fn a_manual_workbook_with_now_opens_clean() {
+    let mut t = open_file(&volatile_file("manual", CalcMode::Manual), OpenMode::Normal);
+    assert!(number(&mut t, "A1") > 40000.0, "load_fresh calculates it in full");
+    assert!(!t.dirty);
+}
+
+#[test]
+fn a_reload_keeps_the_cached_now_and_a_load_without_the_flag_is_clean() {
+    // Protected View's load, the rollback, hot exit: `fresh_volatile` off.
+    let path = volatile_file("cached", CalcMode::Auto);
+    let mut t = crate::sheet_tab_from_path(&path, false, false);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(number(&mut t, "A1"), 100.0);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn a_formula_with_no_cached_value_is_calculated_and_still_counts() {
+    // `has_uncached_formula` already ran `recalc_all`; the volatile pass is
+    // not a second evaluation, but the open is still a change.
+    let mut pkg = gridcore::xlsx::new_xlsx();
+    let sh = &mut pkg.workbook.sheets[0];
+    sh.set_cell(0, 0, gridcore::sheet::Cell::formula("NOW()"));
+    let path = std::env::temp_dir().join(format!("docxy-805-nocache-{}.xlsx", std::process::id()));
+    std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
+    let mut t = open_file(&path, OpenMode::Normal);
+    assert!(number(&mut t, "A1") > 40000.0);
+    assert!(t.dirty);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_protected_workbook_keeps_its_cached_now_and_stays_clean() {
+    let path = volatile_file("protected", CalcMode::Auto);
+    if crate::open_mode_tests::mark_downloaded(&path).is_none() {
+        return;
+    }
+    let mut t = open_file(&path, OpenMode::Normal);
+    assert!(t.access.protected);
+    assert_eq!(number(&mut t, "A1"), 100.0);
+    assert!(!t.dirty);
 }
