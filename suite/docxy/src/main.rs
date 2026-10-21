@@ -12460,11 +12460,7 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
 /// recalculation of the volatile formulas of an automatic workbook (#805):
 /// the last value is true when it ran, which is a change. Reloads (rollback,
 /// hot exit, Protected View) pass false and keep the cached values.
-fn sheet_load(
-    path: &PathBuf,
-    repair: bool,
-    fresh_volatile: bool,
-) -> (Surface, SharedString, bool) {
+fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, SharedString, bool) {
     let loaded = |bytes: &[u8]| {
         if repair {
             gridcore::xlsx::load_xlsx_repair(bytes)
@@ -12554,16 +12550,22 @@ fn sheet_load(
                 (Surface::Sheet(view), status.into(), recalculated)
             }
             // A repair's refusal names the part, in words.
-            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => {
-                (Surface::Placeholder, format!("xlsx load error: {e}").into(), false)
-            }
+            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => (
+                Surface::Placeholder,
+                format!("xlsx load error: {e}").into(),
+                false,
+            ),
             Err(e) => (
                 Surface::Placeholder,
                 format!("xlsx load error: {e:?}").into(),
                 false,
             ),
         },
-        Err(e) => (Surface::Placeholder, format!("read error: {e}").into(), false),
+        Err(e) => (
+            Surface::Placeholder,
+            format!("read error: {e}").into(),
+            false,
+        ),
     }
 }
 

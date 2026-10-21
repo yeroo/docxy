@@ -3,9 +3,12 @@
 //! ribbon and the F9 keys.
 
 use super::*;
-use crate::{Kind, OpenMode, tab_from_path_mode, SheetAct, multi_area_ok, new_sheet_surface, protected_view_allows_act};
-use ctlcore::json::Json;
 use crate::trusted::TrustStore;
+use crate::{
+    Kind, OpenMode, SheetAct, multi_area_ok, new_sheet_surface, protected_view_allows_act,
+    tab_from_path_mode,
+};
+use ctlcore::json::Json;
 use gridcore::sheet::CellValue;
 
 fn tab() -> DocTab {
@@ -628,7 +631,10 @@ fn open_file(path: &std::path::Path, mode: OpenMode) -> DocTab {
 #[test]
 fn opening_a_workbook_with_now_recalculates_it_and_leaves_the_tab_dirty() {
     let mut t = open_file(&volatile_file("auto", CalcMode::Auto), OpenMode::Normal);
-    assert!(number(&mut t, "A1") > 40000.0, "NOW() is the clock, not 100");
+    assert!(
+        number(&mut t, "A1") > 40000.0,
+        "NOW() is the clock, not 100"
+    );
     assert_eq!(number(&mut t, "B1"), number(&mut t, "A1") + 1.0);
     assert!(t.dirty);
 }
@@ -648,14 +654,21 @@ fn a_workbook_with_no_volatile_formula_opens_clean() {
     let path = std::env::temp_dir().join(format!("docxy-805-plain-{}.xlsx", std::process::id()));
     std::fs::write(&path, gridcore::xlsx::save_xlsx(&pkg)).unwrap();
     let mut t = open_file(&path, OpenMode::Normal);
-    assert_eq!(number(&mut t, "A1"), 99.0, "an automatic file keeps its cache");
+    assert_eq!(
+        number(&mut t, "A1"),
+        99.0,
+        "an automatic file keeps its cache"
+    );
     assert!(!t.dirty);
 }
 
 #[test]
 fn a_manual_workbook_with_now_opens_clean() {
     let mut t = open_file(&volatile_file("manual", CalcMode::Manual), OpenMode::Normal);
-    assert!(number(&mut t, "A1") > 40000.0, "load_fresh calculates it in full");
+    assert!(
+        number(&mut t, "A1") > 40000.0,
+        "load_fresh calculates it in full"
+    );
     assert!(!t.dirty);
 }
 
