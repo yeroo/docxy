@@ -14,7 +14,7 @@ use docxcore::ptab::PtabLeader;
 /// Section 1's header open, the caret at its start.
 fn open_header(t: &mut DocTab) {
     caret_in(t, 0);
-    hf_apply(t, HfAct::Edit(true)).unwrap();
+    hf_apply(t, docxcore::markup::MarkupView::All, HfAct::Edit(true)).unwrap();
     assert!(t.hf_edit.is_some(), "{}", t.status);
 }
 
@@ -797,8 +797,13 @@ fn an_unlinked_copy_of_a_header_keeps_its_picture() {
     let first = part_name(&t);
     exit_hf_tab(&mut t);
     caret_in(&mut t, 1);
-    hf_apply(&mut t, HfAct::Edit(true)).unwrap();
-    hf_apply(&mut t, HfAct::LinkToPrevious).unwrap();
+    hf_apply(&mut t, docxcore::markup::MarkupView::All, HfAct::Edit(true)).unwrap();
+    hf_apply(
+        &mut t,
+        docxcore::markup::MarkupView::All,
+        HfAct::LinkToPrevious,
+    )
+    .unwrap();
     let second = part_name(&t);
     assert_ne!(first, second);
     let pkg = saved(&mut t);

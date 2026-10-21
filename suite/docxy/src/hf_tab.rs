@@ -851,18 +851,16 @@ pub(crate) fn reopen(
 }
 
 /// The slot each print-layout page shows, in page order.
-pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
+pub(crate) fn tab_page_slots(tab: &DocTab, markup: MarkupView) -> Vec<PageSlot> {
     let Surface::Doc(ed) = &tab.surface else {
         return Vec::new();
     };
     let even_odd = tab.pkg.as_ref().is_some_and(|p| p.has_even_odd());
-    // The same flow the status bar counts, over the live editor body (the
-    // render flows the shown markup view, which can paginate differently
-    // under Simple Markup — a recorded pre-existing follow-up, so a header
-    // double-click can resolve against different pagination there). A page's
-    // first body block; an empty range (a blank odd/even filler) takes the
-    // previous block, and a filler never takes a section's First variant.
-    let pf = crate::tab_page_flow(tab, &ed.doc.body);
+    // The flow the render draws: the shown markup view's body, which can
+    // paginate differently from the live one under Simple Markup (#1254). A
+    // page's first body block; an empty range (a blank odd/even filler) takes
+    // the previous block, and a filler never takes a section's First variant.
+    let pf = crate::tab_page_flow(tab, &ed.doc.markup_view(markup).body);
     let firsts = page_flow::first_blocks(&pf.ranges());
     let mut slots = crate::hf::page_slots(ed, &firsts, even_odd);
     hf::demote_filler_firsts(&mut slots, &pf.fillers(), even_odd);
@@ -871,9 +869,9 @@ pub(crate) fn tab_page_slots(tab: &DocTab) -> Vec<PageSlot> {
 
 /// The navigation order Previous and Next walk: each (section, variant) slot
 /// that some page shows, in page order.
-pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
+pub(crate) fn nav_slots(tab: &DocTab, markup: MarkupView) -> Vec<PageSlot> {
     let mut out: Vec<PageSlot> = Vec::new();
-    for slot in tab_page_slots(tab) {
+    for slot in tab_page_slots(tab, markup) {
         if !out.contains(&slot) {
             out.push(slot);
         }
@@ -882,8 +880,8 @@ pub(crate) fn nav_slots(tab: &DocTab) -> Vec<PageSlot> {
 }
 
 /// The slot print-layout page `page` (0-based) shows, if there is one.
-pub(crate) fn page_slot(tab: &DocTab, page: usize) -> Option<PageSlot> {
-    tab_page_slots(tab).get(page).copied()
+pub(crate) fn page_slot(tab: &DocTab, markup: MarkupView, page: usize) -> Option<PageSlot> {
+    tab_page_slots(tab, markup).get(page).copied()
 }
 
 fn variant_rank(v: HeaderVariant) -> u8 {
@@ -895,9 +893,9 @@ fn variant_rank(v: HeaderVariant) -> u8 {
 }
 
 /// The slot Next (`forward`) or Previous moves to from the edited one, if any.
-fn step(tab: &DocTab, forward: bool) -> Option<PageSlot> {
+fn step(tab: &DocTab, markup: MarkupView, forward: bool) -> Option<PageSlot> {
     let h = tab.hf_edit.as_ref()?;
-    let slots = nav_slots(tab);
+    let slots = nav_slots(tab, markup);
     let here = PageSlot {
         section: h.section,
         variant: h.variant,
@@ -915,7 +913,7 @@ fn step(tab: &DocTab, forward: bool) -> Option<PageSlot> {
 /// Run a Header & Footer command that works on the tab alone (every one but
 /// the menus, dialogs and Close). The status says what happened; an error
 /// says why nothing did.
-pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
+pub(crate) fn hf_apply(tab: &mut DocTab, markup: MarkupView, act: HfAct) -> Result<(), String> {
     if tab.pkg.is_none() || !matches!(tab.surface, Surface::Doc(_)) {
         return Err("Headers/footers need a .docx (not a Markdown document)".into());
     }
@@ -969,7 +967,7 @@ pub(crate) fn hf_apply(tab: &mut DocTab, act: HfAct) -> Result<(), String> {
         HfAct::Previous | HfAct::Next => {
             let is_header = is_header_now;
             // At either end, and with no page for the next slot, nothing happens.
-            if let Some(to) = step(tab, act == HfAct::Next) {
+            if let Some(to) = step(tab, markup, act == HfAct::Next) {
                 reopen(tab, to.section, is_header, to.variant);
             }
         }
@@ -1243,7 +1241,7 @@ impl Docxy {
             _ => {
                 let was_open = self.hf_active();
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    if let Err(e) = hf_apply(tab, act) {
+                    if let Err(e) = hf_apply(tab, self.markup, act) {
                         tab.status = e.into();
                     }
                 }
@@ -1270,7 +1268,7 @@ impl Docxy {
         let Some(h) = &tab.hf_edit else {
             return;
         };
-        let slots = tab_page_slots(tab);
+        let slots = tab_page_slots(tab, self.markup);
         self.doc_scroll
             .scroll_to_item(crate::hf::edit_page(&slots, h.section, h.variant));
     }

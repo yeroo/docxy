@@ -390,7 +390,12 @@ fn remove_page_numbers_removes_only_placed_numbers() {
         paras: vec![vec![field()]],
     });
     caret_in(&mut t, 2);
-    crate::hf_tab::hf_apply(&mut t, crate::hf_tab::HfAct::Edit(true)).unwrap();
+    crate::hf_tab::hf_apply(
+        &mut t,
+        docxcore::markup::MarkupView::All,
+        crate::hf_tab::HfAct::Edit(true),
+    )
+    .unwrap();
     t.hf_edit.as_mut().unwrap().editor.paste(&Clip {
         paras: vec![vec![field()]],
     });

@@ -23431,8 +23431,8 @@ impl Docxy {
         if !matches!(tab.surface, Surface::Doc(_)) {
             return Err("the active tab is not a document".into());
         }
-        let slot =
-            hf_tab::page_slot(tab, page).ok_or_else(|| format!("there is no page {}", page + 1))?;
+        let slot = hf_tab::page_slot(tab, self.markup, page)
+            .ok_or_else(|| format!("there is no page {}", page + 1))?;
         if area == PageArea::Body {
             if self.hf_active() {
                 self.exit_hf(window, cx);
