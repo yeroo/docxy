@@ -27,6 +27,8 @@ mod clear;
 mod clip;
 mod goto_special;
 #[cfg(test)]
+mod link_shift_tests;
+#[cfg(test)]
 pub(crate) use clear::apply_clear;
 pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
@@ -2262,6 +2264,41 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
         })
         // A 1×1 "merge" left over after clamping is meaningless.
         .filter(|&(r1, c1, r2, c2)| !(r1 == r2 && c1 == c2))
+        .collect();
+    shift_hyperlinks(sheet, shift);
+}
+
+/// Cell hyperlinks follow their cells (#1455): a link on a deleted or
+/// pushed-off cell goes. A loaded range link ([`Sheet::hyperlink_refs`])
+/// moves with its rectangle when the edit leaves it the same size; one the
+/// edit stretches, shrinks or removes is forgotten, and its cells carry on as
+/// the single-cell links they already are in `hyperlinks`.
+/// `hyperlinks_removed` names elements of the loaded file, so it stays.
+fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
+    let axis = |r: u32, c: u32| if shift.rows { r } else { c };
+    let links = std::mem::take(&mut sheet.hyperlinks);
+    sheet.hyperlinks = links
+        .into_iter()
+        .filter_map(|((r, c), target)| {
+            let moved = point(axis(r, c), shift)?;
+            Some((if shift.rows { (moved, c) } else { (r, moved) }, target))
+        })
+        .collect();
+    let refs = std::mem::take(&mut sheet.hyperlink_refs);
+    sheet.hyperlink_refs = refs
+        .into_values()
+        .filter_map(|(r1, c1, r2, c2)| {
+            let (lo, hi) = (point(axis(r1, c1), shift)?, point(axis(r2, c2), shift)?);
+            if hi - lo != axis(r2, c2) - axis(r1, c1) {
+                return None;
+            }
+            let rect = if shift.rows {
+                (lo, c1, hi, c2)
+            } else {
+                (r1, lo, r2, hi)
+            };
+            Some(((rect.0, rect.1), rect))
+        })
         .collect();
 }
 

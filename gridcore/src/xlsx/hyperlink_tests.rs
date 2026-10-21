@@ -451,3 +451,72 @@ fn new_rids_follow_the_parsed_relationships() {
     assert_links_kept(&pkg, &re);
     assert!(text(&re, SHEET).contains("r:id=\"rId4294967296\""));
 }
+
+/// A loaded sheet with `links` (`<hyperlink>` elements, external ones on
+/// rId1), edited by `edit` and saved: the reloaded links.
+fn links_after(links: &str, edit: impl FnOnce(&mut Workbook)) -> Vec<(String, String)> {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData></sheetData><hyperlinks>{links}</hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    edit(&mut pkg.workbook);
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    re.workbook.sheets[0]
+        .hyperlinks
+        .iter()
+        .map(|(&(r, c), t)| (cell_name(r, c), t.clone()))
+        .collect()
+}
+
+fn at(cell: &str) -> (String, String) {
+    (cell.to_string(), "https://one.example".to_string())
+}
+
+#[test]
+fn a_link_follows_an_inserted_row_through_a_save() {
+    let got = links_after("<hyperlink ref=\"A3\" r:id=\"rId1\"/>", |wb| {
+        crate::edit::insert_rows(wb, 0, 0, 1)
+    });
+    assert_eq!(got, vec![at("A4")]);
+}
+
+#[test]
+fn a_link_follows_a_deleted_row_and_one_in_it_goes() {
+    let links = "<hyperlink ref=\"A3\" r:id=\"rId1\"/><hyperlink ref=\"B5\" r:id=\"rId1\"/>";
+    let got = links_after(links, |wb| crate::edit::delete_rows(wb, 0, 2, 1));
+    assert_eq!(got, vec![at("B4")]);
+}
+
+#[test]
+fn a_link_follows_an_inserted_and_a_deleted_column() {
+    let links = "<hyperlink ref=\"C1\" r:id=\"rId1\"/>";
+    let got = links_after(links, |wb| crate::edit::insert_cols(wb, 0, 0, 2));
+    assert_eq!(got, vec![at("E1")]);
+    let got = links_after(links, |wb| crate::edit::delete_cols(wb, 0, 0, 1));
+    assert_eq!(got, vec![at("B1")]);
+}
+
+#[test]
+fn a_range_link_cut_by_an_insert_is_saved_cell_by_cell() {
+    let got = links_after("<hyperlink ref=\"A1:A3\" r:id=\"rId1\"/>", |wb| {
+        crate::edit::insert_rows(wb, 0, 1, 1)
+    });
+    assert_eq!(got, vec![at("A1"), at("A3"), at("A4")]);
+}
+
+#[test]
+fn a_removed_link_stays_removed_after_a_structural_edit() {
+    let links = "<hyperlink ref=\"A3\" r:id=\"rId1\"/><hyperlink ref=\"B3\" r:id=\"rId1\"/>";
+    let got = links_after(links, |wb| {
+        let s = &mut wb.sheets[0];
+        s.hyperlinks.remove(&(2, 0));
+        s.hyperlink_refs.remove(&(2, 0));
+        s.hyperlinks_removed.push((2, 0, 2, 0));
+        crate::edit::insert_rows(wb, 0, 0, 1);
+    });
+    assert_eq!(got, vec![at("B4")]);
+}
