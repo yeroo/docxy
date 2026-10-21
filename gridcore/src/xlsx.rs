@@ -100,6 +100,9 @@ pub struct SheetPackage {
     pub(crate) parts: Vec<(String, Vec<u8>)>,
     /// Worksheet part name per `workbook.sheets` index.
     pub(crate) sheet_parts: Vec<String>,
+    /// Each Excel 4.0 macro sheet as loaded, by part name: a save writes the
+    /// part back untouched while the sheet still equals it (#616).
+    macro_loaded: std::collections::HashMap<String, Sheet>,
     /// Shared strings as loaded (plain text per `<si>`).
     shared: Vec<String>,
     /// Resolved part name of the workbook's shared-strings table, if it has one
@@ -534,9 +537,10 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
     }
 
     let strict = is_strict_workbook(&wb_xml);
-    Ok(SheetPackage {
+    let mut pkg = SheetPackage {
         parts,
         sheet_parts,
+        macro_loaded: Default::default(),
         shared,
         shared_part,
         strict,
@@ -553,7 +557,22 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
             active_tab,
             audit_rules: Default::default(),
         },
-    })
+    };
+    // Macro sheets are written back verbatim while untouched (#616).
+    let loaded = pkg
+        .sheet_rel_types()
+        .iter()
+        .enumerate()
+        .filter(|(_, ty)| is_macro_rel(ty))
+        .map(|(i, _)| (pkg.sheet_parts[i].clone(), pkg.workbook.sheets[i].clone()))
+        .collect();
+    pkg.macro_loaded = loaded;
+    Ok(pkg)
+}
+
+/// Is a sheet relationship type an Excel 4.0 macro sheet?
+fn is_macro_rel(ty: &str) -> bool {
+    ty.ends_with("/xlMacrosheet") || ty.ends_with("/xlIntlMacrosheet")
 }
 
 /// The workbook part, located via the package rels (virtually always
@@ -3727,11 +3746,7 @@ impl SheetPackage {
         self.sheet_rel_types()
             .iter()
             .enumerate()
-            .filter(|(_, ty)| {
-                ["/xlMacrosheet", "/xlIntlMacrosheet", "/dialogsheet"]
-                    .iter()
-                    .any(|suffix| ty.ends_with(suffix))
-            })
+            .filter(|(_, ty)| is_macro_rel(ty) || ty.ends_with("/dialogsheet"))
             .map(|(i, _)| i)
             .collect()
     }
@@ -4092,7 +4107,23 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         let cellless = rel_types
             .get(idx)
             .is_some_and(|ty| ty.ends_with("/chartsheet") || ty.ends_with("/dialogsheet"));
-        let updated = if cellless {
+        // An Excel 4.0 macro sheet nothing was done to keeps its part's bytes:
+        // the worksheet writer would normalise it and drop what it does not
+        // model (#616). Only a tab-selection change still lands.
+        let untouched = pkg.macro_loaded.get(part_name).is_some_and(|loaded| {
+            let mut same = loaded.clone();
+            same.name.clone_from(&sheet.name);
+            same.hidden = sheet.hidden;
+            same == *sheet
+        });
+        let source_text = if untouched {
+            source.clone()
+        } else {
+            String::new()
+        };
+        let updated = if untouched {
+            source
+        } else if cellless {
             page::set_page_setup(&source, &sheet.page_setup, &sheet.page_setup_loaded)
         } else {
             let sheet_data =
@@ -4101,7 +4132,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             // Links made in-session, and retyped ones, with their relationships.
             hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns())
         };
-        let updated = if wb.calc.transition_eval_changed && !cellless {
+        let updated = if wb.calc.transition_eval_changed && !cellless && !untouched {
             set_transition_evaluation(updated, wb.calc.transition_eval)
         } else {
             updated
@@ -4111,8 +4142,12 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         } else {
             updated
         };
-        if let Some(p) = parts.iter_mut().find(|(n, _)| n == part_name) {
-            p.1 = updated.into_bytes();
+        // The part's own bytes stay when nothing changed it (a lossy UTF-8
+        // round trip would not keep them all).
+        if !(untouched && updated == source_text) {
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == part_name) {
+                p.1 = updated.into_bytes();
+            }
         }
         // Drawings round-trip as their original part, so a moved anchor has to
         // be written back into it.
@@ -10854,6 +10889,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
     SheetPackage {
         parts,
         sheet_parts,
+        macro_loaded: Default::default(),
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
         strict: false,
@@ -19191,6 +19227,65 @@ mod kind_tests {
             }
             assert!(part_text(&out, "xl/workbook.xml").contains("Auto_Open"));
         }
+    }
+
+    /// The issue's macro sheet (#616), with a styled cell, put in as the
+    /// part of the XLM fixture's Macro1 and loaded again.
+    const ISSUE_MACROSHEET: &str = "<xm:macrosheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\"><dimension ref=\"A1\"/><sheetViews><sheetView workbookViewId=\"0\"/></sheetViews><sheetFormatPr defaultRowHeight=\"15\"/><sheetData><row r=\"1\"><c r=\"A1\"><f>RETURN(1)</f></c></row></sheetData><pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\"/></xm:macrosheet>";
+
+    fn issue_macro_book(body: &str) -> SheetPackage {
+        let mut pkg = mixed_xlm_book();
+        let part = pkg.sheet_parts[1].clone();
+        assert_eq!(part, "xl/macrosheets/sheet2.xml");
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = body.as_bytes().to_vec();
+        load_xlsx(&write_zip(&pkg.parts)).expect("reloads")
+    }
+
+    #[test]
+    fn an_unedited_macro_sheet_is_saved_byte_for_byte() {
+        for body in [
+            ISSUE_MACROSHEET.to_string(),
+            ISSUE_MACROSHEET
+                .replace("<f>", "<f t=\"normal\">")
+                .replace("<c r=\"A1\">", "<c r=\"A1\" s=\"0\">"),
+        ] {
+            let pkg = issue_macro_book(&body);
+            for kind in [
+                SpreadsheetKind::MacroWorkbook,
+                SpreadsheetKind::MacroTemplate,
+            ] {
+                let out = load_xlsx(&save_xlsx_as(&pkg, kind)).unwrap();
+                assert_eq!(
+                    out.part("xl/macrosheets/sheet2.xml").unwrap(),
+                    body.as_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_macro_sheet_stays_when_another_sheet_is_edited() {
+        let mut pkg = issue_macro_book(ISSUE_MACROSHEET);
+        pkg.workbook.sheets[0].set_cell(5, 5, Cell::number(7.0));
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert_eq!(
+            out.part("xl/macrosheets/sheet2.xml").unwrap(),
+            ISSUE_MACROSHEET.as_bytes()
+        );
+        assert!(out.workbook.sheets[0].cells.contains_key(&(5, 5)));
+    }
+
+    #[test]
+    fn an_edited_macro_sheet_is_still_saved() {
+        let mut pkg = issue_macro_book(ISSUE_MACROSHEET);
+        pkg.workbook.sheets[1].set_cell(2, 0, Cell::number(42.0));
+        let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
+        assert_ne!(
+            out.part("xl/macrosheets/sheet2.xml").unwrap(),
+            ISSUE_MACROSHEET.as_bytes()
+        );
+        assert!(out.workbook.sheets[1].cells.contains_key(&(2, 0)));
+        assert!(out.workbook.sheets[1].cells.contains_key(&(0, 0)));
     }
 
     #[test]

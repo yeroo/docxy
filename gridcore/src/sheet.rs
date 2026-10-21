@@ -583,7 +583,7 @@ pub fn hyperlink_cells(rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (u32,
     (r1..=r2).flat_map(move |r| (c1..=c2).map(move |c| (r, c)))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sheet {
     pub name: String,
     /// Sparse grid, keyed by 0-based (row, col); row-major iteration order.
@@ -819,7 +819,7 @@ impl Sheet {
 }
 
 /// A floating drawing anchored over a cell rectangle (a picture or a chart).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Drawing {
     /// This drawing's position among ALL anchors in its part — anchors we can't
     /// render (shapes, text boxes) are skipped here but still occupy a slot, so
@@ -835,7 +835,7 @@ pub struct Drawing {
 }
 
 /// What a [`Drawing`] holds.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DrawingKind {
     /// A picture: the package part path of its media and a display name. The
     /// bytes are read from the package on demand (the model stays light).
@@ -2400,7 +2400,7 @@ pub struct Dxf {
 }
 
 /// One conditional-formatting rule (`<cfRule>`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CfRule {
     pub kind: CfKind,
     /// Index into [`Styles::dxfs`], applied when the rule matches.
@@ -2410,7 +2410,7 @@ pub struct CfRule {
 }
 
 /// The kind of a conditional-formatting rule that the engine can evaluate.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum CfKind {
     /// `cellIs` with an operator and one or two operand formulas.
     CellIs { op: String, formulas: Vec<String> },
@@ -2501,7 +2501,7 @@ impl CfRule {
 }
 
 /// A conditional-formatting block: its `rules` apply over `ranges` (`sqref`).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CondFormat {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<CfRule>,
@@ -2525,7 +2525,7 @@ pub enum ExtKind {
 /// An Excel 2010 conditional-formatting or data-validation element in the
 /// worksheet's `extLst`: it is not evaluated, only moved with the edits that
 /// move its ranges and formulas, so a save can write them back.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ExtRule {
     pub kind: ExtKind,
     /// Its `<xm:sqref>`.
