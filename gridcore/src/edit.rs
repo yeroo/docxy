@@ -2133,7 +2133,7 @@ fn shift_rules(sheet: &mut Sheet, home_is_target: bool, target: &str, shift: &Ed
 }
 
 /// One coordinate through the shift; None = deleted.
-fn point(v: u32, shift: &EditShift) -> Option<u32> {
+pub(crate) fn point(v: u32, shift: &EditShift) -> Option<u32> {
     let v = v as i64;
     let at = shift.at as i64;
     if shift.delta >= 0 {

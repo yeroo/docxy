@@ -4134,7 +4134,8 @@ impl SheetView {
             StructOp::DeleteRow | StructOp::DeleteCol => None,
         };
         if let Some((axis_rows, at, count)) = over
-            && edit::insert_shifts_data_off(&self.pkg.workbook, s, axis_rows, at, count)
+            && (edit::insert_shifts_data_off(&self.pkg.workbook, s, axis_rows, at, count)
+                || self.pkg.insert_shifts_comments_off(s, axis_rows, at, count))
         {
             self.entry_error = Some(edit::SHIFT_OFF_SHEET.into());
             return false;
@@ -4188,7 +4189,7 @@ impl SheetView {
             delta: shift.2,
         };
         if notes {
-            self.pkg.shift_comments(s, shift.rows, shift.at, shift.delta);
+            self.pkg.shift_comments(s, &shift);
         }
         // Every authored chart, not just the ones ON the edited sheet: a
         // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)

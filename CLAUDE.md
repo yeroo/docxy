@@ -1201,10 +1201,11 @@
 
 ## Sheet notes follow row/column insert and delete (#1335)
 
-- `SheetPackage::shift_comments(sheet, rows, at, delta)` (gridcore
+- `SheetPackage::shift_comments(sheet, &EditShift)` (gridcore
   `comments.rs`) moves a sheet's notes, threaded comments and their `tc=`
   shadows with a whole-row/column insert (`delta > 0`) or delete (`< 0`); those
-  in a deleted span or pushed past the sheet's edge are dropped, and nothing is
+  in a deleted span are dropped (an insert that would push one off the sheet is
+  refused like one for cells: `insert_shifts_comments_off`), and nothing is
   written when none moves. `SheetView::structural_edit` calls it, and takes a
   package snapshot (not the workbook one) only when the sheet has comments.
   It re-serializes the sheet's notes, so rich-text runs inside a note flatten,

@@ -7,7 +7,9 @@
 //! the comments part, a VML drawing for the note box, the worksheet
 //! `<legacyDrawing>` hook, content types, and relationships.
 
-use crate::sheet::{cell_name, parse_col};
+use crate::edit::point;
+use crate::formula::EditShift;
+use crate::sheet::{MAX_COLS, MAX_ROWS, cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, normalise_eol, parse_rels,
     put_worksheet_child, remove_worksheet_singleton, resolve_relative, runs_text,
@@ -129,17 +131,18 @@ fn for_each_element(xml: &str, tag: &str, mut f: impl FnMut(&str)) {
     }
 }
 
-/// `el` with the `ref` attribute of its opening tag set to `cell`.
-fn set_ref(el: &str, cell: &str) -> String {
+/// `el` with the `ref` attribute of its opening tag set to `cell`; `None`
+/// when the tag has none (the attribute follows any XML whitespace).
+fn set_ref(el: &str, cell: &str) -> Option<String> {
     let gt = el.find('>').unwrap_or(el.len());
-    let Some(p) = el[..gt].find(" ref=\"") else {
-        return el.to_string();
-    };
-    let v = p + " ref=\"".len();
-    let Some(q) = el[v..gt].find('"') else {
-        return el.to_string();
-    };
-    format!("{}{}{}", &el[..v], cell, &el[v + q..])
+    let tag = &el[..gt];
+    let v = tag
+        .match_indices("ref=\"")
+        .map(|(p, k)| (p, p + k.len()))
+        .find(|&(p, _)| tag[..p].ends_with(|c: char| c.is_ascii_whitespace()))?
+        .1;
+    let q = tag[v..].find('"')?;
+    Some(format!("{}{}{}", &el[..v], cell, &el[v + q..]))
 }
 
 fn ref_to_rc(cell: &str) -> Option<(u32, u32)> {
@@ -394,34 +397,39 @@ impl SheetPackage {
         self.write_notes(sheet, &ws_part, &notes);
     }
 
-    /// Move the notes and threaded comments of `sheet` for a whole-row
-    /// (`rows`) or whole-column insert (`delta > 0` at `at`) or delete
-    /// (`delta < 0`, `-delta` lines from `at`), as Excel does: those at or
-    /// past `at` move by `delta`, those in a deleted span, or pushed past the
-    /// sheet's edge, are dropped. Nothing is written when none moves.
-    pub fn shift_comments(&mut self, sheet: usize, rows: bool, at: u32, delta: i64) {
+    /// Whether inserting `count` rows or columns at `at` on `sheet` would push
+    /// a note or thread past the sheet's edge, which the caller refuses as it
+    /// does for cells ([`crate::edit::insert_shifts_data_off`]).
+    pub fn insert_shifts_comments_off(
+        &self,
+        sheet: usize,
+        rows: bool,
+        at: u32,
+        count: u32,
+    ) -> bool {
+        let max = if rows { MAX_ROWS } else { MAX_COLS };
+        let edge = at.max(max.saturating_sub(count));
+        self.comments()
+            .iter()
+            .any(|c| c.sheet == sheet && (if rows { c.row } else { c.col }) >= edge)
+    }
+
+    /// Move the notes and threaded comments of `sheet` with a whole-row or
+    /// whole-column insert or delete (`shift`), as the cells move: those in a
+    /// deleted span are dropped. A note an insert would push off the sheet is
+    /// dropped too, but callers refuse such an insert first
+    /// ([`SheetPackage::insert_shifts_comments_off`]). Nothing is written
+    /// when none moves.
+    pub fn shift_comments(&mut self, sheet: usize, shift: &EditShift) {
         let Some(ws_part) = self.sheet_parts.get(sheet).cloned() else {
             return;
         };
-        let limit = i64::from(if rows {
-            crate::sheet::MAX_ROWS
-        } else {
-            crate::sheet::MAX_COLS
-        });
         let to = |(row, col): (u32, u32)| -> Option<(u32, u32)> {
-            let line = if rows { row } else { col };
-            let moved = if line < at {
-                line
-            } else if delta < 0 && i64::from(line) < i64::from(at) - delta {
-                return None;
+            if shift.rows {
+                point(row, shift).map(|r| (r, col))
             } else {
-                let n = i64::from(line) + delta;
-                if n >= limit {
-                    return None;
-                }
-                n as u32
-            };
-            Some(if rows { (moved, col) } else { (row, moved) })
+                point(col, shift).map(|c| (row, c))
+            }
         };
         let moves = self
             .comments()
@@ -437,7 +445,7 @@ impl SheetPackage {
                 return Some(el.to_string());
             };
             let (row, col) = to(rc)?;
-            Some(set_ref(el, &cell_name(row, col)))
+            Some(set_ref(el, &cell_name(row, col)).unwrap_or_else(|| el.to_string()))
         });
         self.write_notes(sheet, &ws_part, &notes);
     }
@@ -1408,19 +1416,47 @@ mod tests {
     #[test]
     fn a_row_insert_moves_notes_at_or_below_it() {
         let mut pkg = with_notes(&[(0, 0, "top"), (2, 0, "a3")]);
-        pkg.shift_comments(0, true, 0, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: 1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(1, 0, "top"), note(3, 0, "a3")]);
         let mut pkg = with_notes(&[(0, 0, "top"), (2, 0, "a3")]);
-        pkg.shift_comments(0, true, 1, 2);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 1,
+                delta: 2,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(0, 0, "top"), note(4, 0, "a3")]);
     }
 
     #[test]
     fn a_row_delete_drops_its_notes_and_moves_the_rest_up() {
         let mut pkg = with_notes(&[(0, 0, "r1"), (2, 0, "r3"), (4, 1, "r5")]);
-        pkg.shift_comments(0, true, 2, -1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 2,
+                delta: -1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(0, 0, "r1"), note(3, 1, "r5")]);
-        pkg.shift_comments(0, true, 0, -1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: -1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(2, 1, "r5")]);
     }
 
@@ -1432,30 +1468,91 @@ mod tests {
             (4, 0, "edge"),
             (5, 0, "below"),
         ]);
-        pkg.shift_comments(0, true, 1, -3);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 1,
+                delta: -3,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(1, 0, "edge"), note(2, 0, "below")]);
     }
 
     #[test]
     fn column_edits_follow_the_same_rules() {
         let mut pkg = with_notes(&[(0, 0, "a"), (0, 2, "c"), (3, 3, "d")]);
-        pkg.shift_comments(0, false, 1, 2);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: false,
+                at: 1,
+                delta: 2,
+            },
+        );
         assert_eq!(
             at(&pkg, 0),
             vec![note(0, 0, "a"), note(0, 4, "c"), note(3, 5, "d")]
         );
-        pkg.shift_comments(0, false, 4, -1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: false,
+                at: 4,
+                delta: -1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(0, 0, "a"), note(3, 4, "d")]);
+    }
+
+    #[test]
+    fn a_note_an_insert_would_push_off_the_sheet_is_found_first() {
+        let last = crate::sheet::MAX_ROWS - 1;
+        let pkg = with_notes(&[(0, 0, "keep"), (last, 0, "edge")]);
+        assert!(pkg.insert_shifts_comments_off(0, true, 5, 1));
+        // Below the insert point only: a note above `at` never moves.
+        assert!(!pkg.insert_shifts_comments_off(0, true, 5, 0));
+        assert!(!pkg.insert_shifts_comments_off(0, true, last + 1, 1));
+        assert!(!pkg.insert_shifts_comments_off(0, false, 0, 1));
+        assert!(!pkg.insert_shifts_comments_off(1, true, 0, 1));
+        let pkg = with_notes(&[(0, crate::sheet::MAX_COLS - 1, "edge")]);
+        assert!(pkg.insert_shifts_comments_off(0, false, 0, 1));
+    }
+
+    #[test]
+    fn set_ref_follows_any_xml_whitespace() {
+        let el =
+            "<threadedComment\n\tref=\"B3\" id=\"{X}\"><text>ref=\"B3\"</text></threadedComment>";
+        let out = set_ref(el, "B9").unwrap();
+        assert!(out.contains("\n\tref=\"B9\" id"), "{out}");
+        assert!(out.contains("<text>ref=\"B3\"</text>"), "{out}");
+        assert_eq!(set_ref("<threadedComment id=\"1\"/>", "A1"), None);
+        // `xref=` is not `ref=`.
+        assert_eq!(set_ref("<threadedComment xref=\"B3\"/>", "A1"), None);
     }
 
     #[test]
     fn a_note_pushed_past_the_sheet_edge_is_dropped() {
         let last = crate::sheet::MAX_ROWS - 1;
         let mut pkg = with_notes(&[(0, 0, "keep"), (last, 0, "edge")]);
-        pkg.shift_comments(0, true, 5, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 5,
+                delta: 1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(0, 0, "keep")]);
         let mut pkg = with_notes(&[(0, crate::sheet::MAX_COLS - 1, "edge")]);
-        pkg.shift_comments(0, false, 0, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: false,
+                at: 0,
+                delta: 1,
+            },
+        );
         assert!(at(&pkg, 0).is_empty());
         assert!(pkg.part("xl/comments1.xml").is_none());
     }
@@ -1466,7 +1563,14 @@ mod tests {
         pkg.add_threaded_comment(0, 2, 1, "Ana", "Is this final?", "2024-01-02T03:04:05Z");
         pkg.add_threaded_comment(0, 2, 1, "Bob", "Yes", "2024-01-02T04:00:00Z");
         assert!(pkg.set_comment(0, 4, 0, "Ann", "plain"));
-        pkg.shift_comments(0, true, 0, 2);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: 2,
+            },
+        );
         let cs = at(&pkg, 0);
         assert_eq!(
             cs.iter()
@@ -1494,7 +1598,14 @@ mod tests {
     fn a_deleted_thread_leaves_no_shadow_and_no_wiring() {
         let mut pkg = blank();
         pkg.add_threaded_comment(0, 2, 1, "Ana", "Gone soon", "2024-01-02T03:04:05Z");
-        pkg.shift_comments(0, true, 2, -1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 2,
+                delta: -1,
+            },
+        );
         assert!(at(&pkg, 0).is_empty());
         assert!(
             !pkg.part_names()
@@ -1514,7 +1625,14 @@ mod tests {
         let mut pkg = blank();
         pkg.add_threaded_comment(0, 1, 0, "Ana", "drop", "2024-01-02T03:04:05Z");
         pkg.add_threaded_comment(0, 3, 0, "Ana", "keep", "2024-01-02T03:05:05Z");
-        pkg.shift_comments(0, true, 1, -1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 1,
+                delta: -1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![(2, 0, "keep".to_string(), true)]);
         let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
         assert_eq!(at(&back, 0), at(&pkg, 0));
@@ -1525,7 +1643,14 @@ mod tests {
         let mut pkg = with_notes(&[(2, 0, "s1")]);
         let s2 = pkg.add_sheet("Two");
         assert!(pkg.set_comment(s2, 2, 0, "Ann", "s2"));
-        pkg.shift_comments(0, true, 0, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: 1,
+            },
+        );
         assert_eq!(at(&pkg, 0), vec![note(3, 0, "s1")]);
         assert_eq!(at(&pkg, s2), vec![note(2, 0, "s2")]);
     }
@@ -1542,20 +1667,55 @@ mod tests {
         pkg.add_threaded_comment(0, 1, 0, "Ana", "t", "2024-01-02T03:04:05Z");
         assert!(pkg.set_comment(0, 2, 0, "Ann", "n"));
         let before = bytes(&pkg);
-        pkg.shift_comments(0, true, 5, 3);
-        pkg.shift_comments(0, true, 5, -3);
-        pkg.shift_comments(0, false, 4, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 5,
+                delta: 3,
+            },
+        );
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 5,
+                delta: -3,
+            },
+        );
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: false,
+                at: 4,
+                delta: 1,
+            },
+        );
         assert_eq!(bytes(&pkg), before);
         let mut none = blank();
         let before = bytes(&none);
-        none.shift_comments(0, true, 0, 1);
+        none.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: 1,
+            },
+        );
         assert_eq!(bytes(&none), before);
     }
 
     #[test]
     fn shifted_notes_survive_save_and_load() {
         let mut pkg = with_notes(&[(2, 0, "a3"), (5, 1, "b6")]);
-        pkg.shift_comments(0, true, 0, 1);
+        pkg.shift_comments(
+            0,
+            &EditShift {
+                rows: true,
+                at: 0,
+                delta: 1,
+            },
+        );
         let back = load_xlsx(&save_xlsx(&pkg)).expect("reload");
         assert_eq!(at(&back, 0), vec![note(3, 0, "a3"), note(6, 1, "b6")]);
     }

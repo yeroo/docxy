@@ -383,3 +383,20 @@ fn a_sheet_without_notes_keeps_the_workbook_step() {
     let step = v.undo.last().expect("a step");
     assert!(matches!(step.snap.body, SnapshotBody::Package(_)));
 }
+
+#[test]
+fn an_insert_that_would_push_a_note_off_the_sheet_is_refused() {
+    let mut v = view();
+    let last = gridcore::sheet::MAX_ROWS - 1;
+    assert!(v.pkg.set_comment(v.active, last, 0, "Ann", "edge"));
+    select(&mut v, "A1", "A1");
+    v.select_rows();
+    let (steps, before) = (v.undo.len(), notes(&v));
+    assert!(!v.structural_edit(StructOp::InsertRow));
+    assert_eq!(v.entry_error.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+    assert_eq!(v.undo.len(), steps);
+    assert_eq!(notes(&v), before);
+    // A delete is still fine, and takes the note along when it is the row.
+    assert!(v.structural_edit(StructOp::DeleteRow));
+    assert_eq!(notes(&v), vec![note_at(&format!("A{last}"), "edge")]);
+}
