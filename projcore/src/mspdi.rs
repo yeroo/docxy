@@ -5426,7 +5426,7 @@ mod tests {
         }
         assert!(xml.contains("<IsNull>0</IsNull>"));
         // The auto task has no stored dates, so it gains the scheduled ones.
-        let r = crate::schedule::schedule(&proj).get(1).unwrap().clone();
+        let r = *crate::schedule::schedule(&proj).get(1).unwrap();
         let a = one_task_xml(&xml, 1);
         assert!(
             a.contains(&format!("<Start>{}</Start>", r.early_start.to_mspdi())),
