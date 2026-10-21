@@ -46,7 +46,9 @@ pub struct Pivot {
     /// Sheet the pivot output lives on.
     pub sheet: usize,
     /// Output region (r1, c1, r2, c2) from `<location ref>`; updated by
-    /// refresh when the result grows or shrinks.
+    /// refresh when the result grows or shrinks, and shifted by row/column
+    /// edits on its sheet (`edit::shift_pivots`; an edit that cuts through it
+    /// leaves it as loaded and sets `unsupported`).
     pub location: (u32, u32, u32, u32),
     pub source: PivotSource,
     /// Cache field names, in cache order (field indices index this).
@@ -76,7 +78,10 @@ pub struct Pivot {
     pub subtotals: bool,
     /// Measures stacked on the row axis (`dataOnRows` / the Values field on rows).
     pub data_on_rows: bool,
-    /// Uses features refresh doesn't model — never refreshed.
+    /// Uses features refresh doesn't model — never refreshed. Also set when
+    /// its source table or range, or its output region, is deleted, or an
+    /// edit cuts through the output or deletes the source's header row or a
+    /// source column.
     pub unsupported: bool,
     /// Field layout changed in the editor — save must rewrite the
     /// definition part (not just patch the location).

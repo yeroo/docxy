@@ -2155,7 +2155,6 @@ pub(crate) fn point(v: u32, shift: &EditShift) -> Option<u32> {
     }
 }
 
-/// A span through the shift (deletes clamp); None = span fully deleted.
 /// A rect (r1, c1, r2, c2) after a row/column edit, or `None` when a delete
 /// removed all of it.
 fn shift_rect(rect: (u32, u32, u32, u32), shift: &EditShift) -> Option<(u32, u32, u32, u32)> {
@@ -2168,20 +2167,34 @@ fn shift_rect(rect: (u32, u32, u32, u32), shift: &EditShift) -> Option<(u32, u32
 }
 
 /// A PivotTable's output region lives on its sheet and a range source on
-/// another (or the same): both move with the cells. A pivot whose region or
-/// source is deleted whole keeps its cache only, like one whose table went.
+/// another (or the same): both move with the cells. A pivot keeps its cache
+/// only (`unsupported`, location left as loaded, as Excel refuses such edits)
+/// when the edit deletes its region or source whole, cuts through the region
+/// (it would change size, and the saved row/column items no longer fit it),
+/// or deletes the source's header row or one of its columns.
 fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditShift) {
     for piv in &mut wb.pivots {
         if piv.sheet == idx {
+            let (r1, c1, r2, c2) = piv.location;
             match shift_rect(piv.location, shift) {
-                Some(rect) => piv.location = rect,
-                None => piv.unsupported = true,
+                Some(moved) if moved.2 - moved.0 == r2 - r1 && moved.3 - moved.1 == c2 - c1 => {
+                    piv.location = moved
+                }
+                _ => piv.unsupported = true,
             }
         }
         if let crate::pivot::PivotSource::Range { sheet, rect } = &mut piv.source {
             if sheet.eq_ignore_ascii_case(target_name) {
+                let (r1, c1, _, c2) = *rect;
+                let header_gone = shift.delta < 0 && shift.rows && point(r1, shift).is_none();
+                let column_gone =
+                    shift.delta < 0 && !shift.rows && (c1..=c2).any(|c| point(c, shift).is_none());
                 match shift_rect(*rect, shift) {
-                    Some(moved) => *rect = moved,
+                    Some(moved) if !header_gone && !column_gone => *rect = moved,
+                    Some(moved) => {
+                        *rect = moved;
+                        piv.unsupported = true;
+                    }
                     None => piv.unsupported = true,
                 }
             }
@@ -2189,6 +2202,7 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
     }
 }
 
+/// A span through the shift (deletes clamp); None = span fully deleted.
 fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     let at = shift.at;
     // `point` says `None` for two different things. On a DELETE the coordinate
@@ -5305,11 +5319,11 @@ mod table_tests {
     fn pivot_location_follows_row_and_column_edits_on_its_sheet() {
         let mut wb = sales();
         wb.pivots
-            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+            .push(range_pivot(1, (2, 2, 4, 3), "Sheet1", (0, 0, 3, 2)));
         insert_rows(&mut wb, 1, 0, 1);
-        assert_eq!(wb.pivots[0].location, (3, 0, 5, 1));
+        assert_eq!(wb.pivots[0].location, (3, 2, 5, 3));
         delete_cols(&mut wb, 1, 0, 1);
-        assert_eq!(wb.pivots[0].location, (3, 0, 5, 0));
+        assert_eq!(wb.pivots[0].location, (3, 1, 5, 2));
         assert!(!wb.pivots[0].unsupported);
         // The source sheet was not edited.
         assert_eq!(range_of(&wb.pivots[0]), (0, 0, 3, 2));
@@ -5347,6 +5361,57 @@ mod table_tests {
         delete_rows(&mut wb, 1, 2, 3);
         assert!(wb.pivots[0].unsupported);
         assert_eq!(wb.pivots[0].location, (2, 0, 4, 1), "left as it was");
+    }
+
+    #[test]
+    fn an_edit_cutting_through_the_output_leaves_the_pivot_unsupported() {
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        insert_rows(&mut wb, 1, 3, 1); // inside the region
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (2, 0, 4, 1));
+
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_cols(&mut wb, 1, 1, 1); // one column of two
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (2, 0, 4, 1));
+
+        // Edits wholly before or after the region only translate it.
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        insert_rows(&mut wb, 1, 5, 1);
+        insert_cols(&mut wb, 1, 2, 1);
+        assert!(!wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (2, 0, 4, 1));
+    }
+
+    #[test]
+    fn deleting_the_source_header_row_or_a_source_column_is_unsupported() {
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_rows(&mut wb, 0, 0, 1);
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(range_of(&wb.pivots[0]), (0, 0, 2, 2));
+
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_cols(&mut wb, 0, 1, 1);
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(range_of(&wb.pivots[0]), (0, 0, 3, 1));
+
+        // A data row goes: the source just shrinks.
+        let mut wb = sales();
+        wb.pivots
+            .push(range_pivot(1, (2, 0, 4, 1), "Sheet1", (0, 0, 3, 2)));
+        delete_rows(&mut wb, 0, 2, 1);
+        assert!(!wb.pivots[0].unsupported);
+        assert_eq!(range_of(&wb.pivots[0]), (0, 0, 2, 2));
     }
 
     #[test]

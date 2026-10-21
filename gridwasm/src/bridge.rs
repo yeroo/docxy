@@ -65,9 +65,10 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`Session::ctl_calc_set`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
-    /// Each PivotTable's `unsupported` flag (deleting its table sets it),
-    /// output region and source: a row/column edit moves the first two and a
-    /// sheet rename the last.
+    /// Each PivotTable's `unsupported` flag, output region and source. A
+    /// row/column edit moves the region and a range source's rect (deleting
+    /// either whole sets the flag, as does deleting its table); a sheet
+    /// rename renames the source.
     pivots: Vec<PivotState>,
 }
 

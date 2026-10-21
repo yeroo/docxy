@@ -17906,6 +17906,19 @@ b",
         assert!(def.contains(r#"<location ref="A5:B7""#), "{def}");
     }
 
+    /// A row inserted inside the output would change its size, which the
+    /// saved row items cannot follow: the pivot keeps its cache only and its
+    /// `<location ref>` stays as loaded.
+    #[test]
+    fn inserting_a_row_inside_the_output_keeps_the_saved_location() {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        crate::edit::insert_rows(&mut pkg.workbook, 1, 3, 1);
+        assert!(pkg.workbook.pivots[0].unsupported);
+        let saved = save_xlsx(&pkg);
+        let def = saved_part(&saved, "xl/pivotTables/pivotTable1.xml");
+        assert!(def.contains(r#"<location ref="A3:B5""#), "{def}");
+    }
+
     /// A refreshed pivot asks Excel to rebuild it, but a refresh that keeps
     /// the region leaves `<location ref>` as loaded.
     #[test]
