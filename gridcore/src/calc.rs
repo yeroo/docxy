@@ -43,6 +43,26 @@ pub fn load_fresh(wb: &mut Workbook, eng: &mut Engine) {
     }
 }
 
+/// An automatic-mode workbook with a volatile formula (`NOW`, `TODAY`,
+/// `RAND`, ...) is one Excel recalculates when it opens, and that counts as a
+/// change (closing asks to save). True for such a workbook; a manual one is
+/// already calculated in full by [`load_fresh`] and is no change (#805).
+pub fn volatile_on_open(wb: &Workbook, eng: &Engine) -> bool {
+    wb.calc.mode != CalcMode::Manual && eng.has_volatile()
+}
+
+/// [`volatile_on_open`], recalculating every volatile formula and what reads
+/// it (for an opened workbook that did not just have its formulas calculated
+/// in full, else this would evaluate them twice). True when it did, and the
+/// host marks the document changed.
+pub fn open_volatile(wb: &mut Workbook, eng: &mut Engine) -> bool {
+    if !volatile_on_open(wb, eng) {
+        return false;
+    }
+    eng.recalc_from(wb, &[]);
+    true
+}
+
 /// Calculation Options > Automatic / Automatic Except Data Tables / Manual.
 /// Going back to automatic brings everything up to date at once, as Excel does.
 pub fn set_mode(wb: &mut Workbook, eng: &mut Engine, mode: CalcMode) {

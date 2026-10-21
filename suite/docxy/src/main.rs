@@ -9581,7 +9581,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
         return project_tab_from_path(path);
     }
     if is_sheet_path(path) {
-        sheet_tab_from_path(path, false)
+        sheet_tab_from_path(path, false, false)
     } else {
         let title: SharedString = file_name(path).into();
         let mut tab = doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false);
@@ -9592,9 +9592,12 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
 
 /// A workbook tab for `path`, loaded leniently when `repair`. A template
 /// opens as a new, untitled workbook.
-fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
+/// `fresh_volatile`: a user's Open of a file that is not in Protected View
+/// recalculates its volatile formulas and opens the tab dirty, as Excel does
+/// (#805). A read-only open does too: closing it asks all the same.
+fn sheet_tab_from_path(path: &PathBuf, repair: bool, fresh_volatile: bool) -> DocTab {
     let title: SharedString = file_name(path).into();
-    let (surface, status) = sheet_from_path_mode(path, repair);
+    let (surface, status, recalculated) = sheet_load(path, repair, fresh_volatile);
     let (title, path, status) = match template_title(path) {
         Some(new_title) if matches!(surface, Surface::Sheet(_)) => (
             new_title.into(),
@@ -9606,9 +9609,10 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool) -> DocTab {
     DocTab {
         kind: Kind::Xlsx,
         title,
+        // A template opens as a new workbook, which starts clean.
+        dirty: recalculated && path.is_some(),
         path,
         surface,
-        dirty: false,
         status,
         comments: vec![],
         tracked_comment_ids: Default::default(),
@@ -9731,7 +9735,7 @@ fn tab_from_path_mode(
     // Taken before the load: a file replaced while it loads leaves a stamp
     // that no longer matches, so Enable Editing trusts nothing new.
     let stamp = protected.then(|| trusted::Stamp::of(&path)).flatten();
-    let mut tab = sheet_tab_from_path(&path, mode == OpenMode::Repair);
+    let mut tab = sheet_tab_from_path(&path, mode == OpenMode::Repair, !protected);
     // A template opens untitled: Save already asks where to go, and there is
     // no file of its own to keep from being overwritten.
     if tab.path.is_some() {
@@ -12448,6 +12452,15 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
 /// harness does not read it as a failed open, and names every part that was
 /// emptied or dropped.
 fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString) {
+    let (surface, status, _) = sheet_load(path, repair, false);
+    (surface, status)
+}
+
+/// [`sheet_from_path_mode`], and with `fresh_volatile` also the open's
+/// recalculation of the volatile formulas of an automatic workbook (#805):
+/// the last value is true when it ran, which is a change. Reloads (rollback,
+/// hot exit, Protected View) pass false and keep the cached values.
+fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, SharedString, bool) {
     let loaded = |bytes: &[u8]| {
         if repair {
             gridcore::xlsx::load_xlsx_repair(bytes)
@@ -12465,11 +12478,15 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                 // Excel computes such cells on open (#673).
                 // A manual-mode file opens fresh too (#674), by the same one
                 // calculation (a second would advance an iterating circle).
-                if has_uncached_formula(&pkg.workbook) {
+                // The volatile recalculation of an open is not a second
+                // calculation of what the full one just did (#805).
+                let recalculated = if has_uncached_formula(&pkg.workbook) {
                     engine.recalc_all(&mut pkg.workbook);
+                    fresh_volatile && gridcore::calc::volatile_on_open(&pkg.workbook, &engine)
                 } else {
                     gridcore::calc::load_fresh(&mut pkg.workbook, &mut engine);
-                }
+                    fresh_volatile && gridcore::calc::open_volatile(&mut pkg.workbook, &mut engine)
+                };
                 let view = SheetView {
                     pkg,
                     active: 0,
@@ -12530,18 +12547,25 @@ fn sheet_from_path_mode(path: &PathBuf, repair: bool) -> (Surface, SharedString)
                     status.push_str(". ");
                     status.push_str(CIRCULAR_WARNING);
                 }
-                (Surface::Sheet(view), status.into())
+                (Surface::Sheet(view), status.into(), recalculated)
             }
             // A repair's refusal names the part, in words.
-            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => {
-                (Surface::Placeholder, format!("xlsx load error: {e}").into())
-            }
+            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => (
+                Surface::Placeholder,
+                format!("xlsx load error: {e}").into(),
+                false,
+            ),
             Err(e) => (
                 Surface::Placeholder,
                 format!("xlsx load error: {e:?}").into(),
+                false,
             ),
         },
-        Err(e) => (Surface::Placeholder, format!("read error: {e}").into()),
+        Err(e) => (
+            Surface::Placeholder,
+            format!("read error: {e}").into(),
+            false,
+        ),
     }
 }
 

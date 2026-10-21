@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn inspect_is_none_for_other_tabs() {
-        let mut tab = crate::sheet_tab_from_path(&PathBuf::from("missing.xlsx"), false);
+        let mut tab = crate::sheet_tab_from_path(&PathBuf::from("missing.xlsx"), false, false);
         assert!(inspect_doc_tab(&tab).is_none());
         assert!(inspect_remove(&mut tab, InspectCategory::Comments).is_err());
     }

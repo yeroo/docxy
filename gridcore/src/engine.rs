@@ -40,6 +40,11 @@ struct FormulaInfo {
     ast: Expr,
     /// Re-evaluated on every recalculation ([`formula::always_recalc`]).
     volatile: bool,
+    /// Calls a volatile function ([`formula::is_volatile`]: `NOW`, `RAND`,
+    /// `OFFSET`, ...), itself or through a defined name: what Excel
+    /// recalculates on open. A D-function alone is not (it is only in
+    /// `volatile`, which is about this engine's evaluation order).
+    clocked: bool,
     /// Calls a D-function: evaluated after every other ready cell (see
     /// [`Engine::evaluate`]).
     db: bool,
@@ -308,11 +313,12 @@ impl Engine {
                 collect_deps(wb, key, &ast, &mut deps, 0);
                 let mut spills = Vec::new();
                 formula::collect_spillrefs(&ast, &mut spills);
-                let (volatile, db) = recalc_flags(wb, key.0, &ast, 0);
+                let (volatile, db, clocked) = recalc_flags(wb, key.0, &ast, 0);
                 self.formulas.insert(
                     key,
                     FormulaInfo {
                         volatile,
+                        clocked,
                         db,
                         legacy,
                         spillref: !spills.is_empty(),
@@ -1429,6 +1435,14 @@ impl Engine {
                 .map(|(s, rects)| (s, CoverIndex::new(rects)))
                 .collect(),
         );
+    }
+
+    /// Whether any formula calls a volatile function (`NOW`, `TODAY`,
+    /// `RAND`, ..., also behind a defined name), which Excel recalculates on
+    /// open; a D-function alone does not count. See
+    /// [`crate::calc::open_volatile`].
+    pub(crate) fn has_volatile(&self) -> bool {
+        self.formulas.values().any(|f| f.clocked)
     }
 
     /// The keys of the volatile formulas and of those with a spill reference,
@@ -2864,14 +2878,18 @@ fn without_position_refs(wb: &Workbook, sheet: usize, ast: &Expr) -> Option<Expr
     has_position_fn(ast).then(|| prune(wb, sheet, ast, &mut Vec::new()))
 }
 
-/// (always recalculate, calls a D-function) for a formula, looking through
+/// (always recalculate, calls a D-function, calls a volatile function) for a formula, looking through
 /// the defined names it references or calls (`=Total` where Total is a DSUM
 /// or NOW()), resolved as [`collect_deps`] resolves them and to the same
 /// depth.
-fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, bool) {
-    let (mut volatile, mut db) = (always_recalc(ast), contains_db_fn(ast));
-    if (volatile && db) || depth >= 8 {
-        return (volatile, db);
+fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, bool, bool) {
+    let (mut volatile, mut db, mut clocked) = (
+        always_recalc(ast),
+        contains_db_fn(ast),
+        formula::is_volatile(ast),
+    );
+    if (volatile && db && clocked) || depth >= 8 {
+        return (volatile, db, clocked);
     }
     let mut names = Vec::new();
     formula::collect_names(ast, &mut names);
@@ -2883,11 +2901,12 @@ fn recalc_flags(wb: &Workbook, sheet: usize, ast: &Expr, depth: u32) -> (bool, b
         else {
             continue;
         };
-        let (v, d) = recalc_flags(wb, sheet, &def_ast, depth + 1);
+        let (v, d, c) = recalc_flags(wb, sheet, &def_ast, depth + 1);
         volatile |= v;
         db |= d;
+        clocked |= c;
     }
-    (volatile, db)
+    (volatile, db, clocked)
 }
 
 /// Engine result → stored cell value. A formula referencing an empty cell
