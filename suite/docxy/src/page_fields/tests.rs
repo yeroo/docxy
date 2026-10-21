@@ -238,7 +238,7 @@ fn chapters_are_numbered_over_the_document_that_was_flowed() {
     let pf = flow(&shown.body, &ch, false);
     let styles = parse_styles_xml(STYLES);
     let vals = |doc: &Document| {
-        let heads = chapter_headings(doc, &pf, NUMBERING, &styles);
+        let heads = chapter_headings(doc, &pf, Some(NUMBERING.as_bytes()), &styles);
         pages(&page_values(&pf, &heads))
             .into_iter()
             .map(str::to_string)
@@ -250,4 +250,49 @@ fn chapters_are_numbered_over_the_document_that_was_flowed() {
     let wrong = vals(&live);
     assert_ne!(right, wrong, "numbering the live body lands on other pages");
     assert!(right[0].starts_with("1-"), "{right:?}");
+}
+
+#[test]
+fn a_numbered_heading_in_a_table_never_sets_the_chapter() {
+    let ch = sect(r#"<w:pgNumType w:chapStyle="1"/>"#);
+    let table = format!(
+        "<w:tbl><w:tr><w:tc>{}</w:tc></w:tr></w:tbl>",
+        heading("In a cell", "Heading1", None)
+    );
+    let xml = format!(
+        "{}{}{}",
+        heading("One", "Heading1", Some(&ch)),
+        // Page 2: only a table whose cell is a numbered heading (chapter 2).
+        table + &para("after", Some(&ch)),
+        para("page three", Some(&ch)),
+    );
+    let got = agree(&xml, &ch);
+    // The cell's heading moves the counter but is no chapter: page 2 keeps
+    // chapter 1, as the export has it.
+    assert_eq!(&got[..3], ["1-1", "1-2", "1-3"]);
+}
+
+#[test]
+fn a_start_past_i32_clamps_like_the_export() {
+    let wide = sect(r#"<w:pgNumType w:start="4294967295"/>"#);
+    let xml = format!("{}{}", para("a", Some(&wide)), para("b", Some(&sect(""))));
+    let got = agree(&xml, &sect(""));
+    assert_eq!(&got[..2], ["32767", "32768"]);
+}
+
+#[test]
+fn a_continuous_section_flowing_onto_page_two_counts_both_pages() {
+    let cont = sect(r#"<w:type w:val="continuous"/>"#);
+    let mut xml = para("first section", Some(&sect("")));
+    for i in 0..120 {
+        xml.push_str(&para(&format!("line {i}"), None));
+    }
+    let (vals, _) = both(&xml, &cont);
+    assert!(vals.len() >= 2, "the continuous section flows on");
+    // Page 1 holds both sections and is owned by the first (1 page); every
+    // later page is the second section's, which is on page 1 too.
+    let n = vals.len().to_string();
+    assert_eq!(vals[0].section_pages, "1");
+    assert_eq!(vals[1].section_pages, n);
+    assert_eq!(vals[0].num_pages, n);
 }

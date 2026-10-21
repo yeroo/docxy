@@ -29,18 +29,23 @@ impl PageVals {
 
 /// The chapter headings `page_values` needs, numbered over `doc`: the document
 /// `pf` was flowed over (the markup view shown, whose block count can differ
-/// from the live body's). Empty, with no parse, when no section prefixes its
-/// page numbers with a chapter.
+/// from the live body's). `numbering_part` is `word/numbering.xml`'s bytes;
+/// nothing is read or parsed when no section prefixes its page numbers with a
+/// chapter.
 pub(crate) fn chapter_headings(
     doc: &Document,
     pf: &PageFlow,
-    numbering_xml: &str,
+    numbering_part: Option<&[u8]>,
     styles: &StyleSheet,
 ) -> Vec<(usize, u8, Option<String>)> {
     if !pf.sections.iter().any(|s| s.chapter.is_some()) {
         return Vec::new();
     }
-    let numbering = docxcore::numbering::parse_numbering_xml(numbering_xml);
+    let numbering = docxcore::numbering::parse_numbering_xml(
+        &numbering_part
+            .map(String::from_utf8_lossy)
+            .unwrap_or_default(),
+    );
     docxcore::numbering::heading_chapters(doc, &numbering, styles)
 }
 

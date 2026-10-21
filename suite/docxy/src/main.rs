@@ -39639,13 +39639,13 @@ impl Render for Docxy {
                         // The chapter headings are numbered only when a section
                         // prefixes its page numbers with one.
                         let page_vals = {
-                            let numbering_xml = pkg
-                                .and_then(|p| p.part("word/numbering.xml"))
-                                .map(|b| String::from_utf8_lossy(b).into_owned())
-                                .unwrap_or_default();
                             // Numbered over the document the flow was made from.
-                            let headings =
-                                page_fields::chapter_headings(&shown, &pf, &numbering_xml, &styles);
+                            let headings = page_fields::chapter_headings(
+                                &shown,
+                                &pf,
+                                pkg.and_then(|p| p.part("word/numbering.xml")),
+                                &styles,
+                            );
                             page_fields::page_values(&pf, &headings)
                         };
                         let mut part_blocks: std::collections::HashMap<&str, Vec<Block>> =

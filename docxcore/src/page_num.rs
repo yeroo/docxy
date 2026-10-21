@@ -29,11 +29,6 @@ impl PageNumFmt {
     }
 }
 
-/// A `w:start`, as a page honours it: 0 to [`MAX_PAGE_START`].
-pub fn clamp_start(start: i32) -> i32 {
-    start.clamp(0, MAX_PAGE_START)
-}
-
 pub fn format_page_number(n: u32, fmt: PageNumFmt) -> String {
     match fmt {
         PageNumFmt::Decimal => n.to_string(),
@@ -182,13 +177,6 @@ mod tests {
             PageNumFmt::Decimal
         );
         assert_eq!(PageNumFmt::from_attr(None), PageNumFmt::Decimal);
-    }
-
-    #[test]
-    fn start_clamps_like_a_page() {
-        assert_eq!(clamp_start(-4), 0);
-        assert_eq!(clamp_start(5), 5);
-        assert_eq!(clamp_start(1_000_000), MAX_PAGE_START);
     }
 
     #[test]

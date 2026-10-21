@@ -4,7 +4,7 @@
 //! every rule here (section splitting, geometry, `w:type` starts, balancing).
 
 use docxcore::model::Block;
-use docxcore::page_num::{PageNumFmt, chapter_prefix, clamp_start};
+use docxcore::page_num::{PageNumFmt, chapter_prefix};
 use docxcore::sect::{PageNumberFormat, SectionSetup, SectionStart};
 
 /// Word's limit on newspaper columns in a section (export.rs `MAX_COLS`).
@@ -192,7 +192,7 @@ fn section_box(sect: &str, gutter_at_top: bool) -> SectionBox {
         col_w,
         col_gap,
         sep: cols.sep,
-        num_start: numfmt.start.map(clamp_start),
+        num_start: docxcore::sect::page_start(sect),
         num_fmt: PageNumFmt::from_attr(numfmt.fmt.as_deref()),
         chapter: chapter_prefix(&numfmt),
         line_numbers: setup.line_numbers,

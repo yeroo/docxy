@@ -355,13 +355,16 @@
 ## Live page fields (#1437)
 
 - `docxcore::page_num` is the one rule for a page's PAGE text: `PageNumFmt`
-  (`w:fmt`; roman and letters, anything else decimal), `clamp_start` (0 to
-  32767), `chapter_prefix`, `page_chapters` (the first heading of the
+  (`w:fmt`; roman and letters, anything else decimal), `MAX_PAGE_START`
+  (a `w:start` clamps to 0..32767, read wide: `sect::page_start` for the
+  suite, `export.rs` its own reader), `chapter_prefix`, `page_chapters` (the first heading of the
   chapStyle level on the page, else the last one before it, carried across
   sections; an unnumbered heading is `None`, so the plain number shows),
   `page_text` and `page_field_kind`. `export.rs` uses them, and
   `export::page_labels` is the oracle the suite is tested against.
-  `numbering::heading_chapters` is `heading_numbers` by top-level body block.
+  `numbering::heading_chapters` is `heading_numbers` for the top-level
+  headings by body block (a heading in a table cell moves the numbering but
+  sets no page's chapter, as in the export).
 - The suite's `Page` carries its `number` (restarts and fillers included).
   `page_fields::page_values` turns a `PageFlow` plus the headings into a
   `PageVals` per page; the page view's headers and footers (the editable one

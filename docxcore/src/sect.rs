@@ -868,6 +868,17 @@ fn num(tag: &str, name: &str) -> Option<i32> {
     attr(tag, name)?.trim().parse().ok()
 }
 
+/// `w:pgNumType w:start` as a page honours it, 0 to
+/// [`crate::page_num::MAX_PAGE_START`]. Read wide, as export.rs does, so a
+/// value past `i32` clamps instead of vanishing (`PageNumberFormat::start`
+/// keeps what the dialog edits).
+pub fn page_start(sect: &str) -> Option<i32> {
+    let tag = start_tag(own_children(sect), "w:pgNumType")?;
+    let n = attr(tag, "w:start")?.trim().parse::<f32>().ok()?;
+    n.is_finite()
+        .then(|| n.clamp(0.0, crate::page_num::MAX_PAGE_START as f32) as i32)
+}
+
 /// Set (`Some`) or remove (`None`) attributes on the first `name` element,
 /// keeping its other attributes. Creates the element in schema order when it
 /// is absent.

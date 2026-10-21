@@ -91,10 +91,6 @@ pub(crate) fn edit_page(slots: &[PageSlot], section: usize, variant: HeaderVaria
         .unwrap_or(0)
 }
 
-/// The blank sheet an oddPage/evenPage section start inserts must not take a
-/// section's First variant (`w:titlePg`): demote any a filler was given to
-/// Default, or to Even under Different Odd & Even when its page number is
-/// even. Called on the slots both page-slot consumers build.
 /// The slot each page of `pf` shows: the page's first body block (an empty
 /// range, a blank odd/even filler, takes the previous block) picks the
 /// section, and a filler sheet never takes a section's First variant. The
@@ -111,6 +107,10 @@ pub(crate) fn slots_of(
     slots
 }
 
+/// The blank sheet an oddPage/evenPage section start inserts must not take a
+/// section's First variant (`w:titlePg`): demote any a filler was given to
+/// Default, or to Even under Different Odd & Even when its page number is
+/// even. Called on the slots both page-slot consumers build.
 pub(crate) fn demote_filler_firsts(
     slots: &mut [PageSlot],
     fillers: &[bool],

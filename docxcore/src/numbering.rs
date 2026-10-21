@@ -469,40 +469,27 @@ pub(crate) fn heading_numbers(
 }
 
 /// [`heading_numbers`] by top-level body block: `(block index, heading level,
-/// chapter number or `None` when unnumbered)` in document order. A heading
-/// inside a table belongs to the table's block. For hosts that place pages by
+/// chapter number or `None` when unnumbered)` in document order. Only
+/// top-level headings are listed: a heading in a table cell still moves the
+/// numbering, but never sets a page's chapter (export.rs flattens a table's
+/// cells without announcing their headings). For hosts that place pages by
 /// body block and cannot hold the paragraph addresses the map is keyed by.
 pub fn heading_chapters(
     doc: &Document,
     num: &Numbering,
     styles: &StyleSheet,
 ) -> Vec<(usize, u8, Option<String>)> {
-    fn paragraphs<'a>(blocks: &'a [Block], out: &mut Vec<&'a Paragraph>) {
-        for block in blocks {
-            match block {
-                Block::Paragraph(p) => out.push(p),
-                Block::Table(t) => {
-                    for cell in t.rows.iter().flat_map(|r| &r.cells) {
-                        paragraphs(&cell.blocks, out);
-                    }
-                }
-                Block::SectionProperties(_) | Block::Raw(_) => {}
-            }
-        }
-    }
     let map = heading_numbers(doc, num, styles);
-    let mut out = Vec::new();
-    let mut ps = Vec::new();
-    for (i, block) in doc.body.iter().enumerate() {
-        ps.clear();
-        paragraphs(std::slice::from_ref(block), &mut ps);
-        for p in &ps {
-            if let Some((level, text)) = map.get(&(*p as *const Paragraph)) {
-                out.push((i, *level, text.clone()));
-            }
-        }
-    }
-    out
+    doc.body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, block)| match block {
+            Block::Paragraph(p) => map
+                .get(&(p as *const Paragraph))
+                .map(|(level, text)| (i, *level, text.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -649,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn heading_chapters_are_by_top_level_block() {
+    fn heading_chapters_list_top_level_headings_by_block() {
         let table = Block::Table(crate::model::Table {
             rows: vec![crate::model::Row {
                 cells: vec![crate::model::Cell {
@@ -675,7 +662,8 @@ mod tests {
             heading_chapters(&doc, &num, &styles),
             vec![
                 (1, 1, Some("1".to_string())),
-                (2, 1, Some("2".to_string())),
+                // The table's heading (numbered 2) is not listed, but moved
+                // the counter.
                 (3, 2, Some("2.1".to_string())),
                 (4, 1, None),
             ]
