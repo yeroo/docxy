@@ -2005,17 +2005,20 @@ impl Table {
     }
 }
 
-/// A table converted to a range, or deleted with all its columns, whose part
-/// is still in the package (see [`Workbook::removed_tables`]). The column
-/// formulas other table parts hold that name it are converted at save as the
-/// cell formulas were: with its geometry as it was removed, then through each
+/// A table converted to a range or deleted (all its columns, its whole range
+/// or its header row), whose part is still in the package (see
+/// [`Workbook::removed_tables`]). The column formulas other table parts hold
+/// that name it follow what the cell formulas did: a converted table's
+/// become its cells, with its geometry as it was removed, then through each
 /// row/column edit made on its sheet since ([`crate::formula::adjust_for_edit`],
-/// the same rewrite the cells went through), so both read the same cells. A
-/// deleted table's columns went with that delete (its first edit), so those
-/// formulas go `#REF!`, as its cell formulas did.
+/// the same rewrite the cells went through), so both read the same cells; a
+/// deleted table's go `#REF!`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemovedTable {
     pub table: Table,
+    /// Deleted by an edit rather than converted to a range: its references
+    /// went `#REF!`, not to cells.
+    pub deleted: bool,
     /// The row/column edits on its sheet since it was removed, in order.
     pub edits: Vec<crate::formula::EditShift>,
 }
@@ -2132,7 +2135,8 @@ pub struct Workbook {
     pub defined_names: Vec<DefinedName>,
     pub tables: Vec<Table>,
     /// Tables converted to a range ([`crate::edit::convert_table_to_range`])
-    /// or deleted with all their columns ([`crate::edit::delete_cols`]) whose
+    /// or deleted (all their columns, their whole range or their header
+    /// row: [`crate::edit::delete_cols`], [`crate::edit::delete_rows`]) whose
     /// parts are still in the package: a save drops each part that no
     /// table in [`Self::tables`] uses any more, together with its
     /// relationship, `<tablePart>` and content type. Only parts named here

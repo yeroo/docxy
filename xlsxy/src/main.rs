@@ -1962,6 +1962,201 @@ struct WbSnapshot {
     /// renames the tables the *current* model names rather than putting back
     /// a copy, which would take later model edits with it.
     model_rename: Option<(String, String)>,
+    /// Edits to the data model's measures and relationships that a table
+    /// column rename or delete made, to replay when this snapshot is
+    /// restored (each applies only where the model still holds its `from`).
+    model_edits: Vec<ModelEdit>,
+    /// The pending copy as a step that rewrote or dropped it left it (the
+    /// step's `after`) or found it (its `before`), for undo and redo to put
+    /// back.
+    clip_edit: Option<ClipEdit>,
+    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    pivot_unsupported: Vec<bool>,
+    /// A Resize Table step: undo and redo leave the model and the pending
+    /// copy alone, as the step did.
+    resize: bool,
+}
+
+/// A change to the pending copy that undo or redo replays: the copy is
+/// replaced (when the pending one is the same copy, by its serial, or none is
+/// pending and the text clipboard is still what the step saw) or dropped
+/// (when the pending one has this sheet, origin and span).
+#[derive(Clone)]
+enum ClipEdit {
+    /// The copy, and the text clipboard when the step saw it.
+    Set(ClipData, Option<String>),
+    Drop(usize, (u32, u32), (u32, u32)),
+}
+
+/// What an edit did to one table, from the snapshots around it
+/// ([`column_changes`]).
+struct TableChange {
+    /// The table as it was.
+    table: gridcore::sheet::Table,
+    /// Its new name, when the edit renamed it.
+    renamed_to: Option<String>,
+    /// Columns renamed, (old, new).
+    renamed: Vec<(String, String)>,
+    /// Which of `table.columns` the edit deleted (empty when none).
+    deleted: Vec<bool>,
+    /// The table is gone: `Some(true)` deleted, `Some(false)` converted.
+    removed: Option<bool>,
+}
+
+impl TableChange {
+    /// `e` as the edit left it. `inside` says the formula sits in the table
+    /// (its bare references name it); `table_name` also follows a table
+    /// rename (the data model has its own, `rename_table_in_model`). A
+    /// formula naming a removed table goes `#REF!`, converted or not, unless
+    /// `table_name` is off and the table was converted.
+    fn apply(
+        &self,
+        e: &gridcore::formula::Expr,
+        inside: bool,
+        table_name: bool,
+    ) -> gridcore::formula::Expr {
+        use gridcore::formula as f;
+        let name = &self.table.name;
+        if let Some(deleted) = self.removed {
+            if deleted || table_name {
+                return f::delete_table_in_expr(e, name, inside);
+            }
+            return e.clone();
+        }
+        let mut out = e.clone();
+        if self.deleted.contains(&true) {
+            out = f::delete_table_columns_in_expr(
+                &out,
+                name,
+                inside,
+                &self.table.columns,
+                &self.deleted,
+            );
+        } else if !self.renamed.is_empty() {
+            out = f::rename_table_columns_in_expr(&out, name, inside, &self.renamed);
+        }
+        match (&self.renamed_to, table_name) {
+            (Some(new), true) => f::rename_tables_in_expr(&out, &[(name.clone(), new.clone())]),
+            _ => out,
+        }
+    }
+
+    /// What a relationship end on column `col` of this table reads after the
+    /// edit, when it changed.
+    fn column_after(&self, col: &str) -> Option<String> {
+        let same = |x: &str| x.eq_ignore_ascii_case(col);
+        if self.removed == Some(true) {
+            return Some("#REF!".to_string());
+        }
+        if let Some((_, new)) = self.renamed.iter().find(|(old, _)| same(old)) {
+            return Some(new.clone());
+        }
+        let j = self.table.columns.iter().position(|x| same(x))?;
+        self.deleted
+            .get(j)
+            .copied()
+            .unwrap_or(false)
+            .then(|| "#REF!".to_string())
+    }
+}
+
+/// The tables `before` and `after` (snapshots around an edit) differ in, by
+/// part. Columns are paired by `Table::column_ids` when both sides know every
+/// column's, else by position (a rename, the same count) or name (a delete,
+/// fewer columns). A table that is not in `after` was removed: deleted when
+/// `after` keeps it in `removed_tables` as such.
+fn column_changes(before: &WbSnapshot, after: &WbSnapshot) -> Vec<TableChange> {
+    let mut out = Vec::new();
+    for b in &before.tables {
+        let a = after.tables.iter().find(|a| a.part == b.part);
+        let mut ch = TableChange {
+            table: b.clone(),
+            renamed_to: None,
+            renamed: Vec::new(),
+            deleted: Vec::new(),
+            removed: None,
+        };
+        match a {
+            None => {
+                ch.removed = Some(
+                    after
+                        .removed_tables
+                        .iter()
+                        .any(|r| r.table.part == b.part && r.deleted),
+                );
+            }
+            Some(a) => {
+                ch.renamed_to = (a.name != b.name).then(|| a.name.clone());
+                let known = |t: &gridcore::sheet::Table| {
+                    t.column_ids.len() == t.columns.len() && !t.column_ids.contains(&0)
+                };
+                if known(b) && known(a) {
+                    let mut deleted = vec![false; b.columns.len()];
+                    for (j, id) in b.column_ids.iter().enumerate() {
+                        match a.column_ids.iter().position(|x| x == id) {
+                            Some(k) if a.columns[k] != b.columns[j] => {
+                                ch.renamed
+                                    .push((b.columns[j].clone(), a.columns[k].clone()));
+                            }
+                            Some(_) => {}
+                            None => deleted[j] = true,
+                        }
+                    }
+                    if deleted.contains(&true) {
+                        ch.deleted = deleted;
+                    }
+                } else if a.columns.len() == b.columns.len() {
+                    ch.renamed = (b.columns.iter().zip(&a.columns))
+                        .filter(|(x, y)| x != y)
+                        .map(|(x, y)| (x.clone(), y.clone()))
+                        .collect();
+                } else if a.columns.len() < b.columns.len() {
+                    let deleted: Vec<bool> = (b.columns.iter())
+                        .map(|x| !a.columns.iter().any(|y| y.eq_ignore_ascii_case(x)))
+                        .collect();
+                    if deleted.contains(&true) {
+                        ch.deleted = deleted;
+                    }
+                }
+            }
+        }
+        if ch.removed.is_some()
+            || ch.renamed_to.is_some()
+            || !ch.renamed.is_empty()
+            || !ch.deleted.is_empty()
+        {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// One change a table column edit made to the data model, replayed by undo
+/// (reversed) and redo on whatever the model holds then.
+#[derive(Clone, Debug, PartialEq)]
+enum ModelEdit {
+    Measure {
+        name: String,
+        from: String,
+        to: String,
+    },
+    Relationship {
+        from: Relationship,
+        to: Relationship,
+    },
+}
+
+impl ModelEdit {
+    fn reversed(&self) -> ModelEdit {
+        match self.clone() {
+            ModelEdit::Measure { name, from, to } => ModelEdit::Measure {
+                name,
+                from: to,
+                to: from,
+            },
+            ModelEdit::Relationship { from, to } => ModelEdit::Relationship { from: to, to: from },
+        }
+    }
 }
 
 /// Whether `wb` differs from the snapshot `before` in what a filter or sort
@@ -2356,6 +2551,10 @@ struct ClipData {
     /// range: a cut moves the rules of all of it (#1050).
     span: (u32, u32),
     cut: bool,
+    /// Which copy this is ([`App::clip_serial`] when it was taken): a rewrite
+    /// keeps it, a new copy of the same range has another, so undo and redo
+    /// tell the two apart where their shown text is the same.
+    serial: u64,
 }
 
 /// What a commit that raised a data-validation alert goes on to do once the
@@ -2521,6 +2720,8 @@ struct App {
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
+    /// The count of grid copies taken ([`ClipData::serial`]).
+    clip_serial: u64,
     /// A modal Yes/No confirmation (e.g. Exit, delete sheet). The shared widget
     /// records its own selection/action.
     confirm: Option<backstage::Confirm<ConfirmAction>>,
@@ -2532,6 +2733,10 @@ struct App {
     model_view: Option<(usize, usize)>,
     model_rels: Vec<Relationship>,
     model_measures: Vec<gridcore::model::Measure>,
+    /// Resize Table is running: it moves a table's columns without
+    /// renaming or deleting them, so the model and the pending copy stay
+    /// as they are ([`App::follow_table_edits`]).
+    resizing_table: bool,
     last_find: Option<String>,
     // Review comments + the side panel that shows them.
     ribbon: ribbon::Ribbon,
@@ -2718,11 +2923,13 @@ impl App {
             clip: None,
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
+            clip_serial: 0,
             confirm: None,
             pending_link: None,
             prompt: None,
             pivot_edit: None,
             model_view: None,
+            resizing_table: false,
             model_rels,
             model_measures,
             last_find: None,
@@ -3461,8 +3668,9 @@ impl App {
                 renamed |= gridcore::edit::sync_table_headers(&mut self.pkg.workbook, *s, &cells);
             }
         }
-        if let (true, Some(before)) = (renamed || rewrote, wb_before) {
-            let after = self.wb_snapshot();
+        if let (true, Some(mut before)) = (renamed || rewrote, wb_before) {
+            let mut after = self.wb_snapshot();
+            self.follow_table_edits(&mut before, &mut after);
             // A write that rewrote formulas rebuilt the engine itself; a
             // header written back may have changed under it.
             if headers {
@@ -3700,9 +3908,13 @@ impl App {
             return Ok(false);
         }
         if sync_headers {
+            // A formula written into a header names its column by its value,
+            // which only a recalculation has (Excel does the same).
+            self.rebuild_engine();
             self.sync_written_headers(&before);
         }
         let mut after = self.wb_snapshot();
+        self.follow_table_edits(&mut before, &mut after);
         if let Some((old, new)) = model_rename {
             self.rename_table_in_model(old, new);
             before.model_rename = Some((new.to_string(), old.to_string()));
@@ -3762,6 +3974,185 @@ impl App {
         }
         for (s, cells) in written {
             gridcore::edit::sync_table_headers(&mut self.pkg.workbook, s, &cells);
+        }
+    }
+
+    /// The data model and the pending copy follow what an edit did to the
+    /// tables' columns (`before` and `after` are the snapshots around it, see
+    /// [`column_changes`]): a renamed column is renamed in the measures'
+    /// formulas and the relationships' ends, a deleted one (or a deleted
+    /// table) reads `#REF!` there. The model's edits go on both snapshots,
+    /// so undo and redo replay them ([`Self::apply_model_edits`]). Resize
+    /// Table is no such edit: it leaves the cells' formulas as they were,
+    /// and so the model.
+    fn follow_table_edits(&mut self, before: &mut WbSnapshot, after: &mut WbSnapshot) {
+        if self.resizing_table {
+            before.resize = true;
+            after.resize = true;
+            return;
+        }
+        let changes = column_changes(before, after);
+        if changes.is_empty() {
+            return;
+        }
+        // Chained per measure and relationship: a step that changes two
+        // tables rewrites each item through both, into one edit.
+        let mut edits: Vec<ModelEdit> = Vec::new();
+        for m in &self.model_measures {
+            let Ok(ast) = gridcore::formula::parse(&m.formula) else {
+                continue;
+            };
+            let out = changes
+                .iter()
+                .fold(ast.clone(), |e, ch| ch.apply(&e, false, false));
+            if out != ast {
+                edits.push(ModelEdit::Measure {
+                    name: m.name.clone(),
+                    from: m.formula.clone(),
+                    to: gridcore::formula::to_string(&out),
+                });
+            }
+        }
+        for r in &self.model_rels {
+            let mut to = r.clone();
+            for ch in &changes {
+                for end in [&mut to.from, &mut to.to] {
+                    if end.0.eq_ignore_ascii_case(&ch.table.name) {
+                        if let Some(col) = ch.column_after(&end.1) {
+                            end.1 = col;
+                        }
+                    }
+                }
+            }
+            if to != *r {
+                edits.push(ModelEdit::Relationship {
+                    from: r.clone(),
+                    to,
+                });
+            }
+        }
+        self.apply_model_edits(&edits);
+        before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
+        after.model_edits = edits;
+        self.follow_tables_in_clip(&changes, before, after);
+    }
+
+    /// The pending copy's formulas follow `changes` (table renames, column
+    /// renames and deletes), as the cells' do, so a paste after the edit
+    /// names what exists. A copy naming a table the edit removed (a delete
+    /// of all its columns or rows, a conversion) cannot be followed and is
+    /// dropped. A pending cut follows the same way; the step ends it right
+    /// after ([`Self::cancel_cut`]). Both snapshots keep the copy as it was
+    /// and as it became, so undo and redo put it back ([`Self::restore`]).
+    fn follow_tables_in_clip(
+        &mut self,
+        changes: &[TableChange],
+        before: &mut WbSnapshot,
+        after: &mut WbSnapshot,
+    ) {
+        let text = self.clip_text.clone();
+        let Some((orig, now)) = self.rewrite_clip(changes) else {
+            return;
+        };
+        let kept = |mut c: ClipData| {
+            c.cut = false;
+            c
+        };
+        before.clip_edit = Some(ClipEdit::Set(kept(orig.clone()), text.clone()));
+        after.clip_edit = Some(match now {
+            Some(clip) => ClipEdit::Set(kept(clip), text),
+            None => ClipEdit::Drop(orig.sheet, orig.from, orig.span),
+        });
+    }
+
+    /// Rewrite the pending copy's formulas through `changes`: the copy as it
+    /// was and as it is now (`None` when it names a removed table and is
+    /// dropped), or `None` when nothing changed.
+    fn rewrite_clip(&mut self, changes: &[TableChange]) -> Option<(ClipData, Option<ClipData>)> {
+        let orig = self.clip.clone()?;
+        let mut clip = orig.clone();
+        let (mut changed, mut dropped) = (false, false);
+        for ch in changes {
+            for (i, row) in clip.cells.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    let Some(cell) = cell else { continue };
+                    let Some(src) = cell.formula.as_ref() else {
+                        continue;
+                    };
+                    let Ok(ast) = gridcore::formula::parse(src) else {
+                        continue;
+                    };
+                    let (r, c) = (clip.from.0 + i as u32, clip.from.1 + j as u32);
+                    let inside = ch.table.contains(clip.sheet, r, c);
+                    let out = ch.apply(&ast, inside, true);
+                    if out != ast {
+                        changed = true;
+                        dropped |= ch.removed.is_some();
+                        cell.formula = Some(gridcore::formula::to_string(&out));
+                    }
+                }
+            }
+        }
+        if !changed {
+            return None;
+        }
+        if dropped {
+            self.clip = None;
+            Some((orig, None))
+        } else {
+            self.clip = Some(clip.clone());
+            Some((orig, Some(clip)))
+        }
+    }
+
+    /// Undo or redo's side of [`Self::follow_tables_in_clip`]. A copy comes
+    /// back over the same copy (its serial: a newer copy of the same range
+    /// stays, whatever it shows), or into an empty slot only while the text
+    /// clipboard is still what it was at the step: a text field's copy
+    /// (`field_copy`) also empties the slot, and is the newer.
+    fn apply_clip_edit(&mut self, edit: &ClipEdit) {
+        let same =
+            |c: &ClipData, key: (usize, (u32, u32), (u32, u32))| (c.sheet, c.from, c.span) == key;
+        match edit {
+            ClipEdit::Set(c, text) => {
+                let fits = match &self.clip {
+                    Some(cur) => cur.serial == c.serial,
+                    None => self.clip_text == *text,
+                };
+                if fits {
+                    self.clip = Some(c.clone());
+                }
+            }
+            ClipEdit::Drop(sheet, from, span) => {
+                if self
+                    .clip
+                    .as_ref()
+                    .is_some_and(|c| same(c, (*sheet, *from, *span)))
+                {
+                    self.clip = None;
+                }
+            }
+        }
+    }
+
+    /// Apply data-model `edits`, each only where the model still holds the
+    /// text it replaces.
+    fn apply_model_edits(&mut self, edits: &[ModelEdit]) {
+        for e in edits {
+            match e {
+                ModelEdit::Measure { name, from, to } => {
+                    if let Some(m) = (self.model_measures.iter_mut())
+                        .find(|m| m.name == *name && m.formula == *from)
+                    {
+                        m.formula = to.clone();
+                    }
+                }
+                ModelEdit::Relationship { from, to } => {
+                    if let Some(r) = self.model_rels.iter_mut().find(|r| *r == from) {
+                        *r = to.clone();
+                    }
+                }
+            }
         }
     }
 
@@ -3851,6 +4242,10 @@ impl App {
             precision: None,
             pivot_sources: wb.pivots.iter().map(|p| p.source.clone()).collect(),
             model_rename: None,
+            model_edits: Vec::new(),
+            clip_edit: None,
+            pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
+            resize: false,
         }
     }
 
@@ -3873,8 +4268,14 @@ impl App {
         // Pivots aren't added or removed by a structural edit; if their count
         // changed since, the sources no longer line up and stay as they are.
         if wb.pivots.len() == snap.pivot_sources.len() {
-            for (p, source) in wb.pivots.iter_mut().zip(&snap.pivot_sources) {
+            for ((p, source), &unsupported) in wb
+                .pivots
+                .iter_mut()
+                .zip(&snap.pivot_sources)
+                .zip(&snap.pivot_unsupported)
+            {
                 p.source = source.clone();
+                p.unsupported = unsupported;
             }
         }
     }
@@ -3882,9 +4283,28 @@ impl App {
     fn restore(&mut self, snap: &WbSnapshot) {
         self.circles.clear();
         self.cancel_cut();
+        // A copy taken after the step is rewritten only by renames (table
+        // and column), which the next replay undoes. A table removal or a
+        // column delete in a replay leaves it as it is: dropping it or
+        // turning a reference to `#REF!` could not be undone, and nothing
+        // records it. Only the copy the step itself found is dropped or
+        // rewritten, and put back through `clip_edit`.
+        let current = (self.clip.is_some() && !snap.resize).then(|| self.wb_snapshot());
         self.put_back(snap);
+        if let Some(current) = current {
+            let mut changes = column_changes(&current, snap);
+            changes.retain(|c| c.removed.is_none());
+            for c in &mut changes {
+                c.deleted.clear();
+            }
+            self.rewrite_clip(&changes);
+        }
         if let Some((old, new)) = &snap.model_rename {
             self.rename_table_in_model(old, new);
+        }
+        self.apply_model_edits(&snap.model_edits);
+        if let Some(edit) = &snap.clip_edit {
+            self.apply_clip_edit(edit);
         }
         self.rebuild_engine();
         self.clamp_cursor();
@@ -4586,6 +5006,7 @@ impl App {
         }
         let rules = gridcore::validation::copy_rules(self.sheet(), (r1, c1, r2, c2));
         let (sr1, sc1, sr2, sc2) = self.selection();
+        self.clip_serial += 1;
         self.clip = Some(ClipData {
             cells: rows,
             rules,
@@ -4593,6 +5014,7 @@ impl App {
             from: (r1, c1),
             span: (sr2 - sr1 + 1, sc2 - sc1 + 1),
             cut,
+            serial: self.clip_serial,
         });
         if let Some(cb) = &mut self.os_clip {
             let _ = cb.set_text(tsv.clone());
@@ -9585,7 +10007,10 @@ impl App {
     fn resize_table(&mut self, name: &str, range: &str) -> Result<(), String> {
         let rect = gridcore::sheet::parse_range_name(&range.replace('$', ""))
             .ok_or_else(|| format!("\"{range}\" isn't a range"))?;
-        self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect))
+        self.resizing_table = true;
+        let done = self.try_structural(None, |wb| gridcore::edit::resize_table(wb, name, rect));
+        self.resizing_table = false;
+        done
     }
 
     /// Convert to Range: table `name` becomes plain cells. Refused while the
@@ -16800,6 +17225,7 @@ mod tests {
             from: (0, 0),
             span: (1, 1),
             cut: false,
+            serial: 0,
         });
         app.paste_special(gridcore::edit::PasteSpec::default());
         assert!(app.status.as_deref().unwrap_or("").contains("gone"));
@@ -19098,6 +19524,466 @@ mod tests {
         app.apply_on(0, vec![(0, 1, Cell::default())]);
         assert_eq!(header_state(&app).0, "Column2");
         assert_eq!(header_state(&app).2, "SUM(Sales[Column2])");
+    }
+
+    /// #991 p4: `Sales` with a measure over `Sales[Qty]` and a relationship
+    /// from `Sales[Qty]`.
+    fn model_app() -> App {
+        let mut app = header_app();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Total".into(),
+            formula: "SUM(Sales[Qty])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Qty".into()),
+            to: ("Qtys".into(), "Id".into()),
+        });
+        app
+    }
+
+    #[test]
+    fn a_header_rename_reaches_the_data_model_991() {
+        let mut app = model_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_rels[0].from.1, "Units");
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_rels[0].from.1, "Units");
+    }
+
+    #[test]
+    fn a_column_delete_reaches_the_data_model_991() {
+        let mut app = model_app();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Items".into(),
+            formula: "COUNTA(Sales[Item])".into(),
+        });
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // the Qty column
+        assert!(app.model_measures[0].formula.contains("#REF!"));
+        assert_eq!(app.model_measures[1].formula, "COUNTA(Sales[Item])");
+        assert_eq!(app.model_rels[0].from.1, "#REF!");
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        app.redo();
+        assert!(app.model_measures[0].formula.contains("#REF!"));
+    }
+
+    #[test]
+    fn a_pending_copy_follows_a_table_and_column_rename_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.rename_table("Sales", "Revenue").unwrap();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.cur = (4, 3);
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Revenue[Units])"));
+        assert_eq!(f.value, CellValue::Number(7.0));
+    }
+
+    #[test]
+    fn a_pending_copy_follows_a_column_delete_and_drops_with_its_table_991() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("=SUM(Sales[Item])"))]);
+        clip_range(&mut app, (0, 3), (0, 4), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // the Qty column: D1:E1 moves to C1:D1
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = |c| {
+            app.pkg.workbook.sheets[0]
+                .cell(4, c)
+                .unwrap()
+                .formula
+                .clone()
+        };
+        assert!(f(3).unwrap().contains("#REF!"), "{:?}", f(3));
+        assert_eq!(f(4).as_deref(), Some("SUM(Sales[Item])"));
+        // Every column of the table deleted: the copy cannot name it.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn a_formula_replaced_into_a_header_names_the_column_by_its_value_991() {
+        let mut app = header_app();
+        app.structural_writing_cells(|wb| {
+            wb.sheets[0].set_cell(0, 1, Cell::formula("\"Units\"&1"));
+        });
+        assert_eq!(header_state(&app).1, ["Item", "Units1"]);
+        assert_eq!(header_state(&app).0, "Units1");
+        let b1 = app.pkg.workbook.sheets[0].cell(0, 1).unwrap();
+        assert!(b1.formula.is_none(), "the header is static text");
+        assert_eq!(header_state(&app).2, "SUM(Sales[Units1])");
+    }
+
+    /// #991 r1: `Sales` over A1:B3 (Id, Qty) and `Costs` over F1:G3 (Id,
+    /// Cost), a measure over both and a relationship between them.
+    fn two_table_app() -> App {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let sh = &mut app.pkg.workbook.sheets[0];
+        for (c, h) in [(0, "Id"), (1, "Qty"), (5, "Id"), (6, "Cost")] {
+            sh.set_cell(0, c, Cell::text(h));
+            sh.set_cell(1, c, Cell::number(1.0));
+            sh.set_cell(2, c, Cell::number(2.0));
+        }
+        app.pkg
+            .add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        app.pkg
+            .add_table(0, (0, 5, 2, 6), true, "TableStyleMedium2")
+            .unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table1", "Sales").unwrap();
+        gridcore::edit::rename_table(&mut app.pkg.workbook, "Table2", "Costs").unwrap();
+        app.rebuild_engine();
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Both".into(),
+            formula: "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Id".into()),
+            to: ("Costs".into(), "Id".into()),
+        });
+        app
+    }
+
+    #[test]
+    fn one_step_over_two_tables_rewrites_the_model_through_both_991() {
+        let mut app = two_table_app();
+        app.replace_all("Id", "Key"); // both headers
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Key", "Qty"]);
+        assert_eq!(app.pkg.workbook.tables[1].columns, ["Key", "Cost"]);
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Key".into()));
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "Key".into()));
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Key])"
+        );
+        app.undo();
+        assert_eq!(app.model_rels[0].to.1, "Id");
+        assert_eq!(app.model_rels[0].from.1, "Id");
+        assert!(app.model_measures[0].formula.ends_with("COUNTA(Sales[Id])"));
+        app.redo();
+        assert_eq!(app.model_rels[0].to.1, "Key");
+        assert_eq!(app.model_rels[0].from.1, "Key");
+    }
+
+    #[test]
+    fn a_delete_over_two_tables_rewrites_the_model_through_both_991() {
+        let mut app = two_table_app();
+        // B:F: Sales loses Qty and Costs loses Id, and both survive.
+        app.cur = (0, 1);
+        app.anchor = Some((0, 5));
+        app.col_op(false);
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Id"]);
+        assert_eq!(app.pkg.workbook.tables[1].columns, ["Cost"]);
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(#REF!)+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "#REF!".into()));
+        app.undo();
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].to, ("Costs".into(), "Id".into()));
+    }
+
+    #[test]
+    fn deleting_a_table_whole_reaches_the_model_and_undo_restores_it_991() {
+        let mut app = two_table_app();
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.row_op(false); // rows 1-3: both tables whole
+        assert!(app.pkg.workbook.tables.is_empty());
+        let f = app.model_measures[0].formula.clone();
+        assert!(!f.contains("Sales[") && !f.contains("Costs["), "{f}");
+        assert_eq!(app.model_rels[0].from.1, "#REF!");
+        assert_eq!(app.model_rels[0].to.1, "#REF!");
+        app.undo();
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        app.redo();
+        assert_eq!(app.model_rels[0].to.1, "#REF!");
+    }
+
+    #[test]
+    fn resize_table_leaves_the_model_and_the_clip_alone_991() {
+        let mut app = two_table_app();
+        app.apply_on(0, vec![(5, 3, parse_input("=SUM(Sales[Qty])"))]);
+        clip_range(&mut app, (5, 3), (5, 3), false);
+        // A:B -> B:C: Id leaves, a new column comes.
+        app.resize_table("Sales", "B1:C3").unwrap();
+        assert_eq!(app.pkg.workbook.tables[0].columns[0], "Qty");
+        assert_eq!(
+            app.model_measures[0].formula,
+            "SUM(Sales[Qty])+SUM(Costs[Cost])+COUNTA(Sales[Id])"
+        );
+        assert_eq!(app.model_rels[0].from, ("Sales".into(), "Id".into()));
+        let f = app.clip.as_ref().unwrap().cells[0][0]
+            .as_ref()
+            .unwrap()
+            .formula
+            .clone();
+        assert_eq!(f.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn undoing_a_table_delete_makes_its_pivot_refreshable_again_991() {
+        let mut app = header_app();
+        let frame = gridcore::frame::Frame::from_range(&app.pkg.workbook, 0, (0, 0, 2, 1));
+        let dest = app.pkg.add_sheet("Pivot");
+        app.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Sales".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 1,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        app.rebuild_engine();
+        app.sheet = 0;
+        app.cur = (0, 0);
+        app.anchor = Some((2, 0));
+        app.row_op(false); // the table's whole range
+        assert!(app.pkg.workbook.tables.is_empty());
+        assert!(app.pkg.workbook.pivots[0].unsupported);
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables.len(), 1);
+        assert!(!app.pkg.workbook.pivots[0].unsupported);
+        app.redo();
+        assert!(app.pkg.workbook.pivots[0].unsupported);
+    }
+
+    fn clip_formula(app: &App) -> Option<String> {
+        app.clip.as_ref()?.cells[0][0].as_ref()?.formula.clone()
+    }
+
+    #[test]
+    fn undo_and_redo_put_the_pending_copy_back_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        app.cur = (4, 3);
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn undo_of_a_column_delete_restores_the_pending_copy_991() {
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // Qty
+        assert!(clip_formula(&app).unwrap().contains("#REF!"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        // Every column: the copy is dropped, and undo brings it back.
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        assert!(!app.clip.as_ref().unwrap().cut);
+        app.redo();
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn undo_and_redo_keep_a_newer_text_field_copy_991() {
+        // Undo: copy, rename a header, Ctrl+C in a text field, Undo, paste.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.field_copy("field text", false);
+        app.undo();
+        assert!(app.clip.is_none(), "the field's copy is the newer");
+        app.cur = (4, 3);
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("field text".into()));
+        assert!(v.formula.is_none());
+        // Redo, with nothing between that ends the redo stack.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        app.undo();
+        app.field_copy("again", false);
+        app.redo();
+        assert!(app.clip.is_none());
+        app.cur = (4, 3);
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("again".into()));
+        // A copy dropped by a table-removing step, then a field copy.
+        let mut app = header_app();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        assert!(app.clip.is_none());
+        app.field_copy("field text", false);
+        app.undo();
+        assert!(app.clip.is_none());
+    }
+
+    #[test]
+    fn a_replay_that_removes_a_table_never_drops_a_newer_copy_991() {
+        // Delete A:B (Sales goes), undo, copy D1, redo, undo, paste.
+        let mut app = header_app();
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+        // A formula naming Sales copied before the step, another after the
+        // undo: the step's guarded Set must not put the first back.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("=COUNT(Sales[Qty])"))]);
+        clip_range(&mut app, (0, 4), (0, 4), false);
+        app.cur = (0, 0);
+        app.anchor = Some((0, 1));
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn a_replay_that_deletes_a_column_never_turns_a_newer_copy_to_ref_error_991() {
+        // Delete column B only, undo, copy D1, redo, undo, paste.
+        let mut app = header_app();
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        app.undo();
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let f = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(f.formula.as_deref(), Some("SUM(Sales[Qty])"));
+    }
+
+    #[test]
+    fn a_copy_taken_after_the_step_follows_the_undo_991() {
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+        app.undo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Qty])"));
+        app.redo();
+        assert_eq!(clip_formula(&app).as_deref(), Some("SUM(Sales[Units])"));
+    }
+
+    #[test]
+    fn undo_keeps_a_newer_copy_of_the_same_range_991() {
+        // Copy D1, delete column B (E1's "hello" shifts into D1), copy D1
+        // again, undo: the newer copy stays and pastes.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("hello"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(
+            app.clip.as_ref().unwrap().cells[0][0]
+                .as_ref()
+                .unwrap()
+                .value,
+            CellValue::Text("hello".into())
+        );
+        app.undo();
+        app.cur = (4, 3);
+        app.anchor = None;
+        app.paste();
+        let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
+        assert_eq!(v.value, CellValue::Text("hello".into()));
+        assert!(v.formula.is_none());
+    }
+
+    #[test]
+    fn undo_and_redo_keep_a_newer_copy_that_shows_the_same_text_991() {
+        // Copy D1 (SUM(Sales[Qty]), shown 7), delete column B (the constant
+        // 7 in E1 shifts into D1), copy D1 again: the same range and the same
+        // shown text, but another copy. Undo keeps it, and so does redo.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("7"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(app.clip_text.as_deref(), Some("7\n"));
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(app.clip_text.as_deref(), Some("7\n"));
+        let paste_at = |app: &mut App, r: u32| {
+            app.cur = (r, 3);
+            app.anchor = None;
+            app.paste();
+            app.pkg.workbook.sheets[0].cell(r, 3).unwrap().clone()
+        };
+        app.undo();
+        let v = paste_at(&mut app, 4);
+        assert!(v.formula.is_none(), "undo kept the constant");
+        assert_eq!(v.value, CellValue::Number(7.0));
+        app.undo();
+        app.redo();
+        app.redo();
+        let v = paste_at(&mut app, 6);
+        assert!(v.formula.is_none(), "redo kept the constant");
     }
 
     #[test]

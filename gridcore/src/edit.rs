@@ -1497,8 +1497,12 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     }
     // Before the grid moves, while each formula is still where the tables
     // see it (an unqualified `[@Qty]` names the table it sits in).
-    if !shift.rows && shift.delta < 0 {
-        delete_table_columns(wb, idx, &shift);
+    if shift.delta < 0 {
+        if shift.rows {
+            delete_table_rows(wb, idx, &shift);
+        } else {
+            delete_table_columns(wb, idx, &shift);
+        }
     }
     shift_grid(&mut wb.sheets[idx], &shift);
 
@@ -1647,9 +1651,11 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     // Table regions follow the grid. Row edits stretch/shift freely. A column
     // delete shrinks a table to its surviving columns (`delete_table_columns`
     // dropped their names and removed a table left with none). A column
-    // insert moves a table only when it falls entirely to its left: an
-    // insert inside it would need a new column (a later refinement), so it
-    // leaves the table in place.
+    // insert moves a table when it falls to its left, widens it when it falls
+    // inside it (`c1 < at <= c2`: new `Column<n>` columns whose header cells
+    // are written below) and leaves it alone
+    // to its right.
+    let mut new_headers: Vec<(usize, u32, u32, String)> = Vec::new();
     for t in &mut wb.tables {
         if t.sheet != idx {
             continue;
@@ -1672,12 +1678,41 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
             if nc2 < MAX_COLS as i64 {
                 t.range = (r1, (c1 as i64 + d) as u32, r2, nc2 as u32);
             }
+        } else if shift.at <= c2 && t.columns.len() == (c2 - c1 + 1) as usize {
+            // (A part whose `ref` is wider than its columns is left alone.)
+            let nc2 = c2 as i64 + shift.delta;
+            if nc2 < MAX_COLS as i64 {
+                t.range = (r1, c1, r2, nc2 as u32);
+                let j = (shift.at - c1) as usize;
+                for k in 0..shift.delta as usize {
+                    // The lowest free `Column<n>`, as an AutoExpansion
+                    // column is named (`resize_table_at`). Not measured
+                    // against Excel's Insert Table Column.
+                    let name = (1..)
+                        .map(|n| format!("Column{n}"))
+                        .find(|c| !t.columns.iter().any(|x| x.eq_ignore_ascii_case(c)))
+                        .unwrap_or_default();
+                    if t.header_rows > 0 {
+                        new_headers.push((idx, r1, shift.at + k as u32, name.clone()));
+                    }
+                    t.columns.insert(j + k, name);
+                    if !t.column_ids.is_empty() {
+                        t.column_ids.insert(j + k, 0);
+                    }
+                    if !t.calculated_formulas.is_empty() {
+                        t.calculated_formulas.insert(j + k, None);
+                    }
+                }
+            }
         }
     }
-    // A table converted to a range, or deleted with all its columns (by
-    // this edit, too), keeps the geometry it was removed with; the edits its
-    // cells went through since are replayed at save on the references to it
-    // (see `RemovedTable::edits`).
+    for (s, r, c, name) in new_headers {
+        wb.sheets[s].set_cell(r, c, Cell::text(&name));
+    }
+    // A table converted to a range keeps the geometry it was removed with
+    // (as does a deleted one, this edit included); the edits its cells went
+    // through since are replayed at save on the references to a converted
+    // one (see `RemovedTable::edits`).
     for rt in &mut wb.removed_tables {
         if rt.table.sheet == idx {
             rt.edits.push(shift);
@@ -1741,6 +1776,55 @@ fn shift_calculated_formulas(
     }
 }
 
+/// Delete table `i`: every reference to it goes `#REF!`, in the cells and,
+/// at the next save, in the other table parts' column formulas, and its part
+/// leaves the file then (the table is kept in [`Workbook::removed_tables`],
+/// marked deleted, until a save drops its part).
+fn delete_table(wb: &mut Workbook, i: usize) {
+    let t = wb.tables[i].clone();
+    rewrite_workbook_formulas(
+        wb,
+        |_, _| true,
+        true,
+        |e, site| crate::formula::delete_table_in_expr(e, &t.name, site.inside(&t)),
+    );
+    wb.tables.remove(i);
+    wb.removed_tables.push(crate::sheet::RemovedTable {
+        table: t.clone(),
+        deleted: true,
+        edits: Vec::new(),
+    });
+    // A PivotTable on the table keeps its cache and its cells, as in Excel,
+    // but has no source to refresh from.
+    for p in &mut wb.pivots {
+        if matches!(&p.source, crate::pivot::PivotSource::Table(n) if n.eq_ignore_ascii_case(&t.name))
+        {
+            p.unsupported = true;
+        }
+    }
+}
+
+/// Row delete `shift` on sheet `idx`: a table whose whole range goes, or
+/// whose header row goes (a table cannot lose its header; Excel's exact
+/// outcome for a header-only delete is not measured here, so it is treated
+/// as deleting the table), is deleted like one that loses every column
+/// ([`delete_table`]). Deleting data rows only leaves the table to
+/// [`structural_edit`], which shrinks it.
+fn delete_table_rows(wb: &mut Workbook, idx: usize, shift: &EditShift) {
+    let mut i = 0;
+    while i < wb.tables.len() {
+        let t = &wb.tables[i];
+        let (r1, _, r2, _) = t.range;
+        let header_gone = t.header_rows > 0 && point(r1, shift).is_none();
+        let all_gone = (r1..=r2).all(|r| point(r, shift).is_none());
+        if t.sheet == idx && (header_gone || all_gone) {
+            delete_table(wb, i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Column delete `shift` on sheet `idx`, as Excel deletes table columns: a
 /// reference to a deleted column of a table goes `#REF!` (a span keeps its
 /// survivors, [`crate::formula::delete_table_columns_in_expr`]) and the
@@ -1762,17 +1846,7 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
         }
         let inside = |site: FormulaSite| site.inside(&t);
         if deleted.iter().all(|&d| d) {
-            rewrite_workbook_formulas(
-                wb,
-                |_, _| true,
-                true,
-                |e, site| crate::formula::delete_table_in_expr(e, &t.name, inside(site)),
-            );
-            wb.tables.remove(i);
-            wb.removed_tables.push(crate::sheet::RemovedTable {
-                table: t,
-                edits: Vec::new(),
-            });
+            delete_table(wb, i);
             continue;
         }
         rewrite_workbook_formulas(
@@ -2878,6 +2952,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
     wb.tables.remove(idx);
     wb.removed_tables.push(crate::sheet::RemovedTable {
         table: t,
+        deleted: false,
         edits: Vec::new(),
     });
     Ok(())
@@ -5011,6 +5086,88 @@ mod table_tests {
     }
 
     #[test]
+    fn column_insert_inside_a_table_widens_it_with_a_named_column() {
+        let mut wb = sales();
+        put(&mut wb, 0, "F1", "SUM(Sales[Qty])");
+        wb.tables[0].column_ids = vec![1, 2, 3];
+        insert_cols(&mut wb, 0, 1, 2); // between Item and Qty
+        let t = &wb.tables[0];
+        assert_eq!(t.range, (0, 0, 3, 4));
+        assert_eq!(t.columns, ["Item", "Column1", "Column2", "Qty", "Dbl"]);
+        assert_eq!(t.column_ids, [1, 0, 0, 2, 3]);
+        let header = |c| wb.sheets[0].cell(0, c).unwrap().value.clone();
+        assert_eq!(header(1), CellValue::Text("Column1".into()));
+        assert_eq!(header(2), CellValue::Text("Column2".into()));
+        assert_eq!(header(3), CellValue::Text("Qty".into()));
+        assert_eq!(formula(&wb, 0, "H1"), "SUM(Sales[Qty])");
+        assert_eq!(value(&mut wb, 0, "H1"), CellValue::Number(12.0));
+    }
+
+    #[test]
+    fn column_insert_in_a_table_wider_than_its_columns_leaves_it_alone_991() {
+        // A part whose `ref` is wider than its tableColumn list.
+        let mut wb = sales();
+        wb.tables[0].columns.truncate(2);
+        insert_cols(&mut wb, 0, 2, 1); // inside A:C, past the two columns
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 2));
+        assert_eq!(wb.tables[0].columns.len(), 2);
+    }
+
+    #[test]
+    fn column_insert_at_the_edges_of_a_table_moves_or_keeps_it() {
+        let mut wb = sales();
+        insert_cols(&mut wb, 0, 0, 1);
+        assert_eq!(wb.tables[0].range, (0, 1, 3, 3));
+        assert_eq!(wb.tables[0].columns.len(), 3);
+        let mut wb = sales();
+        insert_cols(&mut wb, 0, 3, 1);
+        assert_eq!(wb.tables[0].range, (0, 0, 3, 2));
+        assert_eq!(wb.tables[0].columns.len(), 3);
+    }
+
+    #[test]
+    fn row_delete_over_the_whole_table_removes_it() {
+        let mut wb = sales();
+        put(&mut wb, 1, "A1", "SUM(Sales[Qty])");
+        wb.pivots.push(pivot("P", 1, (3, 3, 6, 4), "Sales"));
+        delete_rows(&mut wb, 0, 0, 4);
+        assert!(wb.tables.is_empty());
+        assert_eq!(wb.removed_tables.len(), 1);
+        assert!(formula(&wb, 1, "A1").contains("#REF!"));
+        assert!(wb.pivots[0].unsupported, "the pivot keeps its cache only");
+    }
+
+    #[test]
+    fn row_delete_of_the_header_row_removes_the_table() {
+        let mut wb = sales();
+        put(&mut wb, 1, "A1", "SUM(Sales[Qty])");
+        delete_rows(&mut wb, 0, 0, 1);
+        assert!(wb.tables.is_empty());
+        assert_eq!(wb.removed_tables.len(), 1);
+        assert!(formula(&wb, 1, "A1").contains("#REF!"));
+    }
+
+    #[test]
+    fn row_delete_of_data_rows_keeps_the_table() {
+        let mut wb = sales();
+        delete_rows(&mut wb, 0, 1, 3);
+        assert_eq!(wb.tables.len(), 1);
+        assert_eq!(wb.tables[0].range, (0, 0, 0, 2));
+        assert!(wb.removed_tables.is_empty());
+    }
+
+    #[test]
+    fn deleting_every_column_leaves_a_table_pivot_unrefreshed() {
+        let mut wb = sales();
+        wb.pivots.push(pivot("P", 1, (3, 3, 6, 4), "Sales"));
+        delete_cols(&mut wb, 0, 0, 3);
+        assert!(wb.tables.is_empty());
+        assert!(wb.pivots[0].unsupported);
+        let out = crate::pivot::refresh_pivots(&mut wb);
+        assert_eq!((out.refreshed, out.skipped), (0, 1));
+    }
+
+    #[test]
     fn rename_table_rewrites_every_formula_that_names_it() {
         let mut wb = sales();
         put(&mut wb, 0, "E1", "SUM(Sales[Qty])");
@@ -5441,6 +5598,7 @@ mod table_tests {
             wb.removed_tables,
             [crate::sheet::RemovedTable {
                 table,
+                deleted: true,
                 edits: vec![shift],
             }]
         );

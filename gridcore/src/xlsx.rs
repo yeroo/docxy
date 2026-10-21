@@ -7870,11 +7870,11 @@ fn table_children(xml: &str, name: &str) -> Vec<(usize, usize)> {
     child_spans(xml, (root, root + p.pos()), name)
 }
 
-/// A table converted to a range, or deleted with all its columns, whose part
-/// a save drops: the name other table parts' formulas know it by, and where
-/// its cells are (a deleted table's went with its delete, so those formulas
-/// go `#REF!`).
+/// A table converted to a range or deleted, whose part a save drops: the name
+/// other table parts' formulas know it by, and where its cells are (a deleted
+/// table's formulas go `#REF!`, as its cell formulas did).
 struct ConvertedTable {
+    deleted: bool,
     part: String,
     loaded_name: String,
     edits: Vec<crate::formula::EditShift>,
@@ -7891,11 +7891,22 @@ struct ColumnRenames {
     map: Vec<(String, String)>,
 }
 
+/// A table's columns deleted since its part was loaded: the name formulas in
+/// the parts know the table by, its columns as the part names them and which
+/// of them are gone.
+struct ColumnDeletes {
+    part: String,
+    loaded_name: String,
+    columns: Vec<String>,
+    deleted: Vec<bool>,
+}
+
 /// The formulas a table part holds in its columns (`calculatedColumnFormula`,
 /// `totalsRowFormula`) with table columns renamed (`columns`: qualified
-/// references in every part, unqualified ones in the table's own), tables
-/// renamed (`renames`, old → new, applied at once) and converted tables'
-/// references turned into cells. `own_sheet` and `own_part` are the sheet
+/// references in every part, unqualified ones in the table's own), deleted
+/// columns' references `#REF!` (`deletes`), tables renamed (`renames`, old →
+/// new, applied at once), and removed tables' references: a deleted table's
+/// `#REF!`, a converted one's turned into cells. `own_sheet` and `own_part` are the sheet
 /// and part of the table whose part this is. A formula that doesn't parse,
 /// or that nothing touches, keeps its text.
 fn rewrite_column_formulas(
@@ -7903,6 +7914,7 @@ fn rewrite_column_formulas(
     own_sheet: usize,
     own_part: &str,
     columns: &[ColumnRenames],
+    deletes: &[ColumnDeletes],
     renames: &[(String, String)],
     converted: &[ConvertedTable],
 ) -> String {
@@ -7930,6 +7942,10 @@ fn rewrite_column_formulas(
                 };
                 let mut out = ast.clone();
                 for c in converted {
+                    if c.deleted {
+                        out = crate::formula::delete_table_in_expr(&out, &c.loaded_name, false);
+                        continue;
+                    }
                     let target = crate::formula::TableToRange {
                         name: &c.loaded_name,
                         sheet_name: &c.sheet_name,
@@ -7957,6 +7973,17 @@ fn rewrite_column_formulas(
                             })
                         })
                     });
+                }
+                // A deleted column's references go `#REF!`, as the cells'
+                // did, by the names the file knows it by.
+                for cd in deletes {
+                    out = crate::formula::delete_table_columns_in_expr(
+                        &out,
+                        &cd.loaded_name,
+                        cd.part == own_part,
+                        &cd.columns,
+                        &cd.deleted,
+                    );
                 }
                 // By the names the file knows, before the tables' renames.
                 for cr in columns {
@@ -8170,9 +8197,10 @@ fn part_column_names(t: &Table, xml: &str) -> Vec<String> {
 
 /// Bring the table parts in line with the model: each table's range, name
 /// and columns (renamed ones by id, deleted ones dropped), the column
-/// formulas of every part (renamed tables and columns, converted tables),
-/// and the parts of tables converted to a range or deleted with all their
-/// columns dropped.
+/// formulas of every part (renamed tables and columns, deleted columns,
+/// converted tables),
+/// and the parts of tables converted to a range or deleted (all their
+/// columns, their whole range or their header row) dropped.
 fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
     let part_xml = |parts: &[(String, Vec<u8>)], name: &str| {
         parts
@@ -8209,6 +8237,31 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             })
         })
         .collect();
+    // A column the model no longer has (by id, else by name) is deleted: the
+    // formulas in the parts that name it read `#REF!` for it.
+    let column_deletes: Vec<ColumnDeletes> = wb
+        .tables
+        .iter()
+        .filter_map(|t| {
+            let xml = part_xml(parts, &t.part)?;
+            let loaded = parse_table_xml(&xml, t.sheet, &t.part)?;
+            let deleted: Vec<bool> = (0..loaded.columns.len())
+                .map(|k| match loaded.column_ids.get(k) {
+                    Some(id) if !t.column_ids.is_empty() => !t.column_ids.contains(id),
+                    _ => !t
+                        .columns
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(&loaded.columns[k])),
+                })
+                .collect();
+            deleted.contains(&true).then(|| ColumnDeletes {
+                part: t.part.clone(),
+                loaded_name: loaded.name,
+                columns: loaded.columns,
+                deleted,
+            })
+        })
+        .collect();
     let converted: Vec<ConvertedTable> = wb
         .removed_tables
         .iter()
@@ -8222,6 +8275,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
             let mut info = r.info();
             info.columns = part_column_names(r, &xml);
             Some(ConvertedTable {
+                deleted: removed.deleted,
                 part: r.part.clone(),
                 loaded_name,
                 edits: removed.edits.clone(),
@@ -8260,12 +8314,17 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         if !dropped.is_empty() {
             dropped_columns.push((t.part.clone(), dropped));
         }
-        if !column_renames.is_empty() || !renames.is_empty() || !converted.is_empty() {
+        if !column_renames.is_empty()
+            || !column_deletes.is_empty()
+            || !renames.is_empty()
+            || !converted.is_empty()
+        {
             updated = rewrite_column_formulas(
                 &updated,
                 t.sheet,
                 &t.part,
                 &column_renames,
+                &column_deletes,
                 &renames,
                 &converted,
             );
@@ -14575,7 +14634,7 @@ b",
 
     /// A one-sheet workbook with the standard dynamic-array `xl/metadata.xml`
     /// (`cm="1"` is XLDAPR `fDynamic`); `rows` is the `<sheetData>` content.
-    fn cell_meta_fixture(rows: &str) -> Vec<u8> {
+    pub(super) fn cell_meta_fixture(rows: &str) -> Vec<u8> {
         let sheet = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>{rows}</sheetData></worksheet>"#
@@ -24450,6 +24509,91 @@ mod table_command_tests {
         let s = xml.find("<calculatedColumnFormula>").unwrap() + "<calculatedColumnFormula>".len();
         let e = xml.find("</calculatedColumnFormula>").unwrap();
         decode(&xml[s..e])
+    }
+
+    /// #991 p3: a totals-row formula in a surviving table's part that names
+    /// a deleted column of its table reads `#REF!` after the save, as the
+    /// cells' formulas do; the model holds none of these formulas.
+    #[test]
+    fn a_totals_formula_naming_a_deleted_column_saves_as_ref_error() {
+        let mut pkg = one_table();
+        let part = pkg.workbook.tables[0].part.clone();
+        let xml = text(&pkg, &part);
+        let at = xml.find("name=\"Qty\"/>").unwrap();
+        let end = at + "name=\"Qty\"/>".len();
+        let el = "name=\"Qty\" totalsRowFunction=\"custom\"><totalsRowFormula>COUNTA(Table1[Item])+SUM(Table1[Qty])</totalsRowFormula></tableColumn>";
+        let xml = format!("{}{el}{}", &xml[..at], &xml[end..]);
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let mut pkg = reload(&pkg);
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 0, 1);
+        let saved = text(&reload(&pkg), &part);
+        assert!(
+            saved.contains("<totalsRowFormula>COUNTA(#REF!)+SUM(Table1[Qty])</totalsRowFormula>"),
+            "{saved}"
+        );
+    }
+
+    /// #991 p7: a shared group over a structured reference is expanded into
+    /// plain formulas by the load (only a group whose master does not parse
+    /// keeps its marker, and no rewrite can read that text), so a table
+    /// rename, a header rename and a column delete reach every cell of it.
+    #[test]
+    fn a_shared_group_over_a_table_follows_renames_and_deletes() {
+        let rows = concat!(
+            r#"<row r="1"><c r="D1"><f t="shared" ref="D1:D3" si="0">SUM(Table1[Qty])+ROW()</f><v>0</v></c></row>"#,
+            r#"<row r="2"><c r="D2"><f t="shared" si="0"/><v>0</v></c></row>"#,
+            r#"<row r="3"><c r="D3"><f t="shared" si="0"/><v>0</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&super::tests::cell_meta_fixture(rows)).unwrap();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("Item"));
+        s.set_cell(0, 1, Cell::text("Qty"));
+        pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let f = |pkg: &SheetPackage, r, c| {
+            let c = pkg.workbook.sheets[0].cell(r, c).unwrap();
+            assert!(c.f_attrs.is_none(), "expanded at load");
+            c.formula.clone().unwrap()
+        };
+        assert_eq!(f(&pkg, 2, 3), "SUM(Table1[Qty])+ROW()");
+        crate::edit::rename_table(&mut pkg.workbook, "Table1", "Sales").unwrap();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Units"));
+        crate::edit::sync_table_headers(&mut pkg.workbook, 0, &[(0, 1)]);
+        for r in 0..3 {
+            assert_eq!(f(&pkg, r, 3), "SUM(Sales[Units])+ROW()");
+        }
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        for r in 0..3 {
+            assert!(f(&pkg, r, 2).contains("#REF!"), "{}", f(&pkg, r, 2));
+        }
+    }
+
+    /// #991 r1: a table deleted by a header-row delete is no conversion: the
+    /// other parts' formulas naming it read `#REF!`, as the cells' did, not
+    /// the cells that stay.
+    #[test]
+    fn a_header_row_delete_saves_other_parts_formulas_as_ref_error() {
+        let mut pkg = one_table();
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(5, 0, Cell::text("A"));
+        s.set_cell(5, 1, Cell::text("B"));
+        pkg.add_table(0, (5, 0, 7, 1), true, "TableStyleMedium2")
+            .unwrap();
+        let part = pkg.workbook.tables[1].part.clone();
+        let xml = text(&pkg, &part);
+        let at = xml.find("name=\"B\"/>").unwrap();
+        let end = at + "name=\"B\"/>".len();
+        let el = "name=\"B\" totalsRowFunction=\"custom\"><totalsRowFormula>SUM(Table1[Qty])</totalsRowFormula></tableColumn>";
+        let xml = format!("{}{el}{}", &xml[..at], &xml[end..]);
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let mut pkg = reload(&pkg);
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1); // Table1's header
+        assert_eq!(pkg.workbook.tables.len(), 1);
+        let saved = text(&reload(&pkg), &part);
+        assert!(
+            saved.contains("<totalsRowFormula>SUM(#REF!)</totalsRowFormula>"),
+            "{saved}"
+        );
     }
 
     #[test]

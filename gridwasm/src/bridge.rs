@@ -65,6 +65,8 @@ struct WbSnapshot {
     /// kept), only in the snapshots of the step that switches it on
     /// ([`Session::ctl_calc_set`]); every other step leaves the setting alone.
     precision: Option<(bool, bool)>,
+    /// Each PivotTable's `unsupported` flag: deleting its table sets it.
+    pivot_unsupported: Vec<bool>,
 }
 
 impl WbSnapshot {
@@ -75,6 +77,7 @@ impl WbSnapshot {
             tables: wb.tables.clone(),
             removed_tables: wb.removed_tables.clone(),
             precision: None,
+            pivot_unsupported: wb.pivots.iter().map(|p| p.unsupported).collect(),
         }
     }
 }
@@ -583,8 +586,35 @@ impl Session {
         // anchor re-spills over ([`Session::snapshot`]), whether or not the
         // anchor is in the group.
         let snapshot = |s: &Self| s.snapshot(sheet_idx, &keys);
+        // A header cell of a table names its column: an edit there renames
+        // the column in every formula (`sync_table_headers`, as xlsxy's
+        // edits do), which only a whole-workbook step can undo.
+        let headers = self.hits_table_header(sheet_idx, &keys);
+        let wb_before = headers.then(|| WbSnapshot::of(&self.pkg.workbook));
         let before = snapshot(self);
         write(self);
+        let written = snapshot(self);
+        if let Some(wb_before) = wb_before {
+            let renamed =
+                gridcore::edit::sync_table_headers(&mut self.pkg.workbook, sheet_idx, &keys);
+            if renamed {
+                self.rebuild_engine();
+                let wb_after = WbSnapshot::of(&self.pkg.workbook);
+                self.undo.push(UndoAction::Structural {
+                    before: wb_before,
+                    after: wb_after,
+                });
+                self.edits += 1;
+                self.redo.clear();
+                self.dirty = true;
+                return;
+            }
+            // A header written back as its column's name (a blank, a
+            // duplicate, a formula) changed under the engine.
+            if written != snapshot(self) {
+                self.rebuild_engine();
+            }
+        }
         let after = snapshot(self);
         let group = UndoGroup {
             sheet: sheet_idx,
@@ -599,6 +629,18 @@ impl Session {
         self.edits += 1;
         self.redo.clear();
         self.dirty = true;
+    }
+
+    /// Whether any of `cells` on sheet `sheet` is a header cell of a table.
+    fn hits_table_header(&self, sheet: usize, cells: &[(u32, u32)]) -> bool {
+        self.pkg.workbook.tables.iter().any(|t| {
+            let (r1, c1, _, c2) = t.range;
+            t.sheet == sheet
+                && t.header_rows > 0
+                && cells
+                    .iter()
+                    .any(|&(r, c)| r == r1 && (c1..=c2).contains(&c))
+        })
     }
 
     /// Restyle cells on sheet `sheet_idx` — `(row, col, style index)` — as
@@ -744,6 +786,13 @@ impl Session {
         wb.removed_tables = snap.removed_tables.clone();
         if let Some((on, file_off)) = snap.precision {
             (wb.calc.precision_as_displayed, wb.calc.precision_file_off) = (on, file_off);
+        }
+        // Pivots aren't added or removed by a structural edit; if their count
+        // changed since, the flags no longer line up and stay as they are.
+        if wb.pivots.len() == snap.pivot_unsupported.len() {
+            for (p, &unsupported) in wb.pivots.iter_mut().zip(&snap.pivot_unsupported) {
+                p.unsupported = unsupported;
+            }
         }
         self.rebuild_engine();
         self.dirty = true;
@@ -3036,13 +3085,25 @@ impl Session {
         let today = self.engine.clock;
         self.structural(|wb| {
             let ctx = gridcore::entry::entry_ctx(wb, today);
-            for sheet in &mut wb.sheets {
+            let mut written: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+            for (si, sheet) in wb.sheets.iter_mut().enumerate() {
                 let changes =
                     gridcore::edit::replace_all_in_sheet(sheet, &mut wb.styles, &ctx, query, text);
                 replaced += changes.len();
+                let mut cells = Vec::new();
                 for (r, c, nc) in changes {
+                    // A formula in a header has no value to name its column
+                    // by until a recalculation: it is left as written.
+                    if nc.formula.is_none() {
+                        cells.push((r, c));
+                    }
                     sheet.set_cell(r, c, nc);
                 }
+                written.push((si, cells));
+            }
+            // A table header it rewrote renames that column.
+            for (si, cells) in written {
+                gridcore::edit::sync_table_headers(wb, si, &cells);
             }
         });
         Ok(format!("{{\"replaced\":{replaced},\"undoSteps\":1}}"))
@@ -3479,6 +3540,78 @@ mod tests {
         assert_eq!(s.pkg.workbook.tables, table);
         s.dispatch("redo");
         assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Line"]);
+    }
+
+    /// #991 p5: a header edit renames the table column everywhere, as one
+    /// undo step.
+    #[test]
+    fn a_header_edit_renames_the_table_column_991() {
+        use gridcore::sheet::CellValue;
+        let mut s = table_session();
+        s.dispatch("set\t0\t2\tTotal");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Price", "Total"]);
+        let f1 = s.pkg.workbook.sheets[0].cell(1, 5).unwrap();
+        assert_eq!(f1.formula.as_deref(), Some("SUM(Calc[Total])"));
+        assert_eq!(cell_value(&s, 1, 5), Some(CellValue::Number(66.0)));
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Price", "Line"]);
+        let f1 = s.pkg.workbook.sheets[0].cell(1, 5).unwrap();
+        assert_eq!(f1.formula.as_deref(), Some("SUM(Calc[Line])"));
+        assert_eq!(cell_value(&s, 0, 2), Some(CellValue::Text("Line".into())));
+        s.dispatch("redo");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Price", "Total"]);
+        // A cleared header takes `Column<n>`, written into the cell.
+        s.dispatch("set\t0\t1\t");
+        assert_eq!(s.pkg.workbook.tables[0].columns[1], "Column2");
+        assert_eq!(
+            cell_value(&s, 0, 1),
+            Some(CellValue::Text("Column2".into()))
+        );
+    }
+
+    #[test]
+    fn replace_all_over_a_header_renames_the_table_column_991() {
+        let mut s = table_session();
+        s.dispatch("set\t5\t5\t=COUNTA(Calc[Price])");
+        s.undo.clear();
+        let out = s.ctl(r#"{"verb":"wb.replace-all","args":{"query":"Price","text":"Cost"}}"#);
+        // The header and the formula's text both change.
+        assert!(out.contains("\"replaced\":2"), "{out}");
+        assert_eq!(s.pkg.workbook.tables[0].columns, ["Qty", "Cost", "Line"]);
+        // The formula names a column that exists, so it reads its cells.
+        assert_eq!(
+            cell_value(&s, 5, 5),
+            Some(gridcore::sheet::CellValue::Number(3.0))
+        );
+    }
+
+    #[test]
+    fn undoing_a_table_delete_makes_its_pivot_refreshable_again_991() {
+        let mut s = table_session();
+        let frame = gridcore::frame::Frame::from_range(&s.pkg.workbook, 0, (0, 0, 3, 2));
+        let dest = s.pkg.add_sheet("Pivot");
+        s.pkg
+            .add_pivot(
+                gridcore::pivot::PivotSource::Table("Calc".into()),
+                frame.names.clone(),
+                gridcore::pivot::DataField {
+                    name: "Sum of Qty".into(),
+                    field: 0,
+                    agg: gridcore::frame::Agg::Sum,
+                },
+                dest,
+                (2, 0),
+            )
+            .unwrap();
+        s.rebuild_engine();
+        s.dispatch("delrow\t0\t4"); // the table's whole range
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert!(s.pkg.workbook.pivots[0].unsupported);
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.tables.len(), 1);
+        assert!(!s.pkg.workbook.pivots[0].unsupported);
+        s.dispatch("redo");
+        assert!(s.pkg.workbook.pivots[0].unsupported);
     }
 
     #[test]

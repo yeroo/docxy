@@ -3403,7 +3403,8 @@ pub fn delete_table_columns_in_expr(
     })
 }
 
-/// Table `table` was deleted with all its columns: every structured
+/// Table `table` was deleted (all its columns, its whole range or its header
+/// row): every structured
 /// reference to it (see [`names_table`]) and its bare name become `#REF!`.
 pub fn delete_table_in_expr(e: &Expr, table: &str, inside: bool) -> Expr {
     map_expr(e, &|x| match x {
