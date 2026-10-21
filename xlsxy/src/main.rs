@@ -1978,9 +1978,9 @@ struct WbSnapshot {
 }
 
 /// A change to the pending copy that undo or redo replays: the copy is
-/// replaced (when the pending one has the same source, or none is pending and
-/// the text clipboard is still what the step saw) or dropped (when the
-/// pending one has this sheet, origin and span).
+/// replaced (when the pending one is the same copy, by its serial, or none is
+/// pending and the text clipboard is still what the step saw) or dropped
+/// (when the pending one has this sheet, origin and span).
 #[derive(Clone)]
 enum ClipEdit {
     /// The copy, and the text clipboard when the step saw it.
@@ -2551,6 +2551,10 @@ struct ClipData {
     /// range: a cut moves the rules of all of it (#1050).
     span: (u32, u32),
     cut: bool,
+    /// Which copy this is ([`App::clip_serial`] when it was taken): a rewrite
+    /// keeps it, a new copy of the same range has another, so undo and redo
+    /// tell the two apart where their shown text is the same.
+    serial: u64,
 }
 
 /// What a commit that raised a data-validation alert goes on to do once the
@@ -2716,6 +2720,8 @@ struct App {
     clip: Option<ClipData>,
     os_clip: Option<arboard::Clipboard>,
     clip_text: Option<String>,
+    /// The count of grid copies taken ([`ClipData::serial`]).
+    clip_serial: u64,
     /// A modal Yes/No confirmation (e.g. Exit, delete sheet). The shared widget
     /// records its own selection/action.
     confirm: Option<backstage::Confirm<ConfirmAction>>,
@@ -2917,6 +2923,7 @@ impl App {
             clip: None,
             os_clip: arboard::Clipboard::new().ok(),
             clip_text: None,
+            clip_serial: 0,
             confirm: None,
             pending_link: None,
             prompt: None,
@@ -4099,17 +4106,17 @@ impl App {
     }
 
     /// Undo or redo's side of [`Self::follow_tables_in_clip`]. A copy comes
-    /// back over another with the same source, or into an empty slot only
-    /// while the text clipboard is still what it was at the step: a text
-    /// field's copy (`field_copy`) also empties the slot, and is the newer.
+    /// back over the same copy (its serial: a newer copy of the same range
+    /// stays, whatever it shows), or into an empty slot only while the text
+    /// clipboard is still what it was at the step: a text field's copy
+    /// (`field_copy`) also empties the slot, and is the newer.
     fn apply_clip_edit(&mut self, edit: &ClipEdit) {
         let same =
             |c: &ClipData, key: (usize, (u32, u32), (u32, u32))| (c.sheet, c.from, c.span) == key;
         match edit {
             ClipEdit::Set(c, text) => {
-                let key = (c.sheet, c.from, c.span);
                 let fits = match &self.clip {
-                    Some(cur) => same(cur, key) && self.clip_text == *text,
+                    Some(cur) => cur.serial == c.serial,
                     None => self.clip_text == *text,
                 };
                 if fits {
@@ -4999,6 +5006,7 @@ impl App {
         }
         let rules = gridcore::validation::copy_rules(self.sheet(), (r1, c1, r2, c2));
         let (sr1, sc1, sr2, sc2) = self.selection();
+        self.clip_serial += 1;
         self.clip = Some(ClipData {
             cells: rows,
             rules,
@@ -5006,6 +5014,7 @@ impl App {
             from: (r1, c1),
             span: (sr2 - sr1 + 1, sc2 - sc1 + 1),
             cut,
+            serial: self.clip_serial,
         });
         if let Some(cb) = &mut self.os_clip {
             let _ = cb.set_text(tsv.clone());
@@ -17216,6 +17225,7 @@ mod tests {
             from: (0, 0),
             span: (1, 1),
             cut: false,
+            serial: 0,
         });
         app.paste_special(gridcore::edit::PasteSpec::default());
         assert!(app.status.as_deref().unwrap_or("").contains("gone"));
@@ -19943,6 +19953,37 @@ mod tests {
         let v = app.pkg.workbook.sheets[0].cell(4, 3).unwrap();
         assert_eq!(v.value, CellValue::Text("hello".into()));
         assert!(v.formula.is_none());
+    }
+
+    #[test]
+    fn undo_and_redo_keep_a_newer_copy_that_shows_the_same_text_991() {
+        // Copy D1 (SUM(Sales[Qty]), shown 7), delete column B (the constant
+        // 7 in E1 shifts into D1), copy D1 again: the same range and the same
+        // shown text, but another copy. Undo keeps it, and so does redo.
+        let mut app = header_app();
+        app.apply_on(0, vec![(0, 4, parse_input("7"))]);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(app.clip_text.as_deref(), Some("7\n"));
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false);
+        clip_range(&mut app, (0, 3), (0, 3), false);
+        assert_eq!(app.clip_text.as_deref(), Some("7\n"));
+        let paste_at = |app: &mut App, r: u32| {
+            app.cur = (r, 3);
+            app.anchor = None;
+            app.paste();
+            app.pkg.workbook.sheets[0].cell(r, 3).unwrap().clone()
+        };
+        app.undo();
+        let v = paste_at(&mut app, 4);
+        assert!(v.formula.is_none(), "undo kept the constant");
+        assert_eq!(v.value, CellValue::Number(7.0));
+        app.undo();
+        app.redo();
+        app.redo();
+        let v = paste_at(&mut app, 6);
+        assert!(v.formula.is_none(), "redo kept the constant");
     }
 
     #[test]
