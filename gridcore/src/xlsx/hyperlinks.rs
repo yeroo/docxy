@@ -13,14 +13,12 @@ use super::{
     parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
     remove_worksheet_child, start_tag, worksheet_child_span, worksheet_takes,
 };
-use crate::sheet::{Sheet, cell_name, parse_cell_name, parse_range_name};
+use crate::sheet::{
+    Sheet, cell_name, hyperlink_cells as link_cells, parse_cell_name, parse_range_name,
+};
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
 type Rect = (u32, u32, u32, u32);
-
-/// A range link over more cells than this applies only to its anchor (a
-/// whole-column link would otherwise spread over a million cells).
-const SPREAD_LIMIT: u64 = 4096;
 
 /// External hyperlink targets keyed by relationship id, from a worksheet's
 /// parsed rels.
@@ -53,24 +51,16 @@ pub(super) fn hyperlink_of(
     Some((rect, target))
 }
 
-/// The cells a link over `rect` sets: all of them, or only the anchor past
-/// [`SPREAD_LIMIT`].
-pub(super) fn link_cells(rect: Rect) -> impl Iterator<Item = (u32, u32)> {
-    let (r1, c1, r2, c2) = rect;
-    let cells = (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64;
-    let (r2, c2) = if cells > SPREAD_LIMIT {
-        (r1, c1)
-    } else {
-        (r2, c2)
-    };
-    (r1..=r2).flat_map(move |r| (c1..=c2).map(move |c| (r, c)))
-}
-
 /// A `<hyperlink>` element of the block: its span in the block, and what
 /// [`hyperlink_of`] reads from it.
 struct Item {
     span: (usize, usize),
     link: Option<(Rect, String)>,
+    /// The span of its `ref` value in the block.
+    ref_value: Option<(usize, usize)>,
+    /// Where an edit since the load moved its range: the `ref` to write in
+    /// place (set by [`relocate`], and `link` then holds this rect).
+    moved_to: Option<Rect>,
 }
 
 /// The `<hyperlink>` children of a `<hyperlinks>` block, read as the loader
@@ -80,16 +70,23 @@ fn items(block: &str, targets: &HashMap<String, String>) -> Vec<Item> {
         .into_iter()
         .filter(|(name, _, _)| super::local(name) == "hyperlink")
         .map(|(_, a, b)| {
-            let link = start_tag(&block[a..b]).and_then(|tag| {
-                let attr = |name: &str| {
-                    tag.attrs
-                        .iter()
-                        .find(|(n, _, _)| *n == name)
-                        .map_or("", |&(_, vs, ve)| &block[a + vs..a + ve])
-                };
-                hyperlink_of(attr("ref"), attr("r:id"), attr("location"), targets)
-            });
-            Item { span: (a, b), link }
+            let tag = start_tag(&block[a..b]);
+            let attr_span = |name: &str| {
+                tag.as_ref()
+                    .and_then(|t| t.attrs.iter().find(|(n, _, _)| *n == name))
+                    .map(|&(_, vs, ve)| (a + vs, a + ve))
+            };
+            let attr = |name: &str| attr_span(name).map_or("", |(vs, ve)| &block[vs..ve]);
+            let ref_value = attr_span("ref");
+            let link = tag
+                .as_ref()
+                .and_then(|_| hyperlink_of(attr("ref"), attr("r:id"), attr("location"), targets));
+            Item {
+                span: (a, b),
+                link,
+                ref_value,
+                moved_to: None,
+            }
         })
         .collect()
 }
@@ -108,8 +105,10 @@ fn replay<'a>(items: impl Iterator<Item = &'a Item>) -> HashMap<(u32, u32), &'a 
 }
 
 /// Bring the worksheet's `<hyperlinks>` in line with `sheet.hyperlinks`:
-/// a loaded element whose cells the model changed goes (its relationship
-/// stays, unreferenced, which OPC allows), and each model cell the
+/// a loaded element whose range an edit moved is rewritten in place with its
+/// new `ref`, every other attribute kept ([`relocate`]); one whose cells the
+/// model changed goes (its relationship stays, unreferenced, which OPC allows),
+/// and each model cell the
 /// remaining elements don't give its target gets a `<hyperlink>` of its
 /// own, an external target through a `TargetMode="External"` relationship
 /// in the sheet's rels part (created when missing). A sheet whose links
@@ -142,7 +141,8 @@ pub(super) fn write_hyperlinks(
         Some((s, e)) => (s, &xml[s..e]),
         None => (0, ""),
     };
-    let items = items(block, &targets);
+    let mut items = items(block, &targets);
+    let relocated = relocate(&mut items, sheet);
 
     // The cells whose link the model changed since the load.
     let loaded = replay(items.iter());
@@ -158,7 +158,7 @@ pub(super) fn write_hyperlinks(
             .filter(|cell| !sheet.hyperlinks.contains_key(cell))
             .copied(),
     );
-    if changed.is_empty() {
+    if changed.is_empty() && !relocated {
         return xml;
     }
 
@@ -212,17 +212,35 @@ pub(super) fn write_hyperlinks(
     }
     rels.finish(parts);
 
-    // Strike the stale elements.
+    // Strike the stale elements, and write a moved range into the `ref` of
+    // the element that has it, every other attribute as loaded.
+    let moves = || {
+        items
+            .iter()
+            .zip(&stale)
+            .filter(|(i, s)| !**s && i.moved_to.is_some())
+            .count()
+    };
     let struck = match span {
         Some(_) if added.is_empty() && !stale.is_empty() && stale.iter().all(|&s| s) => {
             return remove_worksheet_child(&xml, "hyperlinks");
         }
-        Some((_, block_end)) if stale.iter().any(|&s| s) => {
+        Some((_, block_end)) if stale.iter().any(|&s| s) || moves() > 0 => {
+            // Edits to the block in order: (start, end, replacement).
+            let mut edits: Vec<(usize, usize, String)> = Vec::new();
+            for (item, &gone) in items.iter().zip(&stale) {
+                if gone {
+                    edits.push((item.span.0, item.span.1, String::new()));
+                } else if let (Some(rect), Some((vs, ve))) = (item.moved_to, item.ref_value) {
+                    edits.push((vs, ve, crate::print::area::rect_name(rect)));
+                }
+            }
             let mut kept_block = String::with_capacity(block.len());
             let mut from = 0;
-            for (item, _) in items.iter().zip(&stale).filter(|(_, s)| **s) {
-                kept_block.push_str(&block[from..item.span.0]);
-                from = item.span.1;
+            for (a, b, text) in edits {
+                kept_block.push_str(&block[from..a]);
+                kept_block.push_str(&text);
+                from = b;
             }
             kept_block.push_str(&block[from..]);
             Some(format!(
@@ -244,6 +262,36 @@ pub(super) fn write_hyperlinks(
         let block = format!("<hyperlinks>{}</hyperlinks>", added.concat());
         put_worksheet_child(&out, "hyperlinks", &block, rels, false)
     }
+}
+
+/// Point each loaded element whose range an edit moved ([`LinkRef`]) at where
+/// it is now, when the model still gives all its cells the element's target:
+/// the save then rewrites its `ref` and keeps the rest of the element. True
+/// when any moved.
+///
+/// [`LinkRef`]: crate::sheet::LinkRef
+fn relocate(items: &mut [Item], sheet: &Sheet) -> bool {
+    let moved: HashMap<Rect, Rect> = sheet
+        .hyperlink_refs
+        .values()
+        .filter(|l| l.loaded != l.now)
+        .map(|l| (l.loaded, l.now))
+        .collect();
+    let mut any = false;
+    for item in items.iter_mut() {
+        let Some((rect, target)) = &item.link else {
+            continue;
+        };
+        let Some(&now) = moved.get(rect) else {
+            continue;
+        };
+        if link_cells(now).all(|c| sheet.hyperlinks.get(&c).map(String::as_str) == Some(target)) {
+            item.moved_to = Some(now);
+            item.link = Some((now, target.clone()));
+            any = true;
+        }
+    }
+    any
 }
 
 /// A worksheet's rels part taking External hyperlink relationships, read

@@ -18,7 +18,13 @@ fn book() -> Workbook {
     s.set_cell(0, 1, Cell::formula("A1*2"));
     s.set_cell(5, 5, Cell::text("outside"));
     s.hyperlinks.insert((0, 0), "https://example.com".into());
-    s.hyperlink_refs.insert((0, 0), (0, 0, 0, 0));
+    s.hyperlink_refs.insert(
+        (0, 0),
+        crate::sheet::LinkRef {
+            loaded: (0, 0, 0, 0),
+            now: (0, 0, 0, 0),
+        },
+    );
     wb.sheets.push(s);
     wb
 }

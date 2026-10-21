@@ -27,6 +27,8 @@ mod clear;
 mod clip;
 mod goto_special;
 #[cfg(test)]
+mod link_shift_tests;
+#[cfg(test)]
 pub(crate) use clear::apply_clear;
 pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
@@ -2263,6 +2265,93 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
         // A 1×1 "merge" left over after clamping is meaningless.
         .filter(|&(r1, c1, r2, c2)| !(r1 == r2 && c1 == c2))
         .collect();
+    shift_hyperlinks(sheet, shift);
+}
+
+/// Cell hyperlinks follow their cells (#1455): a link on a deleted or
+/// pushed-off cell goes. A loaded range link ([`Sheet::hyperlink_refs`]) moves
+/// with its rectangle when the edit leaves it the same size; a range spread
+/// cell by cell that the edit stretches, shrinks or removes is forgotten, and
+/// its cells carry on as the single-cell links they already are in
+/// `hyperlinks`. A range too big to spread is held by its anchor alone, so it
+/// stretches and re-anchors with the edit instead. The loaded `ref` of every
+/// range forgotten goes to `hyperlinks_removed`, so the save strikes its
+/// element; the list itself names elements of the loaded file and is never
+/// shifted.
+fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
+    let axis = |r: u32, c: u32| if shift.rows { r } else { c };
+    let with_axis = |rect: Area, lo: u32, hi: u32| {
+        if shift.rows {
+            (lo, rect.1, hi, rect.3)
+        } else {
+            (rect.0, lo, rect.2, hi)
+        }
+    };
+
+    let refs = std::mem::take(&mut sheet.hyperlink_refs);
+    let mut kept = BTreeMap::new();
+    // A big range's anchor may be the deleted cell: its link lands on the new
+    // anchor below.
+    let mut reanchored: Vec<(Area, String)> = Vec::new();
+    let mut forgotten: Vec<Area> = Vec::new();
+    for l in refs.into_values() {
+        let now = l.now;
+        let (a, b) = (axis(now.0, now.1), axis(now.2, now.3));
+        let moved = if !crate::sheet::hyperlink_spreads(now) {
+            // Pushed off by an insert, or deleted whole: gone.
+            let Some((lo, hi)) =
+                span(a, b, shift).filter(|_| point(a, shift).is_some() || shift.delta < 0)
+            else {
+                forgotten.push(l.loaded);
+                continue;
+            };
+            let rect = with_axis(now, lo, hi);
+            if let Some(target) = sheet.hyperlinks.get(&(now.0, now.1)) {
+                reanchored.push((rect, target.clone()));
+            }
+            rect
+        } else {
+            let (Some(lo), Some(hi)) = (point(a, shift), point(b, shift)) else {
+                forgotten.push(l.loaded);
+                continue;
+            };
+            if hi - lo != b - a {
+                forgotten.push(l.loaded);
+                continue;
+            }
+            with_axis(now, lo, hi)
+        };
+        kept.insert(
+            (moved.0, moved.1),
+            crate::sheet::LinkRef { now: moved, ..l },
+        );
+    }
+    sheet.hyperlink_refs = kept;
+    // The file's elements for the ranges forgotten here go at the save; a
+    // cut range's remaining cells are written as links of their own.
+    let mut removed: std::collections::HashSet<Area> =
+        sheet.hyperlinks_removed.iter().copied().collect();
+    for rect in forgotten {
+        if removed.insert(rect) {
+            sheet.hyperlinks_removed.push(rect);
+        }
+    }
+
+    let links = std::mem::take(&mut sheet.hyperlinks);
+    sheet.hyperlinks = links
+        .into_iter()
+        .filter_map(|((r, c), target)| {
+            let moved = point(axis(r, c), shift)?;
+            Some((if shift.rows { (moved, c) } else { (r, moved) }, target))
+        })
+        .collect();
+    for (rect, target) in reanchored {
+        // A range that shrank to what spreads gets all its cells, as a load
+        // would give it.
+        for rc in crate::sheet::hyperlink_cells(rect) {
+            sheet.hyperlinks.entry(rc).or_insert_with(|| target.clone());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

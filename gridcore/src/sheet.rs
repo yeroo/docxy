@@ -550,6 +550,39 @@ fn attr_hidden(attrs: &str) -> bool {
     xml_attr_flag(attrs, "hidden")
 }
 
+/// A loaded `<hyperlink>` element ([`Sheet::hyperlink_refs`]), one cell or a
+/// range. The save finds the element by [`LinkRef::loaded`] and writes
+/// [`LinkRef::now`] into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkRef {
+    /// The element's `ref` as the loaded file has it (r1, c1, r2, c2).
+    pub loaded: (u32, u32, u32, u32),
+    /// Where the range is now, after row and column edits.
+    pub now: (u32, u32, u32, u32),
+}
+
+/// A range link over more cells than this applies only to its anchor in
+/// [`Sheet::hyperlinks`] (a whole-column link would otherwise spread over a
+/// million cells).
+pub const HYPERLINK_SPREAD_LIMIT: u64 = 4096;
+
+/// Whether a link over `rect` sets every cell of it in [`Sheet::hyperlinks`]
+/// (else only its anchor).
+pub fn hyperlink_spreads((r1, c1, r2, c2): (u32, u32, u32, u32)) -> bool {
+    (r2 - r1 + 1) as u64 * (c2 - c1 + 1) as u64 <= HYPERLINK_SPREAD_LIMIT
+}
+
+/// The cells a link over `rect` sets in [`Sheet::hyperlinks`].
+pub fn hyperlink_cells(rect: (u32, u32, u32, u32)) -> impl Iterator<Item = (u32, u32)> {
+    let (r1, c1, r2, c2) = rect;
+    let (r2, c2) = if hyperlink_spreads(rect) {
+        (r2, c2)
+    } else {
+        (r1, c1)
+    };
+    (r1..=r2).flat_map(move |r| (c1..=c2).map(move |c| (r, c)))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Sheet {
     pub name: String,
@@ -574,12 +607,21 @@ pub struct Sheet {
     /// or an in-workbook location as `#Sheet!A1`. Rendered underlined; a click
     /// opens the URL (external) or jumps (internal).
     pub hyperlinks: std::collections::BTreeMap<(u32, u32), String>,
-    /// The `ref` each loaded `<hyperlink>` covers, keyed by its top-left
-    /// cell: a link over a range spreads over its cells in `hyperlinks`, and
-    /// removing it from one cell removes it from all of them (#671).
-    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), (u32, u32, u32, u32)>,
-    /// The `ref`s of loaded `<hyperlink>` elements whose link was removed: the
-    /// worksheet part still holds them, so a save strikes them.
+    /// Every readable loaded `<hyperlink>` element (one cell or a range),
+    /// keyed by its range's current top-left cell: a link over a range
+    /// spreads over its cells in `hyperlinks`, and removing it from one cell
+    /// removes it from all of them (#671). A row or column edit moves the
+    /// range with its cells ([`LinkRef::now`]) while [`LinkRef::loaded`]
+    /// stays the `ref` the file holds, so the save can rewrite that element
+    /// in place and keep its other attributes (`relocate` in the xlsx
+    /// writer depends on it). An edit that removes or cuts the range drops
+    /// the entry and strikes the element: its `loaded` goes to
+    /// `hyperlinks_removed`, and the cells that remain are written as links
+    /// of their own.
+    pub hyperlink_refs: std::collections::BTreeMap<(u32, u32), LinkRef>,
+    /// The `ref`s, as the loaded file has them, of `<hyperlink>` elements
+    /// whose link was removed or dropped by an edit: the worksheet part still
+    /// holds them, so a save strikes them. Never shifted by an edit.
     pub hyperlinks_removed: Vec<(u32, u32, u32, u32)>,
     /// Error Checking's Ignore Error: the rules hidden over ranges of this
     /// sheet (`<ignoredErrors>`).
