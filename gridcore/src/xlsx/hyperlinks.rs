@@ -70,18 +70,17 @@ fn items(block: &str, targets: &HashMap<String, String>) -> Vec<Item> {
         .into_iter()
         .filter(|(name, _, _)| super::local(name) == "hyperlink")
         .map(|(_, a, b)| {
-            let ref_value = start_tag(&block[a..b])
-                .and_then(|tag| tag.attrs.iter().find(|(n, _, _)| *n == "ref").copied())
-                .map(|(_, vs, ve)| (a + vs, a + ve));
-            let link = start_tag(&block[a..b]).and_then(|tag| {
-                let attr = |name: &str| {
-                    tag.attrs
-                        .iter()
-                        .find(|(n, _, _)| *n == name)
-                        .map_or("", |&(_, vs, ve)| &block[a + vs..a + ve])
-                };
-                hyperlink_of(attr("ref"), attr("r:id"), attr("location"), targets)
-            });
+            let tag = start_tag(&block[a..b]);
+            let attr_span = |name: &str| {
+                tag.as_ref()
+                    .and_then(|t| t.attrs.iter().find(|(n, _, _)| *n == name))
+                    .map(|&(_, vs, ve)| (a + vs, a + ve))
+            };
+            let attr = |name: &str| attr_span(name).map_or("", |(vs, ve)| &block[vs..ve]);
+            let ref_value = attr_span("ref");
+            let link = tag
+                .as_ref()
+                .and_then(|_| hyperlink_of(attr("ref"), attr("r:id"), attr("location"), targets));
             Item {
                 span: (a, b),
                 link,
@@ -233,7 +232,7 @@ pub(super) fn write_hyperlinks(
                 if gone {
                     edits.push((item.span.0, item.span.1, String::new()));
                 } else if let (Some(rect), Some((vs, ve))) = (item.moved_to, item.ref_value) {
-                    edits.push((vs, ve, rect_name(rect)));
+                    edits.push((vs, ve, crate::print::area::rect_name(rect)));
                 }
             }
             let mut kept_block = String::with_capacity(block.len());
@@ -293,15 +292,6 @@ fn relocate(items: &mut [Item], sheet: &Sheet) -> bool {
         }
     }
     any
-}
-
-/// `A1` or `A1:B2`.
-fn rect_name((r1, c1, r2, c2): Rect) -> String {
-    if (r1, c1) == (r2, c2) {
-        cell_name(r1, c1)
-    } else {
-        format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
-    }
 }
 
 /// A worksheet's rels part taking External hyperlink relationships, read

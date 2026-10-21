@@ -2329,8 +2329,10 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
     sheet.hyperlink_refs = kept;
     // The file's elements for the ranges forgotten here go at the save; a
     // cut range's remaining cells are written as links of their own.
+    let mut removed: std::collections::HashSet<Area> =
+        sheet.hyperlinks_removed.iter().copied().collect();
     for rect in forgotten {
-        if !sheet.hyperlinks_removed.contains(&rect) {
+        if removed.insert(rect) {
             sheet.hyperlinks_removed.push(rect);
         }
     }
