@@ -15,7 +15,7 @@ use crate::zip::ZipArchive;
 pub(crate) const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 pub(crate) const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 pub(crate) const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
-const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+pub(crate) const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -341,9 +341,12 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
 /// ([`Rebuilt`], from [`rebuilt_bindings`]): a declaration for each prefix it
 /// uses that is bound there and not declared on the tag already (#1063), the
 /// default namespace included, and the inherited markup-compatibility rules
-/// naming a prefix it uses. A rule the tag already has (by local name,
-/// whatever its prefix) takes the union of the tokens and keeps its spelling;
-/// otherwise it is added.
+/// naming a prefix it uses. A rule the tag already has (by local name, whose
+/// prefix means the MC namespace) takes the union of the tokens and keeps its
+/// spelling; otherwise it is added, under the prefix it had where that still
+/// means the MC namespace, else another MC prefix or a new `mcN`. A prefix
+/// that is the MC namespace's only through the part root, for a rule of the
+/// tag's or of a descendant's, is declared on the tag (`rootless`).
 fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
     let tag = own_tag(raw, &rebuilt.mc_prefixes);
     if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() && tag.rootless.is_empty() {
@@ -531,10 +534,11 @@ pub(crate) fn is_rule_name(name: &str) -> bool {
 /// The start tag's attributes at the parser's current Start event, decoded,
 /// with a declaration for each prefix they use that a save does not keep
 /// (see [`rebuilt_bindings`]), and the inherited markup-compatibility rules
-/// naming a prefix they use, joined into the tag's own rule of that name. The
-/// MC prefix needs no declaration of its own here: the serializer writes the
-/// tag inside the saved part, whose root binds it, or `prefixes` below
-/// declares it from the rebuilt scope.
+/// naming a prefix they use, joined into the tag's own MC-bound rule of that
+/// name (a vendor `x:Ignorable` is not one). The root's MC prefix needs no
+/// declaration of its own here: the serializer writes the tag inside the saved
+/// part, whose root binds it, or `prefixes` below declares it from the rebuilt
+/// scope; a rule written under another or a minted `mcN` prefix declares it.
 fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let mut attrs: Vec<(String, String)> = p
         .attrs()
@@ -2050,7 +2054,7 @@ fn unsupported_revision_kind(name: &str) -> Option<UnsupportedRevisionKind> {
 /// records so review enumeration can return an explicit unsupported result.
 fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
     let kind = unsupported_revision_kind(p.name());
-    // Taken before `parse_revision_metadata` reads on from the Start.
+    // At the element's Start, as at the other capture sites.
     let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let metadata = kind.as_ref().map(|_| parse_revision_metadata(p));
     p.skip_element();

@@ -1342,3 +1342,63 @@ fn r1_writtenback_runs_moved_into_table_cells_keep_the_rule() {
         "{xml}"
     );
 }
+
+/// Review r1 (#1655): a vendor `x:Ignorable` on the kept paragraph is not the
+/// MC rule a join merges into, nor is it one when it is on the gone paragraph.
+#[test]
+fn r1_join_does_not_merge_a_vendor_ignorable_with_the_mc_rule() {
+    let original = docx_with_root(
+        &format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\" \
+             xmlns:x=\"urn:x\">"
+        ),
+        "<w:body><w:p x:Ignorable=\"keep\"><w:r><w:t>one</w:t></w:r></w:p>\
+         <w:p mc:Ignorable=\"ux\"><w:r><w:t>two</w:t></w:r><ux:marker/></w:p>\
+         <w:p x:Ignorable=\"gone\"><w:r><w:t>three</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(1, 0));
+    editor.backspace();
+    editor.set_caret(Caret::top(1, 0));
+    editor.backspace();
+    assert_eq!(editor.doc.body.len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(xml.contains("x:Ignorable=\"keep\""), "{xml}");
+    assert!(!xml.contains("x:Ignorable=\"keep ux"), "{xml}");
+    assert!(!xml.contains("mc:Ignorable=\"ux gone"), "{xml}");
+    assert!(all_markers_ignorable(&xml), "{xml}");
+}
+
+/// Review r1 (#1655): a join copies the rule's own prefix declaration only, so
+/// the kept paragraph's content keeps the root's binding of `ux`.
+#[test]
+fn r1_join_does_not_rebind_prefixes_the_kept_content_uses() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:a\">"),
+        "<w:body><w:p><w:r><w:t>one</w:t></w:r><ux:keep/></w:p>\
+         <w:p xmlns:ux=\"urn:b\" mc:Ignorable=\"ux\"><w:r><w:t>two</w:t></w:r><ux:marker/></w:p>\
+         </w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(1, 0));
+    editor.backspace();
+    assert_eq!(editor.doc.body.len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    let keep = xml.find("<ux:keep").expect("kept content");
+    let mut p = docxcore::xml::XmlParser::new(&xml);
+    loop {
+        match p.next() {
+            docxcore::xml::Event::Start if p.start_pos() == keep => {
+                let ns = p
+                    .namespace_attrs()
+                    .iter()
+                    .find(|a| a.name == "xmlns:ux")
+                    .map(|a| a.value);
+                assert_eq!(ns, Some("urn:a"), "{xml}");
+                break;
+            }
+            docxcore::xml::Event::Eof => panic!("not found: {xml}"),
+            _ => {}
+        }
+    }
+}
