@@ -869,3 +869,41 @@ fn a_cell_edit_alone_keeps_the_rels_part_bytes() {
     let re = resaved(&pkg);
     assert_eq!(text(&re, RELS), text(&pkg, RELS));
 }
+
+#[test]
+fn a_removed_link_with_an_unusual_id_drops_its_relationship() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"R5f3a\"/><hyperlink ref=\"A2\" r:id=\"hId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"R5f3a\" Type=\"{RNS}/hyperlink\" Target=\"https://x.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"hId1\" Type=\"{RNS}/hyperlink\" Target=\"https://y.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"hId2\" Type=\"{RNS}/hyperlink\" Target=\"https://orphan.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    remove_link(&mut pkg, (1, 0));
+    let re = resaved(&pkg);
+    assert_eq!(
+        targets_of(&re, "/hyperlink"),
+        vec!["https://orphan.example"]
+    );
+}
+
+#[test]
+fn a_mixed_case_file_uri_rel_is_reused_for_the_same_target() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"FILE:///\\\\srv\\share\\b\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "B2", "\\\\srv\\share\\b");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"B2\" r:id=\"rId1\"/>"));
+    assert_eq!(targets_of(&re, "/hyperlink").len(), 1);
+}

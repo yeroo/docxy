@@ -336,7 +336,8 @@ struct ExternalRels {
     /// package whose content types give `.rels` parts no type.
     xml: Option<String>,
     exists: bool,
-    /// The External relationships of `rel_type` there or added: target → id.
+    /// The External relationships of `rel_type` there or added: model target
+    /// ([`model_target`]) → id.
     have: HashMap<String, String>,
     /// Every id the rels part has, and every `rIdN` the worksheet names (a
     /// dangling `r:id` included), so a new one never takes either over.
@@ -361,7 +362,8 @@ impl ExternalRels {
         let mut taken = quoted_rids(worksheet);
         for (id, ty, target, mode) in current.as_deref().map(parse_rels_mode).unwrap_or_default() {
             if ty == rel_type && mode.as_deref() == Some("External") {
-                have.entry(target).or_insert_with(|| id.clone());
+                have.entry(model_target(&target).into_owned())
+                    .or_insert_with(|| id.clone());
             }
             taken.insert(id);
         }
@@ -385,16 +387,15 @@ impl ExternalRels {
         }
     }
 
-    /// The id of an External relationship to the model's `target`: an equal
-    /// one already there (in the spelling a save writes, else as typed: a
-    /// #1025 save wrote a UNC path bare), else a new one with the next free
-    /// `rIdN`.
+    /// The id of an External relationship to the model's `target`: one
+    /// already there that loads as it (whatever spelling the file has: Excel's
+    /// `file:///`, a #1025 bare UNC path), else a new one with the next free
+    /// `rIdN`, written as [`wire_target`].
     fn id(&mut self, model: &str) -> Option<String> {
-        let target = wire_target(model);
-        let target = target.as_ref();
-        if let Some(id) = self.have.get(target).or_else(|| self.have.get(model)) {
+        if let Some(id) = self.have.get(model) {
             return Some(id.clone());
         }
+        let target = wire_target(model);
         self.xml.as_ref()?;
         let mut rid = format!("rId{}", self.next);
         while self.taken.contains(&rid) {
@@ -406,9 +407,9 @@ impl ExternalRels {
         self.added.push_str(&format!(
             "<Relationship Id=\"{rid}\" Type=\"{}\" Target=\"{}\" TargetMode=\"External\"/>",
             self.rel_type,
-            esc_attr(target)
+            esc_attr(&target)
         ));
-        self.have.insert(target.to_string(), rid.clone());
+        self.have.insert(model.to_string(), rid.clone());
         Some(rid)
     }
 
@@ -433,8 +434,8 @@ impl ExternalRels {
 }
 
 /// Drop the External hyperlink relationships a save left unreferenced
-/// (#1456): those the worksheet named before (`original`) and no longer
-/// names (`saved`). Others, hyperlink or not, are never touched, so a rels
+/// (#1456): those whose id the worksheet named before (`original`) and no
+/// longer names (`saved`), whatever the id looks like. Others, hyperlink or not, are never touched, so a rels
 /// part keeps its bytes unless a link left it.
 pub(super) fn prune_orphans(
     parts: &mut [(String, Vec<u8>)],
@@ -447,8 +448,11 @@ pub(super) fn prune_orphans(
     let Some(part) = parts.iter_mut().find(|(n, _)| *n == rels_part) else {
         return;
     };
-    let was = quoted_rids(original);
-    let now = quoted_rids(saved);
+    // An id is named when it stands as a quoted attribute value, whatever
+    // its spelling (the loader resolves any `r:id`).
+    let named = |text: &str, id: &str| {
+        text.contains(&format!("\"{id}\"")) || text.contains(&format!("'{id}'"))
+    };
     let xml = String::from_utf8_lossy(&part.1).into_owned();
     let mut out = String::with_capacity(xml.len());
     let mut from = 0;
@@ -461,8 +465,8 @@ pub(super) fn prune_orphans(
             .is_some_and(|(id, ty, _, mode)| {
                 ty == rel_type
                     && mode.as_deref() == Some("External")
-                    && was.contains(id)
-                    && !now.contains(id)
+                    && named(original, id)
+                    && !named(saved, id)
             });
         if orphan {
             out.push_str(&xml[from..a]);
