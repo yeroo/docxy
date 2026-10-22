@@ -116,6 +116,13 @@ test a font box in a collapsed group's flyout closes with the flyout
 test a font box whose group folds away in a narrower window is not kept
   open copy:../fixtures/basic.xlsx
   call window-size {"w":1400,"h":800}
+  # The case before ended at 640 px: settle the widened frame before the first
+  # click (an X server applies a resize later than a Mac), so the Font combo is drawn.
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.state is full
   click E1
   call real-key {"key":"escape"}
   call pointer-click {"input":"sheet-font"}
