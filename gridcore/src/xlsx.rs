@@ -678,6 +678,32 @@ pub(crate) fn resolve_relative(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
+/// `part` (a package path) as a relationship target from the folder `dir`:
+/// `("xl", "xl/worksheets/sheet1.xml")` → `worksheets/sheet1.xml`,
+/// `("xl/book", "xl/styles.xml")` → `../styles.xml`.
+pub(crate) fn rel_from(dir: &str, part: &str) -> String {
+    let from: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+    let to: Vec<&str> = part.split('/').filter(|s| !s.is_empty()).collect();
+    let file = to.len().saturating_sub(1);
+    let common = from
+        .iter()
+        .zip(&to[..file])
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out: Vec<&str> = vec![".."; from.len() - common];
+    out.extend(&to[common..]);
+    out.join("/")
+}
+
+/// The folder of the workbook part.
+fn workbook_dir(parts: &[(String, Vec<u8>)]) -> String {
+    let wb = workbook_part_name(parts);
+    wb.rsplit_once('/')
+        .map(|(d, _)| d)
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Parse one xl/tables/*.xml part.
 fn parse_table_xml(xml: &str, sheet_idx: usize, part: &str) -> Option<Table> {
     let mut p = XmlParser::new(xml);
@@ -4268,14 +4294,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                 parts.push((sst_name.to_string(), xml.into_bytes()));
                 add_content_type_override(
                     &mut parts,
-                    "/xl/sharedStrings.xml",
+                    &format!("/{sst_name}"),
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml",
                 );
-                add_workbook_rel(
-                    &mut parts,
-                    &pkg.ns().rel("sharedStrings"),
-                    "sharedStrings.xml",
-                );
+                add_workbook_rel(&mut parts, &pkg.ns().rel("sharedStrings"), sst_name);
             }
         }
     }
@@ -4329,7 +4351,9 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     // --- sheet names: the model is authoritative ----------------------------
     // workbook.xml is otherwise preserved verbatim, so a rename in the model
     // must be patched into the <sheet name="…"> attributes (in order).
-    if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+    let wb_part = workbook_part_name(&parts);
+    let wb_rels = rels_part_name(&wb_part);
+    if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_part) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         let xml = patch_sheet_names(&xml, &wb.sheets);
         let xml = set_active_tab(&xml, active_tab);
@@ -4347,7 +4371,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     }
 
     // --- calcPr: the calculation settings the user can change ------------------
-    if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+    if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_part) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         let out = sync_calc_pr(&xml, wb);
         if out != xml {
@@ -4357,19 +4381,17 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
 
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
     if any_formulas {
-        parts.retain(|(n, _)| n != "xl/calcChain.xml");
+        let chain = calc_chain_part(&parts, &wb_part);
+        parts.retain(|(n, _)| *n != chain);
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 = remove_element_containing(&xml, "<Override", "/xl/calcChain.xml").into_bytes();
+            p.1 = remove_element_containing(&xml, "<Override", &format!("/{chain}")).into_bytes();
         }
-        if let Some(p) = parts
-            .iter_mut()
-            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-        {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = remove_element_containing(&xml, "<Relationship", "calcChain.xml").into_bytes();
         }
-        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = ensure_full_calc(&xml).into_bytes();
         }
@@ -4379,6 +4401,22 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     crate::docprops::refresh_titles_of_parts(&mut parts, pkg);
 
     parts
+}
+
+/// The calc chain part: the one the workbook's rels name, else
+/// `xl/calcChain.xml` beside a default workbook.
+fn calc_chain_part(parts: &[(String, Vec<u8>)], wb_part: &str) -> String {
+    let dir = wb_part.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    parts
+        .iter()
+        .find(|(n, _)| *n == rels_part_name(wb_part))
+        .and_then(|(_, b)| {
+            parse_rels(&String::from_utf8_lossy(b))
+                .into_iter()
+                .find(|(_, ty, _)| ty.ends_with("/calcChain"))
+                .map(|(_, _, t)| resolve_relative(dir, &t))
+        })
+        .unwrap_or_else(|| "xl/calcChain.xml".to_string())
 }
 
 /// Raw leftover attributes ready to follow another attribute: the loader
@@ -9398,15 +9436,16 @@ pub(crate) fn add_rel(
     String::new()
 }
 
+/// Relate the workbook to `target_part` (a package path), written as a
+/// target relative to the workbook part's folder.
 pub(crate) fn add_workbook_rel(
     parts: &mut [(String, Vec<u8>)],
     rel_type: &str,
-    target: &str,
+    target_part: &str,
 ) -> String {
-    if let Some(p) = parts
-        .iter_mut()
-        .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-    {
+    let target = rel_from(&workbook_dir(parts), target_part);
+    let wb_rels = rels_part_name(&workbook_part_name(parts));
+    if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_rels) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
         if xml.contains(&format!("Target=\"{target}\"")) {
             return String::new();
@@ -9446,17 +9485,10 @@ impl SheetPackage {
             &format!("/{part_name}"),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
         );
-        let rid = add_workbook_rel(
-            &mut self.parts,
-            &ns.rel("worksheet"),
-            &format!("worksheets/sheet{n}.xml"),
-        );
+        let rid = add_workbook_rel(&mut self.parts, &ns.rel("worksheet"), &part_name);
         // workbook.xml <sheets> entry with the next free sheetId.
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(pn, _)| pn == "xl/workbook.xml")
-        {
+        let wb_part = workbook_part_name(&self.parts);
+        if let Some(p) = self.parts.iter_mut().find(|(pn, _)| *pn == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let mut max_id = 0u32;
             let mut i = 0;
@@ -10203,7 +10235,9 @@ impl SheetPackage {
         // `<pivotCache r:id>` names nothing, or a table part no sheet reaches,
         // is worse than no pivot.
         let sheet_part = self.sheet_parts.get(dest_sheet)?.clone();
-        if !rels_takes(&self.parts, "xl/_rels/workbook.xml.rels", true)
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_rels = rels_part_name(&wb_part);
+        if !rels_takes(&self.parts, &wb_rels, true)
             || !rels_takes(&self.parts, &rels_part_name(&sheet_part), false)
         {
             return None;
@@ -10226,7 +10260,7 @@ impl SheetPackage {
         let table_part = format!("xl/pivotTables/pivotTable{n}.xml");
         let cache_part = format!("xl/pivotCache/pivotCacheDefinition{m}.xml");
         let mut cache_id = 1u32;
-        if let Some(bytes) = self.part("xl/workbook.xml") {
+        if let Some(bytes) = self.part(&wb_part) {
             let xml = String::from_utf8_lossy(bytes);
             let mut i = 0;
             while let Some(pos) = xml[i..].find("cacheId=\"") {
@@ -10278,27 +10312,22 @@ impl SheetPackage {
             &format!("/{cache_part}"),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
         );
-        let cache_target = format!("pivotCache/pivotCacheDefinition{m}.xml");
+        let cache_target = rel_from(&workbook_dir(&self.parts), &cache_part);
         let cache_rid = match add_workbook_rel(
             &mut self.parts,
             &ns.rel("pivotCacheDefinition"),
-            &cache_target,
+            &cache_part,
         ) {
             // "" means the rel was already there (a dangling one naming the
             // part name `m` picked): reuse its id.
             id if id.is_empty() => {
-                rel_id_for(&self.parts, "xl/_rels/workbook.xml.rels", &cache_target)
-                    .unwrap_or_default()
+                rel_id_for(&self.parts, &wb_rels, &cache_target).unwrap_or_default()
             }
             id => id,
         };
 
         // workbook.xml: register the cache.
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(pn, _)| pn == "xl/workbook.xml")
-        {
+        if let Some(p) = self.parts.iter_mut().find(|(pn, _)| *pn == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = register_pivot_cache(&xml, cache_id, &cache_rid, ns.rels).into_bytes();
         }
@@ -10456,13 +10485,11 @@ impl SheetPackage {
             p.1 = xml.into_bytes();
         }
         // workbook.xml.rels: drop the cache relationship, remembering its rId.
-        let cache_target = piv.cache_part.trim_start_matches("xl/").to_string();
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_rels = rels_part_name(&wb_part);
+        let cache_target = rel_from(&workbook_dir(&self.parts), &piv.cache_part);
         let mut cache_rid = String::new();
-        if let Some(p) = self
-            .parts
-            .iter_mut()
-            .find(|(n, _)| n == "xl/_rels/workbook.xml.rels")
-        {
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             if let Some(rel_pos) = xml.find(&format!("Target=\"{cache_target}\"")) {
                 if let Some(id_pos) = xml[..rel_pos].rfind("Id=\"") {
@@ -10481,7 +10508,7 @@ impl SheetPackage {
         }
         // workbook.xml: drop the <pivotCache> entry that referenced it.
         if !cache_rid.is_empty() {
-            if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
                 let xml = String::from_utf8_lossy(&p.1).into_owned();
                 p.1 = unregister_pivot_cache(&xml, &cache_rid).into_bytes();
             }
@@ -10537,7 +10564,8 @@ impl SheetPackage {
         // Model + cross-sheet formula references.
         crate::edit::rename_sheet(&mut self.workbook, idx, name);
         // Re-sync workbook.xml from the model (same helper save_xlsx uses).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
+        let wb_part = workbook_part_name(&self.parts);
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = patch_sheet_names(&xml, &self.workbook.sheets).into_bytes();
         }
@@ -19551,6 +19579,158 @@ mod kind_tests {
 
     fn part_text(pkg: &SheetPackage, name: &str) -> String {
         String::from_utf8_lossy(pkg.part(name).unwrap()).into_owned()
+    }
+
+    /// `pkg` with its workbook part moved to `xl/book/wb.xml` (rels beside
+    /// it, sheet targets made relative to `xl/book/`), the layout
+    /// `workbook_part_name` finds through `_rels/.rels`.
+    fn relocated_workbook(pkg: &SheetPackage) -> SheetPackage {
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (name, bytes) in &pkg.parts {
+            let text = || String::from_utf8_lossy(bytes).into_owned();
+            match name.as_str() {
+                "xl/workbook.xml" => parts.push(("xl/book/wb.xml".into(), bytes.clone())),
+                "xl/_rels/workbook.xml.rels" => {
+                    let rels = text()
+                        .replace("Target=\"/", "Target=\"\u{1}")
+                        .replace("Target=\"", "Target=\"../")
+                        .replace("Target=\"\u{1}", "Target=\"/");
+                    parts.push(("xl/book/_rels/wb.xml.rels".into(), rels.into_bytes()));
+                }
+                "_rels/.rels" => parts.push((
+                    name.clone(),
+                    text()
+                        .replace("xl/workbook.xml", "xl/book/wb.xml")
+                        .into_bytes(),
+                )),
+                "[Content_Types].xml" => parts.push((
+                    name.clone(),
+                    text()
+                        .replace("/xl/workbook.xml", "/xl/book/wb.xml")
+                        .into_bytes(),
+                )),
+                _ => parts.push((name.clone(), bytes.clone())),
+            }
+        }
+        load_xlsx(&write_zip(&parts)).expect("the relocated fixture loads")
+    }
+
+    /// #827: the workbook part and its rels are found through `_rels/.rels`
+    /// by every edit and by the save, not assumed at `xl/workbook.xml`.
+    #[test]
+    fn a_workbook_part_elsewhere_saves_renames_and_adds_sheets() {
+        let mut pkg = relocated_workbook(&mixed_xlm_book());
+        assert_eq!(pkg.workbook.sheets.len(), 4);
+        assert!(pkg.rename_sheet(0, "Figures"));
+        assert!(part_text(&pkg, "xl/book/wb.xml").contains("name=\"Figures\""));
+        let added = pkg.add_sheet("Extra");
+        assert!(pkg.part("xl/_rels/workbook.xml.rels").is_none());
+        assert!(pkg.part("xl/workbook.xml").is_none());
+        let rels = part_text(&pkg, "xl/book/_rels/wb.xml.rels");
+        let target = format!(
+            "Target=\"../{}\"",
+            pkg.sheet_parts[added].trim_start_matches("xl/")
+        );
+        assert!(rels.contains(&target), "{target} in {rels}");
+        assert!(part_text(&pkg, "xl/book/wb.xml").contains("name=\"Extra\""));
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::formula("1+1"));
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let names: Vec<&str> = back
+            .workbook
+            .sheets
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, ["Figures", "Macro1", "Dialog1", "Report", "Extra"]);
+        assert!(part_text(&back, "xl/book/wb.xml").contains("fullCalcOnLoad"));
+    }
+
+    #[test]
+    fn a_workbook_part_elsewhere_drops_its_calc_chain_and_macro_sheets() {
+        let mut pkg = relocated_workbook(&mixed_xlm_book());
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::formula("1+1"));
+        pkg.parts.push((
+            "xl/book/calcChain.xml".into(),
+            b"<calcChain xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"/>"
+                .to_vec(),
+        ));
+        let rels = part_text(&pkg, "xl/book/_rels/wb.xml.rels").replace(
+            "</Relationships>",
+            "<Relationship Id=\"rId99\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/calcChain\" Target=\"calcChain.xml\"/></Relationships>",
+        );
+        pkg.set_part("xl/book/_rels/wb.xml.rels", rels.into_bytes());
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert!(!out.has_macro_sheets());
+        assert_eq!(out.workbook.sheets.len(), 2);
+        assert!(out.part("xl/book/calcChain.xml").is_none());
+        assert!(!part_text(&out, "xl/book/_rels/wb.xml.rels").contains("calcChain"));
+        assert!(part_text(&out, "xl/book/wb.xml").contains("fullCalcOnLoad"));
+    }
+
+    #[test]
+    fn a_workbook_part_elsewhere_gets_a_blank_sheet_when_all_are_macro_sheets() {
+        let pkg = relocated_workbook(&xlm_book(&[("Macro1", "macro"), ("Dialog1", "dialog")]));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        assert!(!out.has_macro_sheets());
+        assert_eq!(out.workbook.sheets.len(), 1);
+        assert_eq!(out.workbook.sheets[0].name, "Sheet1");
+        assert!(out.part("xl/_rels/workbook.xml.rels").is_none());
+    }
+
+    #[test]
+    fn a_workbook_part_elsewhere_adds_and_removes_a_pivot() {
+        use crate::frame::Agg;
+        use crate::pivot::{DataField, PivotSource};
+        let add = |pkg: &mut SheetPackage| {
+            pkg.add_pivot(
+                PivotSource::Range {
+                    sheet: "Data".into(),
+                    rect: (0, 0, 3, 1),
+                },
+                vec!["Region".into(), "Sales".into()],
+                DataField {
+                    name: "Sum of Sales".into(),
+                    field: 1,
+                    agg: Agg::Sum,
+                },
+                3,
+                (2, 0),
+            )
+        };
+        let mut pkg = relocated_workbook(&mixed_xlm_book());
+        let before = part_text(&pkg, "xl/book/_rels/wb.xml.rels");
+        let idx = add(&mut pkg).expect("the cache rel lands in the real rels part");
+        let rels = part_text(&pkg, "xl/book/_rels/wb.xml.rels");
+        assert!(
+            rels.contains("Target=\"../pivotCache/pivotCacheDefinition1.xml\""),
+            "{rels}"
+        );
+        assert!(part_text(&pkg, "xl/book/wb.xml").contains("<pivotCache "));
+        assert!(pkg.part("xl/_rels/workbook.xml.rels").is_none());
+        assert!(pkg.remove_pivot(idx));
+        assert_eq!(part_text(&pkg, "xl/book/_rels/wb.xml.rels"), before);
+        assert!(!part_text(&pkg, "xl/book/wb.xml").contains("<pivotCache "));
+        // The cascade: a pivot on a removed sheet goes through remove_pivot.
+        add(&mut pkg).unwrap();
+        assert!(pkg.remove_sheet(3));
+        assert!(pkg.workbook.pivots.is_empty());
+        assert!(!part_text(&pkg, "xl/book/wb.xml").contains("<pivotCache "));
+        assert!(!part_text(&pkg, "xl/book/_rels/wb.xml.rels").contains("pivotCache"));
+    }
+
+    #[test]
+    fn rel_from_walks_up_to_the_common_folder() {
+        assert_eq!(
+            rel_from("xl", "xl/worksheets/sheet1.xml"),
+            "worksheets/sheet1.xml"
+        );
+        assert_eq!(rel_from("xl/book", "xl/styles.xml"), "../styles.xml");
+        assert_eq!(rel_from("xl/book", "xl/book/calc.xml"), "calc.xml");
+        assert_eq!(
+            rel_from("", "xl/persons/person1.xml"),
+            "xl/persons/person1.xml"
+        );
+        assert_eq!(rel_from("a/b/c", "x.xml"), "../../../x.xml");
     }
 
     #[test]
