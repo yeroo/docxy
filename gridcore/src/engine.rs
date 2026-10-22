@@ -1328,6 +1328,10 @@ impl Engine {
                     }
                 }
             }
+        }
+        // A dependents-only call still retries the anchors its own earlier
+        // passes blocked (depth > 0); it seeds none it found blocked on entry.
+        if !self.dependents_only || depth > 0 {
             for k in self.spill_blocked.iter().copied().collect::<Vec<_>>() {
                 if self.formulas.contains_key(&k) && dirty.insert(k) {
                     frontier.push_back(k);

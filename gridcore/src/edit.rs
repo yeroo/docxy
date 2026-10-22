@@ -1358,9 +1358,11 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
 /// A chart ref that names a sheet in `removed` is dropped, as
 /// [`shift_chart_refs`] drops one whose rows are deleted: the cached values
 /// still draw the chart, and a ref to a sheet the file no longer holds would
-/// make Excel repair it. The chart is marked edited, so a writable one is
-/// regenerated without it; the others keep their part, whose `<c:f>` text
-/// the package's own pass rewrites (`SheetPackage::remove_excel4_macros`).
+/// make Excel repair it. Only a chart with no part yet, or one already
+/// edited, has its refs dropped; it is marked edited, so a writable one is
+/// regenerated without them. A chart with a part that is not edited is left
+/// alone (`false`): its part round-trips, and
+/// `SheetPackage::remove_excel4_macros` rewrites the `<c:f>` text in place.
 pub fn remove_sheet_refs_in_chart(cd: &mut crate::sheet::ChartData, removed: &[String]) -> bool {
     // A chart kept as loaded round-trips its part, whose `<c:f>` text the
     // package pass rewrites; marking it edited here would regenerate it and

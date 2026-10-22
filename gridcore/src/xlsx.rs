@@ -3755,8 +3755,17 @@ impl SheetPackage {
             });
         }
         // A chart part kept as loaded names the sheets in its `<c:f>` text.
+        // The part each loaded chart names (it can live anywhere), then any
+        // other chart part under `xl/charts/`.
+        let mut chart_parts: Vec<String> = Vec::new();
+        for d in self.workbook.sheets.iter().flat_map(|s| &s.drawings) {
+            if let crate::sheet::DrawingKind::Chart(cd) = &d.kind {
+                chart_parts.extend(cd.part.clone());
+            }
+        }
         for (n, bytes) in self.parts.iter_mut() {
-            if n.starts_with("xl/charts/") && n.ends_with(".xml") {
+            let named = chart_parts.contains(n);
+            if named || (n.starts_with("xl/charts/") && n.ends_with(".xml")) {
                 let xml = String::from_utf8_lossy(bytes);
                 if let Some(out) = remove_chart_refs(&xml, &refers) {
                     *bytes = out.into_bytes();
@@ -20121,8 +20130,9 @@ mod kind_tests {
             "Macro1!$A$1:$A$3",
             None
         ));
-        // Saved fresh (the writer generates the charts) and as loaded (their
-        // parts are kept, `<c:f>` text rewritten): both leave no mention.
+        // `add_chart` records the part and leaves the chart unedited, so both
+        // the package as built and as reloaded keep their chart parts, `<c:f>`
+        // text rewritten: neither leaves a mention.
         let loaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
         for source in [&pkg, &loaded] {
             let out = roundtrip(source, SpreadsheetKind::Workbook);
@@ -20231,6 +20241,104 @@ mod kind_tests {
             "formatting kept"
         );
         assert!(part_text(&out, &names[1]).contains("<c:lineChart>"));
+    }
+
+    fn macro_chart(sheet: &str, range: (u32, u32, u32, u32)) -> crate::sheet::ChartData {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        let src = |sheet: &str, range| ChartSource {
+            sheet: sheet.into(),
+            range,
+            cat_col: 0,
+        };
+        ChartData {
+            title: "T".into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![ChartSeries {
+                name: "S".into(),
+                values: vec![1.0, 2.0],
+                col: Some(1),
+                values_ref: Some(src(sheet, (1, 1, 2, 1))),
+                name_ref: Some(format!("{sheet}!$B$1")),
+                ..Default::default()
+            }],
+            source: Some(src(sheet, range)),
+            categories_ref: Some(src(sheet, (1, 0, 2, 0))),
+            ..Default::default()
+        }
+    }
+
+    /// #827 r2: a loaded chart's part can live anywhere; the macro-free save
+    /// rewrites the part the chart names, not only those under `xl/charts/`.
+    #[test]
+    fn macro_free_save_rewrites_a_chart_part_outside_xl_charts() {
+        let mut pkg = mixed_xlm_book();
+        assert!(pkg.add_chart(0, (5, 0), (20, 8), &macro_chart("Macro1", (0, 0, 2, 1))));
+        let saved = save_xlsx(&pkg);
+        let loaded = load_xlsx(&saved).unwrap();
+        let mut parts = loaded.parts.clone();
+        for (name, bytes) in parts.iter_mut() {
+            let text = String::from_utf8_lossy(bytes).into_owned();
+            if name == "xl/charts/chart1.xml" {
+                *name = "xl/book/charts/c1.xml".into();
+            } else if name.ends_with(".rels") || name == "[Content_Types].xml" {
+                *bytes = text
+                    .replace("../charts/chart1.xml", "../book/charts/c1.xml")
+                    .replace("/xl/charts/chart1.xml", "/xl/book/charts/c1.xml")
+                    .into_bytes();
+            }
+        }
+        let moved = load_xlsx(&write_zip(&parts)).expect("the moved chart loads");
+        assert!(
+            moved
+                .parts
+                .iter()
+                .any(|(n, _)| n == "xl/book/charts/c1.xml"),
+            "{:?}",
+            part_names(&moved)
+        );
+        let out = roundtrip(&moved, SpreadsheetKind::Workbook);
+        let xml = part_text(&out, "xl/book/charts/c1.xml");
+        assert!(!xml.contains("Macro1"), "{xml}");
+        assert!(xml.contains("<c:f>#REF!</c:f>"), "{xml}");
+    }
+
+    /// #827 r2: an edited, writable chart is regenerated without the refs that
+    /// named the removed sheet, and without a ref rebuilt from the box and the
+    /// series' column (`col`) for the series whose own ref was dropped.
+    #[test]
+    fn macro_free_save_regenerates_an_edited_chart_without_the_dropped_refs() {
+        let mut data = macro_chart("Report", (0, 0, 2, 2));
+        data.edited = true;
+        let mut second = data.series[0].clone();
+        second.name = "Gone".into();
+        second.col = Some(2);
+        second.values_ref = Some(crate::sheet::ChartSource {
+            sheet: "Macro1".into(),
+            range: (1, 2, 2, 2),
+            cat_col: 0,
+        });
+        second.name_ref = None;
+        data.series.push(second);
+        let mut pkg = mixed_xlm_book();
+        assert!(pkg.add_chart(0, (5, 0), (20, 8), &data));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let part = out
+            .parts
+            .iter()
+            .find(|(n, _)| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+            .map(|(n, _)| n.clone())
+            .expect("the chart part");
+        let xml = part_text(&out, &part);
+        assert!(!xml.contains("Macro1"), "{xml}");
+        assert!(
+            xml.contains("Report!$B$2:$B$3"),
+            "the Report series keeps its ref: {xml}"
+        );
+        assert!(
+            !xml.contains("Report!$C"),
+            "no ref rebuilt from the box: {xml}"
+        );
     }
 
     #[test]
