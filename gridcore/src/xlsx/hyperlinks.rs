@@ -4,6 +4,7 @@
 //! A sheet whose links match what its file loads as keeps its worksheet and
 //! rels parts byte for byte.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::xml::{Event, XmlParser};
@@ -20,12 +21,42 @@ use crate::sheet::{
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
 type Rect = (u32, u32, u32, u32);
 
+/// How Excel spells a UNC path in a relationship: `file:///\\server\share`.
+const UNC_URI: &str = "file:///";
+
+/// The relationship `Target` for a model target: a UNC path (`\\server\share`)
+/// gets the `file:///` Excel writes, since a bare backslash path is no URI
+/// (#1456); every other target is written as it is.
+fn wire_target(model: &str) -> Cow<'_, str> {
+    if model.starts_with("\\\\") {
+        Cow::Owned(format!("{UNC_URI}{model}"))
+    } else {
+        Cow::Borrowed(model)
+    }
+}
+
+/// The model target for a relationship `Target`: `file:///\\server\share`
+/// (any case of the scheme) is the plain UNC path; every other target,
+/// including one a #1025 save wrote as a bare UNC path, is as it is.
+fn model_target(wire: &str) -> Cow<'_, str> {
+    match wire.get(..UNC_URI.len()) {
+        Some(scheme) if scheme.eq_ignore_ascii_case(UNC_URI) => {
+            let rest = &wire[UNC_URI.len()..];
+            if rest.starts_with("\\\\") {
+                return Cow::Borrowed(rest);
+            }
+            Cow::Borrowed(wire)
+        }
+        _ => Cow::Borrowed(wire),
+    }
+}
+
 /// External hyperlink targets keyed by relationship id, from a worksheet's
-/// parsed rels.
+/// parsed rels, as the model holds them ([`model_target`]).
 pub(super) fn hyperlink_targets(rels: &[(String, String, String)]) -> HashMap<String, String> {
     rels.iter()
         .filter(|(_, ty, _)| ty.ends_with("/hyperlink"))
-        .map(|(id, _, t)| (id.clone(), t.clone()))
+        .map(|(id, _, t)| (id.clone(), model_target(t).into_owned()))
         .collect()
 }
 
@@ -107,8 +138,8 @@ fn replay<'a>(items: impl Iterator<Item = &'a Item>) -> HashMap<(u32, u32), &'a 
 /// Bring the worksheet's `<hyperlinks>` in line with `sheet.hyperlinks`:
 /// a loaded element whose range an edit moved is rewritten in place with its
 /// new `ref`, every other attribute kept ([`relocate`]); one whose cells the
-/// model changed goes (its relationship stays, unreferenced, which OPC allows),
-/// and each model cell the
+/// model changed goes (its relationship is dropped afterwards by
+/// [`prune_orphans`], once no element names it), and each model cell the
 /// remaining elements don't give its target gets a `<hyperlink>` of its
 /// own, an external target through a `TargetMode="External"` relationship
 /// in the sheet's rels part (created when missing). A sheet whose links
@@ -354,10 +385,14 @@ impl ExternalRels {
         }
     }
 
-    /// The id of an External relationship to `target`: an equal one already
-    /// there, else a new one with the next free `rIdN`.
-    fn id(&mut self, target: &str) -> Option<String> {
-        if let Some(id) = self.have.get(target) {
+    /// The id of an External relationship to the model's `target`: an equal
+    /// one already there (in the spelling a save writes, else as typed: a
+    /// #1025 save wrote a UNC path bare), else a new one with the next free
+    /// `rIdN`.
+    fn id(&mut self, model: &str) -> Option<String> {
+        let target = wire_target(model);
+        let target = target.as_ref();
+        if let Some(id) = self.have.get(target).or_else(|| self.have.get(model)) {
             return Some(id.clone());
         }
         self.xml.as_ref()?;
@@ -395,6 +430,50 @@ impl ExternalRels {
             parts.push((self.rels_part, xml.into_bytes()));
         }
     }
+}
+
+/// Drop the External hyperlink relationships a save left unreferenced
+/// (#1456): those the worksheet named before (`original`) and no longer
+/// names (`saved`). Others, hyperlink or not, are never touched, so a rels
+/// part keeps its bytes unless a link left it.
+pub(super) fn prune_orphans(
+    parts: &mut [(String, Vec<u8>)],
+    part_name: &str,
+    rel_type: &str,
+    original: &str,
+    saved: &str,
+) {
+    let rels_part = rels_part_name(part_name);
+    let Some(part) = parts.iter_mut().find(|(n, _)| *n == rels_part) else {
+        return;
+    };
+    let was = quoted_rids(original);
+    let now = quoted_rids(saved);
+    let xml = String::from_utf8_lossy(&part.1).into_owned();
+    let mut out = String::with_capacity(xml.len());
+    let mut from = 0;
+    for (name, a, b) in element_children(&xml) {
+        if name != "Relationship" {
+            continue;
+        }
+        let orphan = parse_rels_mode(&xml[a..b])
+            .first()
+            .is_some_and(|(id, ty, _, mode)| {
+                ty == rel_type
+                    && mode.as_deref() == Some("External")
+                    && was.contains(id)
+                    && !now.contains(id)
+            });
+        if orphan {
+            out.push_str(&xml[from..a]);
+            from = b;
+        }
+    }
+    if from == 0 {
+        return;
+    }
+    out.push_str(&xml[from..]);
+    part.1 = out.into_bytes();
 }
 
 /// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or

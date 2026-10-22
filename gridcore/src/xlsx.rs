@@ -4220,7 +4220,16 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
                 sheet_data_xml(sheet, &mut index_of, &mut any_formulas, new_cm.as_deref());
             let out = splice_worksheet(&source, sheet, &sheet_data, &wb.styles.dxfs, &mut dxf_for);
             // Links made in-session, and retyped ones, with their relationships.
-            hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns())
+            let out = hyperlinks::write_hyperlinks(out, sheet, &mut parts, part_name, pkg.ns());
+            // Relationships a removed or retyped link left behind go.
+            hyperlinks::prune_orphans(
+                &mut parts,
+                part_name,
+                &pkg.ns().rel("hyperlink"),
+                &source,
+                &out,
+            );
+            out
         };
         let updated = if wb.calc.transition_eval_changed && !cellless {
             set_transition_evaluation(updated, wb.calc.transition_eval)
@@ -5114,8 +5123,9 @@ fn splice_worksheet(
 
 /// Strike the `<hyperlink>` elements whose links were removed
 /// ([`Sheet::hyperlinks_removed`]), and the `<hyperlinks>` block once it is
-/// empty. The external relationship a removed link used stays in the rels,
-/// unreferenced, which OPC allows. Every other element is left as it is;
+/// empty. The external relationship a removed link used is dropped by
+/// `saved_parts` once the final worksheet is known
+/// ([`hyperlinks::prune_orphans`]). Every other element is left as it is;
 /// links added or retyped are written by `saved_parts` afterwards
 /// ([`hyperlinks::write_hyperlinks`]), which has the rels parts.
 fn set_hyperlinks(xml: String, sheet: &Sheet) -> String {
