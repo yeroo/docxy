@@ -916,6 +916,15 @@
   the catalogue; the grids are not catalogued fields (`Grid` is not an editable
   kind). The `project-task-info.uit` cases were written without being run on
   macOS, like the others.
+- Task Information's own top row (#1682) is `header: true` on `name`,
+  `duration` and `estimated`: `Dialog::header_columns` leaves them out of the
+  sum (in a `DialogOwner::TaskInfo` dialog only plugin header controls count),
+  so the band is the plugin header's columns wide, one without any, and Name
+  (`span` 255, clamped) fills it with Duration/Estimated on the next row. The
+  dialog has one `d.size` (`TASK_INFO_SIZE`, Project's 633x393) on every page,
+  so a plugin page's `fill` multiline fills it (`Dialog::fills`). The size
+  clips (`overflow_hidden`): a built-in grid with many rows no longer grows
+  the dialog.
 
 ## Terminal docxy prompts edit at a caret (#1372)
 

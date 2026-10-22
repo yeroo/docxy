@@ -75,6 +75,7 @@ fn field(name: &'static str, label: &str, kind: ControlKind, text: String, page:
 fn top_field(name: &'static str, label: &str, kind: ControlKind, text: String) -> Control {
     let mut c = Control::new(name, label, kind, Value::Text(text));
     c.page = None;
+    c.header = true;
     c
 }
 
@@ -85,6 +86,9 @@ fn check(name: &'static str, label: &str, on: bool, page: usize) -> Control {
 }
 
 const MODES: [&str; 2] = ["Manually Scheduled", "Auto Scheduled"];
+
+/// Project's Task Information size, the same on every page (#1682).
+pub(crate) const TASK_INFO_SIZE: (f32, f32) = (633., 393.);
 
 /// The dialog for task `uid`, opened on `page`. A blank row has no task to
 /// describe.
@@ -120,7 +124,12 @@ pub(crate) fn task_info_dialog(
         .unwrap_or(0);
     let effort = task.effort_driven.unwrap_or(proj.new_tasks_effort_driven());
     d.controls = vec![
-        top_field("name", "&Name:", ControlKind::Text, text(COL_NAME)),
+        {
+            // The band's full width, whatever the plugin header's columns.
+            let mut c = top_field("name", "&Name:", ControlKind::Text, text(COL_NAME));
+            c.span = u8::MAX;
+            c
+        },
         top_field(
             "duration",
             "&Duration:",
@@ -135,6 +144,7 @@ pub(crate) fn task_info_dialog(
                 0,
             );
             c.page = None;
+            c.header = true;
             c.beside = true;
             c
         },
@@ -276,6 +286,7 @@ pub(crate) fn task_info_dialog(
     enabled(&mut d, "percent", !task.summary);
     enabled(&mut d, "estimated", !read_only(COL_DURATION));
     enabled(&mut d, "cdate", needs_date(task.constraint));
+    d.size = Some(TASK_INFO_SIZE);
     d.buttons = ok_cancel();
     // Help (#1536) sits at the bottom left; it says what F1 says.
     d.buttons.insert(0, Button::new("&Help", ButtonRole::Apply));

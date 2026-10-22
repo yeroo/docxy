@@ -1365,11 +1365,14 @@ impl Dialog {
     }
 
     /// The header band's columns (#1609): the sum of the header controls'
-    /// spans, at least 1; the same on every page.
+    /// spans, at least 1; the same on every page. Task Information's own top
+    /// row (#1682) is the band's width, not part of the sum: it spans the
+    /// plugin header's columns, or the one column when there is none.
     pub fn header_columns(&self) -> usize {
+        let host_row = matches!(self.owner, DialogOwner::TaskInfo { .. });
         self.controls
             .iter()
-            .filter(|c| c.header && c.visible)
+            .filter(|c| c.header && c.visible && (c.plugin || !host_row))
             .map(|c| (c.span as usize).max(1))
             .sum::<usize>()
             .max(1)
@@ -1394,17 +1397,17 @@ impl Dialog {
     }
 
     /// The shown controls laid out as Project's (#1609): the header first
-    /// (one band of one row holding every header control, as wide as the
-    /// sum of their spans; a header control's `group` is ignored), then the
+    /// (one band holding every header control, as wide as the sum of their
+    /// spans; a header control's `group` is ignored), then the
     /// page's controls in rows of [`Dialog::columns`], a control's `span`
     /// taking that many columns (clamped to the row), consecutive controls
     /// of one `group` title in one band. A control marked `beside` (#1536)
     /// joins the row of the control before it, whatever the columns. In a
     /// dialog with plugin controls (Task Information with a plugin page,
-    /// #1609 r6) the built-in controls form bands of their own at one
-    /// column, so the shared Name, Duration and Estimated row keeps its
-    /// shape on every page; the page's `columns` apply to the plugin's
-    /// controls.
+    /// #1609 r6) the built-in page controls form bands of their own at one
+    /// column; the page's `columns` apply to the plugin's controls. Task
+    /// Information's top row is header controls (#1682), so a multi-column
+    /// page leaves it whole.
     pub fn layout_rows(&self) -> Vec<LayoutBand> {
         let mut shown = self.shown_indices();
         shown.sort_by_key(|&i| !self.controls[i].header);
@@ -1432,7 +1435,7 @@ impl Dialog {
                 let c = &self.controls[shown[k]];
                 if c.header != header
                     || (!header && c.group != title)
-                    || (!header && mixed && !c.plugin != builtin)
+                    || (!header && mixed && c.plugin == builtin)
                 {
                     break;
                 }

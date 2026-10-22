@@ -473,3 +473,99 @@ fn the_overlay_is_asked_again_when_the_zoom_changes() {
     v.zoom_step(1, 0.);
     assert_eq!(before, overlay_key(v));
 }
+
+const WIDE: &str = r##"{
+  "dialogs":[{"id":"task-information",
+    "header":[{"name":"fx.head","label":"Head:","kind":"label","value":"on every page"}],
+    "pages":[{"name":"Wide","columns":2,"controls":[
+      {"name":"fx.note","label":"&Note:","kind":"multiline","value":""},
+      {"name":"fx.pick","label":"Pick:","kind":"dropdown","items":["none"],"value":"none"}]}]}]
+}"##;
+
+fn wide_manifest() -> Manifest {
+    Manifest::parse(WIDE).unwrap()
+}
+
+#[test]
+fn task_information_top_row_is_a_whole_header_band_over_a_two_column_page() {
+    let m = wide_manifest();
+    let spec = m.dialog("task-information").unwrap();
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let mut d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    extend_task_info_with(&mut d, spec, &Prefill::default());
+    d.mark_opened();
+    d.select_tab("Wide").unwrap();
+    assert_eq!(d.columns(), 2);
+    let name_of = |d: &Dialog, i: usize| d.controls[i].name;
+    let bands = d.layout_rows();
+    let header = &bands[0];
+    assert!(header.header);
+    // The plugin's header label is one column, so the band is one wide:
+    // Name alone, Duration with Estimated beside it, then the plugin's.
+    assert_eq!(header.columns, 1);
+    let rows: Vec<Vec<&str>> = header
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|&(i, _)| name_of(&d, i)).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        [vec!["name"], vec!["duration", "estimated"], vec!["fx.head"]]
+    );
+    // The page keeps its two columns.
+    assert!(bands.iter().skip(1).any(|b| b.columns == 2));
+    for name in ["name", "duration", "estimated"] {
+        assert!(d.controls.iter().find(|c| c.name == name).unwrap().header);
+    }
+}
+
+#[test]
+fn task_information_top_row_spans_a_wide_plugin_header_and_the_size_is_fixed() {
+    let m = wide_manifest();
+    let spec = m.dialog("task-information").unwrap();
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let mut plain = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    let mut d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    extend_task_info_with(&mut d, spec, &Prefill::default());
+    d.controls
+        .iter_mut()
+        .find(|c| c.name == "fx.head")
+        .unwrap()
+        .span = 2;
+    assert_eq!(d.header_columns(), 2);
+    let bands = d.layout_rows();
+    let first = &bands[0].rows[0];
+    assert_eq!(first.len(), 1, "Name is alone in the band's first row");
+    assert_eq!(d.controls[first[0].0].name, "name");
+    // No plugin: one column, and the same order as before.
+    assert_eq!(plain.header_columns(), 1);
+    let order: Vec<&str> = plain.layout_rows()[0]
+        .rows
+        .iter()
+        .flatten()
+        .map(|&(i, _)| plain.controls[i].name)
+        .collect();
+    assert_eq!(order, ["name", "duration", "estimated"]);
+    // One size on every page, with and without a plugin page.
+    for dialog in [&mut plain, &mut d] {
+        assert_eq!(dialog.size, Some(crate::TASK_INFO_SIZE));
+        for t in dialog.tabs.clone() {
+            dialog.select_tab(&t).unwrap();
+            assert_eq!(dialog.size, Some(crate::TASK_INFO_SIZE), "{t}");
+        }
+    }
+    // A `fill` multiline on a plugin page fills it.
+    d.select_tab("Wide").unwrap();
+    let note = d.controls.iter_mut().find(|c| c.name == "fx.note").unwrap();
+    note.fill = true;
+    let note = note.clone();
+    assert!(d.fills(&note));
+}
