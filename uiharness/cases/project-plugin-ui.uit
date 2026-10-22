@@ -461,7 +461,7 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.1.header is true
   assert reply.controls.2.header is true
   assert reply.size.0 is 633
-  assert reply.size.1 is 393
+  assert reply.size.1 is 520
   shot window
   call dialog-read {}
   assert reply.tabs.5 is Fixture
@@ -472,7 +472,7 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.-1.header is true
   assert reply.controls.0.header is true
   assert reply.size.0 is 633
-  assert reply.size.1 is 393
+  assert reply.size.1 is 520
   # Name, Duration and Estimated stay whole above the two-column page.
   shot window
   # The top row (Name, Duration, Estimated) is on every page, so the page's

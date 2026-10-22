@@ -87,8 +87,13 @@ fn check(name: &'static str, label: &str, on: bool, page: usize) -> Control {
 
 const MODES: [&str; 2] = ["Manually Scheduled", "Auto Scheduled"];
 
-/// Project's Task Information size, the same on every page (#1682).
-pub(crate) const TASK_INFO_SIZE: (f32, f32) = (633., 393.);
+/// Task Information's size, the same on every page (#1682). Project's is
+/// 633x393; General's ten rows do not fit that high here (estimated, not
+/// measured), so the height is the largest page's. Anything taller scrolls.
+pub(crate) const TASK_INFO_SIZE: (f32, f32) = (633., 520.);
+
+/// The rows the Predecessors and Resources grids show before they scroll.
+const GRID_ROWS: usize = 6;
 
 /// The dialog for task `uid`, opened on `page`. A blank row has no task to
 /// describe.
@@ -287,6 +292,14 @@ pub(crate) fn task_info_dialog(
     enabled(&mut d, "estimated", !read_only(COL_DURATION));
     enabled(&mut d, "cdate", needs_date(task.constraint));
     d.size = Some(TASK_INFO_SIZE);
+    // A fixed size cannot grow with a long link list: the grids scroll.
+    for c in d
+        .controls
+        .iter_mut()
+        .filter(|c| c.kind == ControlKind::Grid)
+    {
+        c.min_rows = Some(GRID_ROWS);
+    }
     d.buttons = ok_cancel();
     // Help (#1536) sits at the bottom left; it says what F1 says.
     d.buttons.insert(0, Button::new("&Help", ButtonRole::Apply));

@@ -569,3 +569,55 @@ fn task_information_top_row_spans_a_wide_plugin_header_and_the_size_is_fixed() {
     let note = note.clone();
     assert!(d.fills(&note));
 }
+
+#[test]
+fn a_two_column_plugin_header_starts_a_new_row_after_the_estimated_box() {
+    let m = wide_manifest();
+    let spec = m.dialog("task-information").unwrap();
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let mut d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    extend_task_info_with(&mut d, spec, &Prefill::default());
+    let mut second = d
+        .controls
+        .iter()
+        .find(|c| c.name == "fx.head")
+        .unwrap()
+        .clone();
+    second.name = "fx.head2";
+    d.controls.push(second);
+    assert_eq!(d.header_columns(), 2);
+    let rows: Vec<Vec<&str>> = d.layout_rows()[0]
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|&(i, _)| d.controls[i].name).collect())
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            vec!["name"],
+            vec!["duration", "estimated"],
+            vec!["fx.head", "fx.head2"]
+        ]
+    );
+}
+
+#[test]
+fn the_built_in_grids_scroll_in_the_fixed_size() {
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    let grids: Vec<_> = d
+        .controls
+        .iter()
+        .filter(|c| c.kind == ControlKind::Grid)
+        .collect();
+    assert_eq!(grids.len(), 2);
+    assert!(grids.iter().all(|c| c.min_rows.is_some()));
+}

@@ -589,7 +589,9 @@ pub(crate) struct Control {
     /// A multiline that fills the page's remaining height (#1609) in a
     /// dialog with a fixed `size`.
     pub fill: bool,
-    /// Drawn above every page (#1609): a plugin spec's `header` control.
+    /// Drawn above every page (#1609): a plugin spec's `header` control, and
+    /// Task Information's own top row (#1682), which comes first (index
+    /// order) in the drawing and the Tab order.
     pub header: bool,
     /// Drawn on the same row as the control before it (#1536): Duration and
     /// its Estimated box, Start and Finish.
@@ -1442,7 +1444,13 @@ impl Dialog {
                 if c.beside {
                     match rows.last_mut().filter(|_| row.is_empty()) {
                         Some(last) => last.push((shown[k], last.len().min(columns - 1))),
-                        None => row.push((shown[k], used.min(columns - 1))),
+                        None => {
+                            row.push((shown[k], used.min(columns - 1)));
+                            // The row is whole: the next control starts a
+                            // new one, not a squeezed extra cell here.
+                            rows.push(std::mem::take(&mut row));
+                            used = 0;
+                        }
                     }
                     k += 1;
                     continue;
@@ -2014,8 +2022,9 @@ impl Dialog {
 
     /// The controls Tab steps through on the current tab, in order.
     fn focusable(&self) -> Vec<usize> {
-        // A plugin spec's header controls are drawn first and come first
-        // in the Tab order too (#1609); they are listed last so the pages'
+        // Header controls are drawn first and come first in the Tab order
+        // too (#1609), in index order: Task Information's own top row
+        // (#1682), then a plugin spec's, which are listed last so the pages'
         // controls keep their indices.
         let mut order: Vec<usize> = (0..self.controls.len())
             .filter(|&i| {

@@ -531,7 +531,8 @@
   `ControlKind::Sample` (a read-only box drawn by `plugin_ui::styled` from
   the formatting model's `TextStyle`) and `Control::header` (a spec's
   header control, listed last, drawn first on every page and first in the
-  Tab order). A plugin dialog may declare its own buttons (`Button::id`; a
+  Tab order; Task Information's own top row is header too, #1682, so there
+  it comes before the plugin's, in the drawing and the Tab order). A plugin dialog may declare its own buttons (`Button::id`; a
   press sends the command with `button`, the dialog stays open unless the
   reply's `close`); `help` is the host's: the window's press opens the
   spec's `help` URL through `open_help_url` (recorded for `last-url`), else
@@ -920,11 +921,14 @@
   `duration` and `estimated`: `Dialog::header_columns` leaves them out of the
   sum (in a `DialogOwner::TaskInfo` dialog only plugin header controls count),
   so the band is the plugin header's columns wide, one without any, and Name
-  (`span` 255, clamped) fills it with Duration/Estimated on the next row. The
-  dialog has one `d.size` (`TASK_INFO_SIZE`, Project's 633x393) on every page,
-  so a plugin page's `fill` multiline fills it (`Dialog::fills`). The size
-  clips (`overflow_hidden`): a built-in grid with many rows no longer grows
-  the dialog.
+  (`span` 255, clamped) fills it with Duration/Estimated on the next row (a
+  `beside` control closes its row, so a plugin header control starts the
+  next). The dialog has one `d.size` (`TASK_INFO_SIZE`, 633x520: Project's
+  633x393 is too low for General, by estimate, not measured) on every page,
+  so a plugin page's `fill` multiline fills it (`Dialog::fills`). What still
+  does not fit scrolls: the Task Information page body is a scrolling
+  container with a `Scrollbar` (`dialog-body`), and the Predecessors and
+  Resources grids have `min_rows` 6 (empty rows drawn, more scroll).
 
 ## Terminal docxy prompts edit at a caret (#1372)
 
