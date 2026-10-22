@@ -251,6 +251,33 @@ fn an_opaque_cell_and_a_flat_cell_under_a_hatched_row_are_found() {
         None
     );
     assert_eq!(cell_base(None, &with(None, Some("solid"))), None);
+    // A filled row (light/medium/dark-fill) is covered like a hatched one.
+    let grey = with(None, Some("medium-fill"));
+    assert_eq!(
+        cell_base(Some(&grey), &with(None, Some("solid"))),
+        Some(0xFFFFFF)
+    );
+    assert_eq!(cell_base(Some(&grey), &with(None, Some("hollow"))), None);
+    // A row with only a colour is already what the cell inherits.
+    assert_eq!(
+        cell_base(Some(&with(Some(1), None)), &with(None, Some("solid"))),
+        None
+    );
+}
+
+#[test]
+fn an_inactive_row_keeps_its_strike_over_a_plan_strike_off() {
+    use gpui::{Styled, div};
+    let off = TextStyle {
+        strikethrough: Some(false),
+        ..Default::default()
+    };
+    let thickness = |inactive| {
+        let mut el = keep_inactive_strike(styled(div(), &off), inactive);
+        el.style().text.strikethrough.as_ref().map(|s| s.thickness)
+    };
+    assert_eq!(thickness(true), Some(gpui::px(1.)));
+    assert_eq!(thickness(false), Some(gpui::px(0.)));
 }
 
 #[test]

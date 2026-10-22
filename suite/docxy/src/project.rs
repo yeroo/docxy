@@ -1369,6 +1369,7 @@ fn editable_row_cells(
         Some(style) => crate::plugin_ui::styled(cells, style),
         None => cells,
     };
+    let cells = crate::plugin_ui::keep_inactive_strike(cells, inactive);
     cells
         .children(row_style.as_ref().and_then(crate::plugin_ui::pattern_layer))
         .children(values.into_iter().enumerate().map(|(col, value)| {
@@ -1438,6 +1439,7 @@ fn editable_row_cells(
                 Some(style) => crate::plugin_ui::styled(cell, style),
                 None => cell,
             };
+            let cell = crate::plugin_ui::keep_inactive_strike(cell, inactive);
             let cell = match forced_base {
                 Some(base) => cell.bg(hsla_u(base)),
                 None => cell,

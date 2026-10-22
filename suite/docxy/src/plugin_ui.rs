@@ -1748,17 +1748,23 @@ pub(crate) fn paints_opaque(style: &TextStyle) -> bool {
 }
 
 /// The opaque base a cell with a plain (`solid` or unknown) pattern needs
-/// when its row draws a hatch, so the row's does not show through: the
-/// cell's background, else white.
+/// when its row draws a fill or a hatch, so the row's does not show through:
+/// the cell's background, else white.
 pub(crate) fn cell_base(row: Option<&TextStyle>, cell: &TextStyle) -> Option<u32> {
-    let hatched = |s: &TextStyle| {
+    let layered = |s: &TextStyle| {
         matches!(
             pattern_look(s.pattern.as_deref()),
-            PatternLook::Slash { .. } | PatternLook::Dots { .. }
+            PatternLook::Blend(_) | PatternLook::Slash { .. } | PatternLook::Dots { .. }
         )
     };
-    (row.is_some_and(hatched) && pattern_look(cell.pattern.as_deref()) == PatternLook::Flat)
+    (row.is_some_and(layered) && pattern_look(cell.pattern.as_deref()) == PatternLook::Flat)
         .then(|| cell.background.unwrap_or(PATTERN_BG))
+}
+
+/// An inactive task keeps its host line-through whatever the plan's style
+/// says: apply after [`styled`], whose `strikethrough: false` would cancel it.
+pub(crate) fn keep_inactive_strike<E: gpui::Styled>(el: E, inactive: bool) -> E {
+    if inactive { el.line_through() } else { el }
 }
 
 /// `el` drawn in `style`: font, size (points), weight, italic, underline,
