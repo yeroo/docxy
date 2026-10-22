@@ -20,8 +20,8 @@
 //! | `sheet.list` | — | `{active, sheets:[{index, name, rows, cols}]}` |
 //! | `sheet.read` | `{sheet?, range?}` | `{sheet, name, rows, cols, cells:[…], truncated}` |
 //! | `cell.get` | `{ref, sheet?}` | `{ref, row, col, value, formula?, text}` |
-//! | `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}` |
-//! | `range.clear` | `{range, sheet?}` | `{cleared}` |
+//! | `cell.set` | `{ref, text, sheet?}` | `{ref, value, text, …}`; a protected sheet is refused |
+//! | `range.clear` | `{range, sheet?}` | `{cleared}`; a protected sheet is refused |
 //! | `find` | `{query, sheet?}` | `{count, matches:[…]}` |
 //! | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` |
 //! | `wb.export-csv` | `{sheet?}` | `{sheet, csv}` (display-formatted) |
@@ -31,27 +31,27 @@
 //! | `chart.list` | — | `{charts:[{kind,title?,categories,series:[{name?,values}]}]}` |
 //! | `pivot.list` | — | `{pivots:[{sheet,rows,cols,values}]}` |
 //! | `pivot.create` | `{range,rows,cols?,values,name?,sheet?}` | `{sheet,name}` — REAL persistent pivot on a NEW sheet; clears undo history like `sheet.import-csv` |
-//! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}` |
-//! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}` |
-//! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group |
+//! | `comment.add` | `{ref,text,author?,sheet?}` | `{sheet,ref}`; a protected sheet is refused |
+//! | `comment.remove` | `{ref,sheet?}` | `{removed:bool}`; a protected sheet is refused |
+//! | `range.set` | `{start,rows:[[string]],sheet?}` | `{set}` — atomic, one undo group; a protected sheet is refused |
 //! | `sheet.import-csv` | `{text,name?}` | `{sheet,name,rows,cols}` — always a new sheet; fields convert as a `.csv` open does (`sep=`, typed-entry rules, File › Options › Data) |
 //! | `sheet.import-text` | `{text\|path,options?,name?}` | `{sheet,name,rows,cols}` — the Text Import Wizard's options (see `text_options`) into a new sheet |
 //! | `app.options` | `{convert_leading_zeros?,convert_long_numbers?,convert_e_notation?,convert_dates?,edit_fixed_decimal?,edit_fixed_decimal_places?,edit_move_after_enter?,edit_move_direction?,edit_in_cell?,edit_autocomplete?,edit_formula_autocomplete?}` | all of them — File › Options › Data › Automatic Data Conversion and Advanced › Editing (places -300..=300, direction `down`/`right`/`up`/`left`); every given key is checked before any is set |
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples typed at the top of the data (or below a header row: the column's top cell empty, or the examples showing no pattern with it), the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries: text when every example is text that would not stay text typed bare (`'007`), and never with an apostrophe in a Text-formatted cell; one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
 //! | `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
-//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell or range, `Sheet!B2`, `B2` or `Sheet!B2:D9` (default: the cursor on the active sheet; a range more than one cell tall or wide keeps the categories that fit that way); a ref may also be a defined name; `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
-//! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group |
+//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate (a protected destination sheet is refused): `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell or range, `Sheet!B2`, `B2` or `Sheet!B2:D9` (default: the cursor on the active sheet; a range more than one cell tall or wide keeps the categories that fit that way); a ref may also be a defined name; `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
+//! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group; refused, changing nothing, when any sheet is protected |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
 //! | `sheet.rename` | `{sheet,name}` | `{name}` |
 //! | `table.list` | — | `{tables:[{name,sheet,sheet_name,ref,columns,header_rows,totals_rows}]}` |
-//! | `table.rename` | `{name,new}` | the table, as `table.list` shows it — Excel's name rules; every formula naming it follows. One undo step |
-//! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old and keeps a data row; a table with a Total Row keeps its bottom row; new columns' unique names are written into their header cells. One undo step |
-//! | `table.convert` | `{name}` | `{converted}` — structured references become cell references; refused while a PivotTable, a SUMX-style formula or the data model uses the table. One undo step |
-//! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
-//! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}` |
-//! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
+//! | `table.rename` | `{name,new}` | the table, as `table.list` shows it — Excel's name rules; every formula naming it follows. One undo step; refused when the table's sheet is protected |
+//! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old and keeps a data row; a table with a Total Row keeps its bottom row; new columns' unique names are written into their header cells. One undo step; refused when the table's sheet is protected |
+//! | `table.convert` | `{name}` | `{converted}` — structured references become cell references; refused while a PivotTable, a SUMX-style formula or the data model uses the table. One undo step; refused when the table's sheet is protected |
+//! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused |
+//! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused |
+//! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required); a protected sheet is refused |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly); a protected sheet is refused |
 //! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
 //! | `page.header` | `{sheet?, kind?:odd\|even\|first, part?:header\|footer, left?, center?, right?}` | `{stored, left, center, right, changed}` — sections in the editor's form (`&[Page]`, `&[Pages]`, `&[Date]`, `&[Time]`, `&[Path]`, `&[File]`, `&[Tab]`), stored as Excel's codes; with none of left/center/right it only reads; a section over 255 characters is refused; `&[Picture]` only where the section already has a picture; `&L`, `&C` or `&R` inside a section is refused (a literal ampersand is `&&`). One undo step |
@@ -1144,6 +1144,7 @@ fn pivot_list(app: &App) -> Json {
 
 fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "cell.set")?;
     let (r, c) = ref_arg(args)?;
     let text = args.get_str("text").ok_or("cell.set needs 'text'")?;
     // Same validation as the TUI's commit path: a bad formula is rejected
@@ -1169,6 +1170,7 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
 
 fn range_clear(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "range.clear")?;
     let rg = args.get_str("range").ok_or("range.clear needs a 'range'")?;
     let (r1, c1, r2, c2) = parse_range(rg)?;
     // Mirror the TUI's Delete: blank the value/formula but keep the style.
@@ -1202,6 +1204,7 @@ fn range_clear(app: &mut App, args: &Json) -> Result<Json, String> {
 /// undo stack, exactly like the keyboard path.
 fn comment_add(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "comment.add")?;
     let (r, c) = ref_arg(args)?;
     let text = args.get_str("text").ok_or("comment.add needs 'text'")?;
     if text.is_empty() {
@@ -1228,6 +1231,7 @@ fn comment_add(app: &mut App, args: &Json) -> Result<Json, String> {
 /// Remove the comment (threaded or legacy note) on a cell, if any.
 fn comment_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "comment.remove")?;
     let (r, c) = ref_arg(args)?;
     let existed = app
         .pkg
@@ -1253,6 +1257,7 @@ fn comment_remove(app: &mut App, args: &Json) -> Result<Json, String> {
 /// [`App::apply_on`] call, i.e. one undo group.
 fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "range.set")?;
     let start = args.get_str("start").ok_or("range.set needs a 'start'")?;
     let (r0, c0) =
         parse_cell_name(start.trim()).ok_or_else(|| format!("bad cell ref '{start}'"))?;
@@ -1548,9 +1553,7 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
 fn range_flash_fill(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let (r, c) = ref_arg(args)?;
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("range.flash-fill: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "range.flash-fill")?;
     let f = app
         .flash_fill_on(si, r, c)
         .map_err(|e| format!("range.flash-fill: {e}"))?;
@@ -1687,9 +1690,7 @@ fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
 /// true. One undo step.
 fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("range.text-to-columns: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "range.text-to-columns")?;
     let rg = args
         .get_str("range")
         .ok_or("range.text-to-columns needs a 'range'")?;
@@ -1737,6 +1738,7 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
         }
         None => (app.sheet, (app.cur.0, app.cur.1, app.cur.0, app.cur.1)),
     };
+    refuse_if_protected(app, sheet, "wb.consolidate")?;
     let flag = |k: &str| args.get(k).and_then(Json::as_bool).unwrap_or(false);
     let opts = gridcore::edit::ConsolidateOptions {
         func,
@@ -1824,6 +1826,10 @@ fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
         return Err("empty query".into());
     }
     let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
+    // Atomic: one protected sheet refuses the whole workbook-wide edit.
+    if app.pkg.workbook.sheets.iter().any(|s| s.is_protected()) {
+        return Err("wb.replace-all: the sheet is protected".into());
+    }
     let mut replaced = 0usize;
     let today = now_serial();
     app.structural_writing_cells(|wb| {
@@ -1935,11 +1941,14 @@ fn table_arg(app: &App, args: &Json, verb: &str) -> Result<String, String> {
     let name = args
         .get_str("name")
         .ok_or_else(|| format!("{verb} needs a 'name'"))?;
-    app.pkg
+    let t = app
+        .pkg
         .workbook
         .table(name)
-        .map(|t| t.name.clone())
-        .ok_or_else(|| format!("There is no table named {name}"))
+        .ok_or_else(|| format!("There is no table named {name}"))?;
+    // The sheet that holds the table decides, not the active one.
+    refuse_if_protected(app, t.sheet, verb)?;
+    Ok(t.name.clone())
 }
 
 /// The table now named `name`, as `table.list` shows it.
@@ -1992,6 +2001,7 @@ fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
 fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
     let verb = if insert { "row.insert" } else { "row.delete" };
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, verb)?;
     let at = args
         .get_usize("at")
         .ok_or_else(|| format!("{verb} needs an 'at'"))? as u32;
@@ -2015,6 +2025,7 @@ fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
 fn col_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
     let verb = if insert { "col.insert" } else { "col.delete" };
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, verb)?;
     let at = args
         .get_usize("at")
         .ok_or_else(|| format!("{verb} needs an 'at'"))? as u32;
@@ -2063,6 +2074,7 @@ fn patch_pairs(patch: &Json) -> Result<Vec<(String, String)>, String> {
 /// spill are never re-entered, so a spilled block stays spilled.
 fn cell_format(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
+    refuse_if_protected(app, si, "cell.format")?;
     let rg = args.get_str("range").ok_or("cell.format needs a 'range'")?;
     let (r1, c1, r2, c2) = parse_range(rg)?;
     // Reject an oversized range BEFORE materializing a Cell per coordinate or
@@ -2148,9 +2160,7 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
     if !(width.is_finite() && width >= 0.0) {
         return Err("col.width: 'width' must not be negative".to_string());
     }
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("col.width: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "col.width")?;
     app.pkg.workbook.sheets[si].set_col_width(col, width);
     app.modified = true;
     Ok(Json::obj(vec![
@@ -2819,6 +2829,15 @@ fn sheet_arg_required(app: &App, args: &Json) -> Result<usize, String> {
         return Err("needs a 'sheet' (index or name)".into());
     }
     sheet_arg(app, args)
+}
+
+/// Refuse a verb that writes, moves or formats cells of sheet `si` when it is
+/// protected, as the keyboard does: `"<verb>: the sheet is protected"`.
+pub(super) fn refuse_if_protected(app: &App, si: usize, verb: &str) -> Result<(), String> {
+    if app.pkg.workbook.sheets[si].is_protected() {
+        return Err(format!("{verb}: the sheet is protected"));
+    }
+    Ok(())
 }
 
 /// Parse the `ref` arg (`"B4"`) into (row, col).
@@ -4143,6 +4162,214 @@ mod tests {
             a.sheet().cell(2, 1).map(|c| c.value.clone()),
             Some(CellValue::Text("d".into()))
         );
+    }
+
+    /// #1679: every cell-writing verb refuses a protected sheet with
+    /// "<verb>: the sheet is protected" and changes nothing.
+    #[test]
+    fn cell_writing_verbs_refuse_a_protected_sheet() {
+        let mut a = app();
+        set(&mut a, "A1", "x");
+        dispatch(
+            &mut a,
+            "comment.add",
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str("c".into())),
+                ("author", Json::Str("t".into())),
+            ]),
+        )
+        .unwrap();
+        let s = |v: &str| Json::Str(v.into());
+        let cases: Vec<(&str, Json)> = vec![
+            (
+                "cell.set",
+                Json::obj(vec![("ref", s("A1")), ("text", s("y"))]),
+            ),
+            (
+                "range.set",
+                Json::obj(vec![
+                    ("start", s("A1")),
+                    ("rows", Json::Arr(vec![Json::Arr(vec![s("y")])])),
+                ]),
+            ),
+            ("range.clear", Json::obj(vec![("range", s("A1"))])),
+            (
+                "cell.format",
+                Json::obj(vec![
+                    ("range", s("A1")),
+                    ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+                ]),
+            ),
+            ("row.insert", Json::obj(vec![("at", Json::Num(0.0))])),
+            ("row.delete", Json::obj(vec![("at", Json::Num(0.0))])),
+            ("col.insert", Json::obj(vec![("at", Json::Num(0.0))])),
+            ("col.delete", Json::obj(vec![("at", Json::Num(0.0))])),
+            (
+                "comment.add",
+                Json::obj(vec![("ref", s("B1")), ("text", s("n"))]),
+            ),
+            ("comment.remove", Json::obj(vec![("ref", s("A1"))])),
+        ];
+        a.pkg.workbook.sheets[0].set_protected(true);
+        a.modified = false;
+        let dump = |a: &App| format!("{:?}", a.pkg.workbook.sheets[0].cells);
+        let (before, undo_len) = (dump(&a), a.undo.len());
+        let comments = dispatch(&mut a, "comment.list", &Json::Null).unwrap();
+        for (verb, args) in &cases {
+            assert_eq!(
+                dispatch(&mut a, verb, args).unwrap_err(),
+                format!("{verb}: the sheet is protected")
+            );
+        }
+        assert_eq!(dump(&a), before);
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
+        assert_eq!(
+            dispatch(&mut a, "comment.list", &Json::Null).unwrap(),
+            comments
+        );
+        a.pkg.workbook.sheets[0].set_protected(false);
+        for (verb, args) in &cases {
+            dispatch(&mut a, verb, args).unwrap_or_else(|e| panic!("{verb}: {e}"));
+        }
+    }
+
+    /// #1679: the sheet named by `sheet` decides, not the active one.
+    #[test]
+    fn cell_writing_verbs_follow_the_named_sheet_for_protection() {
+        let mut a = app();
+        dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        let s = |v: &str| Json::Str(v.into());
+        let set_on = |sheet: f64| {
+            Json::obj(vec![
+                ("sheet", Json::Num(sheet)),
+                ("ref", s("A1")),
+                ("text", s("z")),
+            ])
+        };
+        // Active Sheet1 protected: Sheet2 still takes writes.
+        a.pkg.workbook.sheets[0].set_protected(true);
+        dispatch(&mut a, "cell.set", &set_on(1.0)).unwrap();
+        assert_eq!(
+            dispatch(&mut a, "cell.set", &set_on(0.0)).unwrap_err(),
+            "cell.set: the sheet is protected"
+        );
+        // Imports always add a new sheet, so a protected active sheet is no bar.
+        dispatch(
+            &mut a,
+            "sheet.import-csv",
+            &Json::obj(vec![("text", s("a,b"))]),
+        )
+        .unwrap();
+        dispatch(
+            &mut a,
+            "sheet.import-text",
+            &Json::obj(vec![("text", s("a b"))]),
+        )
+        .unwrap();
+        // Active Sheet1 open: protected Sheet2 refuses.
+        a.pkg.workbook.sheets[0].set_protected(false);
+        a.pkg.workbook.sheets[1].set_protected(true);
+        assert_eq!(
+            dispatch(&mut a, "cell.set", &set_on(1.0)).unwrap_err(),
+            "cell.set: the sheet is protected"
+        );
+        dispatch(&mut a, "cell.set", &set_on(0.0)).unwrap();
+    }
+
+    /// #1679: `filter.advanced` with `copyTo` writes cells, so a protected
+    /// sheet refuses it; in place it only hides rows and stays allowed.
+    #[test]
+    fn filter_advanced_copy_to_refuses_a_protected_sheet() {
+        let mut a = app();
+        for (r, t) in [
+            ("A1", "h"),
+            ("A2", "x"),
+            ("A3", "y"),
+            ("C1", "h"),
+            ("C2", "x"),
+        ] {
+            set(&mut a, r, t);
+        }
+        let s = |v: &str| Json::Str(v.into());
+        let copy = Json::obj(vec![
+            ("list", s("A1:A3")),
+            ("criteria", s("C1:C2")),
+            ("copyTo", s("E1")),
+        ]);
+        let in_place = Json::obj(vec![("list", s("A1:A3")), ("criteria", s("C1:C2"))]);
+        a.pkg.workbook.sheets[0].set_protected(true);
+        a.modified = false;
+        let undo_len = a.undo.len();
+        assert_eq!(
+            dispatch(&mut a, "filter.advanced", &copy).unwrap_err(),
+            "filter.advanced: the sheet is protected"
+        );
+        assert_eq!(a.sheet().cell(0, 4), None);
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
+        dispatch(&mut a, "filter.advanced", &in_place).unwrap();
+        a.pkg.workbook.sheets[0].set_protected(false);
+        dispatch(&mut a, "filter.advanced", &copy).unwrap();
+        assert!(a.sheet().cell(0, 4).is_some());
+    }
+
+    /// #1679: table verbs go by the sheet that holds the table, and
+    /// `wb.replace-all` refuses whole when any sheet is protected.
+    #[test]
+    fn table_verbs_and_replace_all_refuse_protected_sheets() {
+        let mut a = app();
+        dispatch(&mut a, "sheet.add", &Json::Null).unwrap();
+        a.pkg.workbook.tables.push(gridcore::sheet::Table {
+            name: "T1".into(),
+            sheet: 1,
+            range: (0, 0, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["A".into(), "B".into()],
+            ..Default::default()
+        });
+        let s = |v: &str| Json::Str(v.into());
+        let table_verbs: Vec<(&str, Json)> = vec![
+            (
+                "table.rename",
+                Json::obj(vec![("name", s("T1")), ("new", s("Sales"))]),
+            ),
+            (
+                "table.resize",
+                Json::obj(vec![("name", s("T1")), ("ref", s("A1:B4"))]),
+            ),
+            ("table.convert", Json::obj(vec![("name", s("T1"))])),
+        ];
+        a.pkg.workbook.sheets[1].set_protected(true);
+        for (verb, args) in &table_verbs {
+            assert_eq!(
+                dispatch(&mut a, verb, args).unwrap_err(),
+                format!("{verb}: the sheet is protected")
+            );
+        }
+        assert_eq!(a.pkg.workbook.tables[0].name, "T1");
+        // The active sheet (unprotected) holds one match; the protected
+        // Sheet2 stops the whole replace, so nothing changes on Sheet1.
+        set(&mut a, "A1", "foo");
+        a.modified = false;
+        let undo_len = a.undo.len();
+        let ra = Json::obj(vec![("query", s("foo")), ("text", s("bar"))]);
+        assert_eq!(
+            dispatch(&mut a, "wb.replace-all", &ra).unwrap_err(),
+            "wb.replace-all: the sheet is protected"
+        );
+        assert_eq!(
+            a.pkg.workbook.sheets[0].cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Text("foo".into()))
+        );
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
+        a.pkg.workbook.sheets[1].set_protected(false);
+        let r = dispatch(&mut a, "wb.replace-all", &ra).unwrap();
+        assert_eq!(r.get("replaced").and_then(|v| v.as_f64()), Some(1.0));
+        dispatch(&mut a, "table.rename", &table_verbs[0].1).unwrap();
     }
 
     /// #833: the sheet named by `sheet` decides, not the active one: a
