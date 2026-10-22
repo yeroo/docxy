@@ -1209,7 +1209,7 @@ fn heading_cells(
 ) -> impl IntoElement {
     // The plan's Column Titles text style (#1532), when it sets one.
     let style = crate::plugin_ui::category_style(v, "Column Titles");
-    let row = h_flex().h(px(ROW_H)).items_center();
+    let row = h_flex().relative().h(px(ROW_H)).items_center();
     let row = match &style {
         Some(style) => crate::plugin_ui::styled(row, style),
         None => row,
@@ -1361,6 +1361,7 @@ fn editable_row_cells(
         }
     };
     let cells = h_flex()
+        .relative()
         .h(px(ROW_H))
         .items_center()
         .when(inactive, |d| d.text_color(pal.dim).line_through());
