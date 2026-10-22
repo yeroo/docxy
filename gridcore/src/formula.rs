@@ -3183,13 +3183,6 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     map_sheet_qualifiers(e, &fix, &whole_name)
 }
 
-/// Rebuild `e` with every sheet qualifier `fix` maps: a reference's, a
-/// range's first corner's (the second takes the first's sheet), a column or
-/// row range's, and a 3-D span's two end sheets (through `fix(&Some(name))`).
-/// `special` sees each node first and, returning `Some`, replaces it whole.
-/// The one walker behind [`rename_sheet_in_expr`] and
-/// [`qualify_sheet_in_expr`], so a new qualified `Expr` variant is learned by
-/// both or neither.
 /// A sheet-scoped name's `(sheet, name)`, from the text the parser gave it
 /// (`sheet_prefix` + name; the name itself holds no `!`).
 fn scoped_name(n: &str) -> Option<(String, &str)> {
@@ -3201,6 +3194,14 @@ fn scoped_name(n: &str) -> Option<(String, &str)> {
     Some((sheet, id))
 }
 
+/// Rebuild `e` with every sheet qualifier `fix` maps: a reference's, a
+/// range's first corner's (the second takes the first's sheet), a column or
+/// row range's, a sheet-scoped name's qualifier, and a 3-D span's two end
+/// sheets (through `fix(&Some(name))`).
+/// `special` sees each node first and, returning `Some`, replaces it whole.
+/// The one walker behind [`rename_sheet_in_expr`] and
+/// [`qualify_sheet_in_expr`], so a new qualified `Expr` variant is learned by
+/// both or neither.
 fn map_sheet_qualifiers(
     e: &Expr,
     fix: &dyn Fn(&Option<String>) -> Option<String>,
