@@ -20539,11 +20539,16 @@ mod print_setup_tests {
             ws.contains(r#"<sortState ref="A1:D9"><sortCondition ref="C2:C9"/></sortState>"#),
             "{ws}"
         );
-        // A condition spanning the insert widens; one wholly above it stays.
-        let two = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B5"/><sortCondition ref="A2:A9"/></sortState>"#;
+    }
+
+    #[test]
+    fn sort_state_row_insert_widens_a_spanning_condition_and_spares_one_above() {
+        // The insert is before row 4 (index 3): B2:B3 ends above it and stays,
+        // A2:A9 spans it and widens.
+        let two = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A9"/></sortState>"#;
         let (ws, _) = edited("", two, |w| insert_rows(w, 0, 3, 2));
         assert!(
-            ws.contains(r#"<sortState ref="A1:C11"><sortCondition ref="B2:B7"/><sortCondition ref="A2:A11"/></sortState>"#),
+            ws.contains(r#"<sortState ref="A1:C11"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A11"/></sortState>"#),
             "{ws}"
         );
     }
