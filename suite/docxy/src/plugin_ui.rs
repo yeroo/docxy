@@ -1659,8 +1659,118 @@ pub(crate) fn category_style(v: &ProjectView, category: &str) -> Option<TextStyl
         .cloned()
 }
 
+/// The pattern colour when the style sets no text colour, and Project's
+/// default background under a pattern when it sets none (#1664).
+pub(crate) const PATTERN_FG: u32 = 0x000000;
+const PATTERN_BG: u32 = 0xFFFFFF;
+
+/// How a `TextStyle::pattern` is drawn (#1664). gpui has one 45-degree
+/// slash and a checkerboard, so the vertical stripes and the left/right
+/// slants share the slash and the dithers differ only by cell size; the
+/// fills are the background blended towards the text colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PatternLook {
+    /// `hollow`: no fill, whatever the background colour.
+    Hollow,
+    /// `solid`, an unknown name or none: the plain background.
+    Flat,
+    /// The background blended with the text colour by this percentage.
+    Blend(u8),
+    Slash {
+        width: f32,
+        interval: f32,
+    },
+    Dots {
+        size: f32,
+    },
+}
+
+pub(crate) fn pattern_look(name: Option<&str>) -> PatternLook {
+    match name {
+        Some("hollow") => PatternLook::Hollow,
+        Some("light-fill") => PatternLook::Blend(25),
+        Some("medium-fill") => PatternLook::Blend(50),
+        Some("dark-fill") => PatternLook::Blend(75),
+        Some("diagonal-left" | "diagonal-right") => PatternLook::Slash {
+            width: 1.,
+            interval: 5.,
+        },
+        Some("dark-diagonal-left" | "dark-diagonal-right") => PatternLook::Slash {
+            width: 2.,
+            interval: 3.,
+        },
+        Some("thin-vertical-stripe") => PatternLook::Slash {
+            width: 1.,
+            interval: 3.,
+        },
+        Some("medium-vertical-stripe") => PatternLook::Slash {
+            width: 2.,
+            interval: 2.,
+        },
+        Some("light-dither") => PatternLook::Dots { size: 1. },
+        Some("medium-dither") => PatternLook::Dots { size: 2. },
+        Some("dark-dither") => PatternLook::Dots { size: 3. },
+        _ => PatternLook::Flat,
+    }
+}
+
+/// `base` moved `pct` percent towards `to`, per channel.
+fn blend(base: u32, to: u32, pct: u8) -> u32 {
+    let mix = |shift: u32| {
+        let (a, b) = ((base >> shift) & 0xFF, (to >> shift) & 0xFF);
+        (a * (100 - u32::from(pct)) + b * u32::from(pct) + 50) / 100
+    };
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// The base fill `styled` paints: the background, blended for the fills,
+/// nothing for `hollow`.
+pub(crate) fn base_fill(style: &TextStyle) -> Option<u32> {
+    match pattern_look(style.pattern.as_deref()) {
+        PatternLook::Hollow => None,
+        PatternLook::Blend(pct) => Some(blend(
+            style.background.unwrap_or(PATTERN_BG),
+            style.color.unwrap_or(PATTERN_FG),
+            pct,
+        )),
+        _ => style.background,
+    }
+}
+
+/// Whether `style` paints an opaque base or layer over its box, which
+/// would hide a selection wash set as the box's own background.
+pub(crate) fn paints_opaque(style: &TextStyle) -> bool {
+    base_fill(style).is_some()
+        || matches!(
+            pattern_look(style.pattern.as_deref()),
+            PatternLook::Slash { .. } | PatternLook::Dots { .. }
+        )
+}
+
+/// The opaque base a cell with a plain (`solid` or unknown) pattern needs
+/// when its row draws a fill or a hatch, so the row's does not show through:
+/// the cell's background, else white.
+pub(crate) fn cell_base(row: Option<&TextStyle>, cell: &TextStyle) -> Option<u32> {
+    let layered = |s: &TextStyle| {
+        matches!(
+            pattern_look(s.pattern.as_deref()),
+            PatternLook::Blend(_) | PatternLook::Slash { .. } | PatternLook::Dots { .. }
+        )
+    };
+    (row.is_some_and(layered) && pattern_look(cell.pattern.as_deref()) == PatternLook::Flat)
+        .then(|| cell.background.unwrap_or(PATTERN_BG))
+}
+
+/// An inactive task keeps its host line-through whatever the plan's style
+/// says: apply after [`styled`], whose `strikethrough: false` would cancel it.
+pub(crate) fn keep_inactive_strike<E: gpui::Styled>(el: E, inactive: bool) -> E {
+    if inactive { el.line_through() } else { el }
+}
+
 /// `el` drawn in `style`: font, size (points), weight, italic, underline,
-/// colour and background, each only when the style sets it.
+/// strikethrough, colour and background, each only when the style sets it.
+/// A hatch or stipple pattern also needs [`pattern_layer`] as the box's
+/// first child.
 pub(crate) fn styled<E: gpui::Styled>(el: E, style: &TextStyle) -> E {
     use gpui::{FontWeight, px};
     let mut el = el;
@@ -1681,13 +1791,46 @@ pub(crate) fn styled<E: gpui::Styled>(el: E, style: &TextStyle) -> E {
     if style.underline == Some(true) {
         el = el.underline();
     }
+    match style.strikethrough {
+        Some(true) => el = el.line_through(),
+        // An explicit off cancels a strike inherited from the row.
+        Some(false) => {
+            el.text_style().strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: px(0.),
+                color: None,
+            });
+        }
+        None => {}
+    }
     if let Some(color) = style.color {
         el = el.text_color(crate::hsla_u(color));
     }
-    if let Some(bg) = style.background {
+    if let Some(bg) = base_fill(style) {
         el = el.bg(crate::hsla_u(bg));
     }
     el
+}
+
+/// The hatch or stipple of `style`'s pattern, as an absolute box over the
+/// parent's base fill, to be its first child so the text stays above it;
+/// `None` for every other pattern. Without a background colour the pattern
+/// sits on white, Project's default.
+pub(crate) fn pattern_layer(style: &TextStyle) -> Option<gpui::AnyElement> {
+    use gpui::{IntoElement, ParentElement, Styled, checkerboard, div, pattern_slash};
+    let fg = crate::hsla_u(style.color.unwrap_or(PATTERN_FG));
+    let pattern = match pattern_look(style.pattern.as_deref()) {
+        PatternLook::Slash { width, interval } => pattern_slash(fg, width, interval),
+        PatternLook::Dots { size } => checkerboard(fg, size),
+        _ => return None,
+    };
+    let fill = || div().absolute().top_0().left_0().size_full();
+    let base = fill();
+    let base = if style.background.is_none() {
+        base.bg(crate::hsla_u(PATTERN_BG))
+    } else {
+        base
+    };
+    Some(base.child(fill().bg(pattern)).into_any_element())
 }
 
 /// A view's cache cell.

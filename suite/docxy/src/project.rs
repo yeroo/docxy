@@ -673,6 +673,31 @@ fn project_region(
     }
 }
 
+/// The plan's cell text styles for the harness state (#1664).
+fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
+    let mut text = String::new();
+    projcore::json::Json::Arr(
+        f.cell_styles
+            .iter()
+            .map(|c| {
+                let mut pairs = vec![
+                    (
+                        "uid".to_string(),
+                        projcore::json::Json::Num(f64::from(c.uid)),
+                    ),
+                    ("column".to_string(), projcore::json::Json::str(&c.column)),
+                ];
+                if let projcore::json::Json::Obj(fields) = c.style.to_json() {
+                    pairs.extend(fields);
+                }
+                projcore::json::Json::Obj(pairs)
+            })
+            .collect(),
+    )
+    .write(&mut text);
+    ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
+}
+
 /// The plan's set gridlines for the harness state (#1575).
 fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json {
     let mut text = String::new();
@@ -754,6 +779,11 @@ pub(super) fn project_state(
         (
             "gridlines".into(),
             gridlines_json(&v.ed.project().formatting.gridlines),
+        ),
+        // The cells' own text styles (#1664), each `{uid, column, ..style}`.
+        (
+            "cell_styles".into(),
+            cell_styles_json(&v.ed.project().formatting),
         ),
         (
             "gridlines_set".into(),
@@ -1179,118 +1209,119 @@ fn heading_cells(
 ) -> impl IntoElement {
     // The plan's Column Titles text style (#1532), when it sets one.
     let style = crate::plugin_ui::category_style(v, "Column Titles");
-    let row = h_flex().h(px(ROW_H)).items_center();
+    let row = h_flex().relative().h(px(ROW_H)).items_center();
     let row = match &style {
         Some(style) => crate::plugin_ui::styled(row, style),
         None => row,
     };
     let widths = v.widths();
     let look = v.look();
-    row.children(COLUMNS.iter().enumerate().map(|(col, name)| {
-        let filtered = v.ed.filter(ENTRY_FIELDS[col]).is_some();
-        div()
-            .id(("project-heading", col))
-            .relative()
-            .h_full()
-            .flex()
-            .items_center()
-            .w(px(widths[col]))
-            .flex_none()
-            .pl_2()
-            .pr(px(ARROW_W + EDGE_W))
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .when(col == COL_NAME, |d| d.pl(px(8.)))
-            .when(look.heading_hot(col), |d| {
-                d.bg(selection::header_tint_color())
-            })
-            .child(probe(probes, format!("project-heading:{col}")))
-            .child(*name)
-            // A left press selects the column (#1534); the arrow and the
-            // edge, drawn after, stop their own presses.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                    if this.active == index
-                        && let Some(tab) = this.tabs.get_mut(index)
-                    {
-                        project_column_select(tab, col);
-                    }
-                    this.refocus(window, cx);
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    if this.active == index {
-                        let _ = this.open_column_menu(col, ev.position, window, cx);
-                    }
-                }),
-            )
-            // The AutoFilter arrow (a funnel once the column filters): its
-            // press never selects or drags anything.
-            .child(
-                div()
-                    .id(("project-heading-arrow", col))
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right(px(EDGE_W))
-                    .w(px(ARROW_W))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .text_size(px(9.))
-                    .text_color(if filtered {
-                        hsla_u(crate::accent::brand())
-                    } else {
-                        pal.dim
-                    })
-                    .child(probe(probes, format!("project-heading-arrow:{col}")))
-                    .child(if filtered { "\u{29e9}" } else { "\u{25bc}" })
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+    row.children(style.as_ref().and_then(crate::plugin_ui::pattern_layer))
+        .children(COLUMNS.iter().enumerate().map(|(col, name)| {
+            let filtered = v.ed.filter(ENTRY_FIELDS[col]).is_some();
+            div()
+                .id(("project-heading", col))
+                .relative()
+                .h_full()
+                .flex()
+                .items_center()
+                .w(px(widths[col]))
+                .flex_none()
+                .pl_2()
+                .pr(px(ARROW_W + EDGE_W))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .when(col == COL_NAME, |d| d.pl(px(8.)))
+                .when(look.heading_hot(col), |d| {
+                    d.bg(selection::header_tint_color())
+                })
+                .child(probe(probes, format!("project-heading:{col}")))
+                .child(*name)
+                // A left press selects the column (#1534); the arrow and the
+                // edge, drawn after, stop their own presses.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        if this.active == index
+                            && let Some(tab) = this.tabs.get_mut(index)
+                        {
+                            project_column_select(tab, col);
+                        }
+                        this.refocus(window, cx);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         if this.active == index {
-                            let _ = this.open_project_filter(col, window, cx);
+                            let _ = this.open_column_menu(col, ev.position, window, cx);
                         }
-                    })),
-            )
-            // The right edge: drag to resize, double-click for Best Fit.
-            .child(
-                div()
-                    .id(("project-heading-edge", col))
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(EDGE_W))
-                    .cursor_col_resize()
-                    .child(probe(probes, format!("project-heading-edge:{col}")))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                    }),
+                )
+                // The AutoFilter arrow (a funnel once the column filters): its
+                // press never selects or drags anything.
+                .child(
+                    div()
+                        .id(("project-heading-arrow", col))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(EDGE_W))
+                        .w(px(ARROW_W))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_size(px(9.))
+                        .text_color(if filtered {
+                            hsla_u(crate::accent::brand())
+                        } else {
+                            pal.dim
+                        })
+                        .child(probe(probes, format!("project-heading-arrow:{col}")))
+                        .child(if filtered { "\u{29e9}" } else { "\u{25bc}" })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             cx.stop_propagation();
-                            if this.active == index
-                                && let Some(Surface::Project(v)) =
-                                    this.tabs.get_mut(index).map(|t| &mut t.surface)
-                            {
-                                v.begin_width_drag(col, f32::from(ev.position.x));
-                                cx.notify();
+                            if this.active == index {
+                                let _ = this.open_project_filter(col, window, cx);
                             }
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        if ev.click_count() >= 2 && this.active == index {
-                            this.best_fit_column(col, window, cx);
-                        }
-                    })),
-            )
-    }))
+                        })),
+                )
+                // The right edge: drag to resize, double-click for Best Fit.
+                .child(
+                    div()
+                        .id(("project-heading-edge", col))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(EDGE_W))
+                        .cursor_col_resize()
+                        .child(probe(probes, format!("project-heading-edge:{col}")))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if this.active == index
+                                    && let Some(Surface::Project(v)) =
+                                        this.tabs.get_mut(index).map(|t| &mut t.surface)
+                                {
+                                    v.begin_width_drag(col, f32::from(ev.position.x));
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            if ev.click_count() >= 2 && this.active == index {
+                                this.best_fit_column(col, window, cx);
+                            }
+                        })),
+                )
+        }))
 }
 
 /// A row's cells: a task's, or the empty entry row's when `task` is `None`.
@@ -1330,6 +1361,7 @@ fn editable_row_cells(
         }
     };
     let cells = h_flex()
+        .relative()
         .h(px(ROW_H))
         .items_center()
         .when(inactive, |d| d.text_color(pal.dim).line_through());
@@ -1337,115 +1369,142 @@ fn editable_row_cells(
         Some(style) => crate::plugin_ui::styled(cells, style),
         None => cells,
     };
-    cells.children(values.into_iter().enumerate().map(|(col, value)| {
-        let cell_style = crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col]);
-        let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
-        let content = if let Some(edit) = edit {
-            let measure = Measurer::new(window);
-            let offset =
-                edit.scroll_x(widths[col] - 24., |s| measure.width(s, 12., summary, false));
-            line_edit_view(edit, offset, 16.).into_any_element()
-        } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
-            // A summary's outline glyph: a click shows or hides its
-            // subtasks without editing the cell or moving the cursor.
-            // The press is swallowed too, so the cell's own press
-            // listener cannot move the cursor before the click toggles.
-            let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
-            h_flex()
-                .child(
-                    div()
-                        .id(("project-toggle", row))
-                        .relative()
-                        .flex_none()
-                        .w(px(12.))
-                        .cursor_pointer()
-                        .child(probe(probes, format!("project-toggle:{probe_row}")))
-                        .child(glyph)
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if let Some(tab) = this.tabs.get_mut(index) {
-                                toggle_project_collapse(tab, uid);
-                            }
-                            this.refocus(window, cx);
-                        })),
-                )
-                .child(value)
-                .into_any_element()
-        } else {
-            div().child(value).into_any_element()
-        };
-        let cell = div()
-            .id(("project-cell", row * COLUMN_COUNT + col))
-            .relative()
-            .flex()
-            .items_center()
-            .w(px(widths[col]))
-            .h(px(ROW_H))
-            .flex_none()
-            .px_2()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .bg(selected_bg(uid, col));
-        let cell = match &cell_style {
-            Some(style) => crate::plugin_ui::styled(cell, style),
-            None => cell,
-        };
-        cell.border_1()
-            .border_color(if row == cursor_row && col == v.col {
-                hsla_u(BRAND)
+    let cells = crate::plugin_ui::keep_inactive_strike(cells, inactive);
+    cells
+        .children(row_style.as_ref().and_then(crate::plugin_ui::pattern_layer))
+        .children(values.into_iter().enumerate().map(|(col, value)| {
+            let cell_style = crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col]);
+            let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
+            let content = if let Some(edit) = edit {
+                let measure = Measurer::new(window);
+                let offset =
+                    edit.scroll_x(widths[col] - 24., |s| measure.width(s, 12., summary, false));
+                line_edit_view(edit, offset, 16.).into_any_element()
+            } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
+                // A summary's outline glyph: a click shows or hides its
+                // subtasks without editing the cell or moving the cursor.
+                // The press is swallowed too, so the cell's own press
+                // listener cannot move the cursor before the click toggles.
+                let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
+                h_flex()
+                    .child(
+                        div()
+                            .id(("project-toggle", row))
+                            .relative()
+                            .flex_none()
+                            .w(px(12.))
+                            .cursor_pointer()
+                            .child(probe(probes, format!("project-toggle:{probe_row}")))
+                            .child(glyph)
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(tab) = this.tabs.get_mut(index) {
+                                    toggle_project_collapse(tab, uid);
+                                }
+                                this.refocus(window, cx);
+                            })),
+                    )
+                    .child(value)
+                    .into_any_element()
             } else {
-                hsla(0., 0., 0., 0.)
-            })
-            .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
-            .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
-            .child(content)
-            // The press starts (and the move extends) a drag selection;
-            // the release is the window-level mouse-up, like the sheet.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                div().child(value).into_any_element()
+            };
+            // A cell whose style paints an opaque base or hatch (or must hide
+            // its row's fill or hatch) takes the selection wash as an overlay
+            // above it, else the fill would cover the wash.
+            let forced_base = cell_style
+                .as_ref()
+                .and_then(|s| crate::plugin_ui::cell_base(row_style.as_ref(), s));
+            let covered = forced_base.is_some()
+                || cell_style
+                    .as_ref()
+                    .is_some_and(crate::plugin_ui::paints_opaque);
+            let wash = selected_bg(uid, col);
+            let cell = div()
+                .id(("project-cell", row * COLUMN_COUNT + col))
+                .relative()
+                .flex()
+                .items_center()
+                .w(px(widths[col]))
+                .h(px(ROW_H))
+                .flex_none()
+                .px_2()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .bg(if covered { hsla(0., 0., 0., 0.) } else { wash });
+            let cell = match &cell_style {
+                Some(style) => crate::plugin_ui::styled(cell, style),
+                None => cell,
+            };
+            let cell = crate::plugin_ui::keep_inactive_strike(cell, inactive);
+            let cell = match forced_base {
+                Some(base) => cell.bg(hsla_u(base)),
+                None => cell,
+            };
+            cell.border_1()
+                .border_color(if row == cursor_row && col == v.col {
+                    hsla_u(BRAND)
+                } else {
+                    hsla(0., 0., 0., 0.)
+                })
+                .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
+                .children(
+                    cell_style
+                        .as_ref()
+                        .and_then(crate::plugin_ui::pattern_layer),
+                )
+                .when(covered && wash.a > 0., |d| {
+                    d.child(div().absolute().top_0().left_0().size_full().bg(wash))
+                })
+                .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
+                .child(content)
+                // The press starts (and the move extends) a drag selection;
+                // the release is the window-level mouse-up, like the sheet.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        if this.active == index
+                            && let Some(tab) = this.tabs.get_mut(index)
+                        {
+                            project_cell_press(tab, row, col, ev.modifiers.shift);
+                        }
+                        this.refocus(window, cx);
+                    }),
+                )
+                .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                    // A held left button is a drag's move; plain hover never
+                    // extends a range, however the press state stands.
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
                     if this.active == index
                         && let Some(tab) = this.tabs.get_mut(index)
+                        && project_cell_drag_over(tab, row, col)
                     {
-                        project_cell_press(tab, row, col, ev.modifiers.shift);
+                        cx.notify();
+                    }
+                }))
+                // Right-click selects the cell, then opens the row's menu.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        if this.active == index {
+                            let _ = this.open_row_menu(row, Some(col), ev.position, window, cx);
+                        }
+                    }),
+                )
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(tab) = this.tabs.get_mut(index) {
+                        project_row_click(tab, row, Some(col), ev.click_count() >= 2);
                     }
                     this.refocus(window, cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
-                // A held left button is a drag's move; plain hover never
-                // extends a range, however the press state stands.
-                if ev.pressed_button != Some(MouseButton::Left) {
-                    return;
-                }
-                if this.active == index
-                    && let Some(tab) = this.tabs.get_mut(index)
-                    && project_cell_drag_over(tab, row, col)
-                {
-                    cx.notify();
-                }
-            }))
-            // Right-click selects the cell, then opens the row's menu.
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    if this.active == index {
-                        let _ = this.open_row_menu(row, Some(col), ev.position, window, cx);
-                    }
-                }),
-            )
-            .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                if let Some(tab) = this.tabs.get_mut(index) {
-                    project_row_click(tab, row, Some(col), ev.click_count() >= 2);
-                }
-                this.refocus(window, cx);
-            }))
-    }))
+                }))
+        }))
 }
 
 /// Whether a click on the Project body, pressed at `down_y` and released at

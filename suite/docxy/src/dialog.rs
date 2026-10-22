@@ -450,7 +450,7 @@ pub(crate) enum ControlKind {
     Grid,
     Label,
     /// A read-only preview box (#1609): the value is the sample's JSON
-    /// (`{text, font, size, bold, italic, underline, color, background}`, or
+    /// (`{text, font, size, bold, italic, underline, strikethrough, color, background, pattern}`, or
     /// a bare text), drawn in that style. Never edited, never focused.
     Sample,
     /// A text field of several lines: Enter is a new line, not OK (#1532).

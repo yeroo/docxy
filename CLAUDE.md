@@ -553,6 +553,25 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Text style strikethrough and pattern (#1664)
+
+- `projcore::formatting::TextStyle` has `strikethrough: Option<bool>` and
+  `pattern: Option<String>`, carried by the view JSON (`text_styles`, `cells`),
+  `formatting.xml` (`strikethrough="1"/"0"`, `pattern="..."`) and `over()`.
+  `PATTERNS` lists Project's `PjBackgroundPattern` names in enum order; the
+  name is not validated, an unknown one is kept as text and drawn solid. A
+  wrongly typed JSON value is ignored, as for the other fields.
+- The suite draws it in `plugin_ui`: `styled` adds the line-through and the
+  base fill (`base_fill`: `hollow` none, `light/medium/dark-fill` the
+  background, white without one, blended 25/50/75% towards the text colour),
+  and `pattern_layer` is an absolute child, to be the box's first child, for
+  the hatches and dithers (`pattern_look` decides the family). gpui draws one
+  45-degree slash and a checkerboard, so the left/right slants and the
+  vertical stripes share the slash and the dithers differ in cell size only.
+  Without a text colour the pattern is black, without a background it sits on
+  white. The harness state reports `cell_styles`; the fixture's Bold command
+  sets both keys.
+
 ## Project leveling as a plan edit (#1594)
 
 - `projcore::schedule::level_with(proj, &LevelScope {movable, order,

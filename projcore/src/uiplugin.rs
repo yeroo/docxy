@@ -473,7 +473,7 @@ pub struct DialogPage {
 /// A dialog control. `kind` is one of `text`, `number`, `date`, `duration`,
 /// `checkbox`, `radio`, `dropdown`, `list`, `grid`, `multiline`, `label`,
 /// `sample` (a read-only preview box, #1609: its `value` is `{text, font,
-/// size, bold, italic, underline, color, background}` or a bare text),
+/// size, bold, italic, underline, strikethrough, color, background, pattern}` or a bare text),
 /// `color`, `font`; the host draws the ones it has and the rest as text.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DialogControl {

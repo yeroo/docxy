@@ -444,6 +444,30 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(cells[0].int("uid"), Some(3));
     assert_eq!(cells[0].get_str("column"), Some("Name"));
     assert_eq!(cells[0].get("bold"), Some(&Json::Bool(false)));
+    // It carries strikethrough and pattern too (#1664), which the plan takes.
+    assert_eq!(cells[0].get("strikethrough"), Some(&Json::Bool(false)));
+    assert_eq!(cells[0].get_str("pattern"), Some("solid"));
+    let mut plan = projcore::formatting::Formatting::default();
+    plan.apply_view(&view).unwrap();
+    let style = plan.cell(3, "Name").unwrap();
+    assert_eq!(style.strikethrough, Some(false));
+    assert_eq!(style.pattern.as_deref(), Some("solid"));
+    let struck = ui
+        .command(&Command {
+            selection: Selection {
+                uids: vec![3],
+                cols: vec!["Name".into()],
+            },
+            ..cmd("fixture.bold", vec![3], None)
+        })
+        .unwrap()
+        .unwrap();
+    let mut plan = projcore::formatting::Formatting::default();
+    plan.apply_view(&struck.view.unwrap()).unwrap();
+    let style = plan.cell(3, "Name").unwrap();
+    assert_eq!(style.bold, Some(true));
+    assert_eq!(style.strikethrough, Some(true));
+    assert_eq!(style.pattern.as_deref(), Some("dark-diagonal-left"));
     let renamed = ui
         .command(&cmd("fixture.rename", vec![3, 4], None))
         .unwrap()

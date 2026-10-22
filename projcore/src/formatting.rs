@@ -32,7 +32,29 @@ pub struct TextStyle {
     /// `0xRRGGBB`.
     pub color: Option<u32>,
     pub background: Option<u32>,
+    pub strikethrough: Option<bool>,
+    /// A [`PATTERNS`] name over `background`; any other text is kept as
+    /// typed and drawn solid.
+    pub pattern: Option<String>,
 }
+
+/// Project's `PjBackgroundPattern`, in enum order.
+pub const PATTERNS: [&str; 14] = [
+    "hollow",
+    "solid",
+    "light-fill",
+    "medium-fill",
+    "dark-fill",
+    "diagonal-left",
+    "diagonal-right",
+    "dark-diagonal-left",
+    "dark-diagonal-right",
+    "thin-vertical-stripe",
+    "medium-vertical-stripe",
+    "light-dither",
+    "medium-dither",
+    "dark-dither",
+];
 
 impl TextStyle {
     pub fn is_empty(&self) -> bool {
@@ -62,11 +84,17 @@ impl TextStyle {
         if over.background.is_some() {
             self.background = over.background;
         }
+        if over.strikethrough.is_some() {
+            self.strikethrough = over.strikethrough;
+        }
+        if over.pattern.is_some() {
+            self.pattern.clone_from(&over.pattern);
+        }
         self
     }
 
-    /// From a JSON object `{font, size, bold, italic, underline, color,
-    /// background}` (colours `"#RRGGBB"` or numbers); unknown keys ignored.
+    /// From a JSON object `{font, size, bold, italic, underline,
+    /// strikethrough, color, background, pattern}` (colours `"#RRGGBB"` or numbers); unknown keys ignored.
     pub fn from_json(v: &Json) -> TextStyle {
         TextStyle {
             font: v.get_str("font").map(str::to_string),
@@ -76,6 +104,11 @@ impl TextStyle {
             underline: v.get("underline").and_then(Json::as_bool),
             color: parse_color(v.get("color")),
             background: parse_color(v.get("background")),
+            strikethrough: v.get("strikethrough").and_then(Json::as_bool),
+            pattern: v
+                .get_str("pattern")
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
         }
     }
 
@@ -91,6 +124,7 @@ impl TextStyle {
             ("bold", self.bold),
             ("italic", self.italic),
             ("underline", self.underline),
+            ("strikethrough", self.strikethrough),
         ] {
             if let Some(b) = flag {
                 pairs.push((key, Json::Bool(b)));
@@ -101,6 +135,9 @@ impl TextStyle {
         }
         if let Some(c) = self.background {
             pairs.push(("background", Json::str(hex(c))));
+        }
+        if let Some(p) = &self.pattern {
+            pairs.push(("pattern", Json::str(p.clone())));
         }
         Json::obj(pairs)
     }
@@ -116,6 +153,7 @@ impl TextStyle {
             ("bold", self.bold),
             ("italic", self.italic),
             ("underline", self.underline),
+            ("strikethrough", self.strikethrough),
         ] {
             if let Some(b) = flag {
                 push_attr(out, key, if b { "1" } else { "0" });
@@ -126,6 +164,9 @@ impl TextStyle {
         }
         if let Some(c) = self.background {
             push_attr(out, "background", &hex(c));
+        }
+        if let Some(p) = &self.pattern {
+            push_attr(out, "pattern", p);
         }
     }
 
@@ -143,6 +184,8 @@ impl TextStyle {
             underline: flag("underline"),
             color: attr("color").and_then(|c| parse_hex(&c)),
             background: attr("background").and_then(|c| parse_hex(&c)),
+            strikethrough: flag("strikethrough"),
+            pattern: attr("pattern"),
         }
     }
 }
@@ -546,7 +589,7 @@ mod tests {
                 italic: Some(false),
                 underline: None,
                 color: Some(0x1F3763),
-                background: None,
+                ..TextStyle::default()
             },
         );
         f.set_category(
@@ -604,6 +647,88 @@ mod tests {
         assert!(Formatting::from_xml("<views/>").is_err());
         assert!(Formatting::from_xml("<formatting><text").is_err());
         assert!(Formatting::from_xml("").is_err());
+    }
+
+    #[test]
+    fn strikethrough_and_pattern_round_trip_and_merge() {
+        let both = TextStyle {
+            strikethrough: Some(true),
+            pattern: Some("dark-dither".into()),
+            ..TextStyle::default()
+        };
+        assert!(!both.is_empty());
+        assert!(
+            !TextStyle {
+                strikethrough: Some(false),
+                ..TextStyle::default()
+            }
+            .is_empty()
+        );
+        let json = both.to_json();
+        assert_eq!(
+            json.get("strikethrough").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(json.get_str("pattern"), Some("dark-dither"));
+        assert_eq!(TextStyle::from_json(&json), both);
+        // Wrong types are ignored, as for the other fields.
+        let bad = Json::parse(r#"{"strikethrough":"yes","pattern":3}"#).unwrap();
+        assert_eq!(TextStyle::from_json(&bad), TextStyle::default());
+        // An unknown name is kept verbatim.
+        let odd = TextStyle {
+            pattern: Some("zig<\"zag>&".into()),
+            strikethrough: Some(false),
+            ..TextStyle::default()
+        };
+        assert_eq!(TextStyle::from_json(&odd.to_json()), odd);
+        let mut f = Formatting::default();
+        f.set_category("All", both.clone());
+        f.set_cell(2, "Name", odd.clone());
+        let xml = f.to_xml();
+        assert!(
+            xml.contains(r#"<text category="All" strikethrough="1" pattern="dark-dither"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"strikethrough="0" pattern="zig&lt;&quot;zag&gt;&amp;""#),
+            "{xml}"
+        );
+        assert_eq!(Formatting::from_xml(&xml).unwrap(), f);
+        // A file without them loads unchanged.
+        let old =
+            Formatting::from_xml(r#"<formatting><text category="All" bold="1"/></formatting>"#)
+                .unwrap();
+        assert_eq!(old.category("All").unwrap().pattern, None);
+        assert_eq!(old.category("All").unwrap().strikethrough, None);
+        // over(): a set field replaces, an unset one keeps.
+        let base = TextStyle {
+            strikethrough: Some(true),
+            pattern: Some("hollow".into()),
+            ..TextStyle::default()
+        };
+        let top = TextStyle {
+            strikethrough: Some(false),
+            ..TextStyle::default()
+        };
+        let merged = base.clone().over(&top);
+        assert_eq!(merged.strikethrough, Some(false));
+        assert_eq!(merged.pattern.as_deref(), Some("hollow"));
+        assert_eq!(base.over(&both).pattern.as_deref(), Some("dark-dither"));
+        assert_eq!(PATTERNS.len(), 14);
+        assert_eq!(PATTERNS[0], "hollow");
+        // A view reply carries and applies both keys, in categories and cells.
+        let mut g = Formatting::default();
+        let view = Json::parse(
+            r#"{"text_styles":{"All":{"strikethrough":true,"pattern":"light-fill"}},
+                "cells":[{"uid":4,"column":"Name","strikethrough":false,"pattern":"solid"}]}"#,
+        )
+        .unwrap();
+        g.apply_view(&view).unwrap();
+        assert_eq!(
+            g.category("All").unwrap().pattern.as_deref(),
+            Some("light-fill")
+        );
+        assert_eq!(g.cell(4, "Name").unwrap().strikethrough, Some(false));
     }
 
     #[test]
