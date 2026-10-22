@@ -698,11 +698,12 @@ pub struct Sheet {
     pub auto_filter: Option<SheetAutoFilter>,
     /// The range (r1, c1, r2, c2, 0-based) of the sheet's own top-level
     /// `<sortState>` (not the one nested in an `<autoFilter>` or a table, nor
-    /// a custom view's). Structural edits move it while it only translates;
-    /// any other change (an edit inside it, a delete through it, an insert
-    /// pushing it off the sheet) makes it `None`. A save moves the element by
-    /// the same translation, or drops it once this is `None`; an element
-    /// whose `ref` doesn't read as a range is left alone.
+    /// a custom view's). Structural edits translate it, and an insert strictly
+    /// inside it grows it (see [`Sheet::sort_state_edits`]); a delete through
+    /// it or an insert pushing it off the sheet makes it `None`. A save
+    /// replays the log on the element, or translates it when the log is
+    /// empty, and drops it once this is `None`; an element whose `ref`
+    /// doesn't read as a range is left alone.
     pub sort_state: Option<(u32, u32, u32, u32)>,
     /// Every row/column insert or delete that moved or grew
     /// [`Sheet::sort_state`] since the part was loaded, in order (edits

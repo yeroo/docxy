@@ -5916,8 +5916,8 @@ fn sheet_sort_state_span(xml: &str) -> Option<(usize, usize)> {
 /// left alone while it holds that range (or its `ref` isn't a range), moved
 /// when the model's range is the same size elsewhere (a structural edit
 /// translated it: its `ref` and each `<sortCondition ref>` shift by the same
-/// rows and columns), and dropped otherwise, as the model drops it when an
-/// edit changed its size. With `edits` (the model's log of the structural
+/// rows and columns), and dropped otherwise, as the model drops it when a
+/// delete through it or an insert off the sheet ended it. With `edits` (the model's log of the structural
 /// edits since load, see [`crate::sheet::Sheet::sort_state_edits`]) the loaded
 /// range and every condition are carried through them in order, so an insert
 /// inside the range widens it and the conditions it spans; the result must be
@@ -10581,8 +10581,9 @@ impl SheetPackage {
                 d.formula = text;
             }
         }
-        // Another sheet's kept Consolidate references read `Sheet!#REF!` too,
-        // as a deleted source area does. `consolidate_loaded` stays as loaded,
+        // Another sheet's kept Consolidate references to it read a bare
+        // `#REF!` too, as a defined name does (a deleted source area on a
+        // sheet that stays is `Sheet!#REF!`). `consolidate_loaded` stays as loaded,
         // so the save sees the difference and rewrites the element.
         crate::edit::for_each_consolidate_ref(&mut self.workbook, |text| {
             let rewrite =

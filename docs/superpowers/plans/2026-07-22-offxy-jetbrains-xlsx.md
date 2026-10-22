@@ -147,6 +147,6 @@
 ## Self-Review Notes
 
 - No Rust work anywhere: gridwasm's dispatch + ctl surface (post grid-overhaul + agent-access) already covers every UI need; the plan STOPs if that reading is wrong rather than improvising engine changes.
-- Undo model deliberately differs from docx (engine stack, no snapshots) and the spec says why; the divergent ctl undo semantics (sheet.remove single-slot restore) mirror the documented VS Code tab behavior.
+- Undo model deliberately differs from docx (engine stack, no snapshots) and the spec says why; the divergent ctl undo semantics (sheet.remove stacked restore) mirror the documented VS Code tab behavior.
 - The `WasmBinding` extraction is the only touch on docx-editor code and is gated on its 37 tests staying green.
 - Fixtures come from the real corpus (538 workbooks) — formula-heavy and large picks, not synthetic toys.

@@ -143,7 +143,7 @@ struct RemovedSheetStash {
     /// xlsx.rs), and they live on `Workbook::defined_names`, not `Sheet`,
     /// so they too would otherwise be silently dropped. Replayed on
     /// restore with `scope` re-pointed at the restored sheet's NEW index.
-    defined_names: Vec<DefinedName>,
+    defined_names: Vec<(usize, DefinedName)>,
     /// Whether the removed sheet was the ACTIVE one at the moment of
     /// removal — mirrors `sheet.remove`'s own viewport-reset rule, in
     /// reverse, on restore (see `ctl_sheet_restore_removed`).
@@ -2721,13 +2721,17 @@ impl Session {
         // Defined names scoped to this sheet live on `Workbook::defined_names`,
         // not `Sheet` — `remove_sheet` drops them via a `retain(|d| d.scope
         // != Some(idx))`, so they'd otherwise vanish silently too.
-        let defined_names: Vec<DefinedName> = self
+        // Each with its index in the list: the restore puts it back there, so
+        // the list returns to its order before the removal and an older
+        // entry's `rewritten_names` positions still hold.
+        let defined_names: Vec<(usize, DefinedName)> = self
             .pkg
             .workbook
             .defined_names
             .iter()
-            .filter(|d| d.scope == Some(si))
-            .cloned()
+            .enumerate()
+            .filter(|(_, d)| d.scope == Some(si))
+            .map(|(i, d)| (i, d.clone()))
             .collect();
         let removed_active = self.active == si;
         // Every pivot the impending `remove_sheet` cascade is about to drop
@@ -2999,12 +3003,17 @@ impl Session {
         }
         // Re-point each name's scope at the NEW index — the old one may no
         // longer even exist (sheets above it shifted down on removal).
-        for dn in stash.defined_names {
-            self.pkg.workbook.defined_names.push(DefinedName {
-                name: dn.name,
-                scope: Some(new_idx),
-                formula: dn.formula,
-            });
+        // Ascending, each at its old index (or the end, if the list shrank).
+        for (at, dn) in stash.defined_names {
+            let names = &mut self.pkg.workbook.defined_names;
+            names.insert(
+                at.min(names.len()),
+                DefinedName {
+                    name: dn.name,
+                    scope: Some(new_idx),
+                    formula: dn.formula,
+                },
+            );
         }
         // Reconstitute every pivot that lived on this sheet before removal
         // (see `RemovedSheetStash::pivots`'s doc comment) — `.sheet`
@@ -6179,6 +6188,36 @@ mod tests {
             s.removed_sheet_stashes.last().unwrap().name,
             format!("S{}", n - 1)
         );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_two_levels_put_back_names_in_their_old_order() {
+        // A name scoped to B sits ahead of a global name that reads A: B's
+        // removal and restore must leave the list as it was, so A's later
+        // restore finds its `#REF!` name at the position it recorded.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"B"}}"#);
+        let names = &mut s.pkg.workbook.defined_names;
+        names.push(DefinedName {
+            name: "Print_Area".into(),
+            scope: Some(2),
+            formula: "B!$A$1:$B$2".into(),
+        });
+        names.push(DefinedName {
+            name: "g".into(),
+            scope: None,
+            formula: "A!$A$1".into(),
+        });
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        s.ctl(r#"{"verb":"sheet.restore-removed","args":{}}"#);
+        let names = &s.pkg.workbook.defined_names;
+        let order: Vec<_> = names.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(order, ["Print_Area", "g"]);
+        assert_eq!(names[1].formula, "A!$A$1");
+        assert_eq!(names[0].scope, Some(2));
     }
 
     #[test]
