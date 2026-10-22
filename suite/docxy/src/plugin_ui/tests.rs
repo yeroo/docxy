@@ -104,6 +104,151 @@ fn the_view_json_carries_the_text_styles_and_the_selected_cells_styles() {
     assert!(view_json(v).list("cells").is_empty());
 }
 
+#[test]
+fn the_view_json_carries_strikethrough_and_pattern() {
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    v.ed.edit_formatting(|f| {
+        f.set_category(
+            "Summary Tasks",
+            TextStyle {
+                strikethrough: Some(true),
+                ..Default::default()
+            },
+        );
+        f.set_cell(
+            uid,
+            "Name",
+            TextStyle {
+                pattern: Some("dark-dither".into()),
+                strikethrough: Some(false),
+                ..Default::default()
+            },
+        );
+    });
+    v.entry = false;
+    v.ed.select(0);
+    v.col = crate::COLUMNS.iter().position(|c| *c == "Name").unwrap();
+    let view = view_json(v);
+    let category = view
+        .get("text_styles")
+        .unwrap()
+        .get("Summary Tasks")
+        .unwrap();
+    assert_eq!(category.get("strikethrough"), Some(&Json::Bool(true)));
+    let cells = view.list("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].get_str("pattern"), Some("dark-dither"));
+    assert_eq!(cells[0].get("strikethrough"), Some(&Json::Bool(false)));
+}
+
+#[test]
+fn a_pattern_is_drawn_by_its_family() {
+    use PatternLook::*;
+    assert_eq!(pattern_look(Some("hollow")), Hollow);
+    for flat in [Some("solid"), Some("no-such-pattern"), Some(""), None] {
+        assert_eq!(pattern_look(flat), Flat, "{flat:?}");
+    }
+    assert_eq!(pattern_look(Some("light-fill")), Blend(25));
+    assert_eq!(pattern_look(Some("medium-fill")), Blend(50));
+    assert_eq!(pattern_look(Some("dark-fill")), Blend(75));
+    // Every other name of Project's vocabulary is a layer, none unknown.
+    for name in projcore::formatting::PATTERNS {
+        let hatched = matches!(pattern_look(Some(name)), Slash { .. } | Dots { .. });
+        let expected = !matches!(
+            name,
+            "hollow" | "solid" | "light-fill" | "medium-fill" | "dark-fill"
+        );
+        assert_eq!(hatched, expected, "{name}");
+    }
+    // The dark slants are thicker than the thin ones.
+    let (Slash { width: thin, .. }, Slash { width: dark, .. }) = (
+        pattern_look(Some("diagonal-left")),
+        pattern_look(Some("dark-diagonal-left")),
+    ) else {
+        panic!("slants are slashes");
+    };
+    assert!(dark > thin);
+    // The dithers grow with their weight.
+    let size = |n| match pattern_look(Some(n)) {
+        Dots { size } => size,
+        other => panic!("{n}: {other:?}"),
+    };
+    assert!(size("light-dither") < size("medium-dither"));
+    assert!(size("medium-dither") < size("dark-dither"));
+}
+
+#[test]
+fn the_base_fill_follows_the_pattern() {
+    let style = |background, pattern: Option<&str>| TextStyle {
+        background,
+        pattern: pattern.map(str::to_string),
+        color: Some(0x000000),
+        ..Default::default()
+    };
+    // Hollow is no fill even over a colour; solid and unknown are today's.
+    assert_eq!(base_fill(&style(Some(0xFF0000), Some("hollow"))), None);
+    assert_eq!(
+        base_fill(&style(Some(0xFF0000), Some("solid"))),
+        Some(0xFF0000)
+    );
+    assert_eq!(
+        base_fill(&style(Some(0xFF0000), Some("odd"))),
+        Some(0xFF0000)
+    );
+    assert_eq!(base_fill(&style(None, None)), None);
+    // A hatch keeps the background beneath it; the layer adds the white.
+    assert_eq!(
+        base_fill(&style(Some(0xFF0000), Some("dark-dither"))),
+        Some(0xFF0000)
+    );
+    assert_eq!(base_fill(&style(None, Some("dark-dither"))), None);
+    // A fill moves the background towards the text colour; white without one.
+    assert_eq!(base_fill(&style(None, Some("medium-fill"))), Some(0x808080));
+    assert_eq!(
+        base_fill(&style(Some(0xFF0000), Some("dark-fill"))),
+        Some(0x400000)
+    );
+    assert!(pattern_layer(&style(None, Some("dark-dither"))).is_some());
+    assert!(pattern_layer(&style(None, Some("dark-fill"))).is_none());
+    assert!(pattern_layer(&style(None, Some("solid"))).is_none());
+}
+
+#[test]
+fn styled_strikes_through_with_underline() {
+    use gpui::{Styled, div};
+    let both = TextStyle {
+        strikethrough: Some(true),
+        underline: Some(true),
+        ..Default::default()
+    };
+    let mut el = styled(div(), &both);
+    assert!(el.style().text.underline.is_some());
+    assert!(el.style().text.strikethrough.is_some());
+    let mut plain = styled(div(), &TextStyle::default());
+    assert!(plain.style().text.strikethrough.is_none());
+    let mut off = styled(
+        div(),
+        &TextStyle {
+            strikethrough: Some(false),
+            ..Default::default()
+        },
+    );
+    assert!(off.style().text.strikethrough.is_none());
+    let mut hollow = styled(
+        div(),
+        &TextStyle {
+            background: Some(0xFF0000),
+            pattern: Some("hollow".into()),
+            ..Default::default()
+        },
+    );
+    assert!(hollow.style().background.is_none());
+}
+
 fn ids(tab: &rs::Tab<Act>) -> Vec<(String, Vec<String>)> {
     tab.groups
         .iter()

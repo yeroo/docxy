@@ -1524,7 +1524,8 @@ impl Docxy {
                             .border_color(pal.dim)
                             .bg(pal.panel)
                             .child(
-                                crate::plugin_ui::styled(div(), &style)
+                                crate::plugin_ui::styled(div().relative(), &style)
+                                    .children(crate::plugin_ui::pattern_layer(&style))
                                     .child(SharedString::from(text)),
                             ),
                     )
