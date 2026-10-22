@@ -3771,7 +3771,15 @@ impl SheetPackage {
         }
         // Cell formulas that name a removed sheet read `#REF!`, as Excel
         // turns them.
-        crate::edit::remove_sheet_refs(&mut self.workbook, &names);
+        let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &names);
+        // The cells that read a rewritten one (and theirs) cache the new
+        // value too, so the file is right before Excel recalculates. Only
+        // dependents: a volatile formula that reads none keeps its value.
+        // Before the sheets go, while their indices still hold.
+        if !rewritten.is_empty() {
+            let mut engine = crate::engine::Engine::new(&self.workbook);
+            engine.recalc_dependents_of(&mut self.workbook, &rewritten);
+        }
         for &i in doomed.iter().rev() {
             self.remove_sheet(i);
         }
@@ -20010,6 +20018,46 @@ mod kind_tests {
         let out = roundtrip(&pkg, SpreadsheetKind::MacroWorkbook);
         let cell = out.workbook.sheets[0].cell(1, 0).unwrap();
         assert_eq!(cell.formula.as_deref(), Some("'Macro 1'!A1+1"));
+    }
+
+    /// #827: the cells that read a rewritten cell, however far down the chain,
+    /// are saved with the values the `#REF!` gives them; a formula that reads
+    /// none of them (a volatile one included) keeps its cached value.
+    #[test]
+    fn macro_free_save_updates_the_readers_of_a_rewritten_cell_only() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let cached = |src: &str, v: f64| {
+            let mut c = Cell::formula(src);
+            c.value = CellValue::Number(v);
+            c
+        };
+        data.set_cell(0, 0, cached("Macro1!A1+1", 9.0));
+        data.set_cell(0, 1, cached("A1+1", 10.0));
+        data.set_cell(0, 2, cached("B1*2", 20.0));
+        data.set_cell(0, 3, cached("IFERROR(B1,0)", 10.0));
+        data.set_cell(0, 4, cached("NOW()", 123.0));
+        data.set_cell(0, 5, cached("Report!A1+5", 77.0));
+        data.set_cell(0, 6, cached("NOW()+A1", 0.5));
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let data = &out.workbook.sheets[0];
+        let value = |c: u32| data.cell(0, c).unwrap().value.clone();
+        let ref_err = CellValue::Error("#REF!".into());
+        assert_eq!(value(0), ref_err);
+        assert_eq!(value(1), ref_err, "reads the rewritten cell");
+        assert_eq!(value(2), ref_err, "reads a reader of it");
+        assert_eq!(value(3), CellValue::Number(0.0), "IFERROR sees the error");
+        assert_eq!(value(4), CellValue::Number(123.0), "NOW() reads none of it");
+        assert_eq!(value(5), CellValue::Number(77.0), "reads another sheet");
+        // The engine has no clock or random seed here, so a clock or RAND
+        // formula keeps its cached value even when it reads a rewritten cell;
+        // Excel recalculates it on load (`fullCalcOnLoad`).
+        assert_eq!(value(6), CellValue::Number(0.5), "no clock to evaluate it");
+        // The open workbook is untouched.
+        assert_eq!(
+            pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(10.0)
+        );
     }
 
     #[test]

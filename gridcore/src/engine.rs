@@ -1250,7 +1250,20 @@ impl Engine {
     /// evaluate and every dependent goes stale (see [`Engine::is_stale`]);
     /// [`Engine::recalc_from_forced`] is the Calculate form.
     pub fn recalc_from(&mut self, wb: &mut Workbook, changed: &[Key]) {
-        self.recalc_from_depth(wb, changed, 0);
+        self.recalc_from_depth(wb, changed, 0, true);
+    }
+
+    /// Evaluate `changed` and their transitive dependents only: no volatile
+    /// formula and no blocked spill anchor is seeded, so a formula that
+    /// reads nothing in the set keeps its cached value (`NOW()` included).
+    /// A Calculate form (manual mode lifted), for a host that rewrote cells
+    /// and wants the values that read them right, as a macro-free save does.
+    pub fn recalc_dependents_of(&mut self, wb: &mut Workbook, changed: &[Key]) {
+        self.forcing = true;
+        self.one_pass = wb.calc.mode == CalcMode::Manual;
+        self.recalc_from_depth(wb, changed, 0, false);
+        self.forcing = false;
+        self.one_pass = false;
     }
 
     /// [`Engine::recalc_from`] as part of a Calculate: manual mode lifted, so
@@ -1258,12 +1271,18 @@ impl Engine {
     pub fn recalc_from_forced(&mut self, wb: &mut Workbook, changed: &[Key]) {
         self.forcing = true;
         self.one_pass = wb.calc.mode == CalcMode::Manual;
-        self.recalc_from_depth(wb, changed, 0);
+        self.recalc_from_depth(wb, changed, 0, true);
         self.forcing = false;
         self.one_pass = false;
     }
 
-    fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
+    fn recalc_from_depth(
+        &mut self,
+        wb: &mut Workbook,
+        changed: &[Key],
+        depth: u32,
+        seed_volatile: bool,
+    ) {
         // Spill extents may have moved since indexing — refresh the dep
         // rects of every formula that reads one (`A1#`).
         self.ensure_flagged();
@@ -1302,16 +1321,18 @@ impl Engine {
                 frontier.push_back(k);
             }
         }
-        if let Some(f) = &self.flagged {
-            for &k in &f.volatile {
-                if dirty.insert(k) {
-                    frontier.push_back(k);
+        if seed_volatile {
+            if let Some(f) = &self.flagged {
+                for &k in &f.volatile {
+                    if dirty.insert(k) {
+                        frontier.push_back(k);
+                    }
                 }
             }
-        }
-        for k in self.spill_blocked.iter().copied().collect::<Vec<_>>() {
-            if self.formulas.contains_key(&k) && dirty.insert(k) {
-                frontier.push_back(k);
+            for k in self.spill_blocked.iter().copied().collect::<Vec<_>>() {
+                if self.formulas.contains_key(&k) && dirty.insert(k) {
+                    frontier.push_back(k);
+                }
             }
         }
 
@@ -1742,7 +1763,7 @@ impl Engine {
         if !spilled.is_empty() && depth < MAX_SPILL_PASSES {
             spilled.sort_unstable();
             spilled.dedup();
-            self.recalc_from_depth(wb, &spilled, depth + 1);
+            self.recalc_from_depth(wb, &spilled, depth + 1, true);
         }
         if depth == 0 {
             self.pass_anchors.clear();

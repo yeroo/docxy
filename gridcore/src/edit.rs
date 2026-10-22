@@ -1199,12 +1199,14 @@ fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {
 /// ([`crate::engine::eval_formula_at`]), so `IFERROR(#REF!,0)` caches 0
 /// rather than `#REF!`. An array formula's whole block (its `spill`) takes
 /// the anchor's value, which is right once the removed range has collapsed
-/// to the scalar `#REF!`. Only the rewritten cells are evaluated: a cell that
-/// reads one keeps its cached value, and a volatile formula keeps its own,
-/// until the file is next calculated.
-pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
+/// to the scalar `#REF!`. Only the rewritten cells are evaluated here: a cell
+/// that reads one keeps its cached value, and a volatile formula keeps its
+/// own. The rewritten cells' keys come back, for
+/// [`crate::engine::Engine::recalc_dependents_of`] to bring their readers up
+/// to date.
+pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u32, u32)> {
     if removed.is_empty() {
-        return;
+        return Vec::new();
     }
     remove_sheet_refs_in_rules(wb, removed);
     let mut rewritten = Vec::new();
@@ -1244,7 +1246,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
             crate::engine::value_to_cell(crate::engine::eval_formula_at(wb, s, r, c, src))
         })
         .collect();
-    for ((s, r, c), value) in rewritten.into_iter().zip(values) {
+    for (&(s, r, c), value) in rewritten.iter().zip(values) {
         let sheet = &mut wb.sheets[s];
         let Some(cell) = sheet.cells.get_mut(&(r, c)) else {
             continue;
@@ -1265,6 +1267,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
             }
         }
     }
+    rewritten
 }
 
 /// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
