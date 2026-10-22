@@ -1189,11 +1189,8 @@ fn read_sheet(
                     // clear), unless it is the sheet's default: its
                     // STANDARDWIDTH, or else DEFCOLWIDTH's characters plus
                     // the padding (Excel writes 8 characters as 2194).
-                    let base = sheet.base_col_width.unwrap_or(8).min(255) * 256;
-                    let default = match sheet.default_col_width {
-                        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
-                        None => (base..base + 256).contains(&(coldx as u32)),
-                    };
+                    let default =
+                        is_default_coldx(sheet.base_col_width, sheet.default_col_width, coldx);
                     let width = (grbit & 0x0002 != 0 || !default).then_some(coldx as f64 / 256.0);
                     if ixfe != 15 {
                         book.dropped.insert("column and row formats");
@@ -1203,7 +1200,10 @@ fn read_sheet(
                     }
                     let last = (last as u32).min(crate::sheet::MAX_COLS - 1);
                     if (width.is_some() || hidden) && first as u32 <= last {
-                        sheet.cols.push((first as u32, last, width, hidden));
+                        // fUserSet clear on a width: xlsx's plain width,
+                        // without customWidth.
+                        let plain = width.is_some() && grbit & 0x0002 == 0;
+                        sheet.cols.push((first as u32, last, width, hidden, plain));
                     }
                 }
                 0x0208 => {
@@ -1466,6 +1466,22 @@ fn read_sheet(
         book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
     }
     Ok(sheet)
+}
+
+/// Whether a COLINFO width is the sheet's default: its STANDARDWIDTH, or
+/// else DEFCOLWIDTH's characters plus the padding (Excel writes 8
+/// characters as 2194). The reader drops such a width unless fUserSet
+/// keeps it, and the writer sets fUserSet for one (#1658).
+pub(super) fn is_default_coldx(
+    base_col_width: Option<u32>,
+    default_col_width: Option<f64>,
+    coldx: u16,
+) -> bool {
+    let base = base_col_width.unwrap_or(8).min(255) * 256;
+    match default_col_width {
+        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
+        None => (base..base + 256).contains(&(coldx as u32)),
+    }
 }
 
 /// Whether two margins (inches) are the same, as Excel rounds them.
@@ -2553,7 +2569,7 @@ pub(crate) mod tests {
         // xlwt's 0x0B6D (11.43 characters), flags clear.
         assert_eq!(
             cols(&[colinfo(1, 2, 0x0B6D, 0)]),
-            [(1, 2, Some(0x0B6D as f64 / 256.0), false)]
+            [(1, 2, Some(0x0B6D as f64 / 256.0), false, true)]
         );
         // Excel's default for DEFCOLWIDTH 8 (2194) is no width.
         assert!(cols(&[rec(0x0055, &[8, 0]), colinfo(0, 255, 2194, 0)]).is_empty());
@@ -2561,12 +2577,12 @@ pub(crate) mod tests {
         assert!(cols(&[rec(0x0099, &[0, 12]), colinfo(0, 255, 0x0C00, 0)]).is_empty());
         assert_eq!(
             cols(&[rec(0x0099, &[0, 12]), colinfo(0, 0, 2194, 0)]),
-            [(0, 0, Some(2194.0 / 256.0), false)]
+            [(0, 0, Some(2194.0 / 256.0), false, true)]
         );
         // fUserSet keeps a width that equals the default.
         assert_eq!(
             cols(&[colinfo(3, 3, 2194, 2)]),
-            [(3, 3, Some(2194.0 / 256.0), false)]
+            [(3, 3, Some(2194.0 / 256.0), false, false)]
         );
     }
 

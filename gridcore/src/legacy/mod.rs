@@ -309,8 +309,8 @@ pub(crate) struct SheetIn {
     /// Merged ranges (r1, c1, r2, c2).
     pub merges: Vec<(u32, u32, u32, u32)>,
     /// Column definitions: (first, last, width in characters when set,
-    /// hidden).
-    pub cols: Vec<(u32, u32, Option<f64>, bool)>,
+    /// hidden, plain width: a width the file did not mark as user-set).
+    pub cols: Vec<(u32, u32, Option<f64>, bool, bool)>,
     /// Rows: (row, height in points when set, hidden).
     pub rows: Vec<(u32, Option<f64>, bool)>,
     /// Frozen rows and columns.
@@ -519,7 +519,7 @@ impl BookIn {
                 s.cells.insert(key, cell);
             }
             s.merges = sheet.merges;
-            for (first, last, width, hidden) in sheet.cols {
+            for (first, last, width, hidden, plain) in sheet.cols {
                 s.col_defs.push(crate::sheet::ColDef {
                     min: first,
                     max: last,
@@ -530,7 +530,7 @@ impl BookIn {
                         String::new()
                     },
                     default_width: width.is_none(),
-                    plain_width: false,
+                    plain_width: plain,
                 });
             }
             for (row, height, hidden) in sheet.rows {
