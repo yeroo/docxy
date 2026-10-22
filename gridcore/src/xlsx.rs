@@ -3771,6 +3771,15 @@ impl SheetPackage {
         }
         // Cell formulas that name a removed sheet read `#REF!`, as Excel
         // turns them.
+        // A chart part kept as loaded names the sheets in its `<c:f>` text.
+        for (n, bytes) in self.parts.iter_mut() {
+            if n.starts_with("xl/charts/") && n.ends_with(".xml") {
+                let xml = String::from_utf8_lossy(bytes);
+                if let Some(out) = remove_chart_refs(&xml, &refers) {
+                    *bytes = out.into_bytes();
+                }
+            }
+        }
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &names);
         // The cells that read a rewritten one (and theirs) cache the new
         // value too, so the file is right before Excel recalculates. Only
@@ -3852,6 +3861,41 @@ fn formula_refers_to_sheet(formula: &str, sheet: &str) -> bool {
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '\'' | ']'))
     })
+}
+
+/// A chart part's `<c:f>` references that `refers` says name a removed sheet,
+/// rewritten to `#REF!` as Excel does; `None` when none does. The prefix of
+/// the element is whatever the part declares (`c:f`, `f`).
+fn remove_chart_refs(xml: &str, refers: &dyn Fn(&str) -> bool) -> Option<String> {
+    let mut out = String::with_capacity(xml.len());
+    let mut at = 0;
+    let mut changed = false;
+    while let Some(open) = xml[at..].find('<').map(|i| at + i) {
+        let Some(end) = xml[open..].find('>').map(|i| open + i) else {
+            break;
+        };
+        let tag = &xml[open + 1..end];
+        let name = tag.split_whitespace().next().unwrap_or("");
+        let is_f =
+            !tag.starts_with('/') && !tag.ends_with('/') && name.rsplit(':').next() == Some("f");
+        let close = format!("</{name}>");
+        if is_f {
+            if let Some(stop) = xml[end + 1..].find(&close).map(|i| end + 1 + i) {
+                let text = &xml[end + 1..stop];
+                if refers(&decode(text)) {
+                    out.push_str(&xml[at..end + 1]);
+                    out.push_str("#REF!");
+                    at = stop;
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(&xml[at..=end]);
+        at = end + 1;
+    }
+    out.push_str(&xml[at..]);
+    changed.then_some(out)
 }
 
 /// Remove from workbook.xml every `<definedName>` that is an Excel 4.0 name
@@ -20057,6 +20101,99 @@ mod kind_tests {
         assert_eq!(
             pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
             CellValue::Number(10.0)
+        );
+    }
+
+    /// #827: chart series refs, a validation list and a conditional-format
+    /// rule that name a removed macro sheet leave a macro-free file as
+    /// `#REF!`, not as a sheet the file no longer holds.
+    #[test]
+    fn macro_free_save_leaves_no_chart_rule_or_validation_naming_a_macro_sheet() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |sheet: &str, range| ChartSource {
+            sheet: sheet.into(),
+            range,
+            cat_col: 0,
+        };
+        let chart = |sheet: &str| ChartData {
+            title: "T".into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into()],
+            series: vec![ChartSeries {
+                name: "S".into(),
+                values: vec![1.0],
+                col: Some(1),
+                values_ref: Some(src(sheet, (1, 1, 1, 1))),
+                name_ref: Some(format!("{sheet}!$B$1")),
+                ..Default::default()
+            }],
+            source: Some(src(sheet, (0, 0, 1, 1))),
+            categories_ref: Some(src(sheet, (1, 0, 1, 0))),
+            ..Default::default()
+        };
+        let mut pkg = mixed_xlm_book();
+        // One chart on the macro sheet's data, one on a sheet that stays.
+        assert!(pkg.add_chart(0, (5, 0), (20, 8), &chart("Macro1")));
+        assert!(pkg.add_chart(0, (5, 9), (20, 17), &chart("Report")));
+        assert!(pkg.add_conditional_format(
+            0,
+            (0, 0, 4, 0),
+            "greaterThan",
+            "Macro1!$A$1",
+            None,
+            crate::sheet::Dxf::default()
+        ));
+        assert!(pkg.add_data_validation(
+            0,
+            (0, 1, 4, 1),
+            "list",
+            "between",
+            "Macro1!$A$1:$A$3",
+            None
+        ));
+        // Saved fresh (the writer regenerates the charts) and as loaded
+        // (their parts round-trip verbatim): both leave no mention.
+        let loaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        for source in [&pkg, &loaded] {
+            let out = roundtrip(source, SpreadsheetKind::Workbook);
+            for (name, _) in &out.parts {
+                if name.starts_with("xl/charts/chart") || name.starts_with("xl/worksheets/sheet") {
+                    if name.ends_with(".rels") {
+                        continue;
+                    }
+                    let xml = part_text(&out, name);
+                    assert!(!xml.contains("Macro1"), "{name}: {xml}");
+                }
+            }
+            let sheet = part_text(&out, &out.sheet_parts[0]);
+            assert!(sheet.contains("<formula>#REF!</formula>"), "{sheet}");
+            assert!(sheet.contains("<formula1>#REF!</formula1>"), "{sheet}");
+            let charts: Vec<_> = out
+                .parts
+                .iter()
+                .filter(|(n, _)| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+                .collect();
+            assert_eq!(charts.len(), 2);
+            let all: String = charts
+                .iter()
+                .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+                .collect();
+            assert!(
+                all.contains("Report!$B$1"),
+                "the other chart keeps its refs"
+            );
+            // Whatever the chart kept is still a chart.
+            let kept = out.workbook.sheets[0]
+                .drawings
+                .iter()
+                .filter(|d| matches!(d.kind, DrawingKind::Chart(_)))
+                .count();
+            assert_eq!(kept, 2);
+        }
+        // The open package is untouched.
+        assert!(
+            pkg.parts.iter().any(|(n, b)| n.starts_with("xl/charts/")
+                && String::from_utf8_lossy(b).contains("Macro1"))
         );
     }
 

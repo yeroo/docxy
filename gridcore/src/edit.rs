@@ -1209,6 +1209,13 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u
         return Vec::new();
     }
     remove_sheet_refs_in_rules(wb, removed);
+    for sheet in &mut wb.sheets {
+        for d in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut d.kind {
+                remove_sheet_refs_in_chart(cd, removed);
+            }
+        }
+    }
     let mut rewritten = Vec::new();
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
@@ -1346,6 +1353,45 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
     // why re-basing them here is still worth doing: the panel, `rebuild_source`
     // and the next re-derivation all read the model, not the part.
     cd.edited |= changed;
+}
+
+/// A chart ref that names a sheet in `removed` is dropped, as
+/// [`shift_chart_refs`] drops one whose rows are deleted: the cached values
+/// still draw the chart, and a ref to a sheet the file no longer holds would
+/// make Excel repair it. The chart is marked edited, so a writable one is
+/// regenerated without it; the others keep their part, whose `<c:f>` text
+/// the package's own pass rewrites (`SheetPackage::remove_excel4_macros`).
+pub fn remove_sheet_refs_in_chart(cd: &mut crate::sheet::ChartData, removed: &[String]) -> bool {
+    let gone =
+        |s: &crate::sheet::ChartSource| removed.iter().any(|r| s.sheet.eq_ignore_ascii_case(r));
+    let mut changed = false;
+    let mut drop_ref = |slot: &mut Option<crate::sheet::ChartSource>| {
+        if slot.as_ref().is_some_and(gone) {
+            *slot = None;
+            changed = true;
+        }
+    };
+    drop_ref(&mut cd.source);
+    drop_ref(&mut cd.categories_ref);
+    let mut points = false;
+    for ser in &mut cd.series {
+        drop_ref(&mut ser.values_ref);
+        let before = ser.point_refs.len();
+        ser.point_refs.retain(|s| !gone(s));
+        points |= ser.point_refs.len() != before;
+        let name_gone = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+            .is_some_and(|p| gone(&p));
+        if name_gone {
+            ser.name_ref = None;
+            points = true;
+        }
+    }
+    changed |= points;
+    cd.edited |= changed;
+    changed
 }
 
 /// Move every ref a chart holds on `target` through a row/column insert or
