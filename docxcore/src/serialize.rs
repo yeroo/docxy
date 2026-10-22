@@ -499,6 +499,16 @@ pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: 
     });
 }
 
+/// Whether a shadow element `local` still carries any of `attrs`.
+pub(crate) fn shadow_has_attr(shadow: &[String], local: &str, attrs: &[&str]) -> bool {
+    shadow.iter().any(|raw| {
+        local_name(raw) == local
+            && element_attrs_of(raw)
+                .iter()
+                .any(|(n, _)| attrs.contains(&n.as_str()))
+    })
+}
+
 /// The decoded attributes of the start tag `raw` begins with.
 fn element_attrs_of(raw: &str) -> Vec<(String, String)> {
     let mut p = XmlParser::new(raw);

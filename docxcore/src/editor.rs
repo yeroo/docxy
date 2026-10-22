@@ -2790,27 +2790,24 @@ impl Editor {
 
     /// Increase/decrease the indent of the selected paragraphs by `delta`:
     /// the left indent in twips (clamped at 0), except for a list item with
-    /// no left indent of its own, which steps its level (`ilvl`, clamped to
-    /// 0..=8) by one.
+    /// no left indent attribute of its own (not even `w:left="0"`), which
+    /// steps its level (`ilvl`, clamped to 0..=8) by one.
     ///
     /// The level's indent (`left = 720 * (ilvl + 1)`) is what moves such an
     /// item: a direct left indent written here would beat the level's and
     /// strand it at the margin. An item that already carries a direct `w:ind`
-    /// (loaded from a document) keeps moving that, which is visible. A
-    /// selection of level-stepping items all at the limit changes nothing and
-    /// records no undo step.
+    /// (loaded from a document, whatever its value) keeps moving that, which
+    /// is visible. A selection of level-stepping items all at the limit
+    /// changes nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
         let step = delta.signum();
         let paths = self.selected_para_paths();
         let moves =
             |p: &ParProps| -> bool { !steps_level(p) || (p.ilvl + step).clamp(0, 8) != p.ilvl };
-        let mut any = false;
-        for path in &paths {
-            if let Some(p) = para_mut(&mut self.doc.body, path) {
-                any |= moves(&p.props);
-            }
-        }
-        if !any && !paths.is_empty() {
+        let any = paths
+            .iter()
+            .any(|path| resolve_para(&self.doc.body, path).is_some_and(|p| moves(&p.props)));
+        if !any {
             return;
         }
         self.for_each_para(|pr| {
@@ -3941,7 +3938,7 @@ fn hrule_kind(text: &str) -> Option<BorderKind> {
 /// Whether Increase/Decrease Indent moves this paragraph's list level rather
 /// than its left indent (see [`Editor::change_indent`]).
 fn steps_level(p: &ParProps) -> bool {
-    p.in_list() && p.indent == 0
+    p.in_list() && p.indent == 0 && !p.has_loaded_left_indent()
 }
 
 fn para_mut<'a>(body: &'a mut Vec<Block>, path: &[usize]) -> Option<&'a mut Paragraph> {
