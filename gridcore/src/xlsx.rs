@@ -10654,12 +10654,22 @@ impl SheetPackage {
         }
         let gone = [self.workbook.sheets[idx].name.clone()];
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &gone);
-        // Before the sheet goes, while the indices still hold.
-        if !rewritten.is_empty() {
+        let removed = self.remove_sheet(idx);
+        // The cells that read a rewritten one (and theirs) cache the new value
+        // too, so the file is right before Excel recalculates. After the
+        // sheet went, so a defined name that pointed at it reads `#REF!`
+        // there as well, and with the indices shifted down. Only dependents:
+        // a volatile formula that reads none keeps its value.
+        let moved: Vec<_> = rewritten
+            .into_iter()
+            .filter(|&(s, ..)| s != idx)
+            .map(|(s, r, c)| (if s > idx { s - 1 } else { s }, r, c))
+            .collect();
+        if removed && !moved.is_empty() {
             let mut engine = crate::engine::Engine::new(&self.workbook);
-            engine.recalc_dependents_of(&mut self.workbook, &rewritten);
+            engine.recalc_dependents_of(&mut self.workbook, &moved);
         }
-        self.remove_sheet(idx)
+        removed
     }
 
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
@@ -25088,6 +25098,26 @@ mod rule_shift_tests {
     }
 
     #[test]
+    fn delete_sheet_recalcs_with_the_defined_names_the_sheet_took_along() {
+        // `Total` pointed at the deleted sheet: it reads #REF! now, so the
+        // cell that adds it caches that, not the number it had.
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>IFERROR(Gone!A1,0)+Total</f><v>10</v></c></row></sheetData>"#;
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let u = r#"<sheetData><row r="1"><c r="A1"><f>S!A1+1</f><v>11</v></c></row></sheetData>"#;
+        let names =
+            r#"<definedNames><definedName name="Total">Gone!$A$1</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(
+            names,
+            &[("S", Some(s)), ("Gone", Some(t)), ("U", Some(u))],
+        ))
+        .unwrap();
+        assert!(pkg.delete_sheet(1));
+        let ref_err = CellValue::Error("#REF!".into());
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 0).unwrap().value, ref_err);
+        assert_eq!(pkg.workbook.sheets[1].cell(0, 0).unwrap().value, ref_err);
+    }
+
+    #[test]
     fn delete_sheet_refuses_the_last_sheet_and_changes_nothing() {
         let s = r#"<sheetData><row r="1"><c r="A1"><f>Gone!A1+1</f><v>6</v></c></row></sheetData>"#;
         let mut pkg = load_xlsx(&book("", &[("S", Some(s))])).unwrap();
@@ -25168,6 +25198,11 @@ mod rule_shift_tests {
         );
         let mut pkg = one("S", &format!("{MARGINS}{two}"));
         assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 2);
+        // The rule's element was already named struck: no second entry.
+        let cf_ix = pkg.workbook.sheets[0].ext_rules[0].ix;
+        pkg.workbook.sheets[0]
+            .ext_removed
+            .push((crate::sheet::ExtKind::Cf, cf_ix));
         assert!(pkg.clear_conditional_formats(0));
         assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 1);
         // Twice: no duplicate strike.

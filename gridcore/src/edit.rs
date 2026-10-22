@@ -1180,6 +1180,16 @@ pub fn rename_sheet_in_validations(
     }
 }
 
+/// [`rename_sheet_in_validations`] for Excel 2010 (`extLst`) rules, whose
+/// every formula follows the rename.
+pub fn rename_sheet_in_ext_rules(rules: &mut [crate::sheet::ExtRule], old: &str, new_name: &str) {
+    for ext in rules {
+        for f in &mut ext.formulas {
+            rename_sheet_in_rule(f, old, new_name);
+        }
+    }
+}
+
 /// A rule formula is reprinted only when the rename touches it, so the
 /// loaded spelling stays otherwise.
 fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {

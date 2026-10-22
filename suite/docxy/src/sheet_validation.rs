@@ -342,7 +342,11 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         return Some(Err(PROTECTED.into()));
     }
     let snap = v.snapshot();
-    let before = v.pkg.workbook.sheets[sheet].validations.clone();
+    let rules = |v: &crate::SheetView| {
+        let s = &v.pkg.workbook.sheets[sheet];
+        (s.validations.clone(), s.ext_rules.clone(), s.ext_removed.clone())
+    };
+    let before = rules(v);
     {
         let s = &mut v.pkg.workbook.sheets[sheet];
         match &rule {
@@ -351,7 +355,7 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
         }
     }
     tab.dialogs.pop();
-    if before == v.pkg.workbook.sheets[sheet].validations {
+    if before == rules(v) {
         tab.status = "Data validation unchanged".into();
         return Some(Ok(()));
     }
