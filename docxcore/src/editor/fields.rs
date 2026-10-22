@@ -41,7 +41,9 @@ fn unit_offsets(
 }
 
 /// The inline holding editor offset `idx`, mutably, looking inside a
-/// hyperlink's `content` (as `inline_covering`).
+/// hyperlink's `content` (as `inline_covering`). It marks each raw-backed
+/// hyperlink it enters `content_changed`, so call it only to rewrite what it
+/// returns (#1637).
 fn inline_covering_mut(content: &mut [Inline], idx: usize) -> Option<&mut Inline> {
     let mut acc = 0;
     for inline in content {
