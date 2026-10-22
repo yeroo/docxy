@@ -944,12 +944,22 @@ impl Editor {
         Ok(removed)
     }
 
+    /// Indent (`delta > 0`) or outdent the row together with its subtree, as
+    /// Project does: every descendant moves by the row's own effective shift,
+    /// so relative depth is kept. The row stops at level 1, and at 20 for its
+    /// deepest descendant.
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         self.refuse_while_sorted()?;
         let i = self.index(uid)?;
+        if !self.proj.tasks[i].is_null && outline_shift(&self.proj.tasks, i, delta) == 0 {
+            return Ok(());
+        }
         self.edit_row(i, |proj, _| {
-            let t = &mut proj.tasks[i];
-            t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
+            let shift = outline_shift(&proj.tasks, i, delta);
+            let end = outline::subtree_end_in(&proj.tasks, i);
+            for t in proj.tasks[i..end].iter_mut().filter(|t| !t.is_null) {
+                t.outline_level = (i64::from(t.outline_level) + shift) as u32;
+            }
         })
     }
 
@@ -2325,6 +2335,27 @@ fn renumber_wbs(old: &[Task], new: &mut [Task]) {
     }
 }
 
+/// The levels row `i` and its subtree move by for an indent of `delta`: the
+/// row stays at level 1 or deeper and the deepest descendant at 20 or
+/// shallower. Levels read from a file are unchecked, so the bounds never
+/// push against `delta`: a plan already past a limit just does not move
+/// further that way. The project summary row (UID 0) never moves; other
+/// level-0 rows (built in code, not read from a file) can still be indented.
+fn outline_shift(tasks: &[Task], i: usize, delta: i32) -> i64 {
+    let end = outline::subtree_end_in(tasks, i);
+    let old = i64::from(tasks[i].outline_level);
+    if tasks[i].is_project_summary() {
+        return 0;
+    }
+    let deepest = tasks[i..end]
+        .iter()
+        .filter(|t| !t.is_null)
+        .map(|t| i64::from(t.outline_level))
+        .max()
+        .unwrap_or(old);
+    i64::from(delta).clamp((1 - old).min(0), (20 - deepest).max(0))
+}
+
 /// Parse Project's minute, hour, day, week and month spellings as working time.
 pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
     parse_duration_unit(text, proj).map(|(min, _)| min)
@@ -3018,7 +3049,6 @@ mod tests {
                 assert_unchanged(&mut ed, |ed| {
                     assert!(ed.delete_task(2).unwrap_err().contains("Closed"));
                     assert!(ed.indent(2, -1).unwrap_err().contains("Closed"));
-                    assert!(ed.indent(1, 1).unwrap_err().contains("Closed"));
                     assert!(
                         ed.update_task(
                             2,
@@ -3049,6 +3079,17 @@ mod tests {
                 assert_reopens(&ed);
             }
         }
+    }
+
+    #[test]
+    fn indenting_a_summary_with_an_empty_calendar_moves_its_subtree() {
+        let mut ed = Editor::new(project_with_unused_empty_calendar(false));
+        ed.indent(1, 1).unwrap();
+        let tasks = &ed.project().tasks;
+        assert!(tasks[0].summary);
+        assert_eq!((tasks[0].outline_level, tasks[1].outline_level), (2, 3));
+        assert!(ed.undo());
+        assert_eq!(ed.project().tasks[1].outline_level, 2);
     }
 
     #[test]
