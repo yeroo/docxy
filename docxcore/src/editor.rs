@@ -4940,9 +4940,37 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
 /// the merged paragraph (#748). Its tracked insertion/deletion records replace
 /// `kept`'s too.
 fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
+    keep_rules(&mut kept.element_attrs, &gone.element_attrs);
     crate::review::adopt_mark_revisions(kept, &gone);
     kept.section_break = gone.section_break;
     kept.section_property_change = gone.section_property_change;
+}
+
+/// The markup-compatibility rules a joined paragraph's start tag carried
+/// (`mc:Ignorable`, …) join the kept paragraph's, with the namespace
+/// declarations beside them: the content moved up may be extension markup only
+/// that rule makes ignorable, and the gone start tag is not written (#1655).
+/// Nothing changes for a paragraph with no rule, as Word writes them.
+fn keep_rules(kept: &mut ElementAttrs, gone: &ElementAttrs) {
+    use crate::load::{is_rule_name, rule_local, union_tokens};
+    if !gone.0.iter().any(|(name, _)| is_rule_name(name)) {
+        return;
+    }
+    for (name, value) in gone.0.iter().filter(|(name, _)| is_rule_name(name)) {
+        match kept
+            .0
+            .iter_mut()
+            .find(|(n, _)| is_rule_name(n) && rule_local(n) == rule_local(name))
+        {
+            Some((_, existing)) => union_tokens(existing, value),
+            None => kept.0.push((name.clone(), value.clone())),
+        }
+    }
+    for (name, value) in gone.0.iter().filter(|(name, _)| name.starts_with("xmlns:")) {
+        if !kept.0.iter().any(|(n, _)| n == name) {
+            kept.0.push((name.clone(), value.clone()));
+        }
+    }
 }
 
 /// Split `content` at caret offset `o`: `content` keeps what is before it,

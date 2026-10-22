@@ -725,7 +725,9 @@ fn prefixes_named_by_markup_compatibility_attributes_stay_declared() {
     let xml = document_xml(&save(pkg, editor));
     assert!(
         xml.contains("<w:p mc:Ignorable=\"ux\" xmlns:ux=\"urn:ux\">")
-            && xml.contains("<w:keepNext xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"/>"),
+            && xml.contains(&format!(
+                "<w:keepNext xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\"/>"
+            )),
         "{xml}"
     );
 }
@@ -846,8 +848,9 @@ fn requires_and_escaped_compatibility_values_keep_their_namespaces() {
     let (pkg, editor) = open(&original);
     let xml = document_xml(&save(pkg, editor));
     assert!(
-        xml.contains("<w:keepNext xmlns:ux=\"urn:ux\"")
-            && xml.contains("<mc:AlternateContent xmlns:uy=\"urn:uy\">"),
+        xml.contains(&format!(
+            "<w:keepNext xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\""
+        )) && xml.contains("<mc:AlternateContent xmlns:uy=\"urn:uy\">"),
         "{xml}"
     );
 }
@@ -1037,4 +1040,305 @@ fn increase_indent_keeps_a_declaration_from_the_ancestor_ppr() {
     // `x` is declared on the pPr or the numPr or the ins itself.
     let ppr = &xml[xml.find("<w:pPr").unwrap()..xml.find("</w:pPr>").unwrap()];
     assert!(ppr.contains("xmlns:x=\"urn:x\""), "{xml}");
+}
+
+// ---- #1655 (leftovers from #1089) ----
+
+/// The markup-compatibility attributes written on the `element` start tag
+/// that open in `xml`, as that parser resolves them (an attribute counts only
+/// when its prefix is bound to the MC namespace in scope).
+fn rules_on(xml: &str, element: &str) -> Vec<(String, String)> {
+    use docxcore::xml::{Event, XmlParser};
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == element => {
+                return p
+                    .markup_compatibility_attrs()
+                    .iter()
+                    .filter(|s| s.element_name == element)
+                    .map(|s| (s.attr.name.to_string(), s.attr.value.to_string()))
+                    .collect();
+            }
+            Event::Eof => return Vec::new(),
+            _ => {}
+        }
+    }
+}
+
+/// The first `<element .../>` (or its start tag) in `xml`, alone.
+fn tag_of<'a>(xml: &'a str, element: &str) -> &'a str {
+    let at = xml.find(&format!("<{element}")).expect("element present");
+    &xml[at..at + xml[at..].find('>').unwrap() + 1]
+}
+
+/// Review r3: a captured property element's own `mc:Ignorable`, with `mc`
+/// bound only on the part root, is declared on the element itself, so the
+/// element read apart from the root (a snapshot) still has its rule.
+#[test]
+fn r3_own_rule_root_mc_a_snapshot_elements_own_rule_is_recognised_apart_from_the_root() {
+    let date = "2026-01-01T00:00:00Z";
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\">"),
+        &format!(
+            "<w:body><w:p><w:pPr><w:keepNext/><w:pPrChange w:id=\"1\" w:author=\"A\" \
+             w:date=\"{date}\"><w:pPr><w:keepLines mc:Ignorable=\"ux\" ux:l=\"1\"/></w:pPr>\
+             </w:pPrChange></w:pPr><w:r><w:t>t</w:t></w:r></w:p></w:body>"
+        ),
+    );
+    let (pkg, mut editor) = open(&original);
+    assert_eq!(editor.reject_all_revisions().len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    let tag = tag_of(&xml, "w:keepLines");
+    assert!(tag.contains("ux:l=\"1\""), "{xml}");
+    assert_eq!(
+        rules_on(tag, "w:keepLines"),
+        [("mc:Ignorable".to_string(), "ux".to_string())],
+        "{tag}"
+    );
+}
+
+/// Review r2: `x:Ignorable` where `x` is not the MC namespace is an ordinary
+/// attribute: the rule inherited from a rebuilt ancestor is added beside it,
+/// not merged into it.
+#[test]
+fn r2_isrule_binding_a_vendor_ignorable_is_not_merged_with_the_inherited_rule() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\" xmlns:x=\"urn:x\" mc:Ignorable=\"ux\">\
+         <w:p ux:a=\"1\" x:Ignorable=\"keep\"><w:r><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    let tag = tag_of(&xml, "w:p");
+    assert!(tag.contains("x:Ignorable=\"keep\""), "{tag}");
+    assert_eq!(
+        rules_on(&xml, "w:p"),
+        [("mc:Ignorable".to_string(), "ux".to_string())],
+        "{xml}"
+    );
+}
+
+/// Review r2: a tag that rebinds `mc` to another namespace cannot carry the
+/// inherited rule under that prefix; the rule is written under a prefix bound
+/// to the MC namespace.
+#[test]
+fn r2_isrule_binding_a_tag_rebinding_mc_gets_the_inherited_rule_under_another_prefix() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\" mc:Ignorable=\"ux\">\
+         <w:p xmlns:mc=\"urn:other\" ux:a=\"1\"><w:r><w:t>text</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    let rules = rules_on(&xml, "w:p");
+    assert_eq!(rules.len(), 1, "{xml}");
+    assert!(
+        rules[0].0.ends_with(":Ignorable") && rules[0].1 == "ux",
+        "{xml}"
+    );
+    assert!(!rules[0].0.starts_with("mc:"), "{xml}");
+}
+
+const UX_CELL: &str = "<w:body><w:tbl><w:tblGrid><w:gridCol w:w=\"2000\"/></w:tblGrid><w:tr>\
+     <w:tc xmlns:ux=\"urn:ux\">{content}<w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+     <w:p/></w:body>";
+
+/// Edit the first cell's text (so the table is rebuilt) and save.
+fn saved_after_cell_edit(content: &str) -> String {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        &UX_CELL.replace("{content}", content),
+    );
+    let (pkg, mut editor) = open(&original);
+    let blocks = match &editor.doc.body[0] {
+        Block::Table(t) => t.rows[0].cells[0].blocks.len(),
+        other => panic!("{other:?}"),
+    };
+    editor.set_caret(Caret::at(vec![0, 0, 0, blocks - 1], 0));
+    editor.insert_str("!");
+    document_xml(&save(pkg, editor))
+}
+
+/// Review r4: raw captures keep the bindings of a rebuilt ancestor (`w:tc`).
+#[test]
+fn r4_raw_captures_an_unmodeled_inline_keeps_the_cells_binding() {
+    let xml = saved_after_cell_edit("<w:p><ux:marker/><w:r><w:t>a</w:t></w:r></w:p>");
+    assert!(xml.contains("<ux:marker"), "{xml}");
+}
+
+#[test]
+fn r4_raw_captures_an_unmodeled_block_keeps_the_bodys_binding() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\">"),
+        "<w:body xmlns:ux=\"urn:ux\"><ux:block ux:a=\"1\"/><w:p><w:r><w:t>t</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, editor) = open(&original);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(xml.contains("<ux:block"), "{xml}");
+}
+
+#[test]
+fn r4_raw_captures_an_unsupported_revision_keeps_the_cells_binding() {
+    let xml = saved_after_cell_edit(
+        "<w:p><w:moveFromRangeStart w:id=\"1\" w:author=\"A\" ux:a=\"1\"/>\
+         <w:r><w:t>a</w:t></w:r></w:p>",
+    );
+    assert!(xml.contains("ux:a=\"1\""), "{xml}");
+}
+
+/// Review r4: the sdtPr of a block and an inline content control keeps the
+/// bindings of its rebuilt ancestors and its own `w:sdt`'s; the wrapper stays
+/// the plain `<w:sdt>`.
+#[test]
+fn r4_raw_captures_sdt_properties_keep_the_bindings_in_scope() {
+    let xml = saved_after_cell_edit(
+        "<w:sdt xmlns:uy=\"urn:uy\"><w:sdtPr><ux:p/><uy:q/></w:sdtPr><w:sdtEndPr><ux:e/></w:sdtEndPr>\
+         <w:sdtContent><w:p><w:r><w:t>a</w:t></w:r></w:p></w:sdtContent></w:sdt>\
+         <w:p><w:sdt><w:sdtPr><ux:i/></w:sdtPr><w:sdtContent><w:r><w:t>b</w:t></w:r>\
+         </w:sdtContent></w:sdt></w:p>",
+    );
+    for kept in ["<ux:p", "<uy:q", "<ux:e", "<ux:i"] {
+        assert!(xml.contains(kept), "{kept} lost: {xml}");
+    }
+    assert_eq!(xml.matches("<w:sdt>").count(), 2, "{xml}");
+}
+
+/// Whether `ux` is ignorable where the first `element` in `xml` starts
+/// (inherited rules included): a consumer not knowing `ux` skips it.
+fn ux_ignorable_at(xml: &str, element: &str) -> bool {
+    use docxcore::xml::{Event, XmlParser};
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if p.name() == element => {
+                return p.markup_compatibility_attrs().iter().any(|s| {
+                    s.attr.name.ends_with(":Ignorable")
+                        && s.attr.value.split_whitespace().any(|t| t == "ux")
+                });
+            }
+            Event::Eof => return false,
+            _ => {}
+        }
+    }
+}
+
+/// A body of two paragraphs: the first carries `mc:Ignorable="ux"` and a
+/// `ux:marker`, the second is plain (as Word writes it); `ux` is the root's.
+fn rule_paragraphs() -> Vec<u8> {
+    docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:p mc:Ignorable=\"ux\"><w:r><w:t>one</w:t></w:r><ux:marker/><w:r><w:t>uno</w:t></w:r></w:p>\
+         <w:p><w:r><w:t>two</w:t></w:r></w:p></w:body>",
+    )
+}
+
+#[test]
+fn r1_writtenback_an_untouched_rule_paragraph_keeps_its_rule() {
+    let (pkg, editor) = open(&rule_paragraphs());
+    let xml = document_xml(&save(pkg, editor));
+    assert!(ux_ignorable_at(&xml, "ux:marker"), "{xml}");
+}
+
+#[test]
+fn r1_writtenback_paste_of_a_rule_paragraphs_runs_keeps_the_rule() {
+    let (pkg, mut editor) = open(&rule_paragraphs());
+    editor.set_caret(Caret::top(0, 0));
+    editor.select_all();
+    let clip = editor.copy().expect("copied");
+    editor.clear_selection();
+    editor.set_caret(Caret::top(1, 3));
+    editor.paste(&clip);
+    let xml = document_xml(&save(pkg, editor));
+    // Whatever the clip carries, a marker that is written has its rule.
+    assert!(
+        xml.matches("<ux:marker").count() == 0 || all_markers_ignorable(&xml),
+        "{xml}"
+    );
+}
+
+#[test]
+fn r1_writtenback_joining_into_a_rule_less_paragraph_keeps_the_rule() {
+    let (pkg, mut editor) = open(&rule_paragraphs());
+    // Backspace at the start of the rule paragraph's successor joins the two:
+    // join the plain paragraph into the rule one, then the other way round.
+    editor.set_caret(Caret::top(1, 0));
+    editor.backspace();
+    let xml = document_xml(&save(pkg, editor));
+    assert!(all_markers_ignorable(&xml), "{xml}");
+}
+
+#[test]
+fn r1_writtenback_joining_a_rule_paragraph_into_the_previous_one_keeps_the_rule() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:p><w:r><w:t>one</w:t></w:r></w:p>\
+         <w:p mc:Ignorable=\"ux\"><w:r><w:t>two</w:t></w:r><ux:marker/></w:p></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(1, 0));
+    editor.backspace();
+    assert_eq!(editor.doc.body.len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(xml.contains("<ux:marker"), "{xml}");
+    assert!(all_markers_ignorable(&xml), "{xml}");
+}
+
+/// Whether `ux` is ignorable at every `ux:marker` in `xml`.
+fn all_markers_ignorable(xml: &str) -> bool {
+    use docxcore::xml::{Event, XmlParser};
+    let mut p = XmlParser::new(xml);
+    let mut seen = 0;
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "ux:marker" => {
+                seen += 1;
+                let ok = p.markup_compatibility_attrs().iter().any(|s| {
+                    s.attr.name.ends_with(":Ignorable")
+                        && s.attr.value.split_whitespace().any(|t| t == "ux")
+                });
+                if !ok {
+                    return false;
+                }
+            }
+            Event::Eof => return seen > 0,
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn r1_writtenback_delete_forward_joins_keep_the_following_paragraphs_rule() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:p><w:r><w:t>one</w:t></w:r></w:p>\
+         <w:p mc:Ignorable=\"ux\"><w:r><w:t>two</w:t></w:r><ux:marker/></w:p></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.set_caret(Caret::top(0, 3));
+    editor.delete_forward();
+    assert_eq!(editor.doc.body.len(), 1);
+    let xml = document_xml(&save(pkg, editor));
+    assert!(all_markers_ignorable(&xml), "{xml}");
+}
+
+/// Runs a conversion moves out of a rule paragraph into table cells.
+#[test]
+fn r1_writtenback_runs_moved_into_table_cells_keep_the_rule() {
+    let original = docx_with_root(
+        &format!("<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:ux\">"),
+        "<w:body><w:p mc:Ignorable=\"ux\"><w:r><w:t>a</w:t></w:r><ux:marker/>\
+         <w:r><w:t>b</w:t></w:r></w:p></w:body>",
+    );
+    let (pkg, mut editor) = open(&original);
+    editor.select_all();
+    editor
+        .text_to_table(docxcore::editor::CellSep::Paragraph, Some(1))
+        .expect("converted");
+    assert!(matches!(editor.doc.body[0], Block::Table(_)));
+    let xml = document_xml(&save(pkg, editor));
+    assert!(
+        xml.matches("<ux:marker").count() == 0 || all_markers_ignorable(&xml),
+        "{xml}"
+    );
 }
