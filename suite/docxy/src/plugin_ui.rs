@@ -73,6 +73,19 @@ pub(crate) fn is_plugin(act: Act) -> bool {
     matches!(act, Act::Project(ProjectAct::Plugin(_)))
 }
 
+/// Whether `gal` is a plugin's swatch gallery, drawn by
+/// `Docxy::swatch_gallery` (tiles with no well around them) and sized by
+/// `ribbon_fit::gallery_geom` with no frame (#1685): one predicate for both.
+pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
+    // The width maths is generic over the ribbon's act type; only the
+    // Project ribbon's `Act` can hold a plugin's.
+    gal.items.first().is_some_and(|it| {
+        (&it.act as &dyn std::any::Any)
+            .downcast_ref::<Act>()
+            .is_some_and(|a| is_plugin(*a))
+    })
+}
+
 // ---- the ribbon --------------------------------------------------------------
 
 fn cmd_of(id: &str, label: &str, icon: &str, tip: &str, keytip: &str) -> rs::Cmd<Act> {
@@ -137,13 +150,30 @@ fn control_of(c: &ui::Control) -> Control<Act> {
     }
 }
 
+/// The longest label, in characters, a contributed small button shows: a
+/// longer one is cut with an ellipsis and the full text stays its tip, so one
+/// label cannot make its column absurdly wide (#1685). The estimate and the
+/// renderer both read the command, so they agree.
+pub(crate) const CONTRIB_LABEL_MAX: usize = 24;
+
+/// `label` cut to [`CONTRIB_LABEL_MAX`] characters.
+fn capped_label(label: &str) -> String {
+    if label.chars().count() <= CONTRIB_LABEL_MAX {
+        return label.to_string();
+    }
+    let mut cut: String = label.chars().take(CONTRIB_LABEL_MAX - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
 /// A group's contributed controls, small buttons that follow one another
 /// stacked in columns of up to `rs::MAX_COLUMN_ROWS`, as the built-ins are.
 fn controls_of(controls: &[ui::Control]) -> Vec<Control<Act>> {
     let mut out: Vec<Control<Act>> = Vec::new();
     for c in controls {
         if c.kind == PluginControlKind::Button && !c.large {
-            let cmd = cmd_of(&c.id, &c.label, &c.icon, &c.tip, &c.keytip);
+            let tip = if c.tip.is_empty() { &c.label } else { &c.tip };
+            let cmd = cmd_of(&c.id, &capped_label(&c.label), &c.icon, tip, &c.keytip);
             match out.last_mut() {
                 Some(Control::Column(last)) if last.len() < rs::MAX_COLUMN_ROWS => last.push(cmd),
                 _ => out.push(Control::Column(vec![cmd])),
@@ -222,19 +252,25 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                                 .iter()
                                 .position(|g| g.title.eq_ignore_ascii_case(title))
                         };
-                        let at = if let Some(i) = position(&group.before) {
-                            i
+                        let (at, beside) = if let Some(i) = position(&group.before) {
+                            (i, Some(i))
                         } else if let Some(i) = position(&group.after) {
-                            i + 1
+                            (i + 1, Some(i))
                         } else {
-                            tab.groups.len()
+                            (tab.groups.len(), None)
                         };
+                        // Its own collapse priority, else the built-in
+                        // group's it sits beside, else 50 (#1685).
+                        let priority = group
+                            .priority
+                            .or_else(|| beside.map(|i| tab.groups[i].priority))
+                            .unwrap_or(50);
                         tab.groups.insert(
                             at,
                             rs::Group {
                                 title: intern(&group.title),
                                 launcher: None,
-                                priority: 50,
+                                priority,
                                 items: controls,
                             },
                         );

@@ -148,6 +148,12 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     // A second tab's group asks to go before a built-in group (#1574).
     assert_eq!(m.ribbon[1].tab, "Gantt Chart Format");
     assert_eq!(m.ribbon[1].groups[0].before, "Bar Styles");
+    // A group may declare its collapse priority (#1685); another does not.
+    assert_eq!(m.ribbon[1].groups[0].priority, None);
+    assert_eq!(m.ribbon[1].groups[1].title, "Fixture Percent");
+    assert_eq!(m.ribbon[1].groups[1].after, "Fixture Format");
+    assert_eq!(m.ribbon[1].groups[1].priority, Some(120));
+    assert_eq!(m.ribbon[1].groups[1].controls.len(), 5);
     let group = &m.ribbon[0].groups[0];
     assert_eq!(group.title, "Fixture");
     assert_eq!(

@@ -1,6 +1,7 @@
 use super::*;
 use crate::dialog::{ControlKind, Value, grid_address};
 use crate::menu::MenuItem;
+use crate::ribbon_fit;
 use projcore::uiplugin::Manifest;
 
 const MANIFEST: &str = r##"{
@@ -621,4 +622,150 @@ fn the_built_in_grids_scroll_in_the_fixed_size() {
         .collect();
     assert_eq!(grids.len(), 2);
     assert!(grids.iter().all(|c| c.min_rows.is_some()));
+}
+
+fn extended(json: &str) -> rs::Tab<Act> {
+    let m = Manifest::parse(json).unwrap();
+    let mut ribbon = crate::project_ribbon();
+    let mut task = ribbon.tabs.remove(
+        ribbon
+            .tabs
+            .iter()
+            .position(|t| t.name == "Task")
+            .expect("Project has a Task tab"),
+    );
+    extend_tab_with(&mut task, &[&m]);
+    task
+}
+
+fn priority_of(tab: &rs::Tab<Act>, title: &str) -> u8 {
+    tab.groups
+        .iter()
+        .find(|g| g.title == title)
+        .unwrap_or_else(|| panic!("no group {title}"))
+        .priority
+}
+
+#[test]
+fn a_contributed_group_takes_a_declared_priority_else_its_neighbours_else_50() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Declared","priority":7,"after":"Tasks","controls":[{"id":"d.a","kind":"button","label":"A"}]},
+          {"title":"AfterTasks","after":"Tasks","controls":[{"id":"a.a","kind":"button","label":"A"}]},
+          {"title":"BeforeSchedule","before":"Schedule","controls":[{"id":"b.a","kind":"button","label":"A"}]},
+          {"title":"NoSuchTitle","after":"Nope","controls":[{"id":"n.a","kind":"button","label":"A"}]},
+          {"title":"Appended","controls":[{"id":"p.a","kind":"button","label":"A"}]}]}]}"##,
+    );
+    let built_in = |t: &str| {
+        let plain = crate::project_ribbon();
+        let tab = plain.tabs.iter().find(|t| t.name == "Task").unwrap();
+        priority_of(tab, t)
+    };
+    assert_eq!(priority_of(&task, "Declared"), 7);
+    assert_eq!(priority_of(&task, "AfterTasks"), built_in("Tasks"));
+    assert_eq!(priority_of(&task, "BeforeSchedule"), built_in("Schedule"));
+    assert_eq!(priority_of(&task, "NoSuchTitle"), 50);
+    assert_eq!(priority_of(&task, "Appended"), 50);
+    // Joining a built-in group changes nothing.
+    let joined = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Schedule","priority":1,"controls":[{"id":"j.a","kind":"button","label":"A"}]}]}]}"##,
+    );
+    assert_eq!(priority_of(&joined, "Schedule"), built_in("Schedule"));
+}
+
+#[test]
+fn a_declared_priority_moves_the_group_in_the_collapse_order() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Early","priority":0,"controls":[{"id":"e.a","kind":"button","label":"A"}]}]}]}"##,
+    );
+    let specs: Vec<ribbon_fit::Spec> = task
+        .groups
+        .iter()
+        .map(|g| ribbon_fit::model_spec(g, &ribbon_fit::approx_tw))
+        .collect();
+    let early = task.groups.len() - 1;
+    // Squeezed just below the full width, the lowest priority goes first.
+    let full: f32 = specs.iter().map(|s| s.full).sum();
+    let fit = ribbon_fit::fit_with(
+        &specs,
+        full + ribbon_fit::GUTTER - 1.0,
+        ribbon_fit::Policy::WholeGroups,
+    );
+    assert_eq!(fit.states[early], ribbon_fit::State::Collapsed);
+    // Wide again: every group is full, nothing stays collapsed (#1685).
+    let fit = ribbon_fit::fit_with(
+        &specs,
+        full + ribbon_fit::GUTTER,
+        ribbon_fit::Policy::WholeGroups,
+    );
+    assert!(fit.states.iter().all(|s| *s == ribbon_fit::State::Full));
+}
+
+#[test]
+fn small_buttons_stack_three_deep_and_a_long_label_is_cut() {
+    let long = "A very long contributed label that would stretch its column";
+    let json = format!(
+        r##"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"Percent","controls":[
+          {{"id":"p.0","kind":"button","label":"0%"}},
+          {{"id":"p.25","kind":"button","label":"25%"}},
+          {{"id":"p.50","kind":"button","label":"50%"}},
+          {{"id":"p.75","kind":"button","label":"75%"}},
+          {{"id":"p.100","kind":"button","label":"{long}","tip":""}}]}}]}}]}}"##
+    );
+    let task = extended(&json);
+    let group = task.groups.last().unwrap();
+    let cols: Vec<&Vec<rs::Cmd<Act>>> = group
+        .items
+        .iter()
+        .map(|c| match c {
+            Control::Column(cs) => cs,
+            _ => panic!("small buttons stack in columns"),
+        })
+        .collect();
+    assert_eq!(cols.iter().map(|c| c.len()).collect::<Vec<_>>(), [3, 2]);
+    let cut = &cols[1][1];
+    assert_eq!(cut.label.chars().count(), CONTRIB_LABEL_MAX);
+    assert!(cut.label.ends_with('\u{2026}'));
+    assert_eq!(cut.tip.title, long);
+    // A short label is untouched, and a multibyte one is cut on characters.
+    assert_eq!(capped_label("0%"), "0%");
+    let wide = "é".repeat(CONTRIB_LABEL_MAX + 3);
+    assert_eq!(capped_label(&wide).chars().count(), CONTRIB_LABEL_MAX);
+    // The column is as wide as its capped widest label, not the long one.
+    let tw = ribbon_fit::approx_tw;
+    let w = ribbon_fit::model_control_w(&group.items[1], false, None, &tw);
+    assert!(w <= 18.0 + tw(&"W".repeat(CONTRIB_LABEL_MAX), 12.0), "{w}");
+}
+
+#[test]
+fn a_swatch_gallerys_estimate_is_the_width_it_draws() {
+    let swatches: Vec<String> = (0..12)
+        .map(|i| format!(r##"{{"id":"g.{i}","label":"S{i}","color":"#3366CC"}}"##))
+        .collect();
+    let json = format!(
+        r##"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"Palette","controls":[
+          {{"id":"g.gallery","kind":"gallery","label":"Palette","swatches":[{}]}}]}}]}}]}}"##,
+        swatches.join(",")
+    );
+    let task = extended(&json);
+    let Control::Gallery(gal) = &task.groups.last().unwrap().items[0] else {
+        panic!("a gallery");
+    };
+    assert!(is_swatch_gallery(gal));
+    let t = crate::style_gallery::TILE;
+    let n = gal.items.len() as f32;
+    // `Docxy::swatch_gallery` draws `per_row * w + (per_row - 1) * gap`.
+    let drawn = n * t.w + (n - 1.0) * t.gap;
+    let tw = ribbon_fit::approx_tw;
+    let control = &task.groups.last().unwrap().items[0];
+    assert_eq!(
+        ribbon_fit::model_control_w(control, false, None, &tw),
+        drawn
+    );
+    // Wrapped to a flyout width, the same rule.
+    let (k, w) =
+        ribbon_fit::gallery_row(ribbon_fit::gallery_geom(gal), gal.items.len(), Some(300.0));
+    assert_eq!(w, k as f32 * t.w + (k as f32 - 1.0) * t.gap);
 }

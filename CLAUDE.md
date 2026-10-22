@@ -667,9 +667,23 @@
   sheet order, `project-plugin-ui.uit` the Project one with the fixture's
   Task group at 1180 px only (the CI displays cannot show that tab in full,
   so the widening back to full groups is pinned by `ribbon-fit.uit` and the
-  `ribbon_fit` unit tests) and the Gantt Chart Format tab, whose two groups
-  fit at every CI width, where the fixture's icon-less `fixture.flat` toggle
-  keeps `estimates_ok` true only while its label is drawn.
+  `ribbon_fit` unit tests) and the Gantt Chart Format tab, whose three groups
+  are meant to fit at every CI width (not run on macOS), where the fixture's
+  icon-less `fixture.flat` toggle keeps `estimates_ok` true only while its
+  label is drawn.
+- A contributed ribbon group's collapse priority (#1685): `RibbonGroup.priority`
+  (JSON `priority`, 0 to 255 as the built-ins' run to 200, clamped, a
+  non-number is absent); a new group without one takes the priority of the
+  built-in group named by `before`, else `after`, else 50; joining a built-in
+  group changes nothing. Contributed small buttons stack three deep
+  (`controls_of`) and a label over `CONTRIB_LABEL_MAX` (24 characters) is cut
+  with an ellipsis at construction, its full text the tip, so the estimate
+  and the renderer read the same command. A plugin swatch gallery
+  (`plugin_ui::is_swatch_gallery`, one predicate for `Docxy::swatch_gallery`
+  and `ribbon_fit::gallery_geom`) draws bare tiles, so its estimate has no
+  well `frame`: `n * w + (n - 1) * gap`. It is never capped, so a wide gallery
+  collapses honestly; `fit_with` keeps no state, so a group collapsed at a
+  narrow width is full again at a wide one (`plugin_ui` tests pin both).
 
 ## Project table: resizable columns and AutoFilter (#1533)
 
