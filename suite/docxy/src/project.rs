@@ -1413,8 +1413,8 @@ fn editable_row_cells(
                 div().child(value).into_any_element()
             };
             // A cell whose style paints an opaque base or hatch (or must hide
-            // its row's hatch) takes the selection wash as an overlay above
-            // it, else the fill would cover the wash.
+            // its row's fill or hatch) takes the selection wash as an overlay
+            // above it, else the fill would cover the wash.
             let forced_base = cell_style
                 .as_ref()
                 .and_then(|s| crate::plugin_ui::cell_base(row_style.as_ref(), s));
