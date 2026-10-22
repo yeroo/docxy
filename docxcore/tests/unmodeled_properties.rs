@@ -1005,3 +1005,36 @@ fn increase_indent_on_a_list_item_with_only_a_hanging_indent_steps_the_level() {
     assert!(xml.contains("<w:ilvl w:val=\"1\"/>"), "{xml}");
     assert!(xml.contains("<w:ind w:hanging=\"360\"/>"), "{xml}");
 }
+
+/// The loaded `w:numPr` start tag (and the declarations on it) survives a
+/// level step, so a kept child's prefix stays bound.
+#[test]
+fn increase_indent_keeps_the_numpr_start_tag_declarations() {
+    let body = "<w:p><w:pPr><w:numPr xmlns:x=\"urn:x\"><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains(
+            "<w:numPr xmlns:x=\"urn:x\"><w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>\
+             <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr>"
+        ),
+        "{xml}"
+    );
+}
+
+#[test]
+fn increase_indent_keeps_a_declaration_from_the_ancestor_ppr() {
+    let body = "<w:p><w:pPr xmlns:x=\"urn:x\"><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains("<w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>"),
+        "{xml}"
+    );
+    assert!(xml.contains("x:a=\"1\""), "{xml}");
+    // `x` is declared on the pPr or the numPr or the ins itself.
+    let ppr = &xml[xml.find("<w:pPr").unwrap()..xml.find("</w:pPr>").unwrap()];
+    assert!(ppr.contains("xmlns:x=\"urn:x\""), "{xml}");
+}

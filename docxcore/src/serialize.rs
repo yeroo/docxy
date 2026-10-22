@@ -794,23 +794,32 @@ pub(crate) fn ppr_base_xml(props: &ParProps) -> String {
     out
 }
 
-/// An edited `w:numPr`. Of a loaded element, the children the model does not
-/// carry (`w:numberingChange`, a tracked-insertion `w:ins`) stay as loaded,
+/// An edited `w:numPr`. A loaded element keeps its own start tag (the
+/// namespace declarations the loader moved onto it) and the children the
+/// model does not carry (`w:numberingChange`, a tracked-insertion `w:ins`),
 /// after the new `w:ilvl` and `w:numId` (CT_NumPr order).
 fn numpr_xml(ilvl: i32, num_id: i32, loaded: Option<&str>) -> String {
-    let mut rest = String::new();
-    if let Some(raw) = loaded.filter(|r| !r.trim_end().ends_with("/>")) {
-        if let (Some(open), Some(close)) = (crate::inspect::tag_end(raw), raw.rfind("</")) {
-            let mut inner = raw[open..close.max(open)].to_string();
-            for name in ["w:ilvl", "w:numId"] {
-                while let Some((a, b, _)) = crate::inspect::find_element_from(&inner, name, 0) {
-                    inner.replace_range(a..b, "");
-                }
-            }
-            rest = inner;
+    let new = format!("<w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/>");
+    let Some(raw) = loaded.map(str::trim) else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    let Some(open) = crate::inspect::tag_end(raw) else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    if let Some(head) = raw[..open].strip_suffix("/>") {
+        // No children to keep; the start tag's declarations stay.
+        return format!("{head}>{new}</w:numPr>");
+    }
+    let Some(close) = raw.rfind("</") else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    let mut rest = raw[open..close.max(open)].to_string();
+    for name in ["w:ilvl", "w:numId"] {
+        while let Some((a, b, _)) = crate::inspect::find_element_from(&rest, name, 0) {
+            rest.replace_range(a..b, "");
         }
     }
-    format!("<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/>{rest}</w:numPr>")
+    format!("{}{new}{rest}</w:numPr>", &raw[..open])
 }
 
 fn write_ppr(s: &mut String, props: &ParProps) {
