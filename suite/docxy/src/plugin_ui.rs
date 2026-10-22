@@ -73,6 +73,21 @@ pub(crate) fn is_plugin(act: Act) -> bool {
     matches!(act, Act::Project(ProjectAct::Plugin(_)))
 }
 
+/// Whether `gal` is a plugin's swatch gallery, drawn by
+/// `Docxy::swatch_gallery` (tiles with no well around them) and sized by
+/// `ribbon_fit::gallery_geom` with no frame (#1685): one predicate for both.
+pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
+    // The width maths is generic over the ribbon's act type; only the
+    // Project ribbon's `Act` can hold a plugin's.
+    // The Table Styles gallery is drawn first by `render_control`.
+    gal.id != "tablestyles"
+        && gal.items.first().is_some_and(|it| {
+            (&it.act as &dyn std::any::Any)
+                .downcast_ref::<Act>()
+                .is_some_and(|a| is_plugin(*a))
+        })
+}
+
 // ---- the ribbon --------------------------------------------------------------
 
 fn cmd_of(id: &str, label: &str, icon: &str, tip: &str, keytip: &str) -> rs::Cmd<Act> {
@@ -137,13 +152,42 @@ fn control_of(c: &ui::Control) -> Control<Act> {
     }
 }
 
+/// The longest label, in characters, a contributed small button shows: a
+/// longer one is cut with an ellipsis and the full text stays its tip, so one
+/// label cannot make its column absurdly wide (#1685). The estimate and the
+/// renderer both read the command, so they agree.
+pub(crate) const CONTRIB_LABEL_MAX: usize = 24;
+
+/// `label` cut to [`CONTRIB_LABEL_MAX`] characters.
+fn capped_label(label: &str) -> String {
+    if label.chars().count() <= CONTRIB_LABEL_MAX {
+        return label.to_string();
+    }
+    let mut cut: String = label.chars().take(CONTRIB_LABEL_MAX - 1).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
+/// A contributed small button: its label cut to [`CONTRIB_LABEL_MAX`]; when
+/// it was cut the tip's title is the full label and its body the plugin's tip
+/// (if any), so the whole text is still reachable.
+fn small_cmd(c: &ui::Control) -> rs::Cmd<Act> {
+    let label = capped_label(&c.label);
+    let cmd = cmd_of(&c.id, &label, &c.icon, &c.tip, &c.keytip);
+    if label == c.label {
+        cmd
+    } else {
+        cmd.tip(intern(&c.label), intern(&c.tip), "")
+    }
+}
+
 /// A group's contributed controls, small buttons that follow one another
 /// stacked in columns of up to `rs::MAX_COLUMN_ROWS`, as the built-ins are.
 fn controls_of(controls: &[ui::Control]) -> Vec<Control<Act>> {
     let mut out: Vec<Control<Act>> = Vec::new();
     for c in controls {
         if c.kind == PluginControlKind::Button && !c.large {
-            let cmd = cmd_of(&c.id, &c.label, &c.icon, &c.tip, &c.keytip);
+            let cmd = small_cmd(c);
             match out.last_mut() {
                 Some(Control::Column(last)) if last.len() < rs::MAX_COLUMN_ROWS => last.push(cmd),
                 _ => out.push(Control::Column(vec![cmd])),
@@ -156,10 +200,11 @@ fn controls_of(controls: &[ui::Control]) -> Vec<Control<Act>> {
 }
 
 /// The command in `control` with id `id`, to replace it in place.
-fn cmd_mut<'a>(control: &'a mut Control<Act>, id: &str) -> Option<&'a mut rs::Cmd<Act>> {
-    match control {
+fn cmd_mut<'a>(control: &'a mut Control<Act>, id: &str) -> Option<(&'a mut rs::Cmd<Act>, bool)> {
+    let found = match control {
         Control::Large(c) | Control::Toggle(c) => (c.id == id).then_some(c),
-        Control::Column(cs) => cs.iter_mut().find(|c| c.id == id),
+        // The small buttons of a column: a replacement is capped like a new one.
+        Control::Column(cs) => return cs.iter_mut().find(|c| c.id == id).map(|c| (c, true)),
         Control::Split { primary, menu } => std::iter::once(primary)
             .chain(menu.iter_mut())
             .find(|c| c.id == id),
@@ -170,7 +215,8 @@ fn cmd_mut<'a>(control: &'a mut Control<Act>, id: &str) -> Option<&'a mut rs::Cm
             rs::Cell::Btn(c) | rs::Cell::Combo { cmd: c, .. } => (c.id == id).then_some(c),
         }),
         Control::Gallery(_) | Control::Separator => None,
-    }
+    };
+    found.map(|c| (c, false))
 }
 
 /// Add every loaded plugin's contributions for `tab` (by its name): a
@@ -199,7 +245,10 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                         .flat_map(|g| g.items.iter_mut())
                         .find_map(|control| cmd_mut(control, &c.id));
                     match replaced {
-                        Some(slot) => *slot = cmd_of(&c.id, &c.label, &c.icon, &c.tip, &c.keytip),
+                        Some((slot, true)) => *slot = small_cmd(c),
+                        Some((slot, false)) => {
+                            *slot = cmd_of(&c.id, &c.label, &c.icon, &c.tip, &c.keytip)
+                        }
                         None => added.push(c),
                     }
                 }
@@ -222,19 +271,26 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                                 .iter()
                                 .position(|g| g.title.eq_ignore_ascii_case(title))
                         };
-                        let at = if let Some(i) = position(&group.before) {
-                            i
+                        let (at, beside) = if let Some(i) = position(&group.before) {
+                            (i, Some(i))
                         } else if let Some(i) = position(&group.after) {
-                            i + 1
+                            (i + 1, Some(i))
                         } else {
-                            tab.groups.len()
+                            (tab.groups.len(), None)
                         };
+                        // Its own collapse priority, else that of the group
+                        // (built-in or already contributed) `before` names,
+                        // else `after`, else 50 (#1685).
+                        let priority = group
+                            .priority
+                            .or_else(|| beside.map(|i| tab.groups[i].priority))
+                            .unwrap_or(50);
                         tab.groups.insert(
                             at,
                             rs::Group {
                                 title: intern(&group.title),
                                 launcher: None,
-                                priority: 50,
+                                priority,
                                 items: controls,
                             },
                         );

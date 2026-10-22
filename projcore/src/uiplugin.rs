@@ -215,6 +215,9 @@ fn comparator_holds(part: &str, v: Version) -> Result<bool, String> {
 
 /// What `yppx_ui_manifest` returns: the plugin's static contributions.
 ///
+/// A new group may add `"priority":N` (its collapse priority, #1685) beside
+/// `before` / `after`.
+///
 /// ```json
 /// {"ribbon":[{"tab":"Task","groups":[{"title":"Extras","controls":[
 ///     {"id":"x.hello","kind":"button","label":"Hello","tip":"Say hello","keytip":"XH","large":true}]}]}],
@@ -257,6 +260,11 @@ pub struct RibbonGroup {
     /// A group whose title is a built-in's joins it instead.
     pub before: String,
     pub after: String,
+    /// The collapse priority (0 to 255, as the built-in groups' run to 200; lower
+    /// collapses first) of a new
+    /// group; absent, it takes the priority of the group (built-in or already
+    /// contributed) named by `before`, else `after`, else 50 (#1685).
+    pub priority: Option<u8>,
 }
 
 /// A ribbon control. Its `id` is what `yppx_ui_state` reports on and what
@@ -663,6 +671,7 @@ impl Manifest {
                     controls,
                     before: g.text("before"),
                     after: g.text("after"),
+                    priority: g.num("priority").map(|n| n.clamp(0.0, 255.0).round() as u8),
                 });
             }
             m.ribbon.push(RibbonTab {
@@ -869,6 +878,10 @@ impl Manifest {
                                         if !g.after.is_empty() {
                                             pairs
                                                 .push(("after".into(), Json::str(g.after.clone())));
+                                        }
+                                        if let Some(p) = g.priority {
+                                            pairs
+                                                .push(("priority".into(), Json::Num(f64::from(p))));
                                         }
                                     }
                                     obj
@@ -2033,10 +2046,33 @@ mod tests {
         assert_eq!(back, m);
         assert_eq!(m.ribbon[0].groups[0].before, "Schedule");
         assert_eq!(m.ribbon[0].groups[0].after, "");
+        assert_eq!(m.ribbon[0].groups[0].priority, None);
         assert_eq!(
             Manifest::default().json(),
             r#"{"ribbon":[],"menus":[],"dialogs":[],"palettes":[],"text_style_categories":[]}"#
         );
+    }
+
+    #[test]
+    fn a_group_priority_parses_clamped_and_round_trips() {
+        let parse = |p: &str| {
+            let text = format!(
+                r#"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"G","controls":[]{p}}}]}}]}}"#
+            );
+            Manifest::parse(&text).unwrap().ribbon[0].groups[0].priority
+        };
+        assert_eq!(parse(""), None);
+        assert_eq!(parse(r#","priority":"high""#), None);
+        assert_eq!(parse(r#","priority":30"#), Some(30));
+        assert_eq!(parse(r#","priority":250"#), Some(250));
+        assert_eq!(parse(r#","priority":900"#), Some(255));
+        assert_eq!(parse(r#","priority":-4"#), Some(0));
+        let m = Manifest::parse(
+            r#"{"ribbon":[{"tab":"Task","groups":[{"title":"G","priority":30,"controls":[]}]}]}"#,
+        )
+        .unwrap();
+        assert!(m.json().contains(r#""priority":30"#));
+        assert_eq!(Manifest::parse(&m.json()).unwrap(), m);
     }
 
     #[test]

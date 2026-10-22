@@ -37363,12 +37363,7 @@ impl Docxy {
             Control::Gallery(gal) if gal.id == "tablestyles" => {
                 self.table_style_gallery(gal, max_w, pal, cx)
             }
-            Control::Gallery(gal)
-                if gal
-                    .items
-                    .first()
-                    .is_some_and(|it| plugin_ui::is_plugin(it.act)) =>
-            {
+            Control::Gallery(gal) if plugin_ui::is_swatch_gallery(gal) => {
                 self.swatch_gallery(gal, max_w, pal, cx)
             }
             Control::Gallery(gal) => self.style_gallery(gal, max_w, pal, cx),

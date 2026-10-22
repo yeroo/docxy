@@ -47,7 +47,8 @@ test a contributed group goes before the built-in group its manifest names
   assert reply.tabs.-1.groups.0.title is Fixture Format
   assert reply.tabs.-1.groups.0.commands.0.id is fixture.format
   assert reply.tabs.-1.groups.0.commands.0.plugin is true
-  assert reply.tabs.-1.groups.1.title is Bar Styles
+  assert reply.tabs.-1.groups.1.title is Fixture Percent
+  assert reply.tabs.-1.groups.2.title is Bar Styles
   call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
   assert status is Fixture: format
 
@@ -106,8 +107,12 @@ test the Task tab with a contributed group collapses whole groups, never a label
   assert reply.estimates_ok is true
   assert reply.groups.0.title is Fixture Format
   assert reply.groups.0.state is full
-  assert reply.groups.1.title is Bar Styles
-  assert reply.groups.1.state is full
+  # "Fixture Percent" declares priority 120 and follows Fixture Format; its
+  # five small buttons stack three deep (#1685), so the drawn width matches
+  # the estimate (estimates_ok above covers every group).
+  assert reply.groups.1.title is Fixture Percent
+  assert reply.groups.2.title is Bar Styles
+  assert reply.groups.2.state is full
   shot ribbon
   call ribbon-click {"tab":"Task","command":"Plain"}
   assert status is Fixture: plain on

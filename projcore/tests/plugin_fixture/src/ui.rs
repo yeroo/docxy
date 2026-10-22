@@ -7,6 +7,9 @@
 //!   no icon (its label is drawn, #1608; `fixture.flat` on the Gantt Chart
 //!   Format tab is the same) and a gallery `fixture.palette` of two swatches
 //!   (`fixture.blue`, `fixture.red`).
+//!   On the Gantt Chart Format tab a second group "Fixture Percent" after
+//!   "Fixture Format" declares `priority` 120 and holds five small labelled
+//!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
 //! - Dialogs: a Task Information page "Fixture" with a multiline and a grid
 //!   (and a header label drawn above every page, #1609), and a dialog
@@ -59,7 +62,13 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
     {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
-    {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]}]}],
+    {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]},
+    {"title":"Fixture Percent","after":"Fixture Format","priority":120,"controls":[
+    {"id":"fixture.pct0","kind":"button","label":"0%","tip":"Five small labelled buttons stack three deep (#1685)"},
+    {"id":"fixture.pct25","kind":"button","label":"25%"},
+    {"id":"fixture.pct50","kind":"button","label":"50%"},
+    {"id":"fixture.pct75","kind":"button","label":"75%"},
+    {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
   "dialogs":[
     {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
@@ -483,6 +492,13 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
             }
             Some(_) => r#"{"ops":[],"status":"Fixture: cleared","close":true}"#.to_string(),
         },
+        // The percent buttons (#1685) only say which was pressed.
+        "fixture.pct0" | "fixture.pct25" | "fixture.pct50" | "fixture.pct75" | "fixture.pct100" => {
+            format!(
+                r#"{{"ops":[],"status":"Fixture: {}"}}"#,
+                id.trim_start_matches("fixture.")
+            )
+        }
         "fixture.flag" | "fixture.plain" | "fixture.flat" => {
             let on = !switch_on(&req, id);
             let word = match id {

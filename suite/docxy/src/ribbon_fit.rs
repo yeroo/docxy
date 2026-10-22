@@ -265,8 +265,17 @@ pub(crate) struct GalleryGeom {
 /// The Styles gallery's (`style_gallery::TILE`) or the Table Styles
 /// gallery's (`table_style_gallery`: 4x12 px cells, 3 px padding and a 2 px
 /// border per tile, 2 px apart, in a well with 2 px padding and a 1 px border).
-pub(crate) fn gallery_geom<A>(gal: &rs::Gallery<A>) -> GalleryGeom {
-    if gal.id == "tablestyles" {
+pub(crate) fn gallery_geom<A: 'static>(gal: &rs::Gallery<A>) -> GalleryGeom {
+    if crate::plugin_ui::is_swatch_gallery(gal) {
+        // A plugin's swatches are bare tiles, no well around them (#1685).
+        let t = crate::style_gallery::TILE;
+        GalleryGeom {
+            tile_w: t.w,
+            tile_h: t.h,
+            gap: t.gap,
+            frame: 0.0,
+        }
+    } else if gal.id == "tablestyles" {
         GalleryGeom {
             tile_w: 58.0,
             tile_h: 4.0 * 8.0 + 10.0,
@@ -313,7 +322,7 @@ fn model_icon_btn_w(icon: bool, label: Option<&str>, tw: TextWidth) -> f32 {
 
 /// One control's drawn width; a gallery wraps its tiles to `max_w` (a
 /// flyout's limit) when one is given.
-pub(crate) fn model_control_w<A>(
+pub(crate) fn model_control_w<A: 'static>(
     c: &Control<A>,
     icon_only: bool,
     max_w: Option<f32>,
@@ -375,7 +384,7 @@ pub(crate) fn model_control_w<A>(
 
 /// `render_group`'s width: its controls `gap_1` apart, or its title row when
 /// that is wider, between `px_2` and the 1px right divider.
-pub(crate) fn model_group_w<A>(g: &rs::Group<A>, icon_only: bool, tw: TextWidth) -> f32 {
+pub(crate) fn model_group_w<A: 'static>(g: &rs::Group<A>, icon_only: bool, tw: TextWidth) -> f32 {
     let controls: f32 = g
         .items
         .iter()
@@ -389,7 +398,7 @@ pub(crate) fn model_group_w<A>(g: &rs::Group<A>, icon_only: bool, tw: TextWidth)
     controls.max(title) + 16.0 + 1.0
 }
 
-pub(crate) fn model_spec<A>(g: &rs::Group<A>, tw: TextWidth) -> Spec {
+pub(crate) fn model_spec<A: 'static>(g: &rs::Group<A>, tw: TextWidth) -> Spec {
     Spec {
         priority: g.priority,
         full: model_group_w(g, false, tw),
