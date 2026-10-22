@@ -2788,10 +2788,35 @@ impl Editor {
         }
     }
 
-    /// Increase/decrease the left indent of the selected paragraphs by `delta`
-    /// twips (clamped at 0).
+    /// Increase/decrease the indent of the selected paragraphs by `delta`:
+    /// the left indent in twips (clamped at 0) for a plain paragraph, the list
+    /// level (`ilvl`, clamped to 0..=8) one step for a list item.
+    ///
+    /// A list item keeps its direct `w:ind` untouched: the level's own indent
+    /// (`left = 720 * (ilvl + 1)`) moves it, and a direct left indent written
+    /// here would beat the level's and strand the item. So an item that
+    /// carries a direct `w:ind` of its own (loaded from a document) changes
+    /// level without moving visually. A selection of list items all already
+    /// at the limit changes nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
+        let step = delta.signum();
+        let paths = self.selected_para_paths();
+        let moves =
+            |p: &ParProps| -> bool { p.num_id.is_none() || (p.ilvl + step).clamp(0, 8) != p.ilvl };
+        let mut any = false;
+        for path in &paths {
+            if let Some(p) = para_mut(&mut self.doc.body, path) {
+                any |= moves(&p.props);
+            }
+        }
+        if !any && !paths.is_empty() {
+            return;
+        }
         self.for_each_para(|pr| {
+            if pr.num_id.is_some() {
+                pr.ilvl = (pr.ilvl + step).clamp(0, 8);
+                return;
+            }
             pr.indent = (pr.indent + delta).max(0);
             // The loaded left indent goes, character units included: a
             // decrease clamped to zero twips must still clear `w:leftChars`.
@@ -6759,6 +6784,68 @@ mod tests {
         assert!(ed.all_in_list(42));
         ed.set_list(None);
         assert!(!ed.all_in_list(42));
+    }
+
+    #[test]
+    fn indent_on_a_list_item_steps_its_level_not_its_indent() {
+        let mut ed = Editor::new(doc(&["a", "b"]));
+        ed.select_all();
+        ed.set_list(Some(42));
+        ed.change_indent(720);
+        for b in &ed.doc.body {
+            if let Block::Paragraph(p) = b {
+                assert_eq!((p.props.ilvl, p.props.indent), (1, 0));
+            }
+        }
+        for _ in 0..20 {
+            ed.change_indent(720);
+        }
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.props.ilvl, 8);
+        ed.change_indent(-720);
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!((p.props.ilvl, p.props.indent), (7, 0));
+        for _ in 0..20 {
+            ed.change_indent(-720);
+        }
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.props.ilvl, 0);
+    }
+
+    #[test]
+    fn indent_at_the_list_limit_records_no_undo_step_and_mixed_selection_is_one_step() {
+        let mut ed = Editor::new(doc(&["a", "b"]));
+        ed.caret = Caret::at(vec![0], 0);
+        ed.set_list(Some(42));
+        let before = ed.doc.clone();
+        ed.select_all();
+        // b is not a list item, so a mixed selection moves; each by its rule.
+        ed.change_indent(720);
+        let (Block::Paragraph(a), Block::Paragraph(b)) = (&ed.doc.body[0], &ed.doc.body[1]) else {
+            panic!()
+        };
+        assert_eq!((a.props.ilvl, a.props.indent), (1, 0));
+        assert_eq!((b.props.ilvl, b.props.indent), (0, 720));
+        ed.undo();
+        assert_eq!(ed.doc, before, "one undo restores both");
+
+        // Decrease on a list at level 0: nothing changes, no step recorded.
+        ed.caret = Caret::at(vec![0], 0);
+        ed.change_indent(-720);
+        ed.undo();
+        let Block::Paragraph(a) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(
+            a.props.num_id, None,
+            "the no-op added no step: undo reached set_list"
+        );
     }
 
     #[test]
