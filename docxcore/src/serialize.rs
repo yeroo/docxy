@@ -499,6 +499,16 @@ pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: 
     });
 }
 
+/// Whether a shadow element `local` still carries any of `attrs`.
+pub(crate) fn shadow_has_attr(shadow: &[String], local: &str, attrs: &[&str]) -> bool {
+    shadow.iter().any(|raw| {
+        local_name(raw) == local
+            && element_attrs_of(raw)
+                .iter()
+                .any(|(n, _)| attrs.contains(&n.as_str()))
+    })
+}
+
 /// The decoded attributes of the start tag `raw` begins with.
 fn element_attrs_of(raw: &str) -> Vec<(String, String)> {
     let mut p = XmlParser::new(raw);
@@ -784,6 +794,34 @@ pub(crate) fn ppr_base_xml(props: &ParProps) -> String {
     out
 }
 
+/// An edited `w:numPr`. A loaded element keeps its own start tag (the
+/// namespace declarations the loader moved onto it) and the children the
+/// model does not carry (`w:numberingChange`, a tracked-insertion `w:ins`),
+/// after the new `w:ilvl` and `w:numId` (CT_NumPr order).
+fn numpr_xml(ilvl: i32, num_id: i32, loaded: Option<&str>) -> String {
+    let new = format!("<w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/>");
+    let Some(raw) = loaded.map(str::trim) else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    let Some(open) = crate::inspect::tag_end(raw) else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    if let Some(head) = raw[..open].strip_suffix("/>") {
+        // No children to keep; the start tag's declarations stay.
+        return format!("{head}>{new}</w:numPr>");
+    }
+    let Some(close) = raw.rfind("</") else {
+        return format!("<w:numPr>{new}</w:numPr>");
+    };
+    let mut rest = raw[open..close.max(open)].to_string();
+    for name in ["w:ilvl", "w:numId"] {
+        while let Some((a, b, _)) = crate::inspect::find_element_from(&rest, name, 0) {
+            rest.replace_range(a..b, "");
+        }
+    }
+    format!("{}{new}{rest}</w:numPr>", &raw[..open])
+}
+
 fn write_ppr(s: &mut String, props: &ParProps) {
     // Effective paragraph style: explicit style, else a synthesized heading style.
     let style = props
@@ -870,10 +908,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     if let Some(num) = props.num_id.filter(|_| !kept(PprGroup::Num)) {
         parts.push((
             ppr_rank("numPr"),
-            format!(
-                "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-                props.ilvl, num
-            ),
+            numpr_xml(props.ilvl, num, shadow.find("numPr")),
         ));
     }
     if (props.borders.top.is_some() || props.borders.bottom.is_some()) && !kept(PprGroup::Borders) {

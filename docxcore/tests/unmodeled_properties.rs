@@ -945,3 +945,96 @@ fn decrease_indent_to_zero_clears_a_character_unit_left_indent() {
     );
     assert!(!xml.contains("leftChars"), "{xml}");
 }
+
+/// A loaded list item whose `w:ind` has a left attribute of value 0 (or only
+/// character units) still carries a direct indent that beats its level's, so
+/// Increase Indent moves that indent instead of stepping `ilvl` (#1653).
+#[test]
+fn increase_indent_on_a_loaded_list_item_with_a_zero_left_moves_the_indent() {
+    for ind in ["<w:ind w:left=\"0\"/>", "<w:ind w:leftChars=\"0\"/>"] {
+        let body = format!(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/></w:numPr>{ind}</w:pPr>\
+             <w:r><w:t>item</w:t></w:r></w:p>"
+        );
+        let xml = edited(&body, |e| e.change_indent(720));
+        let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
+        assert!(ppr.contains("<w:ilvl w:val=\"0\"/>"), "{ind}: {ppr}");
+        assert!(ppr.contains("<w:ind w:left=\"720\"/>"), "{ind}: {ppr}");
+    }
+}
+
+/// Stepping a list item's level rewrites its `w:numPr`; the tracked-numbering
+/// `w:ins` it was loaded with stays, after `w:ilvl` and `w:numId` (#1653).
+#[test]
+fn increase_indent_on_a_list_item_keeps_its_numbering_insertion() {
+    let body = "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains(
+            "<w:numPr><w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>\
+             <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\"/></w:numPr>"
+        ),
+        "{xml}"
+    );
+    assert!(!xml.contains("<w:ind"), "{xml}");
+}
+
+#[test]
+fn increase_indent_with_an_out_of_range_level_does_not_panic() {
+    for lvl in ["2147483647", "-5"] {
+        let body = format!(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"{lvl}\"/><w:numId w:val=\"3\"/></w:numPr></w:pPr>\
+             <w:r><w:t>item</w:t></w:r></w:p>"
+        );
+        for delta in [720, -720] {
+            let xml = edited(&body, |e| e.change_indent(delta));
+            assert!(xml.contains("<w:numId w:val=\"3\"/>"), "{lvl}: {xml}");
+        }
+    }
+}
+
+/// Only a left attribute keeps the indent path: a hanging-only `w:ind` stays
+/// as loaded while the level steps.
+#[test]
+fn increase_indent_on_a_list_item_with_only_a_hanging_indent_steps_the_level() {
+    let body = "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/></w:numPr>\
+        <w:ind w:hanging=\"360\"/></w:pPr><w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(xml.contains("<w:ilvl w:val=\"1\"/>"), "{xml}");
+    assert!(xml.contains("<w:ind w:hanging=\"360\"/>"), "{xml}");
+}
+
+/// The loaded `w:numPr` start tag (and the declarations on it) survives a
+/// level step, so a kept child's prefix stays bound.
+#[test]
+fn increase_indent_keeps_the_numpr_start_tag_declarations() {
+    let body = "<w:p><w:pPr><w:numPr xmlns:x=\"urn:x\"><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains(
+            "<w:numPr xmlns:x=\"urn:x\"><w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>\
+             <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr>"
+        ),
+        "{xml}"
+    );
+}
+
+#[test]
+fn increase_indent_keeps_a_declaration_from_the_ancestor_ppr() {
+    let body = "<w:p><w:pPr xmlns:x=\"urn:x\"><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\" x:a=\"1\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains("<w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>"),
+        "{xml}"
+    );
+    assert!(xml.contains("x:a=\"1\""), "{xml}");
+    // `x` is declared on the pPr or the numPr or the ins itself.
+    let ppr = &xml[xml.find("<w:pPr").unwrap()..xml.find("</w:pPr>").unwrap()];
+    assert!(ppr.contains("xmlns:x=\"urn:x\""), "{xml}");
+}

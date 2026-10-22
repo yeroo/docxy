@@ -693,6 +693,18 @@ pub enum IndentSide {
 }
 
 impl ParProps {
+    /// Whether a left indent attribute (`w:left`, `w:start` or their
+    /// character units) was loaded and not since replaced, whatever its value.
+    pub fn has_loaded_left_indent(&self) -> bool {
+        crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_LEFT)
+    }
+
+    /// Whether the paragraph is a list item: a `w:numId` of 0 means "no
+    /// numbering" in OOXML, as in `numbering.rs`.
+    pub fn in_list(&self) -> bool {
+        self.num_id.is_some_and(|n| n != 0)
+    }
+
     /// Call after setting indents explicitly. The loaded `w:ind` loses every
     /// attribute that sets one of `sides`, in twips or in character units
     /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents
