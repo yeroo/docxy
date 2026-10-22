@@ -1607,14 +1607,15 @@ struct App {
     /// since the document was opened (#620), and each one Delete Comment
     /// took all the markers of (#971). Their records live here, not in
     /// `pkg`: one is in `comments` and is saved only while a marker with its
-    /// id is in the body or a header or footer
+    /// id is in the body or a header, footer, footnote or endnote part
     /// ([`App::comment_marker_ids_everywhere`]), so undoing Add Comment
     /// removes it, undoing Delete Comment brings it back, and redo goes the
     /// other way. A Save keeps it; an open, or a Save As (which reloads the
     /// document and its undo history), clears it.
     tracked_comments: std::collections::BTreeMap<String, TrackedComment>,
-    /// The markers Delete Comment (or Delete All) took out of the header and
-    /// footer parts of `pkg` that were not being edited (#981): one record
+    /// The markers Delete Comment (or Delete All) took out of the header,
+    /// footer, footnote and endnote parts of `pkg` that were not being
+    /// edited (#981, #1692): one record
     /// per part, its original text and the comments whose markers went.
     /// [`App::sync_stripped_hf`] keeps each comment's markers in while it is
     /// anchored and out while it is not, in whatever order undo and redo
@@ -3245,8 +3246,8 @@ impl App {
     /// The next free comment id (max existing + 1).
     fn next_comment_id(&self) -> i32 {
         // An undone comment keeps its id: redo brings it back. Ids whose
-        // markers are in the body, a header or a footer are taken too (an
-        // orphan's): a new comment sharing one would stay live after its
+        // markers are in the body, a header, a footer, a footnote or an
+        // endnote are taken too (an orphan's): a new comment sharing one would stay live after its
         // own undo.
         let marked = self.comment_marker_ids_everywhere();
         self.comments
@@ -3275,7 +3276,7 @@ impl App {
     /// Commit the new comment: wrap the selection in markers (one undo step)
     /// and add it to the live panel. Each save writes it to comments.xml
     /// while its markers are in the body, or the header or footer it was
-    /// made in ([`App::reconcile_tracked_comments`]).
+    /// made in, or a note part ([`App::reconcile_tracked_comments`]).
     fn commit_comment(&mut self) {
         if self
             .comment_input
@@ -3414,8 +3415,8 @@ impl App {
         self.sync_page_parts();
     }
 
-    /// Follow the body's undo and redo in the stored header and footer
-    /// parts: a comment's markers are in while it is anchored, out while it
+    /// Follow the body's undo and redo in the stored header, footer,
+    /// footnote and endnote parts: a comment's markers are in while it is anchored, out while it
     /// is not, whatever order the steps come in. A part that moved on since,
     /// or is being edited now, stays as it is: the comment then has no
     /// markers there, and no marker is left without its comment.
@@ -3434,7 +3435,8 @@ impl App {
     }
 
     /// Show a tracked comment only while a marker with its id is in the
-    /// body or a header or footer: undo of Add Comment hides it, undo of
+    /// body or a header, footer, footnote or endnote part: undo of Add
+    /// Comment hides it, undo of
     /// Delete Comment shows it again, where it was. Untracked comments
     /// (loaded and never deleted) are never touched.
     fn sync_tracked_comments(&mut self) {
@@ -3528,7 +3530,8 @@ impl App {
     }
 
     /// What follows a comment whose markers were just taken: one anchored
-    /// only in a header or footer not being edited (`outright`) has no
+    /// only in a header, footer, footnote or endnote part not being edited
+    /// (`outright`) has no
     /// step an undo could undo, so it goes from `pkg` now; otherwise its
     /// record stays, tracked, so the save leaves it out and an undo brings
     /// it back whole (#971). `index` is where it sat in `comments`.
@@ -3572,9 +3575,9 @@ impl App {
     /// Delete the navigation-selected comment: its markers (one undo step)
     /// and its panel entry. Its record stays, tracked, so the save leaves it
     /// out and an undo brings it back whole (#971). Its markers in the
-    /// headers and footers not being edited are taken too, and come back
-    /// with the body's undo ([`App::sync_stripped_hf`]); a comment anchored
-    /// only in such a part has no step to undo, so it is removed from `pkg`
+    /// headers, footers, footnotes and endnotes not being edited are taken
+    /// too, and come back with the body's undo
+    /// ([`App::sync_stripped_hf`]); a comment anchored only in such a part has no step to undo, so it is removed from `pkg`
     /// now.
     fn delete_comment(&mut self) {
         if self.comments.is_empty() {
@@ -3596,7 +3599,7 @@ impl App {
         if self.hf_edit.is_some() {
             self.editor.remove_comment_markers(&c.id);
         }
-        // The other headers' and footers' too, which no step covers: an undo
+        // The other headers', footers' and notes' too, which no step covers: an undo
         // puts them back with the body's ([`App::sync_stripped_hf`]).
         self.strip_stored_hf(&[&c.id], anchored);
         self.keep_deleted_comment(&c, idx, stored && !anchored);
@@ -14530,10 +14533,11 @@ mod tests {
         }
     }
 
-    /// #1692: a comment anchored only in a note stays live through a save,
-    /// and deleting it from the panel leaves no marker and no comment text.
+    /// #1692: a comment anchored only in a note, deleted from the panel,
+    /// leaves no marker and no comment text. (It is not tracked, so its
+    /// liveness is `tracked_comment_anchored_only_in_a_note_stays_live`'s.)
     #[test]
-    fn note_only_comment_is_live_and_its_delete_leaves_no_orphan() {
+    fn delete_of_a_note_only_comment_leaves_no_orphan() {
         for part in ["word/footnotes.xml", "word/endnotes.xml"] {
             let mut app = with_note_markers(app_with_rich_comments(2), part, &["9"]);
             app.comments.push(docxcore::comments::Comment {
@@ -14558,6 +14562,33 @@ mod tests {
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
             assert!(!notes.contains("w:id=\"9\""), "{part}: {notes}");
             assert!(!comments.contains("in the note"), "{part}: {comments}");
+        }
+    }
+
+    /// #1692: a tracked comment (Delete Comment, then undo) whose body
+    /// markers are gone but whose note markers remain is live: the save keeps
+    /// its comments.xml entry and the note keeps its markers, instead of the
+    /// entry being dropped from under them.
+    #[test]
+    fn tracked_comment_anchored_only_in_a_note_stays_live() {
+        for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+            let mut app = with_note_markers(app_with_rich_comments(2), part, &["1"]);
+            app.comment_sel = 0;
+            app.run_act(ribbon::Act::DeleteComment);
+            app.on_key(ctrl(KeyCode::Char('z')));
+            assert_eq!(comment_ids(&app), ["1", "2"], "{part}");
+            assert!(app.tracked_comments.contains_key("1"), "{part}: tracked");
+            // The body loses the markers with no step the note could follow.
+            app.body_editor_mut().remove_comment_markers("1");
+            assert!(!app.anchor_marker_ids().contains("1"), "{part}");
+            assert!(app.comment_marker_ids_everywhere().contains("1"), "{part}");
+            let path = save_to_temp(&mut app, "cmt-note-tracked-live");
+            let notes = saved_part(&path, part);
+            let (doc, comments) = saved_parts(&path);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            assert!(!doc.contains("w:id=\"1\""), "{part}: {doc}");
+            assert_eq!(notes.matches("w:id=\"1\"").count(), 3, "{part}: {notes}");
+            assert!(comments.contains(RICH_COMMENT), "{part}: {comments}");
         }
     }
 
