@@ -446,3 +446,91 @@ fn replace_project_starts_below_a_uid_0_row_whose_summary_flag_is_recomputed() {
     assert!(ed.project().tasks[0].is_project_summary());
     assert_eq!(ed.sel(), 1);
 }
+
+fn levels(ed: &Editor) -> Vec<u32> {
+    ed.project().tasks.iter().map(|t| t.outline_level).collect()
+}
+
+#[test]
+fn indent_moves_the_whole_subtree_and_skips_blank_rows() {
+    let mut proj = plan().project().clone();
+    proj.tasks[1].wbs = Some("2".into());
+    proj.tasks[4].wbs = Some("2.2.1".into());
+    let mut ed = Editor::new(proj);
+    // S { S1, T { T1 }, blank, S2 } follows A, so S can go under A.
+    ed.indent(2, 1).unwrap();
+    assert_eq!(levels(&ed), [1, 2, 3, 3, 4, 0, 3, 1]);
+    assert!(ed.project().tasks[5].is_null);
+    assert_eq!(ed.project().tasks[1].wbs.as_deref(), Some("1.1"));
+    assert_eq!(ed.project().tasks[4].wbs.as_deref(), Some("1.1.2.1"));
+    assert!(ed.project().tasks[0].summary && ed.project().tasks[1].summary);
+}
+
+#[test]
+fn outdent_moves_the_whole_subtree() {
+    let mut ed = outline(&[(1, "P", 1), (2, "S", 2), (3, "S1", 3), (4, "S2", 4)]);
+    ed.indent(2, -1).unwrap();
+    assert_eq!(levels(&ed), [1, 1, 2, 3]);
+}
+
+#[test]
+fn outdent_makes_following_siblings_children() {
+    let mut ed = outline(&[(1, "P", 1), (2, "S", 2), (3, "S1", 3), (4, "X", 2)]);
+    ed.indent(2, -1).unwrap();
+    assert_eq!(levels(&ed), [1, 1, 2, 2]);
+    assert!(ed.project().tasks[1].summary, "X is now under S");
+}
+
+#[test]
+fn indent_clamps_the_deepest_descendant_at_20_keeping_relative_depth() {
+    let mut ed = outline(&[(1, "A", 1), (2, "S", 18), (3, "S1", 19), (4, "S2", 20)]);
+    ed.indent(2, 5).unwrap();
+    assert_eq!(levels(&ed), [1, 18, 19, 20], "already at the limit");
+    let mut ed = outline(&[(1, "A", 1), (2, "S", 17), (3, "S1", 18), (4, "S2", 19)]);
+    ed.indent(2, 5).unwrap();
+    assert_eq!(levels(&ed), [1, 18, 19, 20]);
+}
+
+#[test]
+fn outdent_clamps_the_row_at_1_keeping_relative_depth() {
+    let mut ed = outline(&[(1, "S", 2), (2, "S1", 3)]);
+    ed.indent(1, -5).unwrap();
+    assert_eq!(levels(&ed), [1, 2]);
+}
+
+#[test]
+fn indenting_a_subtree_is_one_undo_step() {
+    let mut ed = plan();
+    let before = levels(&ed);
+    ed.indent(2, 1).unwrap();
+    assert!(ed.undo());
+    assert_eq!(levels(&ed), before);
+    assert!(
+        !ed.undo() || levels(&ed) == before,
+        "no second step was recorded"
+    );
+}
+
+#[test]
+fn indent_moves_a_collapsed_summarys_hidden_rows() {
+    let mut ed = plan();
+    ed.set_collapsed(2, true).unwrap();
+    ed.indent(2, 1).unwrap();
+    assert_eq!(levels(&ed), [1, 2, 3, 3, 4, 0, 3, 1]);
+}
+
+#[test]
+fn indenting_a_leaf_is_unchanged() {
+    let mut ed = plan();
+    ed.indent(8, 1).unwrap();
+    assert_eq!(levels(&ed), [1, 1, 2, 2, 3, 0, 2, 2]);
+}
+
+#[test]
+fn indenting_a_subtree_drops_a_link_that_becomes_ancestor_to_descendant() {
+    let mut ed = outline(&[(1, "A", 1), (2, "S", 1), (3, "S1", 2)]);
+    ed.add_link(3, Predecessor::fs(1)).unwrap();
+    // A becomes the parent of S and so of S1: the link to A is dropped.
+    ed.indent(2, 1).unwrap();
+    assert!(ed.project().task(3).unwrap().predecessors.is_empty());
+}

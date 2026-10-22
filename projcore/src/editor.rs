@@ -944,12 +944,27 @@ impl Editor {
         Ok(removed)
     }
 
+    /// Indent (`delta > 0`) or outdent the row together with its subtree, as
+    /// Project does: every descendant moves by the row's own effective shift,
+    /// so relative depth is kept. The row stops at level 1, and at 20 for its
+    /// deepest descendant.
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         self.refuse_while_sorted()?;
         let i = self.index(uid)?;
         self.edit_row(i, |proj, _| {
-            let t = &mut proj.tasks[i];
-            t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
+            let end = outline::subtree_end_in(&proj.tasks, i);
+            let rows = &mut proj.tasks[i..end];
+            let old = i64::from(rows[0].outline_level);
+            let deepest = rows
+                .iter()
+                .filter(|t| !t.is_null)
+                .map(|t| i64::from(t.outline_level))
+                .max()
+                .unwrap_or(old);
+            let shift = i64::from(delta).clamp(1 - old, 20 - deepest);
+            for t in rows.iter_mut().filter(|t| !t.is_null) {
+                t.outline_level = (i64::from(t.outline_level) + shift) as u32;
+            }
         })
     }
 
@@ -3018,7 +3033,7 @@ mod tests {
                 assert_unchanged(&mut ed, |ed| {
                     assert!(ed.delete_task(2).unwrap_err().contains("Closed"));
                     assert!(ed.indent(2, -1).unwrap_err().contains("Closed"));
-                    assert!(ed.indent(1, 1).unwrap_err().contains("Closed"));
+                    // Indenting Phase moves Build with it, so no summary is lost.
                     assert!(
                         ed.update_task(
                             2,
