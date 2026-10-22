@@ -262,8 +262,8 @@ pub struct RibbonGroup {
     pub after: String,
     /// The collapse priority (0 to 255, as the built-in groups' run to 200; lower
     /// collapses first) of a new
-    /// group; absent, it takes the priority of the built-in group it sits
-    /// beside (`before`, else `after`), else 50 (#1685).
+    /// group; absent, it takes the priority of the group (built-in or already
+    /// contributed) named by `before`, else `after`, else 50 (#1685).
     pub priority: Option<u8>,
 }
 

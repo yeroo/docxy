@@ -674,7 +674,8 @@
 - A contributed ribbon group's collapse priority (#1685): `RibbonGroup.priority`
   (JSON `priority`, 0 to 255 as the built-ins' run to 200, clamped, a
   non-number is absent); a new group without one takes the priority of the
-  built-in group named by `before`, else `after`, else 50; joining a built-in
+  group (built-in or already contributed) named by `before`, else `after`,
+  else 50; joining a built-in
   group changes nothing. Contributed small buttons stack three deep
   (`controls_of`) and a label over `CONTRIB_LABEL_MAX` (24 characters) is cut
   with an ellipsis at construction, its full text the tip, so the estimate

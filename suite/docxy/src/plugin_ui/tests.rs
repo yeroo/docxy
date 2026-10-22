@@ -678,15 +678,20 @@ fn a_contributed_group_takes_a_declared_priority_else_its_neighbours_else_50() {
 fn a_declared_priority_moves_the_group_in_the_collapse_order() {
     let task = extended(
         r##"{"ribbon":[{"tab":"Task","groups":[
-          {"title":"Early","priority":0,"controls":[{"id":"e.a","kind":"button","label":"A"}]}]}]}"##,
+          {"title":"Early","priority":0,"before":"Clipboard","controls":[{"id":"e.a","kind":"button","label":"A"}]},
+          {"title":"Late","priority":255,"controls":[{"id":"l.a","kind":"button","label":"A"}]}]}]}"##,
     );
     let specs: Vec<ribbon_fit::Spec> = task
         .groups
         .iter()
         .map(|g| ribbon_fit::model_spec(g, &ribbon_fit::approx_tw))
         .collect();
-    let early = task.groups.len() - 1;
-    // Squeezed just below the full width, the lowest priority goes first.
+    let at = |t: &str| task.groups.iter().position(|g| g.title == t).unwrap();
+    let (early, late) = (at("Early"), at("Late"));
+    assert_eq!((early, late), (0, task.groups.len() - 1));
+    // Squeezed just below the full width, the lowest priority goes first
+    // (the leftmost group), though the appended one would, at the default 50
+    // and last place, and the highest stays full.
     let full: f32 = specs.iter().map(|s| s.full).sum();
     let fit = ribbon_fit::fit_with(
         &specs,
@@ -694,6 +699,7 @@ fn a_declared_priority_moves_the_group_in_the_collapse_order() {
         ribbon_fit::Policy::WholeGroups,
     );
     assert_eq!(fit.states[early], ribbon_fit::State::Collapsed);
+    assert_eq!(fit.states[late], ribbon_fit::State::Full);
     // Wide again: every group is full, nothing stays collapsed (#1685).
     let fit = ribbon_fit::fit_with(
         &specs,
@@ -768,4 +774,59 @@ fn a_swatch_gallerys_estimate_is_the_width_it_draws() {
     let (k, w) =
         ribbon_fit::gallery_row(ribbon_fit::gallery_geom(gal), gal.items.len(), Some(300.0));
     assert_eq!(w, k as f32 * t.w + (k as f32 - 1.0) * t.gap);
+}
+
+#[test]
+fn a_cut_label_keeps_its_full_text_and_the_plugins_tip() {
+    let long = "A very long contributed label that would stretch its column";
+    let json = format!(
+        r##"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"Cut","controls":[
+          {{"id":"c.a","kind":"button","label":"{long}","tip":"What it does"}}]}}]}}]}}"##
+    );
+    let task = extended(&json);
+    let Control::Column(cs) = &task.groups.last().unwrap().items[0] else {
+        panic!("a column");
+    };
+    assert_eq!(cs[0].label.chars().count(), CONTRIB_LABEL_MAX);
+    assert_eq!((cs[0].tip.title, cs[0].tip.body), (long, "What it does"));
+}
+
+#[test]
+fn a_replacement_in_a_column_is_capped_but_a_large_one_keeps_its_label() {
+    let long = "A very long contributed label that would stretch its column";
+    let json = format!(
+        r##"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"Anywhere","controls":[
+          {{"id":"pr-indent","kind":"button","label":"{long}"}},
+          {{"id":"pr-paste","kind":"button","label":"{long}","large":true}}]}}]}}]}}"##
+    );
+    let task = extended(&json);
+    let find = |id: &str| {
+        task.groups
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .find_map(|c| match c {
+                Control::Column(cs) => cs.iter().find(|c| c.id == id),
+                Control::Large(c) if c.id == id => Some(c),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let indent = find("pr-indent");
+    assert_eq!(indent.label.chars().count(), CONTRIB_LABEL_MAX);
+    assert_eq!(indent.tip.title, long);
+    assert_eq!(find("pr-paste").label, long);
+}
+
+#[test]
+fn a_plugin_gallery_named_like_table_styles_is_not_a_swatch_gallery() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[{"title":"T","controls":[
+          {"id":"tablestyles","kind":"gallery","label":"T","swatches":[{"id":"t.a","label":"A","color":"#3366CC"}]}]}]}]}"##,
+    );
+    let Control::Gallery(gal) = &task.groups.last().unwrap().items[0] else {
+        panic!("a gallery");
+    };
+    assert_eq!(gal.id, "tablestyles");
+    assert!(!is_swatch_gallery(gal));
+    assert_eq!(ribbon_fit::gallery_geom(gal).frame, 6.0);
 }
