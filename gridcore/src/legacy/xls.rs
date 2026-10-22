@@ -1468,7 +1468,6 @@ fn read_sheet(
     Ok(sheet)
 }
 
-/// Whether two margins (inches) are the same, as Excel rounds them.
 /// Whether a COLINFO width is the sheet's default: its STANDARDWIDTH, or
 /// else DEFCOLWIDTH's characters plus the padding (Excel writes 8
 /// characters as 2194). The reader drops such a width unless fUserSet
@@ -1485,6 +1484,7 @@ pub(super) fn is_default_coldx(
     }
 }
 
+/// Whether two margins (inches) are the same, as Excel rounds them.
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
