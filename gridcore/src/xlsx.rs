@@ -400,6 +400,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         sheet.sort_state = sheet_sort_state_span(&xml)
             .and_then(|(s, _)| attr_at(&xml, s, "ref"))
             .and_then(crate::sheet::parse_range_name);
+        sheet.sort_state_edits.clear();
         let sheet_idx = sheets.len();
         if let Some(af) = crate::filter::parse_auto_filter(&xml, &styles.dxfs) {
             auto_filters.push((sheet_idx, af));
@@ -5016,7 +5017,7 @@ fn splice_worksheet(
     let out = set_auto_filter(out, sheet.auto_filter.as_ref(), dxfs, dxf_for);
     let out = set_filter_mode(out, sheet.filter_mode);
     // The sheet-level sortState: kept, moved with the grid, or dropped.
-    let out = set_sort_state(out, sheet.sort_state);
+    let out = set_sort_state(out, sheet.sort_state, &sheet.sort_state_edits);
     // Conditional formatting and data validation: likewise.
     let out = set_cond_formats(out, sheet);
     let out = set_validations(out, sheet);
@@ -5915,9 +5916,17 @@ fn sheet_sort_state_span(xml: &str) -> Option<(usize, usize)> {
 /// left alone while it holds that range (or its `ref` isn't a range), moved
 /// when the model's range is the same size elsewhere (a structural edit
 /// translated it: its `ref` and each `<sortCondition ref>` shift by the same
-/// rows and columns), and dropped otherwise, as the model drops it when an
-/// edit changed its size.
-fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> String {
+/// rows and columns), and dropped otherwise, as the model drops it when a
+/// delete through it or an insert off the sheet ended it. With `edits` (the model's log of the structural
+/// edits since load, see [`crate::sheet::Sheet::sort_state_edits`]) the loaded
+/// range and every condition are carried through them in order, so an insert
+/// inside the range widens it and the conditions it spans; the result must be
+/// the model's range, else the element goes.
+fn set_sort_state(
+    mut xml: String,
+    model: Option<(u32, u32, u32, u32)>,
+    edits: &[crate::formula::EditShift],
+) -> String {
     let Some((start, end)) = sheet_sort_state_span(&xml) else {
         return xml;
     };
@@ -5925,10 +5934,27 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
     let Some(held) = attr_at(&element, 0, "ref").and_then(crate::sheet::parse_range_name) else {
         return xml;
     };
-    let same_size = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
-        r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1
+    let replay = |(mut r1, mut c1, mut r2, mut c2): (u32, u32, u32, u32)| {
+        for e in edits {
+            let (a, b) = if e.rows {
+                (&mut r1, &mut r2)
+            } else {
+                (&mut c1, &mut c2)
+            };
+            *a = crate::edit::point(*a, e)?;
+            *b = crate::edit::point(*b, e)?;
+        }
+        Some((r1, c1, r2, c2))
     };
-    let Some((r1, c1, r2, c2)) = model.filter(|&m| same_size(m)) else {
+    let target = if edits.is_empty() {
+        let same_size = |(r1, c1, r2, c2): (u32, u32, u32, u32)| {
+            r2 - r1 == held.2 - held.0 && c2 - c1 == held.3 - held.1
+        };
+        model.filter(|&m| same_size(m))
+    } else {
+        replay(held).filter(|&m| Some(m) == model)
+    };
+    let Some((r1, c1, r2, c2)) = target else {
         return remove_worksheet_child(&xml, "sortState");
     };
     let dr = i64::from(r1) - i64::from(held.0);
@@ -5936,7 +5962,7 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
     // Each condition moves with the range and must stay inside it (and on
     // the sheet); one that doesn't, or doesn't read as a range, can't be kept
     // honest, so the whole element goes. Also for a range that didn't move.
-    let mut edits: Vec<(usize, String)> = Vec::new();
+    let mut edits_out: Vec<(usize, String)> = Vec::new();
     for (name, s, _) in element_children(&element) {
         if name != "sortCondition" {
             continue;
@@ -5944,7 +5970,11 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
         let moved = attr_at(&element, s, "ref")
             .and_then(crate::sheet::parse_range_name)
             .filter(|&(a, b, c, d)| a >= held.0 && b >= held.1 && c <= held.2 && d <= held.3)
-            .and_then(|(a, b, c, d)| {
+            .and_then(|rect| {
+                if !edits.is_empty() {
+                    return replay(rect);
+                }
+                let (a, b, c, d) = rect;
                 let m = |v: u32, d: i64, max: u32| {
                     u32::try_from(i64::from(v) + d).ok().filter(|&x| x < max)
                 };
@@ -5954,11 +5984,12 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
                     m(c, dr, 1_048_576)?,
                     m(d, dc, 16_384)?,
                 ))
-            });
+            })
+            .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2);
         match moved {
             Some((a, b, c, d)) => {
-                if (dr, dc) != (0, 0) {
-                    edits.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))));
+                if (dr, dc) != (0, 0) || !edits.is_empty() {
+                    edits_out.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))));
                 }
             }
             None => return remove_worksheet_child(&xml, "sortState"),
@@ -5968,7 +5999,7 @@ fn set_sort_state(mut xml: String, model: Option<(u32, u32, u32, u32)>) -> Strin
         return xml;
     }
     let mut block = element;
-    for (s, r) in edits.into_iter().rev() {
+    for (s, r) in edits_out.into_iter().rev() {
         block = set_tag_attr(&block, s, "ref", Some(&r));
     }
     let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
@@ -10550,6 +10581,17 @@ impl SheetPackage {
                 d.formula = text;
             }
         }
+        // Another sheet's kept Consolidate references to it read a bare
+        // `#REF!` too, as a defined name does (a deleted source area on a
+        // sheet that stays is `Sheet!#REF!`). `consolidate_loaded` stays as loaded,
+        // so the save sees the difference and rewrites the element.
+        crate::edit::for_each_consolidate_ref(&mut self.workbook, |text| {
+            let rewrite =
+                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            if let Some(updated) = crate::formula::rewrite_defined_name(text, rewrite, None) {
+                *text = updated;
+            }
+        });
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
         let active = &mut self.workbook.active_tab;
@@ -20462,11 +20504,9 @@ mod print_setup_tests {
     #[test]
     fn sheet_sort_state_is_dropped_when_an_edit_changes_its_size() {
         type Edit = fn(&mut Workbook);
-        let cases: [(&str, Edit); 7] = [
-            ("insert inside", |w| insert_rows(w, 0, 4, 1)),
+        let cases: [(&str, Edit); 5] = [
             ("delete inside", |w| delete_rows(w, 0, 4, 1)),
             ("delete all", |w| delete_rows(w, 0, 0, 20)),
-            ("column inside", |w| insert_cols(w, 0, 1, 1)),
             ("column delete inside", |w| delete_cols(w, 0, 1, 1)),
             ("overlapping top", |w| delete_rows(w, 0, 0, 3)),
             ("off the sheet", |w| insert_rows(w, 0, 0, 1_048_576 - 8)),
@@ -20475,6 +20515,119 @@ mod print_setup_tests {
             let (ws, _) = edited("", SORT, edit);
             assert!(!ws.contains("sortState"), "{what}: {ws}");
         }
+    }
+
+    const GROW: &str = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B9"/></sortState>"#;
+
+    #[test]
+    fn sort_state_grows_on_row_insert_inside_range() {
+        let mut pkg = report("", GROW);
+        insert_rows(&mut pkg.workbook, 0, 4, 2);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, Some((0, 0, 10, 2)));
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C11"><sortCondition ref="B2:B11"/></sortState>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].sort_state, Some((0, 0, 10, 2)));
+    }
+
+    #[test]
+    fn sort_state_grows_on_column_insert_inside_range() {
+        let (ws, _) = edited("", GROW, |w| insert_cols(w, 0, 1, 1));
+        assert!(
+            ws.contains(r#"<sortState ref="A1:D9"><sortCondition ref="C2:C9"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_row_insert_widens_a_spanning_condition_and_spares_one_above() {
+        // The insert is before row 4 (index 3): B2:B3 ends above it and stays,
+        // A2:A9 spans it and widens.
+        let two = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A9"/></sortState>"#;
+        let (ws, _) = edited("", two, |w| insert_rows(w, 0, 3, 2));
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C11"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A11"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_grow_translate_above_grow_again() {
+        let (ws, _) = edited("", GROW, |w| {
+            insert_rows(w, 0, 4, 2);
+            insert_rows(w, 0, 0, 3);
+            insert_rows(w, 0, 7, 1);
+        });
+        assert!(
+            ws.contains(r#"<sortState ref="A4:C15"><sortCondition ref="B5:B15"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_delete_entirely_above_after_grow() {
+        let at5 = r#"<sortState ref="A5:C9"><sortCondition ref="B5:B9"/></sortState>"#;
+        let (ws, _) = edited("", at5, |w| {
+            insert_rows(w, 0, 6, 1);
+            delete_rows(w, 0, 0, 2);
+        });
+        assert!(
+            ws.contains(r#"<sortState ref="A3:C8"><sortCondition ref="B3:B8"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_insert_after_range_leaves_conditions() {
+        let (ws, _) = edited("", GROW, |w| insert_rows(w, 0, 9, 2));
+        assert!(ws.contains(GROW), "{ws}");
+        let (ws, _) = edited("", GROW, |w| insert_rows(w, 0, 0, 2));
+        assert!(
+            ws.contains(r#"<sortState ref="A3:C11"><sortCondition ref="B4:B11"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_unlogged_model_translate_still_works() {
+        let mut pkg = report("", GROW);
+        pkg.workbook.sheets[0].sort_state = Some((2, 0, 10, 2));
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A3:C11"><sortCondition ref="B4:B11"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_log_cleared_when_dropped_and_kept_off_edits_below() {
+        let mut pkg = report("", GROW);
+        insert_rows(&mut pkg.workbook, 0, 20, 1);
+        assert!(pkg.workbook.sheets[0].sort_state_edits.is_empty());
+        insert_rows(&mut pkg.workbook, 0, 4, 1);
+        assert_eq!(pkg.workbook.sheets[0].sort_state_edits.len(), 1);
+        delete_rows(&mut pkg.workbook, 0, 4, 1);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, None);
+        assert!(pkg.workbook.sheets[0].sort_state_edits.is_empty());
+    }
+
+    #[test]
+    fn sort_state_grow_undo_restores_original_element() {
+        let mut pkg = report("", GROW);
+        let before = pkg.workbook.sheets[0].clone();
+        insert_rows(&mut pkg.workbook, 0, 4, 2);
+        pkg.workbook.sheets[0] = before;
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(GROW), "{ws}");
+        // Redoing a different edit after the undo replays from the loaded element.
+        insert_rows(&mut pkg.workbook, 0, 2, 1);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C10"><sortCondition ref="B2:B10"/></sortState>"#),
+            "{ws}"
+        );
     }
 
     #[test]
@@ -20539,6 +20692,43 @@ mod print_setup_tests {
             &[("Data", body), ("Other", body), ("DataX", body)],
         ))
         .expect("fixture loads")
+    }
+
+    #[test]
+    fn remove_sheet_turns_other_sheets_consolidate_refs_into_ref_error() {
+        let mut pkg = three_sheets("");
+        let mut k = crate::edit::ConsolidateSettings {
+            func: crate::edit::SubtotalFunc::Sum,
+            refs: vec![
+                "Data!$A$1:$B$2".into(),
+                "DataX!$A$1:$B$2".into(),
+                "A1".into(),
+                "Totals".into(),
+            ],
+            top_row: false,
+            left_col: false,
+            links: false,
+            external: Vec::new(),
+        };
+        pkg.workbook.sheets[1].consolidate = Some(k.clone());
+        pkg.workbook.sheets[1].consolidate_loaded = Some(k.clone());
+        assert!(pkg.remove_sheet(0));
+        let dest = &pkg.workbook.sheets[0];
+        assert_eq!(dest.name, "Other");
+        // The sheet is gone, so the ref reads a bare `#REF!`, as a defined name does.
+        k.refs[0] = "#REF!".into();
+        assert_eq!(dest.consolidate.as_ref(), Some(&k));
+        assert_ne!(dest.consolidate, dest.consolidate_loaded);
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet2.xml");
+        assert!(
+            ws.contains(r##"<dataRef ref="#REF!"/><dataRef ref="A1:B2" sheet="DataX"/>"##),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].consolidate.as_ref(), Some(&k));
+        assert_eq!(
+            re.workbook.sheets[0].consolidate,
+            re.workbook.sheets[0].consolidate_loaded
+        );
     }
 
     fn names_of(wb: &str) -> Vec<String> {

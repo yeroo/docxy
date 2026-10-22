@@ -210,8 +210,9 @@ Open the sample `.docx` **and** `.xlsx` in tabs first.
   that referred to the sheet read `#REF!` after the remove and have their
   text back after the undo.
 - [ ] **E7.2 Double remove, double undo** — Agent removes two sheets in a row;
-  press Ctrl+Z twice. The second undo **surfaces a warning** (single-slot
-  restore) rather than silently doing the wrong thing.
+  press Ctrl+Z twice. Both come back, the second removal first (the restore
+  is a stack of the latest 16 removals; an older one surfaces a warning
+  rather than silently doing the wrong thing).
 - [ ] **E7.3 Remove → import → undo → undo** — Agent removes a sheet, then
   imports a CSV (new sheet); Ctrl+Z (undo import) then Ctrl+Z again. The
   second undo shows a **mismatch warning** and does **not** silently restore

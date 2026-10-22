@@ -144,11 +144,11 @@
     host-orchestrated inverse request instead of a wasm undo replay, since
     those changes live outside the cell-level undo model.
   - Agent `sheet.remove` is undoable — content, comments, and sheet-scoped
-    defined names are restored — but the restored sheet re-appends at the
-    **end** of the tab's sheet order, and the restore is backed by a
-    **single-slot stash**: a second consecutive `sheet.remove` before
-    undoing the first only leaves the second one recoverable, and undoing
-    past it surfaces a warning instead of silently failing.
+    defined names are restored, and the restored sheet goes back at its
+    original index. The restore is backed by a stack of the latest 16
+    removals, so consecutive removals undo in reverse order; an older
+    removal, or an undo out of order, surfaces a warning instead of
+    silently failing.
   - A tab's `comment.add` with no `author` defaults to `"agent"` (the
     terminal apps default to the OS username instead).
   - `doc.export-pdf` on a tab is rendered by the wasm engine but **written

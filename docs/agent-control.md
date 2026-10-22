@@ -941,12 +941,13 @@ worth knowing:
   the undo gives those names their text back (unless they changed
   meanwhile). When the restore shifts other sheets, the undo/redo history is
   cleared, as `sheet.remove` itself clears it.
-- **Agent sheet-removals are single-level-undoable.** The restore is backed by
-  a single-slot stash (only the most recently removed sheet is recoverable);
-  a *second* consecutive `sheet.remove` followed by two undos succeeds on the
-  first (restoring the second removal) but the second undo shows a warning
-  (`"Offxy: couldn't undo … — nothing left to reverse"` or "… nothing to
-  restore") instead of silently failing or reviving the first removed sheet.
+- **Agent sheet-removals are undoable in reverse order.** The restore is
+  backed by a stack of stashes (the latest 16 removals): two consecutive
+  `sheet.remove`s followed by two undos restore the second removal, then the
+  first. A removal older than the 16th is forgotten, and its undo shows a
+  warning (`"Offxy: couldn't undo … — nothing left to reverse"` or "… nothing
+  to restore"), as does an undo out of order (`restore mismatch: …`), instead
+  of silently failing or reviving the wrong sheet.
 - **An agent `sheet.remove`/`sheet.import-csv` invalidates earlier grid
   edits' undo entries.** These verbs clear the workbook's own undo history
   (mirroring the terminal apps, whose package-parts churn can't be represented
@@ -1059,7 +1060,7 @@ split (`wb.path`/`wb.save`/`wb.reload`/`wb.open`; `wb.open` opens a new tab;
 driving the engine's own undo stack — the same mechanism the grid UI uses,
 detected generically via the engine's `edits` counter. Divergence from
 VS Code tabs: an agent `sheet.remove` is not restorable from the IDE's undo
-(no single-slot stash wiring yet); `sheet.restore-removed` still works over
+(no stash wiring yet); `sheet.restore-removed` still works over
 the wire.
 
 ## The other editors

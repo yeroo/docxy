@@ -117,7 +117,7 @@ VS Code tabs, including open-as-new-tab); every other verb passes through
 already implemented engine-side). Mutating verbs register the same
 engine-stack `UndoableAction` as UI edits, so agent edits are one Ctrl+Z
 away. Divergences documented in agent-control.md's JetBrains section
-(sheet-remove restore order and single-slot semantics mirror the VS Code tab
+(sheet-remove restore order and stacked-restore semantics mirror the VS Code tab
 notes).
 
 ## Testing

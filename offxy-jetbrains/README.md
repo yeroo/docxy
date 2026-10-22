@@ -109,4 +109,4 @@ Needs JDK 17+ and a Rust toolchain with the `wasm32-unknown-unknown` target
 - Spreadsheet: merged cells render at their anchor without spanning; charts
   and pivot tables render as data; no frozen panes or column-drag resize
   yet; agent `sheet.remove` is not undoable from the IDE (unlike VS Code
-  tabs' single-slot restore).
+  tabs' stacked restore).

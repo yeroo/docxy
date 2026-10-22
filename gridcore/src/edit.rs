@@ -1065,6 +1065,12 @@ fn for_each_name_text(wb: &mut Workbook, mut f: impl FnMut(&mut String)) {
     for dn in &mut wb.defined_names {
         f(&mut dn.formula);
     }
+    for_each_consolidate_ref(wb, f);
+}
+
+/// Every sheet's kept Consolidate references (#988), the other half of
+/// [`for_each_name_text`]'s texts.
+pub(crate) fn for_each_consolidate_ref(wb: &mut Workbook, mut f: impl FnMut(&mut String)) {
     for sheet in &mut wb.sheets {
         if let Some(k) = &mut sheet.consolidate {
             k.refs.iter_mut().for_each(&mut f);
@@ -1622,21 +1628,35 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
-    // The sheet-level `<sortState>` only ever translates with the grid: an
-    // edit that changes its size (inside it, or through its rows or columns)
-    // or pushes it off the sheet leaves its conditions naming other cells,
-    // so it goes, as does one a delete took whole.
+    // The sheet-level `<sortState>` translates with the grid, and an insert
+    // strictly inside it grows it (Excel does the same; a condition at or
+    // below the insert shifts by the `point` rule, as a cell reference does).
+    // A delete through it, or an insert that pushes it off the sheet, leaves
+    // its conditions naming other cells, so it goes. Each edit that touches
+    // it is logged, for the save to replay on the loaded element.
     if let Some((r1, c1, r2, c2)) = sheet.sort_state {
         let (lo, hi) = if shift.rows { (r1, r2) } else { (c1, c2) };
         let far_off = shift.delta > 0 && point(hi, &shift).is_none();
-        sheet.sort_state = match span(lo, hi, &shift) {
-            Some((nlo, nhi)) if !far_off && nhi - nlo == hi - lo => Some(if shift.rows {
+        let grown = shift.delta > 0 && lo < shift.at && shift.at <= hi;
+        let moved = if far_off {
+            None
+        } else if grown {
+            point(hi, &shift).map(|nhi| (lo, nhi))
+        } else {
+            span(lo, hi, &shift).filter(|&(nlo, nhi)| nhi - nlo == hi - lo)
+        };
+        sheet.sort_state = moved.map(|(nlo, nhi)| {
+            if shift.rows {
                 (nlo, c1, nhi, c2)
             } else {
                 (r1, nlo, r2, nhi)
-            }),
-            _ => None,
-        };
+            }
+        });
+        if sheet.sort_state.is_none() {
+            sheet.sort_state_edits.clear();
+        } else if shift.at <= hi {
+            sheet.sort_state_edits.push(shift);
+        }
     }
 
     // Chart refs follow the grid too. They are WRITTEN back out as `<c:f>` now,
