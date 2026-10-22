@@ -4940,9 +4940,78 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
 /// the merged paragraph (#748). Its tracked insertion/deletion records replace
 /// `kept`'s too.
 fn keep_section_mark(kept: &mut ParProps, gone: ParProps) {
+    keep_rules(&mut kept.element_attrs, &gone.element_attrs);
     crate::review::adopt_mark_revisions(kept, &gone);
     kept.section_break = gone.section_break;
     kept.section_property_change = gone.section_property_change;
+}
+
+/// The markup-compatibility rules a joined paragraph's start tag carried
+/// (`mc:Ignorable`, …) join the kept paragraph's: the content moved up may be
+/// extension markup only that rule makes ignorable, and the gone start tag is
+/// not written (#1655). An attribute is a rule only when its prefix means the
+/// MC namespace: the paragraph's own `xmlns:<prefix>`, else the root's `mc`.
+/// One kept already has takes the union; otherwise it is added under `mc` (or
+/// another prefix the kept tag binds to MC), or under a new `mcN` it declares
+/// when the kept tag rebinds those. Other declarations on the gone tag stay
+/// behind: copying them would rebind prefixes the kept content uses. Nothing
+/// changes for a paragraph with no rule, as Word writes them.
+fn keep_rules(kept: &mut ElementAttrs, gone: &ElementAttrs) {
+    use crate::load::{MC_NS, is_rule_name, rule_local, union_tokens};
+    let decl = |attrs: &ElementAttrs, prefix: &str| {
+        let name = format!("xmlns:{prefix}");
+        attrs
+            .0
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ns)| ns.clone())
+    };
+    // Whether `name` is a rule on a tag with `attrs`.
+    let is_rule = |attrs: &ElementAttrs, name: &str| {
+        is_rule_name(name) && {
+            let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+            match decl(attrs, prefix) {
+                Some(ns) => ns == MC_NS,
+                None => prefix == "mc",
+            }
+        }
+    };
+    let rules: Vec<(String, String)> = gone
+        .0
+        .iter()
+        .filter(|(name, _)| is_rule(gone, name))
+        .cloned()
+        .collect();
+    for (name, value) in rules {
+        let found = kept
+            .0
+            .iter()
+            .position(|(n, _)| is_rule(kept, n) && rule_local(n) == rule_local(&name));
+        if let Some(i) = found {
+            union_tokens(&mut kept.0[i].1, &value);
+            continue;
+        }
+        let bound_to_mc = kept
+            .0
+            .iter()
+            .filter_map(|(n, ns)| (ns == MC_NS).then(|| n.strip_prefix("xmlns:")).flatten())
+            .next()
+            .map(str::to_string);
+        let prefix = match bound_to_mc {
+            Some(prefix) => prefix,
+            None if decl(kept, "mc").is_none() => "mc".to_string(),
+            None => {
+                let minted = (1..)
+                    .map(|n| format!("mc{n}"))
+                    .find(|q| decl(kept, q).is_none() && decl(gone, q).is_none())
+                    .expect("an unused prefix");
+                kept.0.push((format!("xmlns:{minted}"), MC_NS.to_string()));
+                minted
+            }
+        };
+        kept.0
+            .push((format!("{prefix}:{}", rule_local(&name)), value));
+    }
 }
 
 /// Split `content` at caret offset `o`: `content` keeps what is before it,

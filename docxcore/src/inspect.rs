@@ -541,7 +541,7 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
     // make the copies differ.
     // Copies also differ when a prefix they use means another namespace.
     let bound = bindings_used(raw, &inners);
-    let key = |i: usize| (twin_key(&raw[inners[i].clone()]), &bound[i]);
+    let key = |i: usize| (twin_key(raw, &inners[i]), &bound[i]);
     let first = key(0);
     (0..inners.len())
         .map(|i| TextBoxCopy {
@@ -551,11 +551,23 @@ fn text_box_copies(raw: &str) -> Vec<TextBoxCopy> {
         .collect()
 }
 
+/// Whether the attribute `name` on the parser's current start tag is a
+/// markup-compatibility rule (`mc:Ignorable`, …): its prefix means the MC
+/// namespace in the scope there, as the parser resolves it.
+fn is_mc_rule(p: &XmlParser, name: &str) -> bool {
+    crate::load::is_rule_name(name)
+        && p.markup_compatibility_attrs()
+            .iter()
+            .any(|s| s.element_name == p.name() && s.attr.name == name)
+}
+
 /// For each of `inners` (ranges of `raw`), the namespaces its element and
 /// attribute names (not `w14:paraId` or a markup-compatibility rule) resolve
 /// to: sorted `prefix=namespace` lines, the default namespace as the empty prefix,
 /// bindings inherited from outside the range included. An unbound prefix
-/// resolves to nothing.
+/// resolves to nothing. With them go the rules in effect for each element's
+/// own prefixes, inherited ones included (`rule Ignorable ux`): copies that
+/// differ in which extension prefixes are ignorable are not twins.
 fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
     let mut used: Vec<std::collections::BTreeSet<String>> = vec![Default::default(); inners.len()];
     let mut p = XmlParser::new(raw);
@@ -591,15 +603,32 @@ fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
                     if a.name == "w14:paraId"
                         || a.name == "xmlns"
                         || a.name.starts_with("xmlns:")
-                        || crate::load::is_rule_name(a.name)
+                        || is_mc_rule(&p, a.name)
                     {
                         continue;
                     }
                     prefixes.extend(a.name.split_once(':').map(|(p, _)| p));
                     prefixes.extend(crate::load::mce_value_prefixes(a.name, a.value));
                 }
-                for prefix in prefixes.into_iter().filter(|p| *p != "xml") {
+                for prefix in prefixes.iter().copied().filter(|p| *p != "xml") {
                     used[i].insert(resolve(prefix));
+                }
+                // The rules in effect, for the prefixes this element uses.
+                for scoped in p.markup_compatibility_attrs() {
+                    if !crate::load::is_rule_name(scoped.attr.name) {
+                        continue;
+                    }
+                    let local = scoped.attr.name.rsplit(':').next().unwrap_or_default();
+                    let mut value = String::new();
+                    XmlParser::append_decoded(scoped.attr.value, &mut value);
+                    for token in value.split_whitespace() {
+                        let prefix = token.split_once(':').map_or(token, |(prefix, _)| prefix);
+                        if prefixes.contains(&prefix) {
+                            // `Ignorable` names prefixes; the others, names.
+                            let token = if local == "Ignorable" { prefix } else { token };
+                            used[i].insert(format!("rule {local} {token}"));
+                        }
+                    }
                 }
             }
             Event::Eof => break,
@@ -611,37 +640,39 @@ fn bindings_used(raw: &str, inners: &[Range<usize>]) -> Vec<String> {
         .collect()
 }
 
-/// `xml` as text-box copies are compared: without the `w14:paraId`
-/// attributes, the namespace declarations (`xmlns:p`, `xmlns`) and the
-/// markup-compatibility rules (`mc:Ignorable`, …) of its start tags; text is
-/// left alone. A save may drop a repeated id from one copy only, and the
-/// loader declares on a modeled copy's property elements the prefixes, default
-/// namespace and rules they inherit (#1063, #1089), which the raw copy
-/// inherits unchanged; [`bindings_used`] compares what the names resolve to.
-/// Malformed XML is returned as it is.
-fn twin_key(xml: &str) -> String {
-    use crate::xml::{Event, XmlParser};
+/// The copy `raw[range]` as text-box copies are compared: without the
+/// `w14:paraId` attributes, the namespace declarations (`xmlns:p`, `xmlns`)
+/// and the markup-compatibility rules (`mc:Ignorable`, …) of its start tags
+/// (a rule being an attribute whose prefix means the MC namespace in `raw`'s
+/// scope, not any `x:Ignorable`); text is left alone. A save may drop a
+/// repeated id from one copy only, and the loader declares on a modeled copy's
+/// property elements the prefixes, default namespace and rules they inherit
+/// (#1063, #1089), which the raw copy inherits unchanged; [`bindings_used`]
+/// compares what the names resolve to and the rules in effect. Malformed XML
+/// is returned as it is.
+fn twin_key(raw: &str, range: &Range<usize>) -> String {
     let mut cuts = Vec::new();
-    let mut p = XmlParser::new(xml);
+    let mut p = XmlParser::new(raw);
     loop {
         match p.next() {
-            Event::Start => {
+            Event::Start if range.contains(&p.start_pos()) => {
                 for a in p.attrs().iter().filter(|a| {
                     a.name == "w14:paraId"
                         || a.name == "xmlns"
                         || a.name.starts_with("xmlns:")
-                        || crate::load::is_rule_name(a.name)
+                        || is_mc_rule(&p, a.name)
                 }) {
-                    let Some(cut) = crate::serialize::attr_source_range(xml, a) else {
-                        return xml.to_string();
+                    let Some(cut) = crate::serialize::attr_source_range(raw, a) else {
+                        return raw[range.clone()].to_string();
                     };
-                    cuts.push(cut);
+                    cuts.push(cut.start - range.start..cut.end - range.start);
                 }
             }
             Event::Eof => break,
             _ => {}
         }
     }
+    let xml = &raw[range.clone()];
     if p.is_malformed() {
         return xml.to_string();
     }
@@ -1831,6 +1862,89 @@ mod tests {
             .replace("{a}", inherited)
             .replace("{b}", inherited);
         assert_eq!(twin_flags(&other), [true, false]);
+    }
+
+    const MC: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+    /// Two text-box copies, `a` and `b` being the start tags they sit in
+    /// (carrying a rule or not) around the same content using `ux:`.
+    fn rule_boxes(a: &str, b: &str) -> String {
+        let content =
+            "<w:txbxContent><w:p ux:l=\"1\"><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent>";
+        format!(
+            "<v:g xmlns:mc=\"{MC}\" xmlns:ux=\"urn:a\" xmlns:x=\"urn:x\">\
+             <v:s{a}>{content}</v:s><v:s{b}>{content}</v:s></v:g>"
+        )
+    }
+
+    /// #1655 r2-twin-rules: copies differing only in which extension
+    /// prefixes are ignorable are not twins, so a sync cannot overwrite a
+    /// Fallback with a rule-less copy; equal rules, in any spelling of the
+    /// tokens, still are.
+    #[test]
+    fn text_boxes_differing_in_ignorable_prefixes_are_not_twins() {
+        assert_eq!(
+            twin_flags(&rule_boxes(" mc:Ignorable=\"ux\"", "")),
+            [true, false]
+        );
+        assert_eq!(
+            twin_flags(&rule_boxes(" mc:Ignorable=\"ux\"", " mc:Ignorable=\"ux\"")),
+            [true, true]
+        );
+        assert_eq!(
+            twin_flags(&rule_boxes(
+                " mc:Ignorable=\"ux\"",
+                " mc:Ignorable=\"x ux\""
+            )),
+            [true, true],
+            "a prefix the copy does not use does not count"
+        );
+        assert_eq!(twin_flags(&rule_boxes("", "")), [true, true]);
+    }
+
+    /// #1655 r2-isrule-binding: `x:Ignorable` with `x` not the MC namespace
+    /// is no rule, so it is not cut from the key: copies differing in it
+    /// are not twins, as with any other attribute; a real rule is cut.
+    #[test]
+    fn a_vendor_ignorable_is_not_a_twin_rule() {
+        let copy = |attr: &str| {
+            format!(
+                "<w:txbxContent><w:p ux:l=\"1\" {attr}><w:r><w:t>Same</w:t></w:r></w:p></w:txbxContent>"
+            )
+        };
+        let wrap = |a: &str, b: &str| {
+            format!(
+                "<v:g xmlns:mc=\"{MC}\" xmlns:ux=\"urn:a\" xmlns:x=\"urn:x\">{}{}</v:g>",
+                copy(a),
+                copy(b)
+            )
+        };
+        assert_eq!(
+            twin_flags(&wrap("x:Ignorable=\"a\"", "x:Ignorable=\"b\"")),
+            [true, false]
+        );
+        assert_eq!(
+            twin_flags(&wrap("mc:Ignorable=\"ux\"", "mc:Ignorable=\"ux w14\"")),
+            [true, true]
+        );
+    }
+
+    /// #1655 r2-twin-rules: a sync from the first copy leaves a Fallback
+    /// whose rule differs alone.
+    #[test]
+    fn syncing_twins_leaves_a_copy_with_another_rule() {
+        let raw = rule_boxes(" mc:Ignorable=\"ux\"", "");
+        let flags = twin_flags(&raw);
+        let mut synced = raw.clone();
+        let blocks = [Block::Paragraph(crate::model::Paragraph {
+            props: Default::default(),
+            content: vec![Inline::Run(crate::model::Run {
+                text: "Other".into(),
+                props: Default::default(),
+            })],
+        })];
+        sync_twin_copies(&mut synced, &blocks, &flags);
+        assert_eq!(synced.matches("Same").count(), 1, "{synced}");
     }
 
     /// A default namespace an unprefixed name depends on counts too.

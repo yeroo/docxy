@@ -15,7 +15,7 @@ use crate::zip::ZipArchive;
 pub(crate) const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 pub(crate) const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 pub(crate) const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
-const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+pub(crate) const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -164,9 +164,20 @@ fn rebuilt_bindings(p: &XmlParser) -> Rebuilt {
             out.push((prefix.to_string(), ns));
         }
     }
+    // The prefixes that mean the markup-compatibility namespace here, the
+    // tag's own declarations included: a captured tag read apart from the
+    // part root (a snapshot) cannot tell which prefix is a rule's.
+    let mc_prefixes = p
+        .namespace_scoped_attrs()
+        .filter_map(|scoped| {
+            let prefix = scoped.attr.name.strip_prefix("xmlns:")?;
+            (decode_attr(scoped.attr.value) == MC_NS).then(|| prefix.to_string())
+        })
+        .collect();
     Rebuilt {
         ns: out,
         mce: inherited_markup_compatibility(p),
+        mc_prefixes,
     }
 }
 
@@ -177,6 +188,8 @@ fn rebuilt_bindings(p: &XmlParser) -> Rebuilt {
 struct Rebuilt {
     ns: Vec<(String, String)>,
     mce: Vec<(String, String)>,
+    /// The prefixes bound to the markup-compatibility namespace in scope.
+    mc_prefixes: Vec<String>,
 }
 
 /// Elements whose start tags a save writes back as loaded: a rule declared on
@@ -207,12 +220,12 @@ fn inherited_markup_compatibility(p: &XmlParser) -> Vec<(String, String)> {
 
 /// The local name of an attribute name (`Ignorable` of `mc:Ignorable`): what
 /// two spellings of one rule share.
-fn rule_local(name: &str) -> &str {
+pub(crate) fn rule_local(name: &str) -> &str {
     name.split_once(':').map_or(name, |(_, local)| local)
 }
 
 /// Add `value`'s tokens to `existing`, a rule's token list, once each.
-fn union_tokens(existing: &mut String, value: &str) {
+pub(crate) fn union_tokens(existing: &mut String, value: &str) {
     for token in value.split_whitespace() {
         if !existing.split_whitespace().any(|item| item == token) {
             if !existing.is_empty() {
@@ -328,31 +341,36 @@ fn prefixes_of(raw: &str) -> (Vec<String>, Vec<String>) {
 /// ([`Rebuilt`], from [`rebuilt_bindings`]): a declaration for each prefix it
 /// uses that is bound there and not declared on the tag already (#1063), the
 /// default namespace included, and the inherited markup-compatibility rules
-/// naming a prefix it uses. A rule the tag already has (by local name,
-/// whatever its prefix) takes the union of the tokens and keeps its spelling;
-/// otherwise it is added.
+/// naming a prefix it uses. A rule the tag already has (by local name, whose
+/// prefix means the MC namespace) takes the union of the tokens and keeps its
+/// spelling; otherwise it is added, under the prefix it had where that still
+/// means the MC namespace, else another MC prefix or a new `mcN`. A prefix
+/// that is the MC namespace's only through the part root, for a rule of the
+/// tag's or of a descendant's, is declared on the tag (`rootless`).
 fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
-    if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() {
+    let tag = own_tag(raw, &rebuilt.mc_prefixes);
+    if rebuilt.ns.is_empty() && rebuilt.mce.is_empty() && tag.rootless.is_empty() {
         return raw.to_string();
     }
-    let own_rules = own_rules(raw);
     let (used, mut own) = prefixes_of(raw);
     let mut out = raw.to_string();
     let mut decls = String::new();
     // A rule's prefix is declared on the tag itself, as the markup-
     // compatibility namespace: the tag may be read apart from the part root
     // that binds it (a property-change snapshot, a split container).
-    let mut declare_mc = |name: &str, decls: &mut String| {
-        if let Some((prefix, _)) = name.split_once(':') {
-            if !own.iter().any(|o| o == prefix) {
-                decls.push_str(&format!(" xmlns:{prefix}=\"{MC_NS}\""));
-                own.push(prefix.to_string());
-            }
+    fn declare_mc(own: &mut Vec<String>, prefix: &str, decls: &mut String) {
+        if !own.iter().any(|o| o == prefix) {
+            decls.push_str(&format!(" xmlns:{prefix}=\"{MC_NS}\""));
+            own.push(prefix.to_string());
         }
-    };
+    }
+    for prefix in &tag.rootless {
+        declare_mc(&mut own, prefix, &mut decls);
+    }
     let mut merges: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     for (name, value) in rules_for_prefixes(&rebuilt.mce, &used) {
-        let found = own_rules
+        let found = tag
+            .rules
             .iter()
             .find(|(_, own_name, _)| rule_local(own_name) == rule_local(&name));
         if let Some((range, own_name, own_value)) = found {
@@ -362,13 +380,22 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
             crate::serialize::esc_attr(&merged, &mut text);
             text.push('"');
             merges.push((range.clone(), text));
-            declare_mc(own_name, &mut decls);
             continue;
         }
-        decls.push_str(&format!(" {name}=\""));
+        let prefix = rule_prefix(
+            name.split_once(':').map_or("", |(prefix, _)| prefix),
+            &rebuilt.mc_prefixes,
+            |q| {
+                tag.declared(q)
+                    .map(str::to_string)
+                    .or_else(|| own.iter().any(|o| o == q).then(|| MC_NS.to_string()))
+            },
+            |q| used.iter().any(|u| u == q),
+        );
+        decls.push_str(&format!(" {prefix}:{}=\"", rule_local(&name)));
         crate::serialize::esc_attr(&value, &mut decls);
         decls.push('"');
-        declare_mc(&name, &mut decls);
+        declare_mc(&mut own, &prefix, &mut decls);
     }
     // Last first, so the earlier ranges stay valid.
     merges.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
@@ -392,25 +419,109 @@ fn declare_rebuilt(raw: &str, rebuilt: &Rebuilt) -> String {
     format!("{}{decls}{}", &out[..name_end], &out[name_end..])
 }
 
-/// The markup-compatibility rules (`mc:Ignorable`, …) on `raw`'s own start
-/// tag: source range, name and decoded value.
-fn own_rules(raw: &str) -> Vec<(std::ops::Range<usize>, String, String)> {
-    let mut q = XmlParser::new(raw);
-    if q.next() != Event::Start {
-        return Vec::new();
+/// A captured element's own start tag: its namespace declarations (decoded;
+/// the default namespace is the empty prefix) and its markup-compatibility
+/// rules, as source range, name and decoded value. An attribute named like a
+/// rule is one only when its prefix means the MC namespace: the tag's own
+/// declaration of it decides, else the scope (`mc_scope`, the prefixes bound
+/// to it where the tag was loaded). A vendor `x:Ignorable` is not. `rootless`
+/// are the prefixes of rules anywhere in the element that nothing inside it
+/// declares, though the scope binds them to the MC namespace: the element must
+/// declare them to be read apart from the part root (#1655).
+struct OwnTag {
+    decls: Vec<(String, String)>,
+    rules: Vec<(std::ops::Range<usize>, String, String)>,
+    rootless: Vec<String>,
+}
+
+impl OwnTag {
+    /// The namespace the tag itself binds `prefix` to.
+    fn declared(&self, prefix: &str) -> Option<&str> {
+        self.decls
+            .iter()
+            .find(|(p, _)| p == prefix)
+            .map(|(_, ns)| ns.as_str())
     }
-    q.attrs()
-        .iter()
-        .filter(|a| is_rule_name(a.name))
-        .filter_map(|a| {
-            let range = crate::serialize::attr_source_range(raw, a)?;
-            Some((range, a.name.to_string(), decode_attr(a.value)))
+}
+
+fn own_tag(raw: &str, mc_scope: &[String]) -> OwnTag {
+    let mut q = XmlParser::new(raw);
+    let mut tag = OwnTag {
+        decls: Vec::new(),
+        rules: Vec::new(),
+        rootless: Vec::new(),
+    };
+    let mut first = true;
+    loop {
+        match q.next() {
+            Event::Start => {}
+            Event::Eof => return tag,
+            _ => continue,
+        }
+        if first {
+            for a in q.attrs() {
+                if a.name == "xmlns" {
+                    tag.decls.push((String::new(), decode_attr(a.value)));
+                } else if let Some(prefix) = a.name.strip_prefix("xmlns:") {
+                    tag.decls.push((prefix.to_string(), decode_attr(a.value)));
+                }
+            }
+        }
+        for a in q.attrs().iter().filter(|a| is_rule_name(a.name)) {
+            let prefix = a.name.split_once(':').map_or("", |(prefix, _)| prefix);
+            let decl = format!("xmlns:{prefix}");
+            let bound = q.namespace_attrs().iter().find(|n| n.name == decl);
+            let in_scope = mc_scope.iter().any(|m| m == prefix);
+            if bound.is_none() && in_scope && !tag.rootless.iter().any(|r| r == prefix) {
+                tag.rootless.push(prefix.to_string());
+            }
+            let is_mc = match bound {
+                Some(n) => decode_attr(n.value) == MC_NS,
+                None => in_scope,
+            };
+            if first && is_mc {
+                if let Some(range) = crate::serialize::attr_source_range(raw, a) {
+                    tag.rules
+                        .push((range, a.name.to_string(), decode_attr(a.value)));
+                }
+            }
+        }
+        first = false;
+    }
+}
+
+/// The prefix to write an inherited rule under on a tag, `preferred` (the
+/// one the rule had where it was declared) when it still means the MC
+/// namespace there, else another prefix bound to it, else a new `mcN`.
+/// `declared` is the namespace the tag binds a prefix to itself; `in_use`
+/// whether the captured XML uses the prefix for names (so declaring it as
+/// the MC namespace would rebind them). A prefix the tag does not declare
+/// serves when the scope binds it to MC, or when nothing uses it.
+fn rule_prefix(
+    preferred: &str,
+    scope: &[String],
+    declared: impl Fn(&str) -> Option<String>,
+    in_use: impl Fn(&str) -> bool,
+) -> String {
+    let fits = |q: &str| match declared(q) {
+        Some(ns) => ns == MC_NS,
+        None => scope.iter().any(|m| m == q) || !in_use(q),
+    };
+    std::iter::once(preferred)
+        .chain(scope.iter().map(String::as_str))
+        .find(|q| !q.is_empty() && fits(q))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            (1..)
+                .map(|n| format!("mc{n}"))
+                .find(|q| declared(q).is_none() && !in_use(q) && !scope.contains(q))
+                .expect("an unused prefix")
         })
-        .collect()
 }
 
 /// A prefixed `Ignorable`, `ProcessContent`, `PreserveElements` or
-/// `PreserveAttributes`: the rules a descendant inherits.
+/// `PreserveAttributes`: the shape of the rules a descendant inherits. Whether
+/// the prefix means the MC namespace is the caller's to check.
 pub(crate) fn is_rule_name(name: &str) -> bool {
     name.split_once(':').is_some_and(|(_, local)| {
         matches!(
@@ -423,10 +534,11 @@ pub(crate) fn is_rule_name(name: &str) -> bool {
 /// The start tag's attributes at the parser's current Start event, decoded,
 /// with a declaration for each prefix they use that a save does not keep
 /// (see [`rebuilt_bindings`]), and the inherited markup-compatibility rules
-/// naming a prefix they use, joined into the tag's own rule of that name. The
-/// MC prefix needs no declaration of its own here: the serializer writes the
-/// tag inside the saved part, whose root binds it, or `prefixes` below
-/// declares it from the rebuilt scope.
+/// naming a prefix they use, joined into the tag's own MC-bound rule of that
+/// name (a vendor `x:Ignorable` is not one). The root's MC prefix needs no
+/// declaration of its own here: the serializer writes the tag inside the saved
+/// part, whose root binds it, or `prefixes` below declares it from the rebuilt
+/// scope; a rule written under another or a minted `mcN` prefix declares it.
 fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let mut attrs: Vec<(String, String)> = p
         .attrs()
@@ -449,18 +561,39 @@ fn element_attrs(p: &XmlParser) -> ElementAttrs {
     let rebuilt = rebuilt_bindings(p);
     // A rule a rebuilt ancestor declared, for the extension prefixes this
     // start tag uses, so a consumer that does not know them still ignores
-    // them; it joins the tag's own rule of that name.
+    // them; it joins the tag's own rule of that name. A vendor `x:Ignorable`
+    // is not the tag's rule, and a tag that rebinds the rule's prefix gets
+    // the rule under another prefix bound to the MC namespace.
     for (name, value) in rules_for_prefixes(&rebuilt.mce, &prefixes) {
-        if let Some((prefix, _)) = name.split_once(':') {
-            prefixes.push(prefix.to_string());
+        let own = attrs.iter().position(|(n, _)| {
+            is_rule_name(n)
+                && rule_local(n) == rule_local(&name)
+                && n.split_once(':')
+                    .is_some_and(|(prefix, _)| rebuilt.mc_prefixes.iter().any(|m| m == prefix))
+        });
+        if let Some(i) = own {
+            union_tokens(&mut attrs[i].1, &value);
+            continue;
         }
-        let own = attrs
-            .iter()
-            .position(|(n, _)| is_rule_name(n) && rule_local(n) == rule_local(&name));
-        match own {
-            Some(i) => union_tokens(&mut attrs[i].1, &value),
-            None => attrs.push((name, value)),
+        let decl_of = |q: &str| {
+            let decl = format!("xmlns:{q}");
+            attrs
+                .iter()
+                .find(|(n, _)| *n == decl)
+                .map(|(_, ns)| ns.clone())
+        };
+        let prefix = rule_prefix(
+            name.split_once(':').map_or("", |(prefix, _)| prefix),
+            &rebuilt.mc_prefixes,
+            decl_of,
+            |q| prefixes.iter().any(|u| u == q),
+        );
+        let in_scope = rebuilt.mc_prefixes.contains(&prefix);
+        attrs.push((format!("{prefix}:{}", rule_local(&name)), value));
+        if !in_scope {
+            attrs.push((format!("xmlns:{prefix}"), MC_NS.to_string()));
         }
+        prefixes.push(prefix);
     }
     for prefix in prefixes {
         let decl = format!("xmlns:{prefix}");
@@ -1064,9 +1197,11 @@ fn parse_sdt_block(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Block>
         match p.next() {
             Event::Start => match p.name() {
                 "w:sdtPr" | "w:sdtEndPr" => {
-                    let start = p.start_pos();
+                    // The scope here holds the `w:sdt`'s own declarations; the
+                    // wrapper is written without them (#1655).
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    props.push_str(p.raw_slice(start, p.pos()));
+                    props.push_str(&declare_rebuilt(p.raw_slice(start, p.pos()), &bindings));
                 }
                 "w:sdtContent" => {
                     saw_content = true;
@@ -1142,9 +1277,12 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 }
                 _ => {
                     // Unmodeled block content (content controls, etc.): preserve raw.
-                    let start = p.start_pos();
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    blocks.push(Block::Raw(p.raw_slice(start, p.pos()).to_string()));
+                    blocks.push(Block::Raw(declare_rebuilt(
+                        p.raw_slice(start, p.pos()),
+                        &bindings,
+                    )));
                 }
             },
             Event::End | Event::Eof => break,
@@ -1578,9 +1716,11 @@ fn parse_inline_sdt(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inlin
         match p.next() {
             Event::Start => match p.name() {
                 "w:sdtPr" | "w:sdtEndPr" => {
-                    let start = p.start_pos();
+                    // The scope here holds the `w:sdt`'s own declarations; the
+                    // wrapper is written without them (#1655).
+                    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
                     p.skip_element();
-                    props.push_str(p.raw_slice(start, p.pos()));
+                    props.push_str(&declare_rebuilt(p.raw_slice(start, p.pos()), &bindings));
                 }
                 "w:sdtContent" => {
                     saw_content = true;
@@ -1914,10 +2054,11 @@ fn unsupported_revision_kind(name: &str) -> Option<UnsupportedRevisionKind> {
 /// records so review enumeration can return an explicit unsupported result.
 fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
     let kind = unsupported_revision_kind(p.name());
+    // At the element's Start, as at the other capture sites.
+    let (start, bindings) = (p.start_pos(), rebuilt_bindings(p));
     let metadata = kind.as_ref().map(|_| parse_revision_metadata(p));
-    let start = p.start_pos();
     p.skip_element();
-    let raw = p.raw_slice(start, p.pos()).to_string();
+    let raw = declare_rebuilt(p.raw_slice(start, p.pos()), &bindings);
     match (kind, metadata) {
         (Some(kind), Some(metadata)) => out.push(Inline::UnsupportedRevision {
             kind,
