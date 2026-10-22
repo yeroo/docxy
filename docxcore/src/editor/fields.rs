@@ -41,7 +41,9 @@ fn unit_offsets(
 }
 
 /// The inline holding editor offset `idx`, mutably, looking inside a
-/// hyperlink's `content` (as `inline_covering`).
+/// hyperlink's `content` (as `inline_covering`). It marks each raw-backed
+/// hyperlink it enters `content_changed`, so call it only to rewrite what it
+/// returns (#1637).
 fn inline_covering_mut(content: &mut [Inline], idx: usize) -> Option<&mut Inline> {
     let mut acc = 0;
     for inline in content {
@@ -55,6 +57,8 @@ fn inline_covering_mut(content: &mut [Inline], idx: usize) -> Option<&mut Inline
             let Inline::Hyperlink(h) = inline else {
                 return None;
             };
+            // A raw-backed link is saved as loaded unless marked (#1637).
+            h.content_changed |= h.raw.is_some();
             return inline_covering_mut(&mut h.content, local - runs);
         }
         acc += l;
@@ -403,6 +407,65 @@ mod tests {
         assert_eq!(ed.update_fields(&ctx()), 1);
         let p = resolve_para(&ed.doc.body, &cell).unwrap();
         assert!(matches!(&p.content[0], Inline::Field { text, .. } if text == "10/14/2026"));
+    }
+
+    /// A loaded link with a field in it is saved as its raw XML unless its
+    /// content changed, so a field rewrite has to mark it (#1637).
+    fn link_with_field_and_sibling() -> Editor {
+        Editor::new(doc(&format!(
+            "<w:p><w:hyperlink w:anchor=\"x\">{}{DATE}</w:hyperlink>\
+             <w:hyperlink w:anchor=\"y\">{}</w:hyperlink></w:p>",
+            text_run("Go "),
+            text_run("Stay")
+        )))
+    }
+
+    fn untouched_sibling_link(xml: &str) -> bool {
+        xml.contains("w:anchor=\"y\"") && xml.contains("Stay")
+    }
+
+    #[test]
+    fn f9_in_a_raw_hyperlink_survives_save_1637() {
+        let mut ed = link_with_field_and_sibling();
+        let before = crate::serialize::document_to_xml(&ed.doc);
+        at(&mut ed, &[0], 3);
+        assert_eq!(ed.update_fields(&ctx()), 1);
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert!(xml.contains("10/14/2026"), "{xml}");
+        assert!(!xml.contains("1/2/2000"), "{xml}");
+        assert!(untouched_sibling_link(&xml));
+        // The link not on the field's path is still written as loaded.
+        let sibling = |x: &str| x[x.find("w:anchor=\"y\"").unwrap()..].to_string();
+        assert_eq!(sibling(&xml), sibling(&before));
+        let Inline::Hyperlink(other) = &first_para(&ed).content[1] else {
+            panic!("the second link");
+        };
+        assert!(!other.content_changed);
+    }
+
+    #[test]
+    fn edit_field_in_a_raw_hyperlink_survives_save_1637() {
+        let mut ed = link_with_field_and_sibling();
+        at(&mut ed, &[0], 3);
+        assert!(ed.set_field_instr("= 6*7", &ctx()));
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert!(
+            xml.contains("= 6*7") && xml.contains("<w:t>42</w:t>"),
+            "{xml}"
+        );
+        assert!(!xml.contains("1/2/2000"), "{xml}");
+        assert!(untouched_sibling_link(&xml));
+    }
+
+    #[test]
+    fn a_no_op_update_leaves_a_raw_hyperlink_byte_faithful_1637() {
+        let mut ed = Editor::new(doc(&format!(
+            "<w:p><w:hyperlink w:anchor=\"x\">{PAGE}</w:hyperlink></w:p>"
+        )));
+        let before = crate::serialize::document_to_xml(&ed.doc);
+        at(&mut ed, &[0], 0);
+        assert_eq!(ed.update_fields(&ctx()), 0);
+        assert_eq!(crate::serialize::document_to_xml(&ed.doc), before);
     }
 
     #[test]
