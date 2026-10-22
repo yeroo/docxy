@@ -506,10 +506,7 @@ fn indenting_a_subtree_is_one_undo_step() {
     ed.indent(2, 1).unwrap();
     assert!(ed.undo());
     assert_eq!(levels(&ed), before);
-    assert!(
-        !ed.undo() || levels(&ed) == before,
-        "no second step was recorded"
-    );
+    assert!(!ed.undo(), "no second step was recorded");
 }
 
 #[test]
@@ -550,10 +547,22 @@ fn levels_read_from_a_file_past_the_limits_do_not_panic_or_move_against_delta() 
 }
 
 #[test]
-fn outdenting_a_level_0_row_does_not_indent_the_plan() {
-    let mut proj = outline(&[(1, "Plan", 1), (2, "T", 2)]).project().clone();
+fn outdenting_the_project_summary_does_not_indent_the_plan() {
+    let mut proj = outline(&[(0, "Plan", 1), (2, "T", 2)]).project().clone();
     proj.tasks[0].outline_level = 0;
+    proj.tasks[0].summary = true;
     let mut ed = Editor::new(proj);
-    ed.indent(1, -1).unwrap();
+    ed.indent(0, -1).unwrap();
     assert_eq!(levels(&ed), [0, 2]);
+}
+
+#[test]
+fn indenting_the_project_summary_does_not_move_the_plan() {
+    let mut proj = outline(&[(0, "Plan", 1), (2, "T", 2)]).project().clone();
+    proj.tasks[0].outline_level = 0;
+    proj.tasks[0].summary = true;
+    let mut ed = Editor::new(proj);
+    ed.indent(0, 1).unwrap();
+    assert_eq!(levels(&ed), [0, 2]);
+    assert!(!ed.dirty() && !ed.undo(), "no step for a no-op");
 }

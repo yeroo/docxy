@@ -2339,10 +2339,14 @@ fn renumber_wbs(old: &[Task], new: &mut [Task]) {
 /// row stays at level 1 or deeper and the deepest descendant at 20 or
 /// shallower. Levels read from a file are unchecked, so the bounds never
 /// push against `delta`: a plan already past a limit just does not move
-/// further that way.
+/// further that way. The project summary row (UID 0) never moves; other
+/// level-0 rows (built in code, not read from a file) can still be indented.
 fn outline_shift(tasks: &[Task], i: usize, delta: i32) -> i64 {
     let end = outline::subtree_end_in(tasks, i);
     let old = i64::from(tasks[i].outline_level);
+    if tasks[i].is_project_summary() {
+        return 0;
+    }
     let deepest = tasks[i..end]
         .iter()
         .filter(|t| !t.is_null)
