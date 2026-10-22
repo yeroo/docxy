@@ -7068,6 +7068,23 @@ mod tests {
         assert!(eng.is_unsupported((0, 0, 1)) && eng.is_frozen(&wb, (0, 0, 1)));
     }
 
+    #[test]
+    fn sheet_scoped_name_formula_is_accepted_and_frozen_on_its_cached_value() {
+        // #1632: `Sheet1!Rate` parses (as a name), so entry accepts it as it
+        // does `=NoSuchName`; nothing defines it, so the cell is unsupported
+        // and keeps the value Excel cached.
+        assert!(Engine::validate("Sheet1!Rate").is_ok());
+        assert!(Engine::validate("LET(x,Sheet1!Rate,x*2)").is_ok());
+        let mut b1 = Cell::formula("Sheet1!Rate");
+        b1.value = CellValue::Number(0.07);
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("B1", b1)]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert!(eng.is_unsupported((0, 0, 1)) && eng.is_frozen(&wb, (0, 0, 1)));
+        let cell = wb.sheets[0].cell(0, 1).unwrap();
+        assert_eq!(cell.value, CellValue::Number(0.07));
+    }
+
     /// A1 = 1 and a frozen array anchor E1 `PIVOTBY(A1,4)` (`ref="E1:E3"`)
     /// whose cached block E1:E3 is 7/8/9, as xlsxy opens it (on cached
     /// values, nothing evaluated yet).

@@ -1160,8 +1160,10 @@ impl<'a> Parser<'a> {
                 t => return Err(format!("expected name after :, got {t:?}")),
             }
         }
-        if sheet.is_some() {
-            return Err("sheet-qualified name".into());
+        // `Sheet1!Rate`: a sheet-scoped name, kept as its qualified text. The
+        // `!` keeps it from ever matching a LET/LAMBDA binding.
+        if let Some(sheet) = sheet {
+            return Ok(Expr::Name(format!("{}{id}", sheet_prefix(&sheet))));
         }
         Ok(Expr::Name(id))
     }
@@ -1880,7 +1882,9 @@ impl Printer {
         // `binds_lambda`). Any other binding, LAMBDA parameters included, may
         // hold a lambda, so its call is the local one; the evaluator falls back
         // to the builtin when it holds none. (The parser uppercases a called
-        // name, so the binding gives the spelling.)
+        // name, so the binding gives the spelling.) How Excel itself reads
+        // `_xlpm.text(` on a parameter named like a builtin is unverified
+        // (#1632): it may call the variable and return an error.
         if let Some((b, true)) = self.bound(name) {
             let head = param_name(b);
             return format!("{head}({})", self.list(args));
@@ -6220,7 +6224,8 @@ impl<'a> Eval<'a> {
             Ok(ast @ Expr::Bin(BinOp::Range | BinOp::Isect, ..)) if indirect_literal_refs(&ast) => {
                 Ok(ast)
             }
-            Ok(Expr::Name(_)) if self.depth < 32 => Ok(Expr::Name(text)),
+            // A sheet-scoped name (`Sheet1!nope`) is not read as one here.
+            Ok(Expr::Name(n)) if self.depth < 32 && !n.contains('!') => Ok(Expr::Name(text)),
             _ => Err(Value::Err(ExcelError::Ref)),
         }
     }
@@ -16584,6 +16589,11 @@ mod tests {
             at("ROW(INDIRECT(\"nope nope\"))", &g, 99, 25),
             Value::Err(ExcelError::Ref)
         );
+        // A sheet-scoped name is not a reference either (#1632).
+        assert_eq!(
+            at("ROW(INDIRECT(\"Sheet1!nope\"))", &g, 99, 25),
+            Value::Err(ExcelError::Ref)
+        );
     }
 
     #[test]
@@ -17103,7 +17113,9 @@ mod tests {
             "_xlfn.XLOOKUP( A1 , B:B , C:C )*1.50"
         );
         // A formula the parser refuses still gets its prefixes.
-        assert!(parse("XLOOKUP(Sheet1!MyName,B:B,C:C)").is_err());
+        assert!(parse("XLOOKUP(A1,B:B,C:C").is_err());
+        assert_eq!(file("XLOOKUP(A1,B:B,C:C"), "_xlfn.XLOOKUP(A1,B:B,C:C");
+        // A sheet-qualified name is parsed, not refused (#1632).
         assert_eq!(
             file("XLOOKUP(Sheet1!MyName,B:B,C:C)"),
             "_xlfn.XLOOKUP(Sheet1!MyName,B:B,C:C)"
@@ -17442,19 +17454,39 @@ mod tests {
         // only.
         assert!(parse("SEQUENCE(A1#").is_err());
         assert_eq!(file("SEQUENCE(A1#"), "_xlfn.SEQUENCE(A1#");
-        assert!(parse("LET(x,Sheet1!Rate,x*2)").is_err());
+        // A sheet-qualified defined name parses, so the AST tier prints it.
+        assert!(parse("LET(x,Sheet1!Rate,x*2)").is_ok());
         assert_eq!(
             file("LET(x,Sheet1!Rate,x*2)"),
-            "_xlfn.LET(x,Sheet1!Rate,x*2)"
+            "_xlfn.LET(_xlpm.x,Sheet1!Rate,_xlpm.x*2)"
         );
         assert_eq!(
-            file("lambda(x,Sheet1!Rate*x)(2)+single(Sheet1!Rate)+ANCHORARRAY(Sheet1!Rate)"),
-            "_xlfn.LAMBDA(x,Sheet1!Rate*x)(2)+_xlfn.SINGLE(Sheet1!Rate)+_xlfn.ANCHORARRAY(Sheet1!Rate)"
+            file("LET(sort,LAMBDA(x,x),sort(Sheet1!Rate))"),
+            "_xlfn.LET(_xlpm.sort,_xlfn.LAMBDA(_xlpm.x,_xlpm.x),_xlpm.sort(Sheet1!Rate))"
         );
-        assert!(matches!(
-            file_formula("SUM(A1#)+Sheet1!Rate"),
-            Cow::Borrowed(_)
-        ));
+        assert_eq!(
+            file("lambda(x,Sheet1!Rate*x)(2)+single(Sheet1!Rate)"),
+            "_xlfn.LAMBDA(_xlpm.x,Sheet1!Rate*_xlpm.x)(2)+_xlfn.SINGLE(Sheet1!Rate)"
+        );
+        // ANCHORARRAY of a name is not a spill reference: the parser still
+        // refuses it, so only the prefixes are spliced.
+        assert!(parse("ANCHORARRAY(Sheet1!Rate)").is_err());
+        assert_eq!(
+            file("ANCHORARRAY(Sheet1!Rate)"),
+            "_xlfn.ANCHORARRAY(Sheet1!Rate)"
+        );
+        // Quoting follows `sheet_prefix`.
+        for q in ["'My Sheet'!Rate", "'It''s'!Rate"] {
+            let src = format!("LET(x,{q},x*2)");
+            assert_eq!(file(&src), format!("_xlfn.LET(_xlpm.x,{q},_xlpm.x*2)"));
+            assert_eq!(display_formula(&file(&src)), src);
+        }
+        // It used to stay as typed (the parser refused the name, so `A1#`
+        // was never converted); now the spill reference is saved as one.
+        assert_eq!(
+            file("SUM(A1#)+Sheet1!Rate"),
+            "SUM(_xlfn.ANCHORARRAY(A1))+Sheet1!Rate"
+        );
     }
 
     #[test]
@@ -17469,6 +17501,7 @@ mod tests {
             "@A1:A3",
             "LET(x,1,x+1)",
             "LET(x,1,x)+x",
+            "LET(x,Sheet1!Rate,x*2)",
             "LAMBDA(a,b,a+b)(1,2)",
             "LET(x,1,LAMBDA(y,x+y)(2))",
             "LET(f,LAMBDA(x,x*3),f(2))",
