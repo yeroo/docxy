@@ -192,6 +192,9 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold on
   assert dirty is true
+  # Strikethrough and pattern ride the same view (#1664).
+  assert cell_styles.0.strikethrough is true
+  assert cell_styles.0.pattern is dark-diagonal-left
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.-2.checked is true
   click C1
@@ -202,6 +205,8 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
   assert reply.tabs.1.groups.-1.commands.-2.checked is true
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold off
+  assert cell_styles.0.strikethrough is false
+  assert cell_styles.0.pattern is solid
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.-2.checked is false
 

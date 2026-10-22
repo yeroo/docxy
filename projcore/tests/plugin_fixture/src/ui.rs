@@ -412,6 +412,8 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
         },
         "fixture.bold" => {
             // Bold on every selected cell, off when the cursor cell is bold.
+            // It also strikes the cell through and gives it a dark
+            // diagonal pattern, `solid` when off (#1664).
             let on = !bold(&req);
             let uids: Vec<i64> = req
                 .get("selection")
@@ -438,7 +440,11 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                     .iter()
                     .flat_map(|uid| {
                         cols.iter().map(move |col| {
-                            format!(r#"{{"uid":{uid},"column":{},"bold":{on}}}"#, quote(col))
+                            format!(
+                                r#"{{"uid":{uid},"column":{},"bold":{on},"strikethrough":{on},"pattern":"{}"}}"#,
+                                quote(col),
+                                if on { "dark-diagonal-left" } else { "solid" }
+                            )
                         })
                     })
                     .collect();

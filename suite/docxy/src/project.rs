@@ -673,6 +673,31 @@ fn project_region(
     }
 }
 
+/// The plan's cell text styles for the harness state (#1664).
+fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
+    let mut text = String::new();
+    projcore::json::Json::Arr(
+        f.cell_styles
+            .iter()
+            .map(|c| {
+                let mut pairs = vec![
+                    (
+                        "uid".to_string(),
+                        projcore::json::Json::Num(f64::from(c.uid)),
+                    ),
+                    ("column".to_string(), projcore::json::Json::str(&c.column)),
+                ];
+                if let projcore::json::Json::Obj(fields) = c.style.to_json() {
+                    pairs.extend(fields);
+                }
+                projcore::json::Json::Obj(pairs)
+            })
+            .collect(),
+    )
+    .write(&mut text);
+    ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
+}
+
 /// The plan's set gridlines for the harness state (#1575).
 fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json {
     let mut text = String::new();
@@ -754,6 +779,11 @@ pub(super) fn project_state(
         (
             "gridlines".into(),
             gridlines_json(&v.ed.project().formatting.gridlines),
+        ),
+        // The cells' own text styles (#1664), each `{uid, column, ..style}`.
+        (
+            "cell_styles".into(),
+            cell_styles_json(&v.ed.project().formatting),
         ),
         (
             "gridlines_set".into(),
