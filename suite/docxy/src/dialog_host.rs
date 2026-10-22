@@ -2177,17 +2177,58 @@ impl Docxy {
                                 // it is what holds the buttons at the bottom
                                 // (r10).
                                 let has_controls = !controls.is_empty() || sized;
+                                // Task Information's fixed size (#1682) cuts
+                                // what does not fit: its page scrolls.
+                                let body_scroll = (sized
+                                    && matches!(d.owner, DialogOwner::TaskInfo { .. }))
+                                .then(|| {
+                                    grid_scroll(
+                                        &mut self.dialog_grids.borrow_mut(),
+                                        (d.epoch, "dialog-body"),
+                                        None,
+                                        18.,
+                                        None,
+                                    )
+                                });
+                                let body = if let Some(h) = body_scroll {
+                                    div()
+                                        .relative()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(
+                                            v_flex()
+                                                .id("dialog-controls")
+                                                .gap_3()
+                                                .size_full()
+                                                .overflow_y_scroll()
+                                                .track_scroll(&h)
+                                                .children(controls),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .bottom_0()
+                                                .w(px(8.))
+                                                .child(
+                                                    Scrollbar::vertical(&h)
+                                                        .id("dialog-body-scroll")
+                                                        .scrollbar_show(ScrollbarShow::Always),
+                                                ),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    v_flex()
+                                        .gap_3()
+                                        .when(sized, |v| v.flex_1().min_h_0())
+                                        .children(controls)
+                                        .into_any_element()
+                                };
                                 v_flex()
                                     .gap_3()
                                     .when(sized, |v| v.flex_1().min_h_0())
-                                    .when(has_controls, |v| {
-                                        v.child(
-                                            v_flex()
-                                                .gap_3()
-                                                .when(sized, |v| v.flex_1().min_h_0())
-                                                .children(controls),
-                                        )
-                                    })
+                                    .when(has_controls, |v| v.child(body))
                                     .child(
                                         h_flex()
                                             .w_full()

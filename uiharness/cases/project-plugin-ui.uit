@@ -455,6 +455,13 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.-1.header is true
   assert reply.controls.-1.value is on every page
   assert reply.columns is 1
+  # The host's top row is a header band too, and the size is fixed (#1682).
+  assert reply.controls.0.name is name
+  assert reply.controls.0.header is true
+  assert reply.controls.1.header is true
+  assert reply.controls.2.header is true
+  assert reply.size.0 is 633
+  assert reply.size.1 is 520
   shot window
   call dialog-read {}
   assert reply.tabs.5 is Fixture
@@ -463,6 +470,10 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   # The plugin page's two columns (#1609); the built-in pages keep one.
   assert reply.columns is 2
   assert reply.controls.-1.header is true
+  assert reply.controls.0.header is true
+  assert reply.size.0 is 633
+  assert reply.size.1 is 520
+  # Name, Duration and Estimated stay whole above the two-column page.
   shot window
   # The top row (Name, Duration, Estimated) is on every page, so the page's
   # own controls follow it (#1536).
