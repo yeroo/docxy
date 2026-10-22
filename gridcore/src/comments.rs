@@ -657,8 +657,7 @@ impl SheetPackage {
             TC_REL,
             &rel_target(dir, &tc_part),
         );
-        let persons_wb_target = persons_part.strip_prefix("xl/").unwrap_or(&persons_part);
-        add_workbook_rel(&mut self.parts, PERSON_REL, persons_wb_target);
+        add_workbook_rel(&mut self.parts, PERSON_REL, &persons_part);
 
         // Rebuild the legacy shadow so down-level readers see the thread too.
         let notes = self.sheet_notes(sheet);

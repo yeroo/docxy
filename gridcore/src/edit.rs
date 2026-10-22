@@ -1199,14 +1199,23 @@ fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {
 /// ([`crate::engine::eval_formula_at`]), so `IFERROR(#REF!,0)` caches 0
 /// rather than `#REF!`. An array formula's whole block (its `spill`) takes
 /// the anchor's value, which is right once the removed range has collapsed
-/// to the scalar `#REF!`. Only the rewritten cells are evaluated: a cell that
-/// reads one keeps its cached value, and a volatile formula keeps its own,
-/// until the file is next calculated.
-pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
+/// to the scalar `#REF!`. Only the rewritten cells are evaluated here: a cell
+/// that reads one keeps its cached value, and a volatile formula keeps its
+/// own. The rewritten cells' keys come back, for
+/// [`crate::engine::Engine::recalc_dependents_of`] to bring their readers up
+/// to date.
+pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u32, u32)> {
     if removed.is_empty() {
-        return;
+        return Vec::new();
     }
     remove_sheet_refs_in_rules(wb, removed);
+    for sheet in &mut wb.sheets {
+        for d in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut d.kind {
+                remove_sheet_refs_in_chart(cd, removed);
+            }
+        }
+    }
     let mut rewritten = Vec::new();
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
@@ -1244,7 +1253,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
             crate::engine::value_to_cell(crate::engine::eval_formula_at(wb, s, r, c, src))
         })
         .collect();
-    for ((s, r, c), value) in rewritten.into_iter().zip(values) {
+    for (&(s, r, c), value) in rewritten.iter().zip(values) {
         let sheet = &mut wb.sheets[s];
         let Some(cell) = sheet.cells.get_mut(&(r, c)) else {
             continue;
@@ -1265,6 +1274,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) {
             }
         }
     }
+    rewritten
 }
 
 /// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
@@ -1343,6 +1353,59 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
     // why re-basing them here is still worth doing: the panel, `rebuild_source`
     // and the next re-derivation all read the model, not the part.
     cd.edited |= changed;
+}
+
+/// A chart ref that names a sheet in `removed` is dropped, as
+/// [`shift_chart_refs`] drops one whose rows are deleted: the cached values
+/// still draw the chart, and a ref to a sheet the file no longer holds would
+/// make Excel repair it. Only a chart with no part yet, or one already
+/// edited, has its refs dropped; it is marked edited, so a writable one is
+/// regenerated without them. A chart with a part that is not edited is left
+/// alone (`false`): its part round-trips, and
+/// `SheetPackage::remove_excel4_macros` rewrites the `<c:f>` text in place.
+pub fn remove_sheet_refs_in_chart(cd: &mut crate::sheet::ChartData, removed: &[String]) -> bool {
+    // A chart kept as loaded round-trips its part, whose `<c:f>` text the
+    // package pass rewrites; marking it edited here would regenerate it and
+    // lose the formatting the writer does not model.
+    if cd.part.is_some() && !cd.edited {
+        return false;
+    }
+    let gone =
+        |s: &crate::sheet::ChartSource| removed.iter().any(|r| s.sheet.eq_ignore_ascii_case(r));
+    let mut changed = false;
+    let mut drop_ref = |slot: &mut Option<crate::sheet::ChartSource>| {
+        if slot.as_ref().is_some_and(gone) {
+            *slot = None;
+            changed = true;
+        }
+    };
+    drop_ref(&mut cd.source);
+    drop_ref(&mut cd.categories_ref);
+    let mut points = false;
+    for ser in &mut cd.series {
+        let had_values = ser.values_ref.is_some();
+        drop_ref(&mut ser.values_ref);
+        if had_values && ser.values_ref.is_none() {
+            // `chart_space_xml` derives a ref-less series' cells from the
+            // chart's box and this column, as `shift_chart_refs` notes.
+            ser.col = None;
+        }
+        let before = ser.point_refs.len();
+        ser.point_refs.retain(|s| !gone(s));
+        points |= ser.point_refs.len() != before;
+        let name_gone = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+            .is_some_and(|p| gone(&p));
+        if name_gone {
+            ser.name_ref = None;
+            points = true;
+        }
+    }
+    changed |= points;
+    cd.edited |= changed;
+    changed
 }
 
 /// Move every ref a chart holds on `target` through a row/column insert or

@@ -130,6 +130,8 @@ mod sheet_menus;
 mod sheet_numfmt_tests;
 mod sheet_outline;
 mod sheet_page_setup;
+#[cfg(test)]
+mod sheet_part_undo_tests;
 mod sheet_paste;
 mod sheet_ribbon;
 #[cfg(test)]
@@ -2773,6 +2775,20 @@ impl SheetView {
         let s = self.active;
         self.pkg.workbook.sheets[s].show_formulas = now;
         now
+    }
+
+    /// Run `edit` as one undo step named `step`. The snapshot is the whole
+    /// package, not only the model: the edits that come here (conditional
+    /// formatting, Format as Table) change worksheet and table parts, which
+    /// Undo and Redo must bring back too (#827). A refused edit (`false`)
+    /// records nothing.
+    fn try_edit(&mut self, step: SheetStep, edit: impl FnOnce(&mut SheetView) -> bool) -> bool {
+        let snap = self.snapshot_package();
+        if !edit(self) {
+            return false;
+        }
+        self.push_undo_snapshot(snap, step);
+        true
     }
 
     /// Snapshot before a mutation, named `step`; share the history limit
@@ -19016,12 +19032,10 @@ impl Docxy {
         let Some(v) = self.active_sheet_mut() else {
             return false;
         };
-        let snap = v.snapshot();
-        if !edit(v) {
+        if !v.try_edit(step, edit) {
             self.set_status(DAMAGED_SHEET_STATUS);
             return false;
         }
-        v.push_undo_snapshot(snap, step);
         self.mark_sheet_dirty();
         true
     }
