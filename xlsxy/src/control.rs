@@ -40,7 +40,7 @@
 //! | `range.text-to-columns` | `{range,options?,dest?,replace?,sheet?}` | `{rows}` — one column; refuses with "Do you want to replace the contents of the destination cells?" unless `replace:true`; one undo step |
 //! | `range.flash-fill` | `{ref,sheet?}` | `{changed:[ref], blank:[ref]}` — Data › Flash Fill (Ctrl+E) on the column of `ref`: the examples typed at the top of the data (or below a header row: the column's top cell empty, or the examples showing no pattern with it), the non-empty columns next to it as sources, down to their last row; cells holding values are kept; results are typed like entries: text when every example is text that would not stay text typed bare (`'007`), and never with an apostrophe in a Text-formatted cell; one undo step. No pattern errors with "Flash Fill didn't see a pattern…"; a protected sheet is refused |
 //! | `app.autocorrect` | `{options?:{ac_*:bool}, add?:{replace,with,overwrite?}, delete?, exception?:{kind:first_letter\|initial_caps, add?\|delete?}}` | `{options, entries:[{replace,with}], exceptions:{first_letter, initial_caps}}` — File › Options › Proofing › AutoCorrect: switches, the replace list (re-adding a word with another With needs `overwrite:true`, as the dialog asks) and the exceptions; everything given is checked before anything is set; saved with the app's preferences on exit |
-//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate: `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell or range, `Sheet!B2`, `B2` or `Sheet!B2:D9` (default: the cursor on the active sheet; a range more than one cell tall or wide keeps the categories that fit that way); a ref may also be a defined name; `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
+//! | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | `{sheet,range}` — Data › Consolidate (a protected destination sheet is refused): `refs` like `East!A1:C4` (a bare range is on the destination's sheet); `dest` a cell or range, `Sheet!B2`, `B2` or `Sheet!B2:D9` (default: the cursor on the active sheet; a range more than one cell tall or wide keeps the categories that fit that way); a ref may also be a defined name; `fn` a dialog name or file token (`Sum` default, `Count Numbers`/`countNums`, …); `top`/`left` match by labels; `links` writes linked formulas in an outline (refused for a source on the destination sheet). A refusal changes nothing. One undo step |
 //! | `wb.replace-all` | `{query,text}` | `{replaced}` — every sheet, one undo group; refused, changing nothing, when any sheet is protected |
 //! | `sheet.add` | `{name?}` | `{sheet,name}` |
 //! | `sheet.remove` | `{sheet}` | `{removed:true}` (last-sheet error) |
@@ -1553,9 +1553,7 @@ fn app_options(app: &mut App, args: &Json) -> Result<Json, String> {
 fn range_flash_fill(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
     let (r, c) = ref_arg(args)?;
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("range.flash-fill: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "range.flash-fill")?;
     let f = app
         .flash_fill_on(si, r, c)
         .map_err(|e| format!("range.flash-fill: {e}"))?;
@@ -1692,9 +1690,7 @@ fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
 /// true. One undo step.
 fn range_text_to_columns(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("range.text-to-columns: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "range.text-to-columns")?;
     let rg = args
         .get_str("range")
         .ok_or("range.text-to-columns needs a 'range'")?;
@@ -1742,6 +1738,7 @@ fn wb_consolidate(app: &mut App, args: &Json) -> Result<Json, String> {
         }
         None => (app.sheet, (app.cur.0, app.cur.1, app.cur.0, app.cur.1)),
     };
+    refuse_if_protected(app, sheet, "wb.consolidate")?;
     let flag = |k: &str| args.get(k).and_then(Json::as_bool).unwrap_or(false);
     let opts = gridcore::edit::ConsolidateOptions {
         func,
@@ -2163,9 +2160,7 @@ fn col_width(app: &mut App, args: &Json) -> Result<Json, String> {
     if !(width.is_finite() && width >= 0.0) {
         return Err("col.width: 'width' must not be negative".to_string());
     }
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("col.width: the sheet is protected".into());
-    }
+    refuse_if_protected(app, si, "col.width")?;
     app.pkg.workbook.sheets[si].set_col_width(col, width);
     app.modified = true;
     Ok(Json::obj(vec![
@@ -2838,7 +2833,7 @@ fn sheet_arg_required(app: &App, args: &Json) -> Result<usize, String> {
 
 /// Refuse a verb that writes, moves or formats cells of sheet `si` when it is
 /// protected, as the keyboard does: `"<verb>: the sheet is protected"`.
-fn refuse_if_protected(app: &App, si: usize, verb: &str) -> Result<(), String> {
+pub(super) fn refuse_if_protected(app: &App, si: usize, verb: &str) -> Result<(), String> {
     if app.pkg.workbook.sheets[si].is_protected() {
         return Err(format!("{verb}: the sheet is protected"));
     }
@@ -4281,6 +4276,43 @@ mod tests {
             "cell.set: the sheet is protected"
         );
         dispatch(&mut a, "cell.set", &set_on(0.0)).unwrap();
+    }
+
+    /// #1679: `filter.advanced` with `copyTo` writes cells, so a protected
+    /// sheet refuses it; in place it only hides rows and stays allowed.
+    #[test]
+    fn filter_advanced_copy_to_refuses_a_protected_sheet() {
+        let mut a = app();
+        for (r, t) in [
+            ("A1", "h"),
+            ("A2", "x"),
+            ("A3", "y"),
+            ("C1", "h"),
+            ("C2", "x"),
+        ] {
+            set(&mut a, r, t);
+        }
+        let s = |v: &str| Json::Str(v.into());
+        let copy = Json::obj(vec![
+            ("list", s("A1:A3")),
+            ("criteria", s("C1:C2")),
+            ("copyTo", s("E1")),
+        ]);
+        let in_place = Json::obj(vec![("list", s("A1:A3")), ("criteria", s("C1:C2"))]);
+        a.pkg.workbook.sheets[0].set_protected(true);
+        a.modified = false;
+        let undo_len = a.undo.len();
+        assert_eq!(
+            dispatch(&mut a, "filter.advanced", &copy).unwrap_err(),
+            "filter.advanced: the sheet is protected"
+        );
+        assert_eq!(a.sheet().cell(0, 4), None);
+        assert_eq!(a.undo.len(), undo_len);
+        assert!(!a.modified);
+        dispatch(&mut a, "filter.advanced", &in_place).unwrap();
+        a.pkg.workbook.sheets[0].set_protected(false);
+        dispatch(&mut a, "filter.advanced", &copy).unwrap();
+        assert!(a.sheet().cell(0, 4).is_some());
     }
 
     /// #1679: table verbs go by the sheet that holds the table, and

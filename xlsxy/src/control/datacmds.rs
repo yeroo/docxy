@@ -378,6 +378,11 @@ pub(super) fn filter_advanced(app: &mut App, args: &Json) -> Result<Json, String
         copy_to,
         unique: args.get("unique").and_then(Json::as_bool).unwrap_or(false),
     };
+    // A copy writes (and clears) cells of the list's sheet; filtering in
+    // place only hides rows, which a protected sheet allows.
+    if a.copy_to.is_some() {
+        super::refuse_if_protected(app, si, "filter.advanced")?;
+    }
     let o = app.filter_command_on(si, |wb, si, _| gridcore::filter::advanced(wb, si, &a))?;
     Ok(outcome_json(o))
 }
@@ -477,9 +482,7 @@ fn level_arg(
 /// selection alone.
 pub(super) fn range_sort(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg(app, args)?;
-    if app.pkg.workbook.sheets[si].is_protected() {
-        return Err("range.sort: the sheet is protected".into());
-    }
+    super::refuse_if_protected(app, si, "range.sort")?;
     let wb = &app.pkg.workbook;
     let mut range = area(args.get_str("range").ok_or("range.sort needs a 'range'")?)?;
     let ltr = args.get_str("orientation") == Some("columns");
