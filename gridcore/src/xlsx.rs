@@ -678,23 +678,6 @@ pub(crate) fn resolve_relative(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
-/// `part` (a package path) as a relationship target from the folder `dir`:
-/// `("xl", "xl/worksheets/sheet1.xml")` → `worksheets/sheet1.xml`,
-/// `("xl/book", "xl/styles.xml")` → `../styles.xml`.
-pub(crate) fn rel_from(dir: &str, part: &str) -> String {
-    let from: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
-    let to: Vec<&str> = part.split('/').filter(|s| !s.is_empty()).collect();
-    let file = to.len().saturating_sub(1);
-    let common = from
-        .iter()
-        .zip(&to[..file])
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut out: Vec<&str> = vec![".."; from.len() - common];
-    out.extend(&to[common..]);
-    out.join("/")
-}
-
 /// The folder of the workbook part.
 fn workbook_dir(parts: &[(String, Vec<u8>)]) -> String {
     let wb = workbook_part_name(parts);
@@ -1944,10 +1927,12 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
     // The parts, by where they live.
     let sheet_parts: std::collections::HashSet<&str> =
         pkg.sheet_parts.iter().map(String::as_str).collect();
+    let wb_part = workbook_part_name(&pkg.parts);
     for (name, _) in &pkg.parts {
         let name = name.as_str();
         let under = |dir: &str| name.starts_with(dir);
         if sheet_parts.contains(name)
+            || name == wb_part
             || name == "[Content_Types].xml"
             || name.ends_with(".rels")
             || under("docProps/")
@@ -3769,8 +3754,6 @@ impl SheetPackage {
                     })
             });
         }
-        // Cell formulas that name a removed sheet read `#REF!`, as Excel
-        // turns them.
         // A chart part kept as loaded names the sheets in its `<c:f>` text.
         for (n, bytes) in self.parts.iter_mut() {
             if n.starts_with("xl/charts/") && n.ends_with(".xml") {
@@ -3780,6 +3763,8 @@ impl SheetPackage {
                 }
             }
         }
+        // Cell formulas that name a removed sheet read `#REF!`, as Excel
+        // turns them.
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &names);
         // The cells that read a rewritten one (and theirs) cache the new
         // value too, so the file is right before Excel recalculates. Only
@@ -9495,7 +9480,7 @@ pub(crate) fn add_workbook_rel(
     rel_type: &str,
     target_part: &str,
 ) -> String {
-    let target = rel_from(&workbook_dir(parts), target_part);
+    let target = relative_target(&workbook_dir(parts), target_part);
     let wb_rels = rels_part_name(&workbook_part_name(parts));
     if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_rels) {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -10364,7 +10349,7 @@ impl SheetPackage {
             &format!("/{cache_part}"),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml",
         );
-        let cache_target = rel_from(&workbook_dir(&self.parts), &cache_part);
+        let cache_target = relative_target(&workbook_dir(&self.parts), &cache_part);
         let cache_rid = match add_workbook_rel(
             &mut self.parts,
             &ns.rel("pivotCacheDefinition"),
@@ -10539,24 +10524,24 @@ impl SheetPackage {
         // workbook.xml.rels: drop the cache relationship, remembering its rId.
         let wb_part = workbook_part_name(&self.parts);
         let wb_rels = rels_part_name(&wb_part);
-        let cache_target = rel_from(&workbook_dir(&self.parts), &piv.cache_part);
+        let wb_dir = workbook_dir(&self.parts);
         let mut cache_rid = String::new();
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
-            if let Some(rel_pos) = xml.find(&format!("Target=\"{cache_target}\"")) {
-                if let Some(id_pos) = xml[..rel_pos].rfind("Id=\"") {
-                    let s = id_pos + 4;
-                    if let Some(e) = xml[s..].find('\"') {
-                        cache_rid = xml[s..s + e].to_string();
-                    }
-                }
+            // The rel whose Target resolves to the cache part, however the
+            // file spells it (`../pivotCache/…`, `/xl/pivotCache/…`).
+            let spelled = parse_rels(&xml)
+                .into_iter()
+                .find(|(_, _, t)| resolve_relative(&wb_dir, t) == piv.cache_part);
+            if let Some((id, _, target)) = spelled {
+                cache_rid = id;
+                p.1 = remove_element_containing(
+                    &xml,
+                    "<Relationship",
+                    &format!("Target=\"{target}\""),
+                )
+                .into_bytes();
             }
-            p.1 = remove_element_containing(
-                &xml,
-                "<Relationship",
-                &format!("Target=\"{cache_target}\""),
-            )
-            .into_bytes();
         }
         // workbook.xml: drop the <pivotCache> entry that referenced it.
         if !cache_rid.is_empty() {
@@ -19771,21 +19756,6 @@ mod kind_tests {
     }
 
     #[test]
-    fn rel_from_walks_up_to_the_common_folder() {
-        assert_eq!(
-            rel_from("xl", "xl/worksheets/sheet1.xml"),
-            "worksheets/sheet1.xml"
-        );
-        assert_eq!(rel_from("xl/book", "xl/styles.xml"), "../styles.xml");
-        assert_eq!(rel_from("xl/book", "xl/book/calc.xml"), "calc.xml");
-        assert_eq!(
-            rel_from("", "xl/persons/person1.xml"),
-            "xl/persons/person1.xml"
-        );
-        assert_eq!(rel_from("a/b/c", "x.xml"), "../../../x.xml");
-    }
-
-    #[test]
     fn a_formula_refers_to_a_sheet_only_by_its_whole_name() {
         assert!(formula_refers_to_sheet("Macro1!$A$1", "Macro1"));
         assert!(formula_refers_to_sheet("SUM(macro1!A1:A2)", "Macro1"));
@@ -20151,8 +20121,8 @@ mod kind_tests {
             "Macro1!$A$1:$A$3",
             None
         ));
-        // Saved fresh (the writer regenerates the charts) and as loaded
-        // (their parts round-trip verbatim): both leave no mention.
+        // Saved fresh (the writer generates the charts) and as loaded (their
+        // parts are kept, `<c:f>` text rewritten): both leave no mention.
         let loaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
         for source in [&pkg, &loaded] {
             let out = roundtrip(source, SpreadsheetKind::Workbook);
@@ -20195,6 +20165,72 @@ mod kind_tests {
             pkg.parts.iter().any(|(n, b)| n.starts_with("xl/charts/")
                 && String::from_utf8_lossy(b).contains("Macro1"))
         );
+    }
+
+    /// #827 r1: a chart kept as loaded is not regenerated by the macro-free
+    /// save (that would drop formatting the writer does not model): its
+    /// `<c:f>` text is rewritten in place, for a writable chart with data
+    /// labels and for one the writer cannot reproduce (a second plot group).
+    #[test]
+    fn macro_free_save_rewrites_a_loaded_charts_refs_in_its_own_part() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        let src = |range| ChartSource {
+            sheet: "Macro1".into(),
+            range,
+            cat_col: 0,
+        };
+        let chart = ChartData {
+            title: "T".into(),
+            kind: "column".into(),
+            categories: vec!["Q1".into()],
+            series: vec![ChartSeries {
+                name: "S".into(),
+                values: vec![1.0],
+                col: Some(1),
+                values_ref: Some(src((1, 1, 1, 1))),
+                name_ref: Some("Macro1!$B$1".into()),
+                ..Default::default()
+            }],
+            source: Some(src((0, 0, 1, 1))),
+            categories_ref: Some(src((1, 0, 1, 0))),
+            ..Default::default()
+        };
+        let mut pkg = mixed_xlm_book();
+        assert!(pkg.add_chart(0, (5, 0), (20, 8), &chart));
+        assert!(pkg.add_chart(0, (5, 9), (20, 17), &chart));
+        let mut loaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let names: Vec<String> = loaded
+            .parts
+            .iter()
+            .filter(|(n, _)| n.starts_with("xl/charts/chart") && n.ends_with(".xml"))
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(names.len(), 2);
+        // Formatting the writer does not model, and a combo's second group.
+        let styled = part_text(&loaded, &names[0]).replacen(
+            "</c:ser>",
+            "<c:dLbls><c:showVal val=\"1\"/></c:dLbls></c:ser>",
+            1,
+        );
+        let combo = part_text(&loaded, &names[1]).replacen(
+            "</c:barChart>",
+            "</c:barChart><c:lineChart><c:grouping val=\"standard\"/></c:lineChart>",
+            1,
+        );
+        loaded.set_part(&names[0], styled.into_bytes());
+        loaded.set_part(&names[1], combo.into_bytes());
+        let loaded = load_xlsx(&save_xlsx(&loaded)).unwrap();
+        let out = roundtrip(&loaded, SpreadsheetKind::Workbook);
+        for n in &names {
+            let xml = part_text(&out, n);
+            assert!(!xml.contains("Macro1"), "{n}: {xml}");
+            assert!(xml.contains("<c:f>#REF!</c:f>"), "{n}: {xml}");
+        }
+        assert!(
+            part_text(&out, &names[0]).contains("<c:dLbls>"),
+            "formatting kept"
+        );
+        assert!(part_text(&out, &names[1]).contains("<c:lineChart>"));
     }
 
     #[test]

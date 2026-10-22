@@ -117,6 +117,9 @@ pub struct Engine {
     /// The running Calculate is a manual one with iterative calculation on:
     /// each circle gets one pass, not a run to convergence.
     one_pass: bool,
+    /// Set while [`Engine::recalc_dependents_of`] runs, through its spill
+    /// follow-ups too: no volatile or blocked anchor is seeded.
+    dependents_only: bool,
 }
 
 /// The keys of the volatile formulas and of those with a spill reference
@@ -1250,7 +1253,7 @@ impl Engine {
     /// evaluate and every dependent goes stale (see [`Engine::is_stale`]);
     /// [`Engine::recalc_from_forced`] is the Calculate form.
     pub fn recalc_from(&mut self, wb: &mut Workbook, changed: &[Key]) {
-        self.recalc_from_depth(wb, changed, 0, true);
+        self.recalc_from_depth(wb, changed, 0);
     }
 
     /// Evaluate `changed` and their transitive dependents only: no volatile
@@ -1260,9 +1263,11 @@ impl Engine {
     /// and wants the values that read them right, as a macro-free save does.
     pub fn recalc_dependents_of(&mut self, wb: &mut Workbook, changed: &[Key]) {
         self.forcing = true;
+        self.dependents_only = true;
         self.one_pass = wb.calc.mode == CalcMode::Manual;
-        self.recalc_from_depth(wb, changed, 0, false);
+        self.recalc_from_depth(wb, changed, 0);
         self.forcing = false;
+        self.dependents_only = false;
         self.one_pass = false;
     }
 
@@ -1271,18 +1276,12 @@ impl Engine {
     pub fn recalc_from_forced(&mut self, wb: &mut Workbook, changed: &[Key]) {
         self.forcing = true;
         self.one_pass = wb.calc.mode == CalcMode::Manual;
-        self.recalc_from_depth(wb, changed, 0, true);
+        self.recalc_from_depth(wb, changed, 0);
         self.forcing = false;
         self.one_pass = false;
     }
 
-    fn recalc_from_depth(
-        &mut self,
-        wb: &mut Workbook,
-        changed: &[Key],
-        depth: u32,
-        seed_volatile: bool,
-    ) {
+    fn recalc_from_depth(&mut self, wb: &mut Workbook, changed: &[Key], depth: u32) {
         // Spill extents may have moved since indexing — refresh the dep
         // rects of every formula that reads one (`A1#`).
         self.ensure_flagged();
@@ -1321,7 +1320,7 @@ impl Engine {
                 frontier.push_back(k);
             }
         }
-        if seed_volatile {
+        if !self.dependents_only {
             if let Some(f) = &self.flagged {
                 for &k in &f.volatile {
                     if dirty.insert(k) {
@@ -1763,7 +1762,7 @@ impl Engine {
         if !spilled.is_empty() && depth < MAX_SPILL_PASSES {
             spilled.sort_unstable();
             spilled.dedup();
-            self.recalc_from_depth(wb, &spilled, depth + 1, true);
+            self.recalc_from_depth(wb, &spilled, depth + 1);
         }
         if depth == 0 {
             self.pass_anchors.clear();
@@ -3689,6 +3688,49 @@ mod tests {
         let mut eng = Engine::new(&wb); // no clock
         eng.recalc_all(&mut wb);
         assert_eq!(value_at(&wb, "A1"), CellValue::Number(44_000.0));
+    }
+
+    /// #827: `recalc_dependents_of` evaluates the readers of the changed
+    /// cells, and the spills they cause, without seeding a volatile formula
+    /// (a clock one here, with a clock set) anywhere, the spill follow-up
+    /// pass included; `recalc_from` does seed it.
+    #[test]
+    fn recalc_dependents_of_seeds_no_volatile_even_through_a_spill() {
+        let stale = |f: &str| Cell {
+            value: CellValue::Number(5.0),
+            formula: Some(f.to_string()),
+            ..Cell::default()
+        };
+        let build = || {
+            wb_one_sheet(&[
+                ("A1", Cell::formula("2")),
+                ("C1", array_formula("SEQUENCE(A1)")),
+                ("E1", stale("TODAY()")),
+            ])
+        };
+        let mut wb = build();
+        let mut eng = Engine::new(&wb);
+        eng.clock = Some(45_306.25);
+        let a1 = (0, 0, 0);
+        eng.recalc_dependents_of(&mut wb, &[a1]);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(1.0));
+        assert_eq!(
+            value_at(&wb, "C2"),
+            CellValue::Number(2.0),
+            "the spill lands"
+        );
+        assert_eq!(
+            value_at(&wb, "E1"),
+            CellValue::Number(5.0),
+            "TODAY() untouched"
+        );
+        assert!(!eng.dependents_only, "the mode ends with the call");
+        // The same call through recalc_from refreshes the volatile.
+        let mut wb = build();
+        let mut eng = Engine::new(&wb);
+        eng.clock = Some(45_306.25);
+        eng.recalc_from(&mut wb, &[a1]);
+        assert_eq!(value_at(&wb, "E1"), CellValue::Number(45_306.0));
     }
 
     #[test]

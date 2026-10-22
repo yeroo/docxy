@@ -1362,6 +1362,12 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
 /// regenerated without it; the others keep their part, whose `<c:f>` text
 /// the package's own pass rewrites (`SheetPackage::remove_excel4_macros`).
 pub fn remove_sheet_refs_in_chart(cd: &mut crate::sheet::ChartData, removed: &[String]) -> bool {
+    // A chart kept as loaded round-trips its part, whose `<c:f>` text the
+    // package pass rewrites; marking it edited here would regenerate it and
+    // lose the formatting the writer does not model.
+    if cd.part.is_some() && !cd.edited {
+        return false;
+    }
     let gone =
         |s: &crate::sheet::ChartSource| removed.iter().any(|r| s.sheet.eq_ignore_ascii_case(r));
     let mut changed = false;
@@ -1375,7 +1381,13 @@ pub fn remove_sheet_refs_in_chart(cd: &mut crate::sheet::ChartData, removed: &[S
     drop_ref(&mut cd.categories_ref);
     let mut points = false;
     for ser in &mut cd.series {
+        let had_values = ser.values_ref.is_some();
         drop_ref(&mut ser.values_ref);
+        if had_values && ser.values_ref.is_none() {
+            // `chart_space_xml` derives a ref-less series' cells from the
+            // chart's box and this column, as `shift_chart_refs` notes.
+            ser.col = None;
+        }
         let before = ser.point_refs.len();
         ser.point_refs.retain(|s| !gone(s));
         points |= ser.point_refs.len() != before;
