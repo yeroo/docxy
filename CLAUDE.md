@@ -519,7 +519,8 @@
   (fixed, every page), `buttons_right` (else Help bottom left, the rest
   bottom right), `page_columns` (controls per row; `Dialog::layout_rows`
   lays the bands out and `Docxy::dialog_body` draws them: the header band
-  first as one row, consecutive same-`Control::group` controls as a titled
+  first (in Task Information: Name, then Duration/Estimated, then the
+  plugin's header controls), consecutive same-`Control::group` controls as a titled
   box, rows of `columns` with `span` each, the labels of a column one
   width), `Control::min_rows` (a grid's visible rows; a plugin grid draws
   8, more scroll behind a `Scrollbar`), `Control::fill` (`Dialog::fills`: a
@@ -928,7 +929,10 @@
   so a plugin page's `fill` multiline fills it (`Dialog::fills`). What still
   does not fit scrolls: the Task Information page body is a scrolling
   container with a `Scrollbar` (`dialog-body`), and the Predecessors and
-  Resources grids have `min_rows` 6 (empty rows drawn, more scroll).
+  Resources grids have `min_rows` 6 (empty rows drawn, more scroll). Known
+  limits: the page-body scroll does not follow Tab focus or the open
+  calendar, and a wheel over a nested scrolling grid or multiline also
+  scrolls the page body when the page overflows.
 
 ## Terminal docxy prompts edit at a caret (#1372)
 

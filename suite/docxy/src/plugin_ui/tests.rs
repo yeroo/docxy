@@ -562,7 +562,8 @@ fn task_information_top_row_spans_a_wide_plugin_header_and_the_size_is_fixed() {
             assert_eq!(dialog.size, Some(crate::TASK_INFO_SIZE), "{t}");
         }
     }
-    // A `fill` multiline on a plugin page fills it.
+    // `fills` holds for a `fill` multiline once Task Information is sized
+    // (the flag only; the layout is not covered here).
     d.select_tab("Wide").unwrap();
     let note = d.controls.iter_mut().find(|c| c.name == "fx.note").unwrap();
     note.fill = true;

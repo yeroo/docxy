@@ -1399,8 +1399,9 @@ impl Dialog {
     }
 
     /// The shown controls laid out as Project's (#1609): the header first
-    /// (one band holding every header control, as wide as the sum of their
-    /// spans; a header control's `group` is ignored), then the
+    /// (one band holding every header control, `header_columns` wide: the
+    /// sum of their spans, the plugin's only in Task Information, whose own
+    /// top row spans the band; a header control's `group` is ignored), then the
     /// page's controls in rows of [`Dialog::columns`], a control's `span`
     /// taking that many columns (clamped to the row), consecutive controls
     /// of one `group` title in one band. A control marked `beside` (#1536)
