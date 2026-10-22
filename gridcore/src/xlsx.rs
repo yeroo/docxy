@@ -4358,7 +4358,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     }
 
     // --- tables: geometry, names, columns and conversions reach the parts --
-    sync_table_parts(&mut parts, wb);
+    let table_drops = sync_table_parts(&mut parts, wb);
 
     // --- pivots: patch a moved location, ask Excel to rebuild what we laid out
     // Refresh may have grown/shrunk the output region; the location ref must
@@ -4424,6 +4424,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         // new_xlsx's 1900 part, and its dates would shift by 1462 days.
         p.1 = set_date1904(&xml, wb.date1904).into_bytes();
     }
+
+    // --- slicers over table columns or tables the tables step dropped ------
+    // After the defined names: their `Slicer_<name>` entry is in the model.
+    drop_table_slicers(&mut parts, &table_drops, &wb_part);
 
     // --- calcPr: the calculation settings the user can change ------------------
     if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_part) {
@@ -8366,6 +8370,284 @@ fn drop_table_part(parts: &mut Vec<(String, Vec<u8>)>, part: &str) {
     drop_parts_cascading(parts, part);
 }
 
+/// The attribute of `element`'s start tag with local name `name`, decoded.
+fn start_attr_local(element: &str, name: &str) -> Option<String> {
+    let tag = start_tag(element)?;
+    tag.attrs
+        .iter()
+        .find(|(a, _, _)| local(a) == name)
+        .map(|&(_, vs, ve)| decode(&element[vs..ve]))
+}
+
+/// Strike from the root's `extLst` the `leaf` children (of the `wrapper`
+/// inside an `ext`) that `doomed` accepts. A wrapper left with none goes,
+/// then the `ext` that held only wrappers that went, then the `extLst` that
+/// held only such exts. Anything else is kept byte for byte.
+fn strike_ext_leaves(
+    xml: &str,
+    wrapper: &str,
+    leaf: &str,
+    doomed: &dyn Fn(&str) -> bool,
+) -> String {
+    let mut edits = Vec::new();
+    for (name, ls, le) in element_children(xml) {
+        if name != "extLst" {
+            continue;
+        }
+        let list = &xml[ls..le];
+        let exts = element_children(list);
+        let (mut list_edits, mut gone) = (Vec::new(), 0);
+        for (en, es, ee) in &exts {
+            if en != "ext" {
+                continue;
+            }
+            let ext = &list[*es..*ee];
+            let kids = element_children(ext);
+            let (mut ext_edits, mut emptied) = (Vec::new(), 0);
+            for (kn, ks, ke) in &kids {
+                if kn != wrapper {
+                    continue;
+                }
+                let frag = &ext[*ks..*ke];
+                let items = element_children(frag);
+                let hits: Vec<_> = (items.iter())
+                    .filter(|(n, s, e)| n == leaf && doomed(&frag[*s..*e]))
+                    .collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                if hits.len() == items.len() {
+                    emptied += 1;
+                    ext_edits.push((*ks, *ke, String::new()));
+                } else {
+                    ext_edits.extend(hits.iter().map(|(_, s, e)| (ks + s, ks + e, String::new())));
+                }
+            }
+            if emptied > 0 && emptied == kids.len() {
+                gone += 1;
+                list_edits.push((*es, *ee, String::new()));
+            } else if !ext_edits.is_empty() {
+                list_edits.push((*es, *ee, apply_edits(ext.to_string(), ext_edits)));
+            }
+        }
+        if gone > 0 && gone == exts.len() {
+            edits.push((ls, le, String::new()));
+        } else if !list_edits.is_empty() {
+            edits.push((ls, le, apply_edits(list.to_string(), list_edits)));
+        }
+    }
+    if edits.is_empty() {
+        xml.to_string()
+    } else {
+        apply_edits(xml.to_string(), edits)
+    }
+}
+
+/// `part`'s text, if it exists.
+fn part_text(parts: &[(String, Vec<u8>)], part: &str) -> Option<String> {
+    (parts.iter().find(|(n, _)| n == part)).map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+}
+
+/// The relationships that name `target`, as (owner part, rels part, Id).
+fn rels_naming(parts: &[(String, Vec<u8>)], target: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for (name, bytes) in parts {
+        let Some((dir, file)) = name.rsplit_once("/_rels/") else {
+            continue;
+        };
+        let Some(file) = file.strip_suffix(".rels") else {
+            continue;
+        };
+        for (id, _, t) in parse_rels(&String::from_utf8_lossy(bytes)) {
+            if resolve_relative(dir, &t) == target {
+                out.push((format!("{dir}/{file}"), name.clone(), id));
+            }
+        }
+    }
+    out
+}
+
+/// Remove relationship `id` from `rels`.
+fn remove_rel(parts: &mut [(String, Vec<u8>)], rels: &str, id: &str) {
+    if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels) {
+        let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+        if let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) {
+            xml.replace_range(el.start..el.end, "");
+            p.1 = xml.into_bytes();
+        }
+    }
+}
+
+/// Excel's table slicers over a column or table the save dropped (#1694): the
+/// slicer cache (`xl/slicerCaches`, `x15:tableSlicerCache` naming the table's
+/// `id` and a `tableColumn` id) with its workbook relationship and
+/// `x14:slicerCache` entry, the `Slicer_<name>` defined name, and the
+/// slicers on that cache: their element in the slicer part (the part goes
+/// with its sheet relationship and `x14:slicer` entry when none is left)
+/// and their drawing anchor. Nothing else is touched: a slicer on a
+/// surviving column or an untouched table keeps its bytes. Excel likely
+/// repaired such a file by dropping the slicer (not verified in Excel);
+/// dropping it here is the same loss without the repair prompt.
+fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb_part: &str) {
+    if drops.tables.is_empty() && drops.columns.is_empty() {
+        return;
+    }
+    // The caches that slice what was dropped: (part, cache name).
+    let mut caches: Vec<(String, String)> = Vec::new();
+    for (name, bytes) in parts.iter() {
+        if !name.starts_with("xl/slicerCaches/") || !name.ends_with(".xml") {
+            continue;
+        }
+        let xml = String::from_utf8_lossy(bytes);
+        let mut p = XmlParser::new(&xml);
+        let (mut cache, mut hit) = (None, false);
+        loop {
+            match p.next() {
+                Event::Start => {
+                    let attr = |n: &str| {
+                        (p.attrs().iter())
+                            .find(|a| local(a.name) == n)
+                            .map(|a| decode(a.value))
+                    };
+                    if cache.is_none() {
+                        cache = Some(attr("name").unwrap_or_default());
+                    } else if local(p.name()) == "tableSlicerCache" {
+                        let num = |n: &str| attr(n).and_then(|v| v.parse::<u32>().ok());
+                        if let (Some(t), Some(c)) = (num("tableId"), num("column")) {
+                            hit |= drops.hits(t, c);
+                        }
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        if let (true, Some(cache)) = (hit, cache) {
+            caches.push((name.clone(), cache));
+        }
+    }
+    if caches.is_empty() {
+        return;
+    }
+    let cache_names: Vec<&str> = caches.iter().map(|(_, c)| c.as_str()).collect();
+    let wb_rels = rels_part_name(wb_part);
+
+    // The slicers on those caches, part by part.
+    let mut slicer_names: Vec<String> = Vec::new();
+    let slicer_parts: Vec<String> = (parts.iter())
+        .map(|(n, _)| n.clone())
+        .filter(|n| n.starts_with("xl/slicers/") && n.ends_with(".xml") && !n.contains("_rels/"))
+        .collect();
+    for part in slicer_parts {
+        let Some(xml) = part_text(parts, &part) else {
+            continue;
+        };
+        let kids = element_children(&xml);
+        let hit = |k: &(String, usize, usize)| {
+            k.0 == "slicer"
+                && start_attr_local(&xml[k.1..k.2], "cache")
+                    .is_some_and(|c| cache_names.contains(&c.as_str()))
+        };
+        let hits: Vec<_> = kids.iter().filter(|k| hit(k)).collect();
+        if hits.is_empty() {
+            continue;
+        }
+        slicer_names.extend(
+            hits.iter()
+                .filter_map(|k| start_attr_local(&xml[k.1..k.2], "name")),
+        );
+        if hits.len() < kids.len() {
+            let edits = hits.iter().map(|k| (k.1, k.2, String::new())).collect();
+            if let Some(p) = parts.iter_mut().find(|(n, _)| *n == part) {
+                p.1 = apply_edits(xml, edits).into_bytes();
+            }
+            continue;
+        }
+        // None left: its sheet's relationship and `x14:slicer` entry go
+        // with it.
+        for (owner, rels, id) in rels_naming(parts, &part) {
+            remove_rel(parts, &rels, &id);
+            if let Some(p) = parts.iter_mut().find(|(n, _)| *n == owner) {
+                let sheet = String::from_utf8_lossy(&p.1).into_owned();
+                let out = strike_ext_leaves(&sheet, "slicerList", "slicer", &|f| {
+                    start_attr_local(f, "id").as_deref() == Some(id.as_str())
+                });
+                p.1 = out.into_bytes();
+            }
+        }
+        drop_parts_cascading(parts, &part);
+    }
+
+    // Their anchors in the drawings.
+    if !slicer_names.is_empty() {
+        let drawings: Vec<String> = (parts.iter())
+            .map(|(n, _)| n.clone())
+            .filter(|n| {
+                n.starts_with("xl/drawings/") && n.ends_with(".xml") && !n.contains("_rels/")
+            })
+            .collect();
+        for part in drawings {
+            let Some(xml) = part_text(parts, &part) else {
+                continue;
+            };
+            let edits: Vec<_> = element_children(&xml)
+                .into_iter()
+                .filter(|(_, s, e)| names_a_slicer(&xml[*s..*e], &slicer_names))
+                .map(|(_, s, e)| (s, e, String::new()))
+                .collect();
+            if edits.is_empty() {
+                continue;
+            }
+            if let Some(p) = parts.iter_mut().find(|(n, _)| *n == part) {
+                p.1 = apply_edits(xml, edits).into_bytes();
+            }
+        }
+    }
+
+    // The caches themselves: the workbook's relationship and entry first, so
+    // the cascade finds nothing naming the part.
+    for (part, cache) in &caches {
+        let rids: Vec<String> = (rels_naming(parts, part).into_iter())
+            .filter(|(_, rels, _)| *rels == wb_rels)
+            .map(|(_, _, id)| id)
+            .collect();
+        for id in &rids {
+            remove_rel(parts, &wb_rels, id);
+        }
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == wb_part) {
+            let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+            xml = strike_ext_leaves(&xml, "slicerCaches", "slicerCache", &|f| {
+                start_attr_local(f, "id").is_some_and(|v| rids.contains(&v))
+            });
+            if let Some(el) = find_element_by_attr(&xml, "definedName", "name", |v| v == cache) {
+                xml.replace_range(el.start..el.end, "");
+            }
+            p.1 = xml.into_bytes();
+        }
+        drop_parts_cascading(parts, part);
+    }
+}
+
+/// Whether `anchor` (a drawing's child) holds an `sle:slicer` named one of
+/// `names`.
+fn names_a_slicer(anchor: &str, names: &[String]) -> bool {
+    let mut p = XmlParser::new(anchor);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "slicer" => {
+                let named = (p.attrs().iter())
+                    .find(|a| local(a.name) == "name")
+                    .map(|a| decode(a.value));
+                if named.is_some_and(|n| names.contains(&n)) {
+                    return true;
+                }
+            }
+            Event::Eof => return false,
+            _ => {}
+        }
+    }
+}
+
 /// Table `t`'s columns by the names its part (`xml`) knows them by: a column
 /// renamed since the part was written ([`crate::sheet::Table::column_ids`])
 /// has the part's name for it, every other column its own.
@@ -8388,7 +8670,7 @@ fn part_column_names(t: &Table, xml: &str) -> Vec<String> {
 /// converted tables),
 /// and the parts of tables converted to a range or deleted (all their
 /// columns, their whole range or their header row) dropped.
-fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
+fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) -> TableDrops {
     let part_xml = |parts: &[(String, Vec<u8>)], name: &str| {
         parts
             .iter()
@@ -8473,6 +8755,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         })
         .collect();
     let mut dropped_columns: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut drops = TableDrops::default();
     for t in &wb.tables {
         let Some(p) = parts.iter_mut().find(|(n, _)| n == &t.part) else {
             continue;
@@ -8499,6 +8782,9 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         let dropped;
         (updated, dropped) = sync_table_columns(&updated, &t.columns, &t.column_ids);
         if !dropped.is_empty() {
+            if let Some(id) = table_id(&updated) {
+                drops.columns.push((id, dropped.clone()));
+            }
             dropped_columns.push((t.part.clone(), dropped));
         }
         if !column_renames.is_empty()
@@ -8523,8 +8809,39 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) {
         drop_query_table_fields(parts, part, dropped);
     }
     for c in &converted {
+        if let Some(id) = part_xml(parts, &c.part).and_then(|x| table_id(&x)) {
+            drops.tables.push(id);
+        }
         drop_table_part(parts, &c.part);
     }
+    drops
+}
+
+/// What a save dropped from the table parts, by table `id`: slicer caches
+/// over it go too ([`drop_table_slicers`]).
+#[derive(Default)]
+struct TableDrops {
+    /// A table's `tableColumn` ids dropped from its part.
+    columns: Vec<(u32, Vec<u32>)>,
+    /// Tables whose part was dropped.
+    tables: Vec<u32>,
+}
+
+impl TableDrops {
+    /// Whether a table slicer cache over column `column` of table `table`
+    /// lost what it slices.
+    fn hits(&self, table: u32, column: u32) -> bool {
+        self.tables.contains(&table)
+            || self
+                .columns
+                .iter()
+                .any(|(t, cols)| *t == table && cols.contains(&column))
+    }
+}
+
+/// A table part's `id`.
+fn table_id(xml: &str) -> Option<u32> {
+    table_root_attr(xml, "id")?.1.parse().ok()
 }
 
 /// A text event's content: CDATA as it stands, other text decoded, and
@@ -26162,6 +26479,251 @@ mod table_command_tests {
     fn type_header(pkg: &mut SheetPackage, r: u32, c: u32, text: &str) -> bool {
         pkg.workbook.sheets[0].set_cell(r, c, Cell::text(text));
         crate::edit::sync_table_headers(&mut pkg.workbook, 0, &[(r, c)])
+    }
+
+    /// `one_table` (Item id 1, Qty id 2, table id 1) with Excel's table
+    /// slicers over both columns: caches `Slicer_Item` and `Slicer_Qty`, one
+    /// slicer part holding both slicers, their drawing anchors, and every
+    /// entry that names them (#1694).
+    fn slicer_package() -> SheetPackage {
+        let mut pkg = reload(&one_table());
+        let put = |pkg: &mut SheetPackage, name: &str, xml: &str| match pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == name)
+        {
+            Some(p) => p.1 = xml.as_bytes().to_vec(),
+            None => pkg.parts.push((name.to_string(), xml.as_bytes().to_vec())),
+        };
+        let edit = |pkg: &mut SheetPackage, name: &str, f: &dyn Fn(String) -> String| {
+            let p = pkg.parts.iter_mut().find(|(n, _)| n == name).unwrap();
+            p.1 = f(String::from_utf8(p.1.clone()).unwrap()).into_bytes();
+        };
+        for (n, name, column) in [(1, "Slicer_Item", 1), (2, "Slicer_Qty", 2)] {
+            put(
+                &mut pkg,
+                &format!("xl/slicerCaches/slicerCache{n}.xml"),
+                &format!(
+                    r#"<slicerCacheDefinition xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" name="{name}" sourceName="x"><extLst><ext uri="{{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"><x15:tableSlicerCache tableId="1" column="{column}"/></ext></extLst></slicerCacheDefinition>"#
+                ),
+            );
+        }
+        put(
+            &mut pkg,
+            "xl/slicers/slicer1.xml",
+            r#"<slicers xmlns="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><slicer name="Item" cache="Slicer_Item" caption="Item"/><slicer name="Qty" cache="Slicer_Qty" caption="Qty"/></slicers>"#,
+        );
+        let anchor = |id: u32, name: &str| {
+            format!(
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice xmlns:sle15="http://schemas.microsoft.com/office/drawing/2012/slicer" Requires="sle15"><xdr:twoCellAnchor><xdr:from><xdr:col>5</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{id}" name="{name}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/drawing/2010/slicer"><sle15:slicer name="{name}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="{id}" name="{name}"/></xdr:nvSpPr></xdr:sp></mc:Fallback></mc:AlternateContent>"#
+            )
+        };
+        put(
+            &mut pkg,
+            "xl/drawings/drawing1.xml",
+            &format!(
+                r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{}{}</xdr:wsDr>"#,
+                anchor(2, "Item"),
+                anchor(3, "Qty")
+            ),
+        );
+        let rel = |id: &str, ty: &str, target: &str| {
+            format!(r#"<Relationship Id="{id}" Type="{ty}" Target="{target}"/>"#)
+        };
+        let ms = "http://schemas.microsoft.com/office/2007/relationships";
+        edit(&mut pkg, "xl/_rels/workbook.xml.rels", &|x| {
+            x.replace(
+                "</Relationships>",
+                &format!(
+                    "{}{}</Relationships>",
+                    rel(
+                        "rId10",
+                        &format!("{ms}/slicerCache"),
+                        "slicerCaches/slicerCache1.xml"
+                    ),
+                    rel(
+                        "rId11",
+                        &format!("{ms}/slicerCache"),
+                        "slicerCaches/slicerCache2.xml"
+                    )
+                ),
+            )
+        });
+        edit(&mut pkg, "xl/worksheets/_rels/sheet1.xml.rels", &|x| {
+            x.replace(
+                "</Relationships>",
+                &format!(
+                    "{}{}</Relationships>",
+                    rel("rId2", &format!("{ms}/slicer"), "../slicers/slicer1.xml"),
+                    rel(
+                        "rId3",
+                        "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+                        "../drawings/drawing1.xml"
+                    )
+                ),
+            )
+        });
+        edit(&mut pkg, "xl/worksheets/sheet1.xml", &|x| {
+            x.replace("<tableParts", r#"<drawing r:id="rId3"/><tableParts"#)
+                .replace(
+                    "</worksheet>",
+                    r#"<extLst><ext uri="{A8765BA9-456A-4dab-B4F3-ACF838C121DE}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:slicerList><x14:slicer r:id="rId2"/></x14:slicerList></ext></extLst></worksheet>"#,
+                )
+        });
+        edit(&mut pkg, "xl/workbook.xml", &|x| {
+            x.replace(
+                "</sheets>",
+                r#"</sheets><definedNames><definedName name="Slicer_Item">#N/A</definedName><definedName name="Slicer_Qty">#N/A</definedName><definedName name="Keep">Sheet1!$A$1</definedName></definedNames>"#,
+            )
+            .replace(
+                "</workbook>",
+                r#"<extLst><ext uri="{46BE6895-7355-4a93-B00E-2C351335B9C9}" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main"><x15:slicerCaches xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><x14:slicerCache r:id="rId10"/><x14:slicerCache r:id="rId11"/></x15:slicerCaches></ext></extLst></workbook>"#,
+            )
+        });
+        edit(&mut pkg, "[Content_Types].xml", &|x| {
+            let ov = |part: &str, ty: &str| {
+                format!(
+                    r#"<Override PartName="/{part}" ContentType="application/vnd.ms-excel.{ty}+xml"/>"#
+                )
+            };
+            x.replace(
+                "</Types>",
+                &format!(
+                    "{}{}{}{}</Types>",
+                    ov("xl/slicerCaches/slicerCache1.xml", "slicerCache"),
+                    ov("xl/slicerCaches/slicerCache2.xml", "slicerCache"),
+                    ov("xl/slicers/slicer1.xml", "slicer"),
+                    r#"<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#
+                ),
+            )
+        });
+        reload(&pkg)
+    }
+
+    /// Everything of the slicer fixture that names `Slicer_<name>`.
+    fn slicer_leftovers(pkg: &SheetPackage, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let n = if name == "Item" { 1 } else { 2 };
+        if pkg
+            .part(&format!("xl/slicerCaches/slicerCache{n}.xml"))
+            .is_some()
+        {
+            out.push("cache part".into());
+        }
+        let wb = text(pkg, "xl/workbook.xml");
+        let rid = format!("r:id=\"rId1{}\"", n - 1);
+        if wb.contains(&rid) {
+            out.push("workbook entry".into());
+        }
+        if wb.contains(&format!("\"Slicer_{name}\"")) {
+            out.push("defined name".into());
+        }
+        let rels = text(pkg, "xl/_rels/workbook.xml.rels");
+        if rels.contains(&format!("slicerCache{n}.xml")) {
+            out.push("workbook rel".into());
+        }
+        let types = text(pkg, "[Content_Types].xml");
+        if types.contains(&format!("slicerCache{n}.xml")) {
+            out.push("content type".into());
+        }
+        if let Some(sl) = pkg.part("xl/slicers/slicer1.xml") {
+            if String::from_utf8_lossy(sl).contains(&format!("cache=\"Slicer_{name}\"")) {
+                out.push("slicer".into());
+            }
+        }
+        let drawing = text(pkg, "xl/drawings/drawing1.xml");
+        if drawing.contains(&format!("name=\"{name}\"")) {
+            out.push("drawing anchor".into());
+        }
+        out
+    }
+
+    #[test]
+    fn a_slicer_fixture_loads_and_saves_untouched() {
+        let pkg = slicer_package();
+        assert!(slicer_leftovers(&pkg, "Qty").len() == 7, "fixture");
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&re, name).len(), 7, "{name}");
+        }
+        for part in [
+            "xl/slicers/slicer1.xml",
+            "xl/drawings/drawing1.xml",
+            "xl/slicerCaches/slicerCache2.xml",
+        ] {
+            assert_eq!(text(&re, part), text(&pkg, part), "{part}");
+        }
+        assert!(text(&re, "xl/worksheets/sheet1.xml").contains("slicerList"));
+    }
+
+    #[test]
+    fn save_drops_slicer_cache_of_deleted_table_column() {
+        let mut pkg = slicer_package();
+        // The Qty column goes; the Item slicer stays as loaded.
+        let item_cache = text(&pkg, "xl/slicerCaches/slicerCache1.xml");
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 1, 1);
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.tables[0].columns, ["Item"]);
+        assert_eq!(slicer_leftovers(&re, "Qty"), Vec::<String>::new());
+        assert_eq!(slicer_leftovers(&re, "Item").len(), 7);
+        assert_eq!(text(&re, "xl/slicerCaches/slicerCache1.xml"), item_cache);
+        // The slicer part is shared: only the Qty slicer left it.
+        let slicers = text(&re, "xl/slicers/slicer1.xml");
+        assert!(slicers.contains("Slicer_Item") && !slicers.contains("Slicer_Qty"));
+        let wb = text(&re, "xl/workbook.xml");
+        assert!(wb.contains("rId10") && !wb.contains("rId11"), "{wb}");
+        assert!(wb.contains("name=\"Keep\""), "{wb}");
+        let drawing = text(&re, "xl/drawings/drawing1.xml");
+        assert!(drawing.contains("name=\"Item\"") && !drawing.contains("name=\"Qty\""));
+        // The sheet still lists the slicer part.
+        assert!(text(&re, "xl/worksheets/sheet1.xml").contains("slicerList"));
+        // Saved again, nothing more changes.
+        for part in [
+            "xl/slicers/slicer1.xml",
+            "xl/workbook.xml",
+            "xl/drawings/drawing1.xml",
+        ] {
+            assert_eq!(text(&reload(&re), part), text(&re, part), "{part}");
+        }
+    }
+
+    #[test]
+    fn save_drops_slicer_cache_of_dropped_table() {
+        let mut pkg = slicer_package();
+        crate::edit::delete_cols(&mut pkg.workbook, 0, 0, 2);
+        assert!(pkg.workbook.tables.is_empty());
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&re, name), Vec::<String>::new(), "{name}");
+        }
+        // No slicer is left: the part, its sheet relationship and entry go.
+        assert!(re.part("xl/slicers/slicer1.xml").is_none());
+        let rels = text(&re, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(!rels.contains("slicer"), "{rels}");
+        let ws = text(&re, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("slicer") && !ws.contains("extLst"), "{ws}");
+        let wb = text(&re, "xl/workbook.xml");
+        assert!(
+            !wb.contains("slicerCache") && !wb.contains("extLst"),
+            "{wb}"
+        );
+        assert!(wb.contains("name=\"Keep\""), "{wb}");
+        let types = text(&re, "[Content_Types].xml");
+        assert!(!types.contains("slicer"), "{types}");
+    }
+
+    #[test]
+    fn save_keeps_slicers_when_no_table_column_goes() {
+        let mut pkg = slicer_package();
+        // A rename or a resize that keeps both columns drops nothing.
+        assert!(type_header(&mut pkg, 0, 1, "Units"));
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&re, name).len(), 7, "{name}");
+        }
+        for part in ["xl/slicers/slicer1.xml", "xl/drawings/drawing1.xml"] {
+            assert_eq!(text(&re, part), text(&slicer_package(), part), "{part}");
+        }
     }
 
     #[test]

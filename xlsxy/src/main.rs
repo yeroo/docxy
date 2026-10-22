@@ -4007,10 +4007,27 @@ impl App {
         if changes.is_empty() {
             return;
         }
-        // Chained per measure and relationship: a step that changes two
-        // tables rewrites each item through both, into one edit.
+        let edits = self.model_edits_for(&changes, &[]);
+        self.apply_model_edits(&edits);
+        before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
+        after.model_edits = edits;
+        self.follow_tables_in_clip(&changes, before, after);
+    }
+
+    /// The data-model edits `changes` ask: each measure and relationship
+    /// rewritten through every change, into one edit apiece (a step that
+    /// changes two tables rewrites an item through both). An item `skip`
+    /// holds the `from` of is left to that edit.
+    fn model_edits_for(&self, changes: &[TableChange], skip: &[ModelEdit]) -> Vec<ModelEdit> {
         let mut edits: Vec<ModelEdit> = Vec::new();
         for m in &self.model_measures {
+            let own = |e: &ModelEdit| {
+                matches!(e, ModelEdit::Measure { name, from, .. }
+                    if *name == m.name && *from == m.formula)
+            };
+            if skip.iter().any(own) {
+                continue;
+            }
             let Ok(ast) = gridcore::formula::parse(&m.formula) else {
                 continue;
             };
@@ -4026,8 +4043,14 @@ impl App {
             }
         }
         for r in &self.model_rels {
+            if skip
+                .iter()
+                .any(|e| matches!(e, ModelEdit::Relationship { from, .. } if from == r))
+            {
+                continue;
+            }
             let mut to = r.clone();
-            for ch in &changes {
+            for ch in changes {
                 for end in [&mut to.from, &mut to.to] {
                     if end.0.eq_ignore_ascii_case(&ch.table.name) {
                         if let Some(col) = ch.column_after(&end.1) {
@@ -4043,10 +4066,7 @@ impl App {
                 });
             }
         }
-        self.apply_model_edits(&edits);
-        before.model_edits = edits.iter().rev().map(ModelEdit::reversed).collect();
-        after.model_edits = edits;
-        self.follow_tables_in_clip(&changes, before, after);
+        edits
     }
 
     /// The pending copy's formulas follow `changes` (table renames, column
@@ -4299,13 +4319,16 @@ impl App {
     fn restore(&mut self, snap: &WbSnapshot) {
         self.circles.clear();
         self.cancel_cut();
-        // A copy taken after the step is rewritten only by renames (table
-        // and column), which the next replay undoes. A table removal or a
-        // column delete in a replay leaves it as it is: dropping it or
-        // turning a reference to `#REF!` could not be undone, and nothing
-        // records it. Only the copy the step itself found is dropped or
-        // rewritten, and put back through `clip_edit`.
-        let current = (self.clip.is_some() && !snap.resize).then(|| self.wb_snapshot());
+        // A copy (or a measure or relationship) made after the step is
+        // rewritten only by renames (table and column), which the next
+        // replay undoes. A table removal or a column delete in a replay
+        // leaves it as it is: dropping it or turning a reference to `#REF!`
+        // could not be undone, and nothing records it. Only the copy the
+        // step itself found is dropped or rewritten, and put back through
+        // `clip_edit`.
+        let model_items = !self.model_measures.is_empty() || !self.model_rels.is_empty();
+        let current =
+            (!snap.resize && (self.clip.is_some() || model_items)).then(|| self.wb_snapshot());
         self.put_back(snap);
         if let Some(current) = current {
             let mut changes = column_changes(&current, snap);
@@ -4313,7 +4336,15 @@ impl App {
             for c in &mut changes {
                 c.deleted.clear();
             }
-            self.rewrite_clip(&changes);
+            if self.clip.is_some() {
+                self.rewrite_clip(&changes);
+            }
+            // Measures and relationships added after the step follow its
+            // renames the same way. The step's own items are left to its
+            // recorded `model_edits` below, which restore their exact text
+            // and what it turned to `#REF!`. Nothing records these.
+            let edits = self.model_edits_for(&changes, &snap.model_edits);
+            self.apply_model_edits(&edits);
         }
         if let Some((old, new)) = &snap.model_rename {
             self.rename_table_in_model(old, new);
@@ -19609,6 +19640,91 @@ mod tests {
         app.redo();
         assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
         assert_eq!(app.model_rels[0].from.1, "Units");
+    }
+
+    #[test]
+    fn undoing_a_rename_follows_later_measures_and_relationships() {
+        let mut app = model_app();
+        app.apply_on(0, vec![(0, 1, parse_input("Units"))]);
+        // Model edits are not undo steps: added after the rename.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "M".into(),
+            formula: "SUM(Sales[Units])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Units".into()),
+            to: ("Other".into(), "Id".into()),
+        });
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        assert_eq!(app.model_rels[1].from.1, "Qty");
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Units])");
+        assert_eq!(app.model_rels[0].from.1, "Units");
+        assert_eq!(app.model_rels[1].from.1, "Units");
+    }
+
+    #[test]
+    fn undo_after_column_delete_still_restores_ref_991() {
+        let mut app = model_app();
+        app.cur = (0, 1);
+        app.anchor = None;
+        app.col_op(false); // the Qty column
+        // A measure made after the delete reads the (now missing) column; the
+        // undo brings the column back and leaves that measure as typed, with
+        // the earlier one restored from the step's record.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Late".into(),
+            formula: "SUM(Sales[Qty])".into(),
+        });
+        app.undo();
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Qty])");
+        app.redo();
+        assert!(app.model_measures[0].formula.contains("#REF!"));
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Qty])");
+    }
+
+    #[test]
+    fn undo_restores_the_steps_own_items_exactly_and_follows_later_ones() {
+        let mut app = model_app();
+        // The step's own measure is spelled in lower case.
+        app.model_measures[0].formula = "SUM(Sales[qty])".into();
+        // A chained paste over the headers: Item -> Total, Qty -> Item.
+        app.apply_on(
+            0,
+            vec![(0, 0, parse_input("Total")), (0, 1, parse_input("Item"))],
+        );
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Total", "Item"]);
+        let own = app.model_measures[0].formula.clone();
+        let own_rel = app.model_rels[0].clone();
+        assert_eq!(own, "SUM(Sales[Item])");
+        // Added after the step, over the columns as they are then.
+        app.model_measures.push(gridcore::model::Measure {
+            name: "Late".into(),
+            formula: "SUM(Sales[Item])".into(),
+        });
+        app.model_rels.push(Relationship {
+            from: ("Sales".into(), "Total".into()),
+            to: ("Other".into(), "Id".into()),
+        });
+        app.undo();
+        assert_eq!(app.pkg.workbook.tables[0].columns, ["Item", "Qty"]);
+        // The recorded edit alone restores the step's items, exactly.
+        assert_eq!(app.model_measures[0].formula, "SUM(Sales[qty])");
+        assert_eq!(app.model_rels[0].from.1, "Qty");
+        // The later ones follow the renames.
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Qty])");
+        assert_eq!(app.model_rels[1].from.1, "Item");
+        app.redo();
+        assert_eq!(app.model_measures[0].formula, own);
+        assert_eq!(app.model_rels[0], own_rel);
+        assert_eq!(app.model_measures[1].formula, "SUM(Sales[Item])");
+        assert_eq!(app.model_rels[1].from.1, "Total");
     }
 
     #[test]
