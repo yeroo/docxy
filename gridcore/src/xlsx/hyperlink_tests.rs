@@ -260,9 +260,9 @@ fn hyperlink_target_is_escaped_and_round_trips() {
         rels.contains("Target=\"https://x.example/?a=1&amp;b=&quot;q&quot;&lt;z&gt;\""),
         "{rels}"
     );
-    // A UNC path is written as typed (#1025 m1).
+    // A UNC path is written as Excel writes it (#1456).
     assert!(
-        rels.contains("Target=\"\\\\server\\share\\f.xlsx\""),
+        rels.contains("Target=\"file:///\\\\server\\share\\f.xlsx\""),
         "{rels}"
     );
 }
@@ -632,4 +632,329 @@ fn a_deleted_link_does_not_survive_beside_the_one_that_moved_onto_it() {
     let del_col = |wb: &mut Workbook| crate::edit::delete_cols(wb, 0, 0, 1);
     assert_eq!(block_after(&format!("{x}{y}"), del_col), want);
     assert_eq!(block_after(&format!("{y}{x}"), del_col), want);
+}
+
+// ---- UNC targets as file URIs, and dropped relationships (#1456) ----
+
+const UNC_WS: &str = "<sheetData></sheetData>";
+
+fn plain_book() -> SheetPackage {
+    book(
+        &format!("<worksheet xmlns=\"{SML}\">{UNC_WS}</worksheet>"),
+        None,
+    )
+}
+
+/// The `Target` values of the rels part's relationships of `kind`.
+fn targets_of(pkg: &SheetPackage, kind: &str) -> Vec<String> {
+    parse_rels_mode(&text(pkg, RELS))
+        .into_iter()
+        .filter(|(_, ty, _, _)| ty.ends_with(kind))
+        .map(|(_, _, t, _)| t)
+        .collect()
+}
+
+fn remove_link(pkg: &mut SheetPackage, cell: (u32, u32)) {
+    let s = &mut pkg.workbook.sheets[0];
+    let plan = crate::edit::clear_plan(
+        s,
+        &[(cell.0, cell.1, cell.0, cell.1)],
+        crate::edit::ClearWhat::RemoveHyperlinks,
+        &[],
+    )
+    .unwrap();
+    crate::edit::apply_clear_sheet(s, &plan);
+}
+
+#[test]
+fn unc_link_is_written_as_a_file_uri_and_round_trips() {
+    let mut pkg = plain_book();
+    link(&mut pkg, "A1", "\\\\srv\\share\\a.xlsx");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(
+        text(&re, RELS)
+            .contains("Target=\"file:///\\\\srv\\share\\a.xlsx\" TargetMode=\"External\"/>"),
+        "{}",
+        text(&re, RELS)
+    );
+    // Saved again unchanged, nothing is rewritten.
+    let again = resaved(&re);
+    assert_eq!(text(&again, RELS), text(&re, RELS));
+    assert_eq!(text(&again, SHEET), text(&re, SHEET));
+}
+
+#[test]
+fn excel_file_uri_unc_loads_as_the_plain_path_and_keeps_bytes() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/><hyperlink ref=\"A2\" r:id=\"rId2\"/>\
+         <hyperlink ref=\"A3\" r:id=\"rId3\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"file:///\\\\srv\\share\\a\" TargetMode=\"External\"/>\
+         <Relationship Id=\"rId2\" Type=\"{RNS}/hyperlink\" Target=\"FILE:///\\\\srv\\share\\b\" TargetMode=\"External\"/>\
+         <Relationship Id=\"rId3\" Type=\"{RNS}/hyperlink\" Target=\"file:///C:/x\" TargetMode=\"External\"/>"
+    ));
+    let pkg = book(&ws, Some(&rels));
+    let links = &pkg.workbook.sheets[0].hyperlinks;
+    assert_eq!(links[&(0, 0)], "\\\\srv\\share\\a");
+    assert_eq!(links[&(1, 0)], "\\\\srv\\share\\b");
+    assert_eq!(links[&(2, 0)], "file:///C:/x");
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+}
+
+#[test]
+fn a_raw_unc_rel_from_1025_is_kept_and_reused() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"\\\\srv\\share\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    assert_eq!(pkg.workbook.sheets[0].hyperlinks[&(0, 0)], "\\\\srv\\share");
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+    link(&mut pkg, "B2", "\\\\srv\\share");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"B2\" r:id=\"rId1\"/>"));
+    assert_eq!(targets_of(&re, "/hyperlink"), vec!["\\\\srv\\share"]);
+}
+
+#[test]
+fn non_unc_targets_are_written_as_before() {
+    let mut pkg = plain_book();
+    let all = [
+        "https://example.com/a",
+        "mailto:a@b.example",
+        "C:\\x\\y.xlsx",
+        "file:///C:/x",
+        // Not a UNC path: written as typed, and read back as the plain path.
+        "file:///\\\\srv\\x",
+    ];
+    for (i, t) in all.iter().enumerate() {
+        link(&mut pkg, &format!("A{}", i + 1), t);
+    }
+    let re = resaved(&pkg);
+    let mut got = targets_of(&re, "/hyperlink");
+    got.sort();
+    let mut want: Vec<String> = all.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(got, want);
+    let links = &re.workbook.sheets[0].hyperlinks;
+    for (i, t) in all.iter().take(4).enumerate() {
+        assert_eq!(links[&(i as u32, 0)], *t);
+    }
+    assert_eq!(links[&(4, 0)], "\\\\srv\\x");
+}
+
+#[test]
+fn a_removed_link_drops_its_relationship() {
+    let (mut pkg, _, _) = linked_book();
+    remove_link(&mut pkg, (0, 0));
+    let re = resaved(&pkg);
+    assert!(!re.workbook.sheets[0].hyperlinks.contains_key(&(0, 0)));
+    let rels = text(&re, RELS);
+    assert!(!rels.contains("Id=\"rId1\""), "{rels}");
+    assert!(!text(&re, SHEET).contains("rId1"));
+    // The orphan the file already had is not ours to drop.
+    assert!(rels.contains("Id=\"rId3\""), "{rels}");
+}
+
+#[test]
+fn removing_every_link_drops_the_relationship_and_the_block() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://x.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    let re = resaved(&pkg);
+    assert!(!text(&re, SHEET).contains("hyperlink"));
+    assert!(targets_of(&re, "/hyperlink").is_empty());
+}
+
+#[test]
+fn a_retargeted_link_drops_the_old_relationship() {
+    let (mut pkg, _, _) = linked_book();
+    link(&mut pkg, "A1", "https://other.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    let got = targets_of(&re, "/hyperlink");
+    assert!(!got.iter().any(|t| t.contains("example.com")), "{got:?}");
+    assert!(
+        got.contains(&"https://other.example".to_string()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"https://unused.example".to_string()),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_relationship_still_used_by_a_range_remainder_stays() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1:B2\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://range.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "A1", "https://other.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    let got = targets_of(&re, "/hyperlink");
+    assert!(
+        got.contains(&"https://range.example".to_string()),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&"https://other.example".to_string()),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn a_retarget_to_an_already_related_target_drops_nothing_used() {
+    let (mut pkg, _, _) = linked_book();
+    link(&mut pkg, "A1", "https://unused.example");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"A1\" r:id=\"rId3\"/>"));
+    assert_eq!(
+        targets_of(&re, "/hyperlink"),
+        vec!["https://unused.example"]
+    );
+}
+
+#[test]
+fn unrelated_and_preexisting_orphan_rels_are_untouched() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/><hyperlink ref=\"A2\" r:id=\"rId1\"/></hyperlinks>\
+         <drawing r:id=\"rId2\"/><legacyDrawing r:id=\"rId4\"/></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"https://x.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"rId2\" Type=\"{RNS}/drawing\" Target=\"../drawings/drawing1.xml\"/>\
+         <Relationship Id=\"rId3\" Type=\"{RNS}/hyperlink\" Target=\"https://orphan.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"rId4\" Type=\"{RNS}/vmlDrawing\" Target=\"../drawings/vmlDrawing1.vml\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    remove_link(&mut pkg, (1, 0));
+    let re = resaved(&pkg);
+    let got = text(&re, RELS);
+    assert!(!got.contains("Id=\"rId1\""), "{got}");
+    for keep in ["Id=\"rId2\"", "Id=\"rId3\"", "Id=\"rId4\""] {
+        assert!(got.contains(keep), "{keep} in {got}");
+    }
+}
+
+#[test]
+fn a_cell_edit_alone_keeps_the_rels_part_bytes() {
+    let (mut pkg, _, _) = linked_book();
+    pkg.workbook.sheets[0].set_cell(5, 5, Cell::default());
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+}
+
+#[test]
+fn a_removed_link_with_an_unusual_id_drops_its_relationship() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"R5f3a\"/><hyperlink ref=\"A2\" r:id=\"hId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"R5f3a\" Type=\"{RNS}/hyperlink\" Target=\"https://x.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"hId1\" Type=\"{RNS}/hyperlink\" Target=\"https://y.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"hId2\" Type=\"{RNS}/hyperlink\" Target=\"https://orphan.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    remove_link(&mut pkg, (1, 0));
+    let re = resaved(&pkg);
+    assert_eq!(
+        targets_of(&re, "/hyperlink"),
+        vec!["https://orphan.example"]
+    );
+}
+
+#[test]
+fn a_mixed_case_file_uri_rel_is_reused_for_the_same_target() {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"rId1\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"rId1\" Type=\"{RNS}/hyperlink\" Target=\"FILE:///\\\\srv\\share\\b\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    link(&mut pkg, "B2", "\\\\srv\\share\\b");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"B2\" r:id=\"rId1\"/>"));
+    assert_eq!(targets_of(&re, "/hyperlink").len(), 1);
+}
+
+#[test]
+fn stray_quotes_in_cell_text_do_not_hide_a_reference() {
+    // Inline strings with a lone `"` and `'` before the links: the pairing
+    // of quotes must not drift, so A2's kept link still counts as named and
+    // only A1's goes.
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData>\
+         <row r=\"5\"><c r=\"C5\" t=\"inlineStr\"><is><t>say \" and it's</t></is></c></row>\
+         </sheetData><hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"R1\"/><hyperlink ref=\"A2\" r:id=\"R2\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"R1\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"R2\" Type=\"{RNS}/hyperlink\" Target=\"https://two.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert_eq!(targets_of(&re, "/hyperlink"), vec!["https://two.example"]);
+}
+
+#[test]
+fn dropping_many_relationships_saves_in_linear_time() {
+    let mut pkg = plain_book();
+    for r in 0..20_000 {
+        link(
+            &mut pkg,
+            &format!("A{}", r + 1),
+            &format!("https://example.com/{r}"),
+        );
+    }
+    let mut pkg = resaved(&pkg);
+    assert_eq!(targets_of(&pkg, "/hyperlink").len(), 20_000);
+    let s = &mut pkg.workbook.sheets[0];
+    let plan = crate::edit::clear_plan(
+        s,
+        &[(0, 0, 19_999, 0)],
+        crate::edit::ClearWhat::RemoveHyperlinks,
+        &[],
+    )
+    .unwrap();
+    crate::edit::apply_clear_sheet(s, &plan);
+    let t = std::time::Instant::now();
+    let bytes = save_xlsx(&pkg);
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
+    let re = load_xlsx(&bytes).unwrap();
+    assert!(re.workbook.sheets[0].hyperlinks.is_empty());
+    assert!(targets_of(&re, "/hyperlink").is_empty());
 }
