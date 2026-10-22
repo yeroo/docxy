@@ -951,18 +951,13 @@ impl Editor {
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         self.refuse_while_sorted()?;
         let i = self.index(uid)?;
+        if !self.proj.tasks[i].is_null && outline_shift(&self.proj.tasks, i, delta) == 0 {
+            return Ok(());
+        }
         self.edit_row(i, |proj, _| {
+            let shift = outline_shift(&proj.tasks, i, delta);
             let end = outline::subtree_end_in(&proj.tasks, i);
-            let rows = &mut proj.tasks[i..end];
-            let old = i64::from(rows[0].outline_level);
-            let deepest = rows
-                .iter()
-                .filter(|t| !t.is_null)
-                .map(|t| i64::from(t.outline_level))
-                .max()
-                .unwrap_or(old);
-            let shift = i64::from(delta).clamp(1 - old, 20 - deepest);
-            for t in rows.iter_mut().filter(|t| !t.is_null) {
+            for t in proj.tasks[i..end].iter_mut().filter(|t| !t.is_null) {
                 t.outline_level = (i64::from(t.outline_level) + shift) as u32;
             }
         })
@@ -2340,6 +2335,23 @@ fn renumber_wbs(old: &[Task], new: &mut [Task]) {
     }
 }
 
+/// The levels row `i` and its subtree move by for an indent of `delta`: the
+/// row stays at level 1 or deeper and the deepest descendant at 20 or
+/// shallower. Levels read from a file are unchecked, so the bounds never
+/// push against `delta`: a plan already past a limit just does not move
+/// further that way.
+fn outline_shift(tasks: &[Task], i: usize, delta: i32) -> i64 {
+    let end = outline::subtree_end_in(tasks, i);
+    let old = i64::from(tasks[i].outline_level);
+    let deepest = tasks[i..end]
+        .iter()
+        .filter(|t| !t.is_null)
+        .map(|t| i64::from(t.outline_level))
+        .max()
+        .unwrap_or(old);
+    i64::from(delta).clamp((1 - old).min(0), (20 - deepest).max(0))
+}
+
 /// Parse Project's minute, hour, day, week and month spellings as working time.
 pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
     parse_duration_unit(text, proj).map(|(min, _)| min)
@@ -3033,7 +3045,6 @@ mod tests {
                 assert_unchanged(&mut ed, |ed| {
                     assert!(ed.delete_task(2).unwrap_err().contains("Closed"));
                     assert!(ed.indent(2, -1).unwrap_err().contains("Closed"));
-                    // Indenting Phase moves Build with it, so no summary is lost.
                     assert!(
                         ed.update_task(
                             2,
@@ -3064,6 +3075,17 @@ mod tests {
                 assert_reopens(&ed);
             }
         }
+    }
+
+    #[test]
+    fn indenting_a_summary_with_an_empty_calendar_moves_its_subtree() {
+        let mut ed = Editor::new(project_with_unused_empty_calendar(false));
+        ed.indent(1, 1).unwrap();
+        let tasks = &ed.project().tasks;
+        assert!(tasks[0].summary);
+        assert_eq!((tasks[0].outline_level, tasks[1].outline_level), (2, 3));
+        assert!(ed.undo());
+        assert_eq!(ed.project().tasks[1].outline_level, 2);
     }
 
     #[test]

@@ -486,6 +486,7 @@ fn indent_clamps_the_deepest_descendant_at_20_keeping_relative_depth() {
     let mut ed = outline(&[(1, "A", 1), (2, "S", 18), (3, "S1", 19), (4, "S2", 20)]);
     ed.indent(2, 5).unwrap();
     assert_eq!(levels(&ed), [1, 18, 19, 20], "already at the limit");
+    assert!(!ed.dirty() && !ed.undo(), "a no-op records no step");
     let mut ed = outline(&[(1, "A", 1), (2, "S", 17), (3, "S1", 18), (4, "S2", 19)]);
     ed.indent(2, 5).unwrap();
     assert_eq!(levels(&ed), [1, 18, 19, 20]);
@@ -533,4 +534,26 @@ fn indenting_a_subtree_drops_a_link_that_becomes_ancestor_to_descendant() {
     // A becomes the parent of S and so of S1: the link to A is dropped.
     ed.indent(2, 1).unwrap();
     assert!(ed.project().task(3).unwrap().predecessors.is_empty());
+}
+
+#[test]
+fn levels_read_from_a_file_past_the_limits_do_not_panic_or_move_against_delta() {
+    // The summary is at 1, a descendant at 22 (unchecked on load).
+    let mut ed = outline(&[(1, "S", 1), (2, "S1", 22)]);
+    ed.indent(1, 1).unwrap();
+    assert_eq!(levels(&ed), [1, 22], "already past 20: no deeper");
+    ed.indent(1, -1).unwrap();
+    assert_eq!(levels(&ed), [1, 22], "row already at 1");
+    let mut ed = outline(&[(1, "P", 1), (2, "S", 2), (3, "S1", 25)]);
+    ed.indent(2, -1).unwrap();
+    assert_eq!(levels(&ed), [1, 1, 24], "outdent still works");
+}
+
+#[test]
+fn outdenting_a_level_0_row_does_not_indent_the_plan() {
+    let mut proj = outline(&[(1, "Plan", 1), (2, "T", 2)]).project().clone();
+    proj.tasks[0].outline_level = 0;
+    let mut ed = Editor::new(proj);
+    ed.indent(1, -1).unwrap();
+    assert_eq!(levels(&ed), [0, 2]);
 }
