@@ -3467,30 +3467,23 @@ fn markdown_style_def(id: &str) -> Option<String> {
     }
 }
 
-/// Byte offset of the next `<w:{name}` element start at or after `from`, the
-/// name matched whole (`abstractNum` is not `abstractNumId`).
-fn nx_find_el(xml: &str, name: &str, from: usize) -> Option<usize> {
-    let pat = format!("<w:{name}");
-    let mut at = from;
-    while let Some(i) = xml.get(at..)?.find(&pat) {
-        let start = at + i;
-        match xml.as_bytes().get(start + pat.len()) {
-            Some(b' ' | b'>' | b'/' | b'\t' | b'\r' | b'\n') => return Some(start),
-            _ => at = start + pat.len(),
-        }
-    }
-    None
+/// The byte range of the next `<w:{name}>` element at or after `from`, as
+/// [`crate::inspect::find_element_from`] reads it (the name matched whole,
+/// a `>` inside a quoted attribute skipped, the close tag required).
+fn num_el(xml: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+    crate::inspect::find_element_from(xml, &format!("w:{name}"), from).map(|(s, e, _)| (s, e))
 }
 
-/// Byte offset just past the element starting at `start` (`</w:{name}>`, or
-/// its own `/>`).
-fn nx_el_end(xml: &str, name: &str, start: usize) -> Option<usize> {
-    let gt = start + xml.get(start..)?.find('>')?;
-    if xml.as_bytes()[gt - 1] == b'/' {
-        return Some(gt + 1);
-    }
-    let close = format!("</w:{name}>");
-    Some(gt + xml.get(gt..)?.find(&close)? + close.len())
+/// The value of attribute `attr` in the open tag at `start`.
+fn open_attr(xml: &str, start: usize, attr: &str) -> Option<String> {
+    let head = &xml[start..start + crate::inspect::tag_end(&xml[start..])?];
+    tag_attr(head, attr)
+}
+
+/// `w:ind` of a list level; [`markdown_list_levels`] and the repair of an
+/// older build's levels both write it, so they cannot drift.
+fn level_ind(lvl: i32) -> String {
+    format!("<w:ind w:left=\"{}\" w:hanging=\"360\"/>", 720 * (lvl + 1))
 }
 
 /// Put `abstract_xml` and `num_xml` into a `numbering.xml` in CT_Numbering
@@ -3500,9 +3493,9 @@ fn nx_el_end(xml: &str, name: &str, start: usize) -> Option<usize> {
 /// `numIdMacAtCleanup` or the close tag when there are none. `None` when the
 /// part has no `w:numbering` root to put them in.
 fn splice_numbering(xml: &str, abstract_xml: &str, num_xml: &str) -> Option<String> {
-    let root = nx_find_el(xml, "numbering", 0)?;
-    let gt = root + xml[root..].find('>')?;
-    if xml.as_bytes()[gt - 1] == b'/' {
+    let (root, root_end) = num_el(xml, "numbering", 0)?;
+    let gt = root + crate::inspect::tag_end(&xml[root..])? - 1;
+    if root_end == gt + 1 {
         // `<w:numbering .../>`: open it up.
         return Some(format!(
             "{}>{abstract_xml}{num_xml}</w:numbering>{}",
@@ -3511,51 +3504,43 @@ fn splice_numbering(xml: &str, abstract_xml: &str, num_xml: &str) -> Option<Stri
         ));
     }
     let body = gt + 1;
-    let tail = nx_find_el(xml, "numIdMacAtCleanup", body)
-        .or_else(|| xml.rfind("</w:numbering>").filter(|&c| c >= body))?;
-    let first_abs = nx_find_el(xml, "abstractNum", body);
-    let first_num = nx_find_el(xml, "num", body);
-    let at_abs = first_abs.or(first_num).unwrap_or(tail);
+    let tail = num_el(xml, "numIdMacAtCleanup", body)
+        .map(|(s, _)| s)
+        .unwrap_or(root_end - "</w:numbering>".len());
+    let first_of = |name: &str| {
+        num_el(xml, name, body)
+            .map(|(s, _)| s)
+            .filter(|&s| s < tail)
+    };
     let last_of = |name: &str| {
         let mut end = None;
         let mut from = body;
-        while let Some(s) = nx_find_el(xml, name, from) {
-            end = nx_el_end(xml, name, s);
-            from = s + 1;
+        while let Some((s, e)) = num_el(xml, name, from) {
+            if s >= tail {
+                break;
+            }
+            end = Some(e);
+            from = e;
         }
         end
     };
+    // Whichever of the first abstractNum / num comes first, however the
+    // part orders them.
+    let at_abs = match (first_of("abstractNum"), first_of("num")) {
+        (Some(a), Some(n)) => a.min(n),
+        (a, n) => a.or(n).unwrap_or(tail),
+    };
     let at_num = last_of("num")
         .or_else(|| last_of("abstractNum"))
-        .unwrap_or(tail);
+        .unwrap_or(tail)
+        .max(at_abs);
     let mut out = String::with_capacity(xml.len() + abstract_xml.len() + num_xml.len());
-    if at_abs == at_num {
-        out.push_str(&xml[..at_abs]);
-        out.push_str(abstract_xml);
-        out.push_str(num_xml);
-        out.push_str(&xml[at_abs..]);
-    } else {
-        out.push_str(&xml[..at_abs]);
-        out.push_str(abstract_xml);
-        out.push_str(&xml[at_abs..at_num]);
-        out.push_str(num_xml);
-        out.push_str(&xml[at_num..]);
-    }
+    out.push_str(&xml[..at_abs]);
+    out.push_str(abstract_xml);
+    out.push_str(&xml[at_abs..at_num]);
+    out.push_str(num_xml);
+    out.push_str(&xml[at_num..]);
     Some(out)
-}
-
-/// The value of attribute `attr` in the open tag at `start`.
-fn nx_tag_attr<'a>(xml: &'a str, start: usize, attr: &str) -> Option<&'a str> {
-    let gt = start + xml[start..].find('>')?;
-    let tag = &xml[start..gt];
-    let pat = format!("{attr}=\"");
-    let v = &tag[tag.find(&pat)? + pat.len()..];
-    Some(&v[..v.find('"')?])
-}
-
-/// `w:ind` of a list level, as `markdown_list_levels` writes it.
-fn nx_level_ind(lvl: i32) -> String {
-    format!("<w:ind w:left=\"{}\" w:hanging=\"360\"/>", 720 * (lvl + 1))
 }
 
 /// Give the levels of the abstractNum behind `num_id` that have no `w:ind`
@@ -3566,55 +3551,59 @@ fn nx_level_ind(lvl: i32) -> String {
 fn repair_level_indents(xml: &str, num_id: i32) -> Option<String> {
     // Our num -> its abstractNum (not assumed equal to the num id).
     let mut from = 0;
-    let num = loop {
-        let s = nx_find_el(xml, "num", from)?;
-        if nx_tag_attr(xml, s, "w:numId") == Some(&num_id.to_string()) {
-            break s;
+    let (num, num_end) = loop {
+        let (s, e) = num_el(xml, "num", from)?;
+        if open_attr(xml, s, "w:numId").is_some_and(|v| v == num_id.to_string()) {
+            break (s, e);
         }
-        from = s + 1;
+        from = e;
     };
-    let num_end = nx_el_end(xml, "num", num)?;
-    let a = nx_find_el(&xml[..num_end], "abstractNumId", num)?;
-    let abs_id = nx_tag_attr(xml, a, "w:val")?;
+    let (a, _) = num_el(&xml[..num_end], "abstractNumId", num)?;
+    let abs_id = open_attr(xml, a, "w:val")?;
     let mut from = 0;
-    let abs = loop {
-        let s = nx_find_el(xml, "abstractNum", from)?;
-        if nx_tag_attr(xml, s, "w:abstractNumId") == Some(abs_id) {
-            break s;
+    let (abs, abs_end) = loop {
+        let (s, e) = num_el(xml, "abstractNum", from)?;
+        if open_attr(xml, s, "w:abstractNumId").is_some_and(|v| v == abs_id) {
+            break (s, e);
         }
-        from = s + 1;
+        from = e;
     };
-    let abs_end = nx_el_end(xml, "abstractNum", abs)?;
 
     let mut out = String::new();
     let mut copied = 0;
     let mut at = abs;
-    while let Some(l) = nx_find_el(&xml[..abs_end], "lvl", at) {
-        at = l + 1;
-        let open_end = l + xml[l..].find('>')? + 1;
-        if xml.as_bytes()[open_end - 2] == b'/' {
+    while let Some((l, l_end)) = num_el(&xml[..abs_end], "lvl", at) {
+        at = l_end;
+        if xml[..l_end].ends_with("/>") {
             continue;
         }
-        let end = open_end + xml[open_end..].find("</w:lvl>")?;
+        let open_end = l + crate::inspect::tag_end(&xml[l..])?;
+        let end = l_end - "</w:lvl>".len();
         let body = &xml[open_end..end];
-        let Some(ilvl) = nx_tag_attr(xml, l, "w:ilvl").and_then(|v| v.parse::<i32>().ok()) else {
+        let Some(ilvl) = open_attr(xml, l, "w:ilvl").and_then(|v| v.parse::<i32>().ok()) else {
             continue;
         };
-        if nx_find_el(body, "ind", 0).is_some() {
-            continue;
-        }
-        let ind = nx_level_ind(ilvl);
+        let ind = level_ind(ilvl);
         let jc = "<w:lvlJc w:val=\"left\"/>";
-        let has_jc = nx_find_el(body, "lvlJc", 0).is_some();
-        let fixed = match nx_find_el(body, "pPr", 0) {
-            Some(p) => {
-                let pend = nx_el_end(body, "pPr", p)?;
+        let has_jc = num_el(body, "lvlJc", 0).is_some();
+        let fixed = match num_el(body, "pPr", 0) {
+            Some((p, first_end)) => {
+                // `num_el` stops at the first `</w:pPr>`, which is the nested
+                // one's when a `w:pPrChange` holds a pPr of its own.
+                let pend = match num_el(body, "pPrChange", p) {
+                    Some((cs, ce)) if cs < first_end && !body[..first_end].ends_with("/>") => {
+                        ce + body[ce..].find("</w:pPr>")? + "</w:pPr>".len()
+                    }
+                    _ => first_end,
+                };
                 let ppr = &body[p..pend];
                 let new_ppr = if let Some(open) = ppr.strip_suffix("/>") {
                     format!("{open}>{ind}</w:pPr>")
                 } else {
-                    // `w:ind` precedes these siblings in CT_PPrBase.
-                    const AFTER: [&str; 12] = [
+                    // Only the live pPr's own children count: a nested pPr
+                    // in a `w:pPrChange` is the old formatting, not the
+                    // level's. `w:ind` precedes these siblings in CT_PPrBase.
+                    const AFTER: [&str; 11] = [
                         "contextualSpacing",
                         "mirrorIndents",
                         "suppressOverlap",
@@ -3625,22 +3614,23 @@ fn repair_level_indents(xml: &str, num_id: i32) -> Option<String> {
                         "outlineLvl",
                         "divId",
                         "cnfStyle",
-                        "rPr",
-                        "sectPr",
+                        "pPrChange",
                     ];
-                    let inner = ppr.find('>')? + 1;
+                    let inner = crate::inspect::tag_end(ppr)?;
+                    let live_end = num_el(ppr, "pPrChange", inner)
+                        .map(|(s, _)| s)
+                        .unwrap_or(ppr.len() - "</w:pPr>".len());
+                    if num_el(&ppr[..live_end], "ind", inner).is_some() {
+                        continue;
+                    }
                     let cut = AFTER
                         .iter()
-                        .filter_map(|n| nx_find_el(ppr, n, inner))
-                        .chain(ppr.rfind("</w:pPr>"))
+                        .filter_map(|n| num_el(ppr, n, inner).map(|(s, _)| s))
+                        .chain([ppr.len() - "</w:pPr>".len()])
                         .min()?;
                     format!("{}{ind}{}", &ppr[..cut], &ppr[cut..])
                 };
-                let head = if has_jc {
-                    String::new()
-                } else {
-                    jc.to_string()
-                };
+                let head = if has_jc { "" } else { jc };
                 format!("{}{head}{new_ppr}{}", &body[..p], &body[pend..])
             }
             None => {
@@ -3650,7 +3640,7 @@ fn repair_level_indents(xml: &str, num_id: i32) -> Option<String> {
                     jc.to_string()
                 };
                 add.push_str(&format!("<w:pPr>{ind}</w:pPr>"));
-                let cut = nx_find_el(body, "rPr", 0).unwrap_or(body.len());
+                let cut = num_el(body, "rPr", 0).map_or(body.len(), |(s, _)| s);
                 format!("{}{add}{}", &body[..cut], &body[cut..])
             }
         };
@@ -3676,10 +3666,7 @@ fn markdown_list_levels(bullet: bool) -> String {
     for lvl in 0..9 {
         // Word's built-in lists indent each level 720 twips further with a
         // 360 hanging indent; without it Pages lays the item out at the margin.
-        let ind = format!(
-            "<w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr>",
-            720 * (lvl + 1)
-        );
+        let ind = format!("<w:pPr>{}</w:pPr>", level_ind(lvl));
         if bullet {
             out.push_str(&format!(
                 "<w:lvl w:ilvl=\"{lvl}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/>\
@@ -6689,6 +6676,52 @@ mod tests {
                 && t.ends_with("</w:num></w:numbering>"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn ensure_list_splices_when_a_num_precedes_the_abstract_num() {
+        let num = "<w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num>";
+        let abs = "<w:abstractNum w:abstractNumId=\"1\"/>";
+        for sep in ["", "\n"] {
+            let mut pkg =
+                pkg_with_numbering(&format!("<w:numbering>{num}{sep}{abs}</w:numbering>"));
+            pkg.ensure_list(true);
+            let t = numbering_text(&pkg);
+            assert!(
+                t.contains(num) && t.ends_with(&format!("{sep}{abs}</w:numbering>")),
+                "existing kept: {t}"
+            );
+            let mine = t.find("<w:abstractNum w:abstractNumId=\"9990\"").unwrap();
+            assert!(mine < t.find("<w:num w:numId=\"9990\"").unwrap(), "{t}");
+            assert!(
+                t.find("<w:num w:numId=\"9990\"").unwrap() < t.rfind("</w:numbering>").unwrap()
+            );
+        }
+        // Only nums.
+        let mut pkg = pkg_with_numbering(&format!("<w:numbering>{num}</w:numbering>"));
+        pkg.ensure_list(false);
+        let t = numbering_text(&pkg);
+        assert!(
+            t.contains("<w:abstractNum w:abstractNumId=\"9991\"")
+                && t.contains("<w:num w:numId=\"9991\""),
+            "{t}"
+        );
+        assert!(t.find("<w:abstractNum ").unwrap() < t.find("</w:abstractNum>").unwrap());
+    }
+
+    #[test]
+    fn repair_looks_only_at_the_live_ppr_not_a_ppr_change() {
+        let lvl = "<w:lvl w:ilvl=\"0\"><w:lvlText w:val=\"o\"/><w:pPr><w:tabs/>\
+                   <w:pPrChange w:id=\"1\"><w:pPr><w:jc w:val=\"left\"/></w:pPr></w:pPrChange></w:pPr></w:lvl>";
+        let nested_ind = "<w:lvl w:ilvl=\"1\"><w:lvlText w:val=\"o\"/><w:pPr><w:pPrChange w:id=\"2\"><w:pPr><w:ind w:left=\"5\"/></w:pPr></w:pPrChange></w:pPr></w:lvl>";
+        let mut pkg = pkg_with_numbering(&format!(
+            "<w:numbering><w:abstractNum w:abstractNumId=\"9990\">{lvl}{nested_ind}</w:abstractNum>\
+             <w:num w:numId=\"9990\"><w:abstractNumId w:val=\"9990\"/></w:num></w:numbering>"
+        ));
+        pkg.ensure_list(true);
+        let t = numbering_text(&pkg);
+        assert!(t.contains("<w:pPr><w:tabs/><w:ind w:left=\"720\" w:hanging=\"360\"/><w:pPrChange w:id=\"1\"><w:pPr><w:jc w:val=\"left\"/></w:pPr></w:pPrChange></w:pPr>"), "{t}");
+        assert!(t.contains("<w:ind w:left=\"1440\" w:hanging=\"360\"/><w:pPrChange w:id=\"2\"><w:pPr><w:ind w:left=\"5\"/></w:pPr>"), "{t}");
     }
 
     #[test]

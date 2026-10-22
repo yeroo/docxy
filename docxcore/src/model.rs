@@ -693,6 +693,12 @@ pub enum IndentSide {
 }
 
 impl ParProps {
+    /// Whether the paragraph is a list item: a `w:numId` of 0 means "no
+    /// numbering" in OOXML, as in `numbering.rs`.
+    pub fn in_list(&self) -> bool {
+        self.num_id.is_some_and(|n| n != 0)
+    }
+
     /// Call after setting indents explicitly. The loaded `w:ind` loses every
     /// attribute that sets one of `sides`, in twips or in character units
     /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents
