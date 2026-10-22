@@ -995,7 +995,9 @@ impl<'a> Parser<'a> {
                             )),
                             ("LET" | "LAMBDA", _) => {
                                 let last = args.len().saturating_sub(1);
-                                let slot = |i: usize| i < last && (name == "LAMBDA" || i % 2 == 0);
+                                let slot = |i: usize| {
+                                    i < last && (name == "LAMBDA" || i.is_multiple_of(2))
+                                };
                                 let scoped = |n: &str| n.contains('!');
                                 let bad = args.iter().enumerate().any(|(i, a)| {
                                     slot(i)
