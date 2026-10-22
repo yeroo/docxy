@@ -1065,6 +1065,12 @@ fn for_each_name_text(wb: &mut Workbook, mut f: impl FnMut(&mut String)) {
     for dn in &mut wb.defined_names {
         f(&mut dn.formula);
     }
+    for_each_consolidate_ref(wb, f);
+}
+
+/// Every sheet's kept Consolidate references (#988), the other half of
+/// [`for_each_name_text`]'s texts.
+pub(crate) fn for_each_consolidate_ref(wb: &mut Workbook, mut f: impl FnMut(&mut String)) {
     for sheet in &mut wb.sheets {
         if let Some(k) = &mut sheet.consolidate {
             k.refs.iter_mut().for_each(&mut f);

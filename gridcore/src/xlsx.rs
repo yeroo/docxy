@@ -10581,6 +10581,16 @@ impl SheetPackage {
                 d.formula = text;
             }
         }
+        // Another sheet's kept Consolidate references read `Sheet!#REF!` too,
+        // as a deleted source area does. `consolidate_loaded` stays as loaded,
+        // so the save sees the difference and rewrites the element.
+        crate::edit::for_each_consolidate_ref(&mut self.workbook, |text| {
+            let rewrite =
+                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            if let Some(updated) = crate::formula::rewrite_defined_name(text, rewrite, None) {
+                *text = updated;
+            }
+        });
         let part_name = self.sheet_parts.remove(idx);
         self.workbook.sheets.remove(idx);
         let active = &mut self.workbook.active_tab;
@@ -20676,6 +20686,43 @@ mod print_setup_tests {
             &[("Data", body), ("Other", body), ("DataX", body)],
         ))
         .expect("fixture loads")
+    }
+
+    #[test]
+    fn remove_sheet_turns_other_sheets_consolidate_refs_into_ref_error() {
+        let mut pkg = three_sheets("");
+        let mut k = crate::edit::ConsolidateSettings {
+            func: crate::edit::SubtotalFunc::Sum,
+            refs: vec![
+                "Data!$A$1:$B$2".into(),
+                "DataX!$A$1:$B$2".into(),
+                "A1".into(),
+                "Totals".into(),
+            ],
+            top_row: false,
+            left_col: false,
+            links: false,
+            external: Vec::new(),
+        };
+        pkg.workbook.sheets[1].consolidate = Some(k.clone());
+        pkg.workbook.sheets[1].consolidate_loaded = Some(k.clone());
+        assert!(pkg.remove_sheet(0));
+        let dest = &pkg.workbook.sheets[0];
+        assert_eq!(dest.name, "Other");
+        // The sheet is gone, so the ref reads a bare `#REF!`, as a defined name does.
+        k.refs[0] = "#REF!".into();
+        assert_eq!(dest.consolidate.as_ref(), Some(&k));
+        assert_ne!(dest.consolidate, dest.consolidate_loaded);
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet2.xml");
+        assert!(
+            ws.contains(r##"<dataRef ref="#REF!"/><dataRef ref="A1:B2" sheet="DataX"/>"##),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].consolidate.as_ref(), Some(&k));
+        assert_eq!(
+            re.workbook.sheets[0].consolidate,
+            re.workbook.sheets[0].consolidate_loaded
+        );
     }
 
     fn names_of(wb: &str) -> Vec<String> {
