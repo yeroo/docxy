@@ -1292,3 +1292,18 @@
   It re-serializes the sheet's notes, so rich-text runs inside a note flatten,
   as on any other note edit. xlsxy (terminal), Insert/Delete Cells and Sort do
   not move notes yet.
+
+## Table slicers on save, and Undo of a table step (#1694)
+
+- `gridcore` has no slicer model. When a save drops a `tableColumn` or a whole
+  table part, `drop_table_slicers` (`xlsx.rs`) removes the table slicer caches
+  (`x15:tableSlicerCache` naming that table `id` and column id) with their
+  workbook rel, `x14:slicerCache` entry and `Slicer_<name>` defined name, and
+  the slicers on them (their element in the slicer part, the part with its
+  sheet rel and `x14:slicer` entry when none is left, their drawing anchor).
+  Other slicers keep their bytes. Dropping rather than keeping is unverified
+  against Excel's repair.
+- `App::restore` (xlsxy) folds the renames between the current and the restored
+  table state over the data model's measures and relationships
+  (`model_edits_for`), so ones added after a table step follow its Undo/Redo;
+  the step's recorded `model_edits` still restore its `#REF!` cases.
