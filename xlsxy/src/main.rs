@@ -10868,7 +10868,7 @@ impl App {
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
         let gone = self.sheet;
-        if self.pkg.remove_sheet(gone) {
+        if self.pkg.delete_sheet(gone) {
             self.sheet_removed_circles(gone);
             self.cancel_cut();
             // The copy names its sheet by index: one deleted leaves it no
@@ -17253,6 +17253,37 @@ mod tests {
         app.open_paste_special();
         assert!(app.outline_dialog.is_none());
         assert!(app.status.as_deref().unwrap_or("").contains("cut"));
+    }
+
+    /// #1681: deleting a sheet turns the cell formulas that name it into
+    /// `#REF!`, and the cells that read those follow.
+    #[test]
+    fn delete_current_sheet_turns_formulas_that_name_it_into_ref_errors() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "ref.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(5.0));
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("Sheet2!A1+1"));
+        app.pkg.workbook.sheets[0].set_cell(0, 1, Cell::formula("A1*2"));
+        app.rebuild_engine();
+        app.sheet = 1;
+        app.delete_current_sheet();
+        let ref_err = CellValue::Error("#REF!".into());
+        let a1 = app.pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.formula.as_deref(), Some("#REF!+1"));
+        assert_eq!(a1.value, ref_err);
+        assert_eq!(
+            app.pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
+            ref_err
+        );
+        // The last sheet is refused and nothing is rewritten.
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::formula("Sheet1!A3"));
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        let kept = app.pkg.workbook.sheets[0].cell(2, 0).unwrap();
+        assert_eq!(kept.formula.as_deref(), Some("Sheet1!A3"));
     }
 
     /// #707 r4 M1: Paste Special › All of a spilling array pastes its

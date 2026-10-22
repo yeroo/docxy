@@ -202,3 +202,66 @@ fn clearing_10k_areas_out_of_conditional_formatting_is_fast() {
     // The anchor stayed at A1: the formula reads as before.
     assert!(matches!(&cf.rules[0].kind, CfKind::Expression { formula } if formula == "A1>0"));
 }
+
+/// #1681: a classic `cfvo` of type `formula` follows the anchor a clear moved,
+/// as the rule's `<formula>`s do.
+#[test]
+fn clear_formats_reanchors_a_classic_cfvo_formula() {
+    use crate::sheet::{CfKind, CfRule, Cfvo, CondFormat};
+    let mut wb = book();
+    wb.sheets[0].cond_formats.push(CondFormat {
+        ranges: vec![(0, 0, 9, 0)],
+        rules: vec![CfRule {
+            kind: CfKind::Other {
+                rule_type: "dataBar".into(),
+                formulas: vec!["B1".into()],
+                cfvos: vec![
+                    Cfvo {
+                        kind: "formula".into(),
+                        val: "C1".into(),
+                        gte: true,
+                    },
+                    Cfvo {
+                        kind: "num".into(),
+                        val: "7".into(),
+                        gte: true,
+                    },
+                ],
+            },
+            dxf_id: None,
+            priority: 1,
+        }],
+        ix: None,
+    });
+    let plan = clear_plan(&wb.sheets[0], &[(0, 0, 2, 0)], ClearWhat::Formats, &[]).unwrap();
+    apply_clear_sheet(&mut wb.sheets[0], &plan);
+    let rule = &mut wb.sheets[0].cond_formats[0].rules[0];
+    assert_eq!(rule.formulas(), ["B4"]);
+    let vals: Vec<_> = rule.cfvos().iter().map(|v| v.val.clone()).collect();
+    assert_eq!(vals, ["C4", "7"]);
+}
+
+/// #1681: coverage that only an Excel 2010 rule gives still plans an area to
+/// uncover.
+#[test]
+fn clear_over_x14_only_coverage_plans_an_uncond_area() {
+    use crate::sheet::{ExtKind, ExtRule};
+    let mut wb = book();
+    wb.sheets[0].ext_rules.push(ExtRule {
+        kind: ExtKind::Cf,
+        ranges: vec![(0, 0, 4, 0)],
+        formulas: vec!["A1>0".into()],
+        ix: 0,
+    });
+    wb.sheets[0].ext_rules.push(ExtRule {
+        kind: ExtKind::Dv,
+        ranges: vec![(0, 5, 4, 5)],
+        formulas: vec!["Z1".into()],
+        ix: 0,
+    });
+    let hit = clear_plan(&wb.sheets[0], &[(2, 0, 2, 0)], ClearWhat::Formats, &[]).unwrap();
+    assert_eq!(hit.uncond, vec![(2, 0, 2, 0)]);
+    // A validation is not conditional formatting; a miss plans nothing.
+    let dv = clear_plan(&wb.sheets[0], &[(2, 5, 2, 5)], ClearWhat::Formats, &[]).unwrap();
+    assert!(dv.uncond.is_empty());
+}

@@ -937,8 +937,10 @@ worth knowing:
   on it, at its original index.** A workbook with sheets `[A, B, C]` where
   an agent removes `B` and the user then presses Ctrl+Z ends up `[A, B, C]`
   again. `sheet.remove` turns every defined name that refers to the removed
-  sheet (global, or scoped to another sheet) into `#REF!`, as Excel does;
-  the undo gives those names their text back (unless they changed
+  sheet (global, or scoped to another sheet) into `#REF!`, as Excel does,
+  and so every cell formula that names it (the cells that read those
+  recalculate, as in the TUI's Delete Sheet); the undo gives those names
+  their text back (unless they changed
   meanwhile). When the restore shifts other sheets, the undo/redo history is
   cleared, as `sheet.remove` itself clears it.
 - **Agent sheet-removals are undoable in reverse order.** The restore is
