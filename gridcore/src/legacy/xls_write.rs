@@ -1291,8 +1291,11 @@ fn sheet_records(
     }
     let base = s.format.base_col_width.clamp(0, 255) as u16;
     rec(&mut out, 0x0055, &base.to_le_bytes());
-    if let Some(w) = s.format.default_col_width {
-        let w = (w * 256.0).round().clamp(0.0, 65535.0) as u16;
+    let standard = s
+        .format
+        .default_col_width
+        .map(|w| (w * 256.0).round().clamp(0.0, 65535.0) as u16);
+    if let Some(w) = standard {
         rec(&mut out, 0x0099, &w.to_le_bytes());
     }
     for d in &s.col_defs {
@@ -1306,8 +1309,16 @@ fn sheet_records(
         }
         let width = d.width.unwrap_or(crate::sheet::DEFAULT_COL_WIDTH);
         let coldx = (width * 256.0).round().clamp(0.0, 65535.0) as u16;
-        // fUserSet is xlsx's customWidth: a plain width leaves it clear.
-        let user_set = d.width.is_some() && !d.plain_width;
+        // fUserSet is xlsx's customWidth: a plain width leaves it clear,
+        // unless the reader would take that width for the sheet's default
+        // and drop it.
+        let user_set = d.width.is_some()
+            && (!d.plain_width
+                || super::xls::is_default_coldx(
+                    Some(u32::from(base)),
+                    standard.map(|w| f64::from(w) / 256.0),
+                    coldx,
+                ));
         let flags: u16 = if hidden { 0x0001 } else { 0 } | if user_set { 0x0002 } else { 0 };
         let b = u16s(&[d.min as u16, last, coldx, STYLE_XFS as u16, flags, 0]);
         rec(&mut out, 0x007D, &b);
@@ -2530,7 +2541,8 @@ mod tests {
             plain_width,
         };
         let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
-        pkg.workbook.sheets[0].col_defs = vec![def(1, 12.0, true), def(3, 20.0, false)];
+        pkg.workbook.sheets[0].col_defs =
+            vec![def(1, 12.0, true), def(3, 20.0, false), def(5, 8.5, true)];
         let out = write_xls(&pkg);
         let grbits: Vec<u16> = out
             .bytes
@@ -2539,15 +2551,18 @@ mod tests {
             .filter(|(_, w)| w[..2] == [0x7D, 0x00] && w[2] == 12)
             .map(|(i, _)| u16::from_le_bytes([out.bytes[i + 4 + 8], out.bytes[i + 4 + 9]]))
             .collect();
-        assert_eq!(grbits, [0, 2]);
+        // The 8.5 one is inside the default's range, which the reader drops
+        // without fUserSet.
+        assert_eq!(grbits, [0, 2, 2]);
         let (back, _) = round(&pkg);
         let defs = &back.workbook.sheets[0].col_defs;
         assert_eq!(
             defs.iter()
                 .map(|d| (d.min, d.plain_width))
                 .collect::<Vec<_>>(),
-            [(1, true), (3, false)]
+            [(1, true), (3, false), (5, false)]
         );
+        assert_eq!(defs[2].width, Some(8.5));
         let saved = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&back)).unwrap();
         let xml = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
         assert!(
@@ -2557,6 +2572,18 @@ mod tests {
         assert!(
             xml.contains(r#"<col min="4" max="4" width="20" customWidth="1"/>"#),
             "{xml}"
+        );
+        // A plain width equal to a written STANDARDWIDTH is kept too.
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        pkg.workbook.sheets[0].format.default_col_width = Some(10.0);
+        pkg.workbook.sheets[0].col_defs = vec![def(1, 10.0, true), def(3, 12.0, true)];
+        let (back, _) = round(&pkg);
+        let defs = &back.workbook.sheets[0].col_defs;
+        assert_eq!(
+            defs.iter()
+                .map(|d| (d.min, d.width, d.plain_width))
+                .collect::<Vec<_>>(),
+            [(1, Some(10.0), false), (3, Some(12.0), true)]
         );
     }
 

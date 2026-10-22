@@ -1189,11 +1189,8 @@ fn read_sheet(
                     // clear), unless it is the sheet's default: its
                     // STANDARDWIDTH, or else DEFCOLWIDTH's characters plus
                     // the padding (Excel writes 8 characters as 2194).
-                    let base = sheet.base_col_width.unwrap_or(8).min(255) * 256;
-                    let default = match sheet.default_col_width {
-                        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
-                        None => (base..base + 256).contains(&(coldx as u32)),
-                    };
+                    let default =
+                        is_default_coldx(sheet.base_col_width, sheet.default_col_width, coldx);
                     let width = (grbit & 0x0002 != 0 || !default).then_some(coldx as f64 / 256.0);
                     if ixfe != 15 {
                         book.dropped.insert("column and row formats");
@@ -1472,6 +1469,22 @@ fn read_sheet(
 }
 
 /// Whether two margins (inches) are the same, as Excel rounds them.
+/// Whether a COLINFO width is the sheet's default: its STANDARDWIDTH, or
+/// else DEFCOLWIDTH's characters plus the padding (Excel writes 8
+/// characters as 2194). The reader drops such a width unless fUserSet
+/// keeps it, and the writer sets fUserSet for one (#1658).
+pub(super) fn is_default_coldx(
+    base_col_width: Option<u32>,
+    default_col_width: Option<f64>,
+    coldx: u16,
+) -> bool {
+    let base = base_col_width.unwrap_or(8).min(255) * 256;
+    match default_col_width {
+        Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
+        None => (base..base + 256).contains(&(coldx as u32)),
+    }
+}
+
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-6
 }
