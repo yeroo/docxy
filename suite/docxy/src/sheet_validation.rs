@@ -344,7 +344,11 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
     let snap = v.snapshot();
     let rules = |v: &crate::SheetView| {
         let s = &v.pkg.workbook.sheets[sheet];
-        (s.validations.clone(), s.ext_rules.clone(), s.ext_removed.clone())
+        (
+            s.validations.clone(),
+            s.ext_rules.clone(),
+            s.ext_removed.clone(),
+        )
     };
     let before = rules(v);
     {
