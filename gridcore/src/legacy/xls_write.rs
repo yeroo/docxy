@@ -1306,8 +1306,9 @@ fn sheet_records(
         }
         let width = d.width.unwrap_or(crate::sheet::DEFAULT_COL_WIDTH);
         let coldx = (width * 256.0).round().clamp(0.0, 65535.0) as u16;
-        let flags: u16 =
-            if hidden { 0x0001 } else { 0 } | if d.width.is_some() { 0x0002 } else { 0 };
+        // fUserSet is xlsx's customWidth: a plain width leaves it clear.
+        let user_set = d.width.is_some() && !d.plain_width;
+        let flags: u16 = if hidden { 0x0001 } else { 0 } | if user_set { 0x0002 } else { 0 };
         let b = u16s(&[d.min as u16, last, coldx, STYLE_XFS as u16, flags, 0]);
         rec(&mut out, 0x007D, &b);
     }
@@ -2513,6 +2514,50 @@ mod tests {
             .row_attrs
             .insert(0, " s=\"1\" customFormat=\"1\"".into());
         assert_eq!(write_xls(&pkg).lost, ["column and row formats"]);
+    }
+
+    /// COLINFO's fUserSet is xlsx's customWidth: a plain width (width with
+    /// no customWidth) leaves it clear, a custom one sets it, and the flag
+    /// comes back as `plain_width` and as the saved `<col>` (#1658).
+    #[test]
+    fn colinfo_user_set_follows_plain_width() {
+        let def = |min: u32, width: f64, plain_width: bool| crate::sheet::ColDef {
+            min,
+            max: min,
+            width: Some(width),
+            attrs: String::new(),
+            default_width: false,
+            plain_width,
+        };
+        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+        pkg.workbook.sheets[0].col_defs = vec![def(1, 12.0, true), def(3, 20.0, false)];
+        let out = write_xls(&pkg);
+        let grbits: Vec<u16> = out
+            .bytes
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| w[..2] == [0x7D, 0x00] && w[2] == 12)
+            .map(|(i, _)| u16::from_le_bytes([out.bytes[i + 4 + 8], out.bytes[i + 4 + 9]]))
+            .collect();
+        assert_eq!(grbits, [0, 2]);
+        let (back, _) = round(&pkg);
+        let defs = &back.workbook.sheets[0].col_defs;
+        assert_eq!(
+            defs.iter()
+                .map(|d| (d.min, d.plain_width))
+                .collect::<Vec<_>>(),
+            [(1, true), (3, false)]
+        );
+        let saved = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&back)).unwrap();
+        let xml = String::from_utf8_lossy(saved.part("xl/worksheets/sheet1.xml").unwrap());
+        assert!(
+            xml.contains(r#"<col min="2" max="2" width="12"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<col min="4" max="4" width="20" customWidth="1"/>"#),
+            "{xml}"
+        );
     }
 
     /// A loaded thin box in red is written as the box, its colour named

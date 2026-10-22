@@ -1203,7 +1203,10 @@ fn read_sheet(
                     }
                     let last = (last as u32).min(crate::sheet::MAX_COLS - 1);
                     if (width.is_some() || hidden) && first as u32 <= last {
-                        sheet.cols.push((first as u32, last, width, hidden));
+                        // fUserSet clear on a width: xlsx's plain width,
+                        // without customWidth.
+                        let plain = width.is_some() && grbit & 0x0002 == 0;
+                        sheet.cols.push((first as u32, last, width, hidden, plain));
                     }
                 }
                 0x0208 => {
@@ -2553,7 +2556,7 @@ pub(crate) mod tests {
         // xlwt's 0x0B6D (11.43 characters), flags clear.
         assert_eq!(
             cols(&[colinfo(1, 2, 0x0B6D, 0)]),
-            [(1, 2, Some(0x0B6D as f64 / 256.0), false)]
+            [(1, 2, Some(0x0B6D as f64 / 256.0), false, true)]
         );
         // Excel's default for DEFCOLWIDTH 8 (2194) is no width.
         assert!(cols(&[rec(0x0055, &[8, 0]), colinfo(0, 255, 2194, 0)]).is_empty());
@@ -2561,12 +2564,12 @@ pub(crate) mod tests {
         assert!(cols(&[rec(0x0099, &[0, 12]), colinfo(0, 255, 0x0C00, 0)]).is_empty());
         assert_eq!(
             cols(&[rec(0x0099, &[0, 12]), colinfo(0, 0, 2194, 0)]),
-            [(0, 0, Some(2194.0 / 256.0), false)]
+            [(0, 0, Some(2194.0 / 256.0), false, true)]
         );
         // fUserSet keeps a width that equals the default.
         assert_eq!(
             cols(&[colinfo(3, 3, 2194, 2)]),
-            [(3, 3, Some(2194.0 / 256.0), false)]
+            [(3, 3, Some(2194.0 / 256.0), false, false)]
         );
     }
 
