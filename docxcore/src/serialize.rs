@@ -794,6 +794,25 @@ pub(crate) fn ppr_base_xml(props: &ParProps) -> String {
     out
 }
 
+/// An edited `w:numPr`. Of a loaded element, the children the model does not
+/// carry (`w:numberingChange`, a tracked-insertion `w:ins`) stay as loaded,
+/// after the new `w:ilvl` and `w:numId` (CT_NumPr order).
+fn numpr_xml(ilvl: i32, num_id: i32, loaded: Option<&str>) -> String {
+    let mut rest = String::new();
+    if let Some(raw) = loaded.filter(|r| !r.trim_end().ends_with("/>")) {
+        if let (Some(open), Some(close)) = (crate::inspect::tag_end(raw), raw.rfind("</")) {
+            let mut inner = raw[open..close.max(open)].to_string();
+            for name in ["w:ilvl", "w:numId"] {
+                while let Some((a, b, _)) = crate::inspect::find_element_from(&inner, name, 0) {
+                    inner.replace_range(a..b, "");
+                }
+            }
+            rest = inner;
+        }
+    }
+    format!("<w:numPr><w:ilvl w:val=\"{ilvl}\"/><w:numId w:val=\"{num_id}\"/>{rest}</w:numPr>")
+}
+
 fn write_ppr(s: &mut String, props: &ParProps) {
     // Effective paragraph style: explicit style, else a synthesized heading style.
     let style = props
@@ -880,10 +899,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     if let Some(num) = props.num_id.filter(|_| !kept(PprGroup::Num)) {
         parts.push((
             ppr_rank("numPr"),
-            format!(
-                "<w:numPr><w:ilvl w:val=\"{}\"/><w:numId w:val=\"{}\"/></w:numPr>",
-                props.ilvl, num
-            ),
+            numpr_xml(props.ilvl, num, shadow.find("numPr")),
         ));
     }
     if (props.borders.top.is_some() || props.borders.bottom.is_some()) && !kept(PprGroup::Borders) {

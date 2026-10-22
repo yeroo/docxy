@@ -3580,7 +3580,10 @@ fn repair_level_indents(xml: &str, num_id: i32) -> Option<String> {
         let open_end = l + crate::inspect::tag_end(&xml[l..])?;
         let end = l_end - "</w:lvl>".len();
         let body = &xml[open_end..end];
-        let Some(ilvl) = open_attr(xml, l, "w:ilvl").and_then(|v| v.parse::<i32>().ok()) else {
+        let Some(ilvl) = open_attr(xml, l, "w:ilvl")
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|n| (0..=8).contains(n))
+        else {
             continue;
         };
         let ind = level_ind(ilvl);

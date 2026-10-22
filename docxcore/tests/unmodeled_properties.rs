@@ -962,3 +962,46 @@ fn increase_indent_on_a_loaded_list_item_with_a_zero_left_moves_the_indent() {
         assert!(ppr.contains("<w:ind w:left=\"720\"/>"), "{ind}: {ppr}");
     }
 }
+
+/// Stepping a list item's level rewrites its `w:numPr`; the tracked-numbering
+/// `w:ins` it was loaded with stays, after `w:ilvl` and `w:numId` (#1653).
+#[test]
+fn increase_indent_on_a_list_item_keeps_its_numbering_insertion() {
+    let body = "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/>\
+        <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\"/></w:numPr></w:pPr>\
+        <w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(
+        xml.contains(
+            "<w:numPr><w:ilvl w:val=\"1\"/><w:numId w:val=\"3\"/>\
+             <w:ins w:id=\"2\" w:author=\"A\" w:date=\"2026-01-01T00:00:00Z\"/></w:numPr>"
+        ),
+        "{xml}"
+    );
+    assert!(!xml.contains("<w:ind"), "{xml}");
+}
+
+#[test]
+fn increase_indent_with_an_out_of_range_level_does_not_panic() {
+    for lvl in ["2147483647", "-5"] {
+        let body = format!(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"{lvl}\"/><w:numId w:val=\"3\"/></w:numPr></w:pPr>\
+             <w:r><w:t>item</w:t></w:r></w:p>"
+        );
+        for delta in [720, -720] {
+            let xml = edited(&body, |e| e.change_indent(delta));
+            assert!(xml.contains("<w:numId w:val=\"3\"/>"), "{lvl}: {xml}");
+        }
+    }
+}
+
+/// Only a left attribute keeps the indent path: a hanging-only `w:ind` stays
+/// as loaded while the level steps.
+#[test]
+fn increase_indent_on_a_list_item_with_only_a_hanging_indent_steps_the_level() {
+    let body = "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"3\"/></w:numPr>\
+        <w:ind w:hanging=\"360\"/></w:pPr><w:r><w:t>item</w:t></w:r></w:p>";
+    let xml = edited(body, |e| e.change_indent(720));
+    assert!(xml.contains("<w:ilvl w:val=\"1\"/>"), "{xml}");
+    assert!(xml.contains("<w:ind w:hanging=\"360\"/>"), "{xml}");
+}

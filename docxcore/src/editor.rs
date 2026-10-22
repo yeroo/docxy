@@ -2795,15 +2795,17 @@ impl Editor {
     ///
     /// The level's indent (`left = 720 * (ilvl + 1)`) is what moves such an
     /// item: a direct left indent written here would beat the level's and
-    /// strand it at the margin. An item that already carries a direct `w:ind`
-    /// (loaded from a document, whatever its value) keeps moving that, which
-    /// is visible. A selection of level-stepping items all at the limit
+    /// strand it at the margin. An item that already carries a direct left
+    /// indent attribute (`w:left`, `w:start`, their character units; loaded
+    /// from a document, whatever its value) keeps moving that, which is
+    /// visible. A selection of level-stepping items all at the limit
     /// changes nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
         let step = delta.signum();
         let paths = self.selected_para_paths();
-        let moves =
-            |p: &ParProps| -> bool { !steps_level(p) || (p.ilvl + step).clamp(0, 8) != p.ilvl };
+        let moves = |p: &ParProps| -> bool {
+            !steps_level(p) || (p.ilvl.clamp(0, 8) + step).clamp(0, 8) != p.ilvl
+        };
         let any = paths
             .iter()
             .any(|path| resolve_para(&self.doc.body, path).is_some_and(|p| moves(&p.props)));
@@ -2812,7 +2814,7 @@ impl Editor {
         }
         self.for_each_para(|pr| {
             if steps_level(pr) {
-                pr.ilvl = (pr.ilvl + step).clamp(0, 8);
+                pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
                 return;
             }
             pr.indent = (pr.indent + delta).max(0);
