@@ -704,6 +704,12 @@ pub struct Sheet {
     /// the same translation, or drops it once this is `None`; an element
     /// whose `ref` doesn't read as a range is left alone.
     pub sort_state: Option<(u32, u32, u32, u32)>,
+    /// Every row/column insert or delete that moved or grew
+    /// [`Sheet::sort_state`] since the part was loaded, in order (edits
+    /// wholly below it change nothing and are not kept). The saved element
+    /// still holds the loaded range, so a save replays these on its `ref` and
+    /// each `<sortCondition ref>`. Empty whenever `sort_state` is `None`.
+    pub sort_state_edits: Vec<crate::formula::EditShift>,
     /// `<sheetPr filterMode>` (some rows are filtered): what the part said at
     /// load, then what a filter command last left. A save writes it when it
     /// differs from the part. `None` for a sheet built in memory that no
