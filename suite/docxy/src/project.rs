@@ -1411,6 +1411,17 @@ fn editable_row_cells(
             } else {
                 div().child(value).into_any_element()
             };
+            // A cell whose style paints an opaque base or hatch (or must hide
+            // its row's hatch) takes the selection wash as an overlay above
+            // it, else the fill would cover the wash.
+            let forced_base = cell_style
+                .as_ref()
+                .and_then(|s| crate::plugin_ui::cell_base(row_style.as_ref(), s));
+            let covered = forced_base.is_some()
+                || cell_style
+                    .as_ref()
+                    .is_some_and(crate::plugin_ui::paints_opaque);
+            let wash = selected_bg(uid, col);
             let cell = div()
                 .id(("project-cell", row * COLUMN_COUNT + col))
                 .relative()
@@ -1422,9 +1433,13 @@ fn editable_row_cells(
                 .px_2()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .bg(selected_bg(uid, col));
+                .bg(if covered { hsla(0., 0., 0., 0.) } else { wash });
             let cell = match &cell_style {
                 Some(style) => crate::plugin_ui::styled(cell, style),
+                None => cell,
+            };
+            let cell = match forced_base {
+                Some(base) => cell.bg(hsla_u(base)),
                 None => cell,
             };
             cell.border_1()
@@ -1439,6 +1454,9 @@ fn editable_row_cells(
                         .as_ref()
                         .and_then(crate::plugin_ui::pattern_layer),
                 )
+                .when(covered && wash.a > 0., |d| {
+                    d.child(div().absolute().top_0().left_0().size_full().bg(wash))
+                })
                 .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
                 .child(content)
                 // The press starts (and the move extends) a drag selection;

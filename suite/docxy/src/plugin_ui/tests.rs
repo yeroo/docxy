@@ -218,6 +218,42 @@ fn the_base_fill_follows_the_pattern() {
 }
 
 #[test]
+fn an_opaque_cell_and_a_flat_cell_under_a_hatched_row_are_found() {
+    let with = |background, pattern: Option<&str>| TextStyle {
+        background,
+        pattern: pattern.map(str::to_string),
+        ..Default::default()
+    };
+    // Opaque: a colour, a fill, a hatch; not hollow, not an empty style.
+    assert!(paints_opaque(&with(Some(0xFF0000), None)));
+    assert!(paints_opaque(&with(None, Some("light-fill"))));
+    assert!(paints_opaque(&with(None, Some("dark-dither"))));
+    assert!(!paints_opaque(&with(None, None)));
+    assert!(!paints_opaque(&with(Some(0xFF0000), Some("hollow"))));
+    assert!(!paints_opaque(&with(None, Some("solid"))));
+    // A plain cell under a hatched row gets its own base; others do not.
+    let row = with(None, Some("dark-diagonal-left"));
+    assert_eq!(
+        cell_base(Some(&row), &with(None, Some("solid"))),
+        Some(0xFFFFFF)
+    );
+    assert_eq!(
+        cell_base(Some(&row), &with(Some(0x123456), Some("odd"))),
+        Some(0x123456)
+    );
+    assert_eq!(
+        cell_base(Some(&row), &with(None, Some("dark-dither"))),
+        None
+    );
+    assert_eq!(cell_base(Some(&row), &with(None, Some("hollow"))), None);
+    assert_eq!(
+        cell_base(Some(&with(None, Some("solid"))), &with(None, Some("solid"))),
+        None
+    );
+    assert_eq!(cell_base(None, &with(None, Some("solid"))), None);
+}
+
+#[test]
 fn styled_strikes_through_with_underline() {
     use gpui::{Styled, div};
     let both = TextStyle {
@@ -237,7 +273,11 @@ fn styled_strikes_through_with_underline() {
             ..Default::default()
         },
     );
-    assert!(off.style().text.strikethrough.is_none());
+    // An explicit off is a zero-thickness line, which cancels the row's.
+    assert_eq!(
+        off.style().text.strikethrough.as_ref().map(|s| s.thickness),
+        Some(gpui::px(0.))
+    );
     let mut hollow = styled(
         div(),
         &TextStyle {

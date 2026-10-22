@@ -1737,6 +1737,30 @@ pub(crate) fn base_fill(style: &TextStyle) -> Option<u32> {
     }
 }
 
+/// Whether `style` paints an opaque base or layer over its box, which
+/// would hide a selection wash set as the box's own background.
+pub(crate) fn paints_opaque(style: &TextStyle) -> bool {
+    base_fill(style).is_some()
+        || matches!(
+            pattern_look(style.pattern.as_deref()),
+            PatternLook::Slash { .. } | PatternLook::Dots { .. }
+        )
+}
+
+/// The opaque base a cell with a plain (`solid` or unknown) pattern needs
+/// when its row draws a hatch, so the row's does not show through: the
+/// cell's background, else white.
+pub(crate) fn cell_base(row: Option<&TextStyle>, cell: &TextStyle) -> Option<u32> {
+    let hatched = |s: &TextStyle| {
+        matches!(
+            pattern_look(s.pattern.as_deref()),
+            PatternLook::Slash { .. } | PatternLook::Dots { .. }
+        )
+    };
+    (row.is_some_and(hatched) && pattern_look(cell.pattern.as_deref()) == PatternLook::Flat)
+        .then(|| cell.background.unwrap_or(PATTERN_BG))
+}
+
 /// `el` drawn in `style`: font, size (points), weight, italic, underline,
 /// strikethrough, colour and background, each only when the style sets it.
 /// A hatch or stipple pattern also needs [`pattern_layer`] as the box's
@@ -1761,8 +1785,16 @@ pub(crate) fn styled<E: gpui::Styled>(el: E, style: &TextStyle) -> E {
     if style.underline == Some(true) {
         el = el.underline();
     }
-    if style.strikethrough == Some(true) {
-        el = el.line_through();
+    match style.strikethrough {
+        Some(true) => el = el.line_through(),
+        // An explicit off cancels a strike inherited from the row.
+        Some(false) => {
+            el.text_style().strikethrough = Some(gpui::StrikethroughStyle {
+                thickness: px(0.),
+                color: None,
+            });
+        }
+        None => {}
     }
     if let Some(color) = style.color {
         el = el.text_color(crate::hsla_u(color));

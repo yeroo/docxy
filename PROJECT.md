@@ -557,7 +557,7 @@ without one nothing changes.
   default is 8), `fill` (a
   multiline fills the remaining height of a dialog with a `size`), and the
   `sample` kind (a read-only box drawing `{text, font, size, bold, italic,
-  underline, color, background}`, the formatting model's text style). A
+  underline, strikethrough, color, background, pattern}`, the formatting model's text style). A
   `Help` button is the host's: it opens the spec's `help` URL (recorded for
   the harness's `last-url`), else says the documentation is coming; it is
   never sent to the plugin and never the default. A tabbed dialog without a
