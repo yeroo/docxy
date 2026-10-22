@@ -433,10 +433,28 @@ impl ExternalRels {
     }
 }
 
+/// Which of `ids` stand as a quoted attribute value in `xml`, whatever the
+/// id looks like (the loader resolves any `r:id`): one linear pass per quote
+/// kind, testing the text between each adjacent pair of quotes, so a stray
+/// quote in cell text cannot put the pairing out of step.
+fn named<'a>(xml: &str, ids: &HashSet<&'a str>) -> HashSet<&'a str> {
+    let mut out = HashSet::new();
+    for quote in ['"', '\''] {
+        let at: Vec<usize> = xml.match_indices(quote).map(|(i, _)| i).collect();
+        for w in at.windows(2) {
+            if let Some(&id) = ids.get(&xml[w[0] + 1..w[1]]) {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
 /// Drop the External hyperlink relationships a save left unreferenced
 /// (#1456): those whose id the worksheet named before (`original`) and no
-/// longer names (`saved`), whatever the id looks like. Others, hyperlink or not, are never touched, so a rels
-/// part keeps its bytes unless a link left it.
+/// longer names (`saved`), whatever the id looks like. Others, hyperlink or
+/// not, are never touched, so a rels part keeps its bytes unless a link left
+/// it.
 pub(super) fn prune_orphans(
     parts: &mut [(String, Vec<u8>)],
     part_name: &str,
@@ -448,29 +466,31 @@ pub(super) fn prune_orphans(
     let Some(part) = parts.iter_mut().find(|(n, _)| *n == rels_part) else {
         return;
     };
-    // An id is named when it stands as a quoted attribute value, whatever
-    // its spelling (the loader resolves any `r:id`).
-    let named = |text: &str, id: &str| {
-        text.contains(&format!("\"{id}\"")) || text.contains(&format!("'{id}'"))
-    };
     let xml = String::from_utf8_lossy(&part.1).into_owned();
-    let mut out = String::with_capacity(xml.len());
-    let mut from = 0;
+    // The External hyperlink relationships there: (id, span).
+    let mut candidates: Vec<(String, usize, usize)> = Vec::new();
     for (name, a, b) in element_children(&xml) {
         if name != "Relationship" {
             continue;
         }
-        let orphan = parse_rels_mode(&xml[a..b])
-            .first()
-            .is_some_and(|(id, ty, _, mode)| {
-                ty == rel_type
-                    && mode.as_deref() == Some("External")
-                    && named(original, id)
-                    && !named(saved, id)
-            });
-        if orphan {
-            out.push_str(&xml[from..a]);
-            from = b;
+        if let Some((id, ty, _, mode)) = parse_rels_mode(&xml[a..b]).into_iter().next() {
+            if ty == rel_type && mode.as_deref() == Some("External") {
+                candidates.push((id, a, b));
+            }
+        }
+    }
+    let ids: HashSet<&str> = candidates.iter().map(|(id, _, _)| id.as_str()).collect();
+    let was = named(original, &ids);
+    if was.is_empty() {
+        return;
+    }
+    let now = named(saved, &ids);
+    let mut out = String::with_capacity(xml.len());
+    let mut from = 0;
+    for (id, a, b) in &candidates {
+        if was.contains(id.as_str()) && !now.contains(id.as_str()) {
+            out.push_str(&xml[from..*a]);
+            from = *b;
         }
     }
     if from == 0 {

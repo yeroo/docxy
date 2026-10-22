@@ -907,3 +907,54 @@ fn a_mixed_case_file_uri_rel_is_reused_for_the_same_target() {
     assert!(text(&re, SHEET).contains("<hyperlink ref=\"B2\" r:id=\"rId1\"/>"));
     assert_eq!(targets_of(&re, "/hyperlink").len(), 1);
 }
+
+#[test]
+fn stray_quotes_in_cell_text_do_not_hide_a_reference() {
+    // Inline strings with a lone `"` and `'` before the links: the pairing
+    // of quotes must not drift, so A2's kept link still counts as named and
+    // only A1's goes.
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\"><sheetData>\
+         <row r=\"5\"><c r=\"C5\" t=\"inlineStr\"><is><t>say \" and it's</t></is></c></row>\
+         </sheetData><hyperlinks>\
+         <hyperlink ref=\"A1\" r:id=\"R1\"/><hyperlink ref=\"A2\" r:id=\"R2\"/></hyperlinks></worksheet>"
+    );
+    let rels = rels_part(&format!(
+        "<Relationship Id=\"R1\" Type=\"{RNS}/hyperlink\" Target=\"https://one.example\" TargetMode=\"External\"/>\
+         <Relationship Id=\"R2\" Type=\"{RNS}/hyperlink\" Target=\"https://two.example\" TargetMode=\"External\"/>"
+    ));
+    let mut pkg = book(&ws, Some(&rels));
+    remove_link(&mut pkg, (0, 0));
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    assert_eq!(targets_of(&re, "/hyperlink"), vec!["https://two.example"]);
+}
+
+#[test]
+fn dropping_many_relationships_saves_in_linear_time() {
+    let mut pkg = plain_book();
+    for r in 0..20_000 {
+        link(
+            &mut pkg,
+            &format!("A{}", r + 1),
+            &format!("https://example.com/{r}"),
+        );
+    }
+    let mut pkg = resaved(&pkg);
+    assert_eq!(targets_of(&pkg, "/hyperlink").len(), 20_000);
+    let s = &mut pkg.workbook.sheets[0];
+    let plan = crate::edit::clear_plan(
+        s,
+        &[(0, 0, 19_999, 0)],
+        crate::edit::ClearWhat::RemoveHyperlinks,
+        &[],
+    )
+    .unwrap();
+    crate::edit::apply_clear_sheet(s, &plan);
+    let t = std::time::Instant::now();
+    let bytes = save_xlsx(&pkg);
+    assert!(t.elapsed() < crate::edit::PERF_BOUND, "{:?}", t.elapsed());
+    let re = load_xlsx(&bytes).unwrap();
+    assert!(re.workbook.sheets[0].hyperlinks.is_empty());
+    assert!(targets_of(&re, "/hyperlink").is_empty());
+}
