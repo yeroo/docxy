@@ -22,7 +22,7 @@ opccore = { path = "../opccore" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Read the actual X11 client window; no gpui test-support/offscreen build.
-x11rb = "0.13"
+x11rb = "0.14"
 
 # The pseudo-terminal a terminal editor runs in (#1204): `openpty`, `setsid`
 # and `TIOCSCTTY`. Already in the tree (std's own dependency tree and
