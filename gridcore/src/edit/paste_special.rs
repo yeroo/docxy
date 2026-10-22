@@ -792,9 +792,10 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
     ex
 }
 
-/// Take `rect` out of every validation rule on `sheet`: a rule's ranges are
-/// cut around it, and a rule left with no range goes (its element named in
-/// `dv_removed` for the save).
+/// Take `rect` out of every validation rule on `sheet`, the Excel 2010
+/// (`extLst`) ones too: a rule's ranges are cut around it, and a rule left
+/// with no range goes (its element named in `dv_removed` / `ext_removed` for
+/// the save).
 pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
     let cut = super::areas::RectIndex::new(&[rect]);
     let removed = &mut sheet.dv_removed;
@@ -812,6 +813,8 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
         super::reanchor(&mut dv.formula2, by);
         true
     });
+    // The Excel 2010 (`extLst`) validations the same way.
+    super::cut_ext_rules(sheet, crate::sheet::ExtKind::Dv, &cut);
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

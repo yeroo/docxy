@@ -9958,6 +9958,22 @@ impl SheetPackage {
         s.cond_formats.clear();
         // The elements those named are gone from the part.
         s.cf_removed.clear();
+        // The Excel 2010 rules stay in the part until the save strikes them
+        // by position (`set_ext_rules`): striking now would stale the `ix` of
+        // the ones kept.
+        let cf = crate::sheet::ExtKind::Cf;
+        let struck: Vec<_> = s
+            .ext_rules
+            .iter()
+            .filter(|e| e.kind == cf)
+            .map(|e| (e.kind, e.ix))
+            .collect();
+        s.ext_rules.retain(|e| e.kind != cf);
+        for k in struck {
+            if !s.ext_removed.contains(&k) {
+                s.ext_removed.push(k);
+            }
+        }
         true
     }
 
@@ -10628,6 +10644,40 @@ impl SheetPackage {
         true
     }
 
+    /// Delete sheet `idx` the way a person does: the cell formulas that name
+    /// it read `#REF!` (as Excel turns them), [`Self::remove_sheet`] runs, then
+    /// the cells that read a rewritten cell or a name it turned to `#REF!`
+    /// recalculate, so the file is right before Excel recalculates. A refusal
+    /// (the last sheet, no such sheet) changes nothing.
+    pub fn delete_sheet(&mut self, idx: usize) -> bool {
+        if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
+            return false;
+        }
+        let gone = [self.workbook.sheets[idx].name.clone()];
+        let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &gone);
+        let names: Vec<_> = self
+            .workbook
+            .defined_names
+            .iter()
+            .map(|d| d.formula.clone())
+            .collect();
+        let removed = self.remove_sheet(idx);
+        // After the sheet went, so a defined name that pointed at it reads
+        // `#REF!` there as well. A cell may read the sheet only through such
+        // a name, which no rewritten cell seeds: everything recalculates.
+        let renamed = self
+            .workbook
+            .defined_names
+            .iter()
+            .map(|d| &d.formula)
+            .ne(names.iter());
+        if removed && (!rewritten.is_empty() || renamed) {
+            let mut engine = crate::engine::Engine::new(&self.workbook);
+            engine.recalc_all(&mut self.workbook);
+        }
+        removed
+    }
+
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
             return false;
@@ -10650,7 +10700,7 @@ impl SheetPackage {
         }
         // A name that refers to the sheet reads `#REF!` from now on, as in
         // Excel; the removed sheet's own scoped names are dropped below.
-        // Cell formulas are left to the caller (`edit::remove_sheet_refs`).
+        // Cell formulas are left to the caller ([`Self::delete_sheet`] does).
         let gone = [self.workbook.sheets[idx].name.clone()];
         // So do the conditional-formatting and data-validation formulas that
         // name it.
@@ -25012,6 +25062,195 @@ mod rule_shift_tests {
         assert!(pkg.remove_sheet(1));
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains("<xm:f>#REF!&gt;1</xm:f>"), "{ws}");
+    }
+
+    /// Clear Formats / Clear All over `areas` of sheet 0, through the plan.
+    fn clear_areas(pkg: &mut SheetPackage, areas: &[(u32, u32, u32, u32)], all: bool) {
+        use crate::edit::{ClearWhat, apply_clear_sheet, clear_plan};
+        let what = if all {
+            ClearWhat::All
+        } else {
+            ClearWhat::Formats
+        };
+        let plan = clear_plan(&pkg.workbook.sheets[0], areas, what, &[]).unwrap();
+        apply_clear_sheet(&mut pkg.workbook.sheets[0], &plan);
+    }
+
+    #[test]
+    fn delete_sheet_turns_cell_formulas_into_ref_error_and_recalcs_dependents() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>Gone!A1+1</f><v>6</v></c></row></sheetData>"#;
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let u = r#"<sheetData><row r="1"><c r="A1"><f>S!A1*2</f><v>12</v></c></row></sheetData>"#;
+        let mut pkg = load_xlsx(&book(
+            "",
+            &[("S", Some(s)), ("Gone", Some(t)), ("U", Some(u))],
+        ))
+        .unwrap();
+        assert!(pkg.delete_sheet(1));
+        let ref_err = CellValue::Error("#REF!".into());
+        let a = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a.formula.as_deref(), Some("#REF!+1"));
+        assert_eq!(a.value, ref_err);
+        // The cell that reads the rewritten one caches the new value too.
+        let b = pkg.workbook.sheets[1].cell(0, 0).unwrap();
+        assert_eq!(b.formula.as_deref(), Some("S!A1*2"));
+        assert_eq!(b.value, ref_err);
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("saved file reloads");
+        assert_eq!(re.workbook.sheets.len(), 2);
+        assert_eq!(re.workbook.sheets[0].cell(0, 0).unwrap().value, ref_err);
+        assert_eq!(re.workbook.sheets[1].cell(0, 0).unwrap().value, ref_err);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<f>#REF!+1</f>"), "{ws}");
+    }
+
+    #[test]
+    fn delete_sheet_recalcs_with_the_defined_names_the_sheet_took_along() {
+        // `Total` pointed at the deleted sheet: it reads #REF! now, so the
+        // cell that adds it caches that, not the number it had.
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>IFERROR(Gone!A1,0)+Total</f><v>10</v></c></row></sheetData>"#;
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let u = r#"<sheetData><row r="1"><c r="A1"><f>S!A1+1</f><v>11</v></c></row></sheetData>"#;
+        let names =
+            r#"<definedNames><definedName name="Total">Gone!$A$1</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(
+            names,
+            &[("S", Some(s)), ("Gone", Some(t)), ("U", Some(u))],
+        ))
+        .unwrap();
+        assert!(pkg.delete_sheet(1));
+        let ref_err = CellValue::Error("#REF!".into());
+        assert_eq!(pkg.workbook.sheets[0].cell(0, 0).unwrap().value, ref_err);
+        assert_eq!(pkg.workbook.sheets[1].cell(0, 0).unwrap().value, ref_err);
+    }
+
+    #[test]
+    fn delete_sheet_recalcs_a_cell_that_reads_the_sheet_only_through_a_name() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>Total*2</f><v>10</v></c></row></sheetData>"#;
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let names =
+            r#"<definedNames><definedName name="Total">Gone!$A$1</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(names, &[("S", Some(s)), ("Gone", Some(t))])).unwrap();
+        assert!(pkg.delete_sheet(1));
+        let a = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a.formula.as_deref(), Some("Total*2"));
+        assert_eq!(a.value, CellValue::Error("#REF!".into()));
+    }
+
+    #[test]
+    fn delete_sheet_refuses_the_last_sheet_and_changes_nothing() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>Gone!A1+1</f><v>6</v></c></row></sheetData>"#;
+        let mut pkg = load_xlsx(&book("", &[("S", Some(s))])).unwrap();
+        assert!(!pkg.delete_sheet(0));
+        assert!(!pkg.delete_sheet(3));
+        let a = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a.formula.as_deref(), Some("Gone!A1+1"));
+        assert_eq!(a.value, CellValue::Number(6.0));
+        // Two sheets, an index past them: still nothing rewritten.
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let mut pkg = load_xlsx(&book("", &[("S", Some(s)), ("Gone", Some(t))])).unwrap();
+        assert!(!pkg.delete_sheet(2));
+        assert_eq!(
+            pkg.workbook.sheets[0]
+                .cell(0, 0)
+                .unwrap()
+                .formula
+                .as_deref(),
+            Some("Gone!A1+1")
+        );
+    }
+
+    #[test]
+    fn clear_formats_cuts_an_x14_cf_and_strikes_one_left_with_no_range() {
+        let x14 = x14_cf("A1:A5", "B1&gt;1");
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        clear_areas(&mut pkg, &[(3, 0, 4, 0)], false);
+        assert_eq!(
+            pkg.workbook.sheets[0].ext_rules[0].ranges,
+            vec![(0, 0, 2, 0)]
+        );
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>A1:A3</xm:sqref>"), "{ws}");
+        assert_eq!(
+            re.workbook.sheets[0].ext_rules[0].ranges,
+            vec![(0, 0, 2, 0)]
+        );
+        // The rest goes: the element, its wrappers and the extLst.
+        clear_areas(&mut pkg, &[(0, 0, 2, 0)], true);
+        assert!(pkg.workbook.sheets[0].ext_rules.is_empty());
+        assert_eq!(pkg.workbook.sheets[0].ext_removed.len(), 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("x14:") && !ws.contains("extLst"), "{ws}");
+        assert!(re.workbook.sheets[0].ext_rules.is_empty());
+    }
+
+    #[test]
+    fn clear_formats_reanchors_x14_cf_formulas_when_its_anchor_moves() {
+        let x14 = format!(
+            r#"<extLst><ext uri="{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}" {X14_NS}><x14:conditionalFormattings><x14:conditionalFormatting><x14:cfRule type="dataBar" id="{{D}}"><x14:dataBar minLength="0" maxLength="100"><x14:cfvo type="formula"><xm:f>$B$1</xm:f></x14:cfvo><x14:cfvo type="autoMax"/></x14:dataBar></x14:cfRule><xm:sqref>A1:A5</xm:sqref></x14:conditionalFormatting><x14:conditionalFormatting><x14:cfRule type="expression" priority="2" id="{{X}}"><xm:f>C1&gt;1</xm:f></x14:cfRule><xm:sqref>C1:C5</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>"#
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        // The first two rows of both go; only the data bar's cfvo is relative
+        // by `$B$1` (absolute: kept), the expression's `C1` moves to `C3`.
+        clear_areas(&mut pkg, &[(0, 0, 1, 2)], false);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<xm:sqref>A3:A5</xm:sqref>"), "{ws}");
+        assert!(ws.contains("<xm:sqref>C3:C5</xm:sqref>"), "{ws}");
+        assert!(ws.contains("<xm:f>C3&gt;1</xm:f>"), "{ws}");
+        assert!(ws.contains("<xm:f>$B$1</xm:f>"), "{ws}");
+        assert!(ws.contains(r#"<x14:cfvo type="autoMax"/>"#), "{ws}");
+        // An x14 rule the clear does not reach keeps its bytes.
+        let keep = x14_cf("E1:E5", "F1&gt;1");
+        let mut pkg = one("S", &format!("{MARGINS}{keep}"));
+        clear_areas(&mut pkg, &[(0, 0, 9, 2)], false);
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&keep), "{ws}");
+    }
+
+    #[test]
+    fn clear_conditional_formats_removes_x14_cf_but_keeps_x14_dv() {
+        let cf = x14_cf("A1:A5", "B1&gt;1");
+        let dv = x14_dv("C1:C5", "Z1", None);
+        let two = format!(
+            "{}{}",
+            cf.replace("</extLst>", ""),
+            dv.replace("<extLst>", "")
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{two}"));
+        assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 2);
+        // The rule's element was already named struck: no second entry.
+        let cf_ix = pkg.workbook.sheets[0].ext_rules[0].ix;
+        pkg.workbook.sheets[0]
+            .ext_removed
+            .push((crate::sheet::ExtKind::Cf, cf_ix));
+        assert!(pkg.clear_conditional_formats(0));
+        assert_eq!(pkg.workbook.sheets[0].ext_rules.len(), 1);
+        // Twice: no duplicate strike.
+        assert!(pkg.clear_conditional_formats(0));
+        assert_eq!(pkg.workbook.sheets[0].ext_removed.len(), 1);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("conditionalFormatting"), "{ws}");
+        assert!(ws.contains("<x14:dataValidations count=\"1\">"), "{ws}");
+        assert!(ws.contains("<xm:sqref>C1:C5</xm:sqref>"), "{ws}");
+        assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
+    }
+
+    #[test]
+    fn paste_validation_clear_cuts_an_x14_dv_and_keeps_its_count() {
+        let two = format!(
+            r#"<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" {X14_NS}><x14:dataValidations count="2"><x14:dataValidation type="list"><x14:formula1><xm:f>Z1</xm:f></x14:formula1><xm:sqref>A1:A5</xm:sqref></x14:dataValidation><x14:dataValidation type="list"><x14:formula1><xm:f>Z2</xm:f></x14:formula1><xm:sqref>C1</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>"#
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{two}"));
+        crate::edit::clear_validation(&mut pkg.workbook.sheets[0], (0, 0, 1, 2));
+        let sheet = &pkg.workbook.sheets[0];
+        assert_eq!(sheet.ext_rules.len(), 1);
+        assert_eq!(sheet.ext_rules[0].ranges, vec![(2, 0, 4, 0)]);
+        assert_eq!(sheet.ext_rules[0].formulas, vec!["Z3".to_string()]);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(r#"<x14:dataValidations count="1">"#), "{ws}");
+        assert!(ws.contains("<xm:sqref>A3:A5</xm:sqref>"), "{ws}");
+        assert!(ws.contains("<xm:f>Z3</xm:f>"), "{ws}");
+        assert!(!ws.contains("<xm:f>Z2</xm:f>"), "{ws}");
+        assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
     }
 
     #[test]

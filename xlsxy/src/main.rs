@@ -1911,8 +1911,15 @@ fn bbox(cells: &[(u32, u32)]) -> Option<CellRect> {
 }
 
 /// A sheet's data-validation rules, and the elements of its part a save
-/// strikes ([`gridcore::sheet::Sheet::dv_removed`]).
-type RuleState = (Vec<gridcore::sheet::DataValidation>, Vec<usize>);
+/// strikes ([`gridcore::sheet::Sheet::dv_removed`]), then its Excel 2010
+/// (`extLst`) rules and the ones struck ([`gridcore::sheet::Sheet::ext_rules`],
+/// `ext_removed`): a validation clear cuts those too.
+type RuleState = (
+    Vec<gridcore::sheet::DataValidation>,
+    Vec<usize>,
+    Vec<gridcore::sheet::ExtRule>,
+    Vec<(gridcore::sheet::ExtKind, usize)>,
+);
 
 /// The `(row, col, style)` a restyle group puts back: the style of each
 /// change's `before` or `after` cell (picked by `side`), `None` if absent.
@@ -4213,8 +4220,9 @@ impl App {
                             }
                         }
                         if let Some((before, after)) = &mut g.rules {
-                            for (rules, _) in [before, after] {
+                            for (rules, _, ext, _) in [before, after] {
                                 gridcore::edit::rename_sheet_in_validations(rules, &old, name);
+                                gridcore::edit::rename_sheet_in_ext_rules(ext, &old, name);
                             }
                         }
                     }
@@ -4791,7 +4799,14 @@ impl App {
             .workbook
             .sheets
             .get(sheet)
-            .map(|s| (s.validations.clone(), s.dv_removed.clone()))
+            .map(|s| {
+                (
+                    s.validations.clone(),
+                    s.dv_removed.clone(),
+                    s.ext_rules.clone(),
+                    s.ext_removed.clone(),
+                )
+            })
             .unwrap_or_default()
     }
 
@@ -4799,6 +4814,8 @@ impl App {
         if let Some(s) = self.pkg.workbook.sheets.get_mut(sheet) {
             s.validations = state.0.clone();
             s.dv_removed = state.1.clone();
+            s.ext_rules = state.2.clone();
+            s.ext_removed = state.3.clone();
         }
     }
 
@@ -10868,7 +10885,7 @@ impl App {
     fn delete_current_sheet(&mut self) {
         let name = self.pkg.workbook.sheets[self.sheet].name.clone();
         let gone = self.sheet;
-        if self.pkg.remove_sheet(gone) {
+        if self.pkg.delete_sheet(gone) {
             self.sheet_removed_circles(gone);
             self.cancel_cut();
             // The copy names its sheet by index: one deleted leaves it no
@@ -17253,6 +17270,37 @@ mod tests {
         app.open_paste_special();
         assert!(app.outline_dialog.is_none());
         assert!(app.status.as_deref().unwrap_or("").contains("cut"));
+    }
+
+    /// #1681: deleting a sheet turns the cell formulas that name it into
+    /// `#REF!`, and the cells that read those follow.
+    #[test]
+    fn delete_current_sheet_turns_formulas_that_name_it_into_ref_errors() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Sheet2");
+        let mut app = App::new(pkg, "ref.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[1].set_cell(0, 0, Cell::number(5.0));
+        app.pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("Sheet2!A1+1"));
+        app.pkg.workbook.sheets[0].set_cell(0, 1, Cell::formula("A1*2"));
+        app.rebuild_engine();
+        app.sheet = 1;
+        app.delete_current_sheet();
+        let ref_err = CellValue::Error("#REF!".into());
+        let a1 = app.pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.formula.as_deref(), Some("#REF!+1"));
+        assert_eq!(a1.value, ref_err);
+        assert_eq!(
+            app.pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
+            ref_err
+        );
+        // The last sheet is refused and nothing is rewritten.
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::formula("Sheet1!A3"));
+        app.sheet = 0;
+        app.delete_current_sheet();
+        assert_eq!(app.pkg.workbook.sheets.len(), 1);
+        let kept = app.pkg.workbook.sheets[0].cell(2, 0).unwrap();
+        assert_eq!(kept.formula.as_deref(), Some("Sheet1!A3"));
     }
 
     /// #707 r4 M1: Paste Special › All of a spilling array pastes its
@@ -25100,8 +25148,18 @@ mod tests {
             styles_only: false,
             target: None,
             rules: Some((
-                (Vec::new(), Vec::new()),
-                (vec![rule("Data!$A$1:$A$3")], Vec::new()),
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                (
+                    vec![rule("Data!$A$1:$A$3")],
+                    Vec::new(),
+                    vec![gridcore::sheet::ExtRule {
+                        kind: gridcore::sheet::ExtKind::Dv,
+                        ranges: vec![(0, 1, 0, 1)],
+                        formulas: vec!["Data!$A$1:$A$3".into()],
+                        ix: 0,
+                    }],
+                    Vec::new(),
+                ),
             )),
         }]));
         app.rename_sheet(1, "Lists").unwrap();
@@ -25110,6 +25168,10 @@ mod tests {
         assert_eq!(
             app.pkg.workbook.sheets[0].validations[0].formula1,
             "Lists!$A$1:$A$3"
+        );
+        assert_eq!(
+            app.pkg.workbook.sheets[0].ext_rules[0].formulas,
+            ["Lists!$A$1:$A$3"]
         );
     }
 
@@ -26004,13 +26066,61 @@ mod tests {
     }
 
     /// Every sheet's rules and removed elements: what undo must restore.
-    fn every_rule(app: &App) -> Vec<(Vec<gridcore::sheet::DataValidation>, Vec<usize>)> {
+    fn every_rule(app: &App) -> Vec<RuleState> {
         app.pkg
             .workbook
             .sheets
             .iter()
-            .map(|s| (s.validations.clone(), s.dv_removed.clone()))
+            .map(|s| {
+                (
+                    s.validations.clone(),
+                    s.dv_removed.clone(),
+                    s.ext_rules.clone(),
+                    s.ext_removed.clone(),
+                )
+            })
             .collect()
+    }
+
+    /// #1681: a validation clear that only cuts an Excel 2010 (`extLst`)
+    /// rule is an undo step too, and undo gives the rule and its ranges back.
+    #[test]
+    fn clearing_validation_over_an_x14_rule_is_one_undo_step() {
+        use gridcore::sheet::{ExtKind, ExtRule};
+        let mut app = cut_rule_app("B2>A2");
+        app.pkg.workbook.sheets[0].ext_rules.push(ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![(6, 5, 9, 5)], // F7:F10
+            formulas: vec!["Z7".into()],
+            ix: 0,
+        });
+        let before = every_rule(&app);
+        let depth = app.undo.len();
+        app.with_rules(&[0], |app| {
+            gridcore::validation::clear_all_validation(
+                &mut app.pkg.workbook.sheets[0],
+                (6, 5, 7, 5),
+                false,
+            );
+        });
+        let s = &app.pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules[0].ranges, vec![(8, 5, 9, 5)]);
+        assert_eq!(s.ext_rules[0].formulas, vec!["Z9".to_string()]);
+        assert_eq!(app.undo.len(), depth + 1);
+        app.undo();
+        assert_eq!(every_rule(&app), before);
+        // Struck whole, then undone: the element is not struck any more.
+        app.with_rules(&[0], |app| {
+            gridcore::validation::clear_all_validation(
+                &mut app.pkg.workbook.sheets[0],
+                (0, 5, 20, 5),
+                false,
+            );
+        });
+        assert!(app.pkg.workbook.sheets[0].ext_rules.is_empty());
+        assert_eq!(app.pkg.workbook.sheets[0].ext_removed.len(), 1);
+        app.undo();
+        assert_eq!(every_rule(&app), before);
     }
 
     #[test]
@@ -26467,7 +26577,10 @@ mod tests {
             sheet: 0,
             changes: Vec::new(),
             styles_only: false,
-            rules: Some(((Vec::new(), Vec::new()), (Vec::new(), Vec::new()))),
+            rules: Some((
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            )),
             target: None,
         }]));
         away(&mut app);

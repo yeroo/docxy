@@ -1867,7 +1867,7 @@ fn sheet_add(app: &mut App, args: &Json) -> Result<Json, String> {
 fn sheet_remove(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg_required(app, args)?;
     let removed_active = app.sheet == si;
-    if !app.pkg.remove_sheet(si) {
+    if !app.pkg.delete_sheet(si) {
         return Err("cannot remove the last sheet".into());
     }
     // A pending cut's source sheet may be gone or renumbered.
@@ -5068,6 +5068,34 @@ mod tests {
         assert_eq!(a.pkg.workbook.sheets.len(), 1);
         a.undo();
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    #[test]
+    fn sheet_remove_turns_cell_formulas_that_name_it_into_ref_errors() {
+        // #1681: the verb deletes the sheet the way the TUI does, so a cell
+        // reading it (and a cell reading that one) go `#REF!` rather than
+        // keep the text of a sheet that is gone.
+        let mut a = app();
+        dispatch(
+            &mut a,
+            "sheet.add",
+            &Json::obj(vec![("name", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        a.apply_on(1, vec![(0, 0, gridcore::edit::parse_input("5"))]);
+        set(&mut a, "A1", "=Second!A1+1");
+        set(&mut a, "B1", "=A1*2");
+        dispatch(
+            &mut a,
+            "sheet.remove",
+            &Json::obj(vec![("sheet", Json::Str("Second".into()))]),
+        )
+        .unwrap();
+        let ref_err = gridcore::sheet::CellValue::Error("#REF!".into());
+        let a1 = a.pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a1.formula.as_deref(), Some("#REF!+1"));
+        assert_eq!(a1.value, ref_err);
+        assert_eq!(a.pkg.workbook.sheets[0].cell(0, 1).unwrap().value, ref_err);
     }
 
     #[test]

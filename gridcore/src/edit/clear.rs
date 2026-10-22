@@ -3,8 +3,8 @@
 
 use super::Area;
 use super::areas::{RectIndex, entries_in};
-use super::{cut_rule_ranges, reanchor};
-use crate::sheet::{Cell, Sheet};
+use super::{cut_ext_rules, cut_rule_ranges, reanchor};
+use crate::sheet::{Cell, ExtKind, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
 pub(crate) const MERGED_PART: &str = "Cannot change part of a merged cell.";
@@ -127,6 +127,13 @@ pub fn clear_plan(
                 .cond_formats
                 .iter()
                 .flat_map(|cf| cf.ranges.iter().copied())
+                .chain(
+                    sheet
+                        .ext_rules
+                        .iter()
+                        .filter(|e| e.kind == ExtKind::Cf)
+                        .flat_map(|e| e.ranges.iter().copied()),
+                )
                 .collect::<Vec<_>>(),
         );
         plan.uncond = areas.iter().copied().filter(|&a| cf_ix.meets(a)).collect();
@@ -247,10 +254,11 @@ pub fn apply_clear_sheet(sheet: &mut Sheet, plan: &ClearPlan) {
     }
 }
 
-/// Take `areas` out of every conditional-format block's ranges. A block left
-/// with no range goes (its element named in `cf_removed` for the save); one
-/// whose anchor (the top-left of its ranges) moved takes its formulas along,
-/// so each cell left reads what it read (#707 r9).
+/// Take `areas` out of every conditional-format block's ranges, the Excel
+/// 2010 (`extLst`) rules' too. A block left with no range goes (its element
+/// named in `cf_removed` / `ext_removed` for the save); one whose anchor (the
+/// top-left of its ranges) moved takes its formulas, `cfvo` thresholds
+/// included, along, so each cell left reads what it read (#707 r9, #1681).
 pub(crate) fn clear_cond_formats(sheet: &mut Sheet, areas: &[Area]) {
     if areas.is_empty() {
         return;
@@ -269,9 +277,13 @@ pub(crate) fn clear_cond_formats(sheet: &mut Sheet, areas: &[Area]) {
             for f in rule.formulas_mut() {
                 reanchor(f, by);
             }
+            for f in rule.cfvo_formulas_mut() {
+                reanchor(f, by);
+            }
         }
         true
     });
+    cut_ext_rules(sheet, ExtKind::Cf, &ix);
 }
 
 /// Home › Clear `what` over `areas` of `wb`'s sheet `sheet`, cells and all.

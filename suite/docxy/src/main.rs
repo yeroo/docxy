@@ -2980,7 +2980,7 @@ impl SheetView {
             return false;
         }
         let snap = self.snapshot_package();
-        if !self.pkg.remove_sheet(idx) {
+        if !self.pkg.delete_sheet(idx) {
             return false;
         }
         self.push_undo_snapshot(snap, SheetStep::Named("Delete Sheet"));
