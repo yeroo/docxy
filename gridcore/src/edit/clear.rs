@@ -3,7 +3,7 @@
 
 use super::Area;
 use super::areas::{RectIndex, entries_in};
-use super::{cut_rule_ranges, reanchor};
+use super::{cut_ext_rules, cut_rule_ranges, reanchor};
 use crate::sheet::{Cell, ExtKind, Sheet};
 
 /// Excel's refusal of a clear that would split a merged cell.
@@ -283,22 +283,7 @@ pub(crate) fn clear_cond_formats(sheet: &mut Sheet, areas: &[Area]) {
         }
         true
     });
-    let removed = &mut sheet.ext_removed;
-    sheet.ext_rules.retain_mut(|ext| {
-        if ext.kind != ExtKind::Cf || !ext.ranges.iter().any(|&r| ix.meets(r)) {
-            return true;
-        }
-        let Some(by) = cut_rule_ranges(&mut ext.ranges, &ix) else {
-            if !removed.contains(&(ext.kind, ext.ix)) {
-                removed.push((ext.kind, ext.ix));
-            }
-            return false;
-        };
-        for f in &mut ext.formulas {
-            reanchor(f, by);
-        }
-        true
-    });
+    cut_ext_rules(sheet, ExtKind::Cf, &ix);
 }
 
 /// Home › Clear `what` over `areas` of `wb`'s sheet `sheet`, cells and all.

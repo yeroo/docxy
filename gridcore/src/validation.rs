@@ -1707,6 +1707,12 @@ pub fn cut_rules(wb: &mut Workbook, src: usize, dst: usize, mv: &CellMove, land:
             add_ranges(sheet, &rule, &[p]);
         }
     }
+    // The landing cells lose their Excel 2010 (`extLst`) validations too, as
+    // a plain paste takes them off.
+    if land {
+        let landed = crate::edit::areas::RectIndex::new(&[cut.landed]);
+        crate::edit::cut_ext_rules(&mut wb.sheets[dst], crate::sheet::ExtKind::Dv, &landed);
+    }
     kept_back
 }
 
@@ -2892,6 +2898,31 @@ mod tests {
         for &(cell, want) in cases {
             assert_eq!(seen(wb, s, cell).as_deref(), want, "{cell}");
         }
+    }
+
+    /// #1681: a cut pasted over cells takes their Excel 2010 (`extLst`)
+    /// validation off, as a plain paste does.
+    #[test]
+    fn a_cut_landing_strips_an_x14_validation_from_the_landing_cells() {
+        use crate::sheet::{ExtKind, ExtRule};
+        let mut wb = sheets(&["Sheet1"]);
+        wb.sheets[0].validations.push(custom("B1", "B1>0"));
+        wb.sheets[0].ext_rules.push(ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![area("D1:D10")],
+            formulas: vec!["Z1".into()],
+            ix: 0,
+        });
+        cut(&mut wb, 0, "B1", 0, "D1");
+        let ext = &wb.sheets[0].ext_rules[0];
+        assert_eq!(ext.ranges, vec![area("D2:D10")]);
+        assert_eq!(ext.formulas, vec!["Z2".to_string()]);
+        // A cut over the whole of it strikes it, once.
+        cut(&mut wb, 0, "D2", 0, "D2");
+        wb.sheets[0].validations.push(custom("F1:F9", "F1>0"));
+        cut(&mut wb, 0, "F1:F9", 0, "D2");
+        assert!(wb.sheets[0].ext_rules.is_empty());
+        assert_eq!(wb.sheets[0].ext_removed, vec![(ExtKind::Dv, 0)]);
     }
 
     #[test]

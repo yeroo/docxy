@@ -25152,7 +25152,12 @@ mod tests {
                 (
                     vec![rule("Data!$A$1:$A$3")],
                     Vec::new(),
-                    Vec::new(),
+                    vec![gridcore::sheet::ExtRule {
+                        kind: gridcore::sheet::ExtKind::Dv,
+                        ranges: vec![(0, 1, 0, 1)],
+                        formulas: vec!["Data!$A$1:$A$3".into()],
+                        ix: 0,
+                    }],
                     Vec::new(),
                 ),
             )),
@@ -25163,6 +25168,10 @@ mod tests {
         assert_eq!(
             app.pkg.workbook.sheets[0].validations[0].formula1,
             "Lists!$A$1:$A$3"
+        );
+        assert_eq!(
+            app.pkg.workbook.sheets[0].ext_rules[0].formulas,
+            ["Lists!$A$1:$A$3"]
         );
     }
 

@@ -814,22 +814,7 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
         true
     });
     // The Excel 2010 (`extLst`) validations the same way.
-    let removed = &mut sheet.ext_removed;
-    sheet.ext_rules.retain_mut(|ext| {
-        if ext.kind != crate::sheet::ExtKind::Dv || !ext.ranges.iter().any(|&r| overlaps(r, rect)) {
-            return true;
-        }
-        let Some(by) = super::cut_rule_ranges(&mut ext.ranges, &cut) else {
-            if !removed.contains(&(ext.kind, ext.ix)) {
-                removed.push((ext.kind, ext.ix));
-            }
-            return false;
-        };
-        for f in &mut ext.formulas {
-            super::reanchor(f, by);
-        }
-        true
-    });
+    super::cut_ext_rules(sheet, crate::sheet::ExtKind::Dv, &cut);
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

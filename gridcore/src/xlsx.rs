@@ -10644,30 +10644,36 @@ impl SheetPackage {
         true
     }
 
-    /// Delete sheet `idx` the way a person does: [`Self::remove_sheet`], after
-    /// the cell formulas that name it read `#REF!` (as Excel turns them) and
-    /// the cells that read those recalculate, so the file is right before
-    /// Excel does. A refusal (the last sheet, no such sheet) changes nothing.
+    /// Delete sheet `idx` the way a person does: the cell formulas that name
+    /// it read `#REF!` (as Excel turns them), [`Self::remove_sheet`] runs, then
+    /// the cells that read a rewritten cell or a name it turned to `#REF!`
+    /// recalculate, so the file is right before Excel recalculates. A refusal
+    /// (the last sheet, no such sheet) changes nothing.
     pub fn delete_sheet(&mut self, idx: usize) -> bool {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
             return false;
         }
         let gone = [self.workbook.sheets[idx].name.clone()];
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &gone);
-        let removed = self.remove_sheet(idx);
-        // The cells that read a rewritten one (and theirs) cache the new value
-        // too, so the file is right before Excel recalculates. After the
-        // sheet went, so a defined name that pointed at it reads `#REF!`
-        // there as well, and with the indices shifted down. Only dependents:
-        // a volatile formula that reads none keeps its value.
-        let moved: Vec<_> = rewritten
-            .into_iter()
-            .filter(|&(s, ..)| s != idx)
-            .map(|(s, r, c)| (if s > idx { s - 1 } else { s }, r, c))
+        let names: Vec<_> = self
+            .workbook
+            .defined_names
+            .iter()
+            .map(|d| d.formula.clone())
             .collect();
-        if removed && !moved.is_empty() {
+        let removed = self.remove_sheet(idx);
+        // After the sheet went, so a defined name that pointed at it reads
+        // `#REF!` there as well. A cell may read the sheet only through such
+        // a name, which no rewritten cell seeds: everything recalculates.
+        let renamed = self
+            .workbook
+            .defined_names
+            .iter()
+            .map(|d| &d.formula)
+            .ne(names.iter());
+        if removed && (!rewritten.is_empty() || renamed) {
             let mut engine = crate::engine::Engine::new(&self.workbook);
-            engine.recalc_dependents_of(&mut self.workbook, &moved);
+            engine.recalc_all(&mut self.workbook);
         }
         removed
     }
@@ -25115,6 +25121,19 @@ mod rule_shift_tests {
         let ref_err = CellValue::Error("#REF!".into());
         assert_eq!(pkg.workbook.sheets[0].cell(0, 0).unwrap().value, ref_err);
         assert_eq!(pkg.workbook.sheets[1].cell(0, 0).unwrap().value, ref_err);
+    }
+
+    #[test]
+    fn delete_sheet_recalcs_a_cell_that_reads_the_sheet_only_through_a_name() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>Total*2</f><v>10</v></c></row></sheetData>"#;
+        let t = r#"<sheetData><row r="1"><c r="A1"><v>5</v></c></row></sheetData>"#;
+        let names =
+            r#"<definedNames><definedName name="Total">Gone!$A$1</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(names, &[("S", Some(s)), ("Gone", Some(t))])).unwrap();
+        assert!(pkg.delete_sheet(1));
+        let a = pkg.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(a.formula.as_deref(), Some("Total*2"));
+        assert_eq!(a.value, CellValue::Error("#REF!".into()));
     }
 
     #[test]

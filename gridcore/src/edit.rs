@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 /// selection, a copy, a Subtotal region.
 pub type Area = (u32, u32, u32, u32);
 
-mod areas;
+pub(crate) mod areas;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
 /// and still far below what the quadratic version they guard took (minutes).
@@ -2056,6 +2056,32 @@ pub(crate) fn cut_rule_ranges(
         i64::from(after.0) - i64::from(before.0),
         i64::from(after.1) - i64::from(before.1),
     ))
+}
+
+/// Take `cut` out of every Excel 2010 (`extLst`) rule of `kind` on `sheet`:
+/// ranges cut around it, formulas following a moved anchor, and a rule left
+/// with no range goes (its element named in `ext_removed`, once).
+pub(crate) fn cut_ext_rules(
+    sheet: &mut Sheet,
+    kind: crate::sheet::ExtKind,
+    cut: &areas::RectIndex,
+) {
+    let removed = &mut sheet.ext_removed;
+    sheet.ext_rules.retain_mut(|ext| {
+        if ext.kind != kind || !ext.ranges.iter().any(|&r| cut.meets(r)) {
+            return true;
+        }
+        let Some(by) = cut_rule_ranges(&mut ext.ranges, cut) else {
+            if !removed.contains(&(ext.kind, ext.ix)) {
+                removed.push((ext.kind, ext.ix));
+            }
+            return false;
+        };
+        for f in &mut ext.formulas {
+            reanchor(f, by);
+        }
+        true
+    });
 }
 
 /// `f` translated by `by` (a rule formula following its anchor); kept as it
