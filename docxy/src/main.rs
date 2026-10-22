@@ -4752,10 +4752,30 @@ impl App {
         );
     }
 
+    /// An open header/footer edit whose content differs from its part: it is
+    /// committed only when left, so `modified` does not cover it (#1349). The
+    /// comparison is `commit_hf_edit`'s own `changed`.
+    fn hf_edit_unsaved(&self) -> bool {
+        let Some(hf) = &self.hf_edit else {
+            return false;
+        };
+        let stored = if hf.is_header {
+            &self.headers.default
+        } else {
+            &self.footers.default
+        };
+        // An empty part is seeded with one default paragraph on open.
+        if stored.is_empty() {
+            let seed = [Block::Paragraph(docxcore::model::Paragraph::default())];
+            return self.editor.doc.body.as_slice() != seed;
+        }
+        stored.as_ref() != &self.editor.doc.body
+    }
+
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
     fn request_exit(&mut self) {
         self.backstage = None;
-        let prompt = if self.modified {
+        let prompt = if self.modified || self.hf_edit_unsaved() {
             "Exit docxy? Unsaved changes will be lost."
         } else {
             "Exit docxy?"
@@ -6792,7 +6812,7 @@ impl App {
             // A failed save keeps the app open, its error the status (#1223).
             "wq" | "x" => self.try_save().is_ok(),
             "q" => {
-                if self.modified {
+                if self.modified || self.hf_edit_unsaved() {
                     self.status = Some("unsaved changes (:q! to discard)".to_string());
                     false
                 } else {
@@ -12158,6 +12178,94 @@ mod tests {
             "{status}"
         );
         assert!(!status.contains("Created a footer"), "{status}");
+    }
+
+    fn exit_prompt(app: &mut App) -> String {
+        app.request_exit();
+        app.confirm
+            .as_ref()
+            .expect("exit prompt")
+            .prompt()
+            .to_string()
+    }
+
+    /// #1349 p1: Exit with an open, changed header or footer edit warns, as
+    /// the edit is lost and `modified` does not know it.
+    #[test]
+    fn request_exit_warns_for_a_changed_header_edit() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.editor.doc.body = header_link_body("https://a.example/");
+        app.modified = false;
+        assert!(exit_prompt(&mut app).contains("Unsaved changes will be lost"));
+    }
+
+    #[test]
+    fn request_exit_warns_for_a_changed_footer_edit() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditFooter);
+        app.editor.doc.body = header_link_body("https://a.example/");
+        app.modified = false;
+        assert!(exit_prompt(&mut app).contains("Unsaved changes will be lost"));
+    }
+
+    #[test]
+    fn request_exit_is_plain_for_an_unchanged_header_edit() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.modified = false;
+        assert!(app.hf_edit.is_some());
+        assert_eq!(exit_prompt(&mut app), "Exit docxy?");
+    }
+
+    /// An empty stored header is seeded with one empty paragraph: an
+    /// untouched edit is not a change, a typed one is.
+    #[test]
+    fn request_exit_treats_the_seed_of_an_empty_part_as_unchanged() {
+        for act in [ribbon::Act::EditHeader, ribbon::Act::EditFooter] {
+            let mut app = app_with(&["body"]);
+            // Create the part, leave, then empty the stored default (as an
+            // empty or unreadable part loads) before the edit under test.
+            app.run_act(act);
+            app.leave_hf_edit().unwrap();
+            app.headers.default = Rc::new(Vec::new());
+            app.footers.default = Rc::new(Vec::new());
+            app.run_act(act);
+            app.modified = false;
+            assert!(app.hf_edit.is_some());
+            assert_eq!(exit_prompt(&mut app), "Exit docxy?");
+            app.editor.doc.body = header_link_body("https://a.example/");
+            assert!(exit_prompt(&mut app).contains("Unsaved changes will be lost"));
+        }
+    }
+
+    #[test]
+    fn request_exit_vim_q_refuses_with_a_changed_hf_edit() {
+        let mut app = app_with(&["body"]);
+        app.run_act(ribbon::Act::EditHeader);
+        app.modified = false;
+        assert!(app.vim_run_command("q"), "unchanged edit quits");
+        app.editor.doc.body = header_link_body("https://a.example/");
+        assert!(!app.vim_run_command("q"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("unsaved changes (:q! to discard)")
+        );
+        assert!(app.vim_run_command("q!"));
+    }
+
+    #[test]
+    fn request_exit_is_plain_without_an_edit() {
+        let mut app = app_with(&["body"]);
+        app.modified = false;
+        assert_eq!(exit_prompt(&mut app), "Exit docxy?");
+    }
+
+    #[test]
+    fn request_exit_warns_for_a_failed_header_commit() {
+        let mut app = app_in_failing_header_edit();
+        assert!(!app.modified);
+        assert!(exit_prompt(&mut app).contains("Unsaved changes will be lost"));
     }
 
     /// #1308 p2: a failed commit keeps the header edit open, exactly as
