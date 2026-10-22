@@ -993,6 +993,29 @@ impl<'a> Parser<'a> {
                                 UnOp::Implicit,
                                 Box::new(args.into_iter().next().unwrap()),
                             )),
+                            ("LET" | "LAMBDA", _) => {
+                                let last = args.len().saturating_sub(1);
+                                let slot = |i: usize| i < last && (name == "LAMBDA" || i % 2 == 0);
+                                let scoped = |n: &str| n.contains('!');
+                                let bad = args.iter().enumerate().any(|(i, a)| {
+                                    slot(i)
+                                        && match a {
+                                            Expr::Name(n) => scoped(n),
+                                            Expr::Structured {
+                                                table: None,
+                                                col1: Some(n),
+                                                ..
+                                            } => scoped(n),
+                                            _ => false,
+                                        }
+                                });
+                                if bad {
+                                    return Err(format!(
+                                        "{name} cannot bind a sheet-qualified name"
+                                    ));
+                                }
+                                Ok(Expr::Func(name, args))
+                            }
                             _ => Ok(Expr::Func(name, args)),
                         }
                     }
@@ -1161,7 +1184,8 @@ impl<'a> Parser<'a> {
             }
         }
         // `Sheet1!Rate`: a sheet-scoped name, kept as its qualified text. The
-        // `!` keeps it from ever matching a LET/LAMBDA binding.
+        // `!` keeps it from matching a LET/LAMBDA binding; as a LET name slot
+        // or LAMBDA parameter it is refused where the call is parsed.
         if let Some(sheet) = sheet {
             return Ok(Expr::Name(format!("{}{id}", sheet_prefix(&sheet))));
         }
@@ -3164,6 +3188,17 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
 /// The one walker behind [`rename_sheet_in_expr`] and
 /// [`qualify_sheet_in_expr`], so a new qualified `Expr` variant is learned by
 /// both or neither.
+/// A sheet-scoped name's `(sheet, name)`, from the text the parser gave it
+/// (`sheet_prefix` + name; the name itself holds no `!`).
+fn scoped_name(n: &str) -> Option<(String, &str)> {
+    let (sheet, id) = n.rsplit_once('!')?;
+    let sheet = match sheet.strip_prefix('\'').and_then(|q| q.strip_suffix('\'')) {
+        Some(q) => q.replace("''", "'"),
+        None => sheet.to_string(),
+    };
+    Some((sheet, id))
+}
+
 fn map_sheet_qualifiers(
     e: &Expr,
     fix: &dyn Fn(&Option<String>) -> Option<String>,
@@ -3182,6 +3217,11 @@ fn map_sheet_qualifiers(
                 sheet: fix(&r.sheet),
                 ..r.clone()
             }),
+            Expr::Name(n) => {
+                let (sheet, id) = scoped_name(n)?;
+                let new = fix(&Some(sheet))?;
+                Expr::Name(format!("{}{id}", sheet_prefix(&new)))
+            }
             Expr::Ref3D { first, last, a, b } => {
                 let end = |n: &String| fix(&Some(n.clone())).unwrap_or_else(|| n.clone());
                 Expr::Ref3D {
@@ -3563,6 +3603,9 @@ pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String]) -> Expr {
             Expr::Err(ExcelError::Ref)
         }
         Expr::Ref3D { first, last, .. } if gone(first) || gone(last) => Expr::Err(ExcelError::Ref),
+        Expr::Name(n) if scoped_name(n).is_some_and(|(s, _)| gone(&s)) => {
+            Expr::Err(ExcelError::Ref)
+        }
         Expr::ArrayLit(rows) => Expr::ArrayLit(
             rows.iter()
                 .map(|row| row.iter().map(walk).collect())
@@ -15375,6 +15418,47 @@ mod tests {
             rename_sheet_in_formula("SUM(One:Three!A1)", "Three", "Last Q").unwrap(),
             "SUM('One:Last Q'!A1)"
         );
+    }
+
+    #[test]
+    fn sheet_scoped_names_follow_a_sheet_rename_and_delete() {
+        // #1632: `Sheet1!Rate` parses as a name carrying its qualifier.
+        assert_eq!(
+            rename_sheet_in_formula("Sheet1!Rate*2", "Sheet1", "Data").unwrap(),
+            "Data!Rate*2"
+        );
+        assert_eq!(
+            rename_sheet_in_formula("Sheet1!Rate", "sheet1", "My Sheet").unwrap(),
+            "'My Sheet'!Rate"
+        );
+        assert_eq!(
+            rename_sheet_in_formula("'It''s'!Rate+Other!Rate", "It's", "Plain").unwrap(),
+            "Plain!Rate+Other!Rate"
+        );
+        let gone = |src: &str, removed: &[&str]| {
+            let removed: Vec<String> = removed.iter().map(|s| s.to_string()).collect();
+            to_string(&remove_sheet_refs_in_expr(&parse(src).unwrap(), &removed))
+        };
+        assert_eq!(gone("Sheet1!Rate+1", &["Sheet1"]), "#REF!+1");
+        assert_eq!(gone("'My Sheet'!Rate", &["my sheet"]), "#REF!");
+        assert_eq!(gone("Sheet1!Rate+1", &["Other"]), "Sheet1!Rate+1");
+    }
+
+    #[test]
+    fn let_and_lambda_names_cannot_be_sheet_qualified() {
+        // The old refusal stays: a binding is a bare name (#1632).
+        for src in [
+            "LET(Sheet1!x,1,Sheet1!x+1)",
+            "LET('My Sheet'!x,1,2)",
+            "LAMBDA(Sheet1!x,x)(1)",
+            "LAMBDA(x,[Sheet1!y],x)(1)",
+            "LAMBDA('My Sheet'!x,1)(2)",
+        ] {
+            assert!(parse(src).is_err(), "{src}");
+        }
+        // A scoped name as a value, body or argument is fine.
+        assert!(parse("LET(x,Sheet1!Rate,Sheet1!Rate+x)").is_ok());
+        assert!(parse("LAMBDA(x,Sheet1!Rate*x)(Sheet1!Rate)").is_ok());
     }
 
     /// The printer spells a 3D span as Excel does: bare when both names

@@ -1406,7 +1406,8 @@ fn binding(wb: &Workbook, name: &str, sheet: usize) -> Option<usize> {
 
 /// `e`, a formula moving from sheet `src` to `dst`, with every defined name
 /// that binds otherwise on `dst` replaced by its definition, so it keeps
-/// reading what it read (`Sheet!Name` doesn't parse). `None` when such a
+/// reading what it read (`Sheet!Name` parses, but only as text that is never
+/// resolved as the sheet's name). `None` when such a
 /// name's definition is not one absolute cell or range.
 fn pin_names(e: &Expr, wb: &Workbook, src: usize, dst: usize) -> Option<Expr> {
     let recur = |x: &Expr| pin_names(x, wb, src, dst);
