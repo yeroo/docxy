@@ -611,6 +611,9 @@ impl Compiler<'_> {
                 let range = table_range(wb, t.sheet, self.sheet(), (r1, c1, r2, c2));
                 self.expr(&range, cx)?;
             }
+            // A sheet-scoped name (`Sheet1!Rate`) is not written: the loss is
+            // reported and the value kept (#1632).
+            Expr::Name(n) if n.contains('!') => return Err(Why::Unsupported),
             Expr::Name(n) => {
                 // A table's bare name is its data body, as the engine reads
                 // it; a defined name wins.
@@ -1209,6 +1212,10 @@ pub(crate) mod tests {
         assert_eq!(round("_xll.FOO(A1)").unwrap(), "_xll.FOO(A1)");
         assert_eq!(round("_xlfn.LAMBDA(_xlpm.x,_xlpm.x)(1)"), Err(Why::Lambda));
         assert_eq!(round("_xlfn.LET(_xlpm.x,1,_xlpm.x)"), Err(Why::Lambda));
+        // A sheet-scoped name is no workbook name to point at: a loss, so the
+        // cell is saved as its value (#1632).
+        assert_eq!(round("Sheet1!Rate"), Err(Why::Unsupported));
+        assert_eq!(round("SUM('My Sheet'!Rate,1)"), Err(Why::Unsupported));
         // A named function counts its name as an argument: 127 at most.
         let args = |n: usize| vec!["1"; n].join(",");
         assert!(round(&format!("MYUDF({})", args(126))).is_ok());
