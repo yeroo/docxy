@@ -3334,8 +3334,9 @@ impl App {
         self.status = Some("Comment added".to_string());
     }
 
-    /// Every comment id with a marker in the body, in any header or footer
-    /// part (every section's), or in the header or footer being edited,
+    /// Every comment id with a marker in the body, in any header, footer,
+    /// footnote or endnote part (every section's), or in the header or footer
+    /// being edited,
     /// whose part in `pkg` is stale until the edit is committed.
     fn comment_marker_ids_everywhere(&self) -> std::collections::BTreeSet<String> {
         let mut ids = self.anchor_marker_ids();
@@ -3355,23 +3356,26 @@ impl App {
         ids
     }
 
-    /// The header and footer parts of `pkg` but the one being edited, whose
-    /// text there is stale.
+    /// The header, footer, footnote and endnote parts of `pkg` but the header
+    /// or footer being edited, whose text there is stale. The terminal edits
+    /// no note, so a note part is always the stored one.
     fn stored_hf_parts(&self) -> Vec<String> {
         let editing = self.hf_edit.as_ref().map(|hf| hf.part.as_str());
         self.pkg
             .part_names()
             .into_iter()
             .filter(|name| {
-                (name.starts_with("word/header") || name.starts_with("word/footer"))
-                    && name.ends_with(".xml")
-                    && Some(*name) != editing
+                ((name.starts_with("word/header") || name.starts_with("word/footer"))
+                    && name.ends_with(".xml"))
+                    || matches!(*name, "word/footnotes.xml" | "word/endnotes.xml")
             })
+            .filter(|name| Some(*name) != editing)
             .map(str::to_string)
             .collect()
     }
 
-    /// The ids with a marker in a stored header or footer part.
+    /// The ids with a marker in a stored header, footer, footnote or endnote
+    /// part.
     fn stored_hf_marker_ids(&self) -> std::collections::BTreeSet<String> {
         let mut ids = std::collections::BTreeSet::new();
         for name in self.stored_hf_parts() {
@@ -3382,8 +3386,8 @@ impl App {
         ids
     }
 
-    /// Take the markers of comments `ids` out of the stored header and
-    /// footer parts; `record` keeps them for [`App::sync_stripped_hf`]. Without
+    /// Take the markers of comments `ids` out of the stored header, footer,
+    /// footnote and endnote parts; `record` keeps them for [`App::sync_stripped_hf`]. Without
     /// it they are gone for good (no undo brings them back), which the log
     /// takes in so its other comments still come back.
     fn strip_stored_hf(&mut self, ids: &[&str], record: bool) {
@@ -14431,6 +14435,130 @@ mod tests {
         let header = saved_header(&app, &path);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
         assert!(!header.contains("comment"), "{header}");
+    }
+
+    /// `app` reopened with a note part (`word/footnotes.xml` or
+    /// `word/endnotes.xml`) whose note 7 carries the markers of each comment
+    /// in `ids`, as a loaded document anchoring a comment in a note has them
+    /// (#1692).
+    fn with_note_markers(app: App, part: &str, ids: &[&str]) -> App {
+        let (root, note) = if part.ends_with("footnotes.xml") {
+            ("w:footnotes", "w:footnote")
+        } else {
+            ("w:endnotes", "w:endnote")
+        };
+        let mut starts = String::new();
+        let mut ends = String::new();
+        for id in ids {
+            starts.push_str(&format!("<w:commentRangeStart w:id=\"{id}\"/>"));
+            ends.push_str(&format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:commentReference w:id=\"{id}\"/></w:r>"
+            ));
+        }
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <{root} xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <{note} w:id=\"7\"><w:p>{starts}<w:r><w:t>Note</w:t></w:r>{ends}</w:p></{note}>\
+             </{root}>"
+        );
+        let mut pkg = app.pkg.clone();
+        pkg.document = app.body_editor().doc.clone();
+        let bytes = docxcore::package::save_package(&pkg);
+        let zip = opccore::zip::ZipArchive::open(&bytes).expect("a zip");
+        let mut entries: Vec<(String, Vec<u8>)> = zip
+            .entries()
+            .iter()
+            .filter_map(|e| zip.extract(e).map(|b| (e.name.clone(), b)))
+            .collect();
+        entries.retain(|(n, _)| n != part);
+        entries.push((part.to_string(), xml.into_bytes()));
+        let pkg = load_package(&opccore::zipwrite::write_zip(&entries)).unwrap();
+        assert!(pkg.part_text(part).is_some(), "the note part survives");
+        let mut app = App::new(pkg, "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    fn saved_part(path: &std::path::Path, name: &str) -> String {
+        let pkg = load_package(&std::fs::read(path).expect("saved")).unwrap();
+        pkg.part_text(name).unwrap_or_default()
+    }
+
+    /// #1692: a note part is a stored story, and a header or footer name
+    /// prefix does not catch `footnotes.xml`.
+    #[test]
+    fn note_parts_are_stored_stories() {
+        for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+            let app = with_note_markers(app_with_rich_comments(2), part, &["1"]);
+            assert!(app.stored_hf_parts().iter().any(|n| n == part), "{part}");
+            assert_eq!(
+                app.stored_hf_marker_ids().into_iter().collect::<Vec<_>>(),
+                ["1"],
+                "{part}"
+            );
+            assert!(app.comment_marker_ids_everywhere().contains("1"), "{part}");
+        }
+    }
+
+    /// #1692: Delete Comment on a comment also anchored in a note takes the
+    /// note's markers with the body's; undo puts them back, redo takes them
+    /// again.
+    #[test]
+    fn delete_comment_takes_the_note_markers_and_undo_restores_them() {
+        for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+            let mut app = with_note_markers(app_with_rich_comments(2), part, &["1"]);
+            app.comment_sel = 0;
+            app.run_act(ribbon::Act::DeleteComment);
+            assert_eq!(comment_ids(&app), ["2"], "{part}");
+            let path = save_to_temp(&mut app, "cmt-note-delete-undo");
+            let notes = saved_part(&path, part);
+            assert!(!notes.contains("w:id=\"1\""), "{part}: {notes}");
+            assert!(notes.contains("Note"), "{notes}");
+
+            app.on_key(ctrl(KeyCode::Char('z')));
+            assert_eq!(comment_ids(&app), ["1", "2"], "{part}");
+            app.save();
+            let notes = saved_part(&path, part);
+            assert_eq!(notes.matches("w:id=\"1\"").count(), 3, "{part}: {notes}");
+
+            app.on_key(ctrl(KeyCode::Char('y')));
+            assert_eq!(comment_ids(&app), ["2"], "{part}");
+            app.save();
+            let notes = saved_part(&path, part);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            assert!(!notes.contains("w:id=\"1\""), "{part}: {notes}");
+        }
+    }
+
+    /// #1692: a comment anchored only in a note stays live through a save,
+    /// and deleting it from the panel leaves no marker and no comment text.
+    #[test]
+    fn note_only_comment_is_live_and_its_delete_leaves_no_orphan() {
+        for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+            let mut app = with_note_markers(app_with_rich_comments(2), part, &["9"]);
+            app.comments.push(docxcore::comments::Comment {
+                id: "9".into(),
+                author: "Cy".into(),
+                ..Default::default()
+            });
+            app.pkg
+                .add_comment(9, "Cy", "C", "2020-01-02T03:04:05Z", "in the note");
+            let path = save_to_temp(&mut app, "cmt-note-only-live");
+            let notes = saved_part(&path, part);
+            let (_, comments) = saved_parts(&path);
+            assert_eq!(notes.matches("w:id=\"9\"").count(), 3, "{part}: {notes}");
+            assert!(comments.contains("in the note"), "{part}: {comments}");
+
+            app.comment_sel = 2;
+            app.run_act(ribbon::Act::DeleteComment);
+            assert_eq!(comment_ids(&app), ["1", "2"], "{part}");
+            app.save();
+            let notes = saved_part(&path, part);
+            let (_, comments) = saved_parts(&path);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+            assert!(!notes.contains("w:id=\"9\""), "{part}: {notes}");
+            assert!(!comments.contains("in the note"), "{part}: {comments}");
+        }
     }
 
     /// #981: a comment anchored only in a header, deleted from the panel
