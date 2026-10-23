@@ -392,7 +392,7 @@ fn presses_accept(d: &Dialog, button: &str) -> bool {
             && b.label
                 .replace('&', "")
                 .trim()
-                .eq_ignore_ascii_case(button.trim())
+                .eq_ignore_ascii_case(button.replace('&', "").trim())
     })
 }
 
@@ -635,6 +635,22 @@ mod tests {
         assert_eq!(cell(&t, 0, 0), CellValue::Number(apr3));
         assert_eq!(cell(&t, 0, 1), CellValue::Number(-1234.5));
         assert_eq!(cell(&t, 0, 2), CellValue::Empty);
+    }
+
+    /// #1205: Enter hands over the default button's label with its access
+    /// key ("&Finish"), which must press Finish as a click does.
+    #[test]
+    fn presses_accept_ignores_access_key_ampersand() {
+        let mut t = tab(&[(0, 0, "a\tb")]);
+        open(&mut t, (0, 0, 0, 0));
+        let top = t.dialogs.top().unwrap();
+        assert!(presses_accept(top, "&Finish"));
+        assert!(presses_accept(top, "Finish"));
+        assert!(presses_accept(top, " &finish "));
+        assert!(!presses_accept(top, "&Cancel"));
+        assert!(click(&mut t, "&Finish").is_some_and(|r| r.is_ok()));
+        assert!(!t.dialogs.is_open());
+        assert_eq!(cell(&t, 0, 1), CellValue::Text("b".into()));
     }
 
     /// #692: data in the way asks first; Cancel goes back to the wizard
