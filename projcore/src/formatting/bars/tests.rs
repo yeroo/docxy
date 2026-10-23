@@ -517,7 +517,7 @@ fn a_comma_list_inside_a_json_entry_splits_like_the_xml_form() {
 
 #[test]
 fn date_names_land_on_the_day_scale_by_kind() {
-    use crate::editor::BarDateKind::{Finish, Instant, Start};
+    use crate::editor::BarDateKind::{Finish, Instant, Start, Through};
     let kind = |name: &str, default| crate::editor::BarDateKind::of(name, default);
     assert_eq!(kind("", Field::Start), Start);
     assert_eq!(kind("", Field::Finish), Finish);
@@ -542,13 +542,32 @@ fn date_names_land_on_the_day_scale_by_kind() {
     ] {
         assert_eq!(kind(name, Field::Start), Finish, "{name}");
     }
-    for name in [
-        "CompleteThrough",
-        "Complete Through",
-        "Deadline",
-        "Date1",
-        "Nonsense",
-    ] {
+    for name in ["CompleteThrough", "Complete Through"] {
+        assert_eq!(kind(name, Field::Start), Through, "{name}");
+    }
+    for name in ["Deadline", "Date1", "Nonsense"] {
         assert_eq!(kind(name, Field::Start), Instant, "{name}");
     }
+}
+
+#[test]
+fn bar_through_is_the_progress_fraction_of_the_bar() {
+    let through = |touch: fn(&mut Task)| {
+        let ed = editor_with(touch);
+        let reader = FieldReader::new(&ed);
+        ed.bar_through(&reader, &ed.project().tasks[0])
+    };
+    assert_eq!(through(|_| {}), Some(0.));
+    assert_eq!(through(|t| t.percent_complete = Some(50)), Some(0.5));
+    assert_eq!(through(|t| t.percent_complete = Some(100)), Some(1.));
+    assert_eq!(through(|t| t.percent_complete = Some(250)), Some(1.));
+    // A stop wins over the percent: the start is Monday 8:00, the two-day
+    // task ends Tuesday 17:00 (18 working hours over 33 clock hours).
+    let stop = through(|t| {
+        t.percent_complete = Some(10);
+        t.stop = Some(at(5, 8).add_minutes(33 * 60 / 2));
+    })
+    .unwrap();
+    assert!((stop - 0.5).abs() < 1e-9, "{stop}");
+    assert_eq!(through(|t| t.stop = Some(at(1, 8))), Some(0.));
 }

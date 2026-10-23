@@ -384,10 +384,21 @@ pub(crate) fn bar_rows(
         _ => (5., 14.),
     });
     let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
+    // The task bar's own whole-day frame, which a CompleteThrough end is a
+    // fraction of (#1696).
+    let frame = ed
+        .disp_start(task.uid)
+        .zip(ed.disp_finish(task.uid))
+        .map(|(s, f)| (day(s) * scale.day_w, (day(f) + 1.) * scale.day_w));
+    let through = ed.bar_through(&reader, task);
     let at = |d: projcore::DateTime, kind: BarDateKind| match kind {
-        BarDateKind::Start => day(d) * scale.day_w,
-        BarDateKind::Finish => (day(d) + 1.) * scale.day_w,
-        BarDateKind::Instant => instant_x(scale, 0., d),
+        BarDateKind::Start => Some(day(d) * scale.day_w),
+        BarDateKind::Finish => Some((day(d) + 1.) * scale.day_w),
+        BarDateKind::Instant => Some(instant_x(scale, 0., d)),
+        BarDateKind::Through => {
+            let ((fs, fe), f) = frame.zip(through)?;
+            Some(fs + f as f32 * (fe - fs))
+        }
     };
     let mut out = Vec::new();
     for row in rows {
@@ -398,14 +409,21 @@ pub(crate) fn bar_rows(
             continue;
         };
         // Whole days for the start and finish fields (the palette's bars),
-        // the instant itself for the others; no span (a milestone) sits in
-        // the middle of its day, as the palette's diamond does.
-        let (x0, x1) = if to > from {
-            let x0 = at(from, BarDateKind::of(&row.from, Field::Start));
-            (x0, at(to, BarDateKind::of(&row.to, Field::Finish)).max(x0))
-        } else {
+        // a fraction of the bar for CompleteThrough, the instant itself for
+        // the others. Only a milestone sits in the middle of its day, as the
+        // palette's diamond does; any other row without a span is a point at
+        // its date.
+        let (x0, x1) = if task.is_milestone() && to <= from {
             let mid = (day(from) + 0.5) * scale.day_w;
             (mid, mid)
+        } else {
+            let (Some(x0), Some(x1)) = (
+                at(from, BarDateKind::of(&row.from, Field::Start)),
+                at(to, BarDateKind::of(&row.to, Field::Finish)),
+            ) else {
+                continue;
+            };
+            (x0, x1.max(x0))
         };
         let text = match over {
             Some(o) => row.text.clone().over(&o.text),

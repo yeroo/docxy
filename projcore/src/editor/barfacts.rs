@@ -8,48 +8,64 @@ use crate::formatting::Facts;
 
 /// How a bar row's From or To date lands on the day scale: a start-type date
 /// is the start of its day and a finish-type one the end of it (the
-/// chart's whole-day task bars), anything else is the instant itself.
+/// chart's whole-day task bars), `CompleteThrough` is a fraction of the task
+/// bar's own span ([`Editor::bar_through`]), anything else the instant itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarDateKind {
     Start,
     Finish,
+    Through,
     Instant,
+}
+
+/// What a From or To name stands for.
+enum Named {
+    Field(Field),
+    Through,
+}
+
+/// The field (or `CompleteThrough`) a From or To `name` reads, `default`
+/// when it is empty; `None` for an unknown name.
+fn named(name: &str, default: Field) -> Option<Named> {
+    let compact: String = name
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    Some(Named::Field(match compact.as_str() {
+        "" => default,
+        "taskstart" => Field::Start,
+        "taskfinish" => Field::Finish,
+        "completethrough" => return Some(Named::Through),
+        _ => Field::parse(name).ok()?,
+    }))
 }
 
 impl BarDateKind {
     /// The kind of the field a From or To `name` reads (`default` when it is
     /// empty): `Start`, `Task Start`, `Actual Start`, `Early/Late Start`,
     /// `Baseline<n> Start` and `Start1..10` start; the Finish twins finish;
-    /// `CompleteThrough`, `Deadline` and the other dates are instants.
+    /// `CompleteThrough` is the progress; `Deadline` and the other dates are
+    /// instants.
     pub fn of(name: &str, default: Field) -> BarDateKind {
-        let compact: String = name
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let field = match compact.as_str() {
-            "" => default,
-            "taskstart" => Field::Start,
-            "taskfinish" => Field::Finish,
-            "completethrough" => return BarDateKind::Instant,
-            _ => match Field::parse(name) {
-                Ok(f) => f,
-                Err(_) => return BarDateKind::Instant,
-            },
-        };
-        match field {
-            Field::Start
-            | Field::ActualStart
-            | Field::EarlyStart
-            | Field::LateStart
-            | Field::Baseline(_, BaselinePart::Start)
-            | Field::Custom(CustomKind::Start, _) => BarDateKind::Start,
-            Field::Finish
-            | Field::ActualFinish
-            | Field::EarlyFinish
-            | Field::LateFinish
-            | Field::Baseline(_, BaselinePart::Finish)
-            | Field::Custom(CustomKind::Finish, _) => BarDateKind::Finish,
+        match named(name, default) {
+            Some(Named::Through) => BarDateKind::Through,
+            Some(Named::Field(
+                Field::Start
+                | Field::ActualStart
+                | Field::EarlyStart
+                | Field::LateStart
+                | Field::Baseline(_, BaselinePart::Start)
+                | Field::Custom(CustomKind::Start, _),
+            )) => BarDateKind::Start,
+            Some(Named::Field(
+                Field::Finish
+                | Field::ActualFinish
+                | Field::EarlyFinish
+                | Field::LateFinish
+                | Field::Baseline(_, BaselinePart::Finish)
+                | Field::Custom(CustomKind::Finish, _),
+            )) => BarDateKind::Finish,
             _ => BarDateKind::Instant,
         }
     }
@@ -97,23 +113,32 @@ impl Editor {
         name: &str,
         default: Field,
     ) -> Option<DateTime> {
-        let name = name.trim();
-        let compact: String = name
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            .to_ascii_lowercase();
-        let field = match compact.as_str() {
-            "" => default,
-            "taskstart" => Field::Start,
-            "taskfinish" => Field::Finish,
-            "completethrough" => return self.complete_through(reader, task),
-            _ => Field::parse(name).ok()?,
-        };
-        match reader.read(task, field).value {
+        match named(name, default)? {
+            Named::Through => self.complete_through(reader, task),
+            Named::Field(field) => match reader.read(task, field).value {
+                FieldValue::Date(d) => Some(d),
+                _ => None,
+            },
+        }
+    }
+
+    /// How far along the task is, 0 to 1, for a bar row's `CompleteThrough`:
+    /// the task's `stop` within its start to finish, else its percent
+    /// complete (unmeasured against Project). `None` without a start and
+    /// finish.
+    pub fn bar_through(&self, reader: &FieldReader, task: &Task) -> Option<f64> {
+        let date = |f| match reader.read(task, f).value {
             FieldValue::Date(d) => Some(d),
             _ => None,
-        }
+        };
+        let (start, finish) = (date(Field::Start)?, date(Field::Finish)?);
+        let span = (finish.minutes() - start.minutes()) as f64;
+        let fraction = match task.stop {
+            Some(stop) if span > 0. => (stop.minutes() - start.minutes()) as f64 / span,
+            Some(_) => 0.,
+            None => f64::from(task.percent_complete.unwrap_or(0)) / 100.,
+        };
+        Some(fraction.clamp(0., 1.))
     }
 
     fn complete_through(&self, reader: &FieldReader, task: &Task) -> Option<DateTime> {

@@ -449,82 +449,109 @@ fn the_task_row_grows_with_the_highest_band() {
     );
     assert_eq!(ruled_rows_of(h, h + 10., h), [(1, 2. * h - 1. - (h + 10.))]);
     assert_eq!(filler_rows_of(5. * h, 0., 2, h), 3);
-    assert_eq!(filler_rows_of(280., 0., 3, ROW_H), filler_rows(280., 0., 3));
     assert_eq!(page_rows_of(h * 4., h), 3);
-    assert_eq!(page_rows_of(280., ROW_H), page_rows_for(280.));
     // Back to no table: the original height.
     view.ed.edit_formatting(|f| f.set_bars(Vec::new()));
     assert_eq!(view.row_h(), ROW_H);
 }
 
-/// A plan with `tasks` whose first task starts Monday 5 January at 8:00,
-/// with the bars `bars` and the progress each task states.
-fn progress_editor(bars: Vec<BarRow>) -> ProjectEditor {
-    let mut one_day = task(1, 1, 1);
-    one_day.percent_complete = Some(10);
-    let mut three_days = task(2, 3, 1);
-    three_days.percent_complete = Some(10);
-    let mut two_days = task(3, 2, 1);
-    two_days.percent_complete = Some(50);
-    editor(vec![one_day, three_days, two_days], bars, Vec::new())
+/// Tasks of 1, 5 and 2 days with the progress each is given, under `bars`.
+fn progress_editor(percents: [u8; 3], bars: Vec<BarRow>) -> ProjectEditor {
+    let tasks = [1, 5, 2]
+        .into_iter()
+        .zip(percents)
+        .enumerate()
+        .map(|(k, (days, pct))| {
+            let mut t = task(k as i32 + 1, days, 1);
+            t.percent_complete = Some(pct);
+            t
+        })
+        .collect();
+    editor(tasks, bars, Vec::new())
+}
+
+fn progress_row() -> BarRow {
+    BarRow {
+        to: "CompleteThrough".into(),
+        ..row("Progress", &[], 1)
+    }
 }
 
 #[test]
-fn completed_through_is_an_instant_and_start_finish_stay_whole_days() {
-    let progress = BarRow {
-        to: "CompleteThrough".into(),
-        ..row("Progress", &[], 1)
-    };
-    let ed = progress_editor(vec![progress]);
+fn completed_through_is_a_fraction_of_the_whole_day_bar() {
+    // 100%: the progress ends where the task bar does, for 1 and 5 days.
+    let ed = progress_editor([100, 100, 100], vec![progress_row()]);
     let scale = gantt_scale(&ed);
-    let dw = scale.day_w;
     for uid in [1, 2, 3] {
         let t = ed.project().task(uid).unwrap();
-        let rows = bar_rows(&ed, t, scale, look(1)).unwrap();
-        let start = ed.disp_start(uid).unwrap();
-        let finish = ed.disp_finish(uid).unwrap();
-        let pct = i64::from(t.percent_complete.unwrap());
-        let through = start.add_minutes((finish.minutes() - start.minutes()) * pct / 100);
-        // From is the start of its day, To the instant itself.
-        let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
-        assert_eq!(rows[0].x0, day(start) * dw, "task {uid}");
-        assert_eq!(rows[0].x1, instant_x(scale, 0., through), "task {uid}");
-        // Never past the bar the palette draws.
         let bar = gantt_bar(&ed, t, scale).unwrap();
-        assert!(rows[0].x1 <= (bar.end + 1) as f32 * dw, "task {uid}");
+        let r = bar_rows(&ed, t, scale, look(1)).unwrap();
+        assert_eq!(r[0].x0, bar.start as f32 * scale.day_w, "task {uid}");
+        assert_eq!(r[0].x1, (bar.end + 1) as f32 * scale.day_w, "task {uid}");
     }
-    // 10% of a one-day task is a sliver of its day, not the whole day; 50% of
-    // two days is up to (and a bit into) the second day.
-    let x = |uid: i32| {
+    // 0%: nothing done, a zero-width middle at the start of the bar.
+    let ed = progress_editor([0, 0, 0], vec![progress_row()]);
+    let scale = gantt_scale(&ed);
+    for uid in [1, 2, 3] {
+        let t = ed.project().task(uid).unwrap();
+        let r = bar_rows(&ed, t, scale, look(1)).unwrap();
+        assert_eq!(r[0].x0, r[0].x1, "task {uid}");
+        assert_eq!(first_middle(&r).unwrap().2, 0., "task {uid}");
+    }
+    // 50% of two days is exactly one day; 10% of five is half a day.
+    let ed = progress_editor([10, 10, 50], vec![progress_row()]);
+    let scale = gantt_scale(&ed);
+    let w = |uid: i32| {
         let r = bar_rows(&ed, ed.project().task(uid).unwrap(), scale, look(1)).unwrap();
         r[0].x1 - r[0].x0
     };
-    assert!(x(1) > 0. && x(1) < dw / 2., "{}", x(1));
-    assert!(x(2) > 0. && x(2) < dw, "{}", x(2));
-    assert!(x(3) >= dw && x(3) < 2. * dw, "{}", x(3));
-    // Finish -> Finish: both ends are the end of their day.
-    let ff = BarRow {
-        from: "Task Finish".into(),
-        to: "Baseline Finish".into(),
-        ..row("FF", &[], 1)
-    };
+    assert_eq!(w(3), scale.day_w);
+    assert_eq!(w(2), scale.day_w * 0.5);
+    assert!((w(1) - scale.day_w * 0.1).abs() < 1e-3, "{}", w(1));
+    // A stop date is a fraction of the span too, not a clock position.
     let mut t = task(1, 2, 1);
-    t.baselines = vec![projcore::Baseline {
-        number: 0,
-        start: Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
-        finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, 12, 17, 0)),
-        ..Default::default()
-    }];
-    let ed = editor(vec![t], vec![ff], Vec::new());
+    t.stop = Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    let ed = editor(vec![t], vec![progress_row()], Vec::new());
     let scale = gantt_scale(&ed);
     let r = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
-    let end_of =
-        |d: projcore::DateTime| (d.day_number() - scale.origin_day + 1) as f32 * scale.day_w;
-    assert_eq!(r[0].x0, end_of(ed.disp_finish(1).unwrap()));
-    assert_eq!(
-        r[0].x1,
-        end_of(projcore::DateTime::from_ymd_hm(2026, 1, 12, 17, 0))
+    assert_eq!(r[0].x0, r[0].x1);
+}
+
+#[test]
+fn a_point_row_sits_at_its_date_by_kind() {
+    let point = |from: &str, to: &str| BarRow {
+        from: from.into(),
+        to: to.into(),
+        ..row("P", &[], 1)
+    };
+    let mut t = task(1, 3, 1);
+    t.deadline = Some(projcore::DateTime::from_ymd_hm(2026, 1, 9, 17, 0));
+    let ed = editor(
+        vec![t],
+        vec![
+            point("Finish", "Finish"),
+            point("Start", "Start"),
+            point("Deadline", "Deadline"),
+        ],
+        Vec::new(),
     );
+    let scale = gantt_scale(&ed);
+    let tk = ed.project().task(1).unwrap();
+    let bar = gantt_bar(&ed, tk, scale).unwrap();
+    let rows = bar_rows(&ed, tk, scale, look(1)).unwrap();
+    let dw = scale.day_w;
+    // Finish/Finish is the bar's end, Start/Start its start, a deadline its
+    // instant (the overlay's deadline_x).
+    assert_eq!(
+        (rows[0].x0, rows[0].x1),
+        ((bar.end + 1) as f32 * dw, (bar.end + 1) as f32 * dw)
+    );
+    assert_eq!(
+        (rows[1].x0, rows[1].x1),
+        (bar.start as f32 * dw, bar.start as f32 * dw)
+    );
+    let deadline = instant_x(scale, 0., tk.deadline.unwrap());
+    assert_eq!((rows[2].x0, rows[2].x1), (deadline, deadline));
 }
 
 #[test]

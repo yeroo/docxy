@@ -41,11 +41,6 @@ pub(super) use autofilter::{AUTO_FILTER_STATUS, MENU_ROW_H, autofilter_click, me
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the
 /// `project-body` probe, less one, so the cursor's landing row stays on
 /// screen. Always at least 1.
-#[cfg(test)]
-fn page_rows_for(body_h: f32) -> usize {
-    page_rows_of(body_h, ROW_H)
-}
-
 /// [`page_rows_for`] for rows `row_h` tall.
 fn page_rows_of(body_h: f32, row_h: f32) -> usize {
     ((body_h / row_h).floor() as usize).saturating_sub(1).max(1)

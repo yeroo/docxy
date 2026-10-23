@@ -664,7 +664,7 @@ fn monday_scale(days: i64) -> GanttScale {
 #[test]
 fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
     let rules = |body_h: f32, scroll_y: f32| -> Vec<f32> {
-        ruled_rows(body_h, scroll_y)
+        ruled_rows_of(body_h, scroll_y, ROW_H)
             .into_iter()
             .map(|(_, y)| y)
             .collect()
@@ -685,13 +685,19 @@ fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
 /// level are the day lines, and the major tier's start at the weeks.
 #[test]
 fn ruled_rows_carry_their_row_and_tier_lines_follow_the_timescale() {
-    assert_eq!(ruled_rows(84., 0.), [(0, 27.), (1, 55.), (2, 83.)]);
-    assert_eq!(ruled_rows(60., ROW_H * 3. + 10.), [(3, 17.), (4, 45.)]);
+    assert_eq!(
+        ruled_rows_of(84., 0., ROW_H),
+        [(0, 27.), (1, 55.), (2, 83.)]
+    );
+    assert_eq!(
+        ruled_rows_of(60., ROW_H * 3. + 10., ROW_H),
+        [(3, 17.), (4, 45.)]
+    );
     let two = projcore::formatting::Gridline {
         interval: 2,
         ..projcore::formatting::Gridline::solid()
     };
-    let at: Vec<usize> = ruled_rows(84., 0.)
+    let at: Vec<usize> = ruled_rows_of(84., 0., ROW_H)
         .into_iter()
         .filter(|(row, _)| two.at_interval(*row))
         .map(|(row, _)| row)
@@ -776,18 +782,26 @@ fn a_status_date_line_needs_a_status_date() {
 
 #[test]
 fn filler_rows_count_the_ruled_space_below_the_last_task() {
-    assert_eq!(filler_rows(280., 0., 0), 10);
-    assert_eq!(filler_rows(280., 0., 3), 7);
-    assert_eq!(filler_rows(290., 0., 3), 8, "a partly visible row counts");
-    assert_eq!(filler_rows(280., 0., 10), 0);
-    assert_eq!(filler_rows(280., 0., 20), 0, "more tasks than fit");
+    assert_eq!(filler_rows_of(280., 0., 0, ROW_H), 10);
+    assert_eq!(filler_rows_of(280., 0., 3, ROW_H), 7);
     assert_eq!(
-        filler_rows(280., 20. * ROW_H - 280., 20),
+        filler_rows_of(290., 0., 3, ROW_H),
+        8,
+        "a partly visible row counts"
+    );
+    assert_eq!(filler_rows_of(280., 0., 10, ROW_H), 0);
+    assert_eq!(
+        filler_rows_of(280., 0., 20, ROW_H),
+        0,
+        "more tasks than fit"
+    );
+    assert_eq!(
+        filler_rows_of(280., 20. * ROW_H - 280., 20, ROW_H),
         0,
         "scrolled to the end"
     );
     assert_eq!(
-        filler_rows(280., 10., 3),
+        filler_rows_of(280., 10., 3, ROW_H),
         8,
         "scrolling uncovers more empty rows"
     );

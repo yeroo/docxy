@@ -967,14 +967,14 @@ fn paging_on_an_empty_plan_stays_on_the_entry_row() {
 
 #[test]
 fn page_rows_for_fits_whole_rows_minus_one() {
-    assert_eq!(page_rows_for(280.), 9);
+    assert_eq!(page_rows_of(280., ROW_H), 9);
     assert_eq!(
-        page_rows_for(28.),
+        page_rows_of(28., ROW_H),
         1,
         "one whole row, less one, clamps to 1"
     );
     assert_eq!(
-        page_rows_for(10.),
+        page_rows_of(10., ROW_H),
         1,
         "a height under one row still pages by one"
     );

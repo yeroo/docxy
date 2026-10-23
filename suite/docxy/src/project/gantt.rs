@@ -357,11 +357,6 @@ pub(crate) fn shaded_runs(
 /// the first row of the body) for a gridline's interval (#1575). `scroll_y`
 /// grows downward, so the rules follow the list's scroll phase whether a row
 /// holds a task or not.
-#[cfg(test)]
-pub(crate) fn ruled_rows(body_h: f32, scroll_y: f32) -> Vec<(usize, f32)> {
-    ruled_rows_of(body_h, scroll_y, ROW_H)
-}
-
 /// [`ruled_rows`] for rows `row_h` tall (a view whose bar styles use more
 /// than one band, #1696).
 pub(crate) fn ruled_rows_of(body_h: f32, scroll_y: f32, row_h: f32) -> Vec<(usize, f32)> {
@@ -486,11 +481,6 @@ pub(crate) fn date_lines(
 }
 
 /// Ruled empty rows visible below the last task, counting a partly visible one.
-#[cfg(test)]
-pub(crate) fn filler_rows(body_h: f32, scroll_y: f32, count: usize) -> usize {
-    filler_rows_of(body_h, scroll_y, count, ROW_H)
-}
-
 /// [`filler_rows`] for rows `row_h` tall.
 pub(crate) fn filler_rows_of(body_h: f32, scroll_y: f32, count: usize, row_h: f32) -> usize {
     let used = count as f32 * row_h - scroll_y.max(0.);

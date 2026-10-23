@@ -1188,9 +1188,12 @@
   `BarDateKind::of` says how a date lands on the day scale: start-type
   fields (Start, Actual/Early/Late Start, Baseline Start, Start1..10) are the
   start of their day and finish-type ones the end of it, so a Start-Finish row
-  equals `gantt_bar`; every other date (CompleteThrough, Deadline, ...) is the
-  instant (`instant_x`). A row with no span (To not after From, a milestone)
-  sits in the middle of the From day, as the palette's diamond does.
+  equals `gantt_bar`; `CompleteThrough` is a fraction of the task bar's own
+  whole-day frame (`Editor::bar_through`: `stop` within start..finish, else the
+  percent complete), so 100% ends where the bar does; every other date
+  (Deadline, ...) is the instant (`instant_x`). Only a milestone task's row
+  without a span sits in the middle of its day (as the palette's diamond does);
+  any other row without a span is a point at its date by kind.
 - The suite draws it in `suite/docxy/src/project/barstyle.rs`: `bar_rows`
   (the plan against one task: `None` means the palette drawing, as with no
   table and no override; an override with no table restyles a plain leaf bar
@@ -1204,7 +1207,8 @@
   `pattern_layer`; the five texts are 10 px (left/right beside the marks,
   top/bottom in the bands above and below the zone, inside clipped to the
   middle). `show_critical` does not apply to rows (the category decides);
-  baseline and leveling-delay marks are not drawn for a covered task.
+  the palette's baseline and leveling-delay marks are not drawn for a task the
+  table covers; an override over no table keeps them.
 - `ProjectView::row_h()` is `ROW_H * max(1, max_bar_row)`: every task row,
   chart strip, pane, rule (`ruled_rows_of`), filler (`filler_rows_of`) and page
   (`page_rows_of`) uses it; the headers stay `ROW_H`. With no table everything
