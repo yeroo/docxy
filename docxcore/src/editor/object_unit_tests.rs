@@ -1136,3 +1136,35 @@ fn a_core_field_is_an_undo_step_that_the_controls_follow_1364() {
     assert_eq!(ed.core_fields(), &CoreFields::default());
     assert_eq!(ed.core_unsynced(), []);
 }
+
+/// #1364: a property typed in the other editor (a header) is one body undo
+/// step whose undo puts the controls and the core field back together.
+#[test]
+fn a_property_synced_from_a_header_undoes_with_its_controls_1364() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let body = vec![Block::Paragraph(Paragraph {
+        props: ParProps::default(),
+        content: core_property_control(BoundProp::Title, "Old", 1, &RunProps::default()),
+    })];
+    let mut ed = Editor::new(Document { body });
+    ed.reseed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    assert!(ed.set_core_field(BoundProp::Title, "New"));
+    ed.core_synced();
+    let from = PropSource::Other {
+        newest_step: Some(9_999_999),
+    };
+    assert!(ed.file_property_changed(BoundProp::Title, "Hdr", from));
+    assert_eq!(ed.core_fields().title, "Hdr");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "New");
+    assert_eq!(
+        ed.core_fields().title,
+        "New",
+        "the field undoes with the controls"
+    );
+    assert_eq!(ed.core_unsynced(), [(BoundProp::Title, "New".to_string())]);
+}

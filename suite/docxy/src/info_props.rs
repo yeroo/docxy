@@ -180,10 +180,15 @@ impl Docxy {
         }
         self.info_edit_apply(cx);
         if self.active_locked() {
-            self.info_note = Some(format!(
-                "{} is read-only: this document is in Protected View or marked as final",
-                which.label()
-            ));
+            self.info_note = self.active_tab_id().map(|tab| {
+                (
+                    tab,
+                    format!(
+                        "{} is read-only: this document is in Protected View or marked as final",
+                        which.label()
+                    ),
+                )
+            });
             cx.notify();
             return;
         }
@@ -207,8 +212,9 @@ impl Docxy {
     }
 
     /// Apply the focused field to its tab and close it (Enter, Tab, a click
-    /// elsewhere, leaving Info). An unchanged value records no step; a file
-    /// without a core properties part refuses with a note.
+    /// elsewhere, leaving Info, Save, closing). An unchanged value records no
+    /// step; a file without a core properties part is given one, and a
+    /// package that cannot hold one refuses with a note.
     pub(crate) fn info_edit_apply(&mut self, cx: &mut Context<Self>) {
         let Some(e) = self.info_edit.take() else {
             return;
@@ -229,9 +235,12 @@ impl Docxy {
             return;
         }
         if !tab.ensure_core_part() {
-            self.info_note = Some(format!(
-                "Could not change {}: this file cannot hold document properties",
-                e.which.label()
+            self.info_note = Some((
+                e.tab.clone(),
+                format!(
+                    "Could not change {}: this file cannot hold document properties",
+                    e.which.label()
+                ),
             ));
             return;
         }
@@ -244,6 +253,16 @@ impl Docxy {
         }
     }
 
+    /// Tab (`forward`) or Shift+Tab applies the focused field and focuses the
+    /// next or previous one; they arrive as `tab_key` / `shift_tab_key`, not
+    /// as keys.
+    pub(crate) fn info_edit_tab(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if let Some(e) = &self.info_edit {
+            let next = e.which.step(forward);
+            self.info_edit_open(next, cx);
+        }
+    }
+
     /// Route a keystroke to the focused property field, as the Font box's.
     pub(crate) fn info_edit_key(
         &mut self,
@@ -251,7 +270,6 @@ impl Docxy {
         ctrl: bool,
         alt: bool,
         key: &str,
-        shift: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -297,10 +315,6 @@ impl Docxy {
         match key {
             "escape" => self.info_edit = None,
             "enter" => self.info_edit_apply(cx),
-            "tab" => {
-                let next = e.which.step(!shift);
-                self.info_edit_open(next, cx);
-            }
             "backspace" => edit(e, Op::Backspace),
             "delete" => edit(e, Op::Delete),
             "left" => edit(e, Op::Left),
@@ -481,14 +495,70 @@ mod tests {
         assert!(!xml.contains("Bo") && !xml.contains("Ann"), "{xml}");
     }
 
-    /// A control typed in updates what Info shows, without a step of Info's.
+    /// A property control typed in updates what Info shows and core.xml,
+    /// through `set_dirty`, without a step of Info's.
     #[test]
-    fn typing_in_a_bound_control_updates_the_editors_field() {
+    fn typing_in_a_bound_control_updates_the_editors_field_and_core_xml() {
+        use docxcore::model::{Block, Document, Paragraph, ParProps, RunProps};
         let (_, mut tab) = open("control", Some(CORE));
+        let pkg = tab.pkg.as_ref().unwrap();
+        let fields = core_fields_of(pkg);
+        let body = vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: docxcore::sdt::core_property_control(
+                BoundProp::Title,
+                "Old",
+                1,
+                &RunProps::default(),
+            ),
+        })];
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.reseed_core_fields(fields);
+        tab.surface = Surface::Doc(ed);
         let ed = editor(&mut tab);
-        ed.note_core_field(BoundProp::Title, "Typed");
-        assert_eq!(ed.core_fields().title, "Typed");
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], 3));
+        ed.insert_char('!');
+        let steps = ed.undo_serial();
+        tab.set_dirty();
+        assert!(core_xml(&tab).contains("<dc:title>Old!</dc:title>"), "{}", core_xml(&tab));
+        let ed = editor(&mut tab);
+        assert_eq!(ed.core_fields().title, "Old!");
         assert_eq!(ed.core_unsynced(), []);
-        assert!(ed.undo_serial().is_none());
+        assert_eq!(ed.undo_serial(), steps, "no step of Info's");
+        // Undoing the typing puts the file back with the control.
+        assert!(ed.undo());
+        tab.set_dirty();
+        assert!(core_xml(&tab).contains("<dc:title>Old</dc:title>"), "{}", core_xml(&tab));
+        assert_eq!(editor(&mut tab).core_fields().title, "Old");
+    }
+
+    /// `Docxy` cannot be built in a unit test, so the sites that must apply
+    /// a typed property are read: each of these routes calls
+    /// `info_edit_apply` (or the Tab hook), or a typed value is skipped by
+    /// Save, lost by Close, or written back by Remove All (#1364).
+    #[test]
+    fn the_sites_that_must_apply_a_typed_property_do() {
+        let main = include_str!("main.rs");
+        let close = include_str!("close.rs");
+        let body = |src: &'static str, sig: &str| -> &'static str {
+            let at = src.find(sig).unwrap_or_else(|| panic!("no {sig}"));
+            let rest = &src[at + sig.len()..];
+            let end = rest.find("\n    fn ").or_else(|| rest.find("\n    pub(crate) fn ")).unwrap();
+            &rest[..end]
+        };
+        for (src, sig) in [
+            (main, "fn save_active("),
+            (main, "fn save_as("),
+            (main, "fn backstage_rail_action("),
+            (close, "fn commit_dialog_buffers_for_exit("),
+        ] {
+            assert!(body(src, sig).contains("info_edit_apply"), "{sig}");
+        }
+        assert!(body(main, "fn tab_key(").contains("info_edit_tab(true"));
+        assert!(body(main, "fn shift_tab_key(").contains("info_edit_tab(false"));
+        let remove = &main[main.find("Remove All\")").expect("Remove All button")..];
+        let remove = &remove[..remove.find("cx.notify()").unwrap()];
+        let apply = remove.find("info_edit_apply").expect("apply before removal");
+        assert!(apply < remove.find("inspect_remove_active").unwrap());
     }
 }

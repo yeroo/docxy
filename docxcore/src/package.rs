@@ -3100,7 +3100,12 @@ impl Package {
         ) else {
             return false;
         };
-        if !ct.contains("</Types>") || !rels.contains("</Relationships>") {
+        // A root relationship to a core part we cannot find is not ours to
+        // double: refuse rather than add a second one.
+        if !ct.contains("</Types>")
+            || !rels.contains("</Relationships>")
+            || rels.contains("metadata/core-properties")
+        {
             return false;
         }
         let body = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -3110,11 +3115,13 @@ impl Package {
             xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"></cp:coreProperties>";
         self.parts
             .push((NAME.to_string(), body.as_bytes().to_vec()));
-        let ov = format!("<Override PartName=\"/{NAME}\" ContentType=\"{CT}\"/>");
-        self.set_part_text(
-            "[Content_Types].xml",
-            &ct.replacen("</Types>", &format!("{ov}</Types>"), 1),
-        );
+        if !ct.contains(&format!("PartName=\"/{NAME}\"")) {
+            let ov = format!("<Override PartName=\"/{NAME}\" ContentType=\"{CT}\"/>");
+            self.set_part_text(
+                "[Content_Types].xml",
+                &ct.replacen("</Types>", &format!("{ov}</Types>"), 1),
+            );
+        }
         let rel = format!(
             "<Relationship Id=\"{}\" Type=\"{REL}\" Target=\"{NAME}\"/>",
             next_rid(&rels)
@@ -7879,6 +7886,31 @@ mod tests {
         let mut bare = load_package(&bare).unwrap();
         assert!(!bare.ensure_core_properties());
         assert!(bare.part_text("docProps/core.xml").is_none());
+    }
+
+    #[test]
+    fn ensure_core_properties_does_not_double_what_the_package_names_1364() {
+        let ct = "<Types xmlns=\"t\"></Types>";
+        let with_rel = "<Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/other.xml\"/></Relationships>";
+        let zip = |ct: &str, rels: &str| {
+            load_package(&crate::zipwrite::write_zip(&[
+                ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+                ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+                ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+            ]))
+            .unwrap()
+        };
+        // A relationship to a core part we cannot find: refuse, add nothing.
+        let mut pkg = zip(ct, with_rel);
+        assert!(!pkg.ensure_core_properties());
+        assert!(pkg.part_text("docProps/core.xml").is_none());
+        assert_eq!(pkg.part_text("_rels/.rels").unwrap(), with_rel);
+        // An override already there is not repeated.
+        let ov = "<Types xmlns=\"t\"><Override PartName=\"/docProps/core.xml\" ContentType=\"x\"/></Types>";
+        let mut pkg = zip(ov, "<Relationships xmlns=\"r\"></Relationships>");
+        assert!(pkg.ensure_core_properties());
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert_eq!(ct.matches("/docProps/core.xml").count(), 1, "{ct}");
     }
 
     #[test]

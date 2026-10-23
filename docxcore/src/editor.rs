@@ -939,6 +939,22 @@ impl Editor {
         }
     }
 
+    /// The host has written `prop` = `text` to the file because a control (here,
+    /// or in the other editor `from` names) was typed in: show it in the
+    /// controls ([`Editor::set_bound_property`]), then record it as the
+    /// file's value ([`Editor::note_core_field`]). The note comes last, so a
+    /// step that call pushed keeps the old value for its undo (#1364).
+    pub fn file_property_changed(
+        &mut self,
+        prop: crate::sdt::BoundProp,
+        text: &str,
+        from: PropSource,
+    ) -> bool {
+        let changed = self.set_bound_property(prop, text, from);
+        self.note_core_field(prop, text);
+        changed
+    }
+
     /// Set Title, Tags (Keywords) or Author as one undo step named for the
     /// property, showing the text in every document property control bound to
     /// it inside that step (#1364). Nothing happens, and false is returned,

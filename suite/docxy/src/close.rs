@@ -750,6 +750,8 @@ impl Docxy {
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
         // The bar's exit commit is the same leave a cell click does.
         self.sheet_comment_bar_leave();
+        // A typed Info property is not lost with the window (#1364).
+        self.info_edit_apply(cx);
         if let Some(r) = self.sheet_rename.take() {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 commit_rename_buffer_for_exit(t, r.idx, &r.text);

@@ -5131,9 +5131,10 @@ impl DocTab {
                 continue;
             };
             pkg.set_part_text(prop.part_name(), &new);
-            body.note_core_field(prop, &text);
             let other = |newest_step| PropSource::Other { newest_step };
-            body.set_bound_property(
+            // Noted after the controls follow, so the undo step that call may
+            // push keeps the old value with the old controls (#1364).
+            body.file_property_changed(
                 prop,
                 &text,
                 if from_hf {
@@ -5582,7 +5583,7 @@ struct Docxy {
     /// File > Info's Title, Tags or Author field while it has the keyboard (#1364).
     info_edit: Option<info_props::InfoEdit>,
     /// Why the last Info property edit changed nothing, under Properties.
-    info_note: Option<String>,
+    info_note: Option<(close::TabId, String)>,
     // Grid width (px) captured each render, so the horizontal scroll track can map
     // a click x back to a column fraction.
     sheet_grid_w: f32,
@@ -15170,11 +15171,15 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A typed Info property applies before the rail acts on the tab
+        // (Save, Save As, Close, ...), as Enter would (#1364).
+        self.info_edit_apply(cx);
         match action {
             BackstageRailAction::Back => self.backstage_back(window, cx),
             BackstageRailAction::Info => {
                 self.bs_info = true;
                 self.bs_info_status = None;
+                self.info_note = None;
                 self.bs_new = false;
                 self.bs_export = false;
                 self.reset_backstage_scroll();
@@ -23726,6 +23731,7 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.info_edit_apply(cx);
         // Nothing to save on the Start screen (#806).
         if self.tabs.is_empty() {
             return self.refocus(window, cx);
@@ -23908,6 +23914,7 @@ impl Docxy {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.info_edit_apply(cx);
         // No file dialog for nothing to write (#806).
         if self.tabs.is_empty() {
             return self.refocus(window, cx);
@@ -26371,6 +26378,10 @@ impl Docxy {
         if self.modal_takes_stroke("tab", None, Modifiers::default(), window, cx) {
             return;
         }
+        // An Info property field moves to the next one (#1364).
+        if self.info_edit_live() {
+            return self.info_edit_tab(true, cx);
+        }
         // File (backstage) covers the window; Tab there edits nothing under it.
         if self.backstage {
             return;
@@ -26494,6 +26505,10 @@ impl Docxy {
         if self.modal_takes_stroke("tab", None, shift, window, cx) {
             return;
         }
+        // An Info property field moves to the previous one (#1364).
+        if self.info_edit_live() {
+            return self.info_edit_tab(false, cx);
+        }
         // File (backstage) covers the window; Tab there edits nothing under it.
         if self.backstage {
             return;
@@ -26566,7 +26581,6 @@ impl Docxy {
                     m.control || m.platform,
                     m.alt,
                     &key,
-                    m.shift,
                     window,
                     cx,
                 );
@@ -38144,7 +38158,12 @@ impl Docxy {
                     ),
             );
         }
-        rows.when_some(self.info_note.clone(), |d, note| {
+        let note = self
+            .info_note
+            .as_ref()
+            .filter(|(tab, _)| self.active_tab_id().as_ref() == Some(tab))
+            .map(|(_, note)| note.clone());
+        rows.when_some(note, |d, note| {
             d.child(
                 div()
                     .id("info-properties-note")
@@ -38213,6 +38232,10 @@ impl Docxy {
                                 .hover(|d| d.border_color(rgb(accent::brand())))
                                 .child("Remove All")
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    // A typed Info property applies first, so the
+                                    // click that bubbles to the page cannot write
+                                    // it back after the removal (#1364).
+                                    this.info_edit_apply(cx);
                                     let _ = this.inspect_remove_active(category);
                                     cx.notify();
                                 })),

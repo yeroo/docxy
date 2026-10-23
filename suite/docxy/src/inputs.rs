@@ -323,9 +323,11 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// the active cell, which opens it, refused while an entry is open, where a
 /// click on the cell would commit it; the sheet tab's rename is a
 /// double-click on the active tab's name, refused while a rename is open. A
-/// document input goes to [`press_doc`]. A Backstage input says why the
-/// harness cannot reach it; a Project input goes to [`press_project`].
-/// A terminal editor's input names the case that types into it.
+/// document input goes to [`press_doc`]; a Backstage input is File > Info's
+/// Title, Tags or Author ([`press_info`]), except Save As's file name, which
+/// says why the harness cannot reach it (the OS's file dialog); a Project
+/// input goes to [`press_project`]. A terminal editor's input names the case
+/// that types into it.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
@@ -457,8 +459,10 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 
 /// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
 /// document input goes to [`read_doc`] and a Project input to
-/// [`read_project`]; a Backstage input says why the harness cannot reach
-/// it, and a terminal editor's input names the case that reads it), in the
+/// [`read_project`]; a Backstage input is File > Info's Title, Tags or Author
+/// ([`read_info`], the stored value while unfocused), except Save As's file
+/// name, which says why the harness cannot reach it; a terminal editor's
+/// input names the case that reads it), in the
 /// shape of a dialog
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
