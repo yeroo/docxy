@@ -1075,3 +1075,47 @@ fn two_properties_from_one_source_step_are_one_step_1433() {
     assert_eq!(ed.undo_names().len(), n0 + 1);
     assert_eq!(ed.undo_names()[0], "Title");
 }
+
+/// #1364: File > Info's Title, Tags and Author are one undo step each, shown in
+/// the bound controls inside that step.
+#[test]
+fn a_core_field_is_an_undo_step_that_the_controls_follow_1364() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let body = vec![Block::Paragraph(Paragraph {
+        props: ParProps::default(),
+        content: core_property_control(BoundProp::Title, "Old", 1, &RunProps::default()),
+    })];
+    let mut ed = Editor::new(Document { body });
+    ed.seed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    let text = |ed: &Editor| para(ed, 0).plain_text();
+    assert!(!ed.set_core_field(BoundProp::Title, "Old"), "unchanged");
+    assert!(
+        !ed.set_core_field(BoundProp::Subject, "x"),
+        "not an Info field"
+    );
+    assert_eq!(ed.undo_serial(), None, "no step for either");
+    assert!(ed.set_core_field(BoundProp::Title, "New"));
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(text(&ed), "New");
+    assert_eq!(ed.take_bound_edits(), [], "the host's own write is no edit");
+    assert!(ed.set_core_field(BoundProp::Keywords, "a, b"));
+    assert_eq!(ed.core_fields().tags, "a, b");
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields().tags, "");
+    assert_eq!(ed.core_fields().title, "New");
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields().title, "Old");
+    assert_eq!(text(&ed), "Old");
+    assert!(!ed.undo());
+    assert!(ed.redo() && ed.redo());
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_fields().tags, "a, b");
+    assert_eq!(text(&ed), "New");
+    // A control typed in is noted without a step of its own.
+    ed.note_core_field(BoundProp::Author, "Ann");
+    assert_eq!(ed.core_fields().author, "Ann");
+    ed.note_core_field(BoundProp::Subject, "ignored");
+}
