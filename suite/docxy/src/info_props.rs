@@ -271,10 +271,19 @@ impl Docxy {
     /// step; a file without a core properties part is given one, and a
     /// package that cannot hold one refuses with a note.
     pub(crate) fn info_edit_apply(&mut self, cx: &mut Context<Self>) {
+        if self.info_edit.is_some() {
+            self.info_edit_apply_now();
+            cx.notify();
+        }
+    }
+
+    /// [`Docxy::info_edit_apply`] for the code that leaves Info or closes File
+    /// and has no context to hand: the edit lands before anything else does,
+    /// not at the next render.
+    pub(crate) fn info_edit_apply_now(&mut self) {
         let Some(e) = self.info_edit.take() else {
             return;
         };
-        cx.notify();
         let Some(idx) = self
             .tabs
             .iter()
@@ -395,7 +404,8 @@ mod tests {
     const W: &str = "xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"";
 
     fn temp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("docxy-info-props-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("docxy-info-props-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -409,7 +419,10 @@ mod tests {
         let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
             <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
         let mut parts: Vec<(&str, &str)> = vec![
-            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types xmlns=\"t\"></Types>"),
+            (
+                "[Content_Types].xml",
+                "<?xml version=\"1.0\"?><Types xmlns=\"t\"></Types>",
+            ),
             ("_rels/.rels", rels),
             ("word/document.xml", &document),
             ("word/styles.xml", "<?xml version=\"1.0\"?><w:styles/>"),
@@ -496,7 +509,10 @@ mod tests {
         tab.mark_dirty();
         assert!(tab.dirty);
         let xml = core_xml(&tab);
-        assert!(xml.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"), "{xml}");
+        assert!(
+            xml.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"),
+            "{xml}"
+        );
         assert!(xml.contains("<dc:creator>Bo</dc:creator>"), "{xml}");
         assert!(xml.contains("<cp:keywords>x, y</cp:keywords>"), "{xml}");
 
@@ -504,14 +520,20 @@ mod tests {
         tab.set_dirty();
         let xml = core_xml(&tab);
         assert!(xml.contains("<dc:creator>Ann</dc:creator>"), "{xml}");
-        assert!(xml.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"), "{xml}");
+        assert!(
+            xml.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"),
+            "{xml}"
+        );
         assert!(editor(&mut tab).redo());
         tab.set_dirty();
         assert!(core_xml(&tab).contains("<dc:creator>Bo</dc:creator>"));
 
         assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         let saved = part(&path, CORE_PART);
-        assert!(saved.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"), "{saved}");
+        assert!(
+            saved.contains("<dc:title>A &amp; &lt;B&gt;</dc:title>"),
+            "{saved}"
+        );
         let mut again = tab_from_path(&path);
         let f = editor(&mut again).core_fields().clone();
         assert_eq!((f.title.as_str(), f.author.as_str()), ("A & <B>", "Bo"));
@@ -563,15 +585,25 @@ mod tests {
         let path = temp("newdoc").join("new.docx");
         assert!(save_doc_tab(&mut tab, Some(path.clone())), "{}", tab.status);
         let core = part(&path, CORE_PART);
-        assert!(core.contains("<dc:title>New &amp; Shiny</dc:title>"), "{core}");
+        assert!(
+            core.contains("<dc:title>New &amp; Shiny</dc:title>"),
+            "{core}"
+        );
         assert!(core.contains("<dc:creator>Ann</dc:creator>"), "{core}");
         let mut again = tab_from_path(&path);
         let f = editor(&mut again).core_fields().clone();
-        assert_eq!((f.title.as_str(), f.author.as_str()), ("New & Shiny", "Ann"));
+        assert_eq!(
+            (f.title.as_str(), f.author.as_str()),
+            ("New & Shiny", "Ann")
+        );
         // A new document nobody edited the properties of saves no core part.
         let mut plain = crate::blank_docx_tab("Document2");
         let path = temp("newdoc-plain").join("plain.docx");
-        assert!(save_doc_tab(&mut plain, Some(path.clone())), "{}", plain.status);
+        assert!(
+            save_doc_tab(&mut plain, Some(path.clone())),
+            "{}",
+            plain.status
+        );
         assert_eq!(part(&path, CORE_PART), "");
     }
 
@@ -622,7 +654,11 @@ mod tests {
         };
         assert!(tab.ensure_core_part().is_ok());
         assert_eq!(
-            tab.pkg.as_ref().unwrap().part_text("word/styles.xml").unwrap(),
+            tab.pkg
+                .as_ref()
+                .unwrap()
+                .part_text("word/styles.xml")
+                .unwrap(),
             styles_before,
             "an Info edit restyles nothing"
         );
@@ -702,7 +738,11 @@ mod tests {
         ed.insert_char('!');
         tab.set_dirty();
         assert_eq!(editor(&mut tab).core_fields().title, "Info!");
-        assert!(core_xml(&tab).contains("<dc:title>Info!</dc:title>"), "{}", core_xml(&tab));
+        assert!(
+            core_xml(&tab).contains("<dc:title>Info!</dc:title>"),
+            "{}",
+            core_xml(&tab)
+        );
     }
 
     /// Remove All Properties cleans a default-namespace core part too, and
@@ -725,7 +765,7 @@ mod tests {
     /// through `set_dirty`, without a step of Info's.
     #[test]
     fn typing_in_a_bound_control_updates_the_editors_field_and_core_xml() {
-        use docxcore::model::{Block, Document, Paragraph, ParProps, RunProps};
+        use docxcore::model::{Block, Document, ParProps, Paragraph, RunProps};
         let (_, mut tab) = open("control", Some(CORE));
         let pkg = tab.pkg.as_ref().unwrap();
         let fields = core_fields_of(pkg);
@@ -746,7 +786,11 @@ mod tests {
         ed.insert_char('!');
         let steps = ed.undo_serial();
         tab.set_dirty();
-        assert!(core_xml(&tab).contains("<dc:title>Old!</dc:title>"), "{}", core_xml(&tab));
+        assert!(
+            core_xml(&tab).contains("<dc:title>Old!</dc:title>"),
+            "{}",
+            core_xml(&tab)
+        );
         let ed = editor(&mut tab);
         assert_eq!(ed.core_fields().title, "Old!");
         assert_eq!(ed.core_unsynced(), []);
@@ -754,7 +798,11 @@ mod tests {
         // Undoing the typing puts the file back with the control.
         assert!(ed.undo());
         tab.set_dirty();
-        assert!(core_xml(&tab).contains("<dc:title>Old</dc:title>"), "{}", core_xml(&tab));
+        assert!(
+            core_xml(&tab).contains("<dc:title>Old</dc:title>"),
+            "{}",
+            core_xml(&tab)
+        );
         assert_eq!(editor(&mut tab).core_fields().title, "Old");
     }
 
@@ -769,10 +817,20 @@ mod tests {
         let body = |src: &'static str, sig: &str| -> &'static str {
             let at = src.find(sig).unwrap_or_else(|| panic!("no {sig}"));
             let rest = &src[at + sig.len()..];
-            let end = rest.find("\n    fn ").or_else(|| rest.find("\n    pub(crate) fn ")).unwrap();
+            let end = rest
+                .find("\n    fn ")
+                .or_else(|| rest.find("\n    pub(crate) fn "))
+                .unwrap();
             &rest[..end]
         };
         for (src, sig) in [
+            (main, "fn show_backstage_open_page("),
+            (main, "fn show_backstage_new_page("),
+            (main, "fn backstage_back("),
+            (main, "fn open_account("),
+            (main, "fn add_tab("),
+            (include_str!("doc_export.rs"), "fn open_export("),
+            (close, "fn backstage_close("),
             (main, "fn save_active("),
             (main, "fn save_as("),
             (main, "fn backstage_rail_action("),
@@ -784,7 +842,9 @@ mod tests {
         assert!(body(main, "fn shift_tab_key(").contains("info_edit_tab(false"));
         let remove = &main[main.find("Remove All\")").expect("Remove All button")..];
         let remove = &remove[..remove.find("cx.notify()").unwrap()];
-        let apply = remove.find("info_edit_apply").expect("apply before removal");
+        let apply = remove
+            .find("info_edit_apply")
+            .expect("apply before removal");
         assert!(apply < remove.find("inspect_remove_active").unwrap());
         // Opening a field clears the note before it applies the field it
         // leaves, whose refusal must survive.

@@ -379,10 +379,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
 fn press_info(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     crate::harness::active_doc(app)?;
     if !(app.backstage && app.bs_info) {
-        return Err(format!(
-            "{} is not drawn: open File > Info first",
-            i.name
-        ));
+        return Err(format!("{} is not drawn: open File > Info first", i.name));
     }
     let which = crate::info_props::InfoProp::from_id(i.id).ok_or_else(|| not_covered(i))?;
     let b = app
@@ -878,12 +875,7 @@ mod tests {
             )
         );
         for i in registry() {
-            assert_eq!(
-                why(i.id).is_some(),
-                i.id == "save-as-name",
-                "{}",
-                i.id
-            );
+            assert_eq!(why(i.id).is_some(), i.id == "save-as-name", "{}", i.id);
         }
     }
 

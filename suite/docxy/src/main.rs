@@ -58,7 +58,6 @@ mod doc_templates_tests;
 mod field_edit;
 mod file_keys;
 mod font_box;
-mod info_props;
 mod harness;
 mod help_tab;
 mod hf;
@@ -67,6 +66,7 @@ mod hf_tab;
 mod hl_mode;
 mod html_bundle;
 mod hyphenation_dialog;
+mod info_props;
 mod inputs;
 mod inspector;
 mod layout_tab;
@@ -15082,6 +15082,8 @@ impl Docxy {
 
     /// The default (Open) page, as `open_backstage` leaves it.
     fn show_backstage_open_page(&mut self) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_new = false;
         self.bs_export = false;
         self.bs_info = false;
@@ -15097,6 +15099,8 @@ impl Docxy {
 
     /// File > New's page: the Document / Spreadsheet / Project / Mail cards.
     fn show_backstage_new_page(&mut self) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_new = true;
         self.bs_export = false;
         self.bs_templates = doc_templates::personal_templates(&doc_templates::templates_dir());
@@ -15115,6 +15119,8 @@ impl Docxy {
     }
 
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         // With no tab there is no tab to go back to: File stays up, on its
         // default page (Recent, Settings) instead of the New page (#806).
         if self.tabs.is_empty() {
@@ -15156,6 +15162,8 @@ impl Docxy {
     /// File > Account (#1023): the build line and the About button. The rail
     /// item and the harness's `account` verb both come here.
     fn open_account(&mut self, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_account = true;
         self.bs_info = false;
         self.bs_info_status = None;
@@ -15680,6 +15688,8 @@ impl Docxy {
     }
 
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
             kind,
@@ -26576,14 +26586,7 @@ impl Docxy {
             if self.info_edit_live() {
                 let m = &ev.keystroke.modifiers;
                 let key = ev.keystroke.key.clone();
-                return self.info_edit_key(
-                    ev,
-                    m.control || m.platform,
-                    m.alt,
-                    &key,
-                    window,
-                    cx,
-                );
+                return self.info_edit_key(ev, m.control || m.platform, m.alt, &key, window, cx);
             }
             if self.backstage_scroll_key(&ev.keystroke) {
                 cx.notify();
@@ -38139,11 +38142,7 @@ impl Docxy {
                             .px_2()
                             .rounded_sm()
                             .border_1()
-                            .border_color(if edit.is_some() {
-                                hsla_u(BRAND)
-                            } else {
-                                dim
-                            })
+                            .border_color(if edit.is_some() { hsla_u(BRAND) } else { dim })
                             .text_size(px(13.))
                             .text_color(fg)
                             .cursor_text()
