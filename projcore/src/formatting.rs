@@ -12,7 +12,9 @@
 use crate::json::Json;
 use opccore::xml::{Event, XmlParser};
 
+pub mod bars;
 pub mod gridlines;
+pub use bars::{BarRow, BarText, Facts, Mark, Middle, TaskBar};
 pub use gridlines::{Gridline, Gridlines, LineType};
 
 /// The `.yppx` part the formatting is saved in.
@@ -221,6 +223,10 @@ pub struct Formatting {
     /// (#1553). The hosts keep none of their own here: `critical`,
     /// `baseline` and `timeline` stay the view's.
     pub switches: Vec<(String, bool)>,
+    /// The view's Bar Styles table (#1696); empty keeps the palette drawing.
+    pub bars: Vec<BarRow>,
+    /// Format Bar's per-task overrides (#1696); see [`bars`].
+    pub task_bars: Vec<TaskBar>,
 }
 
 impl Formatting {
@@ -330,6 +336,7 @@ impl Formatting {
         if let Some(l) = text(view, "link_style")? {
             self.link_style = l;
         }
+        self.apply_bars(view)?;
         match view.get("switches") {
             None | Some(Json::Null) => {}
             Some(Json::Obj(pairs)) => {
@@ -402,6 +409,7 @@ impl Formatting {
             push_attr(&mut out, "on", if *on { "1" } else { "0" });
             out.push_str("/>\n");
         }
+        self.bars_to_xml(&mut out);
         self.gridlines.to_xml(&mut out);
         out.push_str("</formatting>\n");
         out
@@ -457,6 +465,7 @@ impl Formatting {
                                     out.set_switch(&name, Some(on));
                                 }
                             }
+                            "bar" | "task-bar" => out.read_bar_xml(name, &parser),
                             "gridline" => out.gridlines.read_xml(&parser),
                             _ => {}
                         }

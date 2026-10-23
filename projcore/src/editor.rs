@@ -18,6 +18,7 @@ const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own pr
 pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
 mod assignments;
+mod barfacts;
 mod batch;
 mod cells;
 mod effort;
