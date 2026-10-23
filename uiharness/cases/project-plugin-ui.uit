@@ -218,7 +218,9 @@ test a command's view.layout sets the Layout fields, draws taller bars and clear
   assert layout.bar_height is 12
   key ctrl+z
   assert layout.bar_height is nothing
-  assert dirty is false
+  # Undo does not clear the dirty flag (`Editor::changed` sets it for an edit
+  # and for its undo alike): the plan stays marked changed.
+  assert dirty is true
 
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
