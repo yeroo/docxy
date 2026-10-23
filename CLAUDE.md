@@ -177,6 +177,40 @@
   validation and ToUnicode extraction), so nothing depends on `qpdf` (used too
   when installed) or on fonts being installed.
 
+## PDF export: borders, picture watermarks, unequal columns (#797)
+
+- `StyleSheet::{effective_run, effective_align, paragraph_rtl_override,
+  effective_tabs, effective_borders}` fall back to the default paragraph style
+  (`w:default="1"`) for a paragraph without a `pStyle`, as `effective_vanish`
+  and `effective_ppr_flag` did; so a Normal that sets alignment or colour now
+  reaches the terminal render and the PDF. `shown_run` (the suite) still skips
+  Normal.
+- Page borders: `BorderStyle::{Wave, ThreeD, Motif}`. `border_rules` draws
+  `wave`/`doubleWave` as a sine polyline (amplitude one width, wavelength four),
+  the 3-D styles as a light and a dark half stroke (raised: light inside on the
+  top and left), and the art names `basicBlack/WhiteDots`,
+  `basicBlack/WhiteSquares`, `stars`, `hearts`, `circlesLines`, `triangles` as
+  tiled vector motifs of side `sz` points. Word's artwork is bitmap, so the
+  motifs are approximations (no oracle); every other art name stays a dashed
+  band. Tables still stroke all of these as one solid line (`strokes`).
+- Picture watermarks: `package::picture_watermarks` reads a header's VML
+  `v:imagedata r:id` or DrawingML `a:blip r:embed` (size from the style or
+  `wp:extent`); `PdfOptions::from_package` resolves it through the header's
+  rels into `PdfOptions::images` (`export/pic.rs`, `PdfImage`) and
+  `picture_watermarks`. Nothing is decoded: JPEG (1 or 3 components) goes in
+  as `DCTDecode`, a non-interlaced 8-bit grey/RGB or 1-8-bit palette PNG as its
+  concatenated `IDAT` under `FlateDecode` with `/Predictor 15` (`tRNS` ignored).
+  Anything else (alpha, 16-bit, interlaced, GIF/BMP/WMF/EMF) draws nothing. The
+  picture is centred on the margin box, washed out with `/ca` (the shape's
+  opacity, else 0.5), and its page resources appear only on pages that draw one,
+  so other files are byte-identical.
+- Unequal-width columns balance too (`Pager::balance_unequal`): lines wrap per
+  column, so the set's paragraphs are laid out again from a `RegionSnap` taken
+  before its first line, at a bisected trial height (`Trial`; running out of
+  columns fails it). The unlimited layout must reproduce the lines already
+  placed, and the result must be shorter, or the set is left as it was; a set
+  that begins mid-paragraph (spilled from the page before) is not balanced.
+
 ## Start screen (#806)
 
 - A suite launch with nothing to restore and no file on the command line has
