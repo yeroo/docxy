@@ -12,7 +12,9 @@
 use crate::json::Json;
 use opccore::xml::{Event, XmlParser};
 
+pub mod bars;
 pub mod gridlines;
+pub use bars::{BarRow, BarText, Facts, Mark, Middle, TaskBar};
 pub use gridlines::{Gridline, Gridlines, LineType};
 
 /// The `.yppx` part the formatting is saved in.
@@ -221,6 +223,10 @@ pub struct Formatting {
     /// (#1553). The hosts keep none of their own here: `critical`,
     /// `baseline` and `timeline` stay the view's.
     pub switches: Vec<(String, bool)>,
+    /// The view's Bar Styles table (#1696); empty keeps the palette drawing.
+    pub bars: Vec<BarRow>,
+    /// Format Bar's per-task overrides (#1696); see [`bars`].
+    pub task_bars: Vec<TaskBar>,
 }
 
 impl Formatting {
@@ -308,9 +314,13 @@ impl Formatting {
     /// null to clear), `text_styles` (an object of category to style, a
     /// null clearing one), `cells` (an array of `{uid, column, ...style}`,
     /// an empty style clearing one), `gridlines` (an object of line name to
-    /// its drawing, or null for every default: [`Gridlines::apply`], #1575)
-    /// and `link_style` (a string or null). Other keys are the host's (its
-    /// view switches) and ignored here. `true` when something changed.
+    /// its drawing, or null for every default: [`Gridlines::apply`], #1575),
+    /// `link_style` (a string or null), `switches` (an object of name to a
+    /// boolean, null clearing one), and the bar styles `bars` (an array
+    /// replacing the Bar Styles table, null clearing it) and `task_bars`
+    /// (an array of per-task overrides, null clearing all; see [`bars`],
+    /// #1696). Other keys are the host's and ignored here. `true` when
+    /// something changed.
     pub fn apply_view(&mut self, view: &Json) -> Result<bool, String> {
         let before = self.clone();
         let text = |v: &Json, key: &str| -> Result<Option<Option<String>>, String> {
@@ -330,6 +340,7 @@ impl Formatting {
         if let Some(l) = text(view, "link_style")? {
             self.link_style = l;
         }
+        self.apply_bars(view)?;
         match view.get("switches") {
             None | Some(Json::Null) => {}
             Some(Json::Obj(pairs)) => {
@@ -402,6 +413,7 @@ impl Formatting {
             push_attr(&mut out, "on", if *on { "1" } else { "0" });
             out.push_str("/>\n");
         }
+        self.bars_to_xml(&mut out);
         self.gridlines.to_xml(&mut out);
         out.push_str("</formatting>\n");
         out
@@ -457,6 +469,7 @@ impl Formatting {
                                     out.set_switch(&name, Some(on));
                                 }
                             }
+                            "bar" | "task-bar" => out.read_bar_xml(name, &parser),
                             "gridline" => out.gridlines.read_xml(&parser),
                             _ => {}
                         }

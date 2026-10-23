@@ -39,9 +39,17 @@
 //!   blue, no sheet rows, solid green sheet columns and a solid red project
 //!   start line; a second press, seeing the view's Gantt Rows dotted, clears
 //!   them all with null).
+//!   and `fixture.bars` (#1696: sets two bar style rows through `view.bars`,
+//!   a normal-task row 1 with Resource Names to the right and a not-summary
+//!   row 2 with other marks, one `view.task_bars` override of task 1 and
+//!   the `fixture.names` switch; a second press, seeing rows in the view,
+//!   clears both with null and leaves the switch on).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565).
+//!   With the `fixture.names` switch on it also writes each row's Resource
+//!   Names right of its bar, unless a bar style row of the view already has
+//!   a text field of that name (#1696).
 
 use crate::json::{Json, quote};
 use crate::{OK, UNSUPPORTED_EXTENSION, YppxBuf, bytes, fail, give};
@@ -59,7 +67,8 @@ const MANIFEST: &str = r##"{
       {"id":"fixture.blue","label":"Blue","color":"#3366CC","preview":"fixture.blue"},
       {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
-    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"}]}]},
+    {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"},
+    {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
     {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
     {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]},
@@ -389,6 +398,34 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                     .to_string()
             }
         }
+        // The bar style rows (#1696): set them, or, seeing rows in the view,
+        // clear the table and the overrides.
+        "fixture.bars" => {
+            let set = req
+                .get("view")
+                .and_then(|v| v.get("bars"))
+                .map(Json::list)
+                .is_some_and(|rows| !rows.is_empty());
+            if set {
+                r#"{"ops":[],"status":"Fixture: bars reset","view":{"bars":null,"task_bars":null}}"#
+                    .to_string()
+            } else {
+                r##"{"ops":[],"status":"Fixture: bars","view":{"switches":{"fixture.names":true},
+                    "bars":[
+                      {"name":"Main","show_for":["Normal"],"row":1,
+                       "start":{"shape":"diamond","type":"framed","color":"#CC3333"},
+                       "middle":{"shape":"full","color":"#CC3333"},
+                       "end":{"shape":"arrow-right","type":"solid"},
+                       "text":{"right":"Resource Names"}},
+                      {"name":"Detail","show_for":["Not Summary"],"row":2,
+                       "start":{"shape":"square"},
+                       "middle":{"shape":"narrow-middle","pattern":"light-fill","color":"#3366CC"},
+                       "end":{"shape":"circle","type":"dashed"},
+                       "text":{"inside":"Name"}}],
+                    "task_bars":[{"uid":1,"middle":{"color":"#33AA33"},"text":{"top":"Overridden"}}]}}"##
+                    .to_string()
+            }
+        }
         "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {
             // Bump (#1610): one op on the first selected task, the dialog
             // kept open.
@@ -637,6 +674,46 @@ pub unsafe extern "C" fn yppx_ui_overlay(input: *const u8, len: usize, out: *mut
                 f("x") + f("w") + 6.0,
                 f("y"),
                 uid as i64
+            ));
+        }
+    }
+    // Resource Names right of each bar, as the fixture's own bar text,
+    // unless a bar style row of the view writes them itself (#1696).
+    let flags = req.get("flags");
+    let names_on = flags
+        .and_then(|f| f.get("switches"))
+        .and_then(|s| s.get("fixture.names"))
+        .and_then(Json::bool)
+        .unwrap_or(false);
+    let row_writes_names = flags
+        .and_then(|f| f.get("bars"))
+        .map(Json::list)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|row| row.get("text"))
+        .any(|text| {
+            ["left", "right", "top", "bottom", "inside"]
+                .iter()
+                .any(|pos| text.get(pos).and_then(Json::str) == Some("Resource Names"))
+        });
+    if names_on && !row_writes_names {
+        for row in req.get("rows").map(Json::list).unwrap_or(&[]) {
+            let names = row
+                .get("resource_names")
+                .and_then(Json::str)
+                .unwrap_or_default();
+            let Some(bar) = row.get("bar").filter(|b| !b.is_null()) else {
+                continue;
+            };
+            if names.is_empty() {
+                continue;
+            }
+            let f = |k: &str| bar.get(k).and_then(Json::num).unwrap_or(0.0);
+            shapes.push(format!(
+                r##"{{"kind":"text","x":{},"y":{},"text":{},"color":"#333333","size":10}}"##,
+                f("x") + f("w") + 6.0,
+                f("y"),
+                quote(&format!("names {names}"))
             ));
         }
     }

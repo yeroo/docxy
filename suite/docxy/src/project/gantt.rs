@@ -1,4 +1,5 @@
 //! Day-scale geometry shared by the renderer and harness.
+use super::barstyle::{BarStyled, styled_children};
 use super::*;
 use projcore::formatting::gridlines::{Gridline, Gridlines, Line, LineType};
 
@@ -356,10 +357,11 @@ pub(crate) fn shaded_runs(
 /// the first row of the body) for a gridline's interval (#1575). `scroll_y`
 /// grows downward, so the rules follow the list's scroll phase whether a row
 /// holds a task or not.
-pub(crate) fn ruled_rows(body_h: f32, scroll_y: f32) -> Vec<(usize, f32)> {
+/// `row_h` is `ProjectView::row_h` (#1696).
+pub(crate) fn ruled_rows_of(body_h: f32, scroll_y: f32, row_h: f32) -> Vec<(usize, f32)> {
     let scroll_y = scroll_y.max(0.);
-    ((scroll_y / ROW_H).floor().max(0.) as usize..)
-        .map(|k| (k, (k + 1) as f32 * ROW_H - 1. - scroll_y))
+    ((scroll_y / row_h).floor().max(0.) as usize..)
+        .map(|k| (k, (k + 1) as f32 * row_h - 1. - scroll_y))
         .skip_while(|(_, y)| *y < 0.)
         .take_while(|(_, y)| *y < body_h)
         .collect()
@@ -478,9 +480,10 @@ pub(crate) fn date_lines(
 }
 
 /// Ruled empty rows visible below the last task, counting a partly visible one.
-pub(crate) fn filler_rows(body_h: f32, scroll_y: f32, count: usize) -> usize {
-    let used = count as f32 * ROW_H - scroll_y.max(0.);
-    ((body_h - used).max(0.) / ROW_H).ceil() as usize
+/// `row_h` is `ProjectView::row_h`.
+pub(crate) fn filler_rows_of(body_h: f32, scroll_y: f32, count: usize, row_h: f32) -> usize {
+    let used = count as f32 * row_h - scroll_y.max(0.);
+    ((body_h - used).max(0.) / row_h).ceil() as usize
 }
 
 pub(crate) fn nonworking_fill(pal: Pal) -> Hsla {
@@ -543,6 +546,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
         view.chart_scale(),
     );
     let widths = view.widths();
+    let row_h = view.row_h();
     let rule = Hsla {
         a: pal.border.a * 0.6,
         ..pal.border
@@ -557,7 +561,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             // Read at paint: the list's prepaint, which runs after this canvas's, settles the offset.
             let scroll_y = -f32::from(scroll.0.borrow().base_handle.offset().y);
             let body_h = f32::from(bounds.size.height);
-            let rules = ruled_rows(body_h, scroll_y);
+            let rules = ruled_rows_of(body_h, scroll_y, row_h);
             // A row rule of `line` across `w` from `x`: the row's interval
             // style when the interval lands on it, else the normal one, in
             // the line's colour or the host's `automatic`.
@@ -759,6 +763,34 @@ fn header_cells(
     cells
 }
 
+/// The leveling delay and the baseline under a bar: the palette's marks.
+fn delay_and_baseline(mut strip: Div, bar: GanttBar, dw: f32, pal: Pal) -> Div {
+    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla| {
+        div()
+            .absolute()
+            .left(px(s as f32 * dw))
+            .top(px(y))
+            .w(px((e - s + 1).max(1) as f32 * dw))
+            .h(px(h))
+            .bg(color)
+    };
+    if let Some((s, e)) = bar.delay {
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(s as f32 * dw))
+                .top(px(8.))
+                .w(px((e - s).max(0) as f32 * dw))
+                .h(px(8.))
+                .bg(Hsla { a: 0.4, ..pal.dim }),
+        );
+    }
+    if let Some((s, e)) = bar.baseline {
+        strip = strip.child(span(s, e, 22., 4., pal.dim));
+    }
+    strip
+}
+
 /// One row's Gantt strip. `on_right` is the bar's own right-press (#1207):
 /// it is attached to the drawn bar (or milestone diamond) only, so a press
 /// on the chart beside it is not the bar's.
@@ -769,6 +801,8 @@ pub(crate) fn gantt_strip(
     pal: Pal,
     palette: Option<&projcore::uiplugin::Palette>,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    row_h: f32,
+    styled: Option<BarStyled>,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_chart_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -777,8 +811,24 @@ pub(crate) fn gantt_strip(
     let strip = div()
         .relative()
         .w(px(scale.width()))
-        .h(px(ROW_H))
+        .h(px(row_h))
         .on_mouse_down(MouseButton::Right, on_chart_right);
+    // The plan's bar style rows replace the palette drawing of a task they
+    // cover (#1696); an override over a plain leaf bar keeps its baseline
+    // and leveling-delay marks.
+    if let Some(styled) = styled {
+        let strip = match bar.filter(|_| styled.marks) {
+            Some(bar) => delay_and_baseline(strip, bar, scale.day_w, pal),
+            None => strip,
+        };
+        return strip.children(styled_children(
+            styled.parts,
+            id,
+            pal,
+            probes,
+            std::rc::Rc::new(on_right),
+        ));
+    }
     let Some(bar) = bar else {
         return strip;
     };
@@ -794,21 +844,8 @@ pub(crate) fn gantt_strip(
             .when(hollow, |d| d.border_1().border_color(color))
             .when(!hollow, |d| d.bg(color))
     };
+    let strip = delay_and_baseline(strip, bar, dw, pal);
     let mut strip = strip;
-    if let Some((s, e)) = bar.delay {
-        strip = strip.child(
-            div()
-                .absolute()
-                .left(px(s as f32 * dw))
-                .top(px(8.))
-                .w(px((e - s).max(0) as f32 * dw))
-                .h(px(8.))
-                .bg(Hsla { a: 0.4, ..pal.dim }),
-        );
-    }
-    if let Some((s, e)) = bar.baseline {
-        strip = strip.child(span(s, e, 22., 4., pal.dim, false));
-    }
     if bar.inactive {
         if let Some((s, e)) = bar.rollup {
             strip = strip.child(span(s, e, 3., 4., hsla_u(color), true));

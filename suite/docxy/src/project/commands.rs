@@ -2875,7 +2875,7 @@ impl Docxy {
             .current("project-body")
             .map(|b| f32::from(b.size.height));
         if let (Some(body_h), Surface::Project(v)) = (body_h, &mut tab.surface) {
-            v.page_rows = page_rows_for(body_h);
+            v.page_rows = page_rows_of(body_h, v.row_h());
         }
         let stroke = project_stroke(ev, edit_open, crate::text_input::MACOS);
         if let Some(act) = project_input(

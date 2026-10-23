@@ -44,7 +44,7 @@ Built bottom-up, each a pure module:
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `report` | Project's Report › View Reports as Markdown, from the plan's stored values |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`, plus `formatting.xml` when the plan has formatting) |
-| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, the gridlines (#1575, `formatting::gridlines`: Project's Gridlines dialog as data, a type, colour and interval per line, `<gridline line type color interval interval-type interval-color>`, only lines set away from their default stored) and link-line style, and the named view switches a UI plugin owns (#1553, `<switch name on>`); `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
+| `formatting` | the plan's formatting (#1532, #1390): bar palette id, text styles per category and per cell, the gridlines (#1575, `formatting::gridlines`: Project's Gridlines dialog as data, a type, colour and interval per line, `<gridline line type color interval interval-type interval-color>`, only lines set away from their default stored) and link-line style, the named view switches a UI plugin owns (#1553, `<switch name on>`), the view's Bar Styles table and the per-task Format Bar overrides (#1696, `formatting::bars`: `<bar name show-for row from to start-* middle-* end-* text-*>` and `<task-bar uid ...>`; `Formatting::bars`, `task_bars`); `Project::formatting`, edited as one undo step by `Editor::edit_formatting`, saved in `formatting.xml`, never in MSPDI |
 | `formats` | the `ProjectFormat` trait and the `Registry` of formats hosts open and save (built-in `.yppx` and `.xml`), and, behind the `plugins` feature, the format and UI plugin loader |
 | `plugin_abi` | the C ABI a format plugin implements, with the optional version-target and UI symbols (see [Format plugins](#format-plugins) and [UI plugins](#ui-plugins-1532)) |
 | `json` | the hand-written JSON value the plugin ABI's payloads use |
@@ -587,7 +587,7 @@ without one nothing changes.
   current dates, the `selected` UIDs (the cursor's first), the project
   start and finish x and the view flags (the switches, the plan's
   `palette`, `link_style` and `gridlines`, the plugins' `switches`, the
-  formatting's `text_styles` and the selected cells' `cells`, #1572) in; shapes in chart pixels out (`polyline`, `dashed`,
+  formatting's `text_styles` and the selected cells' `cells`, #1572, and its `bars` and `task_bars`, #1696) in; shapes in chart pixels out (`polyline`, `dashed`,
   `arrow`, `bracket`, `rect`, `text`, each with a colour and width), drawn
   over the bars.
 - **Loader.** `projcore::formats::plugin::load_plugins_for(dirs, Some(Host

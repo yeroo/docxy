@@ -1451,7 +1451,10 @@ pub struct OverlayCtx {
     /// (#1548; since #1575 an object of every gridline as drawn, by
     /// Project's name), the plugins' `switches` (#1553), and the
     /// formatting's `text_styles` and the selected cells' `cells` (#1572),
-    /// by key.
+    /// and its Bar Styles table `bars` and Format Bar overrides `task_bars`
+    /// (#1696, the shape `Formatting::apply_view` reads), by key. An
+    /// `OverlayRow::bar` is the first drawn bar row's middle when the plan's
+    /// bar styles draw the task (a table, or the task's override).
     pub flags: Json,
 }
 
@@ -1461,7 +1464,10 @@ pub struct OverlayCtx {
 pub struct OverlayRow {
     pub uid: i32,
     pub row_y: f32,
-    /// `(x, y, w, h)` of the bar, or the milestone's diamond.
+    /// `(x, y, w, h)` of the bar, or the milestone's diamond; when the
+    /// plan's bar styles draw the task (a table, or the task's override,
+    /// #1696) the first drawn row's middle instead, zero-wide for a row
+    /// that is a point.
     pub bar: Option<(f32, f32, f32, f32)>,
     /// `critical`, `on-track`, `summary` or `milestone`.
     pub kind: String,

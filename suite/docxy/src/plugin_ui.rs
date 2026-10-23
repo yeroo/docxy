@@ -377,6 +377,8 @@ fn view_json(v: &ProjectView) -> Json {
         ("link_style", text(&formatting.link_style)),
         ("gridlines", formatting.gridlines.to_json()),
         ("switches", formatting.switches_json()),
+        ("bars", formatting.bars_json()),
+        ("task_bars", formatting.task_bars_json()),
         ("text_styles", Json::Obj(text_styles)),
         ("cells", Json::Arr(cells)),
     ])
@@ -1341,6 +1343,8 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
     let shown = ed.display_rows();
     let sched = ed.schedule();
     let reader = projcore::editor::FieldReader::new(ed);
+    let row_h = v.row_h();
+    let palette = palette(v);
     // An instant's x in chart pixels, within its day: the chart's own rule.
     let x_at = |d: projcore::DateTime| crate::project::instant_x(scale, 0., d);
     let stamp = |d: projcore::DateTime| {
@@ -1356,7 +1360,16 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
         .filter_map(|(row, &i)| {
             let task = tasks.get(i)?;
             let bar = crate::gantt_bar(ed, task, scale).map(|b| v.styled_bar(b));
-            let row_y = row as f32 * crate::ROW_H;
+            let row_y = row as f32 * row_h;
+            // Under the plan's bar styles the bar is the first drawn row's
+            // middle (#1696), not the palette's rectangle.
+            let styled = crate::bar_rows(
+                ed,
+                task,
+                scale,
+                crate::PaletteLook::of(bar, palette.as_ref()),
+            )
+            .map(|rows| crate::first_middle(&rows));
             let dated = !matches!(
                 task.constraint,
                 projcore::ConstraintType::AsSoonAsPossible
@@ -1366,10 +1379,13 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
             Some(OverlayRow {
                 uid: task.uid,
                 row_y,
-                bar: bar.map(|b| {
-                    let (x, y, w, h) = crate::bar_rect(&b, scale.day_w);
-                    (x, row_y + y, w, h)
-                }),
+                bar: match styled {
+                    Some(middle) => middle.map(|(x, y, w, h)| (x, row_y + y, w, h)),
+                    None => bar.map(|b| {
+                        let (x, y, w, h) = crate::bar_rect(&b, scale.day_w);
+                        (x, row_y + y, w, h)
+                    }),
+                },
                 kind: bar.map_or("", |b| crate::bar_kind_name(b.kind)).to_string(),
                 summary: task.summary,
                 milestone: task.is_milestone(),
@@ -1439,7 +1455,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
         rows,
         origin_day: scale.origin_day,
         day_w: scale.day_w,
-        row_h: crate::ROW_H,
+        row_h,
         links,
         status_date,
         current_date,

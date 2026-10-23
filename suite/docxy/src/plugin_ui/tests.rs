@@ -1042,3 +1042,77 @@ fn a_plugin_gallery_named_like_table_styles_is_not_a_swatch_gallery() {
     assert!(!is_swatch_gallery(gal));
     assert_eq!(ribbon_fit::gallery_geom(gal).frame, 6.0);
 }
+
+#[test]
+fn the_view_json_carries_bars_and_the_overlay_bar_follows_the_first_row() {
+    use projcore::formatting::{BarRow, Middle, TaskBar};
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    // No table: the view says so and the overlay row has the palette's
+    // rectangle at the original row height.
+    let view = view_json(v);
+    assert!(view.list("bars").is_empty() && view.list("task_bars").is_empty());
+    let plain = overlay_ctx(v);
+    assert_eq!(plain.row_h, crate::ROW_H);
+    let palette_bar = plain.rows[0].bar.expect("a scheduled leaf has a bar");
+    assert_eq!(plain.rows[1].row_y, crate::ROW_H);
+    // Two rows, the first in band 2: rows are two bands tall, the second
+    // task's row starts a row later, and the bar is the first drawn row's
+    // middle (a medium-bottom bar here), in that band.
+    v.ed.edit_formatting(|f| {
+        f.set_bars(vec![
+            BarRow {
+                name: "A".into(),
+                row: 2,
+                middle: Middle {
+                    shape: Some("medium-bottom".into()),
+                    ..Middle::default()
+                },
+                ..BarRow::default()
+            },
+            BarRow {
+                name: "B".into(),
+                row: 1,
+                ..BarRow::default()
+            },
+        ]);
+        f.set_task_bar(TaskBar {
+            uid,
+            middle: Middle {
+                color: Some(0x00AA00),
+                ..Middle::default()
+            },
+            ..TaskBar::default()
+        });
+    });
+    let view = view_json(v);
+    assert_eq!(view.list("bars").len(), 2);
+    assert_eq!(view.list("bars")[0].get_str("name"), Some("A"));
+    assert_eq!(view.list("bars")[0].int("row"), Some(2));
+    assert_eq!(view.list("task_bars")[0].int("uid"), Some(i64::from(uid)));
+    // The same JSON read back is the same table.
+    let mut back = projcore::formatting::Formatting::default();
+    back.apply_view(&Json::obj(vec![
+        ("bars", view.get("bars").unwrap().clone()),
+        ("task_bars", view.get("task_bars").unwrap().clone()),
+    ]))
+    .unwrap();
+    assert_eq!(back.bars, v.ed.project().formatting.bars);
+    assert_eq!(back.task_bars, v.ed.project().formatting.task_bars);
+    let ctx = overlay_ctx(v);
+    assert_eq!(ctx.row_h, 2. * crate::ROW_H);
+    assert_eq!(ctx.rows[1].row_y, 2. * crate::ROW_H);
+    let (x, y, w, h) = ctx.rows[0].bar.unwrap();
+    assert_eq!(
+        (x, y, w, h),
+        (
+            palette_bar.0,
+            crate::ROW_H + crate::BAR_Y + 2.,
+            palette_bar.2,
+            8.
+        )
+    );
+}
