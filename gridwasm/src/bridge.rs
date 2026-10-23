@@ -2525,10 +2525,19 @@ impl Session {
         }
 
         // Pass 1: validate every formula and length before touching anything.
+        // A batch that writes a table header renames the column before its
+        // formulas are read, so they are checked for syntax only.
+        let cells: Vec<(u32, u32)> = entries.iter().map(|(r, c, _)| (*r, *c)).collect();
+        let renames = self.hits_table_header(si, &cells);
         for (r, c, text) in &entries {
             let wb = &self.pkg.workbook;
             if let Some(body) = gridcore::entry::typed_formula(wb, si, *r, *c, text) {
-                Engine::validate_in(wb, si, *r, *c, body).map_err(|e| {
+                let checked = if renames {
+                    Engine::validate(body)
+                } else {
+                    Engine::validate_in(wb, si, *r, *c, body)
+                };
+                checked.map_err(|e| {
                     format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
                 })?;
             }

@@ -1282,11 +1282,20 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
 
     // Pass 1: validate every formula and length before touching anything
     // (atomicity).
+    // A batch that writes a table header renames the column before its
+    // formulas are read, so they are checked for syntax only.
+    let cells: Vec<(u32, u32)> = entries.iter().map(|(r, c, _)| (*r, *c)).collect();
+    let renames = app.hits_table_header(si, &cells);
     for (r, c, text) in &entries {
         gridcore::entry::check_len(text)
             .map_err(|e| format!("range.set: {} at {}", e, cell_name(*r, *c)))?;
         if let Some(body) = gridcore::entry::typed_formula(&app.pkg.workbook, si, *r, *c, text) {
-            Engine::validate_in(&app.pkg.workbook, si, *r, *c, body)
+            let checked = if renames {
+                Engine::validate(body)
+            } else {
+                Engine::validate_in(&app.pkg.workbook, si, *r, *c, body)
+            };
+            checked
                 .map_err(|e| format!("range.set: formula error at {}: {e}", cell_name(*r, *c)))?;
         }
     }
@@ -7829,6 +7838,35 @@ mod table_verb_tests {
         ] {
             put(&mut a, "H2", ok);
         }
+    }
+
+    #[test]
+    fn range_set_writing_a_header_and_a_formula_using_it_684() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        let row = |start: &str, cells: &[&str]| {
+            Json::obj(vec![
+                ("start", Json::Str(start.into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(
+                        cells.iter().map(|c| Json::Str((*c).into())).collect(),
+                    )]),
+                ),
+            ])
+        };
+        // The new name is unknown until the header is written.
+        let alone = row("F1", &["=SUM(Sales[Units])"]);
+        assert!(dispatch(&mut a, "range.set", &alone).is_err());
+        // One call writing the header and the formula that uses its new name.
+        let both = row(
+            "B1",
+            &["Units", "Price", "Region", "Extra", "=SUM(Sales[Units])"],
+        );
+        dispatch(&mut a, "range.set", &both).unwrap();
+        assert_eq!(
+            formula_value(&mut a, "F1").0.as_deref(),
+            Some("=SUM(Sales[Units])")
+        );
     }
 
     #[test]
