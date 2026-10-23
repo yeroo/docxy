@@ -6,7 +6,8 @@
 //! [`super::Registry`]. Each type a library declares becomes one
 //! [`ProjectFormat`]: its `read` calls `yppx_plugin_read` and parses the MSPDI
 //! with [`read_mspdi`], its `write` serialises with [`write_mspdi`] and calls
-//! `yppx_plugin_write` with the source bytes. A library is loaded once and
+//! `yppx_plugin_write` with the source bytes (the optional `_ex` variants of
+//! both also carry the plan's formatting). A library is loaded once and
 //! kept for the life of the process, and calls into it are serialised.
 //!
 //! A host that names itself ([`Host`], through [`load_plugins_for`]) also
@@ -21,6 +22,7 @@
 //! put only plugins you trust in a plugin directory.
 
 use super::ProjectFormat;
+use crate::formatting::Formatting;
 use crate::model::Project;
 use crate::mspdi::{read_mspdi, write_mspdi};
 use crate::plugin_abi::{self as abi, YppxBuf};
@@ -28,7 +30,7 @@ use crate::uiplugin::{
     Command, CommandResult, Manifest, OverlayCtx, Shape, State, StateCtx, Target,
 };
 use std::collections::HashSet;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -205,6 +207,8 @@ pub fn load_plugin_for(path: &Path, host: Option<Host>) -> Result<Library, Strin
             formats: symbol(library, abi::SYMBOL_FORMATS)?,
             read: symbol(library, abi::SYMBOL_READ)?,
             write: symbol(library, abi::SYMBOL_WRITE)?,
+            read_ex: optional_symbol(library, abi::SYMBOL_READ_EX),
+            write_ex: optional_symbol(library, abi::SYMBOL_WRITE_EX),
             free,
             last_error,
         }
@@ -318,6 +322,9 @@ struct Api {
     formats: abi::FormatsFn,
     read: abi::ReadFn,
     write: abi::WriteFn,
+    /// Optional: when present, read and write carry the plan's formatting.
+    read_ex: Option<abi::ReadExFn>,
+    write_ex: Option<abi::WriteExFn>,
     free: abi::FreeFn,
     last_error: abi::LastErrorFn,
 }
@@ -341,6 +348,83 @@ impl Plugin {
     /// The message for a non-zero `code` just returned, the lock still held.
     fn error(&self, code: i32) -> String {
         error_message(&self.name, self.api.free, self.api.last_error, code)
+    }
+
+    /// A file's bytes to its MSPDI text and formatting text (empty without
+    /// any), through `yppx_plugin_read_ex` when the library has it, else
+    /// `yppx_plugin_read`. Both buffers are freed whatever the code.
+    fn read_file(&self, ext: &CStr, bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mspdi = YppxBuf::empty();
+        let mut formatting = YppxBuf::empty();
+        // SAFETY: an ABI call; every pointer is valid for its length for the
+        // duration of the call.
+        let code = unsafe {
+            match self.api.read_ex {
+                Some(read_ex) => read_ex(
+                    ext.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &mut mspdi,
+                    &mut formatting,
+                ),
+                None => (self.api.read)(ext.as_ptr(), bytes.as_ptr(), bytes.len(), &mut mspdi),
+            }
+        };
+        let mspdi = self.take(mspdi);
+        let formatting = self.take(formatting);
+        if code != abi::OK {
+            return Err(self.error(code));
+        }
+        Ok((mspdi, formatting))
+    }
+
+    /// MSPDI text and the plan's formatting to a file's bytes, through
+    /// `yppx_plugin_write_ex` when the library has it (`formatting` NULL
+    /// and 0 when `None`), else `yppx_plugin_write`.
+    fn write_file(
+        &self,
+        ext: &CStr,
+        mspdi: &str,
+        formatting: Option<&str>,
+        source: Option<&[u8]>,
+    ) -> Result<Vec<u8>, String> {
+        let (source_ptr, source_len) =
+            source.map_or((std::ptr::null(), 0), |s| (s.as_ptr(), s.len()));
+        let (fmt_ptr, fmt_len) =
+            formatting.map_or((std::ptr::null(), 0), |f| (f.as_ptr(), f.len()));
+        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = YppxBuf::empty();
+        // SAFETY: an ABI call; every pointer is valid for its length for the
+        // duration of the call, and `source_ptr` and `fmt_ptr` are NULL
+        // without a source or formatting.
+        let code = unsafe {
+            match self.api.write_ex {
+                Some(write_ex) => write_ex(
+                    ext.as_ptr(),
+                    mspdi.as_ptr(),
+                    mspdi.len(),
+                    fmt_ptr,
+                    fmt_len,
+                    source_ptr,
+                    source_len,
+                    &mut out,
+                ),
+                None => (self.api.write)(
+                    ext.as_ptr(),
+                    mspdi.as_ptr(),
+                    mspdi.len(),
+                    source_ptr,
+                    source_len,
+                    &mut out,
+                ),
+            }
+        };
+        let bytes = self.take(out);
+        if code != abi::OK {
+            return Err(self.error(code));
+        }
+        Ok(bytes)
     }
 
     /// A JSON call: `input` in, the reply's text out, with a non-zero code
@@ -536,23 +620,17 @@ impl ProjectFormat for PluginFormat {
             return Err(format!("{}: does not read .{}", self.plugin.name, self.ext));
         }
         let plugin = &self.plugin;
-        let xml = {
-            let _guard = plugin.lock.lock().unwrap_or_else(|e| e.into_inner());
-            let mut out = YppxBuf::empty();
-            // SAFETY: an ABI call; every pointer is valid for its length for
-            // the duration of the call.
-            let code = unsafe {
-                (plugin.api.read)(self.ext_c.as_ptr(), bytes.as_ptr(), bytes.len(), &mut out)
-            };
-            let xml = plugin.take(out);
-            if code != abi::OK {
-                return Err(plugin.error(code));
-            }
-            xml
-        };
+        let (xml, formatting) = plugin.read_file(&self.ext_c, bytes)?;
         let xml = String::from_utf8(xml)
             .map_err(|_| format!("{}: the MSPDI it returned is not UTF-8", plugin.name))?;
-        read_mspdi(&xml)
+        let mut project = read_mspdi(&xml)?;
+        if !formatting.is_empty() {
+            let text = String::from_utf8(formatting)
+                .map_err(|_| format!("{}: the formatting it returned is not UTF-8", plugin.name))?;
+            project.formatting = Formatting::from_xml(&text)
+                .map_err(|e| format!("{}: the formatting it returned: {e}", plugin.name))?;
+        }
+        Ok(project)
     }
 
     fn write(&self, project: &Project, source: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -562,29 +640,10 @@ impl ProjectFormat for PluginFormat {
                 self.plugin.name, self.ext
             ));
         }
-        let plugin = &self.plugin;
         let xml = write_mspdi(project);
-        let (source_ptr, source_len) =
-            source.map_or((std::ptr::null(), 0), |s| (s.as_ptr(), s.len()));
-        let _guard = plugin.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = YppxBuf::empty();
-        // SAFETY: an ABI call; every pointer is valid for its length for the
-        // duration of the call, and `source_ptr` is NULL without a source.
-        let code = unsafe {
-            (plugin.api.write)(
-                self.ext_c.as_ptr(),
-                xml.as_ptr(),
-                xml.len(),
-                source_ptr,
-                source_len,
-                &mut out,
-            )
-        };
-        let bytes = plugin.take(out);
-        if code != abi::OK {
-            return Err(plugin.error(code));
-        }
-        Ok(bytes)
+        let formatting = (!project.formatting.is_empty()).then(|| project.formatting.to_xml());
+        self.plugin
+            .write_file(&self.ext_c, &xml, formatting.as_deref(), source)
     }
 }
 
@@ -628,5 +687,112 @@ mod tests {
         );
         assert!(load_plugins(&[dir.clone(), dir.clone()]).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    thread_local! {
+        static CALLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn note(call: String) {
+        CALLS.with(|c| c.borrow_mut().push(call));
+    }
+
+    fn calls() -> Vec<String> {
+        CALLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    unsafe extern "C" fn stub_formats(_: *mut YppxBuf) -> i32 {
+        abi::OK
+    }
+    unsafe extern "C" fn stub_read(
+        _: *const std::os::raw::c_char,
+        _: *const u8,
+        _: usize,
+        _: *mut YppxBuf,
+    ) -> i32 {
+        note("read".into());
+        abi::OK
+    }
+    unsafe extern "C" fn stub_write(
+        _: *const std::os::raw::c_char,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        _: *mut YppxBuf,
+    ) -> i32 {
+        note("write".into());
+        abi::OK
+    }
+    unsafe extern "C" fn stub_read_ex(
+        _: *const std::os::raw::c_char,
+        _: *const u8,
+        _: usize,
+        _: *mut YppxBuf,
+        _: *mut YppxBuf,
+    ) -> i32 {
+        note("read_ex".into());
+        abi::OK
+    }
+    unsafe extern "C" fn stub_write_ex(
+        _: *const std::os::raw::c_char,
+        _: *const u8,
+        _: usize,
+        formatting: *const u8,
+        formatting_len: usize,
+        _: *const u8,
+        _: usize,
+        _: *mut YppxBuf,
+    ) -> i32 {
+        note(format!(
+            "write_ex null={} len={formatting_len}",
+            formatting.is_null()
+        ));
+        abi::OK
+    }
+    unsafe extern "C" fn stub_free(_: *mut YppxBuf) {}
+    unsafe extern "C" fn stub_last_error(_: *mut YppxBuf) -> i32 {
+        1
+    }
+
+    fn stub_plugin(read_ex: bool, write_ex: bool) -> Plugin {
+        Plugin {
+            name: "stub".into(),
+            api: Api {
+                formats: stub_formats,
+                read: stub_read,
+                write: stub_write,
+                read_ex: read_ex.then_some(stub_read_ex as abi::ReadExFn),
+                write_ex: write_ex.then_some(stub_write_ex as abi::WriteExFn),
+                free: stub_free,
+                last_error: stub_last_error,
+            },
+            lock: Mutex::new(()),
+        }
+    }
+
+    #[test]
+    fn each_ex_symbol_is_used_alone_and_the_plain_one_otherwise() {
+        let ext = CString::new("x").unwrap();
+        for (read_ex, write_ex) in [(false, false), (true, false), (false, true), (true, true)] {
+            let plugin = stub_plugin(read_ex, write_ex);
+            plugin.read_file(&ext, b"f").unwrap();
+            plugin.write_file(&ext, "<x/>", Some("<f/>"), None).unwrap();
+            plugin.write_file(&ext, "<x/>", None, None).unwrap();
+            let expected = [
+                if read_ex { "read_ex" } else { "read" },
+                if write_ex {
+                    "write_ex null=false len=4"
+                } else {
+                    "write"
+                },
+                if write_ex {
+                    "write_ex null=true len=0"
+                } else {
+                    "write"
+                },
+            ];
+            assert_eq!(calls(), expected, "read_ex={read_ex} write_ex={write_ex}");
+        }
     }
 }

@@ -87,6 +87,106 @@ fn the_fixture_plugin_round_trips_a_project() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn formatted_plan() -> projcore::Project {
+    use projcore::formatting::{Gridline, LineType, TextStyle, gridlines::Line};
+    let mut project = corpus_plan();
+    let f = &mut project.formatting;
+    f.palette = Some("fx.blue".into());
+    f.set_switch("fx.slack", Some(true));
+    f.set_category(
+        "Summary Tasks",
+        TextStyle {
+            bold: Some(true),
+            color: Some(0x1F3763),
+            ..TextStyle::default()
+        },
+    );
+    f.gridlines.set(
+        Line::GanttRows,
+        Gridline {
+            line_type: LineType::Dotted,
+            color: Some(0xCC3333),
+            interval: 2,
+            interval_type: LineType::Solid,
+            interval_color: None,
+        },
+    );
+    project
+}
+
+#[test]
+fn a_plugin_write_and_read_carry_the_formatting() {
+    let dir = fixture_plugin::plugin_dir("projcore-plugin-formatting");
+    let mut registry = Registry::new();
+    for format in load_plugins(std::slice::from_ref(&dir)) {
+        registry.register(format);
+    }
+    let path = Path::new("plan.fakeproj");
+
+    // The formatting reaches the plugin beside the MSPDI, and comes back.
+    let project = formatted_plan();
+    assert!(!project.formatting.is_empty());
+    let bytes = registry.write(&project, path, None).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains("<!-- fixture-formatting: "), "{text}");
+    let back = registry.read(path, &bytes).unwrap();
+    assert_eq!(back.formatting, project.formatting);
+    assert_eq!(
+        back,
+        read_mspdi(&write_mspdi(&project))
+            .map(|mut p| {
+                p.formatting = project.formatting.clone();
+                p
+            })
+            .unwrap()
+    );
+
+    // With a source file the note follows the trailer; both still read.
+    let with_source = registry.write(&project, path, Some(b"abc")).unwrap();
+    assert!(with_source.ends_with(b"<!-- fixture: source 3 bytes -->\n"));
+    assert_eq!(
+        registry.read(path, &with_source).unwrap().formatting,
+        project.formatting
+    );
+
+    // The plain read (what a host without the `_ex` symbols calls) parses
+    // the MSPDI with the trailer after it.
+    assert_eq!(read_mspdi(&text).unwrap().tasks, project.tasks);
+
+    // No formatting: NULL and 0 reach the plugin (no trailer), and a read
+    // leaves the formatting default.
+    let plain = corpus_plan();
+    let bytes = registry.write(&plain, path, None).unwrap();
+    assert_eq!(bytes, write_mspdi(&plain).into_bytes());
+    assert!(registry.read(path, &bytes).unwrap().formatting.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn formatting_a_plugin_returns_that_cannot_be_read_fails_the_read() {
+    let dir = fixture_plugin::plugin_dir("projcore-plugin-formatting-bad");
+    let mut registry = Registry::new();
+    for format in load_plugins(std::slice::from_ref(&dir)) {
+        registry.register(format);
+    }
+    let path = Path::new("plan.fakeproj");
+    let name = "yppx_fixture".to_string() + std::env::consts::DLL_SUFFIX;
+    for (marker, why) in [
+        ("<!-- fixture-formatting-nonutf8 -->", "not UTF-8"),
+        (
+            "<!-- fixture-formatting-malformed -->",
+            "the formatting it returned",
+        ),
+    ] {
+        let file = format!("{}{marker}\n", write_mspdi(&corpus_plan()));
+        let error = registry.read(path, file.as_bytes()).unwrap_err();
+        assert!(error.starts_with(&format!("{name}: ")), "{error}");
+        assert!(error.contains(why), "{error}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn plugin_errors_carry_the_plugin_message() {
     let dir = fixture_plugin::plugin_dir("projcore-plugin-errors");

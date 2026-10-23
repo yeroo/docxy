@@ -10,9 +10,18 @@
 //! - writing with source bytes appends `<!-- fixture: source N bytes -->`
 //!   after the MSPDI, so a test can see the source arrive.
 //!
+//! - `yppx_plugin_write_ex` / `yppx_plugin_read_ex` (`fmt`) carry the plan's
+//!   formatting: a write appends `<!-- fixture-formatting: <hex> -->` after
+//!   the MSPDI when formatting is given (nothing when it is NULL), and a read
+//!   strips that trailer and returns the formatting. The markers
+//!   `<!-- fixture-formatting-nonutf8 -->` and
+//!   `<!-- fixture-formatting-malformed -->` make a read return formatting
+//!   the host must refuse.
+//!
 //! It also carries the optional version target and user-interface symbols
 //! (`ui`), so the hosts' UI plumbing is covered without any real plugin.
 
+mod fmt;
 mod json;
 mod ui;
 
@@ -66,7 +75,7 @@ pub(crate) unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
 
 /// # Safety
 /// `ext` is NULL or a NUL-terminated string.
-unsafe fn is_ours(ext: *const c_char) -> bool {
+pub(crate) unsafe fn is_ours(ext: *const c_char) -> bool {
     // SAFETY: the caller's contract.
     !ext.is_null() && unsafe { CStr::from_ptr(ext) }.to_bytes() == b"fakeproj"
 }
