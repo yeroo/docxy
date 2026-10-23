@@ -142,7 +142,7 @@ impl StyleSheet {
         direct: &RunProps,
     ) -> RunProps {
         let mut agg = self.default_run.clone();
-        if let Some(s) = para_style {
+        if let Some(s) = para_style.or(self.default_paragraph.as_deref()) {
             let mut seen = HashSet::new();
             self.fold(&mut agg, s, &mut seen);
         }
@@ -252,12 +252,13 @@ impl StyleSheet {
         agg.vanish.unwrap_or(false)
     }
 
-    /// Effective alignment: direct wins; otherwise inherit from the style chain.
+    /// Effective alignment: direct wins; otherwise inherit from the style chain
+    /// (the default paragraph style's when the paragraph names none).
     pub fn effective_align(&self, para_style: Option<&str>, direct: Align) -> Align {
         if direct != Align::Left {
             return direct;
         }
-        if let Some(s) = para_style {
+        if let Some(s) = para_style.or(self.default_paragraph.as_deref()) {
             let mut seen = HashSet::new();
             if let Some(a) = self.fold_align(s, &mut seen) {
                 return a;
@@ -279,7 +280,7 @@ impl StyleSheet {
         if has_raw_child(&direct.raw_props, "bidi") {
             return Some(false);
         }
-        if let Some(s) = para_style {
+        if let Some(s) = para_style.or(self.default_paragraph.as_deref()) {
             let mut seen = HashSet::new();
             if let Some(rtl) = self.fold_rtl(s, &mut seen) {
                 return Some(rtl);
@@ -401,6 +402,7 @@ impl StyleSheet {
     pub fn effective_tabs(&self, para_style: Option<&str>) -> Vec<TabStop> {
         let mut seen = HashSet::new();
         para_style
+            .or(self.default_paragraph.as_deref())
             .map(|s| self.fold_tabs(s, &mut seen))
             .unwrap_or_default()
     }
@@ -425,6 +427,7 @@ impl StyleSheet {
     /// most-derived side from the style chain.
     pub fn effective_borders(&self, para_style: Option<&str>, direct: ParBorders) -> ParBorders {
         let style_b = para_style
+            .or(self.default_paragraph.as_deref())
             .map(|s| self.fold_borders(s, &mut HashSet::new()))
             .unwrap_or_default();
         ParBorders {
@@ -1165,6 +1168,62 @@ mod tests {
             r#"<w:styles><w:style w:type="paragraph" w:styleId="Normal"><w:pPr><w:pageBreakBefore/></w:pPr></w:style></w:styles>"#,
         );
         assert!(!none.effective_ppr_flag(None, &props, PprFlag::PageBreakBefore));
+    }
+
+    /// #797: every resolver falls back to the default paragraph style when a
+    /// paragraph names none; a named style replaces it, direct wins, and with
+    /// no default style nothing changes.
+    #[test]
+    fn every_resolver_falls_back_to_the_default_paragraph_style_797() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+              <w:pPr><w:jc w:val="center"/><w:bidi/><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs>
+                <w:pBdr><w:top w:val="single" w:sz="4"/></w:pBdr></w:pPr>
+              <w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr>
+            </w:style>
+            <w:style w:type="paragraph" w:styleId="Other"/>
+        </w:styles>"#,
+        );
+        let none = parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="Normal"><w:pPr><w:jc w:val="center"/></w:pPr></w:style></w:styles>"#,
+        );
+        let direct = RunProps::default();
+        let run = ss.effective_run(None, None, &direct);
+        assert!(run.bold);
+        assert_eq!(run.color.as_deref(), Some("FF0000"));
+        assert!(!ss.effective_run(Some("Other"), None, &direct).bold);
+        assert!(!none.effective_run(None, None, &direct).bold);
+        let own = RunProps {
+            color: Some("00FF00".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ss.effective_run(None, None, &own).color.as_deref(),
+            Some("00FF00")
+        );
+
+        assert_eq!(ss.effective_align(None, Align::Left), Align::Center);
+        assert_eq!(ss.effective_align(None, Align::Right), Align::Right);
+        assert_eq!(ss.effective_align(Some("Other"), Align::Left), Align::Left);
+        assert_eq!(none.effective_align(None, Align::Left), Align::Left);
+
+        let props = ParProps::default();
+        assert_eq!(ss.paragraph_rtl_override(None, &props), Some(true));
+        assert_eq!(ss.paragraph_rtl_override(Some("Other"), &props), None);
+
+        assert_eq!(ss.effective_tabs(None).len(), 1);
+        assert!(ss.effective_tabs(Some("Other")).is_empty());
+        assert!(none.effective_tabs(None).is_empty());
+
+        assert!(ss
+            .effective_borders(None, ParBorders::default())
+            .top
+            .is_some());
+        assert!(ss
+            .effective_borders(Some("Other"), ParBorders::default())
+            .top
+            .is_none());
     }
 
     /// #918: hidden text through a character style, a paragraph style (or
