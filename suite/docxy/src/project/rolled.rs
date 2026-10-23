@@ -42,8 +42,11 @@ pub(crate) fn rolled_parts(
     }
     let tasks = &ed.project().tasks;
     let at = tasks.iter().position(|t| t.uid == summary.uid)?;
+    // The outline rule of `Editor`'s subtrees: a blank row is skipped, and
+    // one after the last descendant is not part of the subtree.
     let children = tasks[at + 1..]
         .iter()
+        .filter(|t| !t.is_null)
         .take_while(|t| t.outline_level > summary.outline_level)
         .filter(|t| !t.summary)
         .filter_map(|t| {

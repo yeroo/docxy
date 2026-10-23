@@ -1402,3 +1402,59 @@ fn rolled_children_skip_inactive_tasks_and_honour_round_bars() {
     .unwrap();
     assert_eq!(off[0].kind, BarKind::OnTrack);
 }
+
+#[test]
+fn rolled_children_walk_past_a_blank_row_and_stop_at_the_next_sibling() {
+    let blank = Task {
+        is_null: true,
+        outline_level: 0,
+        ..task(5, 0, 0)
+    };
+    let trailing = Task {
+        is_null: true,
+        outline_level: 0,
+        ..task(8, 0, 0)
+    };
+    let mut ed = editor(vec![
+        task(1, 0, 1),
+        task(2, 0, 2),
+        task(3, 2, 3),
+        task(4, 1, 2),
+        blank,
+        task(6, 0, 2),
+        task(7, 3, 3),
+        trailing,
+        task(9, 1, 1),
+    ]);
+    set_layout(&mut ed, r#"{"rollup":true}"#);
+    ed.set_collapsed(1, true).unwrap();
+    // The blank row between two descendants goes with the subtree; a blank
+    // one after the last, and the next level-1 task, do not.
+    assert_eq!(rolled(&ed, 1), Some(vec![3, 4, 7]));
+}
+
+#[test]
+fn layout_drawn_lists_rects_with_the_row_offset_and_skips_table_rows_for_rollups() {
+    let mut p = untitled_project();
+    p.tasks = vec![task(1, 0, 1), task(2, 2, 2), task(3, 0, 2), task(4, 1, 1)];
+    let mut view = ProjectView::new(p, false);
+    let scale = view.scale;
+    let set = projcore::json::Json::parse(r#"{"layout":{"bar_height":12,"rollup":true}}"#).unwrap();
+    view.ed.edit_formatting(|f| {
+        f.apply_view(&set).unwrap();
+    });
+    let (rects, rolls) = layout_drawn(&view, scale);
+    assert_eq!(rects.len(), 4);
+    let fields = |s: &str| s.split(':').map(str::to_string).collect::<Vec<_>>();
+    // Task 2 is the second drawn row: y = 28 + 4 (a 16 px bar centred on 12).
+    let second = fields(&rects[1]);
+    assert_eq!((second[0].as_str(), second[2].as_str(), second[4].as_str()), ("2", "32", "16"));
+    // The summary: 16 px bar -> an 11 px summary centred on y 14.
+    assert_eq!((fields(&rects[0])[2].as_str(), fields(&rects[0])[4].as_str()), ("8.5", "11"));
+    assert_eq!(rolls, ["1:2"]);
+    // A Bar Styles table draws every row itself: no roll-up is reported.
+    view.ed.edit_formatting(|f| f.set_bars(vec![projcore::formatting::BarRow::default()]));
+    let (rects, rolls) = layout_drawn(&view, scale);
+    assert_eq!(rects.len(), 4);
+    assert!(rolls.is_empty());
+}

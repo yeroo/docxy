@@ -192,9 +192,10 @@ test a command's view.bars draws the bar style rows, grows the rows and resets (
 test a command's view.layout sets the Layout fields, draws taller bars and clears (#1695)
   # The fixture's Layout sets 12 pt bars, roll-up on, round bars off and the
   # stored-only fields, in one undo step; a second press, seeing the bar
-  # height, clears them. The shots show the 16 px bars (12 pt); their
-  # rectangles are `bar_rects` in the state, pinned by the unit tests (the
-  # case was written without being run: macOS cannot drive the window).
+  # height, clears them. The shots show the 16 px bars (12 pt). The state's
+  # `bar_rects` and `rolled_bars` are pinned by the `layout_drawn` unit test,
+  # not here (the case was written without being run: macOS cannot drive the
+  # window).
   open copy:../fixtures/project-clipboard.xml
   assert layout.bar_height is nothing
   assert dirty is false

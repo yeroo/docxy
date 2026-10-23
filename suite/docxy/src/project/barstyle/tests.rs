@@ -606,8 +606,8 @@ fn a_milestone_row_is_centred_in_its_day_like_the_palette_diamond() {
     let t = ed.project().task(2).unwrap();
     let bar = gantt_bar(&ed, t, scale).unwrap();
     let rows = bar_rows(&ed, t, scale, look(1)).unwrap();
-    // The diamond's 14 px box starts at milestone_x; its centre is the mark's.
-    let centre = milestone_x(bar.start, scale.day_w) + 7.;
+    // The diamond's 14 px box starts at milestone_left; its centre is the mark's.
+    let centre = milestone_left(&bar, scale.day_w) + bar_boxes(bar.geom.height).diamond.1 / 2.;
     assert_eq!((rows[0].x0, rows[0].x1), (centre, centre));
     let marks: Vec<f32> = bar_parts(&rows)
         .iter()
@@ -736,7 +736,7 @@ fn only_a_milestones_own_dates_are_centred() {
     let deadline = instant_x(scale, 0., tk.deadline.unwrap());
     assert_eq!((rows[0].x0, rows[0].x1), (deadline, deadline));
     let bar = gantt_bar(&ed, tk, scale).unwrap();
-    let centre = milestone_x(bar.start, scale.day_w) + 7.;
+    let centre = milestone_left(&bar, scale.day_w) + bar_boxes(bar.geom.height).diamond.1 / 2.;
     assert_eq!((rows[1].x0, rows[1].x1), (centre, centre));
 }
 

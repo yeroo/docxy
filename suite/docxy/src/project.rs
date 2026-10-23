@@ -850,7 +850,7 @@ pub(super) fn project_state(
 /// rectangle, `<uid>:<x>:<y>:<w>:<h>` with y from the top of the first row
 /// (the chart pixels `OverlayRow.bar` reports), and each summary row that
 /// rolls up, `<uid>:<children drawn>`.
-fn layout_drawn(v: &ProjectView, scale: GanttScale) -> (Vec<String>, Vec<String>) {
+pub(crate) fn layout_drawn(v: &ProjectView, scale: GanttScale) -> (Vec<String>, Vec<String>) {
     let tasks = &v.ed.project().tasks;
     let (mut rects, mut rolls) = (Vec::new(), Vec::new());
     for (row, t) in v
@@ -866,6 +866,11 @@ fn layout_drawn(v: &ProjectView, scale: GanttScale) -> (Vec<String>, Vec<String>
         let (x, y, w, h) = bar_rect(&bar, scale.day_w);
         let y = y + row as f32 * v.row_h();
         rects.push(format!("{}:{x}:{y}:{w}:{h}", t.uid));
+        // A row the Bar Styles table (or an override) draws shows no roll-up.
+        let look = PaletteLook::of(Some(bar), crate::plugin_ui::palette(v).as_ref());
+        if bar_rows(&v.ed, t, scale, look).is_some() {
+            continue;
+        }
         if let Some(children) = rolled_parts(&v.ed, t, scale, |b| v.styled_bar(b)) {
             rolls.push(format!("{}:{}", t.uid, children.len()));
         }
@@ -1853,7 +1858,10 @@ pub(super) fn project_el(
                                                     );
                                                     bar_styled(&v.ed, t, scale, look)
                                                 });
+                                                // Roll-up is not drawn under a Bar
+                                                // Styles table or an override.
                                                 let rolled = task
+                                                    .filter(|_| styled.is_none())
                                                     .filter(|_| bar.is_some_and(|b| b.kind == BarKind::Summary))
                                                     .and_then(|t| {
                                                         rolled_parts(&v.ed, t, scale, |b| {

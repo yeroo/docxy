@@ -1249,16 +1249,21 @@
   `bar_rect` (so the overlay's `OverlayRow.bar`) and the palette stand-in
   under an override with no Bar Styles table all read it. Round bars off
   places a bar on its instants (`span_x`) and a milestone's centre on its start
-  instant; the Bar Styles table (#1696) already places by instants and is
-  unchanged; baseline and leveling-delay marks stay whole-day, so they no
-  longer line up with a bar that starts or ends mid-day (known mismatch).
+  instant. The Bar Styles table (#1696) is unchanged: with round bars off,
+  table-drawn and override bars (and `OverlayRow.bar` for those tasks) keep
+  their whole-day Start/Finish edges, and baseline and leveling-delay marks
+  stay whole-day, so they no longer line up with a palette bar that starts or
+  ends mid-day (known mismatches).
 - Roll-up is `project/rolled.rs` (`rolled_parts`, per frame for the summary
   rows drawn): with `rollup` on and the summary collapsed, or expanded unless
   `hide_rollup_expanded`, the row also draws its descendant leaves and
   milestones (inactive ones skipped, nested summaries only through their
   leaves, rows an AutoFilter hides still roll up), 4s px bars and 8s px
   diamonds centred on y 14 (`s` = bar height / 14) with a 1 px panel outline,
-  in the kind's palette colour (the view's critical toggle applies). They take
+  in the kind's palette colour (the view's critical toggle applies; a
+  milestone child sits on a panel-coloured diamond one px larger). Under a
+  Bar Styles table or an override roll-up is not drawn (nor listed in
+  `rolled_bars`). The summary is painted first, its children over it. They take
   the place of a manual summary's own rolled-up strip (`GanttBar::rollup`, a
   different thing) while roll-up is on. The task's own `Rollup` flag (Task
   Information) is still not drawn.

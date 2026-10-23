@@ -323,7 +323,8 @@ impl Formatting {
     /// boolean, null clearing one), and the bar styles `bars` (an array
     /// replacing the Bar Styles table, null clearing it) and `task_bars`
     /// (an array of per-task overrides, null clearing all; see [`bars`],
-    /// #1696). Other keys are the host's and ignored here. `true` when
+    /// #1696), and `layout` (an object of the [`layout`] keys, null
+    /// clearing them all, #1695). Other keys are the host's and ignored here. `true` when
     /// something changed.
     pub fn apply_view(&mut self, view: &Json) -> Result<bool, String> {
         let before = self.clone();

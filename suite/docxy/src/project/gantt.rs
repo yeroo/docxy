@@ -95,12 +95,6 @@ pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
     }
 }
 
-/// The left of a milestone's 14 px diamond: centred in its day.
-#[cfg(test)]
-pub(crate) fn milestone_x(start: i64, day_w: f32) -> f32 {
-    start as f32 * day_w + day_w / 2. - 7.
-}
-
 /// The left of `bar`'s milestone diamond: centred in its day, or on its
 /// start instant with round bars off.
 pub(crate) fn milestone_left(bar: &GanttBar, day_w: f32) -> f32 {
@@ -966,7 +960,7 @@ pub(crate) fn gantt_strip(
         }
         let marker = probe(probes, format!("bar:{id}"));
         let outline = if shape == BarShape::Diamond {
-            let (_, y, size, _) = bar_rect(&bar, dw);
+            let (y, size) = boxes.diamond;
             div()
                 .absolute()
                 .left(px(milestone_left(&bar, dw)))
@@ -983,8 +977,8 @@ pub(crate) fn gantt_strip(
             at(bx, bw, y, h, hsla_u(color), true).child(marker)
         };
         return strip
-            .children(rolled_children(rolled, bar, palette, pal))
-            .child(outline.on_mouse_down(MouseButton::Right, on_right));
+            .child(outline.on_mouse_down(MouseButton::Right, on_right))
+            .children(rolled_children(rolled, bar, palette, pal));
     }
     // A manual summary's rollup: a thin bar above its own. Its warning marks
     // the part past its finish, else its own finish day (an overrun within
@@ -1051,9 +1045,10 @@ pub(crate) fn gantt_strip(
             .child(milestone_diamond(color, false))
             .child(marker),
     };
+    // The children are painted after the summary, over it.
     strip
-        .children(rolled_children(rolled, bar, palette, pal))
         .child(element.on_mouse_down(MouseButton::Right, on_right))
+        .children(rolled_children(rolled, bar, palette, pal))
 }
 
 /// A summary's rolled-up children (#1695): thin bars and diamonds centred on
@@ -1081,7 +1076,19 @@ fn rolled_children(
             };
             let el = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h));
             match c.kind {
-                BarKind::Milestone => el.child(milestone_diamond(color, false)),
+                // A panel-coloured diamond one px larger behind it.
+                BarKind::Milestone => {
+                    let panel: Rgba = pal.panel.into();
+                    let channel = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+                    let panel = channel(panel.r) << 16 | channel(panel.g) << 8 | channel(panel.b);
+                    div()
+                        .absolute()
+                        .left(px(x - 1.))
+                        .top(px(y - 1.))
+                        .size(px(w + 2.))
+                        .child(milestone_diamond(panel, false))
+                        .child(el.left(px(1.)).top(px(1.)).child(milestone_diamond(color, false)))
+                }
                 _ => el
                     .bg(hsla_u(color))
                     .border_1()
