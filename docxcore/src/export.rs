@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::border_style::BorderStyle;
+use crate::border_style::{BorderStyle, Motif};
 use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
@@ -41,6 +41,25 @@ use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
 
 mod cid;
+mod pic;
+
+pub use pic::PdfImage;
+
+/// A picture watermark of a header part (#797).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PicWatermark {
+    /// Index into [`PdfOptions::images`].
+    pub image: usize,
+    /// Clockwise rotation in degrees.
+    pub rotation: f32,
+    /// The shape's size in points; a missing side follows the other by the
+    /// picture's aspect, and both missing mean its pixel size at 96 dpi,
+    /// shrunk to fit the margin box.
+    pub width_pt: Option<f32>,
+    pub height_pt: Option<f32>,
+    /// 0..1; washed out to one half when the shape sets none.
+    pub opacity: Option<f32>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PdfOptions {
@@ -57,6 +76,12 @@ pub struct PdfOptions {
     /// The text watermarks of each header part, keyed by part name; drawn
     /// behind the body on every page that applies the header.
     pub watermarks: HashMap<String, Vec<TextWatermark>>,
+    /// The picture watermarks of each header part, keyed by part name; drawn
+    /// washed out behind the body, after the text ones. Each names an entry
+    /// of `images`.
+    pub picture_watermarks: HashMap<String, Vec<PicWatermark>>,
+    /// The pictures `picture_watermarks` draw, written once each.
+    pub images: Vec<Rc<PdfImage>>,
     /// Main document relationships, resolving each section's header/footer
     /// references to part names.
     pub rels: Relationships,
@@ -93,6 +118,8 @@ impl Default for PdfOptions {
             styles: Rc::new(StyleSheet::default()),
             header_footer: HashMap::new(),
             watermarks: HashMap::new(),
+            picture_watermarks: HashMap::new(),
+            images: Vec::new(),
             rels: Relationships::default(),
             last_sect_pr: None,
             even_and_odd_headers: false,
@@ -115,6 +142,9 @@ impl PdfOptions {
         let rels = pkg.document_rels();
         let mut header_footer = HashMap::new();
         let mut watermarks = HashMap::new();
+        let mut picture_watermarks = HashMap::new();
+        let mut images: Vec<Rc<PdfImage>> = Vec::new();
+        let mut image_of: HashMap<String, Option<usize>> = HashMap::new();
         for (_, target, external) in rels.iter() {
             if external {
                 continue;
@@ -133,6 +163,30 @@ impl PdfOptions {
                 if !marks.is_empty() {
                     watermarks.insert(name.clone(), marks);
                 }
+                let mut pics = Vec::new();
+                for mark in crate::package::picture_watermarks(&xml) {
+                    let Some(media) = pkg.part_rel_target(&name, &mark.rid) else {
+                        continue;
+                    };
+                    let index = *image_of.entry(media.clone()).or_insert_with(|| {
+                        let image = PdfImage::parse(pkg.part(&media)?)?;
+                        images.push(Rc::new(image));
+                        Some(images.len() - 1)
+                    });
+                    let Some(image) = index else {
+                        continue;
+                    };
+                    pics.push(PicWatermark {
+                        image,
+                        rotation: mark.rotation,
+                        width_pt: mark.width_pt,
+                        height_pt: mark.height_pt,
+                        opacity: mark.opacity,
+                    });
+                }
+                if !pics.is_empty() {
+                    picture_watermarks.insert(name.clone(), pics);
+                }
             }
             if let Some(blocks) = pkg.header_footer_blocks(&name) {
                 header_footer.insert(name, Rc::new(blocks));
@@ -149,6 +203,8 @@ impl PdfOptions {
             styles,
             header_footer,
             watermarks,
+            picture_watermarks,
+            images,
             rels,
             last_sect_pr: Some(pkg.sect_pr().to_string()),
             even_and_odd_headers: pkg.has_even_odd(),
@@ -518,7 +574,11 @@ fn parse_page_borders(sect: &str) -> PageBorders {
         let color = xml_attr_value(el, "w:color")
             .and_then(|c| parse_hex(&c))
             .map_or((0.0, 0.0, 0.0), rgb_f);
-        let eighths = if style == BorderStyle::Art { 1.0 } else { 8.0 };
+        let eighths = if matches!(style, BorderStyle::Art | BorderStyle::Motif(_)) {
+            1.0
+        } else {
+            8.0
+        };
         out.sides[i] = Some(BorderSide {
             width: num_attr(el, "w:sz").map_or(0.5, |sz| (sz / eighths).max(0.25)),
             space: num_attr(el, "w:space").unwrap_or(0.0),
@@ -698,6 +758,49 @@ struct WatermarkDraw {
     color: (f32, f32, f32),
 }
 
+/// A picture watermark placed on a page: a `w` by `h` box centred on
+/// `(cx, cy)`, turned `angle` degrees counter-clockwise.
+#[derive(Debug, Clone)]
+struct PictureDraw {
+    image: usize,
+    w: f32,
+    h: f32,
+    cx: f32,
+    cy: f32,
+    angle: f32,
+    /// Percent, the name of the page's graphics state.
+    opacity: u32,
+}
+
+impl PictureDraw {
+    fn place(
+        mark: &PicWatermark,
+        image: &PdfImage,
+        (left, bottom, right, top): (f32, f32, f32, f32),
+    ) -> Self {
+        let aspect = image.width as f32 / image.height as f32;
+        let (w, h) = match (mark.width_pt, mark.height_pt) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w / aspect),
+            (None, Some(h)) => (h * aspect, h),
+            (None, None) => {
+                let (w, h) = (image.width as f32 * 0.75, image.height as f32 * 0.75);
+                let fit = ((right - left) / w).min((top - bottom) / h).min(1.0);
+                (w * fit, h * fit)
+            }
+        };
+        PictureDraw {
+            image: 0,
+            w: w.max(1.0),
+            h: h.max(1.0),
+            cx: (left + right) / 2.0,
+            cy: (bottom + top) / 2.0,
+            angle: -mark.rotation,
+            opacity: (mark.opacity.unwrap_or(0.5) * 100.0).round() as u32,
+        }
+    }
+}
+
 impl WatermarkDraw {
     /// Place `mark` in the margin box `(left, bottom, right, top)`, Word's
     /// default (`mso-position-*-relative:margin`, centred).
@@ -739,8 +842,23 @@ struct Rule {
     color: (f32, f32, f32),
     /// A dash array in points; empty for a solid line.
     dash: Vec<f32>,
+    shape: RuleShape,
 }
 
+/// How a [`Rule`] is stroked between its end points.
+#[derive(Clone, Copy, PartialEq)]
+enum RuleShape {
+    Line,
+    /// A sine line `amp` off the straight one with wavelength `len`.
+    Wave {
+        amp: f32,
+        len: f32,
+    },
+    /// Motifs of side `width`, tiled along it.
+    Motif(Motif),
+}
+
+#[derive(Clone)]
 struct Page {
     w: f32,
     h: f32,
@@ -762,6 +880,8 @@ struct Page {
     hf_links: Vec<Link>,
     /// Text watermarks from the page's header, drawn behind everything else.
     watermarks: Vec<WatermarkDraw>,
+    /// Picture watermarks, drawn after the text ones.
+    pictures: Vec<PictureDraw>,
     rules: Vec<Rule>,
     /// Every body line, in layout order (vertical alignment, column balancing).
     lines: Vec<LineRec>,
@@ -846,6 +966,12 @@ trait Flow {
     fn hard_break(&mut self, kind: BreakKind);
     /// Nothing has been laid out on the current page yet.
     fn at_top(&self) -> bool;
+}
+
+/// Whether every column of a set is as wide as the first.
+fn equal_widths(xs: &[(f32, f32)]) -> bool {
+    xs.first()
+        .is_none_or(|&(_, w0)| xs.iter().all(|&(_, w)| (w - w0).abs() <= 0.01))
 }
 
 fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
@@ -1327,6 +1453,7 @@ impl Flow for BandFlow {
 }
 
 /// A column set on one page, belonging to one section.
+#[derive(Clone)]
 struct Region {
     /// Unique per column set per page, tying [`LineRec`]s to it.
     id: u32,
@@ -1364,10 +1491,34 @@ struct Pager<'a> {
     chapters: HashMap<*const Paragraph, (u8, Option<String>)>,
     /// The heading begun, until its first line settles on a page.
     pending_chapter: Option<(u8, Option<String>)>,
+    /// The body's paragraphs and tables in order: paragraph ordinal `n`
+    /// (`para`) is `blocks[n - 1]`.
+    blocks: Vec<&'a Block>,
+    /// The page as it was before the first line of the current column set
+    /// with unequal widths landed on it, to lay it out again balanced.
+    region_snap: Option<RegionSnap>,
+    /// Set while a column set is laid out again at a trial height.
+    trial: Option<Trial>,
+}
+
+/// A page and counters before a column set's first line on it (#797).
+struct RegionSnap {
+    region: u32,
+    /// The ordinal of the paragraph that line belongs to.
+    para: u32,
+    page: Page,
+    line_count: LineCount,
+}
+
+/// A trial layout of a column set: columns hold `bottom` and no more, and
+/// running out of columns (or breaking the page) fails it.
+struct Trial {
+    bottom: Option<f32>,
+    failed: bool,
 }
 
 /// The line-number counter and where it last counted, for `w:restart`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LineCount {
     count: u32,
     /// The page index and section of the last counted line.
@@ -1375,7 +1526,7 @@ struct LineCount {
 }
 
 impl<'a> Pager<'a> {
-    fn run(doc: &Document, opts: &'a PdfOptions) -> Vec<Page> {
+    fn run(doc: &'a Document, opts: &'a PdfOptions) -> Vec<Page> {
         let sections = split_sections(doc, opts);
         let raws: Vec<&str> = sections.iter().map(|(_, raw)| *raw).collect();
         let sects: Vec<SectionLayout> = raws
@@ -1410,6 +1561,13 @@ impl<'a> Pager<'a> {
             line_count: LineCount::default(),
             chapters,
             pending_chapter: None,
+            blocks: doc
+                .body
+                .iter()
+                .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
+                .collect(),
+            region_snap: None,
+            trial: None,
         };
         for (i, (range, _)) in sections.iter().enumerate() {
             pager.start_section(i);
@@ -1491,6 +1649,19 @@ impl<'a> Pager<'a> {
             .flatten()
             .map(|mark| WatermarkDraw::place(mark, margin_box, Metrics::of(opts)))
             .collect();
+        let pictures: Vec<PictureDraw> = parts
+            .and_then(|p| p.headers[variant.index()].as_ref())
+            .and_then(|a| opts.picture_watermarks.get(&a.part_name))
+            .into_iter()
+            .flatten()
+            .filter_map(|mark| {
+                let image = opts.images.get(mark.image)?;
+                Some(PictureDraw {
+                    image: mark.image,
+                    ..PictureDraw::place(mark, image, margin_box)
+                })
+            })
+            .collect();
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
         let mut hf_links = Vec::new();
@@ -1554,6 +1725,7 @@ impl<'a> Pager<'a> {
             hf_frags,
             hf_links,
             watermarks,
+            pictures,
             rules: Vec::new(),
             lines: Vec::new(),
             min_base: f32::INFINITY,
@@ -1578,6 +1750,7 @@ impl<'a> Pager<'a> {
             x += w + space;
         }
         self.next_region += 1;
+        self.region_snap = None;
         self.region = Region {
             id: self.next_region,
             sect,
@@ -1614,6 +1787,7 @@ impl<'a> Pager<'a> {
                 width: 0.5,
                 color: (0.0, 0.0, 0.0),
                 dash: Vec::new(),
+                shape: RuleShape::Line,
             });
         }
     }
@@ -1622,6 +1796,9 @@ impl<'a> Pager<'a> {
         if self.region.col + 1 < self.region.xs.len() {
             self.region.col += 1;
             self.y = self.region.top;
+        } else if let Some(trial) = self.trial.as_mut() {
+            trial.failed = true;
+            self.y = self.region.top;
         } else {
             self.new_page(self.region.sect, false, false);
         }
@@ -1629,18 +1806,17 @@ impl<'a> Pager<'a> {
 
     /// Balance the ending column set's lines on this page before a continuous
     /// section starts below it, as Word does: re-pour them in order into its
-    /// columns so the tallest column is as short as possible. Lines don't
-    /// re-wrap, so only equal-width columns are balanced, and not after a
-    /// column break (which placed the lines deliberately).
+    /// columns so the tallest column is as short as possible. Equal-width
+    /// columns re-pour the lines as they are; unequal ones lay the paragraphs
+    /// out again ([`Pager::balance_unequal`]). Neither balances after a column
+    /// break (which placed the lines deliberately).
     fn balance_region(&mut self) {
         let region = &self.region;
-        let Some(&(_, w0)) = region.xs.first() else {
+        if region.xs.len() < 2 || region.column_break {
             return;
-        };
-        if region.xs.len() < 2
-            || region.column_break
-            || region.xs.iter().any(|&(_, w)| (w - w0).abs() > 0.01)
-        {
+        }
+        if !equal_widths(&region.xs) {
+            self.balance_unequal();
             return;
         }
         let Some(page) = self.pages.last_mut() else {
@@ -1722,6 +1898,98 @@ impl<'a> Pager<'a> {
         }
         page.min_base = page.lines.iter().map(|l| l.y).fold(f32::INFINITY, f32::min);
         self.region.low = low;
+    }
+
+    /// Balance a column set whose columns differ in width (#797). Lines
+    /// wrap per column, so its paragraphs are laid out again from the
+    /// snapshot taken before its first line, with the columns held to a trial
+    /// height that is bisected for the smallest one all the paragraphs still
+    /// fit in. The first, unlimited, layout must reproduce the lines already
+    /// placed, or the set is left as it is (a page break, or a paragraph
+    /// that began on the page before); so must a result that is no shorter.
+    fn balance_unequal(&mut self) {
+        let Some(snap) = self.region_snap.take() else {
+            return;
+        };
+        let last = self.pages.len() - 1;
+        let p0 = snap.para as usize;
+        if snap.region != self.region.id || p0 == 0 || p0 > self.para as usize {
+            return;
+        }
+        let ended = self.para as usize;
+        let Some(blocks) = self.blocks.get(p0 - 1..ended) else {
+            return;
+        };
+        let blocks: Vec<&Block> = blocks.to_vec();
+        // A paragraph that began on the page before can't start over.
+        if last > 0
+            && self.pages[last - 1]
+                .lines
+                .iter()
+                .any(|l| l.para as usize == p0)
+        {
+            return;
+        }
+        let first = snap.page.lines.len();
+        let original = self.pages[last].clone();
+        let saved_region = self.region.clone();
+        let saved_y = self.y;
+        let saved_para = self.para;
+        let saved_numbered = self.numbered;
+        let saved_line_count = self.line_count.clone();
+        let saved_pending = self.pending_chapter.clone();
+        let top = self.region.top;
+        let room = top - snap.page.body_bottom;
+        let opts = self.opts;
+        let layout = |pager: &mut Self, height: Option<f32>| -> bool {
+            pager.pages[last] = snap.page.clone();
+            pager.line_count = snap.line_count.clone();
+            pager.region.col = 0;
+            pager.region.low = top;
+            pager.region.placed = false;
+            pager.y = top;
+            pager.para = (p0 - 1) as u32;
+            pager.pending_chapter = None;
+            pager.trial = Some(Trial {
+                bottom: height.map(|h| top - h),
+                failed: false,
+            });
+            for block in &blocks {
+                emit_block(pager, block, opts);
+            }
+            !pager.trial.take().is_some_and(|t| t.failed)
+        };
+        let reproduced = layout(self, None) && {
+            let (now, was) = (&self.pages[last].lines[first..], &original.lines[first..]);
+            now.len() == was.len()
+                && now.iter().zip(was).all(|(a, b)| {
+                    a.col == b.col && (a.y - b.y).abs() < 0.01 && (a.lh - b.lh).abs() < 0.01
+                })
+        };
+        let mut best = None;
+        if reproduced {
+            let (mut lo, mut hi) = (0.0_f32, room);
+            for _ in 0..30 {
+                let mid = (lo + hi) / 2.0;
+                if layout(self, Some(mid)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            if layout(self, Some(hi)) && self.region.low > saved_region.low + 0.001 {
+                best = Some(self.region.low);
+            }
+        }
+        if best.is_none() {
+            self.pages[last] = original;
+            self.region = saved_region;
+            self.line_count = saved_line_count;
+        }
+        self.y = saved_y;
+        self.para = saved_para;
+        self.numbered = saved_numbered;
+        self.pending_chapter = saved_pending;
     }
 
     /// Count a body line just placed for line numbering (`w:lnNumType`): the
@@ -1885,21 +2153,54 @@ fn border_rules(
     // Outward (away from the text) for each side.
     let outward: [(f32, f32); 4] = [(0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0)];
     let mut rules = Vec::new();
-    for ((side, (x1, y1, x2, y2)), (ox, oy)) in b.sides.iter().zip(lines).zip(outward) {
+    for (i, ((side, (x1, y1, x2, y2)), (ox, oy))) in
+        b.sides.iter().zip(lines).zip(outward).enumerate()
+    {
         let Some(side) = side else {
             continue;
         };
         let w = side.width;
         // Each stroke's width and its distance outward from the frame line.
+        let mut shape = RuleShape::Line;
+        let mut colors = [side.color; 4];
         let (strokes, dash): (Vec<(f32, f32)>, Vec<f32>) = match &side.style {
             BorderStyle::Single => (vec![(w, 0.0)], Vec::new()),
             BorderStyle::Dashes(pattern) => {
                 (vec![(w, 0.0)], pattern.iter().map(|k| k * w).collect())
             }
             BorderStyle::Art => (vec![(w, 0.0)], vec![w, w]),
+            BorderStyle::Motif(m) => {
+                shape = RuleShape::Motif(*m);
+                (vec![(w, 0.0)], Vec::new())
+            }
+            BorderStyle::Wave { double } => {
+                // A wave a width tall and four widths long; the double one is
+                // two, a width apart.
+                shape = RuleShape::Wave {
+                    amp: w,
+                    len: 4.0 * w,
+                };
+                let thin = (w / 2.0).max(0.25);
+                if *double {
+                    (vec![(thin, -w), (thin, w)], Vec::new())
+                } else {
+                    (vec![(thin, 0.0)], Vec::new())
+                }
+            }
+            BorderStyle::ThreeD { raised } => {
+                // Two half strokes, light and dark: the inner one light on
+                // the top and left sides and dark on the bottom and right
+                // ones when raised, the other way round when sunken.
+                let light = lighten(side.color);
+                let dark = darken(side.color);
+                let inner_light = (i < 2) == *raised;
+                colors[0] = if inner_light { light } else { dark };
+                colors[1] = if inner_light { dark } else { light };
+                (vec![(w / 2.0, -w / 4.0), (w / 2.0, w / 4.0)], Vec::new())
+            }
             lines @ BorderStyle::Lines { .. } => (lines.strokes(w), Vec::new()),
         };
-        for (width, d) in strokes {
+        for (k, (width, d)) in strokes.into_iter().enumerate() {
             // Along the frame inflated by `d`, so the corners stay closed: a
             // horizontal side grows by `d` at both ends, a vertical one too.
             let (ax, ay) = (oy.abs(), ox.abs());
@@ -1909,12 +2210,164 @@ fn border_rules(
                 x2: x2 + ox * d + ax * d,
                 y2: y2 + oy * d + ay * d,
                 width,
-                color: side.color,
+                color: colors[k.min(3)],
                 dash: dash.clone(),
+                shape,
             });
         }
     }
     rules
+}
+
+/// `c` washed halfway towards white / darkened by half: the two tones of a
+/// 3-D border.
+fn lighten((r, g, b): (f32, f32, f32)) -> (f32, f32, f32) {
+    ((r + 1.0) / 2.0, (g + 1.0) / 2.0, (b + 1.0) / 2.0)
+}
+
+fn darken((r, g, b): (f32, f32, f32)) -> (f32, f32, f32) {
+    (r / 2.0, g / 2.0, b / 2.0)
+}
+
+/// The content-stream operators for one rule of a non-straight shape.
+fn shaped_rule_ops(rule: &Rule) -> String {
+    use std::fmt::Write;
+    let (dx, dy) = (rule.x2 - rule.x1, rule.y2 - rule.y1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let mut s = String::new();
+    if len <= 0.0 {
+        return s;
+    }
+    let (ux, uy) = (dx / len, dy / len);
+    let (nx, ny) = (-uy, ux);
+    let (r, g, b) = rule.color;
+    match rule.shape {
+        RuleShape::Line => {}
+        RuleShape::Wave { amp, len: wave } => {
+            let step = wave / 8.0;
+            let n = (len / step).ceil().max(1.0) as usize;
+            writeln!(s, "q 1 j 1 J {r:.3} {g:.3} {b:.3} RG {:.2} w", rule.width).ok();
+            for k in 0..=n {
+                let t = (k as f32 * step).min(len);
+                let off = amp * (std::f32::consts::TAU * t / wave).sin();
+                let (x, y) = (rule.x1 + ux * t + nx * off, rule.y1 + uy * t + ny * off);
+                writeln!(s, "{x:.2} {y:.2} {}", if k == 0 { "m" } else { "l" }).ok();
+            }
+            s.push_str("S\nQ\n");
+        }
+        RuleShape::Motif(motif) => {
+            let size = rule.width.max(0.5);
+            let n = (len / size).floor().max(1.0) as usize;
+            let pad = (len - n as f32 * size) / 2.0;
+            writeln!(s, "q {r:.3} {g:.3} {b:.3} rg {r:.3} {g:.3} {b:.3} RG 0.5 w").ok();
+            for k in 0..n {
+                let t = pad + (k as f32 + 0.5) * size;
+                s.push_str(&motif_ops(motif, rule.x1 + ux * t, rule.y1 + uy * t, size));
+            }
+            s.push_str("Q\n");
+        }
+    }
+    s
+}
+
+/// One motif of side `size` centred on `(cx, cy)`, filled (`f`) or outlined
+/// (`S`) in the colours already set.
+fn motif_ops(motif: Motif, cx: f32, cy: f32, size: f32) -> String {
+    use std::fmt::Write;
+    let h = size * 0.4;
+    let mut s = String::new();
+    let paint = |filled: bool| if filled { "f\n" } else { "S\n" };
+    match motif {
+        Motif::Dot { filled } => {
+            circle(&mut s, cx, cy, h);
+            s.push_str(paint(filled));
+        }
+        Motif::Circle => {
+            // Rings, so it differs from the white dot's one outline.
+            circle(&mut s, cx, cy, h);
+            s.push_str(paint(false));
+            circle(&mut s, cx, cy, h / 2.0);
+            s.push_str(paint(false));
+        }
+        Motif::Square { filled } => {
+            write!(
+                s,
+                "{:.2} {:.2} {:.2} {:.2} re ",
+                cx - h,
+                cy - h,
+                2.0 * h,
+                2.0 * h
+            )
+            .ok();
+            s.push_str(paint(filled));
+        }
+        Motif::Triangle => {
+            writeln!(
+                s,
+                "{:.2} {:.2} m {:.2} {:.2} l {:.2} {:.2} l h f",
+                cx - h,
+                cy - h,
+                cx + h,
+                cy - h,
+                cx,
+                cy + h
+            )
+            .ok();
+        }
+        Motif::Star => {
+            // Five points, joined every second one: an upright pentagram.
+            for k in 0..5 {
+                let a = std::f32::consts::FRAC_PI_2 + k as f32 * 4.0 * std::f32::consts::PI / 5.0;
+                write!(
+                    s,
+                    "{:.2} {:.2} {} ",
+                    cx + h * a.cos(),
+                    cy + h * a.sin(),
+                    if k == 0 { "m" } else { "l" }
+                )
+                .ok();
+            }
+            s.push_str("h f*\n");
+        }
+        Motif::Heart => {
+            let p = |x: f32, y: f32| format!("{:.2} {:.2}", cx + x * h, cy + y * h);
+            writeln!(
+                s,
+                "{} m {} {} {} c {} {} {} c {} {} {} c {} {} {} c f",
+                p(0.0, -1.0),
+                p(-0.2, -0.6),
+                p(-1.0, -0.1),
+                p(-1.0, 0.35),
+                p(-1.0, 0.85),
+                p(-0.2, 0.95),
+                p(0.0, 0.4),
+                p(0.2, 0.95),
+                p(1.0, 0.85),
+                p(1.0, 0.35),
+                p(1.0, -0.1),
+                p(0.2, -0.6),
+                p(0.0, -1.0),
+            )
+            .ok();
+        }
+    }
+    s
+}
+
+/// A circle of radius `r` as four Bézier arcs.
+fn circle(s: &mut String, cx: f32, cy: f32, r: f32) {
+    use std::fmt::Write;
+    let k = 0.5523 * r;
+    write!(
+        s,
+        "{:.2} {:.2} m {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c ",
+        cx + r, cy,
+        cx + r, cy + k, cx + k, cy + r, cx, cy + r,
+        cx - k, cy + r, cx - r, cy + k, cx - r, cy,
+        cx - r, cy - k, cx - k, cy - r, cx, cy - r,
+        cx + k, cy - r, cx + r, cy - k, cx + r, cy,
+    )
+    .ok();
 }
 
 impl Flow for Pager<'_> {
@@ -1933,7 +2386,14 @@ impl Flow for Pager<'_> {
         // on the page can have no room in any of its columns. A line taller
         // than an empty page is placed anyway.
         loop {
-            let bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
+            let mut bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
+            if let Some(Trial {
+                bottom: Some(limit),
+                ..
+            }) = &self.trial
+            {
+                bottom = bottom.max(*limit);
+            }
             if self.y >= bottom {
                 break;
             }
@@ -1946,6 +2406,14 @@ impl Flow for Pager<'_> {
         }
         self.mark_low();
         let (x, w) = self.region.xs[self.region.col];
+        if !self.region.placed && self.trial.is_none() && !equal_widths(&self.region.xs) {
+            self.region_snap = Some(RegionSnap {
+                region: self.region.id,
+                para: self.para,
+                page: self.pages.last().expect("a page exists").clone(),
+                line_count: self.line_count.clone(),
+            });
+        }
         let number = self.count_line();
         let page = self.pages.last_mut().expect("a page exists");
         // A heading counts on the page its first line settled on.
@@ -2016,7 +2484,10 @@ impl Flow for Pager<'_> {
     }
     fn hard_break(&mut self, kind: BreakKind) {
         match kind {
-            BreakKind::Page => self.new_page(self.region.sect, false, false),
+            BreakKind::Page => match self.trial.as_mut() {
+                Some(trial) => trial.failed = true,
+                None => self.new_page(self.region.sect, false, false),
+            },
             BreakKind::Column => {
                 self.region.column_break = true;
                 self.advance_column();
@@ -2459,7 +2930,29 @@ fn build_content(page: &Page, opts: &PdfOptions, mut book: Option<&mut cid::Book
             s.extend(b") Tj ET\nQ\n");
         }
     }
+    for pic in &page.pictures {
+        let (sin, cos) = pic.angle.to_radians().sin_cos();
+        s.extend(
+            format!(
+                "q\n/GS{} gs\n{cos:.4} {sin:.4} {:.4} {cos:.4} {:.2} {:.2} cm\n{:.2} 0 0 {:.2} {:.2} {:.2} cm\n/Im{} Do\nQ\n",
+                pic.opacity,
+                -sin,
+                pic.cx,
+                pic.cy,
+                pic.w,
+                pic.h,
+                -pic.w / 2.0,
+                -pic.h / 2.0,
+                pic.image
+            )
+            .as_bytes(),
+        );
+    }
     for rule in &page.rules {
+        if rule.shape != RuleShape::Line {
+            s.extend(shaped_rule_ops(rule).as_bytes());
+            continue;
+        }
         if !rule.dash.is_empty() {
             let dash: Vec<String> = rule.dash.iter().map(|d| format!("{d:.2}")).collect();
             s.extend(format!("[{}] 0 d\n", dash.join(" ")).as_bytes());
@@ -2550,25 +3043,36 @@ fn write_pdf(pages: &[Page], opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
             missing_chars: book.missing,
         };
         if book.used() {
-            return (serialize_pdf(pages, contents, Some(&book)), report);
+            return (
+                serialize_pdf(pages, contents, Some(&book), &opts.images),
+                report,
+            );
         }
         // No embedded face showed anything: the plain Courier file.
         let contents = pages
             .iter()
             .map(|page| build_content(page, opts, None))
             .collect();
-        return (serialize_pdf(pages, contents, None), report);
+        return (serialize_pdf(pages, contents, None, &opts.images), report);
     }
     let contents = pages
         .iter()
         .map(|page| build_content(page, opts, None))
         .collect();
-    (serialize_pdf(pages, contents, None), PdfReport::default())
+    (
+        serialize_pdf(pages, contents, None, &opts.images),
+        PdfReport::default(),
+    )
 }
 
 /// The file for already-built page contents; `book` holds the embedded faces
 /// (and then the contents are Flate-compressed).
-fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book>) -> Vec<u8> {
+fn serialize_pdf(
+    pages: &[Page],
+    contents: Vec<Vec<u8>>,
+    book: Option<&cid::Book>,
+    images: &[Rc<PdfImage>],
+) -> Vec<u8> {
     // Object ids: 1=Catalog, 2=Pages, 3..6=Courier fonts, then 5 objects per
     // embedded face (Type0 first), then per-page content/annot/page.
     let mut objs: Vec<Vec<u8>> = vec![Vec::new(), Vec::new()];
@@ -2594,6 +3098,15 @@ fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book
             face_fonts.push_str(&format!(" /{name} {id} 0 R"));
         }
         objs.extend(book.objects(first));
+    }
+
+    // The pictures any page draws, one object each.
+    let mut image_ids: HashMap<usize, usize> = HashMap::new();
+    for pic in pages.iter().flat_map(|p| &p.pictures) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = image_ids.entry(pic.image) {
+            objs.push(images[pic.image].object());
+            slot.insert(objs.len());
+        }
     }
 
     let mut page_ids: Vec<usize> = Vec::new();
@@ -2630,8 +3143,26 @@ fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book
             annot_ids.push(objs.len());
         }
 
+        let mut extra = String::new();
+        if !page.pictures.is_empty() {
+            let mut names: Vec<usize> = page.pictures.iter().map(|p| p.image).collect();
+            names.sort_unstable();
+            names.dedup();
+            extra.push_str(" /XObject <<");
+            for n in names {
+                extra.push_str(&format!(" /Im{n} {} 0 R", image_ids[&n]));
+            }
+            let mut washes: Vec<u32> = page.pictures.iter().map(|p| p.opacity).collect();
+            washes.sort_unstable();
+            washes.dedup();
+            extra.push_str(" >> /ExtGState <<");
+            for pct in washes {
+                extra.push_str(&format!(" /GS{pct} << /ca {:.2} >>", pct as f32 / 100.0));
+            }
+            extra.push_str(" >>");
+        }
         let mut page_obj = format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R{face_fonts} >> >> /Contents {content_id} 0 R",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R{face_fonts} >>{extra} >> /Contents {content_id} 0 R",
             page.w, page.h
         );
         if !annot_ids.is_empty() {
@@ -4371,6 +4902,117 @@ mod tests {
     }
 
     #[test]
+    fn unequal_columns_rewrap_and_balance_before_a_continuous_break_797() {
+        // 150 pt and 300 pt columns: each 39-character paragraph wraps to two
+        // lines in the first and fits one line in the second.
+        let sect = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+        let words = "aaaa bbbb cccc dddd eeee ffff gggg";
+        let mut blocks: Vec<Block> = (0..9)
+            .map(|i| text_para(&format!("p{i} {words}")))
+            .collect();
+        blocks.push(sect_para(&format!("p9 {words}"), sect));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        // Lines flow: three two-line paragraphs and the first line of the
+        // fourth on the left, its second line (rewrapped to the wider column,
+        // 258 = 72 + 150 + 36) and six one-line paragraphs on the right.
+        for i in 0..4 {
+            assert!(
+                close(page.at(&format!("p{i} ")).0, 72.0),
+                "{:?}",
+                page.texts
+            );
+        }
+        let tail = page
+            .texts
+            .iter()
+            .filter(|(x, _, t)| close(*x, 258.0) && t == "eeee ffff gggg")
+            .count();
+        assert_eq!(tail, 1, "{:?}", page.texts);
+        for i in 4..10 {
+            let line = format!("p{i} {words}");
+            assert!(
+                page.texts
+                    .iter()
+                    .any(|(x, _, t)| close(*x, 258.0) && *t == line),
+                "p{i} on one line in the wide column: {:?}",
+                page.texts
+            );
+        }
+        // The next section starts below the taller (right) column: seven
+        // lines and the six gaps between its paragraphs, then the last gap.
+        let low = 720.0 - 7.0 * LH - 6.0 * 4.4 - 4.4;
+        assert!(close(page.at("next").1, low - LH), "{:?}", page.at("next"));
+    }
+
+    const UNEQUAL: &str = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+
+    /// A set whose paragraphs a trial can't lay out again is left as it was
+    /// laid out (#797): a paragraph cut by a page break, or one that ran on
+    /// from the page before. Either guard alone leaves the second case as it
+    /// is (the first layout must also reproduce the lines placed).
+    #[test]
+    fn unequal_columns_meet_a_page_break_and_stay_unbalanced_797() {
+        // The paragraph's break puts its tail on page 2, so the set's part
+        // there begins mid-paragraph and a trial can't start it over (a
+        // trial that does meet a page break fails, a defence no layout
+        // reaches while the paragraph guard holds).
+        let mut blocks = vec![text_para("a0")];
+        blocks.push(para(vec![
+            run("b-", RunProps::default()),
+            page_break(),
+            run("b0", RunProps::default()),
+        ]));
+        blocks.extend(paras("b", 7).into_iter().skip(1));
+        blocks.push(sect_para("b7", UNEQUAL));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        let page = &pages[1];
+        // All in the first column, one under the other, as the flow placed
+        // them (a balanced set would use the second one, at x = 258).
+        for (k, label) in ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]
+            .into_iter()
+            .enumerate()
+        {
+            let (x, y) = page.at(label);
+            assert!(close(x, 72.0), "{label}: {:?}", page.texts);
+            assert!(close(y, 720.0 - LH - k as f32 * (LH + 4.4)), "{label}: {y}");
+        }
+        assert!(close(page.at("next").1, 720.0 - LH - 8.0 * (LH + 4.4)));
+    }
+
+    #[test]
+    fn unequal_columns_continuing_a_paragraph_from_the_page_before_stay_unbalanced_797() {
+        // 64 one-line paragraphs fill page 1's first column and most of its
+        // second; the long last one runs off the page, so the set's page 2
+        // part begins mid-paragraph.
+        let long = "aaaa ".repeat(60);
+        let mut blocks = paras("q", 64);
+        blocks.push(sect_para(&format!("Z {long}"), UNEQUAL));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        let page = &pages[1];
+        let z_lines: Vec<_> = page
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.starts_with("aaaa"))
+            .collect();
+        assert!(z_lines.len() > 5, "{:?}", page.texts);
+        assert!(
+            z_lines.iter().all(|(x, _, _)| close(*x, 72.0)),
+            "the rest of the paragraph stays in the first column: {:?}",
+            page.texts
+        );
+    }
+
+    #[test]
     fn columns_balance_before_continuous_break() {
         let pages = pages_of(
             &balanced_doc(10, &two_col_sect(r#" w:sep="1""#)),
@@ -4432,17 +5074,19 @@ mod tests {
     }
 
     #[test]
-    fn columns_are_not_balanced_at_the_end_after_a_break_or_when_unequal() {
+    fn columns_are_not_balanced_at_the_end_or_after_a_break() {
         // At the end of the document: everything stays in column one.
         let mut blocks = paras("l", 10);
         blocks.push(trailing(&two_col_sect("")));
         let pages = pages_of(&doc(blocks), &PdfOptions::default());
         assert!(close(pages[0].at("l9").0, 72.0));
 
-        // Unequal explicit widths would need re-wrapping.
+        // Unequal explicit widths balance too (#797): single-line paragraphs
+        // split five and five, the second column starting 250 + 36 pt in.
         let unequal = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="5000" w:space="720"/><w:col w:w="3000"/></w:cols></w:sectPr>"#;
         let pages = pages_of(&balanced_doc(10, unequal), &PdfOptions::default());
-        assert!(close(pages[0].at("l9").0, 72.0), "{:?}", pages[0].texts);
+        assert!(close(pages[0].at("l4").0, 72.0), "{:?}", pages[0].texts);
+        assert!(close(pages[0].at("l5").0, 358.0), "{:?}", pages[0].texts);
 
         // A column break placed the lines deliberately.
         let d = doc(vec![
@@ -4488,6 +5132,76 @@ mod tests {
     }
 
     #[test]
+    fn wave_borders_draw_a_sine_polyline_797() {
+        let c = border_page(r#"w:val="wave" w:sz="8""#);
+        assert!(!c.contains("24.00 768.00 m 588.00 768.00 l S"), "{c}");
+        assert!(c.contains("1 j 1 J"), "{c}");
+        assert!(c.matches(" l\n").count() > 100, "{c}");
+        let single = c.matches(" RG ").count();
+        let c2 = border_page(r#"w:val="doubleWave" w:sz="8""#);
+        assert!(
+            c2.matches(" RG ").count() > single,
+            "two waves on top: {c2}"
+        );
+    }
+
+    #[test]
+    fn three_d_borders_draw_light_and_dark_halves_797() {
+        // The tones of each stroke in drawing order: top, then bottom.
+        let tones = |val: &str| -> Vec<char> {
+            let sect = format!(
+                r#"<w:sectPr><w:pgBorders w:offsetFrom="page"><w:top w:val="{val}" w:sz="8" w:color="808080" w:space="24"/><w:bottom w:val="{val}" w:sz="8" w:color="808080" w:space="24"/></w:pgBorders></w:sectPr>"#
+            );
+            let d = doc(vec![text_para("x"), trailing(&sect)]);
+            let c = pages_of(&d, &PdfOptions::default()).remove(0).content;
+            assert!(c.contains("0.50 w"), "{c}");
+            c.lines()
+                .filter(|l| l.contains(" RG "))
+                .map(|l| match l.split(' ').next() {
+                    Some("0.751") => 'L',
+                    Some("0.251") => 'D',
+                    other => panic!("tone {other:?} in {c}"),
+                })
+                .collect()
+        };
+        // Raised: light inside on top, dark inside on the bottom.
+        assert_eq!(tones("threeDEmboss"), ['L', 'D', 'D', 'L']);
+        assert_eq!(tones("outset"), ['L', 'D', 'D', 'L']);
+        // Sunken: the other way round.
+        assert_eq!(tones("threeDEngrave"), ['D', 'L', 'L', 'D']);
+        assert_eq!(tones("inset"), ['D', 'L', 'L', 'D']);
+    }
+
+    #[test]
+    fn art_borders_tile_motifs_and_unknown_art_stays_dashed_797() {
+        let motifs: Vec<String> = [
+            "basicBlackDots",
+            "basicWhiteDots",
+            "basicBlackSquares",
+            "basicWhiteSquares",
+            "stars",
+            "hearts",
+            "circlesLines",
+            "triangles",
+        ]
+        .iter()
+        .map(|n| border_page(&format!(r#"w:val="{n}" w:sz="6""#)))
+        .collect();
+        for (i, c) in motifs.iter().enumerate() {
+            assert!(!c.contains("[6.00 6.00] 0 d"), "{i}: {c}");
+            assert!(
+                c.contains(" f\n") || c.contains(" f*\n") || c.contains("S\n"),
+                "{i}"
+            );
+            for (j, d) in motifs.iter().enumerate().skip(i + 1) {
+                assert_ne!(c, d, "{i} and {j} look alike");
+            }
+        }
+        let apples = border_page(r#"w:val="apples" w:sz="6""#);
+        assert!(apples.contains("[6.00 6.00] 0 d"), "{apples}");
+    }
+
+    #[test]
     fn thin_thick_borders_put_the_first_named_line_inside() {
         // sz 24 = 3pt, the thin line a third of it, a small gap one thin width.
         let c = border_page(r#"w:val="thinThickSmallGap" w:sz="24""#);
@@ -4527,8 +5241,8 @@ mod tests {
             c.contains("[12.00 12.00] 0 d\n0.000 1.000 0.000 RG 12.00 w 24.00 768.00 m 588.00 768.00 l S\n[] 0 d\n"),
             "{c}"
         );
-        // A wave is drawn as a single line for now.
-        let c = border_page(r#"w:val="wave" w:sz="8""#);
+        // A style nothing draws specially is a single line.
+        let c = border_page(r#"w:val="dashDotStroked" w:sz="8""#);
         assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S") && !c.contains(" 0 d"));
     }
 

@@ -2456,7 +2456,7 @@ fn render_paragraph(
             let total = projected.width;
             let align = opts
                 .styles
-                .effective_align(para.props.style_id.as_deref(), para.props.align);
+                .effective_align(para.props.style_id.as_deref(), &para.props);
             // Bidi direction chooses the paragraph's base embedding level.
             // Alignment is still just padding around the projected visual line:
             // it must not reverse text a second time.

@@ -6,17 +6,45 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum BorderStyle {
     /// One solid line: `single`, `thick`, and the styles drawn as it for now
-    /// (`wave`, `doubleWave`, `dashDotStroked`, the 3-D styles).
+    /// (`dashDotStroked`). Tables draw [`BorderStyle::Wave`] and
+    /// [`BorderStyle::ThreeD`] as one solid stroke too ([`BorderStyle::strokes`]).
     Single,
+    /// `wave` / `doubleWave`: a sine line, twice for `double` (the PDF export
+    /// draws it; a table side is a solid stroke).
+    Wave { double: bool },
+    /// `threeDEmboss` / `outset` (raised) and `threeDEngrave` / `inset`
+    /// (sunken): a light and a dark half stroke (the PDF export draws it; a
+    /// table side is a solid stroke).
+    ThreeD { raised: bool },
     /// Parallel solid lines, innermost first: whether each is thin (a third of
     /// the side's width), and the gap between them in widths of the thin line
     /// (or of the line, when none is thin).
     Lines { thin: Vec<bool>, gap: f32 },
     /// A dash array in multiples of the line width.
     Dashes(Vec<f32>),
-    /// An art border (`apples`, `basicBlackDots`, …): a dashed band, since
-    /// the artwork isn't drawn.
+    /// An art border (`apples`, …) whose artwork isn't drawn: a dashed band.
     Art,
+    /// An art border the PDF export draws as tiled vector motifs. Word's
+    /// artwork is bitmap, so these are approximations in the border colour,
+    /// with no oracle to measure them against.
+    Motif(Motif),
+}
+
+/// A tiled motif of an art border (`w:val`, ECMA-376 §17.18.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Motif {
+    /// `basicBlackDots` (filled) and `basicWhiteDots` (outline).
+    Dot { filled: bool },
+    /// `basicBlackSquares` (filled) and `basicWhiteSquares` (outline).
+    Square { filled: bool },
+    /// `stars`.
+    Star,
+    /// `hearts`.
+    Heart,
+    /// `circlesLines`: rings (two outline circles).
+    Circle,
+    /// `triangles`.
+    Triangle,
 }
 
 impl BorderStyle {
@@ -28,8 +56,19 @@ impl BorderStyle {
         };
         Some(match val {
             "none" | "nil" => return None,
-            "single" | "thick" | "wave" | "doubleWave" | "dashDotStroked" | "threeDEmboss"
-            | "threeDEngrave" | "outset" | "inset" => BorderStyle::Single,
+            "single" | "thick" | "dashDotStroked" => BorderStyle::Single,
+            "wave" => BorderStyle::Wave { double: false },
+            "doubleWave" => BorderStyle::Wave { double: true },
+            "threeDEmboss" | "outset" => BorderStyle::ThreeD { raised: true },
+            "threeDEngrave" | "inset" => BorderStyle::ThreeD { raised: false },
+            "basicBlackDots" => BorderStyle::Motif(Motif::Dot { filled: true }),
+            "basicWhiteDots" => BorderStyle::Motif(Motif::Dot { filled: false }),
+            "basicBlackSquares" => BorderStyle::Motif(Motif::Square { filled: true }),
+            "basicWhiteSquares" => BorderStyle::Motif(Motif::Square { filled: false }),
+            "stars" => BorderStyle::Motif(Motif::Star),
+            "hearts" => BorderStyle::Motif(Motif::Heart),
+            "circlesLines" => BorderStyle::Motif(Motif::Circle),
+            "triangles" => BorderStyle::Motif(Motif::Triangle),
             // Gaps of one line width.
             "double" => lines(&[false, false], 1.0),
             "triple" => lines(&[false, false, false], 1.0),
@@ -119,5 +158,25 @@ mod tests {
         assert_eq!(BorderStyle::parse("single").unwrap().total(3.0), 3.0);
         assert_eq!(BorderStyle::parse("nil"), None);
         assert_eq!(BorderStyle::parse("apples"), Some(BorderStyle::Art));
+    }
+
+    #[test]
+    fn wave_three_d_and_art_motifs_parse_797() {
+        let p = |v: &str| BorderStyle::parse(v).unwrap();
+        assert_eq!(p("wave"), BorderStyle::Wave { double: false });
+        assert_eq!(p("doubleWave"), BorderStyle::Wave { double: true });
+        assert_eq!(p("threeDEmboss"), BorderStyle::ThreeD { raised: true });
+        assert_eq!(p("outset"), BorderStyle::ThreeD { raised: true });
+        assert_eq!(p("threeDEngrave"), BorderStyle::ThreeD { raised: false });
+        assert_eq!(p("inset"), BorderStyle::ThreeD { raised: false });
+        assert_eq!(p("stars"), BorderStyle::Motif(Motif::Star));
+        assert_eq!(
+            p("basicBlackDots"),
+            BorderStyle::Motif(Motif::Dot { filled: true })
+        );
+        // Tables draw these as one solid stroke.
+        for v in ["wave", "doubleWave", "inset", "hearts"] {
+            assert_eq!(p(v).strokes(3.0), [(3.0, 0.0)], "{v}");
+        }
     }
 }

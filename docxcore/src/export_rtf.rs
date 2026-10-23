@@ -200,7 +200,7 @@ impl Writer<'_> {
                 .effective_run(Some(&style), None, &RunProps::default());
         }
         self.body
-            .push_str(match self.styles.effective_align(pstyle, p.props.align) {
+            .push_str(match self.styles.effective_align(pstyle, &p.props) {
                 Align::Left => "\\ql",
                 Align::Center => "\\qc",
                 Align::Right => "\\qr",
