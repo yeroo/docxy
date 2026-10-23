@@ -8,8 +8,9 @@ use crate::formatting::Facts;
 
 /// How a bar row's From or To date lands on the day scale: a start-type date
 /// is the start of its day and a finish-type one the end of it (the
-/// chart's whole-day task bars), `CompleteThrough` is a fraction of the task
-/// bar's own span ([`Editor::bar_through`]), anything else the instant itself.
+/// chart's whole-day task bars), `CompleteThrough` is an instant placed
+/// within its day by [`Editor::bar_day_fraction`], anything else the instant
+/// itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarDateKind {
     Start,
@@ -122,36 +123,50 @@ impl Editor {
         }
     }
 
-    /// How far along the task is, 0 to 1, for a bar row's `CompleteThrough`:
-    /// the task's `stop` within its start to finish, else its percent
-    /// complete (unmeasured against Project). `None` without a start and
-    /// finish.
-    pub fn bar_through(&self, reader: &FieldReader, task: &Task) -> Option<f64> {
+    /// Where a bar row's `CompleteThrough` is: the task's `stop`, else its
+    /// start plus its percent complete of the working time between its start
+    /// and finish on its calendar (unmeasured against Project), within start
+    /// to finish. `None` without a start and finish.
+    fn complete_through(&self, reader: &FieldReader, task: &Task) -> Option<DateTime> {
         let date = |f| match reader.read(task, f).value {
             FieldValue::Date(d) => Some(d),
             _ => None,
         };
         let (start, finish) = (date(Field::Start)?, date(Field::Finish)?);
-        let span = (finish.minutes() - start.minutes()) as f64;
-        let fraction = match task.stop {
-            Some(stop) if span > 0. => (stop.minutes() - start.minutes()) as f64 / span,
-            Some(_) => 0.,
-            None => f64::from(task.percent_complete.unwrap_or(0)) / 100.,
+        let through = match task.stop {
+            Some(stop) => stop,
+            None => {
+                let proj = self.project();
+                let work = crate::schedule::working_minutes_between_on(
+                    proj,
+                    task.calendar_uid,
+                    start,
+                    finish,
+                );
+                let done = work * i64::from(task.percent_complete.unwrap_or(0).min(100)) / 100;
+                self.working_time_after(task.uid, start, done)
+                    .unwrap_or(start)
+            }
         };
-        Some(fraction.clamp(0., 1.))
+        Some(through.max(start).min(finish))
     }
 
-    fn complete_through(&self, reader: &FieldReader, task: &Task) -> Option<DateTime> {
-        if let Some(stop) = task.stop {
-            return Some(stop);
+    /// How far through its working day `at` is on `task`'s calendar, 0 to 1:
+    /// 0 at the day's first working minute (or before), 1 at its last (or
+    /// after), linear between. A day without working time reads as 8:00 to
+    /// 17:00, as a typed date does.
+    pub fn bar_day_fraction(&self, task: &Task, at: DateTime) -> f64 {
+        let proj = self.project();
+        let first = super::cells::day_start(proj, task, at);
+        let last = super::cells::day_end(proj, task, at);
+        let span = (last.minutes() - first.minutes()) as f64;
+        if at >= last {
+            1.
+        } else if at <= first || span <= 0. {
+            0.
+        } else {
+            (at.minutes() - first.minutes()) as f64 / span
         }
-        let date = |f| match reader.read(task, f).value {
-            FieldValue::Date(d) => Some(d),
-            _ => None,
-        };
-        let (start, finish) = (date(Field::Start)?, date(Field::Finish)?);
-        let percent = i64::from(task.percent_complete.unwrap_or(0).min(100));
-        Some(start.add_minutes((finish.minutes() - start.minutes()) * percent / 100))
     }
 
     /// A bar's text field for a task as the sheet shows it; empty when the

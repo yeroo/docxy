@@ -478,7 +478,7 @@ fn progress_row() -> BarRow {
 }
 
 #[test]
-fn completed_through_is_a_fraction_of_the_whole_day_bar() {
+fn completed_through_lands_in_its_working_day_of_the_whole_day_bar() {
     // 100%: the progress ends where the task bar does, for 1 and 5 days.
     let ed = progress_editor([100, 100, 100], vec![progress_row()]);
     let scale = gantt_scale(&ed);
@@ -498,7 +498,8 @@ fn completed_through_is_a_fraction_of_the_whole_day_bar() {
         assert_eq!(r[0].x0, r[0].x1, "task {uid}");
         assert_eq!(first_middle(&r).unwrap().2, 0., "task {uid}");
     }
-    // 50% of two days is exactly one day; 10% of five is half a day.
+    // 50% of two days is exactly one day; 10% of five days is four of the nine
+    // working hours of its first day, 10% of one day 48 of 540 minutes.
     let ed = progress_editor([10, 10, 50], vec![progress_row()]);
     let scale = gantt_scale(&ed);
     let w = |uid: i32| {
@@ -506,15 +507,57 @@ fn completed_through_is_a_fraction_of_the_whole_day_bar() {
         r[0].x1 - r[0].x0
     };
     assert_eq!(w(3), scale.day_w);
-    assert_eq!(w(2), scale.day_w * 0.5);
-    assert!((w(1) - scale.day_w * 0.1).abs() < 1e-3, "{}", w(1));
-    // A stop date is a fraction of the span too, not a clock position.
+    assert!((w(2) - scale.day_w * 4. / 9.).abs() < 1e-3, "{}", w(2));
+    assert!((w(1) - scale.day_w * 0.8 / 9.).abs() < 1e-3, "{}", w(1));
+}
+
+/// Tasks starting Thursday 8 January 2026 (the project start) with the
+/// bar `bar`.
+fn thursday_editor(tasks: Vec<Task>, bar: BarRow) -> ProjectEditor {
+    let mut p = untitled_project();
+    p.start_date = Some(projcore::DateTime::from_ymd_hm(2026, 1, 8, 8, 0));
+    p.tasks = tasks;
+    p.formatting.set_bars(vec![bar]);
+    ProjectEditor::new(p)
+}
+
+#[test]
+fn completed_through_spans_a_weekend_and_a_stop_at_the_end_of_a_day() {
+    let days = |ed: &ProjectEditor, uid: i32| {
+        let scale = gantt_scale(ed);
+        let r = bar_rows(ed, ed.project().task(uid).unwrap(), scale, look(1)).unwrap();
+        (r[0].x1 - r[0].x0) / scale.day_w
+    };
+    // Thu to Tue, four working days, 50% done: the end of Friday, two
+    // calendar days in (the weekend is not worked and not counted in).
+    let mut t = task(1, 4, 1);
+    t.percent_complete = Some(50);
+    let ed = thursday_editor(vec![t], progress_row());
+    assert_eq!(days(&ed, 1), 2.);
+    // 75% is the end of Monday: five calendar days, the weekend inside.
+    let mut t = task(1, 4, 1);
+    t.percent_complete = Some(75);
+    let ed = thursday_editor(vec![t], progress_row());
+    assert_eq!(days(&ed, 1), 5.);
+    // A stop at the end of day 1 of 2 is exactly one day.
     let mut t = task(1, 2, 1);
-    t.stop = Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
-    let ed = editor(vec![t], vec![progress_row()], Vec::new());
-    let scale = gantt_scale(&ed);
-    let r = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
-    assert_eq!(r[0].x0, r[0].x1);
+    t.stop = Some(projcore::DateTime::from_ymd_hm(2026, 1, 8, 17, 0));
+    let ed = thursday_editor(vec![t], progress_row());
+    assert_eq!(days(&ed, 1), 1.);
+    // Monday to Wednesday with a stop on Tuesday 17:00 is two days.
+    let mut t = task(1, 3, 1);
+    t.stop = Some(projcore::DateTime::from_ymd_hm(2026, 1, 13, 17, 0));
+    let mut p = untitled_project();
+    p.start_date = Some(projcore::DateTime::from_ymd_hm(2026, 1, 12, 8, 0));
+    p.tasks = vec![t];
+    p.formatting.set_bars(vec![progress_row()]);
+    let ed = ProjectEditor::new(p);
+    assert_eq!(days(&ed, 1), 2.);
+    // A stop at noon is the middle of its working day's frame.
+    let mut t = task(1, 2, 1);
+    t.stop = Some(projcore::DateTime::from_ymd_hm(2026, 1, 8, 12, 30));
+    let ed = thursday_editor(vec![t], progress_row());
+    assert_eq!(days(&ed, 1), 0.5);
 }
 
 #[test]
@@ -668,4 +711,63 @@ fn bars_drawn_lists_the_shown_rows_in_drawn_order() {
     // Collapsing the summary hides task 2: it is no longer drawn or listed.
     view.ed.set_collapsed(1, true).unwrap();
     assert_eq!(bars_drawn(&view, scale), ["1:1:R", "3:1:R"]);
+}
+
+#[test]
+fn only_a_milestones_own_dates_are_centred() {
+    let mut t = task(1, 0, 1);
+    t.deadline = Some(projcore::DateTime::from_ymd_hm(2026, 1, 9, 17, 0));
+    let point = |from: &str, to: &str| BarRow {
+        from: from.into(),
+        to: to.into(),
+        ..row("P", &[], 1)
+    };
+    let ed = editor(
+        vec![t],
+        vec![
+            point("Deadline", "Deadline"),
+            point("Task Start", "Task Finish"),
+        ],
+        Vec::new(),
+    );
+    let scale = gantt_scale(&ed);
+    let tk = ed.project().task(1).unwrap();
+    let rows = bar_rows(&ed, tk, scale, look(1)).unwrap();
+    let deadline = instant_x(scale, 0., tk.deadline.unwrap());
+    assert_eq!((rows[0].x0, rows[0].x1), (deadline, deadline));
+    let bar = gantt_bar(&ed, tk, scale).unwrap();
+    let centre = milestone_x(bar.start, scale.day_w) + 7.;
+    assert_eq!((rows[1].x0, rows[1].x1), (centre, centre));
+}
+
+#[test]
+fn only_painted_pieces_take_the_bars_press() {
+    // A bar and a far mark: the empty chart between them is outside every
+    // hit box, so it opens the chart's menu, not the bar's.
+    let mut r = draw(22., 66., 1);
+    r.end.shape = Some("circle".into());
+    r.end.color = Some(1);
+    r.start.shape = Some("square".into());
+    r.texts = vec![("right", "Name".into())];
+    let mut far = r.clone();
+    far.x0 = 22.;
+    far.x1 = 600.;
+    far.middle.shape = Some("narrow-top".into());
+    let parts = bar_parts(&[far]);
+    let boxes: Vec<_> = parts.iter().filter_map(hit_box).collect();
+    // Middle, start mark, end mark; the text is not one.
+    assert_eq!(boxes.len(), 3);
+    let hit = |x: f32, y: f32| {
+        boxes
+            .iter()
+            .any(|b| x >= b.0 && x < b.0 + b.2 && y >= b.1 && y < b.1 + b.3)
+    };
+    let y = BAR_Y + 2.;
+    assert!(hit(30., y) && hit(600., y + 3.));
+    // Below the narrow bar and its marks' reach, and past the end mark.
+    assert!(!hit(300., BAR_Y + BAR_H - 1.));
+    assert!(!hit(640., y));
+    // A zero-width middle is not pressable.
+    let point = bar_parts(&[draw(44., 44., 1)]);
+    assert!(point.iter().filter_map(hit_box).next().is_none());
 }

@@ -551,23 +551,73 @@ fn date_names_land_on_the_day_scale_by_kind() {
 }
 
 #[test]
-fn bar_through_is_the_progress_fraction_of_the_bar() {
-    let through = |touch: fn(&mut Task)| {
-        let ed = editor_with(touch);
+fn project_names_for_scheduling_and_external_tasks_are_known() {
+    let auto = facts(|_| {});
+    let manual = facts(|f| f.manual = true);
+    let external = facts(|f| f.external = true);
+    // Project's default Task row, word for word.
+    let task_row = row("Task", &["Normal", "Active", "Not Manually Scheduled"], 1);
+    assert!(task_row.applies(&auto));
+    assert!(!task_row.applies(&manual));
+    assert!(row("a", &["Manually Scheduled"], 1).applies(&manual));
+    assert!(!row("a", &["manually  scheduled"], 1).applies(&auto));
+    assert!(row("a", &["Automatically Scheduled"], 1).applies(&auto));
+    assert!(!row("a", &["Automatically Scheduled"], 1).applies(&manual));
+    for name in ["External", "External Task", "External Tasks"] {
+        assert!(row("a", &[name], 1).applies(&external), "{name}");
+        assert!(!row("a", &[name], 1).applies(&auto), "{name}");
+    }
+}
+
+#[test]
+fn a_day_fraction_follows_the_calendar_and_complete_through_is_working_time() {
+    let ed = editor();
+    let task = ed.project().tasks[0].clone();
+    // 8:00 to 17:00 on a working day.
+    assert_eq!(ed.bar_day_fraction(&task, at(5, 8)), 0.);
+    assert_eq!(ed.bar_day_fraction(&task, at(5, 17)), 1.);
+    assert_eq!(ed.bar_day_fraction(&task, at(5, 19)), 1.);
+    assert_eq!(ed.bar_day_fraction(&task, at(5, 3)), 0.);
+    let noon = ed.bar_day_fraction(&task, at(5, 12).add_minutes(30));
+    assert_eq!(noon, 0.5);
+    // A weekend day reads 8:00 to 17:00 too.
+    assert_eq!(ed.bar_day_fraction(&task, at(10, 17)), 1.);
+}
+
+#[test]
+fn complete_through_counts_working_time_across_a_weekend() {
+    // Thursday 8 January: a four-day task runs Thu, Fri, Mon, Tue.
+    let through = |days: i64, pct: u8, stop: Option<DateTime>| {
+        let task = Task {
+            uid: 1,
+            id: 1,
+            name: "T".into(),
+            outline_level: 1,
+            duration_min: days * 480,
+            percent_complete: Some(pct),
+            stop,
+            ..Task::default()
+        };
+        let ed = Editor::new(Project {
+            start_date: Some(at(8, 8)),
+            tasks: vec![task],
+            ..Project::default()
+        });
         let reader = FieldReader::new(&ed);
-        ed.bar_through(&reader, &ed.project().tasks[0])
+        let t = ed.project().tasks[0].clone();
+        ed.bar_date(&reader, &t, "CompleteThrough", Field::Start)
     };
-    assert_eq!(through(|_| {}), Some(0.));
-    assert_eq!(through(|t| t.percent_complete = Some(50)), Some(0.5));
-    assert_eq!(through(|t| t.percent_complete = Some(100)), Some(1.));
-    assert_eq!(through(|t| t.percent_complete = Some(250)), Some(1.));
-    // A stop wins over the percent: the start is Monday 8:00, the two-day
-    // task ends Tuesday 17:00 (18 working hours over 33 clock hours).
-    let stop = through(|t| {
-        t.percent_complete = Some(10);
-        t.stop = Some(at(5, 8).add_minutes(33 * 60 / 2));
-    })
-    .unwrap();
-    assert!((stop - 0.5).abs() < 1e-9, "{stop}");
-    assert_eq!(through(|t| t.stop = Some(at(1, 8))), Some(0.));
+    // 50% is two working days: the end of Friday, not Saturday morning.
+    assert_eq!(through(4, 50, None), Some(at(9, 17)));
+    // 0% is the start, 100% the finish (Tuesday 17:00).
+    assert_eq!(through(4, 0, None), Some(at(8, 8)));
+    assert_eq!(through(4, 100, None), Some(at(13, 17)));
+    // 75% is three days: the end of Monday.
+    assert_eq!(through(4, 75, None), Some(at(12, 17)));
+    // A stop wins over the percent, kept inside the task.
+    assert_eq!(through(2, 10, Some(at(8, 17))), Some(at(8, 17)));
+    assert_eq!(through(3, 0, Some(at(13, 17))), Some(at(12, 17)));
+    assert_eq!(through(3, 0, Some(at(12, 17))), Some(at(12, 17)));
+    assert_eq!(through(2, 0, Some(at(30, 17))), Some(at(9, 17)));
+    assert_eq!(through(2, 0, Some(at(1, 8))), Some(at(8, 8)));
 }

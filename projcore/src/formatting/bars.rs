@@ -351,7 +351,11 @@ pub struct Facts {
 impl Facts {
     /// Whether the task is in `category` (a name, case-insensitive; no `Not`).
     pub fn is(&self, category: &str) -> bool {
-        let c = category.trim().to_ascii_lowercase();
+        let c = category
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
         match c.as_str() {
             "normal" => !self.summary && !self.milestone,
             "milestone" => self.milestone,
@@ -360,9 +364,11 @@ impl Facts {
             "noncritical" => !self.critical,
             "active" => self.active,
             "inactive" => !self.active,
-            "manual" => self.manual,
-            "auto" => !self.manual,
-            "external" => self.external,
+            // Project's own words for the scheduling modes and external
+            // tasks, beside the short forms.
+            "manual" | "manually scheduled" => self.manual,
+            "auto" | "automatically scheduled" => !self.manual,
+            "external" | "external task" | "external tasks" => self.external,
             "late" => self.late,
             _ => c
                 .strip_prefix("flag")

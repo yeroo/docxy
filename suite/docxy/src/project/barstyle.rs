@@ -219,14 +219,6 @@ pub(crate) enum Part {
     },
 }
 
-impl Part {
-    pub fn band(&self) -> u8 {
-        match self {
-            Part::Middle { band, .. } | Part::Mark { band, .. } | Part::Text { band, .. } => *band,
-        }
-    }
-}
-
 /// The parts of `rows`, in table order: for each row its middle, start and
 /// end marks, then its texts.
 pub(crate) fn bar_parts(rows: &[DrawRow]) -> Vec<Part> {
@@ -311,6 +303,16 @@ pub(crate) fn bar_parts(rows: &[DrawRow]) -> Vec<Part> {
     parts
 }
 
+/// The strip rectangle a part takes the bar's right-press on: a painted
+/// middle or a mark, never a text or a zero-width middle.
+pub(crate) fn hit_box(part: &Part) -> Option<(f32, f32, f32, f32)> {
+    match part {
+        Part::Middle { rect, .. } if rect.2 > 0. => Some(*rect),
+        Part::Mark { rect, .. } => Some(*rect),
+        _ => None,
+    }
+}
+
 /// The first row's middle rectangle `(x, y, w, h)` in strip pixels: what the
 /// plugin overlay's `OverlayRow.bar` follows.
 pub(crate) fn first_middle(rows: &[DrawRow]) -> Option<(f32, f32, f32, f32)> {
@@ -384,21 +386,13 @@ pub(crate) fn bar_rows(
         _ => (5., 14.),
     });
     let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
-    // The task bar's own whole-day frame, which a CompleteThrough end is a
-    // fraction of (#1696).
-    let frame = ed
-        .disp_start(task.uid)
-        .zip(ed.disp_finish(task.uid))
-        .map(|(s, f)| (day(s) * scale.day_w, (day(f) + 1.) * scale.day_w));
-    let through = ed.bar_through(&reader, task);
     let at = |d: projcore::DateTime, kind: BarDateKind| match kind {
-        BarDateKind::Start => Some(day(d) * scale.day_w),
-        BarDateKind::Finish => Some((day(d) + 1.) * scale.day_w),
-        BarDateKind::Instant => Some(instant_x(scale, 0., d)),
-        BarDateKind::Through => {
-            let ((fs, fe), f) = frame.zip(through)?;
-            Some(fs + f as f32 * (fe - fs))
-        }
+        BarDateKind::Start => day(d) * scale.day_w,
+        BarDateKind::Finish => (day(d) + 1.) * scale.day_w,
+        BarDateKind::Instant => instant_x(scale, 0., d),
+        // A CompleteThrough instant lands within its working day, so the end
+        // of the last working minute is the end of the day's frame (#1696).
+        BarDateKind::Through => (day(d) + ed.bar_day_fraction(task, d) as f32) * scale.day_w,
     };
     let mut out = Vec::new();
     for row in rows {
@@ -409,22 +403,18 @@ pub(crate) fn bar_rows(
             continue;
         };
         // Whole days for the start and finish fields (the palette's bars),
-        // a fraction of the bar for CompleteThrough, the instant itself for
+        // a working-day position for CompleteThrough, the instant itself for
         // the others. Only a milestone sits in the middle of its day, as the
         // palette's diamond does; any other row without a span is a point at
         // its date.
-        let (x0, x1) = if task.is_milestone() && to <= from {
-            let mid = (day(from) + 0.5) * scale.day_w;
-            (mid, mid)
-        } else {
-            let (Some(x0), Some(x1)) = (
-                at(from, BarDateKind::of(&row.from, Field::Start)),
-                at(to, BarDateKind::of(&row.to, Field::Finish)),
-            ) else {
-                continue;
+        let (x0, x1) =
+            if task.is_milestone() && to <= from && own_date(&row.from) && own_date(&row.to) {
+                let mid = (day(from) + 0.5) * scale.day_w;
+                (mid, mid)
+            } else {
+                let x0 = at(from, BarDateKind::of(&row.from, Field::Start));
+                (x0, at(to, BarDateKind::of(&row.to, Field::Finish)).max(x0))
             };
-            (x0, x1.max(x0))
-        };
         let text = match over {
             Some(o) => row.text.clone().over(&o.text),
             None => row.text.clone(),
@@ -452,6 +442,20 @@ pub(crate) fn bar_rows(
         });
     }
     Some(out)
+}
+
+/// Whether a From or To name is the task's own Start or Finish (or empty, the
+/// default): what a milestone's diamond stands for.
+fn own_date(name: &str) -> bool {
+    let compact: String = name
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    matches!(
+        compact.as_str(),
+        "" | "start" | "finish" | "taskstart" | "taskfinish"
+    )
 }
 
 fn texts_of(text: &BarText) -> Vec<(&'static str, &str)> {
@@ -587,12 +591,13 @@ fn middle_element(rect: (f32, f32, f32, f32), color: u32, pattern: Option<&str>)
     el.children(crate::plugin_ui::pattern_layer(&style))
 }
 
-/// A bar's right-press handler, shared by its bands.
+/// A bar's right-press handler, shared by its pieces.
 pub(crate) type OnRight = std::rc::Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
-/// The parts as elements for a strip: per band a container over its middle
-/// and marks (the bar's own right-press, and for the first band the
-/// `bar:<id>` probe), then the texts, which take no press.
+/// The parts as elements for a strip: each painted middle and mark takes the
+/// bar's own right-press (the first also carries the `bar:<id>` probe), so
+/// the empty chart between a bar and a far mark is the chart's; the texts
+/// take no press.
 pub(crate) fn styled_children(
     parts: Vec<Part>,
     id: i32,
@@ -601,75 +606,42 @@ pub(crate) fn styled_children(
     on_right: OnRight,
 ) -> Vec<AnyElement> {
     let mut out: Vec<AnyElement> = Vec::new();
-    let mut bands: Vec<u8> = parts.iter().map(Part::band).collect();
-    bands.sort_unstable();
-    bands.dedup();
     let mut probed = false;
-    for band in bands {
-        let solid: Vec<&Part> = parts
-            .iter()
-            .filter(|p| p.band() == band && !matches!(p, Part::Text { .. }))
-            .collect();
-        let rect_of = |p: &&Part| match p {
-            Part::Middle { rect, .. } | Part::Mark { rect, .. } => *rect,
-            Part::Text { rect, .. } => *rect,
-        };
-        let left = solid
-            .iter()
-            .map(|p| rect_of(p).0)
-            .fold(f32::INFINITY, f32::min);
-        let right = solid
-            .iter()
-            .map(|p| rect_of(p).0 + rect_of(p).2)
-            .fold(f32::NEG_INFINITY, f32::max);
-        if !left.is_finite() {
+    for part in &parts {
+        if hit_box(part).is_none() {
             continue;
         }
-        let band_y = f32::from(band - 1) * ROW_H;
         let handler = on_right.clone();
-        let mut container = div()
-            .absolute()
-            .left(px(left))
-            .top(px(band_y))
-            .w(px((right - left).max(1.)))
-            .h(px(ROW_H))
-            .on_mouse_down(MouseButton::Right, move |e, w, a| handler(e, w, a));
-        for part in solid {
-            container = match part {
-                Part::Middle {
-                    rect,
-                    color,
-                    pattern,
-                    ..
-                } => {
-                    if rect.2 <= 0. {
-                        continue;
-                    }
-                    let local = (rect.0 - left, rect.1 - band_y, rect.2, rect.3);
-                    container.child(middle_element(local, *color, pattern.as_deref()))
-                }
-                Part::Mark {
-                    rect,
-                    shape,
-                    kind,
-                    color,
-                    ..
-                } => container.child(
-                    div()
-                        .absolute()
-                        .left(px(rect.0 - left))
-                        .top(px(rect.1 - band_y))
-                        .size(px(rect.2))
-                        .child(mark_element(*shape, *kind, *color)),
-                ),
-                Part::Text { .. } => container,
-            };
-        }
+        let press = move |e: &MouseDownEvent, w: &mut Window, a: &mut App| handler(e, w, a);
+        let mut el = match part {
+            Part::Middle {
+                rect,
+                color,
+                pattern,
+                ..
+            } => middle_element(*rect, *color, pattern.as_deref()),
+            Part::Mark {
+                rect,
+                shape,
+                kind,
+                color,
+                ..
+            } => div()
+                .absolute()
+                .left(px(rect.0))
+                .top(px(rect.1))
+                .size(px(rect.2))
+                .child(mark_element(*shape, *kind, *color)),
+            Part::Text { .. } => continue,
+        };
         if !probed {
             probed = true;
-            container = container.child(probe(probes, format!("bar:{id}")));
+            el = el.child(probe(probes, format!("bar:{id}")));
         }
-        out.push(container.into_any_element());
+        out.push(
+            el.on_mouse_down(MouseButton::Right, press)
+                .into_any_element(),
+        );
     }
     for part in &parts {
         let Part::Text {

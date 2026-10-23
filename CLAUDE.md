@@ -1188,12 +1188,19 @@
   `BarDateKind::of` says how a date lands on the day scale: start-type
   fields (Start, Actual/Early/Late Start, Baseline Start, Start1..10) are the
   start of their day and finish-type ones the end of it, so a Start-Finish row
-  equals `gantt_bar`; `CompleteThrough` is a fraction of the task bar's own
-  whole-day frame (`Editor::bar_through`: `stop` within start..finish, else the
-  percent complete), so 100% ends where the bar does; every other date
-  (Deadline, ...) is the instant (`instant_x`). Only a milestone task's row
-  without a span sits in the middle of its day (as the palette's diamond does);
-  any other row without a span is a point at its date by kind.
+  equals `gantt_bar`; `CompleteThrough` is an instant (the task's `stop`, else
+  its start plus its percent complete of the working time to its finish on its
+  calendar, kept within start..finish) placed within its day by
+  `Editor::bar_day_fraction` (0 at the day's first working minute, 1 at its
+  last, so 100% ends where the bar does and a stop at the end of day 1 of 2 is
+  exactly one day; the weekend before it counts in the calendar-day frame as
+  it does for the bar); every other date (Deadline, ...) is the instant
+  (`instant_x`). Only a milestone task's row whose From and To are its own
+  Start/Finish (or empty) and without a span sits in the middle of its day (as
+  the palette's diamond does); any other row without a span is a point at its
+  date by kind. `Facts::is` takes Project's own names too (`Manually
+  Scheduled`, `Automatically Scheduled`, `External Tasks`). A bar's right-press
+  is on each painted middle and mark (`hit_box`), not the span between.
 - The suite draws it in `suite/docxy/src/project/barstyle.rs`: `bar_rows`
   (the plan against one task: `None` means the palette drawing, as with no
   table and no override; an override with no table restyles a plain leaf bar
