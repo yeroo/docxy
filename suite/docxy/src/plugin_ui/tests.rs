@@ -1130,22 +1130,37 @@ fn the_view_json_carries_layout_and_the_overlay_bar_follows_the_bar_height() {
     };
     assert_eq!(pairs.len(), 7);
     assert!(pairs.iter().all(|(_, value)| value.is_null()));
-    let plain = overlay_ctx(v).rows[0].bar.expect("a scheduled leaf has a bar");
+    let plain = overlay_ctx(v).rows[0]
+        .bar
+        .expect("a scheduled leaf has a bar");
     assert_eq!(plain.3, 14.);
     // 12 pt is 16 px, still centred on y 12; the layout reads back as sent.
-    let set = Json::parse(r#"{"layout":{"bar_height":12,"rollup":true,"round_bars":false}}"#)
-        .unwrap();
+    let set =
+        Json::parse(r#"{"layout":{"bar_height":12,"rollup":true,"round_bars":false}}"#).unwrap();
     v.ed.edit_formatting(|f| {
         f.apply_view(&set).unwrap();
     });
     let view = view_json(v);
     assert_eq!(view.get("layout").unwrap().int("bar_height"), Some(12));
-    assert_eq!(view.get("layout").unwrap().get("round_bars"), Some(&Json::Bool(false)));
+    assert_eq!(
+        view.get("layout").unwrap().get("round_bars"),
+        Some(&Json::Bool(false))
+    );
     let mut back = projcore::formatting::Formatting::default();
-    back.apply_view(&Json::obj(vec![("layout", view.get("layout").unwrap().clone())]))
-        .unwrap();
+    back.apply_view(&Json::obj(vec![(
+        "layout",
+        view.get("layout").unwrap().clone(),
+    )]))
+    .unwrap();
     assert_eq!(back.layout, v.ed.project().formatting.layout);
     let tall = overlay_ctx(v).rows[0].bar.unwrap();
     assert_eq!((tall.1, tall.3), (4., 16.));
-    assert_eq!(overlay_ctx(v).flags.get("layout").unwrap().int("bar_height"), Some(12));
+    assert_eq!(
+        overlay_ctx(v)
+            .flags
+            .get("layout")
+            .unwrap()
+            .int("bar_height"),
+        Some(12)
+    );
 }

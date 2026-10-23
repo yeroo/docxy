@@ -836,8 +836,14 @@ pub(super) fn project_state(
         ctlcore::json::Json::parse(&layout).unwrap_or(ctlcore::json::Json::Null),
     ));
     let (rects, rolls) = layout_drawn(v, scale);
-    entries.push(("bar_rects".into(), Json::Arr(rects.into_iter().map(Json::Str).collect())));
-    entries.push(("rolled_bars".into(), Json::Arr(rolls.into_iter().map(Json::Str).collect())));
+    entries.push((
+        "bar_rects".into(),
+        Json::Arr(rects.into_iter().map(Json::Str).collect()),
+    ));
+    entries.push((
+        "rolled_bars".into(),
+        Json::Arr(rolls.into_iter().map(Json::Str).collect()),
+    ));
     entries.extend(project_cell_state(v));
     entries.extend(selection::selection_state(v));
     entries.extend(timeline_state(v));
@@ -853,12 +859,11 @@ pub(super) fn project_state(
 pub(crate) fn layout_drawn(v: &ProjectView, scale: GanttScale) -> (Vec<String>, Vec<String>) {
     let tasks = &v.ed.project().tasks;
     let (mut rects, mut rolls) = (Vec::new(), Vec::new());
-    for (row, t) in v
-        .ed
-        .display_rows()
-        .into_iter()
-        .filter_map(|i| tasks.get(i))
-        .enumerate()
+    for (row, t) in
+        v.ed.display_rows()
+            .into_iter()
+            .filter_map(|i| tasks.get(i))
+            .enumerate()
     {
         let Some(bar) = gantt_bar(&v.ed, t, scale).map(|b| v.styled_bar(b)) else {
             continue;

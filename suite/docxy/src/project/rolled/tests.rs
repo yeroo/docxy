@@ -70,9 +70,8 @@ fn rolled_children_skip_inactive_tasks_and_honour_round_bars() {
     set_layout(&mut ed, r#"{"rollup":true}"#);
     assert_eq!(rolled(&ed, 1), Some(vec![2, 4]));
     let scale = gantt_scale(&ed);
-    let parts = |ed: &ProjectEditor| {
-        rolled_parts(ed, ed.project().task(1).unwrap(), scale, |b| b).unwrap()
-    };
+    let parts =
+        |ed: &ProjectEditor| rolled_parts(ed, ed.project().task(1).unwrap(), scale, |b| b).unwrap();
     let whole = parts(&ed);
     assert_eq!(whole[0].kind, bar(&ed, 2).kind);
     assert_eq!(whole[1].kind, BarKind::Milestone);
@@ -118,4 +117,3 @@ fn rolled_children_walk_past_a_blank_row_and_stop_at_the_next_sibling() {
     // one after the last, and the next level-1 task, do not.
     assert_eq!(rolled(&ed, 1), Some(vec![3, 4, 7]));
 }
-

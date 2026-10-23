@@ -269,9 +269,7 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
     let finish = ed.disp_finish(task.uid)?;
     let day = |dt: projcore::DateTime| dt.day_number() - scale.origin_day;
     let layout = &ed.project().formatting.layout;
-    let edge = |dt: projcore::DateTime| {
-        (dt.minutes() - scale.origin_day * 1440) as f32 / 1440.
-    };
+    let edge = |dt: projcore::DateTime| (dt.minutes() - scale.origin_day * 1440) as f32 / 1440.;
     let milestone = !task.summary && task.is_milestone();
     let inactive = ed
         .project()
@@ -1005,7 +1003,9 @@ pub(crate) fn gantt_strip(
         BarShape::Hollow => {
             at(bx, bw, boxes.leaf.0, boxes.leaf.1, hsla_u(color), true).child(marker)
         }
-        BarShape::Thin => at(bx, bw, boxes.thin.0, boxes.thin.1, hsla_u(color), false).child(marker),
+        BarShape::Thin => {
+            at(bx, bw, boxes.thin.0, boxes.thin.1, hsla_u(color), false).child(marker)
+        }
         BarShape::Summary => div()
             .absolute()
             .left(px(bx))
@@ -1087,12 +1087,13 @@ fn rolled_children(
                         .top(px(y - 1.))
                         .size(px(w + 2.))
                         .child(milestone_diamond(panel, false))
-                        .child(el.left(px(1.)).top(px(1.)).child(milestone_diamond(color, false)))
+                        .child(
+                            el.left(px(1.))
+                                .top(px(1.))
+                                .child(milestone_diamond(color, false)),
+                        )
                 }
-                _ => el
-                    .bg(hsla_u(color))
-                    .border_1()
-                    .border_color(pal.panel),
+                _ => el.bg(hsla_u(color)).border_1().border_color(pal.panel),
             }
         })
         .collect()

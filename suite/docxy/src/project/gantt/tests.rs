@@ -1308,7 +1308,10 @@ fn a_layout_bar_height_reaches_gantt_bar_and_the_overlay_rectangle() {
     let (_, y, _, h) = bar_rect(&tall, 22.);
     assert_eq!((y, h), (4., 16.));
     assert_eq!(bar_rect(&bar(&ed, 3), 22.).3, 16.);
-    assert_eq!(bar_rect(&bar(&ed, 1), 22.).1 + bar_rect(&bar(&ed, 1), 22.).3 / 2., 14.);
+    assert_eq!(
+        bar_rect(&bar(&ed, 1), 22.).1 + bar_rect(&bar(&ed, 1), 22.).3 / 2.,
+        14.
+    );
     // Unset is not Some(12): 14 px against 16 px.
     assert_ne!(bar_rect(&leaf, 22.).3, h);
     set_layout(&mut ed, r#"{"bar_height":null}"#);
@@ -1358,12 +1361,19 @@ fn layout_drawn_lists_rects_with_the_row_offset_and_skips_table_rows_for_rollups
     let fields = |s: &str| s.split(':').map(str::to_string).collect::<Vec<_>>();
     // Task 2 is the second drawn row: y = 28 + 4 (a 16 px bar centred on 12).
     let second = fields(&rects[1]);
-    assert_eq!((second[0].as_str(), second[2].as_str(), second[4].as_str()), ("2", "32", "16"));
+    assert_eq!(
+        (second[0].as_str(), second[2].as_str(), second[4].as_str()),
+        ("2", "32", "16")
+    );
     // The summary: 16 px bar -> an 11 px summary centred on y 14.
-    assert_eq!((fields(&rects[0])[2].as_str(), fields(&rects[0])[4].as_str()), ("8.5", "11"));
+    assert_eq!(
+        (fields(&rects[0])[2].as_str(), fields(&rects[0])[4].as_str()),
+        ("8.5", "11")
+    );
     assert_eq!(rolls, ["1:2"]);
     // A Bar Styles table draws every row itself: no roll-up is reported.
-    view.ed.edit_formatting(|f| f.set_bars(vec![projcore::formatting::BarRow::default()]));
+    view.ed
+        .edit_formatting(|f| f.set_bars(vec![projcore::formatting::BarRow::default()]));
     let (rects, rolls) = layout_drawn(&view, scale);
     assert_eq!(rects.len(), 4);
     assert!(rolls.is_empty());
