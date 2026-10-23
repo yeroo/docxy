@@ -342,7 +342,8 @@ control verbs drive both (docs/agent-control.md).
   and a UI plugin's named view switches (#1553),
   written only when the plan has any, declared in the content types with its
   own override, and read back into `Project::formatting`; MSPDI carries none
-  of it, as in Project.
+  of it, as in Project (a format plugin gets it through the optional `_ex`
+  symbols below).
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
@@ -432,13 +433,18 @@ refusal is what it was before plugins existed.
   `read`, `write` and `default` are false when absent, other keys are
   ignored). MSPDI XML text crosses the boundary, never model structs. A save to the type the
   plan was opened from passes the plugin that file's bytes, so it can carry
-  over what the model does not hold.
+  over what the model does not hold. Two more symbols are optional and
+  independent (#1702; the ABI stays 1): `yppx_plugin_read_ex` also returns the
+  plan's `formatting.xml` in a second buffer, and `yppx_plugin_write_ex` also
+  takes it (NULL and 0 when the plan has none); each is called instead of its
+  plain twin when present, since MSPDI holds no formatting.
 - **`projcore::formats::plugin`**, behind the cargo feature `plugins` (it
   adds `libloading`; hosts enable it, so the default build and the wasm
   builds stay dependency-free), loads the libraries, checks the ABI version
   and the six symbols, and wraps each declared type as a `ProjectFormat`
-  whose `read` is `yppx_plugin_read` then `read_mspdi`, and whose `write` is
-  `write_mspdi` then `yppx_plugin_write`. A library stays loaded for the
+  whose `read` is `yppx_plugin_read` (or `_read_ex`, whose formatting must
+  parse or the read fails) then `read_mspdi`, and whose `write` is
+  `write_mspdi` then `yppx_plugin_write` (or `_write_ex` with the formatting). A library stays loaded for the
   process and calls into it are serialised. One that fails to load is
   skipped with a message: headless `yppxy` prints it on stderr, the editor
   shows the first on its status line.
@@ -464,7 +470,8 @@ refusal is what it was before plugins existed.
   first window's status line, never in a dialog.
 - **The fixture**: `projcore/tests/plugin_fixture` is a dependency-free cdylib
   (`publish = false`) that implements the ABI by hand for a fake `.fakeproj`
-  type, passing MSPDI through, and declares it the default save type. `projcore/tests/plugins.rs` (run with
+  type, passing MSPDI through (with the plan's formatting as a hex trailer
+  comment, through the `_ex` symbols), and declares it the default save type. `projcore/tests/plugins.rs` (run with
   `--features plugins`) and `yppxy/tests/plugins.rs` build it with cargo, copy
   it into a plugin directory as `yppx_fixture.<dll|so|dylib>`, and round-trip
   a plan through it, `yppxy plan.xml --save out.fakeproj` included. The

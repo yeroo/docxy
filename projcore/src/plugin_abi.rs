@@ -122,32 +122,6 @@ pub const SYMBOL_FORMATS: &str = "yppx_plugin_formats";
 pub const SYMBOL_READ: &str = "yppx_plugin_read";
 /// `int32_t yppx_plugin_write(...)`: see [`WriteFn`].
 pub const SYMBOL_WRITE: &str = "yppx_plugin_write";
-/// `int32_t yppx_plugin_read_ex(const char* ext, const uint8_t* file, size_t
-/// len, YppxBuf* mspdi_out, YppxBuf* formatting_out)`: [`ReadFn`] that also
-/// returns the plan's `formatting.xml`, or an empty buffer.
-pub type ReadExFn = unsafe extern "C" fn(
-    ext: *const c_char,
-    file: *const u8,
-    len: usize,
-    mspdi_out: *mut YppxBuf,
-    formatting_out: *mut YppxBuf,
-) -> i32;
-
-/// `int32_t yppx_plugin_write_ex(const char* ext, const uint8_t* mspdi,
-/// size_t len, const uint8_t* formatting_xml, size_t formatting_len, const
-/// uint8_t* source_file, size_t source_len, YppxBuf* file_out)`: [`WriteFn`]
-/// that also takes the plan's `formatting.xml`, or NULL.
-pub type WriteExFn = unsafe extern "C" fn(
-    ext: *const c_char,
-    mspdi: *const u8,
-    len: usize,
-    formatting_xml: *const u8,
-    formatting_len: usize,
-    source_file: *const u8,
-    source_len: usize,
-    file_out: *mut YppxBuf,
-) -> i32;
-
 /// `void yppx_plugin_free(YppxBuf*)`: see [`FreeFn`].
 pub const SYMBOL_FREE: &str = "yppx_plugin_free";
 /// `int32_t yppx_plugin_last_error(YppxBuf* utf8_out)`: see [`LastErrorFn`].
@@ -265,6 +239,32 @@ pub type WriteFn = unsafe extern "C" fn(
     ext: *const c_char,
     mspdi: *const u8,
     len: usize,
+    source_file: *const u8,
+    source_len: usize,
+    file_out: *mut YppxBuf,
+) -> i32;
+
+/// `int32_t yppx_plugin_read_ex(const char* ext, const uint8_t* file, size_t
+/// len, YppxBuf* mspdi_out, YppxBuf* formatting_out)`: [`ReadFn`] that also
+/// returns the plan's `formatting.xml`, or an empty buffer.
+pub type ReadExFn = unsafe extern "C" fn(
+    ext: *const c_char,
+    file: *const u8,
+    len: usize,
+    mspdi_out: *mut YppxBuf,
+    formatting_out: *mut YppxBuf,
+) -> i32;
+
+/// `int32_t yppx_plugin_write_ex(const char* ext, const uint8_t* mspdi,
+/// size_t len, const uint8_t* formatting_xml, size_t formatting_len, const
+/// uint8_t* source_file, size_t source_len, YppxBuf* file_out)`: [`WriteFn`]
+/// that also takes the plan's `formatting.xml`, or NULL.
+pub type WriteExFn = unsafe extern "C" fn(
+    ext: *const c_char,
+    mspdi: *const u8,
+    len: usize,
+    formatting_xml: *const u8,
+    formatting_len: usize,
     source_file: *const u8,
     source_len: usize,
     file_out: *mut YppxBuf,
