@@ -286,6 +286,9 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(page.name, "Fixture");
     assert_eq!(page.controls[0].kind, "multiline");
     assert_eq!(page.controls[1].columns[1].kind, "checkbox");
+    // The richtext control (#1557).
+    let rich = page.controls.iter().find(|c| c.name == "fixture.rich");
+    assert_eq!(rich.map(|c| c.kind.as_str()), Some("richtext"));
     assert_eq!(
         m.dialog("fixture.options").unwrap().title,
         "Fixture Options"
@@ -340,6 +343,13 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         state.value("fixture.note").and_then(Json::as_str),
         Some("note for task 3")
     );
+    // A richtext's value is the markup of `projcore::richtext`, which reads
+    // back to the text the state meant (#1557).
+    let markup = state.value("fixture.rich").and_then(Json::as_str).unwrap();
+    assert_eq!(markup, "<p>rich <b>text</b> for task 3</p>");
+    let rich = projcore::richtext::Rich::parse(markup);
+    assert_eq!(rich.to_plain(), "rich text for task 3");
+    assert_eq!(rich.to_markup(), markup);
     assert_eq!(
         state
             .value("fixture.grid")
@@ -452,6 +462,25 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         .unwrap();
     assert!(cleared.close);
     assert_eq!(cleared.status.as_deref(), Some("Fixture: cleared"));
+    // Task Information's OK sends the richtext's markup whole (#1557).
+    let saved = ui
+        .command(&cmd(
+            "task-information",
+            vec![],
+            Some(Json::obj(vec![
+                ("fixture.note", Json::str("n")),
+                (
+                    "fixture.rich",
+                    Json::str("<li align=\"right\"><b>a &lt; b</b></li>"),
+                ),
+            ])),
+        ))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.status.as_deref(),
+        Some("Fixture: note saved (1 chars); rich <li align=\"right\"><b>a &lt; b</b></li>")
+    );
     // A committed Name cell renames the row's task at once (#1602).
     let typed = ui
         .command(&Command {

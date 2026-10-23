@@ -1540,7 +1540,7 @@ fn to_field_arg(args: &Json) -> Result<Option<&str>, String> {
 }
 
 /// The targets `pointer-click` takes; a call names exactly one (#1029).
-const POINTER_TARGETS: [&str; 9] = [
+const POINTER_TARGETS: [&str; 10] = [
     "region",
     "at",
     "dialog-field",
@@ -1549,6 +1549,7 @@ const POINTER_TARGETS: [&str; 9] = [
     "dialog-control",
     "dialog-calendar",
     "dialog-cell",
+    "dialog-richtool",
     "input",
 ];
 
@@ -5501,6 +5502,9 @@ fn dispatch_verb(
                 // column's heading in lower case, or a narrowed combo
                 // list's item `name[suggest].<n>` (#1536).
                 ("dialog-cell", "a grid cell"),
+                // A richtext's toolbar button (#1557), `<field>:<tool>` with
+                // the tool one of bold, italic, left, center, right, bullets.
+                ("dialog-richtool", "a richtext toolbar button"),
             ]
             .into_iter()
             .find_map(|(key, what)| args.get(key).map(|v| (key, what, v)));

@@ -1164,3 +1164,67 @@ fn the_view_json_carries_layout_and_the_overlay_bar_follows_the_bar_height() {
         Some(12)
     );
 }
+
+#[test]
+fn a_richtext_travels_as_markup_and_a_same_markup_refresh_leaves_it_alone() {
+    use crate::dialog::RichTool;
+    assert_eq!(kind_of("richtext"), ControlKind::Richtext);
+    assert_eq!(kind_of("multiline"), ControlKind::Multiline);
+    let json = r##"{"dialogs":[{"id":"task-information","pages":[{"name":"Fixture","controls":[
+        {"name":"fx.rich","label":"&Rich:","kind":"richtext","value":"<p>a <b>b</b></p>"},
+        {"name":"fx.plain","label":"P:","kind":"richtext","value":"if a<b>c"}]}]}]}"##;
+    let m = Manifest::parse(json).unwrap();
+    let spec = m.dialog("task-information").unwrap();
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let mut d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+    // A prefill of markup, and one of plain text.
+    let prefill = Prefill {
+        values: vec![(
+            "fx.rich".to_string(),
+            Json::str("<p align=\"right\">x &lt; y</p>"),
+        )],
+        ..Prefill::default()
+    };
+    extend_task_info_with(&mut d, spec, &prefill);
+    d.mark_opened();
+    let rich = |d: &Dialog, n: &str| d.controls.iter().position(|c| c.name == n).unwrap();
+    let (ri, pi) = (rich(&d, "fx.rich"), rich(&d, "fx.plain"));
+    assert_eq!(d.controls[ri].kind, ControlKind::Richtext);
+    assert_eq!(d.controls[ri].text(), "x < y");
+    assert_eq!(d.controls[pi].text(), "if a<b>c");
+    // The plugin reads the markup, plain text normalised.
+    let values = values_of(&d);
+    assert_eq!(
+        values.get("fx.rich").and_then(Json::as_str),
+        Some("<p align=\"right\">x &lt; y</p>")
+    );
+    assert_eq!(
+        values.get("fx.plain").and_then(Json::as_str),
+        Some("<p>if a&lt;b&gt;c</p>")
+    );
+    assert!(!d.changed("fx.rich"));
+    d.select_tab("Fixture").unwrap();
+    d.rich_tool_at(ri, RichTool::Left).unwrap();
+    d.select_all();
+    d.rich_tool_at(ri, RichTool::Bold).unwrap();
+    assert!(d.changed("fx.rich"));
+    assert_eq!(
+        values_of(&d).get("fx.rich").and_then(Json::as_str),
+        Some("<p><b>x &lt; y</b></p>")
+    );
+    // A refresh with the markup it holds keeps the pending style; another
+    // markup replaces the text and drops it.
+    d.move_caret_to(1, false);
+    d.rich_tool_at(ri, RichTool::Italic).unwrap();
+    assert!(d.tool_state(ri).pending_italic);
+    let held = Json::str("<p><b>x &lt; y</b></p>");
+    follow_value(&mut d.controls[ri], &held);
+    assert!(d.tool_state(ri).pending_italic);
+    follow_value(&mut d.controls[ri], &Json::str("<p>new</p>"));
+    assert_eq!(d.controls[ri].text(), "new");
+    assert!(!d.tool_state(ri).pending_italic);
+}

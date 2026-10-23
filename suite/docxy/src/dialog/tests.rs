@@ -1871,3 +1871,221 @@ fn tab_selects_the_value_and_a_click_does_not() {
     assert_eq!(focused_name(&s), Some("percent"));
     assert_eq!(s.top().unwrap().selection(), None);
 }
+
+// ---- richtext (#1557) ---------------------------------------------------
+
+/// A form whose last control is a richtext holding `markup`, focused.
+fn rich_form(markup: &str) -> (Dialog, usize) {
+    let mut d = form();
+    let mut c = Control::new(
+        "rich",
+        "Rich",
+        ControlKind::Richtext,
+        Value::Text(String::new()),
+    );
+    c.page = Some(0);
+    c.set_markup(markup);
+    d.controls.push(c);
+    let i = d.controls.len() - 1;
+    d.mark_opened();
+    d.focus_control(i);
+    (d, i)
+}
+
+fn markup_of(d: &Dialog, i: usize) -> String {
+    d.controls[i].markup()
+}
+
+#[test]
+fn a_richtext_is_a_multiline_in_every_behaviour() {
+    assert!(ControlKind::Richtext.is_multiline() && ControlKind::Richtext.is_text());
+    assert!(ControlKind::Multiline.is_multiline());
+    assert!(!ControlKind::Text.is_multiline());
+    assert_eq!(ControlKind::Richtext.name(), "richtext");
+    let (mut d, i) = rich_form("<p>abc</p>");
+    // Focus does not select all, as a multiline's; a single-line field's does.
+    d.focus_control(0);
+    assert!(d.selection().is_some());
+    d.focus_control(i);
+    assert_eq!(d.selection(), None);
+    // Enter is a new line, not OK.
+    d.size = Some((400., 300.));
+    d.controls[i].fill = true;
+    assert!(d.fills(&d.controls[i]));
+    let mut s = DialogStack::default();
+    s.push(d);
+    s.top_dialog_mut().unwrap().focus_control(i);
+    assert_eq!(s.key_button("enter", true), None);
+    // A paste keeps its line breaks, one paragraph per line.
+    let d = s.top_dialog_mut().unwrap();
+    d.insert_text("x\ny").unwrap();
+    assert_eq!(d.controls[i].text(), "abcx\ny");
+    assert_eq!(markup_of(d, i), "<p>abcx</p>\n<p>y</p>");
+}
+
+#[test]
+fn typing_keeps_the_styles_and_paragraph_properties_in_step() {
+    let (mut d, i) = rich_form("<li align=\"center\"><b>ab</b>c</li>");
+    // At the end, after a plain "c": plain.
+    d.type_char('d').unwrap();
+    assert_eq!(markup_of(&d, i), "<li align=\"center\"><b>ab</b>cd</li>");
+    // After a bold character: bold.
+    d.move_caret_to(2, false);
+    d.type_char('X').unwrap();
+    assert_eq!(markup_of(&d, i), "<li align=\"center\"><b>abX</b>cd</li>");
+    // Enter splits the line and the new one keeps the properties.
+    d.insert_text("\n").unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"center\"><b>abX</b></li>\n<li align=\"center\">cd</li>"
+    );
+    // Backspace across the line break joins, keeping the first line's.
+    d.rich_tool_at(i, RichTool::Left).unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"center\"><b>abX</b></li>\n<li>cd</li>"
+    );
+    d.backspace().unwrap();
+    assert_eq!(markup_of(&d, i), "<li align=\"center\"><b>abX</b>cd</li>");
+    // Delete the other way.
+    d.move_caret_to(3, false);
+    d.delete().unwrap();
+    assert_eq!(markup_of(&d, i), "<li align=\"center\"><b>abX</b>d</li>");
+    // A selection replaced takes the style before it; at a line start the
+    // line's first character's.
+    d.move_caret_to(0, false);
+    d.type_char('>').unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"center\"><b>&gt;abX</b>d</li>"
+    );
+}
+
+#[test]
+fn typed_text_is_never_read_as_markup() {
+    let (mut d, i) = rich_form("");
+    for ch in "<b>x</b> &amp;".chars() {
+        d.type_char(ch).unwrap();
+    }
+    assert_eq!(d.controls[i].text(), "<b>x</b> &amp;");
+    assert_eq!(markup_of(&d, i), "<p>&lt;b&gt;x&lt;/b&gt; &amp;amp;</p>");
+}
+
+#[test]
+fn the_toolbar_changes_the_selection_or_the_next_typed_text() {
+    let (mut d, i) = rich_form("<p>one</p>\n<p>two</p>");
+    d.select_all();
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    d.rich_tool_at(i, RichTool::Bullets).unwrap();
+    d.rich_tool_at(i, RichTool::Right).unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"right\"><b>one</b></li>\n<li align=\"right\"><b>two</b></li>"
+    );
+    let st = d.tool_state(i);
+    assert!(st.bold && !st.italic && st.bullets);
+    assert_eq!(st.align, projcore::richtext::Align::Right);
+    // The selection survives a press.
+    assert_eq!(d.selection(), Some((0, 7)));
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"right\">one</li>\n<li align=\"right\">two</li>"
+    );
+    // A bare caret: a pending style for the next typed text, dropped when
+    // the caret moves away.
+    d.move_caret_to(3, false);
+    d.rich_tool_at(i, RichTool::Italic).unwrap();
+    assert!(d.tool_state(i).pending_italic);
+    d.move_caret_to(2, false);
+    assert!(!d.tool_state(i).pending_italic);
+    d.move_caret_to(3, false);
+    d.rich_tool_at(i, RichTool::Italic).unwrap();
+    d.type_char('!').unwrap();
+    assert_eq!(
+        markup_of(&d, i),
+        "<li align=\"right\">one<i>!</i></li>\n<li align=\"right\">two</li>"
+    );
+    assert!(!d.tool_state(i).pending_italic);
+    // A press on another control, then back, drops it too.
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    d.focus_control(0);
+    d.focus_control(i);
+    assert!(!d.tool_state(i).pending_bold);
+    assert_eq!(
+        d.rich_tool_at(0, RichTool::Bold).unwrap_err(),
+        "'&Name:' is not a richtext".replace('&', "")
+    );
+}
+
+#[test]
+fn a_style_only_edit_counts_as_changed() {
+    let (mut d, i) = rich_form("<p>abc</p>");
+    assert!(!d.changed("rich"), "untouched equals the opened one");
+    // A value assigned without the control (a dialog-set of the plain text
+    // would reset the styles; an owner's write does not): the state pads, and
+    // a look at it changes nothing.
+    d.controls[i].value = Value::Text("abc".into());
+    assert!(!d.changed("rich"));
+    d.select_all();
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    assert!(d.changed("rich"));
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    assert!(!d.changed("rich"), "back to the opened markup");
+    d.rich_tool_at(i, RichTool::Center).unwrap();
+    assert!(d.changed("rich"));
+    // Typing a longer plain value directly pads the tail plain.
+    d.controls[i].value = Value::Text("abcdef".into());
+    assert_eq!(markup_of(&d, i), "<p align=\"center\">abcdef</p>");
+}
+
+#[test]
+fn dialog_set_takes_markup_or_plain_text_and_reports_the_toolbar() {
+    let (d, i) = rich_form("");
+    let mut s = DialogStack::default();
+    s.push(d);
+    s.set(
+        "rich",
+        &args(r#"{"value":"<p align=\"center\">a <b>b</b></p>"}"#),
+    )
+    .unwrap();
+    let controls = |s: &DialogStack| {
+        s.to_json()
+            .get("controls")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .to_vec()
+    };
+    let rich = |s: &DialogStack| {
+        controls(s)
+            .into_iter()
+            .find(|c| c.get_str("name") == Some("rich"))
+            .unwrap()
+    };
+    let c = rich(&s);
+    assert_eq!(c.get_str("kind"), Some("richtext"));
+    assert_eq!(
+        c.get_str("value"),
+        Some("<p align=\"center\">a <b>b</b></p>")
+    );
+    assert_eq!(c.get_str("text"), Some("a b"));
+    assert_eq!(
+        c.get("richtext").and_then(|r| r.get_str("align")),
+        Some("center")
+    );
+    // Plain text, even with a '<', is verbatim.
+    s.set("rich", &args(r#"{"value":"if a<b>c\nnext"}"#))
+        .unwrap();
+    let c = rich(&s);
+    assert_eq!(c.get_str("text"), Some("if a<b>c\nnext"));
+    assert_eq!(
+        c.get_str("value"),
+        Some("<p>if a&lt;b&gt;c</p>\n<p>next</p>")
+    );
+    assert_eq!(
+        s.set("rich", &args(r#"{"value":3}"#)).unwrap_err(),
+        "'Rich' takes text"
+    );
+    let _ = i;
+}

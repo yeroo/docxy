@@ -725,6 +725,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
         "date" => K::Date,
         "duration" => K::Duration,
         "multiline" => K::Multiline,
+        "richtext" => K::Richtext,
         "checkbox" => K::Checkbox,
         "check" => K::Check,
         "radio" => K::Radio,
@@ -780,6 +781,20 @@ fn value_of(kind: dialog::ControlKind, items: &[String], value: &Json) -> dialog
     }
 }
 
+/// Take the state's `value` into control `c`. A richtext given the markup it
+/// already holds is left alone, so the caret and the pending style survive
+/// the refresh (#1557).
+fn follow_value(c: &mut dialog::Control, value: &Json) {
+    if c.kind == dialog::ControlKind::Richtext {
+        let markup = cell_text(value);
+        if projcore::richtext::Rich::parse(&markup).to_markup() != c.markup() {
+            c.set_markup(&markup);
+        }
+    } else {
+        c.value = value_of(c.kind, &c.items, value);
+    }
+}
+
 /// A JSON scalar as a cell's text.
 fn cell_text(value: &Json) -> String {
     match value {
@@ -798,6 +813,8 @@ fn value_back(c: &dialog::Control) -> Json {
             .trim()
             .parse::<f64>()
             .map_or_else(|_| Json::Str(s.clone()), Json::Num),
+        // A richtext travels as its markup (#1557).
+        Value::Text(_) if c.kind == K::Richtext => Json::Str(c.markup()),
         Value::Text(s) => Json::Str(s.clone()),
         Value::Bool(b) => Json::Bool(*b),
         Value::Choice(i) => i
@@ -845,6 +862,9 @@ fn control_of_spec(
         kind,
         value_of(kind, items, value),
     );
+    if kind == dialog::ControlKind::Richtext {
+        out.set_markup(&cell_text(value));
+    }
     out.items = items.to_vec();
     if let Some(on) = prefill.enabled(&c.name) {
         out.enabled = on;
@@ -1119,7 +1139,7 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
                 dialog::ControlKind::Label | dialog::ControlKind::Sample
             );
         if follows && let Some(value) = p.value(c.name) {
-            c.value = value_of(c.kind, &c.items, value);
+            follow_value(c, value);
             if c.kind == dialog::ControlKind::Grid {
                 let rows = match &c.value {
                     dialog::Value::Rows(rows) => rows.len(),

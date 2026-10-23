@@ -90,7 +90,8 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.note","label":"Fixture &note:","kind":"multiline","value":""},
       {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
-      {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true}]}]},
+      {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true},
+      {"name":"fixture.rich","label":"Fixture &rich:","kind":"richtext","value":"","span":2}]}]},
     {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture","span":2},{"name":"fixture.tag","label":"Ta&g:","kind":"text","value":""}],"pages":[{"name":"General","columns":2,"controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1","group":"Numbers"},
       {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},
@@ -360,8 +361,10 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
             // The values, the dropdown's items for this plan (#1556) and a
             // control greyed by the state.
             reply.push_str(&format!(
-                r#","values":{{"fixture.note":{},"fixture.grid":[["task","false"],["{uid}","true"]],"fixture.pick":"{uid}"}},"items":{{"fixture.pick":["task","{uid}"]}},"enabled":{{"fixture.locked":false}}"#,
-                quote(&format!("note for task {uid}"))
+                r#","values":{{"fixture.note":{},"fixture.rich":{},"fixture.grid":[["task","false"],["{uid}","true"]],"fixture.pick":"{uid}"}},"items":{{"fixture.pick":["task","{uid}"]}},"enabled":{{"fixture.locked":false}}"#,
+                quote(&format!("note for task {uid}")),
+                // A richtext's value is markup (#1557).
+                quote(&format!("<p>rich <b>text</b> for task {uid}</p>"))
             ));
         }
     }
@@ -592,10 +595,16 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                 .and_then(|v| v.get("fixture.note"))
                 .and_then(Json::str)
                 .unwrap_or_default();
+            // The richtext's markup, as it arrived (#1557).
+            let rich = req
+                .get("values")
+                .and_then(|v| v.get("fixture.rich"))
+                .and_then(Json::str)
+                .unwrap_or_default();
             format!(
                 r#"{{"ops":[],"status":{}}}"#,
                 quote(&format!(
-                    "Fixture: note saved ({} chars)",
+                    "Fixture: note saved ({} chars); rich {rich}",
                     note.chars().count()
                 ))
             )

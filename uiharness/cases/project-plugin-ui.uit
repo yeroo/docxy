@@ -583,6 +583,49 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.5.value is task
   assert reply.controls.6.name is fixture.locked
   assert reply.controls.6.enabled is false
+  # The richtext (#1557): its value is the markup the state gave, its text
+  # the plain text; it is edited at a caret like the multiline.
+  assert reply.controls.7.name is fixture.rich
+  assert reply.controls.7.kind is richtext
+  assert reply.controls.7.plugin is true
+  assert reply.controls.7.value is <p>rich <b>text</b> for task 2</p>
+  assert reply.controls.7.text is rich text for task 2
+  call pointer-click {"dialog-field":"fixture.rich"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"a < b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p>a &lt; b</p>
+  assert reply.controls.7.text is a < b
+  # The toolbar over the selection: bold, italic, centre, bullets.
+  call real-key {"key":"ctrl+a"}
+  call pointer-click {"dialog-richtool":"fixture.rich:bold"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><b>a &lt; b</b></p>
+  assert reply.controls.7.richtext.bold is true
+  assert reply.controls.7.richtext.italic is false
+  call pointer-click {"dialog-richtool":"fixture.rich:italic"}
+  call pointer-click {"dialog-richtool":"fixture.rich:center"}
+  call pointer-click {"dialog-richtool":"fixture.rich:bullets"}
+  call dialog-read {}
+  assert reply.controls.7.value is <li align="center"><b><i>a &lt; b</i></b></li>
+  assert reply.controls.7.richtext.italic is true
+  assert reply.controls.7.richtext.align is center
+  assert reply.controls.7.richtext.bullets is true
+  # The chord clears bold, and sets it again.
+  call real-key {"key":"ctrl+b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <li align="center"><i>a &lt; b</i></li>
+  call real-key {"key":"ctrl+b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <li align="center"><b><i>a &lt; b</i></b></li>
+  # A bare caret toggles the style of the next typed text.
+  call real-key {"key":"end"}
+  call pointer-click {"dialog-richtool":"fixture.rich:italic"}
+  call dialog-read {}
+  assert reply.controls.7.richtext.pending_italic is false
+  call real-type {"text":"!"}
+  call dialog-read {}
+  assert reply.controls.7.value is <li align="center"><b><i>a &lt; b</i></b><b>!</b></li>
   # Enter in the multiline is a new line, not OK.
   call pointer-click {"dialog-field":"fixture.note"}
   call real-key {"key":"end"}
@@ -596,7 +639,7 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.id is task-information
   call dialog-click {"button":"OK"}
   assert dialog is none
-  assert status is Fixture: note saved (20 chars)
+  assert status is Fixture: note saved (20 chars); rich <li align="center"><b><i>a &lt; b</i></b><b>!</b></li>
 
 test the overlay returns the fixture's shapes for the chart
   open copy:../fixtures/project-clipboard.xml

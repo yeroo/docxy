@@ -1327,10 +1327,27 @@ column drawn as Project's check mark that a click or Space toggles.
 Each control is `{name, label, kind, value, text, enabled, visible}`:
 
 - `kind` is one of `text`, `number`, `date`, `duration`, `multiline`,
-  `checkbox`, `radio`, `dropdown`, `list`, `grid`, `checklist`, `label` and
+  `richtext`, `checkbox`, `radio`, `dropdown`, `list`, `grid`, `checklist`, `label` and
   `sample` (read-only like a label: `dialog-set` refuses it, #1609).
   A `multiline` field (#1532) is typed into like a text field, and Enter in
   it is a new line rather than OK; Ctrl+V keeps a pasted text's line breaks.
+- A `richtext` field (#1557) is a `multiline` with a toolbar (Bold, Italic,
+  Align Left / Center / Right, Bulleted List) and the same editing. Its
+  `value` is the canonical markup of `projcore::richtext` (one block per
+  line: `<p>` or `<li>`, with `align="center"` / `"right"`, inline `<b>` and
+  `<i>`, the escapes `&amp; &lt; &gt;`), its `text` the plain text, and it
+  adds `richtext`: `{bold, italic, align, bullets, pending_bold,
+  pending_italic}`, the toolbar's state at the caret or selection (`bold` /
+  `italic` when every selected character has it; `pending_*` the style a
+  bare caret's toggle set for the next typed text). `dialog-set` takes
+  markup or plain text (a value is markup only when it starts with `<p ` /
+  `<p>` / `<li ` / `<li>`); plugin `values`, a prefill and a refresh carry the
+  markup, and a host with no `richtext` draws the kind as plain text.
+  `pointer-click {"dialog-richtool":"<field>:<tool>"}` presses a toolbar
+  button (`bold`, `italic`, `left`, `center`, `right`, `bullets`), and
+  Ctrl/Cmd+B, I, L, E and R do the same from the keyboard with the field
+  focused. Typing, Backspace, Delete and paste keep the styles in step with
+  the text; typed text takes the style of the character before the caret.
 - `value` is typed: a checkbox's is a bool, a number's a number, an item
   control's the selected item's label (or null), and a grid's its rows.
   `text` is what the control shows.
