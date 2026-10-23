@@ -36,7 +36,7 @@ pub const MARK_SHAPES: [&str; 10] = [
 pub const MARK_KINDS: [&str; 3] = ["solid", "dashed", "framed"];
 
 /// The middle bar's shapes: full height, or a medium (8 px) or narrow (4 px)
-/// bar at the top, middle or bottom of the band.
+/// bar at the top, middle or bottom of the bar zone (a full bar's height).
 pub const MIDDLE_SHAPES: [&str; 7] = [
     "full",
     "medium-top",
@@ -537,10 +537,17 @@ impl Formatting {
 
     /// Set a task's override, or (when it overrides nothing) remove it:
     /// Format Bar's `Reset`.
+    /// An existing entry is replaced in place, so re-sending an unchanged
+    /// override changes nothing.
     pub fn set_task_bar(&mut self, bar: TaskBar) {
-        self.task_bars.retain(|t| t.uid != bar.uid);
-        if !bar.is_empty() {
-            self.task_bars.push(bar);
+        let at = self.task_bars.iter().position(|t| t.uid == bar.uid);
+        match (at, bar.is_empty()) {
+            (Some(i), true) => {
+                self.task_bars.remove(i);
+            }
+            (Some(i), false) => self.task_bars[i] = bar,
+            (None, false) => self.task_bars.push(bar),
+            (None, true) => {}
         }
     }
 

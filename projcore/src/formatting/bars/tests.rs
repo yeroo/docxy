@@ -637,3 +637,68 @@ fn complete_through_counts_working_time_across_a_weekend() {
     assert_eq!(through(2, 0, Some(at(30, 17))), Some(at(9, 17)));
     assert_eq!(through(2, 0, Some(at(1, 8))), Some(at(8, 8)));
 }
+
+#[test]
+fn resending_an_unchanged_override_is_no_change_and_keeps_the_order() {
+    let over = |uid, color| TaskBar {
+        uid,
+        middle: Middle {
+            color: Some(color),
+            ..Middle::default()
+        },
+        ..TaskBar::default()
+    };
+    let mut ed = editor();
+    ed.edit_formatting(|f| {
+        f.set_task_bar(over(1, 0x111111));
+        f.set_task_bar(over(2, 0x222222));
+    });
+    let depth = ed.undo_depth();
+    let again = Json::parse(r##"{"task_bars":[{"uid":1,"middle":{"color":"#111111"}}]}"##).unwrap();
+    ed.edit_formatting(|f| {
+        assert!(!f.apply_view(&again).unwrap());
+    });
+    assert_eq!(ed.undo_depth(), depth);
+    let uids: Vec<i32> = ed
+        .project()
+        .formatting
+        .task_bars
+        .iter()
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(uids, [1, 2]);
+    // A changed one replaces in place too; a removed one leaves the rest.
+    let changed =
+        Json::parse(r##"{"task_bars":[{"uid":1,"middle":{"color":"#333333"}}]}"##).unwrap();
+    ed.edit_formatting(|f| {
+        f.apply_view(&changed).unwrap();
+    });
+    let task_bars = &ed.project().formatting.task_bars;
+    assert_eq!(
+        (task_bars[0].uid, task_bars[0].middle.color),
+        (1, Some(0x333333))
+    );
+    assert_eq!(task_bars[1].uid, 2);
+}
+
+#[test]
+fn a_bar_that_ends_where_it_starts_or_a_day_with_no_room_reads_zero_then_one() {
+    let ed = editor();
+    let task = ed.project().tasks[0].clone();
+    // Starting at the day's last minute: 0 there, not 1.
+    assert_eq!(
+        ed.bar_day_fraction(&task, at(5, 17), at(5, 17), at(6, 12)),
+        0.
+    );
+    // A bar with no span (a milestone) is at 0.
+    assert_eq!(ed.bar_day_fraction(&task, at(5, 8), at(5, 8), at(5, 8)), 0.);
+    // Its finish and the day's end are 1.
+    assert_eq!(
+        ed.bar_day_fraction(&task, at(6, 12), at(5, 17), at(6, 12)),
+        1.
+    );
+    assert_eq!(
+        ed.bar_day_fraction(&task, at(6, 17), at(5, 8), at(30, 17)),
+        1.
+    );
+}

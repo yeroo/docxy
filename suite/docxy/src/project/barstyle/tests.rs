@@ -840,3 +840,11 @@ fn progress_is_placed_against_the_bar_not_the_whole_working_day() {
     let (x0, x1, _, dw) = progress(&afternoon_editor(1, 25));
     assert_eq!(x1 - x0, dw * 0.5);
 }
+
+#[test]
+fn a_milestone_under_a_progress_row_is_a_point() {
+    let ed = editor(vec![task(1, 0, 1)], vec![progress_row()], Vec::new());
+    let scale = gantt_scale(&ed);
+    let r = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
+    assert_eq!(r[0].x0, r[0].x1);
+}

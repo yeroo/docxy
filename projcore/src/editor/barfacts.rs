@@ -177,9 +177,11 @@ impl Editor {
         let first = super::cells::day_start(proj, task, at).max(start);
         let last = super::cells::day_end(proj, task, at).min(finish);
         let span = (last.minutes() - first.minutes()) as f64;
-        if at >= last {
+        if at <= start || span <= 0. {
+            0.
+        } else if at >= finish || at >= last {
             1.
-        } else if at <= first || span <= 0. {
+        } else if at <= first {
             0.
         } else {
             (at.minutes() - first.minutes()) as f64 / span
