@@ -1054,6 +1054,7 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
         delay: None,
         rollup: Some((0, 3)),
         warning: true,
+        geom: BarGeom::default(),
     };
     assert_eq!(same_day.warning_days(), Some((3, 3)));
     // Without a rollup, a warned bar marks its own finish day.
@@ -1148,6 +1149,7 @@ fn bar_styles_hide_critical_colour_and_baseline_only() {
         delay: Some((0, 2)),
         rollup: None,
         warning: false,
+        geom: BarGeom::default(),
     };
     assert_eq!(styled_bar(base, true, true), base);
     assert_eq!(
@@ -1223,4 +1225,180 @@ fn wheel_clamps_like_clamp_offsets_and_reports_no_change_at_an_edge() {
     assert_eq!(v.table_x.get(), 0.);
     assert!(!v.wheel(10., -50.));
     assert_eq!(v.table_x.get(), 0.);
+}
+
+fn set_layout(ed: &mut ProjectEditor, json: &str) {
+    let view = projcore::json::Json::parse(&format!(r#"{{"layout":{json}}}"#)).unwrap();
+    ed.edit_formatting(|f| {
+        f.apply_view(&view).unwrap();
+    });
+}
+
+fn plain(kind: BarKind) -> GanttBar {
+    GanttBar {
+        kind,
+        inactive: false,
+        start: 3,
+        end: 5,
+        baseline: None,
+        delay: None,
+        rollup: None,
+        warning: false,
+        geom: BarGeom::default(),
+    }
+}
+
+#[test]
+fn the_default_geometry_is_the_original_boxes() {
+    let b = bar_boxes(None);
+    assert_eq!(
+        (b.leaf, b.thin, b.summary, b.summary_top, b.post, b.diamond),
+        ((5., 14.), (11., 6.), (9., 10.), 6., 3., (5., 14.))
+    );
+    assert_eq!(bar_boxes(Some(BAR_PX)), b);
+    for kind in [
+        BarKind::Critical,
+        BarKind::OnTrack,
+        BarKind::Summary,
+        BarKind::Milestone,
+    ] {
+        let bar = plain(kind);
+        let expected = match kind {
+            BarKind::Summary => (66., 9., 66., 10.),
+            BarKind::Milestone => (3. * 22. + 11. - 7., 5., 14., 14.),
+            _ => (66., 5., 66., 14.),
+        };
+        assert_eq!(bar_rect(&bar, 22.), expected, "{kind:?}");
+        assert_eq!(bar.geom, BarGeom::default());
+    }
+}
+
+#[test]
+fn bar_height_scales_each_kind_about_its_own_centre() {
+    // 12 pt = 16 px.
+    let b = bar_boxes(Some(16.));
+    assert_eq!(b.leaf, (4., 16.));
+    assert_eq!(b.diamond, (4., 16.));
+    // round(10 * 16/14) = 11 px tall, centred on y 14.
+    assert_eq!(b.summary, (14. - 5.5, 11.));
+    assert_eq!(b.thin.0 + b.thin.1 / 2., 14.);
+    // Every kind keeps its centre line for every height that fits the row.
+    for px in [8., 10., 13.333_333, 16., 20., 24.] {
+        let b = bar_boxes(Some(px));
+        assert!((b.leaf.0 + b.leaf.1 / 2. - 12.).abs() < 1e-3, "{px}");
+        assert!((b.diamond.0 + b.diamond.1 / 2. - 12.).abs() < 1e-3, "{px}");
+        assert!((b.summary.0 + b.summary.1 / 2. - 14.).abs() < 1e-3, "{px}");
+        assert!((b.thin.0 + b.thin.1 / 2. - 14.).abs() < 1e-3, "{px}");
+    }
+    // Capped at the row and kept inside it.
+    let big = bar_boxes(Some(32.));
+    assert_eq!(big.leaf, (0., ROW_H));
+    assert!(big.summary.0 >= 0. && big.summary.0 + big.summary.1 <= ROW_H);
+    assert!(big.summary_top <= big.summary.1);
+}
+
+#[test]
+fn a_layout_bar_height_reaches_gantt_bar_and_the_overlay_rectangle() {
+    let mut ed = editor(vec![task(1, 0, 1), task(2, 2, 2), task(3, 0, 2)]);
+    let (leaf, sum, ms) = (bar(&ed, 2), bar(&ed, 1), bar(&ed, 3));
+    assert_eq!(leaf.geom.height, None);
+    set_layout(&mut ed, r#"{"bar_height":12}"#);
+    let tall = bar(&ed, 2);
+    assert_eq!(tall.geom.height, Some(16.));
+    let (_, y, _, h) = bar_rect(&tall, 22.);
+    assert_eq!((y, h), (4., 16.));
+    assert_eq!(bar_rect(&bar(&ed, 3), 22.).3, 16.);
+    assert_eq!(bar_rect(&bar(&ed, 1), 22.).1 + bar_rect(&bar(&ed, 1), 22.).3 / 2., 14.);
+    // Unset is not Some(12): 14 px against 16 px.
+    assert_ne!(bar_rect(&leaf, 22.).3, h);
+    set_layout(&mut ed, r#"{"bar_height":null}"#);
+    assert_eq!(bar(&ed, 2), leaf);
+    assert_eq!(bar(&ed, 1), sum);
+    assert_eq!(bar(&ed, 3), ms);
+}
+
+#[test]
+fn round_bars_off_draws_start_and_finish_at_their_instants() {
+    let mut ed = editor(vec![task(1, 0, 1), task(2, 1, 2), task(3, 0, 2)]);
+    let scale = gantt_scale(&ed);
+    let whole = bar(&ed, 2);
+    set_layout(&mut ed, r#"{"round_bars":false}"#);
+    let exact = bar(&ed, 2);
+    let t = ed.project().task(2).unwrap();
+    let (x, w) = span_x(&exact, scale.day_w);
+    let want = |at| instant_x(scale, 0., at);
+    assert!((x - want(ed.disp_start(2).unwrap())).abs() < 1e-3);
+    assert!((x + w - want(ed.disp_finish(2).unwrap())).abs() < 1e-3);
+    assert!(t.duration_min > 0);
+    // A one-day task ends before the end of its day: narrower than whole days.
+    assert!(w < span_x(&whole, scale.day_w).1);
+    // A milestone is centred on its start instant.
+    let m = bar(&ed, 3);
+    let centre = milestone_left(&m, scale.day_w) + 7.;
+    assert!((centre - want(ed.disp_start(3).unwrap())).abs() < 1e-3);
+    // Round bars on (or unset) is the whole-day drawing.
+    set_layout(&mut ed, r#"{"round_bars":true}"#);
+    assert_eq!(bar(&ed, 2), whole);
+    set_layout(&mut ed, r#"{"round_bars":null}"#);
+    assert_eq!(bar(&ed, 2), whole);
+}
+
+fn rolled(ed: &ProjectEditor, uid: i32) -> Option<Vec<i32>> {
+    let t = ed.project().task(uid).unwrap();
+    rolled_parts(ed, t, gantt_scale(ed), |b| b).map(|v| v.into_iter().map(|c| c.uid).collect())
+}
+
+#[test]
+fn rolled_children_follow_rollup_collapse_and_hide_expanded() {
+    let mut ed = editor(vec![
+        task(1, 0, 1),
+        task(2, 2, 2),
+        task(3, 0, 2),
+        task(4, 0, 2),
+        task(5, 3, 3),
+        task(6, 1, 1),
+    ]);
+    // Nested summary 4 holds leaf 5; leaf 6 is outside summary 1.
+    assert_eq!(rolled(&ed, 1), None);
+    set_layout(&mut ed, r#"{"rollup":true}"#);
+    // Expanded, roll-up on: leaves and milestones, nested summary itself
+    // never drawn; its leaf is.
+    assert_eq!(rolled(&ed, 1), Some(vec![2, 3, 5]));
+    assert_eq!(rolled(&ed, 2), None, "a leaf rolls nothing up");
+    set_layout(&mut ed, r#"{"hide_rollup_expanded":true}"#);
+    assert_eq!(rolled(&ed, 1), None);
+    ed.set_collapsed(1, true).unwrap();
+    assert_eq!(rolled(&ed, 1), Some(vec![2, 3, 5]));
+    ed.set_collapsed(1, false).unwrap();
+    set_layout(&mut ed, r#"{"rollup":false}"#);
+    assert_eq!(rolled(&ed, 1), None);
+    set_layout(&mut ed, r#"{"rollup":null,"hide_rollup_expanded":null}"#);
+    assert_eq!(rolled(&ed, 1), None);
+}
+
+#[test]
+fn rolled_children_skip_inactive_tasks_and_honour_round_bars() {
+    let mut inactive = task(3, 2, 2);
+    inactive.active = Some(false);
+    let mut ed = editor(vec![task(1, 0, 1), task(2, 2, 2), inactive, task(4, 0, 2)]);
+    set_layout(&mut ed, r#"{"rollup":true}"#);
+    assert_eq!(rolled(&ed, 1), Some(vec![2, 4]));
+    let scale = gantt_scale(&ed);
+    let parts = |ed: &ProjectEditor| {
+        rolled_parts(ed, ed.project().task(1).unwrap(), scale, |b| b).unwrap()
+    };
+    let whole = parts(&ed);
+    assert_eq!(whole[0].kind, bar(&ed, 2).kind);
+    assert_eq!(whole[1].kind, BarKind::Milestone);
+    assert_eq!(whole[0].x, bar_rect(&bar(&ed, 2), scale.day_w).0);
+    set_layout(&mut ed, r#"{"round_bars":false}"#);
+    let exact = parts(&ed);
+    assert!(exact[0].w < whole[0].w);
+    // The view's critical toggle recolours a rolled critical child.
+    assert_eq!(whole[0].kind, BarKind::Critical);
+    let off = rolled_parts(&ed, ed.project().task(1).unwrap(), scale, |b| {
+        styled_bar(b, false, true)
+    })
+    .unwrap();
+    assert_eq!(off[0].kind, BarKind::OnTrack);
 }

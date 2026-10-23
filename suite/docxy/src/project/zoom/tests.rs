@@ -183,6 +183,7 @@ fn geometry_follows_the_scales_own_width() {
         delay: None,
         rollup: None,
         warning: false,
+        geom: BarGeom::default(),
     };
     assert_eq!(bar_rect(&bar, 6.), (60., 5., 30., 14.));
     assert_eq!(bar_rect(&bar, 22.), (220., 5., 110., 14.));

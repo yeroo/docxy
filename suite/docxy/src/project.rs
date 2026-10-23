@@ -12,10 +12,12 @@ use std::path::Path;
 use std::rc::Rc;
 mod barstyle;
 mod gantt;
+mod rolled;
 #[cfg(test)]
 pub(super) use barstyle::BAR_Y;
 pub(super) use barstyle::{PaletteLook, bar_rows, bar_styled, drawn_entries, first_middle};
 pub(super) use gantt::*;
+pub(super) use rolled::rolled_parts;
 mod commands;
 pub(super) use commands::*;
 mod cell;
@@ -1813,6 +1815,13 @@ pub(super) fn project_el(
                                                     );
                                                     bar_styled(&v.ed, t, scale, look)
                                                 });
+                                                let rolled = task
+                                                    .filter(|_| bar.is_some_and(|b| b.kind == BarKind::Summary))
+                                                    .and_then(|t| {
+                                                        rolled_parts(&v.ed, t, scale, |b| {
+                                                            v.styled_bar(b)
+                                                        })
+                                                    });
                                                 h_flex()
                                                     .id(("project-row", i))
                                                     .h(px(row_h))
@@ -1883,6 +1892,7 @@ pub(super) fn project_el(
                                                             &row_probes,
                                                             row_h,
                                                             styled,
+                                                            rolled.as_deref(),
                                                             // A right-press on the bar
                                                             // selects its row and opens
                                                             // the bar's menu.

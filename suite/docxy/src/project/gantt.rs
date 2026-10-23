@@ -1,5 +1,6 @@
 //! Day-scale geometry shared by the renderer and harness.
 use super::barstyle::{BarStyled, styled_children};
+use super::rolled::RolledChild;
 use super::*;
 use projcore::formatting::gridlines::{Gridline, Gridlines, Line, LineType};
 
@@ -28,6 +29,60 @@ pub(crate) struct GanttBar {
     /// Project's warning on a manual summary: its subtasks finish after its
     /// own finish, or it finishes after its manual parent summary's.
     pub warning: bool,
+    /// Layout's bar height and round-to-days settings (#1695).
+    pub geom: BarGeom,
+}
+
+/// The Layout dialog's drawing settings that shape one bar (#1695). The
+/// default is the built-in 14 px bar in whole days.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub(crate) struct BarGeom {
+    /// The bar's height in px (`bar_height` points at 96/72); `None` is the
+    /// built-in 14 px, which is not 12 pt.
+    pub height: Option<f32>,
+    /// With round bars off: the bar's start and finish as fractional days
+    /// from the scale's origin (a milestone's both its start).
+    pub exact: Option<(f32, f32)>,
+}
+
+/// The built-in bar height, px.
+pub(crate) const BAR_PX: f32 = 14.;
+
+/// One bar's boxes within its row (`y`, `h`), from the bar height: a leaf
+/// bar centred on y 12, a summary and a thin bar on y 14, a milestone's
+/// diamond on y 12. The default height gives the original 5/14, 9/10,
+/// 11/6 and 5/14.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BarBoxes {
+    pub leaf: (f32, f32),
+    pub thin: (f32, f32),
+    pub summary: (f32, f32),
+    /// The summary's top bar height.
+    pub summary_top: f32,
+    /// The summary's end posts' width.
+    pub post: f32,
+    /// The diamond's square box: top and side.
+    pub diamond: (f32, f32),
+}
+
+/// `BarBoxes` for a bar `height` px tall (`None` is the built-in), capped at
+/// the row and kept inside it.
+pub(crate) fn bar_boxes(height: Option<f32>) -> BarBoxes {
+    let h = height.unwrap_or(BAR_PX).clamp(1., ROW_H);
+    let s = h / BAR_PX;
+    let boxed = |centre: f32, size: f32| {
+        let size = size.min(ROW_H);
+        ((centre - size / 2.).clamp(0., ROW_H - size), size)
+    };
+    let summary_h = (10. * s).round().max(1.);
+    BarBoxes {
+        leaf: boxed(12., h),
+        thin: boxed(14., (6. * s).round().max(1.)),
+        summary: boxed(14., summary_h),
+        summary_top: (6. * s).round().max(1.).min(summary_h),
+        post: 3.,
+        diamond: (boxed(12., h).0, h),
+    }
 }
 
 /// A bar kind's name as the UI plugins know it (#1532).
@@ -45,14 +100,41 @@ pub(crate) fn milestone_x(start: i64, day_w: f32) -> f32 {
     start as f32 * day_w + day_w / 2. - 7.
 }
 
+/// The left of `bar`'s milestone diamond: centred in its day, or on its
+/// start instant with round bars off.
+pub(crate) fn milestone_left(bar: &GanttBar, day_w: f32) -> f32 {
+    let half = bar_boxes(bar.geom.height).diamond.1 / 2.;
+    match bar.geom.exact {
+        Some((s, _)) => s * day_w - half,
+        None => bar.start as f32 * day_w + day_w / 2. - half,
+    }
+}
+
+/// The left and width of `bar`'s span: whole days, or its instants.
+pub(crate) fn span_x(bar: &GanttBar, day_w: f32) -> (f32, f32) {
+    match bar.geom.exact {
+        Some((s, e)) => (s * day_w, ((e - s) * day_w).max(1.)),
+        None => (
+            bar.start as f32 * day_w,
+            (bar.end - bar.start + 1).max(1) as f32 * day_w,
+        ),
+    }
+}
+
 /// The rectangle `gantt_strip` draws `bar` in, `(x, y, w, h)` within its
 /// row: a leaf bar, a summary's thinner bar, or a milestone's diamond box.
 pub(crate) fn bar_rect(bar: &GanttBar, day_w: f32) -> (f32, f32, f32, f32) {
-    let w = (bar.end - bar.start + 1).max(1) as f32 * day_w;
+    let boxes = bar_boxes(bar.geom.height);
+    let (x, w) = span_x(bar, day_w);
     match bar.kind {
-        BarKind::Summary => (bar.start as f32 * day_w, 9., w, 10.),
-        BarKind::Milestone => (milestone_x(bar.start, day_w), 5., 14., 14.),
-        BarKind::Critical | BarKind::OnTrack => (bar.start as f32 * day_w, 5., w, 14.),
+        BarKind::Summary => (x, boxes.summary.0, w, boxes.summary.1),
+        BarKind::Milestone => (
+            milestone_left(bar, day_w),
+            boxes.diamond.0,
+            boxes.diamond.1,
+            boxes.diamond.1,
+        ),
+        BarKind::Critical | BarKind::OnTrack => (x, boxes.leaf.0, w, boxes.leaf.1),
     }
 }
 
@@ -191,6 +273,11 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
     let start = ed.disp_start(task.uid)?;
     let finish = ed.disp_finish(task.uid)?;
     let day = |dt: projcore::DateTime| dt.day_number() - scale.origin_day;
+    let layout = &ed.project().formatting.layout;
+    let edge = |dt: projcore::DateTime| {
+        (dt.minutes() - scale.origin_day * 1440) as f32 / 1440.
+    };
+    let milestone = !task.summary && task.is_milestone();
     let inactive = ed
         .project()
         .tasks
@@ -222,6 +309,13 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
             .map(|(s, e)| (day(s), day(e))),
         // Leaf rows do not show the warning yet, as in yppxy.
         warning: task.summary && ed.summary_warning(task.uid),
+        geom: BarGeom {
+            height: layout.bar_height_px(),
+            exact: (!layout.rounds_bars()).then(|| {
+                let s = edge(start);
+                (s, if milestone { s } else { edge(finish) })
+            }),
+        },
     })
 }
 
@@ -803,6 +897,7 @@ pub(crate) fn gantt_strip(
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     row_h: f32,
     styled: Option<BarStyled>,
+    rolled: Option<&[RolledChild]>,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_chart_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -834,20 +929,35 @@ pub(crate) fn gantt_strip(
     };
     let (color, shape) = bar_look(bar.kind, palette);
     let dw = scale.day_w;
-    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
+    let boxes = bar_boxes(bar.geom.height);
+    let (bx, bw) = span_x(&bar, dw);
+    let at = |x: f32, w: f32, y: f32, h: f32, color: Hsla, hollow: bool| {
         div()
             .absolute()
-            .left(px(s as f32 * dw))
+            .left(px(x))
             .top(px(y))
-            .w(px((e - s + 1).max(1) as f32 * dw))
+            .w(px(w))
             .h(px(h))
             .when(hollow, |d| d.border_1().border_color(color))
             .when(!hollow, |d| d.bg(color))
     };
+    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
+        at(
+            s as f32 * dw,
+            (e - s + 1).max(1) as f32 * dw,
+            y,
+            h,
+            color,
+            hollow,
+        )
+    };
     let strip = delay_and_baseline(strip, bar, dw, pal);
     let mut strip = strip;
+    // With Layout's roll-up on, the summary's children are drawn instead of
+    // a manual summary's own rolled-up strip (#1695).
+    let own_rollup = bar.rollup.filter(|_| rolled.is_none());
     if bar.inactive {
-        if let Some((s, e)) = bar.rollup {
+        if let Some((s, e)) = own_rollup {
             strip = strip.child(span(s, e, 3., 4., hsla_u(color), true));
         }
         if let Some((s, e)) = bar.warning_days() {
@@ -855,30 +965,30 @@ pub(crate) fn gantt_strip(
         }
         let marker = probe(probes, format!("bar:{id}"));
         let outline = if shape == BarShape::Diamond {
+            let (_, y, size, _) = bar_rect(&bar, dw);
             div()
                 .absolute()
-                .left(px(milestone_x(bar.start, dw)))
-                .top(px(5.))
-                .size(px(14.))
+                .left(px(milestone_left(&bar, dw)))
+                .top(px(y))
+                .size(px(size))
                 .child(milestone_diamond(color, true))
                 .child(marker)
         } else {
-            span(
-                bar.start,
-                bar.end,
-                if shape == BarShape::Summary { 9. } else { 5. },
-                if shape == BarShape::Summary { 10. } else { 14. },
-                hsla_u(color),
-                true,
-            )
-            .child(marker)
+            let (y, h) = if shape == BarShape::Summary {
+                boxes.summary
+            } else {
+                boxes.leaf
+            };
+            at(bx, bw, y, h, hsla_u(color), true).child(marker)
         };
-        return strip.child(outline.on_mouse_down(MouseButton::Right, on_right));
+        return strip
+            .children(rolled_children(rolled, bar, palette, pal))
+            .child(outline.on_mouse_down(MouseButton::Right, on_right));
     }
     // A manual summary's rollup: a thin bar above its own. Its warning marks
     // the part past its finish, else its own finish day (an overrun within
     // that day, or a finish past its manual parent), in the warning colour.
-    if let Some((s, e)) = bar.rollup {
+    if let Some((s, e)) = own_rollup {
         strip = strip.child(span(
             s,
             e,
@@ -896,28 +1006,30 @@ pub(crate) fn gantt_strip(
     }
     let marker = probe(probes, format!("bar:{id}"));
     let element = match shape {
-        BarShape::Bar => span(bar.start, bar.end, 5., 14., hsla_u(color), false).child(marker),
-        BarShape::Hollow => span(bar.start, bar.end, 5., 14., hsla_u(color), true).child(marker),
-        BarShape::Thin => span(bar.start, bar.end, 11., 6., hsla_u(color), false).child(marker),
+        BarShape::Bar => at(bx, bw, boxes.leaf.0, boxes.leaf.1, hsla_u(color), false).child(marker),
+        BarShape::Hollow => {
+            at(bx, bw, boxes.leaf.0, boxes.leaf.1, hsla_u(color), true).child(marker)
+        }
+        BarShape::Thin => at(bx, bw, boxes.thin.0, boxes.thin.1, hsla_u(color), false).child(marker),
         BarShape::Summary => div()
             .absolute()
-            .left(px(bar.start as f32 * dw))
-            .top(px(9.))
-            .w(px((bar.end - bar.start + 1).max(1) as f32 * dw))
-            .h(px(10.))
+            .left(px(bx))
+            .top(px(boxes.summary.0))
+            .w(px(bw))
+            .h(px(boxes.summary.1))
             .child(
                 div()
                     .absolute()
                     .top_0()
                     .w_full()
-                    .h(px(6.))
+                    .h(px(boxes.summary_top))
                     .bg(hsla_u(color)),
             )
             .child(
                 div()
                     .absolute()
                     .left_0()
-                    .w(px(3.))
+                    .w(px(boxes.post))
                     .h_full()
                     .bg(hsla_u(color)),
             )
@@ -925,20 +1037,57 @@ pub(crate) fn gantt_strip(
                 div()
                     .absolute()
                     .right_0()
-                    .w(px(3.))
+                    .w(px(boxes.post))
                     .h_full()
                     .bg(hsla_u(color)),
             )
             .child(marker),
         BarShape::Diamond => div()
             .absolute()
-            .left(px(milestone_x(bar.start, dw)))
-            .top(px(5.))
-            .size(px(14.))
+            .left(px(milestone_left(&bar, dw)))
+            .top(px(boxes.diamond.0))
+            .size(px(boxes.diamond.1))
             .child(milestone_diamond(color, false))
             .child(marker),
     };
-    strip.child(element.on_mouse_down(MouseButton::Right, on_right))
+    strip
+        .children(rolled_children(rolled, bar, palette, pal))
+        .child(element.on_mouse_down(MouseButton::Right, on_right))
+}
+
+/// A summary's rolled-up children (#1695): thin bars and diamonds centred on
+/// the summary bar's centre line, each with a 1 px outline in the panel colour
+/// so it reads over the summary's own colour. They take no press.
+fn rolled_children(
+    rolled: Option<&[RolledChild]>,
+    bar: GanttBar,
+    palette: Option<&projcore::uiplugin::Palette>,
+    pal: Pal,
+) -> Vec<Div> {
+    let s = bar.geom.height.unwrap_or(BAR_PX).clamp(1., ROW_H) / BAR_PX;
+    rolled
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let (color, _) = bar_look(c.kind, palette);
+            let (h, w) = match c.kind {
+                BarKind::Milestone => ((8. * s).round().max(2.), (8. * s).round().max(2.)),
+                _ => ((4. * s).round().max(1.), c.w),
+            };
+            let (x, y) = match c.kind {
+                BarKind::Milestone => (c.x - w / 2., 14. - h / 2.),
+                _ => (c.x, 14. - h / 2.),
+            };
+            let el = div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h));
+            match c.kind {
+                BarKind::Milestone => el.child(milestone_diamond(color, false)),
+                _ => el
+                    .bg(hsla_u(color))
+                    .border_1()
+                    .border_color(pal.panel),
+            }
+        })
+        .collect()
 }
 
 /// The UI plugins' overlay (#1532): their shapes, in chart pixels (x from
@@ -1140,10 +1289,11 @@ fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
             };
             let x = b.origin.x;
             let y = b.origin.y;
-            path.move_to(point(x + px(7.), y));
-            path.line_to(point(x + px(14.), y + px(7.)));
-            path.line_to(point(x + px(7.), y + px(14.)));
-            path.line_to(point(x, y + px(7.)));
+            let (w, h) = (b.size.width, b.size.height);
+            path.move_to(point(x + w / 2., y));
+            path.line_to(point(x + w, y + h / 2.));
+            path.line_to(point(x + w / 2., y + h));
+            path.line_to(point(x, y + h / 2.));
             path.close();
             if let Ok(path) = path.build() {
                 window.paint_path(path, rgb(color));
