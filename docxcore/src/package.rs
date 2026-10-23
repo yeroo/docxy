@@ -4252,53 +4252,66 @@ pub fn new_package(document: Document) -> Package {
     }
 }
 
-/// Build a package for a Markdown-backed document: like [`new_package`] but with
-/// a `word/numbering.xml` that defines `numId` 1 (bullets) and `numId` 2 (decimal)
-/// across nine levels — the two ids [`crate::markdown::from_markdown`] emits. This
-/// makes Markdown list paragraphs render real markers in the TUI and survive a
-/// save to `.docx` (Word picks up the numbering part too).
-pub fn new_markdown_package(document: Document) -> Package {
-    const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    let mut pkg = new_package(document);
-
-    let bullets = markdown_list_levels(true);
-    let decimals = markdown_list_levels(false);
-    let numbering = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+impl Package {
+    /// Add a `word/numbering.xml` defining `numId` 1 (bullets) and 2 (decimal)
+    /// across nine levels, with its content-type override and the relationship
+    /// from the document part, unless the package has a numbering part (then
+    /// nothing changes). The part [`new_markdown_package`] starts with, for
+    /// a document that gets its lists later (#1364).
+    pub fn add_markdown_numbering(&mut self) {
+        if self.part("word/numbering.xml").is_some() {
+            return;
+        }
+        const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let bullets = markdown_list_levels(true);
+        let decimals = markdown_list_levels(false);
+        let numbering = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:numbering xmlns:w=\"{W}\">\
          <w:abstractNum w:abstractNumId=\"100\">{bullets}</w:abstractNum>\
          <w:abstractNum w:abstractNumId=\"101\">{decimals}</w:abstractNum>\
          <w:num w:numId=\"1\"><w:abstractNumId w:val=\"100\"/></w:num>\
          <w:num w:numId=\"2\"><w:abstractNumId w:val=\"101\"/></w:num>\
          </w:numbering>"
-    );
-    pkg.parts
-        .push(("word/numbering.xml".to_string(), numbering.into_bytes()));
+        );
+        self.parts
+            .push(("word/numbering.xml".to_string(), numbering.into_bytes()));
 
-    // Content-type override for the new part.
-    if let Some(b) = pkg.part("[Content_Types].xml") {
-        let ct = String::from_utf8_lossy(b).into_owned();
-        let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
-        pkg.set_part(
-            "[Content_Types].xml",
-            ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
-                .into_bytes(),
-        );
+        // Content-type override for the new part.
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
+            self.set_part(
+                "[Content_Types].xml",
+                ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                    .into_bytes(),
+            );
+        }
+        // Relationship from document.xml to the numbering part.
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            let rid = next_rid(&rels);
+            let rel = format!(
+                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
+            );
+            self.set_part(
+                rels_name,
+                rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                    .into_bytes(),
+            );
+        }
     }
-    // Relationship from document.xml to the numbering part.
-    let rels_name = "word/_rels/document.xml.rels";
-    if let Some(b) = pkg.part(rels_name) {
-        let rels = String::from_utf8_lossy(b).into_owned();
-        let rid = next_rid(&rels);
-        let rel = format!(
-            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
-        );
-        pkg.set_part(
-            rels_name,
-            rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
-                .into_bytes(),
-        );
-    }
+}
+
+/// Build a package for a Markdown-backed document: like [`new_package`] but with
+/// a `word/numbering.xml` that defines `numId` 1 (bullets) and `numId` 2 (decimal)
+/// across nine levels — the two ids [`crate::markdown::from_markdown`] emits. This
+/// makes Markdown list paragraphs render real markers in the TUI and survive a
+/// save to `.docx` (Word picks up the numbering part too).
+pub fn new_markdown_package(document: Document) -> Package {
+    let mut pkg = new_package(document);
+    pkg.add_markdown_numbering();
 
     // Define the styles that Markdown maps onto, so Word (and our renderer)
     // actually format them. A `<w:pStyle w:val="Heading1"/>` with no matching
@@ -7913,6 +7926,29 @@ mod tests {
         assert!(pkg.ensure_core_properties());
         let ct = pkg.part_text("[Content_Types].xml").unwrap();
         assert_eq!(ct.matches("/docProps/core.xml").count(), 1, "{ct}");
+    }
+
+    #[test]
+    fn add_markdown_numbering_adds_only_numbering_once_1364() {
+        let mut pkg = new_package(Document::default());
+        let styles = pkg.part_text("word/styles.xml").unwrap();
+        pkg.add_markdown_numbering();
+        let numbering = pkg.part_text("word/numbering.xml").unwrap();
+        assert!(numbering.contains("w:numId=\"1\"") && numbering.contains("w:numId=\"2\""));
+        assert_eq!(pkg.part_text("word/styles.xml").unwrap(), styles);
+        assert!(
+            pkg.part_text("[Content_Types].xml")
+                .unwrap()
+                .contains("/word/numbering.xml")
+        );
+        assert!(
+            pkg.part_text("word/_rels/document.xml.rels")
+                .unwrap()
+                .contains("numbering.xml")
+        );
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        pkg.add_markdown_numbering();
+        assert_eq!(pkg.part_text("[Content_Types].xml").unwrap(), ct, "once");
     }
 
     #[test]

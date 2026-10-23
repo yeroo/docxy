@@ -106,18 +106,19 @@ impl BoundProp {
         format!("/{root}[1]/{el}[1]")
     }
 
-    /// The element's name in its part.
-    fn part_element(self) -> &'static str {
+    /// The element's local name in its part, and which namespace it is in
+    /// (`None`: the extended properties', unprefixed).
+    fn part_element(self) -> (Option<Ns>, &'static str) {
         match self {
-            Self::Author => "dc:creator",
-            Self::Category => "cp:category",
-            Self::Comments => "dc:description",
-            Self::Company => "Company",
-            Self::Keywords => "cp:keywords",
-            Self::Manager => "Manager",
-            Self::Status => "cp:contentStatus",
-            Self::Subject => "dc:subject",
-            Self::Title => "dc:title",
+            Self::Author => (Some(Ns::Dc), "creator"),
+            Self::Category => (Some(Ns::Cp), "category"),
+            Self::Comments => (Some(Ns::Dc), "description"),
+            Self::Company => (None, "Company"),
+            Self::Keywords => (Some(Ns::Cp), "keywords"),
+            Self::Manager => (None, "Manager"),
+            Self::Status => (Some(Ns::Cp), "contentStatus"),
+            Self::Subject => (Some(Ns::Dc), "subject"),
+            Self::Title => (Some(Ns::Dc), "title"),
         }
     }
 
@@ -147,9 +148,21 @@ impl BoundProp {
 
     /// `xml` (the property's part) with the property set to `text`: its
     /// element's content replaced, or the element added before the root's
-    /// close. `None` when `xml` has no root to add it to.
+    /// close. The element is spelled with the prefix the root binds to its
+    /// namespace (or none, for the default namespace); a namespace the root
+    /// does not declare gets the conventional prefix and its declaration
+    /// (#1364). `None` when `xml` has no root to add it to.
     pub fn write(self, xml: &str, text: &str) -> Option<String> {
-        let name = self.part_element();
+        let (ns, local) = self.part_element();
+        let names = crate::field::CoreNames::of(xml);
+        let spelling = ns.map(|n| match n {
+            Ns::Cp => (names.cp, "cp", crate::field::CORE_NS),
+            Ns::Dc => (names.dc, "dc", crate::field::DC_NS),
+        });
+        let name = match &spelling {
+            Some((s, _, _)) => format!("{}{local}", s.prefix),
+            None => local.to_string(),
+        };
         let mut escaped = String::new();
         crate::serialize::esc_text(text, &mut escaped);
         let open = format!("<{name}");
@@ -171,6 +184,13 @@ impl BoundProp {
             let end = xml[gt..].find(&close).map(|e| gt + e)?;
             return Some(format!("{}{escaped}{}", &xml[..gt], &xml[end..]));
         }
+        // Appending: the namespace is declared first if the root lacks it.
+        let mut xml = std::borrow::Cow::Borrowed(xml);
+        if let Some((s, conventional, uri)) = &spelling {
+            if !s.declared {
+                xml = std::borrow::Cow::Owned(declare_on_root(&xml, conventional, uri)?);
+            }
+        }
         let root_close = xml.rfind("</")?;
         Some(format!(
             "{}<{name}>{escaped}</{name}>{}",
@@ -178,6 +198,36 @@ impl BoundProp {
             &xml[root_close..]
         ))
     }
+}
+
+/// Which core namespace a property's element is in.
+#[derive(Clone, Copy)]
+enum Ns {
+    Cp,
+    Dc,
+}
+
+/// `xml` with `xmlns:<prefix>="<uri>"` added to its root start tag. `None`
+/// when the root is self-closing or there is none.
+fn declare_on_root(xml: &str, prefix: &str, uri: &str) -> Option<String> {
+    let mut from = 0;
+    let start = loop {
+        let at = xml[from..].find('<').map(|i| from + i)?;
+        if xml[at + 1..].starts_with(['?', '!']) {
+            from = at + 1;
+            continue;
+        }
+        break at;
+    };
+    let gt = xml[start..].find('>').map(|e| start + e)?;
+    if xml[..gt].ends_with('/') {
+        return None;
+    }
+    Some(format!(
+        "{} xmlns:{prefix}=\"{uri}\"{}",
+        &xml[..gt],
+        &xml[gt..]
+    ))
 }
 
 /// A document property control in a paragraph's content (#1433): the `open`
@@ -379,6 +429,101 @@ pub fn core_property_control(
 
 #[cfg(test)]
 mod tests {
+    const CP_NS: &str = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+
+    /// #1364: a core part with the core namespace as its default (System.IO
+    /// .Packaging, the Open XML SDK) reads and writes `<keywords>` unprefixed.
+    #[test]
+    fn a_default_namespace_core_part_reads_and_writes_unprefixed_1364() {
+        let xml = format!(
+            "<?xml version=\"1.0\"?><coreProperties xmlns=\"{CP_NS}\" \
+             xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+             <dc:title>T</dc:title><keywords>a, b</keywords></coreProperties>"
+        );
+        let props = crate::field::parse_core_props(&xml);
+        assert_eq!(
+            (props.keywords.as_str(), props.title.as_str()),
+            ("a, b", "T")
+        );
+        let out = BoundProp::Keywords.write(&xml, "c & d").unwrap();
+        assert!(out.contains("<keywords>c &amp; d</keywords>"), "{out}");
+        assert!(!out.contains("cp:"), "{out}");
+        assert_eq!(out.matches("keywords>").count(), 2, "{out}");
+        // Absent: appended unprefixed, again with no cp: introduced.
+        let bare = xml.replace("<keywords>a, b</keywords>", "");
+        let out = BoundProp::Keywords.write(&bare, "x").unwrap();
+        assert!(
+            out.contains("<keywords>x</keywords></coreProperties>"),
+            "{out}"
+        );
+        assert!(!out.contains("cp:"), "{out}");
+        // A dc element in the same file keeps its prefix.
+        let out = BoundProp::Title.write(&xml, "U").unwrap();
+        assert!(out.contains("<dc:title>U</dc:title>"), "{out}");
+    }
+
+    /// #1364: a root that binds no cp (or dc) prefix gets the declaration with
+    /// the element, so the part stays well-formed.
+    #[test]
+    fn a_missing_namespace_binding_is_declared_with_the_element_1364() {
+        let xml =
+            "<?xml version=\"1.0\"?><props xmlns:dcterms=\"http://purl.org/dc/terms/\"></props>";
+        let out = BoundProp::Keywords.write(xml, "k").unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "<?xml version=\"1.0\"?><props xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+                 xmlns:cp=\"{CP_NS}\"><cp:keywords>k</cp:keywords></props>"
+            )
+        );
+        let out = BoundProp::Author.write(&out, "Ann").unwrap();
+        assert!(
+            out.contains("xmlns:dc=\"http://purl.org/dc/elements/1.1/\""),
+            "{out}"
+        );
+        assert!(out.contains("<dc:creator>Ann</dc:creator>"), "{out}");
+        assert_eq!(out.matches("xmlns:cp=").count(), 1, "{out}");
+        let props = crate::field::parse_core_props(&out);
+        assert_eq!(
+            (props.keywords.as_str(), props.author.as_str()),
+            ("k", "Ann")
+        );
+    }
+
+    /// #1364: the usual prefixed part is written exactly as before, declared
+    /// by the file or by a conventional prefix with any URI.
+    #[test]
+    fn a_prefixed_core_part_is_written_as_before_1364() {
+        let real = format!(
+            "<cp:coreProperties xmlns:cp=\"{CP_NS}\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+             <dc:title>Old</dc:title></cp:coreProperties>"
+        );
+        assert_eq!(
+            BoundProp::Keywords.write(&real, "k").unwrap(),
+            real.replace(
+                "</cp:coreProperties>",
+                "<cp:keywords>k</cp:keywords></cp:coreProperties>"
+            )
+        );
+        assert_eq!(
+            BoundProp::Title.write(&real, "New").unwrap(),
+            real.replace("Old", "New")
+        );
+        // Another prefix for the same URI is used as it is.
+        let other = real
+            .replace("cp:", "meta:")
+            .replace("xmlns:cp", "xmlns:meta");
+        let out = BoundProp::Keywords.write(&other, "k").unwrap();
+        assert!(out.contains("<meta:keywords>k</meta:keywords>"), "{out}");
+        assert!(!out.contains("<cp:"), "{out}");
+        assert_eq!(crate::field::parse_core_props(&out).keywords, "k");
+        // The conventional prefix with a made-up URI (test files) is kept.
+        let fake = "<cp:coreProperties xmlns:cp=\"c\" xmlns:dc=\"d\"></cp:coreProperties>";
+        let out = BoundProp::Keywords.write(fake, "k").unwrap();
+        assert_eq!(out.matches("xmlns:cp").count(), 1, "{out}");
+        assert!(out.contains("<cp:keywords>k</cp:keywords>"), "{out}");
+    }
+
     use super::*;
     use crate::model::{Block, Paragraph};
 

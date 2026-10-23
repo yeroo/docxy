@@ -621,7 +621,8 @@ fn typing_editor(tab: &mut DocTab) -> Result<&mut Editor, String> {
 }
 
 /// The tab's package, made from the editor for a new document.
-pub(crate) fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
+/// [`DocTab::ensure_package`] makes it; Info's properties share it (#1364).
+fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
     if tab.markdown {
         return Err("Mail merge needs a .docx (not Markdown)".into());
     }
@@ -629,6 +630,12 @@ pub(crate) fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
     // package its conversion wrote, which defines its styles.
     tab.ensure_package()?;
     Ok(tab.pkg.as_mut().expect("just made"))
+}
+
+/// [`package`] for the tests of the other users of the tab's package.
+#[cfg(test)]
+pub(crate) fn package_for_test(tab: &mut DocTab) -> Result<(), String> {
+    package(tab).map(|_| ())
 }
 
 /// Write the tab's mail merge into its package's settings.

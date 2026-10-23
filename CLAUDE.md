@@ -971,12 +971,18 @@
   override and package-root relationship; it stays after an undo). A document with
   no package yet (a new one) is given one on its first Info edit
   (`DocTab::ensure_package`, shared with `mailings_tab::package`: the
-  Markdown package, which also defines the Bullets/Numbering `numId`s 1 and
-  2, so lists applied later still save), so the editor never holds values
+  package a save would make plus `Package::add_markdown_numbering`, because
+  a tab that holds a package never gets a numbering part later and Bullets
+  and Numbering use `numId`s 1 and 2; its styles part is untouched), so the editor never holds values
   the package lacks. A tab whose save writes no package (Markdown, Plain
   Text, Rich Text, or a new document saved as an editable-HTML page, which
   has none) refuses the edit with a note; an opened HTML page keeps them in
   the package it embeds.
+- `BoundProp::write` and `parse_core_props` spell the elements as the root
+  binds their namespaces (`field::CoreNames`: the prefix bound to the URI, none
+  for a default namespace as System.IO.Packaging writes, else a conventional
+  prefix with its `xmlns` declaration added to the root when an element is
+  appended); a prefixed file is written byte-identically to before.
 - Anything that changes core.xml other than an edit must call
   `Editor::reseed_core_fields`, which also rewrites every undo and redo step,
   or a later sync or undo writes the old values back: Inspect Document's

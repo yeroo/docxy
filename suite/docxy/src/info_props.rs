@@ -154,10 +154,12 @@ impl crate::DocTab {
         }
     }
 
-    /// Give a document with no package yet (a new one) the one a save would
-    /// make, with the Markdown package's numbering so Bullets and Numbering
-    /// applied later still save (Mailings does the same). A converted tab
-    /// has its own package.
+    /// Give a document with no package yet (a new one) the package a save
+    /// would make (styles and all), plus the numbering part Bullets and
+    /// Numbering need: the save only defines one for a document that already
+    /// has a list, and once the tab holds a package it never adds one, so
+    /// lists applied later would save a `w:numId` with nothing behind it
+    /// (Mailings gets the same package). A converted tab has its own.
     pub(crate) fn ensure_package(&mut self) -> Result<(), String> {
         if self.pkg.is_some() {
             return Ok(());
@@ -165,13 +167,10 @@ impl crate::DocTab {
         let Surface::Doc(ed) = &self.surface else {
             return Err("this tab is not a document".into());
         };
-        let bytes = crate::doc_to_docx_styled(
-            &ed.doc,
-            &crate::live_comments(self, &ed.doc),
-            None,
-            true,
-        );
-        self.pkg = Some(docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?);
+        let bytes = crate::doc_to_docx(&ed.doc, &crate::live_comments(self, &ed.doc), None);
+        let mut pkg = docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?;
+        pkg.add_markdown_numbering();
+        self.pkg = Some(pkg);
         Ok(())
     }
 
@@ -610,11 +609,23 @@ mod tests {
     }
 
     /// A new document given a package by the first Info edit still saves a
-    /// list applied afterwards: the package defines numIds 1 and 2.
+    /// list applied afterwards (the package defines numIds 1 and 2), and the
+    /// edit leaves the styles part exactly as a save would make it.
     #[test]
     fn lists_applied_after_an_info_edit_on_a_new_document_save_1364() {
         let mut tab = crate::blank_docx_tab("Document1");
+        let styles_before = {
+            let ed = editor(&mut tab);
+            let bytes = crate::doc_to_docx(&ed.doc.clone(), &[], None);
+            let pkg = docxcore::package::load_package(&bytes).unwrap();
+            pkg.part_text("word/styles.xml").unwrap()
+        };
         assert!(tab.ensure_core_part().is_ok());
+        assert_eq!(
+            tab.pkg.as_ref().unwrap().part_text("word/styles.xml").unwrap(),
+            styles_before,
+            "an Info edit restyles nothing"
+        );
         assert!(editor(&mut tab).set_core_field(BoundProp::Title, "T"));
         tab.mark_dirty();
         let ed = editor(&mut tab);
@@ -638,13 +649,13 @@ mod tests {
     fn mailings_and_info_share_the_new_documents_package_1364() {
         let mut tab = crate::blank_docx_tab("Document1");
         editor(&mut tab).insert_str("Body");
-        crate::mailings_tab::package(&mut tab).unwrap();
+        crate::mailings_tab::package_for_test(&mut tab).unwrap();
         assert!(tab.ensure_core_part().is_ok());
         assert!(editor(&mut tab).set_core_field(BoundProp::Title, "T"));
         tab.mark_dirty();
         assert!(core_xml(&tab).contains("<dc:title>T</dc:title>"));
         let made = core_xml(&tab);
-        crate::mailings_tab::package(&mut tab).unwrap();
+        crate::mailings_tab::package_for_test(&mut tab).unwrap();
         assert_eq!(core_xml(&tab), made, "Mailings keeps the package");
         assert!(editor(&mut tab).undo());
         tab.set_dirty();
@@ -657,7 +668,7 @@ mod tests {
         assert!(other.ensure_core_part().is_ok());
         assert!(editor(&mut other).set_core_field(BoundProp::Author, "Ann"));
         other.mark_dirty();
-        crate::mailings_tab::package(&mut other).unwrap();
+        crate::mailings_tab::package_for_test(&mut other).unwrap();
         assert!(core_xml(&other).contains("<dc:creator>Ann</dc:creator>"));
     }
 
