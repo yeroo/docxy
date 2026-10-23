@@ -13453,22 +13453,11 @@ fn save_base<'a>(
     // `w:trackRevisions` (#624). A new document has no package yet: one
     // is made for it, as the save would make.
     let track = matches!(&tab.surface, Surface::Doc(ed) if ed.track_changes());
-    // So have its File > Info properties (#1364): they live in the editor and
-    // go into that package.
-    let core = match &tab.surface {
-        Surface::Doc(ed) if tab.pkg.is_none() => {
-            Some(ed.core_fields()).filter(|f| **f != docxcore::editor::CoreFields::default())
-        }
-        _ => None,
-    };
-    let mut base: Cow<'a, Package> = match (tab.pkg.as_ref(), track || core.is_some()) {
+    let mut base: Cow<'a, Package> = match (tab.pkg.as_ref(), track) {
         (Some(pkg), _) => Cow::Borrowed(pkg),
         (None, true) => Cow::Owned(blank_base(doc)),
         (None, false) => return None,
     };
-    if let Some(fields) = core {
-        info_props::write_core_fields(base.to_mut(), fields);
-    }
     if base.track_revisions() != track {
         base.to_mut().set_track_revisions(track);
     }

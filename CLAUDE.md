@@ -968,10 +968,12 @@
   write the old one back. A file with no core part (most
   files other tools make, every `uiharness/fixtures` document) gets an empty
   one on the first edit (`Package::ensure_core_properties`: content-type
-  override and package-root relationship; it stays after an undo). A new
-  document (`pkg: None`) keeps the values in the editor only and
-  `save_base` writes them into the package its first save makes (the tab is
-  not given a package: much of the suite branches on `tab.pkg`).
+  override and package-root relationship; it stays after an undo). A document with
+  no package yet (a new one) is given the one a save makes on its first Info
+  edit (`DocTab::ensure_core_part`, as `mailings_tab::package` does), so the
+  editor never holds values the package lacks; a Markdown, Plain Text, Rich
+  Text or editable-HTML tab, which saves without the package, refuses the
+  edit with a note.
 - Anything that changes core.xml other than an edit must call
   `Editor::reseed_core_fields`, which also rewrites every undo and redo step,
   or a later sync or undo writes the old values back: Inspect Document's
