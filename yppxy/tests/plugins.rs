@@ -184,6 +184,39 @@ fn a_ui_plugin_command_runs_headless() {
     let plan = projcore::yppx::read_yppx(&std::fs::read(&cleared).unwrap()).unwrap();
     assert_eq!(plan.formatting.gridlines.set_lines().count(), 0);
 
+    // #1695: the request's `view.layout` carries the plan's Layout, so
+    // `fixture.layout` sets it and, seeing a bar height in a saved `.yppx`,
+    // clears it again.
+    let laid = dir.join("laid.yppx");
+    let output = yppxy(
+        Some(&plugins),
+        &[
+            &input,
+            Path::new("--command"),
+            Path::new("fixture.layout"),
+            Path::new("--save"),
+            &laid,
+        ],
+    );
+    ok(&output);
+    let plan = projcore::yppx::read_yppx(&std::fs::read(&laid).unwrap()).unwrap();
+    assert_eq!(plan.formatting.layout.bar_height, Some(12));
+    assert_eq!(plan.formatting.layout.rollup, Some(true));
+    let unlaid = dir.join("unlaid.yppx");
+    let output = yppxy(
+        Some(&plugins),
+        &[
+            &laid,
+            Path::new("--command"),
+            Path::new("fixture.layout"),
+            Path::new("--save"),
+            &unlaid,
+        ],
+    );
+    ok(&output);
+    let plan = projcore::yppx::read_yppx(&std::fs::read(&unlaid).unwrap()).unwrap();
+    assert!(plan.formatting.layout.is_empty());
+
     // A status-only command saves nothing and says what the plugin said.
     let output = yppxy(
         Some(&plugins),

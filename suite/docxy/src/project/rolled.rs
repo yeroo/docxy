@@ -73,3 +73,6 @@ pub(crate) fn rolled_parts(
         .collect();
     Some(children)
 }
+
+#[cfg(test)]
+mod tests;

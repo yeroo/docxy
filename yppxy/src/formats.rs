@@ -268,6 +268,7 @@ impl Formats {
                 ("gridlines", ed.project().formatting.gridlines.to_json()),
                 ("bars", ed.project().formatting.bars_json()),
                 ("task_bars", ed.project().formatting.task_bars_json()),
+                ("layout", ed.project().formatting.layout_json()),
             ]),
             values,
             button: None,
