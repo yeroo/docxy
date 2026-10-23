@@ -1319,3 +1319,26 @@ fn a_refresh_with_objects_replaces_the_specs_and_plain_strings_keep_them() {
     assert_eq!(c.cell_kind(1, 1), K::Combo);
     assert_eq!(c.cell_items(1, 1), ["x"]);
 }
+
+#[test]
+fn a_plain_string_prefill_keeps_the_manifests_cell_specs() {
+    use crate::dialog::ControlKind as K;
+    let m = Manifest::parse(CELL_GRID).unwrap();
+    let spec = &m.dialog("cells").unwrap().pages[0].controls[0];
+    let prefill = Prefill {
+        values: vec![(
+            "cf.grid".to_string(),
+            Json::parse(r#"[["Discipline","Electrical"],["Done","true"]]"#).unwrap(),
+        )],
+        ..Prefill::default()
+    };
+    let c = control_of_spec(spec, Some(0), &prefill);
+    assert_eq!(
+        c.value,
+        strings(&[&["Discipline", "Electrical"], &["Done", "true"]])
+    );
+    assert_eq!(c.cell_kind(0, 1), K::Dropdown);
+    assert_eq!(c.cell_items(0, 1), ["Civil", "Electrical"]);
+    assert_eq!(c.cell_kind(1, 1), K::Checkbox);
+    assert_eq!(c.cell_specs.len(), 2);
+}

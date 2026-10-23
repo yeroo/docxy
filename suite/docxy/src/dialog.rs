@@ -1304,9 +1304,10 @@ impl Control {
                 })?,
             None => return Err("missing argument 'column'".into()),
         };
-        // A cell takes what its column's kind takes (#1532): a number
-        // column a finite number (as text or a number), a checkbox column
-        // true or false, the rest text.
+        // A cell takes what its own kind takes (#1532): a number cell a
+        // finite number (as text or a number), a checkbox cell true or false,
+        // the rest text. The kind is its column's, or in a plugin's `cell`
+        // column the cell's own (#1558).
         let kind = self.cell_kind(row, column);
         let heading = self.columns.get(column).map_or("", String::as_str);
         // A `cell` column says which cell kind refused (#1558).
@@ -1993,8 +1994,9 @@ impl Dialog {
         }
     }
 
-    /// Toggle the selected row's cell in the active column of grid `i`, a
-    /// check or checkbox column; nothing otherwise.
+    /// Toggle the selected row's cell in the active column of grid `i`, when
+    /// the cell is a check or checkbox (its column's kind, or in a `cell`
+    /// column its own, #1558); nothing otherwise.
     fn grid_toggle(&mut self, i: usize) -> Result<(), String> {
         let c = &self.controls[i];
         let Some(row) = c.row else {
@@ -2074,8 +2076,9 @@ impl Dialog {
         Ok(())
     }
 
-    /// Step the selected row's active cell of grid `i` to the next item of
-    /// its dropdown column, the first after the last.
+    /// Step the selected row's active cell of grid `i` to the next of its own
+    /// items (its dropdown column's, or in a `cell` column the cell's, #1558),
+    /// the first after the last.
     fn grid_step_item(&mut self, i: usize) -> Result<(), String> {
         let c = &self.controls[i];
         let (Some(row), col) = (c.row, c.col) else {
@@ -2091,8 +2094,9 @@ impl Dialog {
     }
 
     /// A key on a focused grid (#1602): Up and Down select a row, Left and
-    /// Right the active column, Space toggles a check cell (or steps an
-    /// editable grid's dropdown cell), typing starts (and goes on) editing the
+    /// Right the active column, Space toggles a check cell (or steps a dropdown
+    /// cell of an editable grid or of a plugin's `cell` column, by the cell's
+    /// own kind and items, #1558), typing starts (and goes on) editing the
     /// cell, Enter commits the edit, Escape drops it, Backspace shortens the
     /// cell's text. Delete clears a plugin grid's cell and removes an editable
     /// grid's row. In an editable grid Up and Down commit a cell being typed

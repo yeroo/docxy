@@ -782,6 +782,29 @@ fn value_of(kind: dialog::ControlKind, items: &[String], value: &Json) -> dialog
     }
 }
 
+/// Take a `cell` grid's `value` (#1558): objects in a `cell` column give the
+/// cells' specs again; plain strings keep the specs the rows have, by row
+/// index.
+fn take_cell_grid(c: &mut dialog::Control, value: &Json) {
+    let (rows, specs) = grid_cells(&c.column_kinds, value);
+    let carries = value.as_array().unwrap_or(&[]).iter().any(|row| {
+        row.as_array()
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .any(|(i, cell)| {
+                c.column_kinds.get(i) == Some(&dialog::ControlKind::Cell)
+                    && matches!(cell, Json::Obj(_))
+            })
+    });
+    if carries {
+        c.cell_specs = specs;
+    } else {
+        c.cell_specs.truncate(rows.len());
+    }
+    c.value = dialog::Value::Rows(rows);
+}
+
 /// Take the state's `value` into control `c`. A richtext given the markup it
 /// already holds is left alone, so the caret and the pending style survive
 /// the refresh (#1557).
@@ -794,25 +817,7 @@ fn follow_value(c: &mut dialog::Control, value: &Json) {
     } else if c.kind == dialog::ControlKind::Grid
         && c.column_kinds.contains(&dialog::ControlKind::Cell)
     {
-        // Objects in a `cell` column give the cells' specs again; plain
-        // strings keep the specs the rows have (#1558).
-        let (rows, specs) = grid_cells(&c.column_kinds, value);
-        let carries = value.as_array().unwrap_or(&[]).iter().any(|row| {
-            row.as_array()
-                .unwrap_or(&[])
-                .iter()
-                .enumerate()
-                .any(|(i, cell)| {
-                    c.column_kinds.get(i) == Some(&dialog::ControlKind::Cell)
-                        && matches!(cell, Json::Obj(_))
-                })
-        });
-        if carries {
-            c.cell_specs = specs;
-        } else {
-            c.cell_specs.truncate(rows.len());
-        }
-        c.value = dialog::Value::Rows(rows);
+        take_cell_grid(c, value);
     } else {
         c.value = value_of(c.kind, &c.items, value);
     }
@@ -948,9 +953,12 @@ fn control_of_spec(
     out.columns = c.columns.iter().map(|col| col.name.clone()).collect();
     out.column_kinds = c.columns.iter().map(|col| kind_of(&col.kind)).collect();
     if kind == dialog::ControlKind::Grid && out.column_kinds.contains(&dialog::ControlKind::Cell) {
-        let (rows, specs) = grid_cells(&out.column_kinds, value);
-        out.value = dialog::Value::Rows(rows);
-        out.cell_specs = specs;
+        // The declared cells give the specs; a prefill's value then goes
+        // through the rule a refresh follows (#1558).
+        take_cell_grid(&mut out, &c.value);
+        if let Some(given) = prefill.value(&c.name) {
+            take_cell_grid(&mut out, given);
+        }
     }
     out.commit_command = c.commit_command;
     out.page = page;
