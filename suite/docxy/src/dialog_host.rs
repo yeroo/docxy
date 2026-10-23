@@ -2480,17 +2480,7 @@ fn char_at_rich_x(
     };
     let para = rich.paras.get(n).copied().unwrap_or_default();
     let x = (x - dialog::richtext::line_offset(para, box_w, upto_w(len))).max(0.);
-    let mut at = 0;
-    let mut prev = 0.0;
-    for (_, g) in line.grapheme_indices(true) {
-        let w = upto_w(at + g.chars().count());
-        if x < (prev + w) / 2.0 {
-            return start + at;
-        }
-        prev = w;
-        at += g.chars().count();
-    }
-    start + at
+    start + char_at_x(line, x, |prefix| upto_w(prefix.chars().count()))
 }
 
 /// The character gap nearest to `x` pixels along `text` (a gap is between
@@ -2531,12 +2521,8 @@ mod tests {
     use crate::text_input::ImeState;
     use core::prelude::v1::test;
 
-    /// #988 r1: a list's choice that moves is scrolled into view once; a
-    /// frame with the same choice asks for no scroll (a wheel scroll stays),
-    /// and the handle is the same one frame to frame.
-    /// #1609: a click in a multiline lands on the line under the pointer,
-    /// the gaps of the lines above counted, however far the box scrolled
-    /// (the distance is measured from the first line, which scrolls too).
+    /// #1557: a click in a richtext takes the line's bullet gutter and
+    /// alignment off, and measures its bold runs in their own width.
     #[test]
     fn a_richtext_click_takes_off_the_gutter_and_alignment_and_measures_runs() {
         use projcore::richtext::{Align, BOLD, Para, Rich};
@@ -2610,6 +2596,12 @@ mod tests {
         assert_eq!(char_at_rich_x(&two, 20., 0., 200., width), 3);
     }
 
+    /// #988 r1: a list's choice that moves is scrolled into view once; a
+    /// frame with the same choice asks for no scroll (a wheel scroll stays),
+    /// and the handle is the same one frame to frame.
+    /// #1609: a click in a multiline lands on the line under the pointer,
+    /// the gaps of the lines above counted, however far the box scrolled
+    /// (the distance is measured from the first line, which scrolls too).
     #[test]
     fn a_multiline_click_lands_on_its_line() {
         let width = |s: &str| s.chars().count() as f32 * 7.;

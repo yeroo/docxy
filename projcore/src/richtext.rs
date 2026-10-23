@@ -231,7 +231,10 @@ fn parse_markup(src: &str) -> Rich {
                         implicit = false;
                         (bold, italic) = (0, 0);
                     }
-                    ("p" | "li", true) => open = false,
+                    ("p" | "li", true) => {
+                        open = false;
+                        (bold, italic) = (0, 0);
+                    }
                     ("b", false) => bold += 1,
                     ("b", true) => bold = bold.saturating_sub(1),
                     ("i", false) => italic += 1,
@@ -483,6 +486,9 @@ mod tests {
         // Styles do not leak into the next block.
         let r = Rich::parse("<p><b>a</p>\n<p>b</p>");
         assert_eq!(r.chars, vec![BOLD, 0, 0]);
+        // ... nor into text outside any block.
+        let r = Rich::parse("<p><i>a</p>\ntail");
+        assert_eq!(r.chars, vec![ITALIC, 0, 0, 0, 0, 0]);
         // Text outside blocks becomes a paragraph; layout whitespace does not.
         let r = Rich::parse("<p>a</p>\n  tail\n");
         assert_eq!(r.text, "a\ntail");

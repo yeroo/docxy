@@ -1871,6 +1871,7 @@ impl Dialog {
         if row >= rows {
             return Err(no_row(&shown(&c.label), row, rows));
         }
+        self.clear_pending();
         self.focus = Some(i);
         self.close_calendar_unless(i);
         let c = &mut self.controls[i];
@@ -2520,6 +2521,7 @@ impl Dialog {
             self.caret = None;
             self.anchor = None;
         }
+        self.clear_pending();
         self.focus = Some(index);
         self.close_calendar_unless(index);
         let c = &self.controls[index];
@@ -2629,6 +2631,7 @@ impl Dialog {
             self.caret = None;
             self.anchor = None;
         }
+        self.clear_pending();
         self.focus = Some(index);
         self.calendar = Some(calendar::Calendar::open(index, &text, today));
         Ok(())
@@ -2828,15 +2831,14 @@ impl Dialog {
             (
                 "controls",
                 Json::Arr(
-                    self.page_controls()
-                        .map(
-                            |c| match self.controls.iter().position(|o| std::ptr::eq(o, c)) {
-                                Some(i) if c.kind == ControlKind::Richtext => {
-                                    c.to_json_with(Some(self.tool_state(i)))
-                                }
-                                _ => c.to_json(),
-                            },
-                        )
+                    self.controls
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| self.on_page(c))
+                        .map(|(i, c)| match c.kind {
+                            ControlKind::Richtext => c.to_json_with(Some(self.tool_state(i))),
+                            _ => c.to_json(),
+                        })
                         .collect(),
                 ),
             ),

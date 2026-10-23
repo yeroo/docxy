@@ -2012,6 +2012,12 @@ fn the_toolbar_changes_the_selection_or_the_next_typed_text() {
     d.focus_control(0);
     d.focus_control(i);
     assert!(!d.tool_state(i).pending_bold);
+    // ... and so does a click on another control (not through focus_control).
+    d.rich_tool_at(i, RichTool::Bold).unwrap();
+    assert!(d.tool_state(i).pending_bold);
+    d.click_control(4, None).unwrap();
+    d.focus_control(i);
+    assert!(!d.tool_state(i).pending_bold);
     assert_eq!(
         d.rich_tool_at(0, RichTool::Bold).unwrap_err(),
         "'&Name:' is not a richtext".replace('&', "")
