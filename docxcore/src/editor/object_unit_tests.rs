@@ -1168,3 +1168,31 @@ fn a_property_synced_from_a_header_undoes_with_its_controls_1364() {
     );
     assert_eq!(ed.core_unsynced(), [(BoundProp::Title, "New".to_string())]);
 }
+
+/// #1364: with no bound control in the body, a property synced from the
+/// header has no body step, so no body undo or redo may put the old value
+/// back.
+#[test]
+fn a_header_property_with_no_body_control_survives_body_undo_1364() {
+    use crate::sdt::BoundProp;
+    let mut ed = Editor::new(doc(&[t("body")]));
+    ed.reseed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    ed.set_caret(Caret::at(vec![0], 4));
+    ed.insert_char('!');
+    let from = PropSource::Other {
+        newest_step: Some(9_999_999),
+    };
+    assert!(!ed.file_property_changed(BoundProp::Title, "New", from));
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "body");
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.redo());
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+}

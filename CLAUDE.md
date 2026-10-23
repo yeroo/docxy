@@ -962,10 +962,16 @@
   the host wrote) lists goes to `docProps/core.xml` (`BoundProp::write`) and
   to the open header/footer's controls, so an edit, undo and redo all reach
   the file through that one place. A control typed in (`sync_bound_property`)
-  tells the editor with `note_core_field`. A file with no core part (most
+  tells the editor with `Editor::file_property_changed`, which notes the field
+  after the controls follow; a header/footer-typed value with no body control
+  to step also rewrites every undo/redo step's field, or a body undo would
+  write the old one back. A file with no core part (most
   files other tools make, every `uiharness/fixtures` document) gets an empty
   one on the first edit (`Package::ensure_core_properties`: content-type
-  override and package-root relationship; it stays after an undo).
+  override and package-root relationship; it stays after an undo). A new
+  document (`pkg: None`) keeps the values in the editor only and
+  `save_base` writes them into the package its first save makes (the tab is
+  not given a package: much of the suite branches on `tab.pkg`).
 - Anything that changes core.xml other than an edit must call
   `Editor::reseed_core_fields`, which also rewrites every undo and redo step,
   or a later sync or undo writes the old values back: Inspect Document's

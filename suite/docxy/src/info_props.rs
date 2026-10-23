@@ -91,6 +91,27 @@ pub(crate) fn core_fields_of(pkg: &Package) -> CoreFields {
     }
 }
 
+/// Write the non-empty Title, Tags and Author into `pkg`'s core part, adding
+/// it (a new document's save package: [`crate::save_base`]).
+pub(crate) fn write_core_fields(pkg: &mut Package, fields: &CoreFields) {
+    use docxcore::sdt::BoundProp;
+    if !pkg.ensure_core_properties() {
+        return;
+    }
+    for prop in [BoundProp::Title, BoundProp::Keywords, BoundProp::Author] {
+        let text = fields.get(prop).unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        let written = pkg
+            .part_text(prop.part_name())
+            .and_then(|xml| prop.write(&xml, text));
+        if let Some(new) = written {
+            pkg.set_part_text(prop.part_name(), &new);
+        }
+    }
+}
+
 impl crate::DocTab {
     /// Give the editor the file's core properties if it has none yet (an
     /// editor made without them), with no undo step.
@@ -178,6 +199,9 @@ impl Docxy {
         if self.info_edit_live() && self.info_edit.as_ref().is_some_and(|e| e.which == which) {
             return;
         }
+        // Apply the field being left first: its refusal note must outlive the
+        // clearing below.
+        self.info_note = None;
         self.info_edit_apply(cx);
         if self.active_locked() {
             self.info_note = self.active_tab_id().map(|tab| {
@@ -200,7 +224,6 @@ impl Docxy {
         }
         let text = self.info_prop_value(which);
         let caret = text.chars().count();
-        self.info_note = None;
         self.info_edit = Some(InfoEdit {
             which,
             sel: caret > 0,
@@ -234,7 +257,9 @@ impl Docxy {
         if same {
             return;
         }
-        if !tab.ensure_core_part() {
+        // A new document has no package yet: its values live in the editor and
+        // `save_base` writes them into the package its first save makes.
+        if tab.pkg.is_some() && !tab.ensure_core_part() {
             self.info_note = Some((
                 e.tab.clone(),
                 format!(
@@ -495,6 +520,34 @@ mod tests {
         assert!(!xml.contains("Bo") && !xml.contains("Ann"), "{xml}");
     }
 
+    /// A new document has no package: its Title, Tags and Author live in the
+    /// editor, and its first save writes them (escaped) into the package it
+    /// makes; a reopen shows them.
+    #[test]
+    fn a_new_document_saves_its_properties_1364() {
+        let mut tab = crate::blank_docx_tab("Document1");
+        assert!(tab.pkg.is_none());
+        let ed = editor(&mut tab);
+        assert!(ed.set_core_field(BoundProp::Title, "New & Shiny"));
+        assert!(ed.set_core_field(BoundProp::Author, "Ann"));
+        tab.mark_dirty();
+        assert!(tab.pkg.is_none(), "the tab keeps its no-package shape");
+        let path = temp("newdoc").join("new.docx");
+        assert!(save_doc_tab(&mut tab, Some(path.clone())), "{}", tab.status);
+        let core = part(&path, CORE_PART);
+        assert!(core.contains("<dc:title>New &amp; Shiny</dc:title>"), "{core}");
+        assert!(core.contains("<dc:creator>Ann</dc:creator>"), "{core}");
+        assert!(!core.contains("<cp:keywords>"), "{core}");
+        let mut again = tab_from_path(&path);
+        let f = editor(&mut again).core_fields().clone();
+        assert_eq!((f.title.as_str(), f.author.as_str()), ("New & Shiny", "Ann"));
+        // A new document without properties still saves no core part.
+        let mut plain = crate::blank_docx_tab("Document2");
+        let path = temp("newdoc-plain").join("plain.docx");
+        assert!(save_doc_tab(&mut plain, Some(path.clone())), "{}", plain.status);
+        assert_eq!(part(&path, CORE_PART), "");
+    }
+
     /// A property control typed in updates what Info shows and core.xml,
     /// through `set_dirty`, without a step of Info's.
     #[test]
@@ -560,5 +613,10 @@ mod tests {
         let remove = &remove[..remove.find("cx.notify()").unwrap()];
         let apply = remove.find("info_edit_apply").expect("apply before removal");
         assert!(apply < remove.find("inspect_remove_active").unwrap());
+        // Opening a field clears the note before it applies the field it
+        // leaves, whose refusal must survive.
+        let info = include_str!("info_props.rs");
+        let open = body(info, "fn info_edit_open(");
+        assert!(open.find("info_note = None").unwrap() < open.find("info_edit_apply").unwrap());
     }
 }

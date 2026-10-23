@@ -926,10 +926,10 @@ impl Editor {
         self.core_base = self.core.clone();
     }
 
-    /// Record that the file's `prop` now reads `text` (a document property
-    /// control was typed in and the host wrote it): no undo step, the control
-    /// edit's own covers it. Only Title, Tags and Author are kept.
-    pub fn note_core_field(&mut self, prop: crate::sdt::BoundProp, text: &str) {
+    /// Take `text` as the current and the written value of `prop`; no undo
+    /// step and the history is left alone. Only Title, Tags and Author are
+    /// kept.
+    fn note_core_field(&mut self, prop: crate::sdt::BoundProp, text: &str) {
         for fields in [&mut self.core, &mut self.core_base] {
             if fields.get(prop).is_some_and(|v| v != text) {
                 if let Some(slot) = Arc::make_mut(fields).slot(prop) {
@@ -942,8 +942,12 @@ impl Editor {
     /// The host has written `prop` = `text` to the file because a control (here,
     /// or in the other editor `from` names) was typed in: show it in the
     /// controls ([`Editor::set_bound_property`]), then record it as the
-    /// file's value ([`Editor::note_core_field`]). The note comes last, so a
-    /// step that call pushed keeps the old value for its undo (#1364).
+    /// file's value (#1364). The record comes after, so an undo step that call
+    /// pushed keeps the old value with the old controls. When it pushed none
+    /// because no control here differed, from the other editor, nothing in the
+    /// history would bring the field back with controls, so every undo and
+    /// redo step takes the new value too: a body undo cannot write the old
+    /// one back over the header's edit.
     pub fn file_property_changed(
         &mut self,
         prop: crate::sdt::BoundProp,
@@ -952,6 +956,15 @@ impl Editor {
     ) -> bool {
         let changed = self.set_bound_property(prop, text, from);
         self.note_core_field(prop, text);
+        if !changed && matches!(from, PropSource::Other { .. }) {
+            for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+                if step.core.get(prop).is_some_and(|v| v != text) {
+                    if let Some(slot) = Arc::make_mut(&mut step.core).slot(prop) {
+                        *slot = text.to_string();
+                    }
+                }
+            }
+        }
         changed
     }
 

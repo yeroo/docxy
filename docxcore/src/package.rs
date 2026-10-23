@@ -3082,9 +3082,11 @@ impl Package {
 
     /// Make sure the package has a core properties part (`docProps/core.xml`,
     /// #1364): one that is there stays as it is; else an empty one is added
-    /// with its content-type override and the package-root relationship.
-    /// False, and nothing added, when the package has no content types or no
-    /// root relationships to register it in.
+    /// with its content-type override (kept if one already names it) and the
+    /// package-root relationship. False, and nothing added, when the package
+    /// has no content types or no root relationships to register it in, or
+    /// when its root relationships already name a core properties part
+    /// (elsewhere than `docProps/core.xml`): a second one would be invalid.
     pub fn ensure_core_properties(&mut self) -> bool {
         const NAME: &str = "docProps/core.xml";
         const ROOT_RELS: &str = "_rels/.rels";
