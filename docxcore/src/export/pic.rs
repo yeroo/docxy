@@ -47,51 +47,26 @@ impl PdfImage {
 }
 
 fn jpeg(b: &[u8]) -> Option<PdfImage> {
-    let mut i = 2;
-    while i + 4 <= b.len() {
-        if b[i] != 0xFF {
-            return None;
-        }
-        let marker = b[i + 1];
-        if marker == 0xFF {
-            i += 1;
-            continue;
-        }
-        // Markers without a length.
-        if marker == 0x01 || (0xD0..=0xD8).contains(&marker) {
-            i += 2;
-            continue;
-        }
-        let len = u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
-        if matches!(marker, 0xC0..=0xC2) {
-            let sof = b.get(i + 4..i + 4 + 6)?;
-            let (precision, height, width, comps) = (
-                sof[0],
-                u16::from_be_bytes([sof[1], sof[2]]) as u32,
-                u16::from_be_bytes([sof[3], sof[4]]) as u32,
-                sof[5],
-            );
-            let space = match comps {
-                1 => "/DeviceGray",
-                3 => "/DeviceRGB",
-                _ => return None,
-            };
-            if precision != 8 || width == 0 || height == 0 {
-                return None;
-            }
-            return Some(PdfImage {
-                width,
-                height,
-                entries: format!("/ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode"),
-                data: b.to_vec(),
-            });
-        }
-        if marker == 0xDA || marker == 0xD9 {
-            return None;
-        }
-        i += 2 + len;
+    let frame = crate::image::jpeg_frame(b)?;
+    // PDF's DCTDecode reads baseline, extended and progressive frames only.
+    let space = match frame.components {
+        1 => "/DeviceGray",
+        3 => "/DeviceRGB",
+        _ => return None,
+    };
+    if !matches!(frame.marker, 0xc0..=0xc2)
+        || frame.precision != 8
+        || frame.width == 0
+        || frame.height == 0
+    {
+        return None;
     }
-    None
+    Some(PdfImage {
+        width: frame.width,
+        height: frame.height,
+        entries: format!("/ColorSpace {space} /BitsPerComponent 8 /Filter /DCTDecode"),
+        data: b.to_vec(),
+    })
 }
 
 fn png(b: &[u8]) -> Option<PdfImage> {

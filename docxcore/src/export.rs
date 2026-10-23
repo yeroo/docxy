@@ -1932,14 +1932,12 @@ impl<'a> Pager<'a> {
         }
         let first = snap.page.lines.len();
         let original = self.pages[last].clone();
-        let saved = (
-            self.region.clone(),
-            self.y,
-            self.para,
-            self.numbered,
-            self.line_count.clone(),
-            self.pending_chapter.clone(),
-        );
+        let saved_region = self.region.clone();
+        let saved_y = self.y;
+        let saved_para = self.para;
+        let saved_numbered = self.numbered;
+        let saved_line_count = self.line_count.clone();
+        let saved_pending = self.pending_chapter.clone();
         let top = self.region.top;
         let room = top - snap.page.body_bottom;
         let opts = self.opts;
@@ -1979,19 +1977,19 @@ impl<'a> Pager<'a> {
                     lo = mid;
                 }
             }
-            if layout(self, Some(hi)) && self.region.low > saved.0.low + 0.001 {
+            if layout(self, Some(hi)) && self.region.low > saved_region.low + 0.001 {
                 best = Some(self.region.low);
             }
         }
         if best.is_none() {
             self.pages[last] = original;
-            self.region = saved.0;
-            self.line_count = saved.4;
+            self.region = saved_region;
+            self.line_count = saved_line_count;
         }
-        self.y = saved.1;
-        self.para = saved.2;
-        self.numbered = saved.3;
-        self.pending_chapter = saved.5;
+        self.y = saved_y;
+        self.para = saved_para;
+        self.numbered = saved_numbered;
+        self.pending_chapter = saved_pending;
     }
 
     /// Count a body line just placed for line numbering (`w:lnNumType`): the
@@ -4950,42 +4948,68 @@ mod tests {
         assert!(close(page.at("next").1, low - LH), "{:?}", page.at("next"));
     }
 
+    const UNEQUAL: &str = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+
+    /// A set whose paragraphs a trial can't lay out again is left as it was
+    /// laid out (#797): a paragraph cut by a page break, or one that ran on
+    /// from the page before. Either guard alone leaves the second case as it
+    /// is (the first layout must also reproduce the lines placed).
     #[test]
-    fn unequal_columns_leave_a_set_that_spilled_or_broke_alone_797() {
-        let sect = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
-        // Several pages of columns, the last page's set continuing a flow.
-        let mut blocks = paras("q", 119);
-        blocks.push(sect_para("q119", sect));
-        blocks.push(text_para("next"));
-        blocks.push(trailing(CONTINUOUS));
-        let pages = pages_of(&doc(blocks), &PdfOptions::default());
-        assert!(pages.len() >= 2, "{}", pages.len());
-        for i in 0..120 {
-            let label = format!("q{i}");
-            assert!(
-                pages
-                    .iter()
-                    .any(|p| p.texts.iter().any(|(_, _, t)| *t == label)),
-                "{label} printed"
-            );
-        }
-        assert!(
-            pages
-                .last()
-                .unwrap()
-                .texts
-                .iter()
-                .any(|(_, _, t)| t == "next")
-        );
-        // A page break inside the set: the lines are as they were laid out.
-        let mut blocks = paras("a", 3);
-        blocks.push(para(vec![run("b", RunProps::default()), page_break()]));
-        blocks.push(sect_para("c", sect));
+    fn unequal_columns_meet_a_page_break_and_stay_unbalanced_797() {
+        // The paragraph's break puts its tail on page 2, so the set's part
+        // there begins mid-paragraph and a trial can't start it over (a
+        // trial that does meet a page break fails, a defence no layout
+        // reaches while the paragraph guard holds).
+        let mut blocks = vec![text_para("a0")];
+        blocks.push(para(vec![
+            run("b-", RunProps::default()),
+            page_break(),
+            run("b0", RunProps::default()),
+        ]));
+        blocks.extend(paras("b", 7).into_iter().skip(1));
+        blocks.push(sect_para("b7", UNEQUAL));
         blocks.push(text_para("next"));
         blocks.push(trailing(CONTINUOUS));
         let pages = pages_of(&doc(blocks), &PdfOptions::default());
         assert_eq!(pages.len(), 2);
-        assert!(close(pages[1].at("c").0, 72.0), "{:?}", pages[1].texts);
+        let page = &pages[1];
+        // All in the first column, one under the other, as the flow placed
+        // them (a balanced set would use the second one, at x = 258).
+        for (k, label) in ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7"]
+            .into_iter()
+            .enumerate()
+        {
+            let (x, y) = page.at(label);
+            assert!(close(x, 72.0), "{label}: {:?}", page.texts);
+            assert!(close(y, 720.0 - LH - k as f32 * (LH + 4.4)), "{label}: {y}");
+        }
+        assert!(close(page.at("next").1, 720.0 - LH - 8.0 * (LH + 4.4)));
+    }
+
+    #[test]
+    fn unequal_columns_continuing_a_paragraph_from_the_page_before_stay_unbalanced_797() {
+        // 64 one-line paragraphs fill page 1's first column and most of its
+        // second; the long last one runs off the page, so the set's page 2
+        // part begins mid-paragraph.
+        let long = "aaaa ".repeat(60);
+        let mut blocks = paras("q", 64);
+        blocks.push(sect_para(&format!("Z {long}"), UNEQUAL));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        let page = &pages[1];
+        let z_lines: Vec<_> = page
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.starts_with("aaaa"))
+            .collect();
+        assert!(z_lines.len() > 5, "{:?}", page.texts);
+        assert!(
+            z_lines.iter().all(|(x, _, _)| close(*x, 72.0)),
+            "the rest of the paragraph stays in the first column: {:?}",
+            page.texts
+        );
     }
 
     #[test]
@@ -5123,16 +5147,29 @@ mod tests {
 
     #[test]
     fn three_d_borders_draw_light_and_dark_halves_797() {
-        let c = border_page(r#"w:val="threeDEmboss" w:sz="8" w:color="808080""#);
-        assert!(c.contains("0.751 0.751 0.751 RG 0.50 w"), "{c}");
-        assert!(c.contains("0.251 0.251 0.251 RG 0.50 w"), "{c}");
-        // Raised and sunken swap the tones on the top side.
-        let raised =
-            c.find("0.751 0.751 0.751 RG").unwrap() < c.find("0.251 0.251 0.251 RG").unwrap();
-        let c = border_page(r#"w:val="threeDEngrave" w:sz="8" w:color="808080""#);
-        let sunken =
-            c.find("0.751 0.751 0.751 RG").unwrap() < c.find("0.251 0.251 0.251 RG").unwrap();
-        assert_ne!(raised, sunken);
+        // The tones of each stroke in drawing order: top, then bottom.
+        let tones = |val: &str| -> Vec<char> {
+            let sect = format!(
+                r#"<w:sectPr><w:pgBorders w:offsetFrom="page"><w:top w:val="{val}" w:sz="8" w:color="808080" w:space="24"/><w:bottom w:val="{val}" w:sz="8" w:color="808080" w:space="24"/></w:pgBorders></w:sectPr>"#
+            );
+            let d = doc(vec![text_para("x"), trailing(&sect)]);
+            let c = pages_of(&d, &PdfOptions::default()).remove(0).content;
+            assert!(c.contains("0.50 w"), "{c}");
+            c.lines()
+                .filter(|l| l.contains(" RG "))
+                .map(|l| match l.split(' ').next() {
+                    Some("0.751") => 'L',
+                    Some("0.251") => 'D',
+                    other => panic!("tone {other:?} in {c}"),
+                })
+                .collect()
+        };
+        // Raised: light inside on top, dark inside on the bottom.
+        assert_eq!(tones("threeDEmboss"), ['L', 'D', 'D', 'L']);
+        assert_eq!(tones("outset"), ['L', 'D', 'D', 'L']);
+        // Sunken: the other way round.
+        assert_eq!(tones("threeDEngrave"), ['D', 'L', 'L', 'D']);
+        assert_eq!(tones("inset"), ['D', 'L', 'L', 'D']);
     }
 
     #[test]

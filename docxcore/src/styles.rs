@@ -252,11 +252,15 @@ impl StyleSheet {
         agg.vanish.unwrap_or(false)
     }
 
-    /// Effective alignment: direct wins; otherwise inherit from the style chain
+    /// Effective alignment: direct wins, an explicit direct `w:jc="left"`
+    /// (kept in `raw_props`) included; otherwise inherit from the style chain
     /// (the default paragraph style's when the paragraph names none).
-    pub fn effective_align(&self, para_style: Option<&str>, direct: Align) -> Align {
-        if direct != Align::Left {
-            return direct;
+    pub fn effective_align(&self, para_style: Option<&str>, direct: &ParProps) -> Align {
+        if direct.align != Align::Left {
+            return direct.align;
+        }
+        if has_raw_child(&direct.raw_props, "jc") {
+            return Align::Left;
         }
         if let Some(s) = para_style.or(self.default_paragraph.as_deref()) {
             let mut seen = HashSet::new();
@@ -1044,14 +1048,36 @@ mod tests {
     fn alignment_inherited_from_style() {
         let xml = r#"<w:styles><w:style w:styleId="Centered"><w:pPr><w:jc w:val="center"/></w:pPr></w:style></w:styles>"#;
         let ss = parse_styles_xml(xml);
+        let with = |align| ParProps {
+            align,
+            ..Default::default()
+        };
         assert_eq!(
-            ss.effective_align(Some("Centered"), Align::Left),
+            ss.effective_align(Some("Centered"), &with(Align::Left)),
             Align::Center
         );
         assert_eq!(
-            ss.effective_align(Some("Centered"), Align::Right),
+            ss.effective_align(Some("Centered"), &with(Align::Right)),
             Align::Right
         ); // direct wins
+    }
+
+    /// #797: a direct `w:jc="left"` (kept in `raw_props`) beats a centred
+    /// style, named or default.
+    #[test]
+    fn explicit_direct_left_beats_a_centred_style_797() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:jc w:val="center"/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Centered"><w:pPr><w:jc w:val="center"/></w:pPr></w:style>
+        </w:styles>"#,
+        );
+        let (_, left) = par(None, &[r#"<w:jc w:val="left"/>"#]);
+        assert_eq!(ss.effective_align(None, &left), Align::Left);
+        assert_eq!(ss.effective_align(Some("Centered"), &left), Align::Left);
+        let plain = ParProps::default();
+        assert_eq!(ss.effective_align(None, &plain), Align::Center);
+        assert_eq!(ss.effective_align(Some("Centered"), &plain), Align::Center);
     }
 
     #[test]
@@ -1203,10 +1229,17 @@ mod tests {
             Some("00FF00")
         );
 
-        assert_eq!(ss.effective_align(None, Align::Left), Align::Center);
-        assert_eq!(ss.effective_align(None, Align::Right), Align::Right);
-        assert_eq!(ss.effective_align(Some("Other"), Align::Left), Align::Left);
-        assert_eq!(none.effective_align(None, Align::Left), Align::Left);
+        let with = |align| ParProps {
+            align,
+            ..Default::default()
+        };
+        assert_eq!(ss.effective_align(None, &with(Align::Left)), Align::Center);
+        assert_eq!(ss.effective_align(None, &with(Align::Right)), Align::Right);
+        assert_eq!(
+            ss.effective_align(Some("Other"), &with(Align::Left)),
+            Align::Left
+        );
+        assert_eq!(none.effective_align(None, &with(Align::Left)), Align::Left);
 
         let props = ParProps::default();
         assert_eq!(ss.paragraph_rtl_override(None, &props), Some(true));

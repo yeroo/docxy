@@ -155,9 +155,7 @@ fn push_paragraph(out: &mut String, p: &Paragraph, path: &[usize], ctx: &Ctx<'_>
     if let Some(h) = props.heading_level {
         out.push_str(&format!(",\"head\":{h}"));
     }
-    let align = ctx
-        .styles
-        .effective_align(props.style_id.as_deref(), props.align);
+    let align = ctx.styles.effective_align(props.style_id.as_deref(), props);
     if align != Align::Left {
         out.push_str(",\"align\":\"");
         out.push_str(align_name(align));

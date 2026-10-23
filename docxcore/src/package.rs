@@ -799,12 +799,21 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
     let mut parser = XmlParser::new(xml);
     let mut shapes: Vec<Shape> = Vec::new();
     let mut out: Vec<WatermarkShape> = Vec::new();
-    // The last `wp:extent` seen (it comes before its `docPr`), and whether the
-    // last pushed DrawingML watermark still wants its `a:blip`.
+    // The last `wp:extent` seen (it comes before its `docPr`), and the
+    // DrawingML watermark in `out` that still wants its `a:blip`: only the
+    // drawing holding its `docPr` can give it one.
     let mut extent_pt = None;
-    let mut want_blip = false;
+    let mut blip_for: Option<usize> = None;
     loop {
         match parser.next() {
+            Event::Start if local_name(parser.name()) == "drawing" => {
+                extent_pt = None;
+                blip_for = None;
+            }
+            Event::End if local_name(parser.name()) == "drawing" => {
+                extent_pt = None;
+                blip_for = None;
+            }
             Event::Start if local_name(parser.name()) == "extent" => {
                 let emu = |name| {
                     decoded_attr_by_local(&parser, name)
@@ -814,9 +823,8 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                 extent_pt = emu("cx").zip(emu("cy"));
             }
             Event::Start if local_name(parser.name()) == "blip" => {
-                if want_blip && let Some(last) = out.last_mut() {
-                    last.rid = decoded_attr_by_local(&parser, "embed");
-                    want_blip = false;
+                if let Some(i) = blip_for.take() {
+                    out[i].rid = decoded_attr_by_local(&parser, "embed");
                 }
             }
             Event::Start if local_name(parser.name()) == "shape" => {
@@ -860,6 +868,7 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
             Event::Start if local_name(parser.name()) == "docPr" => {
                 // DrawingML picture watermarks use a watermark-named docPr rather
                 // than VML's PowerPlusWaterMarkObject shape id.
+                blip_for = None;
                 if marker_in_attrs(&parser) {
                     out.push(WatermarkShape {
                         kind: WatermarkKind::Picture,
@@ -867,7 +876,7 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                         rid: None,
                         extent_pt: extent_pt.take(),
                     });
-                    want_blip = true;
+                    blip_for = Some(out.len() - 1);
                 }
             }
             Event::End if local_name(parser.name()) == "shape" => {
@@ -7008,6 +7017,43 @@ mod tests {
         let second = pkg.parts_stamp();
         assert_ne!(second, first);
         assert_ne!(new_package(Document { body: vec![] }).parts_stamp(), second);
+    }
+
+    /// #797: a marked drawing without a blip never takes a later drawing's
+    /// (a logo's) picture, and two marked drawings each keep their own.
+    #[test]
+    fn drawingml_watermark_takes_only_its_own_blip_797() {
+        let drawing = |name: &str, rid: Option<&str>| {
+            let blip = rid.map_or(String::new(), |r| format!(r#"<a:blip r:embed="{r}"/>"#));
+            format!(
+                r#"<w:drawing><wp:anchor><wp:extent cx="127000" cy="127000"/><wp:docPr id="1" name="{name}"/><a:graphic><a:graphicData><pic:pic><pic:blipFill>{blip}</pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:anchor></w:drawing>"#
+            )
+        };
+        let wrap = |inner: String| format!("<w:hdr><w:p><w:r>{inner}</w:r></w:p></w:hdr>");
+        let xml = wrap(format!(
+            "{}{}",
+            drawing("WordPictureWatermark1", None),
+            drawing("Logo", Some("rIdLogo"))
+        ));
+        assert!(picture_watermarks(&xml).is_empty(), "no rid for the mark");
+        let xml = wrap(format!(
+            "{}{}{}",
+            drawing("WordPictureWatermark1", Some("rId1")),
+            drawing("Logo", Some("rIdLogo")),
+            drawing("WordPictureWatermark2", Some("rId2"))
+        ));
+        let rids: Vec<String> = picture_watermarks(&xml)
+            .into_iter()
+            .map(|m| m.rid)
+            .collect();
+        assert_eq!(rids, ["rId1", "rId2"]);
+        // An extent of an unmarked drawing doesn't size the next mark.
+        let xml = wrap(format!(
+            "{}{}",
+            drawing("Logo", Some("rIdLogo")).replace("127000", "999999"),
+            drawing("WordPictureWatermark1", Some("rId1"))
+        ));
+        assert_eq!(picture_watermarks(&xml)[0].width_pt, Some(10.0));
     }
 
     #[test]

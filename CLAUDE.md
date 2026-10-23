@@ -182,9 +182,14 @@
 - `StyleSheet::{effective_run, effective_align, paragraph_rtl_override,
   effective_tabs, effective_borders}` fall back to the default paragraph style
   (`w:default="1"`) for a paragraph without a `pStyle`, as `effective_vanish`
-  and `effective_ppr_flag` did; so a Normal that sets alignment or colour now
-  reaches the terminal render and the PDF. `shown_run` (the suite) still skips
-  Normal.
+  and `effective_ppr_flag` did; so a Normal that sets alignment, colour or
+  bold now reaches the terminal render, the RTF writer (rich copy, Save As)
+  and `docxwasm`'s richdoc. The PDF export gets only the run properties and
+  the paragraph direction from them: `emit_paragraph` reads alignment from
+  `p.props.align`, not through the styles (unchanged here). `effective_align`
+  takes the paragraph's `ParProps`, so a direct `w:jc="left"` (kept in
+  `raw_props`) still beats a centred style. `shown_run` (the suite) still
+  skips Normal.
 - Page borders: `BorderStyle::{Wave, ThreeD, Motif}`. `border_rules` draws
   `wave`/`doubleWave` as a sine polyline (amplitude one width, wavelength four),
   the 3-D styles as a light and a dark half stroke (raised: light inside on the

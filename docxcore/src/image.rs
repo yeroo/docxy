@@ -168,8 +168,22 @@ fn png_size(b: &[u8]) -> Option<(u32, u32)> {
     Some((be32(b, 16)?, be32(b, 20)?))
 }
 
-/// The first start-of-frame marker's size, walking the segments after SOI.
+/// A JPEG's first start-of-frame segment.
+pub(crate) struct JpegFrame {
+    /// The marker: `0xc0` baseline, `0xc1` extended, `0xc2` progressive, ….
+    pub marker: u8,
+    pub precision: u8,
+    pub width: u32,
+    pub height: u32,
+    pub components: u8,
+}
+
 fn jpeg_size(b: &[u8]) -> Option<(u32, u32)> {
+    jpeg_frame(b).map(|f| (f.width, f.height))
+}
+
+/// The first start-of-frame segment, walking the segments after SOI.
+pub(crate) fn jpeg_frame(b: &[u8]) -> Option<JpegFrame> {
     let mut i = 2;
     loop {
         // Fill bytes (0xFF) may pad before a marker.
@@ -188,8 +202,14 @@ fn jpeg_size(b: &[u8]) -> Option<(u32, u32)> {
             0xd9 | 0xda => return None,
             // SOF0..15, but DHT (C4), JPG (C8) and DAC (CC).
             0xc0..=0xcf if !matches!(marker, 0xc4 | 0xc8 | 0xcc) => {
-                // Length, precision, then height and width.
-                return Some((be16(b, i + 5)?, be16(b, i + 3)?));
+                // Length, precision, height, width, component count.
+                return Some(JpegFrame {
+                    marker,
+                    precision: *b.get(i + 2)?,
+                    height: be16(b, i + 3)?,
+                    width: be16(b, i + 5)?,
+                    components: *b.get(i + 7)?,
+                });
             }
             _ => i += be16(b, i)? as usize,
         }
