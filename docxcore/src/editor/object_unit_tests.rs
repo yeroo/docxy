@@ -1075,3 +1075,124 @@ fn two_properties_from_one_source_step_are_one_step_1433() {
     assert_eq!(ed.undo_names().len(), n0 + 1);
     assert_eq!(ed.undo_names()[0], "Title");
 }
+
+/// #1364: File > Info's Title, Tags and Author are one undo step each, shown in
+/// the bound controls inside that step.
+#[test]
+fn a_core_field_is_an_undo_step_that_the_controls_follow_1364() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let body = vec![Block::Paragraph(Paragraph {
+        props: ParProps::default(),
+        content: core_property_control(BoundProp::Title, "Old", 1, &RunProps::default()),
+    })];
+    let mut ed = Editor::new(Document { body });
+    ed.reseed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    let text = |ed: &Editor| para(ed, 0).plain_text();
+    assert!(!ed.set_core_field(BoundProp::Title, "Old"), "unchanged");
+    assert!(
+        !ed.set_core_field(BoundProp::Subject, "x"),
+        "not an Info field"
+    );
+    assert_eq!(ed.undo_serial(), None, "no step for either");
+    assert!(ed.set_core_field(BoundProp::Title, "New"));
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(text(&ed), "New");
+    assert_eq!(ed.take_bound_edits(), [], "the host's own write is no edit");
+    assert!(ed.set_core_field(BoundProp::Keywords, "a, b"));
+    assert_eq!(ed.core_fields().tags, "a, b");
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields().tags, "");
+    assert_eq!(ed.core_fields().title, "New");
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields().title, "Old");
+    assert_eq!(text(&ed), "Old");
+    assert!(!ed.undo());
+    assert!(ed.redo() && ed.redo());
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_fields().tags, "a, b");
+    assert_eq!(text(&ed), "New");
+    // The host sees what an edit, undo or redo changed, and writes it.
+    assert_eq!(
+        ed.core_unsynced(),
+        [
+            (BoundProp::Title, "New".to_string()),
+            (BoundProp::Keywords, "a, b".to_string())
+        ]
+    );
+    ed.core_synced();
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(ed.core_unsynced(), [(BoundProp::Keywords, String::new())]);
+    // A control typed in is noted without a step of its own, and is synced.
+    ed.note_core_field(BoundProp::Author, "Ann");
+    assert_eq!(ed.core_fields().author, "Ann");
+    ed.note_core_field(BoundProp::Subject, "ignored");
+    // Reseeding changes every step: an undo cannot bring back the old file.
+    ed.reseed_core_fields(CoreFields::default());
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields(), &CoreFields::default());
+    assert_eq!(ed.core_unsynced(), []);
+}
+
+/// #1364: a property typed in the other editor (a header) is one body undo
+/// step whose undo puts the controls and the core field back together.
+#[test]
+fn a_property_synced_from_a_header_undoes_with_its_controls_1364() {
+    use crate::sdt::{BoundProp, core_property_control};
+    let body = vec![Block::Paragraph(Paragraph {
+        props: ParProps::default(),
+        content: core_property_control(BoundProp::Title, "Old", 1, &RunProps::default()),
+    })];
+    let mut ed = Editor::new(Document { body });
+    ed.reseed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    assert!(ed.set_core_field(BoundProp::Title, "New"));
+    ed.core_synced();
+    let from = PropSource::Other {
+        newest_step: Some(9_999_999),
+    };
+    assert!(ed.file_property_changed(BoundProp::Title, "Hdr", from));
+    assert_eq!(ed.core_fields().title, "Hdr");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "New");
+    assert_eq!(
+        ed.core_fields().title,
+        "New",
+        "the field undoes with the controls"
+    );
+    assert_eq!(ed.core_unsynced(), [(BoundProp::Title, "New".to_string())]);
+}
+
+/// #1364: with no bound control in the body, a property synced from the
+/// header has no body step, so no body undo or redo may put the old value
+/// back.
+#[test]
+fn a_header_property_with_no_body_control_survives_body_undo_1364() {
+    use crate::sdt::BoundProp;
+    let mut ed = Editor::new(doc(&[t("body")]));
+    ed.reseed_core_fields(CoreFields {
+        title: "Old".into(),
+        ..CoreFields::default()
+    });
+    ed.set_caret(Caret::at(vec![0], 4));
+    ed.insert_char('!');
+    let from = PropSource::Other {
+        newest_step: Some(9_999_999),
+    };
+    assert!(!ed.file_property_changed(BoundProp::Title, "New", from));
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(para(&ed, 0).plain_text(), "body");
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.redo());
+    assert_eq!(ed.core_fields().title, "New");
+    assert_eq!(ed.core_unsynced(), []);
+}

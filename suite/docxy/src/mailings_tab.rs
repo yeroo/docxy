@@ -621,20 +621,21 @@ fn typing_editor(tab: &mut DocTab) -> Result<&mut Editor, String> {
 }
 
 /// The tab's package, made from the editor for a new document.
+/// [`DocTab::ensure_package`] makes it; Info's properties share it (#1364).
 fn package(tab: &mut DocTab) -> Result<&mut Package, String> {
     if tab.markdown {
         return Err("Mail merge needs a .docx (not Markdown)".into());
     }
-    if tab.pkg.is_none() {
-        let Surface::Doc(ed) = &tab.surface else {
-            return Err("Mail merge needs a document".into());
-        };
-        // A new document's. A converted tab (#633) never comes here: it has
-        // the package its conversion wrote, which defines its styles.
-        let bytes = doc_to_docx(&ed.doc, &live_comments(tab, &ed.doc), None);
-        tab.pkg = Some(docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?);
-    }
+    // A new document's. A converted tab (#633) never comes here: it has the
+    // package its conversion wrote, which defines its styles.
+    tab.ensure_package()?;
     Ok(tab.pkg.as_mut().expect("just made"))
+}
+
+/// [`package`] for the tests of the other users of the tab's package.
+#[cfg(test)]
+pub(crate) fn package_for_test(tab: &mut DocTab) -> Result<(), String> {
+    package(tab).map(|_| ())
 }
 
 /// Write the tab's mail merge into its package's settings.

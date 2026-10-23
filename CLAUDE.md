@@ -943,6 +943,56 @@
   / `FontSize`) are gone. `uiharness/cases/doc-font-box.uit` covers what
   `doc-inputs-typing.uit` does not.
 
+## File > Info Properties (#1364)
+
+- `Docxy::info_page` has a Properties section: Title (`dc:title`), Tags
+  (`cp:keywords`) and Author (`dc:creator`) as one-line fields
+  (`suite/docxy/src/info_props.rs`, `InfoEdit` on `field_edit` like the
+  Font box, probes `info-prop:<title|tags|author>`). A click opens one with
+  the value selected; Enter, Tab (to the next field), a click elsewhere on
+  the page, or leaving Info (applied by the next render) applies it, Escape
+  restores it. Backstage's `on_key` hands every key to a live field before
+  its page-scroll keys. Protected View and final documents refuse the click
+  with a note under Properties.
+- The values are editor state, like `DocSettings`: `docxcore::editor::CoreFields`
+  rides in every `Snapshot`, `Editor::set_core_field` is one undo step named
+  Title/Tags/Author (a no-op for an equal value) and shows the text in the
+  body's bound content controls inside it. `DocTab::set_dirty` calls
+  `sync_core_fields`: what `Editor::core_unsynced` (editor vs the last value
+  the host wrote) lists goes to `docProps/core.xml` (`BoundProp::write`) and
+  to the open header/footer's controls, so an edit, undo and redo all reach
+  the file through that one place. A control typed in (`sync_bound_property`)
+  tells the editor with `Editor::file_property_changed`, which notes the field
+  after the controls follow; a header/footer-typed value with no body control
+  to step also rewrites every undo/redo step's field, or a body undo would
+  write the old one back. A file with no core part (most
+  files other tools make, every `uiharness/fixtures` document) gets an empty
+  one on the first edit (`Package::ensure_core_properties`: content-type
+  override and package-root relationship; it stays after an undo). A document with
+  no package yet (a new one) is given one on its first Info edit
+  (`DocTab::ensure_package`, shared with `mailings_tab::package`: the
+  package a save would make plus `Package::add_markdown_numbering`, because
+  a tab that holds a package never gets a numbering part later and Bullets
+  and Numbering use `numId`s 1 and 2; its styles part is untouched), so the editor never holds values
+  the package lacks. A tab whose save writes no package (Markdown, Plain
+  Text, Rich Text, or a new document saved as an editable-HTML page, which
+  has none) refuses the edit with a note; an opened HTML page keeps them in
+  the package it embeds.
+- `BoundProp::write` and `parse_core_props` spell the elements as the root
+  binds their namespaces (`field::CoreNames`: the prefix bound to the URI, none
+  for a default namespace as System.IO.Packaging writes, else a conventional
+  prefix with its `xmlns` declaration added to the root when an element is
+  appended); a prefixed file is written byte-identically to before.
+- Anything that changes core.xml other than an edit must call
+  `Editor::reseed_core_fields`, which also rewrites every undo and redo step,
+  or a later sync or undo writes the old values back: Inspect Document's
+  Remove All Properties does. `DocTab::seed_core_fields` seeds an editor made
+  without them. Out of scope: Comments, Related People, Subject, Company,
+  `lastModifiedBy` (#872), sheets (#600), terminal docxy, wasm editors.
+- `info-title`, `info-tags` and `info-author` are harness inputs
+  (`inputs.rs`; `Reach::Missing` is gone); `backstage-inputs-typing.uit`
+  types into them. Backstage swallows Ctrl+Z, so its undo steps close File.
+
 ## Document comment editor (#1362)
 
 - The comment bar (`comment_key` / `comment_bar`) edits at a caret through

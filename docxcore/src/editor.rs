@@ -234,6 +234,9 @@ struct Snapshot {
     /// The document-wide settings, so undoing or redoing a toggle of one
     /// brings it back with the section edits made beside it (#770).
     settings: DocSettings,
+    /// The core properties File > Info edits, so undo and redo put them back
+    /// with the body (#1364).
+    core: Arc<CoreFields>,
 }
 
 /// The content index text typed at `caret` goes in at, just after the
@@ -633,6 +636,40 @@ pub struct DocSettings {
     pub gutter_at_top: bool,
 }
 
+/// The core properties File > Info edits (`docProps/core.xml`, #1364):
+/// Title (`dc:title`), Tags (`cp:keywords`) and Author (`dc:creator`). Edits
+/// and undo carry them like [`DocSettings`]; the host seeds them from the file
+/// and writes them back after every edit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreFields {
+    pub title: String,
+    pub tags: String,
+    pub author: String,
+}
+
+impl CoreFields {
+    /// The field `prop` names, or `None` for a property Info does not edit.
+    pub fn get(&self, prop: crate::sdt::BoundProp) -> Option<&str> {
+        use crate::sdt::BoundProp;
+        match prop {
+            BoundProp::Title => Some(&self.title),
+            BoundProp::Keywords => Some(&self.tags),
+            BoundProp::Author => Some(&self.author),
+            _ => None,
+        }
+    }
+
+    fn slot(&mut self, prop: crate::sdt::BoundProp) -> Option<&mut String> {
+        use crate::sdt::BoundProp;
+        match prop {
+            BoundProp::Title => Some(&mut self.title),
+            BoundProp::Keywords => Some(&mut self.tags),
+            BoundProp::Author => Some(&mut self.author),
+            _ => None,
+        }
+    }
+}
+
 /// An editing session over a [`Document`].
 pub struct Editor {
     pub doc: Document,
@@ -669,6 +706,13 @@ pub struct Editor {
     after_object: Option<AfterObject>,
     /// See [`Editor::settings`].
     settings: DocSettings,
+    /// See [`Editor::core_fields`].
+    core: Arc<CoreFields>,
+    /// What the host last wrote to (or read from) the package: the fields
+    /// that differ from [`Self::core`] are [`Editor::core_unsynced`].
+    core_base: Arc<CoreFields>,
+    /// [`Editor::reseed_core_fields`] has run.
+    core_seeded: bool,
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
@@ -759,6 +803,9 @@ impl Editor {
             pending: None,
             after_object: None,
             settings: DocSettings::default(),
+            core: Arc::default(),
+            core_base: Arc::default(),
+            core_seeded: false,
             display_only: false,
         }
     }
@@ -787,6 +834,9 @@ impl Editor {
             pending: self.pending.clone(),
             after_object: self.after_object.clone(),
             settings: self.settings,
+            core: self.core.clone(),
+            core_base: self.core_base.clone(),
+            core_seeded: self.core_seeded,
             display_only: true,
             bound_seen: self.bound_seen.clone(),
             sync_step: None,
@@ -831,6 +881,117 @@ impl Editor {
     /// Take the settings the document was opened with: no undo step.
     pub fn seed_settings(&mut self, settings: DocSettings) {
         self.settings = settings;
+    }
+
+    /// The core properties as edits and undo have left them (#1364).
+    pub fn core_fields(&self) -> &CoreFields {
+        &self.core
+    }
+
+    /// Whether the host has given the editor the file's core properties.
+    pub fn core_seeded(&self) -> bool {
+        self.core_seeded
+    }
+
+    /// Take the core properties the file holds now (opened, or changed by
+    /// something other than an edit, as Inspect Document's Remove All does):
+    /// no undo step, and every step in the history takes them too, so an
+    /// undo cannot put back what the file no longer has.
+    pub fn reseed_core_fields(&mut self, fields: CoreFields) {
+        let fields = Arc::new(fields);
+        self.core = fields.clone();
+        self.core_base = fields.clone();
+        self.core_seeded = true;
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            step.core = fields.clone();
+        }
+    }
+
+    /// The properties whose editor value is not the one the host last
+    /// wrote: an edit, undo or redo changed them. Write each, then call
+    /// [`Editor::core_synced`].
+    pub fn core_unsynced(&self) -> Vec<(crate::sdt::BoundProp, String)> {
+        use crate::sdt::BoundProp;
+        [BoundProp::Title, BoundProp::Keywords, BoundProp::Author]
+            .into_iter()
+            .filter_map(|p| {
+                let now = self.core.get(p)?;
+                (self.core_base.get(p)? != now).then(|| (p, now.to_string()))
+            })
+            .collect()
+    }
+
+    /// The host has written [`Editor::core_unsynced`].
+    pub fn core_synced(&mut self) {
+        self.core_base = self.core.clone();
+    }
+
+    /// Take `text` as the current and the written value of `prop`; no undo
+    /// step and the history is left alone. Only Title, Tags and Author are
+    /// kept.
+    fn note_core_field(&mut self, prop: crate::sdt::BoundProp, text: &str) {
+        for fields in [&mut self.core, &mut self.core_base] {
+            if fields.get(prop).is_some_and(|v| v != text) {
+                if let Some(slot) = Arc::make_mut(fields).slot(prop) {
+                    *slot = text.to_string();
+                }
+            }
+        }
+    }
+
+    /// The host has written `prop` = `text` to the file because a control (here,
+    /// or in the other editor `from` names) was typed in: show it in the
+    /// controls ([`Editor::set_bound_property`]), then record it as the
+    /// file's value (#1364). The record comes after, so an undo step that call
+    /// pushed keeps the old value with the old controls. When it pushed none
+    /// because no control here differed, from the other editor, nothing in the
+    /// history would bring the field back with controls, so every undo and
+    /// redo step takes the new value too: a body undo cannot write the old
+    /// one back over the header's edit.
+    pub fn file_property_changed(
+        &mut self,
+        prop: crate::sdt::BoundProp,
+        text: &str,
+        from: PropSource,
+    ) -> bool {
+        let changed = self.set_bound_property(prop, text, from);
+        self.note_core_field(prop, text);
+        if !changed && matches!(from, PropSource::Other { .. }) {
+            for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+                if step.core.get(prop).is_some_and(|v| v != text) {
+                    if let Some(slot) = Arc::make_mut(&mut step.core).slot(prop) {
+                        *slot = text.to_string();
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Set Title, Tags (Keywords) or Author as one undo step named for the
+    /// property, showing the text in every document property control bound to
+    /// it inside that step (#1364). Nothing happens, and false is returned,
+    /// when the property is not one Info edits or already reads `text`.
+    pub fn set_core_field(&mut self, prop: crate::sdt::BoundProp, text: &str) -> bool {
+        if self.core.get(prop).is_none_or(|v| v == text) {
+            return false;
+        }
+        let before = self.undo_serial();
+        self.checkpoint(EditKind::Structural);
+        let pushed = self.undo_serial() != before;
+        if let Some(step) = self.undo.back_mut().filter(|_| pushed) {
+            let name = if prop == crate::sdt::BoundProp::Keywords {
+                "Tags"
+            } else {
+                prop.label()
+            };
+            step.name = StepName::Named(name.to_string());
+        }
+        if let Some(slot) = Arc::make_mut(&mut self.core).slot(prop) {
+            *slot = text.to_string();
+        }
+        self.set_bound_property(prop, text, PropSource::Here);
+        true
     }
 
     /// Turn Different Odd & Even Pages on or off as an undo step (none when
@@ -909,6 +1070,7 @@ impl Editor {
             pending: self.pending.clone(),
             after_object: self.after_object.clone(),
             settings: self.settings,
+            core: self.core.clone(),
         }
     }
 
@@ -1098,6 +1260,7 @@ impl Editor {
             self.pending = prev.pending;
             self.after_object = prev.after_object;
             self.settings = prev.settings;
+            self.core = prev.core;
             self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();
@@ -1117,6 +1280,7 @@ impl Editor {
             self.pending = next.pending;
             self.after_object = next.after_object;
             self.settings = next.settings;
+            self.core = next.core;
             self.sync_step = None;
             self.last = EditKind::None;
             self.refresh_merge_preview();

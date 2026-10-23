@@ -715,6 +715,8 @@ pub(crate) fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) -
 
 impl Docxy {
     pub(super) fn backstage_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving File applies a typed Info property first (#1364).
+        self.info_edit_apply_now();
         // No tab to close: the Start screen stays (#806).
         if self.tabs.is_empty() {
             return;
@@ -750,6 +752,8 @@ impl Docxy {
     pub(crate) fn commit_dialog_buffers_for_exit(&mut self, cx: &mut Context<Self>) {
         // The bar's exit commit is the same leave a cell click does.
         self.sheet_comment_bar_leave();
+        // A typed Info property is not lost with the window (#1364).
+        self.info_edit_apply(cx);
         if let Some(r) = self.sheet_rename.take() {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 commit_rename_buffer_for_exit(t, r.idx, &r.text);

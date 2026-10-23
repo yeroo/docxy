@@ -842,22 +842,129 @@ pub fn civil_from_unix(secs: i64) -> DateTime {
     }
 }
 
+pub(crate) const CORE_NS: &str =
+    "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+pub(crate) const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
+pub(crate) const DCTERMS_NS: &str = "http://purl.org/dc/terms/";
+
+/// How `docProps/core.xml` spells the three namespaces its elements are in
+/// (#1364): the prefix with its colon the root binds to each URI, `""` where
+/// the namespace is the default, else the conventional `cp:`, `dc:` or
+/// `dcterms:`, flagged undeclared so a writer adds the declaration. A prefix
+/// of the conventional name bound to some other URI is taken as it is.
+pub(crate) struct CoreNames {
+    pub(crate) cp: Spelling,
+    pub(crate) dc: Spelling,
+    pub(crate) dcterms: Spelling,
+}
+
+pub(crate) struct Spelling {
+    /// `cp:`, or `""` for the default namespace.
+    pub(crate) prefix: String,
+    /// The root declares it (a writer need not).
+    pub(crate) declared: bool,
+}
+
+impl CoreNames {
+    pub(crate) fn of(xml: &str) -> CoreNames {
+        let bindings = root_bindings(xml);
+        let spell = |uri: &str, conventional: &str| {
+            if let Some((Some(p), _)) = bindings.iter().find(|(p, u)| p.is_some() && u == uri) {
+                return Spelling {
+                    prefix: format!("{p}:"),
+                    declared: true,
+                };
+            }
+            if bindings.iter().any(|(p, u)| p.is_none() && u == uri) {
+                return Spelling {
+                    prefix: String::new(),
+                    declared: true,
+                };
+            }
+            Spelling {
+                prefix: format!("{conventional}:"),
+                declared: bindings
+                    .iter()
+                    .any(|(p, _)| p.as_deref() == Some(conventional)),
+            }
+        };
+        CoreNames {
+            cp: spell(CORE_NS, "cp"),
+            dc: spell(DC_NS, "dc"),
+            dcterms: spell(DCTERMS_NS, "dcterms"),
+        }
+    }
+}
+
+/// The namespace declarations on the document's root start tag:
+/// `(prefix, uri)`, the prefix `None` for the default namespace.
+fn root_bindings(xml: &str) -> Vec<(Option<String>, String)> {
+    let mut from = 0;
+    let start = loop {
+        let Some(at) = xml[from..].find('<').map(|i| from + i) else {
+            return Vec::new();
+        };
+        if xml[at + 1..].starts_with(['?', '!']) {
+            from = at + 1;
+            continue;
+        }
+        break at;
+    };
+    let end = xml[start..].find('>').map_or(xml.len(), |e| start + e);
+    let tag = &xml[start..end];
+    let mut out = Vec::new();
+    let mut rest = tag;
+    while let Some(at) = rest.find("xmlns") {
+        let before = rest[..at].chars().next_back();
+        rest = &rest[at + "xmlns".len()..];
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let prefix = if let Some(after) = rest.strip_prefix(':') {
+            let name: String = after
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '=')
+                .collect();
+            Some(name)
+        } else if rest.trim_start().starts_with('=') {
+            None
+        } else {
+            continue;
+        };
+        let Some(eq) = rest.find('=') else { break };
+        let value = rest[eq + 1..].trim_start();
+        let Some(quote) = value.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            continue;
+        };
+        let Some(close) = value[1..].find(quote) else {
+            break;
+        };
+        out.push((prefix, value[1..1 + close].to_string()));
+        rest = &value[1 + close + 1..];
+    }
+    out
+}
+
 /// Parse `docProps/core.xml` into [`DocProps`].
 pub fn parse_core_props(xml: &str) -> DocProps {
+    let n = CoreNames::of(xml);
+    let cp = |local: &str| core_element(xml, &format!("{}{local}", n.cp.prefix));
+    let dc = |local: &str| core_element(xml, &format!("{}{local}", n.dc.prefix));
+    let dcterms = |local: &str| core_element(xml, &format!("{}{local}", n.dcterms.prefix));
     DocProps {
-        author: core_element(xml, "dc:creator"),
-        title: core_element(xml, "dc:title"),
-        subject: core_element(xml, "dc:subject"),
-        keywords: core_element(xml, "cp:keywords"),
-        comments: core_element(xml, "dc:description"),
-        last_saved_by: core_element(xml, "cp:lastModifiedBy"),
-        revision: core_element(xml, "cp:revision"),
-        category: core_element(xml, "cp:category"),
-        content_status: core_element(xml, "cp:contentStatus"),
+        author: dc("creator"),
+        title: dc("title"),
+        subject: dc("subject"),
+        keywords: cp("keywords"),
+        comments: dc("description"),
+        last_saved_by: cp("lastModifiedBy"),
+        revision: cp("revision"),
+        category: cp("category"),
+        content_status: cp("contentStatus"),
         company: String::new(),
         manager: String::new(),
-        created: parse_iso(&core_element(xml, "dcterms:created")),
-        modified: parse_iso(&core_element(xml, "dcterms:modified")),
+        created: parse_iso(&dcterms("created")),
+        modified: parse_iso(&dcterms("modified")),
     }
 }
 

@@ -66,6 +66,7 @@ mod hf_tab;
 mod hl_mode;
 mod html_bundle;
 mod hyphenation_dialog;
+mod info_props;
 mod inputs;
 mod inspector;
 mod layout_tab;
@@ -5081,6 +5082,9 @@ impl DocTab {
                 pkg.set_gutter_at_top(s.gutter_at_top);
             }
         }
+        // Title, Tags and Author follow the editor (#1364), before a control
+        // edit's own write below, which the editor is then told about.
+        self.sync_core_fields();
         self.sync_bound_property();
     }
 
@@ -5128,7 +5132,9 @@ impl DocTab {
             };
             pkg.set_part_text(prop.part_name(), &new);
             let other = |newest_step| PropSource::Other { newest_step };
-            body.set_bound_property(
+            // Noted after the controls follow, so the undo step that call may
+            // push keeps the old value with the old controls (#1364).
+            body.file_property_changed(
                 prop,
                 &text,
                 if from_hf {
@@ -5574,6 +5580,10 @@ struct Docxy {
     name_box: Option<NameBoxEdit>,
     /// The Home ribbon's Font or Font Size box while it has the keyboard (#1344).
     font_box: Option<FontBoxEdit>,
+    /// File > Info's Title, Tags or Author field while it has the keyboard (#1364).
+    info_edit: Option<info_props::InfoEdit>,
+    /// Why the last Info property edit changed nothing, under Properties.
+    info_note: Option<(close::TabId, String)>,
     // Grid width (px) captured each render, so the horizontal scroll track can map
     // a click x back to a column fraction.
     sheet_grid_w: f32,
@@ -9233,6 +9243,7 @@ fn reauthor_tracking(tabs: &mut [DocTab], user_name: &str, user_initials: &str) 
 fn new_doc_editor(doc: Document, pkg: Option<&Package>) -> Editor {
     let mut editor = Editor::new(doc);
     if let Some(pkg) = pkg {
+        editor.reseed_core_fields(info_props::core_fields_of(pkg));
         editor.seed_settings(docxcore::editor::DocSettings {
             even_and_odd_headers: pkg.has_even_odd(),
             auto_hyphenation: pkg.has_auto_hyphenation(),
@@ -14837,6 +14848,8 @@ impl Docxy {
             sheet_rename: None,
             name_box: None,
             font_box: None,
+            info_edit: None,
+            info_note: None,
             sheet_grid_w: 1000.0,
             sheet_comment_edit: None,
             sheet_comment_seed: None,
@@ -15069,6 +15082,8 @@ impl Docxy {
 
     /// The default (Open) page, as `open_backstage` leaves it.
     fn show_backstage_open_page(&mut self) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_new = false;
         self.bs_export = false;
         self.bs_info = false;
@@ -15084,6 +15099,8 @@ impl Docxy {
 
     /// File > New's page: the Document / Spreadsheet / Project / Mail cards.
     fn show_backstage_new_page(&mut self) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_new = true;
         self.bs_export = false;
         self.bs_templates = doc_templates::personal_templates(&doc_templates::templates_dir());
@@ -15102,6 +15119,8 @@ impl Docxy {
     }
 
     fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         // With no tab there is no tab to go back to: File stays up, on its
         // default page (Recent, Settings) instead of the New page (#806).
         if self.tabs.is_empty() {
@@ -15143,6 +15162,8 @@ impl Docxy {
     /// File > Account (#1023): the build line and the About button. The rail
     /// item and the harness's `account` verb both come here.
     fn open_account(&mut self, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.bs_account = true;
         self.bs_info = false;
         self.bs_info_status = None;
@@ -15158,11 +15179,15 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A typed Info property applies before the rail acts on the tab
+        // (Save, Save As, Close, ...), as Enter would (#1364).
+        self.info_edit_apply(cx);
         match action {
             BackstageRailAction::Back => self.backstage_back(window, cx),
             BackstageRailAction::Info => {
                 self.bs_info = true;
                 self.bs_info_status = None;
+                self.info_note = None;
                 self.bs_new = false;
                 self.bs_export = false;
                 self.reset_backstage_scroll();
@@ -15663,6 +15688,8 @@ impl Docxy {
     }
 
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
             kind,
@@ -23714,6 +23741,7 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.info_edit_apply(cx);
         // Nothing to save on the Start screen (#806).
         if self.tabs.is_empty() {
             return self.refocus(window, cx);
@@ -23896,6 +23924,7 @@ impl Docxy {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.info_edit_apply(cx);
         // No file dialog for nothing to write (#806).
         if self.tabs.is_empty() {
             return self.refocus(window, cx);
@@ -26359,6 +26388,10 @@ impl Docxy {
         if self.modal_takes_stroke("tab", None, Modifiers::default(), window, cx) {
             return;
         }
+        // An Info property field moves to the next one (#1364).
+        if self.info_edit_live() {
+            return self.info_edit_tab(true, cx);
+        }
         // File (backstage) covers the window; Tab there edits nothing under it.
         if self.backstage {
             return;
@@ -26482,6 +26515,10 @@ impl Docxy {
         if self.modal_takes_stroke("tab", None, shift, window, cx) {
             return;
         }
+        // An Info property field moves to the previous one (#1364).
+        if self.info_edit_live() {
+            return self.info_edit_tab(false, cx);
+        }
         // File (backstage) covers the window; Tab there edits nothing under it.
         if self.backstage {
             return;
@@ -26545,6 +26582,12 @@ impl Docxy {
         // edits nothing under it (#1027; its root takes keys for the dialogs).
         // PageUp/PageDown/Home/End scroll its page (#1028).
         if self.backstage {
+            // A focused Info property field (#1364) takes every key.
+            if self.info_edit_live() {
+                let m = &ev.keystroke.modifiers;
+                let key = ev.keystroke.key.clone();
+                return self.info_edit_key(ev, m.control || m.platform, m.alt, &key, window, cx);
+            }
             if self.backstage_scroll_key(&ev.keystroke) {
                 cx.notify();
             }
@@ -38049,6 +38092,88 @@ impl Docxy {
         Some(page.into_any_element())
     }
 
+    /// File > Info's Properties (#1364): Title, Tags and Author as text
+    /// fields (`info_props`), drawn from `info_edit` while one has the keys.
+    fn info_properties(&self, fg: Hsla, dim: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let mut rows = v_flex().gap_2().child(
+            div()
+                .pt_2()
+                .text_size(px(16.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(fg)
+                .child("Properties"),
+        );
+        for prop in info_props::InfoProp::ALL {
+            let edit = self
+                .info_edit
+                .as_ref()
+                .filter(|e| e.which == prop && self.info_edit_live());
+            let content = match edit {
+                // Focused: the text split at the caret, a whole-field
+                // selection tinted, as the Font box draws.
+                Some(e) => {
+                    let at = char_to_byte(&e.text, e.caret);
+                    div()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .when(e.sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .child(SharedString::from(e.text[..at].to_string()))
+                        .child(div().w(px(1.)).h(px(14.)).bg(hsla_u(BRAND)))
+                        .child(SharedString::from(e.text[at..].to_string()))
+                }
+                None => div()
+                    .overflow_hidden()
+                    .child(SharedString::from(self.info_prop_value(prop))),
+            };
+            rows = rows.child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().w(px(80.)).text_color(dim).child(prop.label()))
+                    .child(
+                        div()
+                            .id(prop.id())
+                            .relative()
+                            .flex()
+                            .items_center()
+                            .w(px(360.))
+                            .h(px(28.))
+                            .px_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if edit.is_some() { hsla_u(BRAND) } else { dim })
+                            .text_size(px(13.))
+                            .text_color(fg)
+                            .cursor_text()
+                            // Where `pointer-click {"input":…}` finds it.
+                            .child(probe(&self.probes, prop.probe()))
+                            .child(content)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.info_edit_open(prop, cx);
+                                this.focus.focus(window, cx);
+                                cx.stop_propagation();
+                            })),
+                    ),
+            );
+        }
+        let note = self
+            .info_note
+            .as_ref()
+            .filter(|(tab, _)| self.active_tab_id().as_ref() == Some(tab))
+            .map(|(_, note)| note.clone());
+        rows.when_some(note, |d, note| {
+            d.child(
+                div()
+                    .id("info-properties-note")
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(note),
+            )
+        })
+        .into_any_element()
+    }
+
     /// File > Info for a document tab (#627): its name and path, then Word's
     /// Inspect Document with a Remove All per category found. `None` unless
     /// the Info page is selected and the active tab is a document.
@@ -38106,6 +38231,10 @@ impl Docxy {
                                 .hover(|d| d.border_color(rgb(accent::brand())))
                                 .child("Remove All")
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    // A typed Info property applies first, so the
+                                    // click that bubbles to the page cannot write
+                                    // it back after the removal (#1364).
+                                    this.info_edit_apply(cx);
                                     let _ = this.inspect_remove_active(category);
                                     cx.notify();
                                 })),
@@ -38113,12 +38242,17 @@ impl Docxy {
                     }),
             );
         }
+        let properties = self.info_properties(fg, dim, cx);
         Some(
             v_flex()
+                .id("info-page")
                 .w_full()
                 .p_8()
                 .gap_4()
                 .bg(bg)
+                // A click anywhere else on the page leaves a property field
+                // (a field's own click stops here, #1364).
+                .on_click(cx.listener(|this, _, _, cx| this.info_edit_apply(cx)))
                 .child(
                     div()
                         .text_size(px(20.))
@@ -38131,6 +38265,7 @@ impl Docxy {
                 .when(tab.import.compat, |d| {
                     d.child(self.compat_section(fg, dim, cx))
                 })
+                .child(properties)
                 .child(
                     div()
                         .pt_2()
@@ -39065,6 +39200,11 @@ impl Render for Docxy {
             if self.probes.borrow().get(fb.probe()).is_none() {
                 self.font_box = None;
             }
+        }
+        // An Info property field whose page is gone (File closed, Info left,
+        // another tab) applies as Enter does (#1364).
+        if self.info_edit.is_some() && !self.info_edit_live() {
+            self.info_edit_apply(cx);
         }
         // Apply the theme choice (Auto follows the OS appearance).
         self.apply_theme(window, cx);

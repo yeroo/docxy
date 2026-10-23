@@ -3080,6 +3080,61 @@ impl Package {
         self.set_part_text(name, &out);
     }
 
+    /// Make sure the package has a core properties part (`docProps/core.xml`,
+    /// #1364): one that is there stays as it is; else an empty one is added
+    /// with its content-type override (kept if one already names it) and the
+    /// package-root relationship. False, and nothing added, when the package
+    /// has no content types or no root relationships to register it in, or
+    /// when its root relationships already name a core properties part
+    /// (elsewhere than `docProps/core.xml`): a second one would be invalid.
+    pub fn ensure_core_properties(&mut self) -> bool {
+        const NAME: &str = "docProps/core.xml";
+        const ROOT_RELS: &str = "_rels/.rels";
+        const CT: &str = "application/vnd.openxmlformats-package.core-properties+xml";
+        const REL: &str =
+            "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
+        if self.part(NAME).is_some() {
+            return true;
+        }
+        let (Some(ct), Some(rels)) = (
+            self.part_text("[Content_Types].xml"),
+            self.part_text(ROOT_RELS),
+        ) else {
+            return false;
+        };
+        // A root relationship to a core part we cannot find is not ours to
+        // double: refuse rather than add a second one.
+        if !ct.contains("</Types>")
+            || !rels.contains("</Relationships>")
+            || rels.contains("metadata/core-properties")
+        {
+            return false;
+        }
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+            <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+            xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+            xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" \
+            xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"></cp:coreProperties>";
+        self.parts
+            .push((NAME.to_string(), body.as_bytes().to_vec()));
+        if !ct.contains(&format!("PartName=\"/{NAME}\"")) {
+            let ov = format!("<Override PartName=\"/{NAME}\" ContentType=\"{CT}\"/>");
+            self.set_part_text(
+                "[Content_Types].xml",
+                &ct.replacen("</Types>", &format!("{ov}</Types>"), 1),
+            );
+        }
+        let rel = format!(
+            "<Relationship Id=\"{}\" Type=\"{REL}\" Target=\"{NAME}\"/>",
+            next_rid(&rels)
+        );
+        self.set_part_text(
+            ROOT_RELS,
+            &rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1),
+        );
+        true
+    }
+
     /// Add a new part with its content-type override and a relationship from
     /// the main document part.
     fn add_part_with_rel(&mut self, name: &str, content_type: &str, rel_type: &str, body: String) {
@@ -4197,53 +4252,66 @@ pub fn new_package(document: Document) -> Package {
     }
 }
 
-/// Build a package for a Markdown-backed document: like [`new_package`] but with
-/// a `word/numbering.xml` that defines `numId` 1 (bullets) and `numId` 2 (decimal)
-/// across nine levels — the two ids [`crate::markdown::from_markdown`] emits. This
-/// makes Markdown list paragraphs render real markers in the TUI and survive a
-/// save to `.docx` (Word picks up the numbering part too).
-pub fn new_markdown_package(document: Document) -> Package {
-    const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
-    let mut pkg = new_package(document);
-
-    let bullets = markdown_list_levels(true);
-    let decimals = markdown_list_levels(false);
-    let numbering = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+impl Package {
+    /// Add a `word/numbering.xml` defining `numId` 1 (bullets) and 2 (decimal)
+    /// across nine levels, with its content-type override and the relationship
+    /// from the document part, unless the package has a numbering part (then
+    /// nothing changes). The part [`new_markdown_package`] starts with, for
+    /// a document that gets its lists later (#1364).
+    pub fn add_markdown_numbering(&mut self) {
+        if self.part("word/numbering.xml").is_some() {
+            return;
+        }
+        const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+        let bullets = markdown_list_levels(true);
+        let decimals = markdown_list_levels(false);
+        let numbering = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:numbering xmlns:w=\"{W}\">\
          <w:abstractNum w:abstractNumId=\"100\">{bullets}</w:abstractNum>\
          <w:abstractNum w:abstractNumId=\"101\">{decimals}</w:abstractNum>\
          <w:num w:numId=\"1\"><w:abstractNumId w:val=\"100\"/></w:num>\
          <w:num w:numId=\"2\"><w:abstractNumId w:val=\"101\"/></w:num>\
          </w:numbering>"
-    );
-    pkg.parts
-        .push(("word/numbering.xml".to_string(), numbering.into_bytes()));
+        );
+        self.parts
+            .push(("word/numbering.xml".to_string(), numbering.into_bytes()));
 
-    // Content-type override for the new part.
-    if let Some(b) = pkg.part("[Content_Types].xml") {
-        let ct = String::from_utf8_lossy(b).into_owned();
-        let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
-        pkg.set_part(
-            "[Content_Types].xml",
-            ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
-                .into_bytes(),
-        );
+        // Content-type override for the new part.
+        if let Some(b) = self.part("[Content_Types].xml") {
+            let ct = String::from_utf8_lossy(b).into_owned();
+            let ov = "<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>";
+            self.set_part(
+                "[Content_Types].xml",
+                ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                    .into_bytes(),
+            );
+        }
+        // Relationship from document.xml to the numbering part.
+        let rels_name = "word/_rels/document.xml.rels";
+        if let Some(b) = self.part(rels_name) {
+            let rels = String::from_utf8_lossy(b).into_owned();
+            let rid = next_rid(&rels);
+            let rel = format!(
+                "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
+            );
+            self.set_part(
+                rels_name,
+                rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                    .into_bytes(),
+            );
+        }
     }
-    // Relationship from document.xml to the numbering part.
-    let rels_name = "word/_rels/document.xml.rels";
-    if let Some(b) = pkg.part(rels_name) {
-        let rels = String::from_utf8_lossy(b).into_owned();
-        let rid = next_rid(&rels);
-        let rel = format!(
-            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>"
-        );
-        pkg.set_part(
-            rels_name,
-            rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
-                .into_bytes(),
-        );
-    }
+}
+
+/// Build a package for a Markdown-backed document: like [`new_package`] but with
+/// a `word/numbering.xml` that defines `numId` 1 (bullets) and `numId` 2 (decimal)
+/// across nine levels — the two ids [`crate::markdown::from_markdown`] emits. This
+/// makes Markdown list paragraphs render real markers in the TUI and survive a
+/// save to `.docx` (Word picks up the numbering part too).
+pub fn new_markdown_package(document: Document) -> Package {
+    let mut pkg = new_package(document);
+    pkg.add_markdown_numbering();
 
     // Define the styles that Markdown maps onto, so Word (and our renderer)
     // actually format them. A `<w:pStyle w:val="Heading1"/>` with no matching
@@ -7797,6 +7865,90 @@ mod tests {
                 WatermarkKind::Picture,
             ]
         );
+    }
+
+    #[test]
+    fn ensure_core_properties_adds_the_part_once_1364() {
+        let ct = "<?xml version=\"1.0\"?><Types xmlns=\"t\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>";
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Type=\"o\" Target=\"word/document.xml\"/></Relationships>";
+        let zip = crate::zipwrite::write_zip(&[
+            ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+        ]);
+        let mut pkg = load_package(&zip).unwrap();
+        assert!(pkg.part_text("docProps/core.xml").is_none());
+        assert!(pkg.ensure_core_properties());
+        let core = pkg.part_text("docProps/core.xml").unwrap();
+        assert!(core.contains("<cp:coreProperties") && core.ends_with("</cp:coreProperties>"));
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(ct.contains("PartName=\"/docProps/core.xml\""), "{ct}");
+        let rels = pkg.part_text("_rels/.rels").unwrap();
+        assert!(
+            rels.contains("Id=\"rId2\"") && rels.contains("metadata/core-properties"),
+            "{rels}"
+        );
+        // A second call changes nothing, and the part survives a save.
+        assert!(pkg.ensure_core_properties());
+        assert_eq!(pkg.part_text("[Content_Types].xml").unwrap(), ct);
+        let again = load_package(&save_package(&pkg)).unwrap();
+        assert!(again.part_text("docProps/core.xml").is_some());
+        // No registry to put it in: nothing is added.
+        let bare = crate::zipwrite::write_zip(&[(
+            "word/document.xml".to_string(),
+            b"<w:document/>".to_vec(),
+        )]);
+        let mut bare = load_package(&bare).unwrap();
+        assert!(!bare.ensure_core_properties());
+        assert!(bare.part_text("docProps/core.xml").is_none());
+    }
+
+    #[test]
+    fn ensure_core_properties_does_not_double_what_the_package_names_1364() {
+        let ct = "<Types xmlns=\"t\"></Types>";
+        let with_rel = "<Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/other.xml\"/></Relationships>";
+        let zip = |ct: &str, rels: &str| {
+            load_package(&crate::zipwrite::write_zip(&[
+                ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+                ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+                ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+            ]))
+            .unwrap()
+        };
+        // A relationship to a core part we cannot find: refuse, add nothing.
+        let mut pkg = zip(ct, with_rel);
+        assert!(!pkg.ensure_core_properties());
+        assert!(pkg.part_text("docProps/core.xml").is_none());
+        assert_eq!(pkg.part_text("_rels/.rels").unwrap(), with_rel);
+        // An override already there is not repeated.
+        let ov = "<Types xmlns=\"t\"><Override PartName=\"/docProps/core.xml\" ContentType=\"x\"/></Types>";
+        let mut pkg = zip(ov, "<Relationships xmlns=\"r\"></Relationships>");
+        assert!(pkg.ensure_core_properties());
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert_eq!(ct.matches("/docProps/core.xml").count(), 1, "{ct}");
+    }
+
+    #[test]
+    fn add_markdown_numbering_adds_only_numbering_once_1364() {
+        let mut pkg = new_package(Document::default());
+        let styles = pkg.part_text("word/styles.xml").unwrap();
+        pkg.add_markdown_numbering();
+        let numbering = pkg.part_text("word/numbering.xml").unwrap();
+        assert!(numbering.contains("w:numId=\"1\"") && numbering.contains("w:numId=\"2\""));
+        assert_eq!(pkg.part_text("word/styles.xml").unwrap(), styles);
+        assert!(
+            pkg.part_text("[Content_Types].xml")
+                .unwrap()
+                .contains("/word/numbering.xml")
+        );
+        assert!(
+            pkg.part_text("word/_rels/document.xml.rels")
+                .unwrap()
+                .contains("numbering.xml")
+        );
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        pkg.add_markdown_numbering();
+        assert_eq!(pkg.part_text("[Content_Types].xml").unwrap(), ct, "once");
     }
 
     #[test]

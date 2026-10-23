@@ -10,9 +10,9 @@
 //! (#1201): the Find bar's Find and Replace fields, Home's Font and Font
 //! Size boxes and the comment editor, for
 //! `uiharness/cases/doc-inputs-typing.uit`. So is the sheet tab's inline
-//! rename (#1202), for `uiharness/cases/backstage-inputs-typing.uit`, which
-//! also pins why Backstage's are not typed into: Save As's file name is the
-//! OS's file dialog, and File > Info has no properties yet (#1364). So are
+//! rename (#1202) and File > Info's Title, Tags and Author (#1364), for
+//! `uiharness/cases/backstage-inputs-typing.uit`, which also pins why Save
+//! As's file name is not typed into: it is the OS's file dialog. So are
 //! Project's (#1203): the grid's inline cell editor, for
 //! `uiharness/cases/project-inputs-typing.uit`; Task > Information... is the
 //! catalogued Task Information dialog (#1368). The terminal editors' prompts (#1204)
@@ -60,8 +60,6 @@ pub(crate) enum Reach {
     Harness,
     /// The OS draws it, in a dialog a harness instance never opens: why.
     Native(&'static str),
-    /// The suite does not have it yet: the issue that adds it.
-    Missing(u32),
 }
 
 /// One input.
@@ -138,9 +136,6 @@ const fn unreachable_input(id: &'static str, name: &'static str, reach: Reach) -
 const SAVE_AS_NATIVE: &str = "Save As's file name is the OS's file dialog, \
      which a harness instance never opens; see qa/inputs-typing.md";
 
-/// The issue that adds File > Info's properties.
-const INFO_PROPERTIES: u32 = 1364;
-
 static REGISTRY: &[Input] = &[
     input("formula-bar", "the formula bar", Surface::Sheet, SHEET),
     input("cell-editor", "the in-cell editor", Surface::Sheet, SHEET),
@@ -205,20 +200,23 @@ static REGISTRY: &[Input] = &[
         "Save As's file name",
         Reach::Native(SAVE_AS_NATIVE),
     ),
-    unreachable_input(
+    input(
         "info-title",
         "Info's Title property",
-        Reach::Missing(INFO_PROPERTIES),
+        Surface::Backstage,
+        BACKSTAGE,
     ),
-    unreachable_input(
+    input(
         "info-tags",
         "Info's Tags property",
-        Reach::Missing(INFO_PROPERTIES),
+        Surface::Backstage,
+        BACKSTAGE,
     ),
-    unreachable_input(
+    input(
         "info-author",
         "Info's Author property",
-        Reach::Missing(INFO_PROPERTIES),
+        Surface::Backstage,
+        BACKSTAGE,
     ),
     input(
         "project-cell",
@@ -274,16 +272,11 @@ fn find(id: &str) -> Result<&'static Input, String> {
     })
 }
 
-/// Why the harness cannot reach `i`, if it cannot: the OS draws it, or the
-/// suite does not have it yet.
+/// Why the harness cannot reach `i`, if it cannot: the OS draws it.
 fn unreachable(i: &Input) -> Option<String> {
     match i.reach {
         Reach::Harness => None,
         Reach::Native(why) => Some(why.into()),
-        Reach::Missing(issue) => Some(format!(
-            "File > Info has no {} yet, see #{issue}",
-            i.name.trim_start_matches("Info's ")
-        )),
     }
 }
 
@@ -330,9 +323,11 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// the active cell, which opens it, refused while an entry is open, where a
 /// click on the cell would commit it; the sheet tab's rename is a
 /// double-click on the active tab's name, refused while a rename is open. A
-/// document input goes to [`press_doc`]. A Backstage input says why the
-/// harness cannot reach it; a Project input goes to [`press_project`].
-/// A terminal editor's input names the case that types into it.
+/// document input goes to [`press_doc`]; a Backstage input is File > Info's
+/// Title, Tags or Author ([`press_info`]), except Save As's file name, which
+/// says why the harness cannot reach it (the OS's file dialog); a Project
+/// input goes to [`press_project`]. A terminal editor's input names the case
+/// that types into it.
 pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
@@ -343,7 +338,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
         Surface::Doc => return press_doc(app, i),
         Surface::Project => return press_project(app, i),
         Surface::Terminal => return Err(terminal_case(i)),
-        _ => return Err(not_covered(i)),
+        Surface::Backstage => return press_info(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
@@ -379,6 +374,62 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
     })
 }
 
+/// File > Info's property field `i`, pressed where it is drawn: Info is up on
+/// a document.
+fn press_info(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
+    crate::harness::active_doc(app)?;
+    if !(app.backstage && app.bs_info) {
+        return Err(format!("{} is not drawn: open File > Info first", i.name));
+    }
+    let which = crate::info_props::InfoProp::from_id(i.id).ok_or_else(|| not_covered(i))?;
+    let b = app
+        .probes
+        .borrow()
+        .on_screen(which.probe())
+        .ok_or_else(|| format!("{} is not drawn", i.name))?;
+    Ok(Press {
+        at: b.center(),
+        double: false,
+    })
+}
+
+/// `field-read {"input":id}` for an Info property: the field as it is edited
+/// while it has the keys, else the stored value, in the sheet inputs' shape.
+fn read_info(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
+    crate::harness::active_doc(app)?;
+    let which = crate::info_props::InfoProp::from_id(i.id).ok_or_else(|| not_covered(i))?;
+    Ok(
+        match app
+            .info_edit
+            .as_ref()
+            .filter(|e| e.which == which && app.info_edit_live())
+        {
+            Some(e) => {
+                let len = e.text.chars().count();
+                let selection = if e.sel && len > 0 {
+                    Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+                } else {
+                    Json::Null
+                };
+                field_json(
+                    i.id,
+                    Json::Str(e.text.clone()),
+                    true,
+                    Json::Num(e.caret.min(len) as f64),
+                    selection,
+                )
+            }
+            None => field_json(
+                i.id,
+                Json::Str(app.info_prop_value(which)),
+                false,
+                Json::Null,
+                Json::Null,
+            ),
+        },
+    )
+}
+
 /// A document input, pressed where it is drawn.
 fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     crate::harness::active_doc(app)?;
@@ -405,8 +456,10 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 
 /// `field-read {"input":id}`: a sheet input as it is edited and drawn (a
 /// document input goes to [`read_doc`] and a Project input to
-/// [`read_project`]; a Backstage input says why the harness cannot reach
-/// it, and a terminal editor's input names the case that reads it), in the
+/// [`read_project`]; a Backstage input is File > Info's Title, Tags or Author
+/// ([`read_info`], the stored value while unfocused), except Save As's file
+/// name, which says why the harness cannot reach it; a terminal editor's
+/// input names the case that reads it), in the
 /// shape of a dialog
 /// field's (`value`, `focused`, `caret` and `selection` in chars, `null`
 /// while it has no focus). The formula bar and the in-cell
@@ -428,7 +481,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         Surface::Doc => return read_doc(app, i),
         Surface::Project => return read_project(app, i),
         Surface::Terminal => return Err(terminal_case(i)),
-        _ => return Err(not_covered(i)),
+        Surface::Backstage => return read_info(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
@@ -809,7 +862,7 @@ mod tests {
         }
     }
 
-    /// #1202: Backstage's inputs say why the harness cannot type into them,
+    /// #1202: Save As's file name says why the harness cannot type into it,
     /// and every other input is one it can reach.
     #[test]
     fn unreachable_inputs_say_why() {
@@ -821,26 +874,29 @@ mod tests {
                  instance never opens; see qa/inputs-typing.md"
             )
         );
-        assert_eq!(
-            why("info-title").as_deref(),
-            Some("File > Info has no Title property yet, see #1364")
-        );
-        assert_eq!(
-            why("info-tags").as_deref(),
-            Some("File > Info has no Tags property yet, see #1364")
-        );
-        assert_eq!(
-            why("info-author").as_deref(),
-            Some("File > Info has no Author property yet, see #1364")
-        );
         for i in registry() {
-            assert_eq!(
-                why(i.id).is_some(),
-                i.surface == Surface::Backstage,
-                "{}",
-                i.id
-            );
+            assert_eq!(why(i.id).is_some(), i.id == "save-as-name", "{}", i.id);
         }
+    }
+
+    /// #1364: File > Info's three properties are pressed where they are
+    /// drawn, each under its own probe.
+    #[test]
+    fn every_info_input_has_a_target() {
+        let info: Vec<&str> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Backstage && i.id != "save-as-name")
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(info, ["info-title", "info-tags", "info-author"]);
+        let probes: Vec<&str> = info
+            .iter()
+            .map(|id| crate::info_props::InfoProp::from_id(id).expect(id).probe())
+            .collect();
+        assert_eq!(
+            probes,
+            ["info-prop:title", "info-prop:tags", "info-prop:author"]
+        );
     }
 
     /// #1201: every document input is pressed where it is drawn.
