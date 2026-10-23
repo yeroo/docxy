@@ -145,3 +145,25 @@ fn xml_reads_leniently() {
     let big = r#"<formatting><layout bar-height="400"/></formatting>"#;
     assert_eq!(Formatting::from_xml(big).unwrap().layout.bar_height, Some(24));
 }
+
+#[test]
+fn a_layout_command_is_one_undo_step_and_an_unchanged_one_is_none() {
+    use crate::editor::Editor;
+    use crate::model::Project;
+    let mut ed = Editor::new(Project::default());
+    let depth = ed.undo_depth();
+    let view = json(r#"{"layout":{"bar_height":18,"rollup":true}}"#);
+    ed.edit_formatting(|f| {
+        f.apply_view(&view).unwrap();
+    });
+    assert_eq!(ed.undo_depth(), depth + 1);
+    assert_eq!(ed.project().formatting.layout.bar_height, Some(18));
+    ed.edit_formatting(|f| {
+        assert!(!f.apply_view(&view).unwrap());
+    });
+    assert_eq!(ed.undo_depth(), depth + 1);
+    assert!(ed.undo());
+    assert!(ed.project().formatting.is_empty());
+    assert!(ed.redo());
+    assert_eq!(ed.project().formatting.layout.rollup, Some(true));
+}

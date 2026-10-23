@@ -1452,7 +1452,10 @@ pub struct OverlayCtx {
     /// Project's name), the plugins' `switches` (#1553), and the
     /// formatting's `text_styles` and the selected cells' `cells` (#1572),
     /// and its Bar Styles table `bars` and Format Bar overrides `task_bars`
-    /// (#1696, the shape `Formatting::apply_view` reads), by key. An
+    /// (#1696, the shape `Formatting::apply_view` reads), and its `layout`
+    /// (#1695: `bar_height` in points, `rollup`, `hide_rollup_expanded`,
+    /// `round_bars`, `show_splits`, `show_drawings`, `bar_text_date_format`,
+    /// null for unset), by key. An
     /// `OverlayRow::bar` is the first drawn bar row's middle when the plan's
     /// bar styles draw the task (a table, or the task's override).
     pub flags: Json,
