@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::border_style::BorderStyle;
+use crate::border_style::{BorderStyle, Motif};
 use crate::field::{FieldEvent, field_events};
 use crate::load::{Relationships, xml_attr_value};
 use crate::model::*;
@@ -518,7 +518,11 @@ fn parse_page_borders(sect: &str) -> PageBorders {
         let color = xml_attr_value(el, "w:color")
             .and_then(|c| parse_hex(&c))
             .map_or((0.0, 0.0, 0.0), rgb_f);
-        let eighths = if style == BorderStyle::Art { 1.0 } else { 8.0 };
+        let eighths = if matches!(style, BorderStyle::Art | BorderStyle::Motif(_)) {
+            1.0
+        } else {
+            8.0
+        };
         out.sides[i] = Some(BorderSide {
             width: num_attr(el, "w:sz").map_or(0.5, |sz| (sz / eighths).max(0.25)),
             space: num_attr(el, "w:space").unwrap_or(0.0),
@@ -739,6 +743,20 @@ struct Rule {
     color: (f32, f32, f32),
     /// A dash array in points; empty for a solid line.
     dash: Vec<f32>,
+    shape: RuleShape,
+}
+
+/// How a [`Rule`] is stroked between its end points.
+#[derive(Clone, Copy, PartialEq)]
+enum RuleShape {
+    Line,
+    /// A sine line `amp` off the straight one with wavelength `len`.
+    Wave {
+        amp: f32,
+        len: f32,
+    },
+    /// Motifs of side `width`, tiled along it.
+    Motif(Motif),
 }
 
 struct Page {
@@ -1614,6 +1632,7 @@ impl<'a> Pager<'a> {
                 width: 0.5,
                 color: (0.0, 0.0, 0.0),
                 dash: Vec::new(),
+                shape: RuleShape::Line,
             });
         }
     }
@@ -1885,21 +1904,54 @@ fn border_rules(
     // Outward (away from the text) for each side.
     let outward: [(f32, f32); 4] = [(0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0)];
     let mut rules = Vec::new();
-    for ((side, (x1, y1, x2, y2)), (ox, oy)) in b.sides.iter().zip(lines).zip(outward) {
+    for (i, ((side, (x1, y1, x2, y2)), (ox, oy))) in
+        b.sides.iter().zip(lines).zip(outward).enumerate()
+    {
         let Some(side) = side else {
             continue;
         };
         let w = side.width;
         // Each stroke's width and its distance outward from the frame line.
+        let mut shape = RuleShape::Line;
+        let mut colors = [side.color; 4];
         let (strokes, dash): (Vec<(f32, f32)>, Vec<f32>) = match &side.style {
             BorderStyle::Single => (vec![(w, 0.0)], Vec::new()),
             BorderStyle::Dashes(pattern) => {
                 (vec![(w, 0.0)], pattern.iter().map(|k| k * w).collect())
             }
             BorderStyle::Art => (vec![(w, 0.0)], vec![w, w]),
+            BorderStyle::Motif(m) => {
+                shape = RuleShape::Motif(*m);
+                (vec![(w, 0.0)], Vec::new())
+            }
+            BorderStyle::Wave { double } => {
+                // A wave a width tall and four widths long; the double one is
+                // two, a width apart.
+                shape = RuleShape::Wave {
+                    amp: w,
+                    len: 4.0 * w,
+                };
+                let thin = (w / 2.0).max(0.25);
+                if *double {
+                    (vec![(thin, -w), (thin, w)], Vec::new())
+                } else {
+                    (vec![(thin, 0.0)], Vec::new())
+                }
+            }
+            BorderStyle::ThreeD { raised } => {
+                // Two half strokes, light and dark: the inner one light on
+                // the top and left sides and dark on the bottom and right
+                // ones when raised, the other way round when sunken.
+                let light = lighten(side.color);
+                let dark = darken(side.color);
+                let inner_light = (i < 2) == *raised;
+                colors[0] = if inner_light { light } else { dark };
+                colors[1] = if inner_light { dark } else { light };
+                (vec![(w / 2.0, -w / 4.0), (w / 2.0, w / 4.0)], Vec::new())
+            }
             lines @ BorderStyle::Lines { .. } => (lines.strokes(w), Vec::new()),
         };
-        for (width, d) in strokes {
+        for (k, (width, d)) in strokes.into_iter().enumerate() {
             // Along the frame inflated by `d`, so the corners stay closed: a
             // horizontal side grows by `d` at both ends, a vertical one too.
             let (ax, ay) = (oy.abs(), ox.abs());
@@ -1909,12 +1961,164 @@ fn border_rules(
                 x2: x2 + ox * d + ax * d,
                 y2: y2 + oy * d + ay * d,
                 width,
-                color: side.color,
+                color: colors[k.min(3)],
                 dash: dash.clone(),
+                shape,
             });
         }
     }
     rules
+}
+
+/// `c` washed halfway towards white / darkened by half: the two tones of a
+/// 3-D border.
+fn lighten((r, g, b): (f32, f32, f32)) -> (f32, f32, f32) {
+    ((r + 1.0) / 2.0, (g + 1.0) / 2.0, (b + 1.0) / 2.0)
+}
+
+fn darken((r, g, b): (f32, f32, f32)) -> (f32, f32, f32) {
+    (r / 2.0, g / 2.0, b / 2.0)
+}
+
+/// The content-stream operators for one rule of a non-straight shape.
+fn shaped_rule_ops(rule: &Rule) -> String {
+    use std::fmt::Write;
+    let (dx, dy) = (rule.x2 - rule.x1, rule.y2 - rule.y1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let mut s = String::new();
+    if len <= 0.0 {
+        return s;
+    }
+    let (ux, uy) = (dx / len, dy / len);
+    let (nx, ny) = (-uy, ux);
+    let (r, g, b) = rule.color;
+    match rule.shape {
+        RuleShape::Line => {}
+        RuleShape::Wave { amp, len: wave } => {
+            let step = wave / 8.0;
+            let n = (len / step).ceil().max(1.0) as usize;
+            writeln!(s, "q 1 j 1 J {r:.3} {g:.3} {b:.3} RG {:.2} w", rule.width).ok();
+            for k in 0..=n {
+                let t = (k as f32 * step).min(len);
+                let off = amp * (std::f32::consts::TAU * t / wave).sin();
+                let (x, y) = (rule.x1 + ux * t + nx * off, rule.y1 + uy * t + ny * off);
+                writeln!(s, "{x:.2} {y:.2} {}", if k == 0 { "m" } else { "l" }).ok();
+            }
+            s.push_str("S\nQ\n");
+        }
+        RuleShape::Motif(motif) => {
+            let size = rule.width.max(0.5);
+            let n = (len / size).floor().max(1.0) as usize;
+            let pad = (len - n as f32 * size) / 2.0;
+            writeln!(s, "q {r:.3} {g:.3} {b:.3} rg {r:.3} {g:.3} {b:.3} RG 0.5 w").ok();
+            for k in 0..n {
+                let t = pad + (k as f32 + 0.5) * size;
+                s.push_str(&motif_ops(motif, rule.x1 + ux * t, rule.y1 + uy * t, size));
+            }
+            s.push_str("Q\n");
+        }
+    }
+    s
+}
+
+/// One motif of side `size` centred on `(cx, cy)`, filled (`f`) or outlined
+/// (`S`) in the colours already set.
+fn motif_ops(motif: Motif, cx: f32, cy: f32, size: f32) -> String {
+    use std::fmt::Write;
+    let h = size * 0.4;
+    let mut s = String::new();
+    let paint = |filled: bool| if filled { "f\n" } else { "S\n" };
+    match motif {
+        Motif::Dot { filled } => {
+            circle(&mut s, cx, cy, h);
+            s.push_str(paint(filled));
+        }
+        Motif::Circle => {
+            // Rings, so it differs from the white dot's one outline.
+            circle(&mut s, cx, cy, h);
+            s.push_str(paint(false));
+            circle(&mut s, cx, cy, h / 2.0);
+            s.push_str(paint(false));
+        }
+        Motif::Square { filled } => {
+            write!(
+                s,
+                "{:.2} {:.2} {:.2} {:.2} re ",
+                cx - h,
+                cy - h,
+                2.0 * h,
+                2.0 * h
+            )
+            .ok();
+            s.push_str(paint(filled));
+        }
+        Motif::Triangle => {
+            writeln!(
+                s,
+                "{:.2} {:.2} m {:.2} {:.2} l {:.2} {:.2} l h f",
+                cx - h,
+                cy - h,
+                cx + h,
+                cy - h,
+                cx,
+                cy + h
+            )
+            .ok();
+        }
+        Motif::Star => {
+            // Five points, joined every second one: an upright pentagram.
+            for k in 0..5 {
+                let a = std::f32::consts::FRAC_PI_2 + k as f32 * 4.0 * std::f32::consts::PI / 5.0;
+                write!(
+                    s,
+                    "{:.2} {:.2} {} ",
+                    cx + h * a.cos(),
+                    cy + h * a.sin(),
+                    if k == 0 { "m" } else { "l" }
+                )
+                .ok();
+            }
+            s.push_str("h f*\n");
+        }
+        Motif::Heart => {
+            let p = |x: f32, y: f32| format!("{:.2} {:.2}", cx + x * h, cy + y * h);
+            writeln!(
+                s,
+                "{} m {} {} {} c {} {} {} c {} {} {} c {} {} {} c f",
+                p(0.0, -1.0),
+                p(-0.2, -0.6),
+                p(-1.0, -0.1),
+                p(-1.0, 0.35),
+                p(-1.0, 0.85),
+                p(-0.2, 0.95),
+                p(0.0, 0.4),
+                p(0.2, 0.95),
+                p(1.0, 0.85),
+                p(1.0, 0.35),
+                p(1.0, -0.1),
+                p(0.2, -0.6),
+                p(0.0, -1.0),
+            )
+            .ok();
+        }
+    }
+    s
+}
+
+/// A circle of radius `r` as four Bézier arcs.
+fn circle(s: &mut String, cx: f32, cy: f32, r: f32) {
+    use std::fmt::Write;
+    let k = 0.5523 * r;
+    write!(
+        s,
+        "{:.2} {:.2} m {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c ",
+        cx + r, cy,
+        cx + r, cy + k, cx + k, cy + r, cx, cy + r,
+        cx - k, cy + r, cx - r, cy + k, cx - r, cy,
+        cx - r, cy - k, cx - k, cy - r, cx, cy - r,
+        cx + k, cy - r, cx + r, cy - k, cx + r, cy,
+    )
+    .ok();
 }
 
 impl Flow for Pager<'_> {
@@ -2460,6 +2664,10 @@ fn build_content(page: &Page, opts: &PdfOptions, mut book: Option<&mut cid::Book
         }
     }
     for rule in &page.rules {
+        if rule.shape != RuleShape::Line {
+            s.extend(shaped_rule_ops(rule).as_bytes());
+            continue;
+        }
         if !rule.dash.is_empty() {
             let dash: Vec<String> = rule.dash.iter().map(|d| format!("{d:.2}")).collect();
             s.extend(format!("[{}] 0 d\n", dash.join(" ")).as_bytes());
@@ -4488,6 +4696,63 @@ mod tests {
     }
 
     #[test]
+    fn wave_borders_draw_a_sine_polyline_797() {
+        let c = border_page(r#"w:val="wave" w:sz="8""#);
+        assert!(!c.contains("24.00 768.00 m 588.00 768.00 l S"), "{c}");
+        assert!(c.contains("1 j 1 J"), "{c}");
+        assert!(c.matches(" l\n").count() > 100, "{c}");
+        let single = c.matches(" RG ").count();
+        let c2 = border_page(r#"w:val="doubleWave" w:sz="8""#);
+        assert!(
+            c2.matches(" RG ").count() > single,
+            "two waves on top: {c2}"
+        );
+    }
+
+    #[test]
+    fn three_d_borders_draw_light_and_dark_halves_797() {
+        let c = border_page(r#"w:val="threeDEmboss" w:sz="8" w:color="808080""#);
+        assert!(c.contains("0.751 0.751 0.751 RG 0.50 w"), "{c}");
+        assert!(c.contains("0.251 0.251 0.251 RG 0.50 w"), "{c}");
+        // Raised and sunken swap the tones on the top side.
+        let raised =
+            c.find("0.751 0.751 0.751 RG").unwrap() < c.find("0.251 0.251 0.251 RG").unwrap();
+        let c = border_page(r#"w:val="threeDEngrave" w:sz="8" w:color="808080""#);
+        let sunken =
+            c.find("0.751 0.751 0.751 RG").unwrap() < c.find("0.251 0.251 0.251 RG").unwrap();
+        assert_ne!(raised, sunken);
+    }
+
+    #[test]
+    fn art_borders_tile_motifs_and_unknown_art_stays_dashed_797() {
+        let motifs: Vec<String> = [
+            "basicBlackDots",
+            "basicWhiteDots",
+            "basicBlackSquares",
+            "basicWhiteSquares",
+            "stars",
+            "hearts",
+            "circlesLines",
+            "triangles",
+        ]
+        .iter()
+        .map(|n| border_page(&format!(r#"w:val="{n}" w:sz="6""#)))
+        .collect();
+        for (i, c) in motifs.iter().enumerate() {
+            assert!(!c.contains("[6.00 6.00] 0 d"), "{i}: {c}");
+            assert!(
+                c.contains(" f\n") || c.contains(" f*\n") || c.contains("S\n"),
+                "{i}"
+            );
+            for (j, d) in motifs.iter().enumerate().skip(i + 1) {
+                assert_ne!(c, d, "{i} and {j} look alike");
+            }
+        }
+        let apples = border_page(r#"w:val="apples" w:sz="6""#);
+        assert!(apples.contains("[6.00 6.00] 0 d"), "{apples}");
+    }
+
+    #[test]
     fn thin_thick_borders_put_the_first_named_line_inside() {
         // sz 24 = 3pt, the thin line a third of it, a small gap one thin width.
         let c = border_page(r#"w:val="thinThickSmallGap" w:sz="24""#);
@@ -4527,8 +4792,8 @@ mod tests {
             c.contains("[12.00 12.00] 0 d\n0.000 1.000 0.000 RG 12.00 w 24.00 768.00 m 588.00 768.00 l S\n[] 0 d\n"),
             "{c}"
         );
-        // A wave is drawn as a single line for now.
-        let c = border_page(r#"w:val="wave" w:sz="8""#);
+        // A style nothing draws specially is a single line.
+        let c = border_page(r#"w:val="dashDotStroked" w:sz="8""#);
         assert!(c.contains("1.00 w 24.00 768.00 m 588.00 768.00 l S") && !c.contains(" 0 d"));
     }
 

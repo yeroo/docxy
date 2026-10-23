@@ -1216,14 +1216,16 @@ mod tests {
         assert!(ss.effective_tabs(Some("Other")).is_empty());
         assert!(none.effective_tabs(None).is_empty());
 
-        assert!(ss
-            .effective_borders(None, ParBorders::default())
-            .top
-            .is_some());
-        assert!(ss
-            .effective_borders(Some("Other"), ParBorders::default())
-            .top
-            .is_none());
+        assert!(
+            ss.effective_borders(None, ParBorders::default())
+                .top
+                .is_some()
+        );
+        assert!(
+            ss.effective_borders(Some("Other"), ParBorders::default())
+                .top
+                .is_none()
+        );
     }
 
     /// #918: hidden text through a character style, a paragraph style (or
