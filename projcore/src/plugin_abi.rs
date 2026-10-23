@@ -76,6 +76,33 @@
 //! return codes, the one-thread rule and `yppx_plugin_last_error` are as for
 //! the format calls; [`UNSUPPORTED_EXTENSION`] from `yppx_ui_command` means
 //! the command is not this plugin's.
+//!
+//! ## Formatting (optional symbols)
+//!
+//! The plan's formatting ([`crate::formatting::Formatting`]: palette, text
+//! styles, switches, gridlines) is not part of MSPDI. A library that wants it
+//! to survive a save and reopen exports either or both of:
+//!
+//! ```c
+//! int32_t yppx_plugin_read_ex (const char* ext, const uint8_t* file, size_t len,
+//!                              YppxBuf* mspdi_out, YppxBuf* formatting_out);
+//! int32_t yppx_plugin_write_ex(const char* ext, const uint8_t* mspdi, size_t len,
+//!                              const uint8_t* formatting_xml, size_t formatting_len,
+//!                              const uint8_t* source_file, size_t source_len,
+//!                              YppxBuf* file_out);
+//! ```
+//!
+//! Each is independent of the other and of the six required symbols, and the
+//! ABI version stays 1. When `yppx_plugin_write_ex` exists the host calls it
+//! instead of `yppx_plugin_write`, with the `formatting.xml` text (UTF-8, the
+//! part a `.yppx` keeps) in `formatting_xml`, or NULL with `formatting_len` 0
+//! when the plan has no formatting; the rest is as for `yppx_plugin_write`.
+//! When `yppx_plugin_read_ex` exists the host calls it instead of
+//! `yppx_plugin_read`; a non-empty `formatting_out` (UTF-8 `formatting.xml`)
+//! becomes the plan's formatting, and an empty one leaves it default. A
+//! `formatting_out` that is not UTF-8 or does not parse fails the read. Both
+//! buffers are freed whatever the return code. Without the symbols nothing
+//! changes: the formatting is not passed and a read returns none.
 
 use crate::json::{Json, quote};
 use std::os::raw::c_char;
@@ -112,6 +139,11 @@ pub const SYMBOLS: [&str; 6] = [
 
 /// The UI ABI version this host speaks: `yppx_ui_abi` must return it.
 pub const UI_ABI_VERSION: u32 = 1;
+
+/// `int32_t yppx_plugin_read_ex(...)`: optional, see [`ReadExFn`].
+pub const SYMBOL_READ_EX: &str = "yppx_plugin_read_ex";
+/// `int32_t yppx_plugin_write_ex(...)`: optional, see [`WriteExFn`].
+pub const SYMBOL_WRITE_EX: &str = "yppx_plugin_write_ex";
 
 /// `int32_t yppx_plugin_target(YppxBuf* out)`: see [`TargetFn`].
 pub const SYMBOL_TARGET: &str = "yppx_plugin_target";
@@ -207,6 +239,32 @@ pub type WriteFn = unsafe extern "C" fn(
     ext: *const c_char,
     mspdi: *const u8,
     len: usize,
+    source_file: *const u8,
+    source_len: usize,
+    file_out: *mut YppxBuf,
+) -> i32;
+
+/// `int32_t yppx_plugin_read_ex(const char* ext, const uint8_t* file, size_t
+/// len, YppxBuf* mspdi_out, YppxBuf* formatting_out)`: [`ReadFn`] that also
+/// returns the plan's `formatting.xml`, or an empty buffer.
+pub type ReadExFn = unsafe extern "C" fn(
+    ext: *const c_char,
+    file: *const u8,
+    len: usize,
+    mspdi_out: *mut YppxBuf,
+    formatting_out: *mut YppxBuf,
+) -> i32;
+
+/// `int32_t yppx_plugin_write_ex(const char* ext, const uint8_t* mspdi,
+/// size_t len, const uint8_t* formatting_xml, size_t formatting_len, const
+/// uint8_t* source_file, size_t source_len, YppxBuf* file_out)`: [`WriteFn`]
+/// that also takes the plan's `formatting.xml`, or NULL.
+pub type WriteExFn = unsafe extern "C" fn(
+    ext: *const c_char,
+    mspdi: *const u8,
+    len: usize,
+    formatting_xml: *const u8,
+    formatting_len: usize,
     source_file: *const u8,
     source_len: usize,
     file_out: *mut YppxBuf,

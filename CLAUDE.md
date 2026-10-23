@@ -402,6 +402,16 @@
   registry order), the harness's `save-as` and `save-types`, and control
   `proj.save`. Unit tests load none; `project_formats::tests::Override` swaps
   in a stand-in per thread.
+- A library may also export `yppx_plugin_read_ex` / `yppx_plugin_write_ex`
+  (#1702; independent, optional, ABI still 1) to carry the plan's
+  `Formatting`, which MSPDI does not: write_ex gets the `formatting.xml` text
+  beside the MSPDI (NULL/0 when the plan has none) and is called instead of
+  `yppx_plugin_write`; read_ex returns it in a second buffer (empty leaves the
+  default; non-UTF-8 or unparsable fails the read with the plugin's name).
+  `.yppx` keeps it in `formatting.xml` as before. Hosts need nothing: they pass
+  the whole `Project` to `Registry::write`. The fixture appends a hex
+  `fixture-formatting` trailer (`projcore/tests/plugin_fixture/src/fmt.rs`);
+  the no-`_ex` fallback is unit-tested in `plugin.rs` with stub fns.
 - A format plugin may be the default save type: `"default": true` on a
   formats JSON entry (`FormatDecl::default`, `ProjectFormat::is_default`;
   ABI still 1). Save As proposes `Registry::default_save_extension(opened)`:
