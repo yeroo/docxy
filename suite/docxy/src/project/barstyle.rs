@@ -489,6 +489,9 @@ fn middle_element(rect: (f32, f32, f32, f32), color: u32, pattern: Option<&str>)
     el.children(crate::plugin_ui::pattern_layer(&style))
 }
 
+/// A bar's right-press handler, shared by its bands.
+pub(crate) type OnRight = std::rc::Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
+
 /// The parts as elements for a strip: per band a container over its middle
 /// and marks (the bar's own right-press, and for the first band the
 /// `bar:<id>` probe), then the texts, which take no press.
@@ -497,7 +500,7 @@ pub(crate) fn styled_children(
     id: i32,
     pal: Pal,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
-    on_right: std::rc::Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    on_right: OnRight,
 ) -> Vec<AnyElement> {
     let mut out: Vec<AnyElement> = Vec::new();
     let mut bands: Vec<u8> = parts.iter().map(Part::band).collect();

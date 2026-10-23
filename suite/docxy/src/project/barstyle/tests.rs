@@ -175,20 +175,20 @@ fn the_five_texts_sit_around_the_bar() {
         .into_iter()
         .map(|p| (p, p.to_uppercase()))
         .collect();
-    let texts: std::collections::HashMap<&str, ((f32, f32, f32, f32), Align, Option<u32>)> =
-        bar_parts(&[r])
-            .into_iter()
-            .filter_map(|p| match p {
-                Part::Text {
-                    pos,
-                    rect,
-                    align,
-                    on,
-                    ..
-                } => Some((pos, (rect, align, on))),
-                _ => None,
-            })
-            .collect();
+    type Placed = ((f32, f32, f32, f32), Align, Option<u32>);
+    let texts: std::collections::HashMap<&str, Placed> = bar_parts(&[r])
+        .into_iter()
+        .filter_map(|p| match p {
+            Part::Text {
+                pos,
+                rect,
+                align,
+                on,
+                ..
+            } => Some((pos, (rect, align, on))),
+            _ => None,
+        })
+        .collect();
     let band = ROW_H;
     let zone = band + BAR_Y;
     // Left ends before the start mark, right starts after the (absent) end

@@ -12,7 +12,9 @@ use std::path::Path;
 use std::rc::Rc;
 mod barstyle;
 mod gantt;
-pub(super) use barstyle::{BAR_Y, Part, bar_parts, bar_rows, drawn_entries, first_middle};
+#[cfg(test)]
+pub(super) use barstyle::BAR_Y;
+pub(super) use barstyle::{Part, bar_parts, bar_rows, drawn_entries, first_middle};
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;
