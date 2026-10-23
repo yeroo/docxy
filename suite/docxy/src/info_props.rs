@@ -705,6 +705,22 @@ mod tests {
         assert!(core_xml(&tab).contains("<dc:title>Info!</dc:title>"), "{}", core_xml(&tab));
     }
 
+    /// Remove All Properties cleans a default-namespace core part too, and
+    /// Info then shows no Tags.
+    #[test]
+    fn remove_all_properties_clears_a_default_namespace_core_part_1364() {
+        let core = "<?xml version=\"1.0\"?><coreProperties \
+            xmlns=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+            xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+            <dc:title>T</dc:title><keywords>a, b</keywords></coreProperties>";
+        let (_, mut tab) = open("remove-default", Some(core));
+        assert_eq!(editor(&mut tab).core_fields().tags, "a, b");
+        crate::inspector::inspect_remove(&mut tab, crate::inspector::InspectCategory::Properties)
+            .unwrap();
+        assert!(!core_xml(&tab).contains("keywords"), "{}", core_xml(&tab));
+        assert_eq!(editor(&mut tab).core_fields(), &CoreFields::default());
+    }
+
     /// A property control typed in updates what Info shows and core.xml,
     /// through `set_dirty`, without a step of Info's.
     #[test]

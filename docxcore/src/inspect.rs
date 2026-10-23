@@ -1297,20 +1297,28 @@ const CORE_PART: &str = "docProps/core.xml";
 const APP_PART: &str = "docProps/app.xml";
 const CUSTOM_PART: &str = "docProps/custom.xml";
 
-/// The personal properties Word's inspector removes from `core.xml`. The
-/// creation/modification dates and `cp:revision` stay. The prefixes are
-/// matched literally: Word and the other producers we know write exactly
-/// these.
-const CORE_PERSONAL: [&str; 8] = [
-    "dc:creator",
-    "cp:lastModifiedBy",
-    "dc:title",
-    "dc:subject",
-    "cp:keywords",
-    "dc:description",
-    "cp:category",
-    "cp:contentStatus",
+/// The personal properties Word's inspector removes from `core.xml`, as
+/// (namespace, local name). The creation/modification dates and `cp:revision`
+/// stay. They are spelled as the part's root binds the namespaces
+/// ([`crate::field::CoreNames`]), so a default-namespace or other-prefix part
+/// is cleaned too (#1364).
+const CORE_PERSONAL: [(CoreNs, &str); 8] = [
+    (CoreNs::Dc, "creator"),
+    (CoreNs::Cp, "lastModifiedBy"),
+    (CoreNs::Dc, "title"),
+    (CoreNs::Dc, "subject"),
+    (CoreNs::Cp, "keywords"),
+    (CoreNs::Dc, "description"),
+    (CoreNs::Cp, "category"),
+    (CoreNs::Cp, "contentStatus"),
 ];
+
+#[derive(Clone, Copy)]
+enum CoreNs {
+    Cp,
+    Dc,
+}
+
 const APP_PERSONAL: [&str; 2] = ["Company", "Manager"];
 const CUSTOM_PERSONAL: [&str; 1] = ["property"];
 
@@ -1357,21 +1365,39 @@ fn has_filled(xml: &str, names: &[&str]) -> bool {
     })
 }
 
-fn property_parts() -> [(&'static str, &'static [&'static str]); 3] {
-    [
-        (CORE_PART, &CORE_PERSONAL),
-        (APP_PART, &APP_PERSONAL),
-        (CUSTOM_PART, &CUSTOM_PERSONAL),
-    ]
+/// The personal property parts and the element names to remove from each,
+/// spelled for `xml`, the part's text.
+fn personal_names(part: &str, xml: &str) -> Vec<String> {
+    match part {
+        CORE_PART => {
+            let names = crate::field::CoreNames::of(xml);
+            CORE_PERSONAL
+                .iter()
+                .map(|(ns, local)| {
+                    let prefix = match ns {
+                        CoreNs::Cp => &names.cp.prefix,
+                        CoreNs::Dc => &names.dc.prefix,
+                    };
+                    format!("{prefix}{local}")
+                })
+                .collect()
+        }
+        APP_PART => APP_PERSONAL.iter().map(|n| n.to_string()).collect(),
+        _ => CUSTOM_PERSONAL.iter().map(|n| n.to_string()).collect(),
+    }
 }
+
+const PROPERTY_PARTS: [&str; 3] = [CORE_PART, APP_PART, CUSTOM_PART];
 
 /// Whether the package holds personal document properties: a non-empty
 /// author, title, … in `core.xml`, a company or manager in `app.xml`, or any
 /// custom property. Empty elements (`<dc:title/>`) don't count.
 pub fn has_personal_properties(pkg: &Package) -> bool {
-    property_parts().iter().any(|(part, names)| {
-        pkg.part_text(part)
-            .is_some_and(|xml| has_filled(&xml, names))
+    PROPERTY_PARTS.iter().any(|part| {
+        pkg.part_text(part).is_some_and(|xml| {
+            let names = personal_names(part, &xml);
+            has_filled(&xml, &names.iter().map(String::as_str).collect::<Vec<_>>())
+        })
     })
 }
 
@@ -1379,11 +1405,12 @@ pub fn has_personal_properties(pkg: &Package) -> bool {
 /// empty ones included. Returns whether any part changed.
 pub fn remove_personal_properties(pkg: &mut Package) -> bool {
     let mut changed = false;
-    for (part, names) in property_parts() {
+    for part in PROPERTY_PARTS {
         let Some(xml) = pkg.part_text(part) else {
             continue;
         };
-        let (out, _) = remove_elements(&xml, names);
+        let names = personal_names(part, &xml);
+        let (out, _) = remove_elements(&xml, &names.iter().map(String::as_str).collect::<Vec<_>>());
         if out != xml {
             changed |= pkg.set_part_text(part, &out);
         }
@@ -2370,6 +2397,47 @@ mod tests {
             "<Properties xmlns=\"p\"><Application>Microsoft Office Word</Application></Properties>"
         );
         assert!(!remove_personal_properties(&mut pkg), "nothing left");
+    }
+
+    /// #1364: Remove All cleans a core part that spells the namespaces
+    /// differently (the core namespace as the default, another prefix), which
+    /// Info's Tags and the other properties read.
+    #[test]
+    fn inspect_removes_personal_properties_in_other_namespace_spellings_1364() {
+        let cp = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties";
+        let dc = "http://purl.org/dc/elements/1.1/";
+        let default_ns = format!(
+            "<?xml version=\"1.0\"?><coreProperties xmlns=\"{cp}\" xmlns:dc=\"{dc}\">\
+             <dc:title>Plan</dc:title><keywords>a, b</keywords><category>C</category>\
+             <revision>4</revision></coreProperties>"
+        );
+        let other_prefix = format!(
+            "<?xml version=\"1.0\"?><m:coreProperties xmlns:m=\"{cp}\" xmlns:d=\"{dc}\">\
+             <d:creator>Ann</d:creator><m:keywords>a, b</m:keywords>\
+             <m:revision>4</m:revision></m:coreProperties>"
+        );
+        for (core, kept) in [
+            (default_ns, "<revision>4</revision>"),
+            (other_prefix, "<m:revision>4</m:revision>"),
+        ] {
+            let mut pkg = docx(
+                &format!("<w:document {W}><w:body><w:p/></w:body></w:document>"),
+                &[("docProps/core.xml", &core)],
+            );
+            assert!(has_personal_properties(&pkg), "{core}");
+            let before = crate::field::parse_core_props(&core);
+            assert_eq!(before.keywords, "a, b");
+            assert!(remove_personal_properties(&mut pkg));
+            assert!(!has_personal_properties(&pkg));
+            let after = pkg.part_text("docProps/core.xml").unwrap();
+            assert!(after.contains(kept), "{after}");
+            for gone in ["keywords", "category", "title", "creator"] {
+                assert!(!after.contains(gone), "{gone}: {after}");
+            }
+            let props = crate::field::parse_core_props(&after);
+            assert_eq!(props.keywords, "", "Info shows no Tags");
+            assert_eq!((props.title.as_str(), props.author.as_str()), ("", ""));
+        }
     }
 
     #[test]
