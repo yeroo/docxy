@@ -381,9 +381,10 @@ pub(crate) fn bar_rows(
         let facts = ed.bar_facts(&reader, task, f.bars_use_flags());
         f.bars_for(&facts)
     };
+    let boxes = super::gantt::bar_boxes(f.layout.bar_height_px());
     let palette_box = f.bars.is_empty().then_some(match look.shape {
-        BarShape::Thin => (11., 6.),
-        _ => (5., 14.),
+        BarShape::Thin => boxes.thin,
+        _ => boxes.leaf,
     });
     let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
     let (start, finish) = (ed.disp_start(task.uid), ed.disp_finish(task.uid));

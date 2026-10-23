@@ -270,6 +270,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             ("fixture.bold", ControlKind::Toggle),
             ("fixture.sheet", ControlKind::Button),
             ("fixture.bars", ControlKind::Button),
+            ("fixture.layout", ControlKind::Button),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
@@ -661,6 +662,29 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert!(plan.apply_view(reset.view.as_ref().unwrap()).unwrap());
     assert!(plan.bars.is_empty() && plan.task_bars.is_empty());
     assert_eq!(plan.switch("fixture.names"), Some(true));
+    // The layout command (#1695) sets the Layout object through the view,
+    // one press clears it again, and the view JSON carries it back.
+    let layout = ui
+        .command(&cmd("fixture.layout", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(layout.status.as_deref(), Some("Fixture: layout"));
+    assert!(plan.apply_view(layout.view.as_ref().unwrap()).unwrap());
+    assert_eq!(plan.layout.bar_height, Some(12));
+    assert_eq!(plan.layout.rollup, Some(true));
+    assert_eq!(plan.layout.round_bars, Some(false));
+    assert_eq!(plan.layout.show_splits, Some(false));
+    assert_eq!(plan.layout.bar_text_date_format.as_deref(), Some("1/28"));
+    assert_eq!(
+        projcore::formatting::Formatting::from_xml(&plan.to_xml()).unwrap(),
+        plan
+    );
+    let mut seen = cmd("fixture.layout", vec![], None);
+    seen.view = Json::obj(vec![("layout", plan.layout_json())]);
+    let cleared = ui.command(&seen).unwrap().unwrap();
+    assert_eq!(cleared.status.as_deref(), Some("Fixture: layout reset"));
+    assert!(plan.apply_view(cleared.view.as_ref().unwrap()).unwrap());
+    assert!(plan.layout.is_empty());
     assert_eq!(
         ui.state(&ctx(Vec::new(), None))
             .unwrap()

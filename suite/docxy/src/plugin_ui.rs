@@ -344,7 +344,8 @@ pub(crate) struct PluginCache {
 /// view's switches, the plan's formatting (palette, link style, every
 /// gridline as drawn by Project's name (#1575), the plugins' switches, every
 /// text style category, and the selected cells' styles, #1572) in the shape
-/// `Formatting::apply_view` reads.
+/// `Formatting::apply_view` reads; `layout` is the Layout dialog's seven
+/// keys (#1695).
 fn view_json(v: &ProjectView) -> Json {
     let formatting = &v.ed.project().formatting;
     let text = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
@@ -379,6 +380,7 @@ fn view_json(v: &ProjectView) -> Json {
         ("switches", formatting.switches_json()),
         ("bars", formatting.bars_json()),
         ("task_bars", formatting.task_bars_json()),
+        ("layout", formatting.layout_json()),
         ("text_styles", Json::Obj(text_styles)),
         ("cells", Json::Arr(cells)),
     ])
