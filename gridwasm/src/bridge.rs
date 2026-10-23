@@ -334,7 +334,7 @@ impl Session {
                     // A Text cell stores `=…` as text: nothing to validate.
                     if let Some(body) = gridcore::entry::typed_formula(wb, self.active, r, c, text)
                     {
-                        if let Err(e) = Engine::validate(body) {
+                        if let Err(e) = Engine::validate_in(wb, self.active, r, c, body) {
                             self.err = Some(format!("formula error: {e}"));
                             return None;
                         }
@@ -2528,7 +2528,7 @@ impl Session {
         for (r, c, text) in &entries {
             let wb = &self.pkg.workbook;
             if let Some(body) = gridcore::entry::typed_formula(wb, si, *r, *c, text) {
-                Engine::validate(body).map_err(|e| {
+                Engine::validate_in(wb, si, *r, *c, body).map_err(|e| {
                     format!("range.set: formula error at {}: {e}", cell_name(*r, *c))
                 })?;
             }

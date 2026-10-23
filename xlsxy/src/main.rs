@@ -3300,7 +3300,8 @@ impl App {
         };
         let (r, c) = self.cur;
         let formula = gridcore::entry::typed_formula(&self.pkg.workbook, self.sheet, r, c, &text);
-        if let Some(Err(e)) = formula.map(Engine::validate) {
+        let checked = formula.map(|f| Engine::validate_in(&self.pkg.workbook, self.sheet, r, c, f));
+        if let Some(Err(e)) = checked {
             self.status = Some(format!("formula error: {e}"));
             self.edit = Some(EditState {
                 cursor: text.chars().count(),
@@ -9771,7 +9772,9 @@ impl App {
                 .and_then(|r| wb.sheets[d.sheet].cell(r, c))
                 .map_or(0, |cell| cell.style);
             let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
-            let built = match formula.map(Engine::validate) {
+            let checked =
+                formula.map(|f| Engine::validate_in(&self.pkg.workbook, d.sheet, row, c, f));
+            let built = match checked {
                 Some(Err(e)) => Err(format!("formula error: {e}")),
                 _ => gridcore::entry::entry_cell_styled(&mut self.pkg.workbook, base, &text, &ctx)
                     .map_err(|e| e.to_string()),

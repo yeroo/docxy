@@ -1150,7 +1150,8 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
     // Same validation as the TUI's commit path: a bad formula is rejected
     // before it touches the workbook (a Text cell stores `=…` as text).
     if let Some(body) = gridcore::entry::typed_formula(&app.pkg.workbook, si, r, c, text) {
-        Engine::validate(body).map_err(|e| format!("formula error: {e}"))?;
+        Engine::validate_in(&app.pkg.workbook, si, r, c, body)
+            .map_err(|e| format!("formula error: {e}"))?;
     }
     // Typed the way the grid types it: the cell's format decides, a
     // recognised shape takes its format, and an over-long entry is refused.
@@ -1285,7 +1286,7 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
         gridcore::entry::check_len(text)
             .map_err(|e| format!("range.set: {} at {}", e, cell_name(*r, *c)))?;
         if let Some(body) = gridcore::entry::typed_formula(&app.pkg.workbook, si, *r, *c, text) {
-            Engine::validate(body)
+            Engine::validate_in(&app.pkg.workbook, si, *r, *c, body)
                 .map_err(|e| format!("range.set: formula error at {}: {e}", cell_name(*r, *c)))?;
         }
     }
@@ -7791,6 +7792,43 @@ mod table_verb_tests {
             ("count", Json::Num(count as f64)),
         ]);
         dispatch(a, "col.delete", &args).unwrap();
+    }
+
+    #[test]
+    fn cell_set_refuses_an_unknown_table_or_column_684() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        for bad in [
+            "=SUM(Sales[Nope])",
+            "=SUM(Nosuch[Qty])",
+            "=SUM(Sales[[Qty]:[Nope]])",
+        ] {
+            let e = call(&mut a, "cell.set", vec![("ref", "H1"), ("text", bad)]).unwrap_err();
+            assert!(e.starts_with("formula error: "), "{bad}: {e}");
+            let g = call(&mut a, "cell.get", vec![("ref", "H1")]).unwrap();
+            assert_eq!(g.get_str("formula"), None, "{bad}");
+            assert_eq!(g.get_str("text").unwrap_or(""), "", "{bad}");
+        }
+        let args = Json::obj(vec![
+            ("start", Json::Str("H1".into())),
+            (
+                "rows",
+                Json::Arr(vec![Json::Arr(vec![
+                    Json::Str("1".into()),
+                    Json::Str("=SUM(Sales[Nope])".into()),
+                ])]),
+            ),
+        ]);
+        let e = dispatch(&mut a, "range.set", &args).unwrap_err();
+        assert!(e.contains("formula error at I1"), "{e}");
+        let g = call(&mut a, "cell.get", vec![("ref", "H1")]).unwrap();
+        assert_eq!(g.get_str("text").unwrap_or(""), "");
+        for ok in [
+            "=SUM(Sales[Qty])",
+            "=SUM(sales[[Qty]:[Price]])",
+            "=Sales[@Qty]",
+        ] {
+            put(&mut a, "H2", ok);
+        }
     }
 
     #[test]

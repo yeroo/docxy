@@ -344,6 +344,50 @@ impl Engine {
         formula::parse(src).map(|_| ())
     }
 
+    /// [`Engine::validate`] for a formula typed into one cell: also refuses a
+    /// structured reference naming a table or a table column that does not
+    /// exist, as Excel does at entry (#684). A bare `[Col]` is checked against
+    /// the table around the cell, and not at all outside one or in a formula
+    /// that calls LAMBDA (`[y]` may be its parameter). Loading a file never
+    /// comes through here, so stored formulas stay lenient.
+    pub fn validate_in(
+        wb: &Workbook,
+        sheet: usize,
+        row: u32,
+        col: u32,
+        src: &str,
+    ) -> Result<(), String> {
+        let ast = formula::parse(src)?;
+        let mut refs = Vec::new();
+        formula::collect_structured(&ast, &mut refs);
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let mut called = Vec::new();
+        formula::collect_called_names(&ast, &mut called);
+        let lambda = called.iter().any(|n| n.eq_ignore_ascii_case("LAMBDA"));
+        for (table, _, col1, col2) in refs {
+            let t = match &table {
+                Some(n) => wb.table(n).ok_or_else(|| format!("unknown table '{n}'"))?,
+                None if lambda => continue,
+                None => match wb.table_at(sheet, row, col) {
+                    Some(t) => t,
+                    None => continue,
+                },
+            };
+            let info = t.info();
+            for c in [&col1, &col2].into_iter().flatten() {
+                if info
+                    .resolve_err(formula::TableItem::All, &Some(c.clone()), &None, row)
+                    .is_err()
+                {
+                    return Err(format!("unknown column '{c}' in table '{}'", t.name));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply one cell edit and recalculate everything affected.
     ///
     /// A formula whose text differs from the one in the cell is typed: it is
@@ -6008,6 +6052,61 @@ mod tests {
             assert_eq!(value_at(&wb, "D2"), CellValue::Number(d2), "{calc}");
             assert_eq!(value_at(&wb, "D3"), CellValue::Number(d3), "{calc}");
         }
+    }
+
+    #[test]
+    fn validate_in_refuses_unknown_tables_and_columns() {
+        // #684: `Sales[Nope]` and `Nosuch[Qty]` are refused at entry.
+        let wb = calc_column_wb("Sales", "[@Qty]*[@Price]");
+        let v = |r, c, s: &str| Engine::validate_in(&wb, 0, r, c, s);
+        // Outside the table (H1).
+        for bad in [
+            "SUM(Sales[Nope])",
+            "SUM(Nosuch[Qty])",
+            "SUM(Sales[[Qty]:[Nope]])",
+            "SUM(Sales[[Nope]:[Qty]])",
+            "Sales[[#Headers],[Nope]]",
+            "Sales[@Nope]",
+        ] {
+            assert!(v(0, 7, bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            v(0, 7, "SUM(Sales[Nope])").unwrap_err(),
+            "unknown column 'Nope' in table 'Sales'"
+        );
+        assert_eq!(
+            v(0, 7, "SUM(Nosuch[Qty])").unwrap_err(),
+            "unknown table 'Nosuch'"
+        );
+        for ok in [
+            "SUM(Sales[Qty])",
+            "SUM(sales[qty])",
+            "SUM(Sales[[#Headers],[Qty]])",
+            "SUM(Sales[[Qty]:[Price]])",
+            "Sales[@Qty]",
+            "ROWS(Sales[#All])",
+            "ROWS(Sales[])",
+            "ROWS(Sales)",
+            "SUM([x])",
+        ] {
+            assert!(v(0, 7, ok).is_ok(), "{ok}");
+        }
+        // Inside the table a bare column is checked.
+        assert!(v(1, 3, "[@Qty]*[Price]").is_ok());
+        assert!(v(1, 3, "[@Nope]").is_err());
+        assert!(v(1, 3, "[Nope]").is_err());
+        // A LAMBDA parameter may be written `[y]`.
+        assert!(v(1, 3, "LAMBDA(y,[y]+1)(2)").is_ok());
+        // Plain `validate` and a stored formula stay lenient.
+        assert!(Engine::validate("SUM(Sales[Nope])").is_ok());
+    }
+
+    #[test]
+    fn validate_in_accepts_an_escaped_column_name() {
+        let mut wb = calc_column_wb("Sales", "1");
+        wb.tables[0].columns[0] = "#Id".into();
+        assert!(Engine::validate_in(&wb, 0, 0, 7, "SUM(Sales['#Id])").is_ok());
+        assert!(Engine::validate_in(&wb, 0, 0, 7, "SUM(Sales['#Id2])").is_err());
     }
 
     #[test]

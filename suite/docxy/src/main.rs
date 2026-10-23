@@ -3386,7 +3386,7 @@ impl SheetView {
     /// that an Enter-mode arrow commits a half-typed formula.
     fn formula_error(&self, s: usize, rect: (u32, u32, u32, u32), buf: &str) -> Option<String> {
         let body = gridcore::entry::range_formula(&self.pkg.workbook, s, rect, buf)?;
-        gridcore::engine::Engine::validate(body)
+        gridcore::engine::Engine::validate_in(&self.pkg.workbook, s, rect.0, rect.1, body)
             .err()
             .map(|e| format!("formula error: {e}"))
     }

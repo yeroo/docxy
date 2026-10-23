@@ -313,7 +313,7 @@ mod win {
                     // range would make it a formula, which must parse.
                     let rect = (r1, c1, r2, c2);
                     let body = gridcore::entry::range_formula(wb, sheet, rect, text);
-                    if let Some(Err(e)) = body.map(Engine::validate) {
+                    if let Some(Err(e)) = body.map(|b| Engine::validate_in(wb, sheet, r1, c1, b)) {
                         log(&format!("put refused: formula error: {e}"));
                         return Err(E_FAIL);
                     }
