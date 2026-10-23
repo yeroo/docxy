@@ -1332,12 +1332,18 @@ enum SpecPart {
     ThisRow(Option<String>),
     Col(String),
     Span(String, String),
+    /// `@[A]:[B]` — a span of the formula's own row.
+    ThisRowSpan(String, String),
 }
 
 fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
     let t = raw.trim();
     // `[A]:[B]` — a column span.
     if let Some((a, b)) = split_top_level_colon(t) {
+        let (a, this_row) = match a.trim_start().strip_prefix('@') {
+            Some(rest) => (rest, true),
+            None => (a, false),
+        };
         let name = |x: &str| -> Result<String, String> {
             let x = x.trim();
             let inner = x
@@ -1346,7 +1352,12 @@ fn parse_spec_part(raw: &str) -> Result<SpecPart, String> {
                 .unwrap_or(x);
             Ok(unescape_spec(inner))
         };
-        return Ok(SpecPart::Span(name(a)?, name(b)?));
+        let (a, b) = (name(a)?, name(b)?);
+        return Ok(if this_row {
+            SpecPart::ThisRowSpan(a, b)
+        } else {
+            SpecPart::Span(a, b)
+        });
     }
     // Strip one level of brackets: `[#Totals]` → `#Totals`. Inside them a
     // column name is exact: `[[Qty ]]` names `Qty ` (its space and all).
@@ -1449,6 +1460,11 @@ fn parse_spec(table: Option<String>, spec: &str) -> Result<Expr, String> {
                 }
             }
             SpecPart::Span(a, b) => {
+                col1 = Some(a);
+                col2 = Some(b);
+            }
+            SpecPart::ThisRowSpan(a, b) => {
+                item = Some(TableItem::ThisRow);
                 col1 = Some(a);
                 col2 = Some(b);
             }
