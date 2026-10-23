@@ -17,18 +17,21 @@
 # deletes the selected name, the rest nothing), so each fails for its own
 # step only.
 #
-# Backstage's own fields are not typed into here. Save As's file name (File >
-# Save As, F12, Export > Change File Type) is the OS's file dialog, which a
-# harness instance never opens: qa/inputs-typing.md has it as a manual case.
-# File > Info has no Title, Tags or Author yet (#1364). The tests below pin
-# what pointer-click and field-read answer for each of these, on the Info
-# page; when #1364 adds the Properties, each one's answer test becomes the
-# full set of steps above. Settings' typed values are
+# Save As's file name (File > Save As, F12, Export > Change File Type) is the
+# OS's file dialog, which a harness instance never opens: qa/inputs-typing.md
+# has it as a manual case, and its test pins what pointer-click and
+# field-read answer for it. File > Info's Properties (#1364) are typed into
+# below like the document's Font box (doc-inputs-typing.uit): each is focused
+# by `pointer-click {"input":"info-title"|"info-tags"|"info-author"}` on the
+# Info page (or by Tab from the field before it), and a test is one input and
+# one step, named `backstage <input>: <step>`. basic.docx has no core
+# properties part, so every field starts empty and the first edit adds the
+# part. Backstage swallows Ctrl+Z, so the undo steps close File first.
+# Settings' typed values are
 # the User name and Custom Lists dialogs, which the dialog catalogue lists
 # and `inputs-typing-doc-app.uit` and `inputs-typing-sheet-data.uit` type
 # into, entering from Backstage (the #1027 path).
-# The steps that fail today are in expected-failures.txt. See
-# qa/inputs-typing.md.
+# See qa/inputs-typing.md.
 
 # ---- The sheet tab's rename: a double-click on the active tab opens it.
 
@@ -196,29 +199,493 @@ test backstage save-as-name: says it is the OS's file dialog
   call-error pointer-click {"input":"save-as-name"} => Save As's file name is the OS's file dialog, which a harness instance never opens
   call-error field-read {"input":"save-as-name"} => Save As's file name is the OS's file dialog, which a harness instance never opens
 
-test backstage info-title: says File > Info has no Title yet
-  open copy:../fixtures/basic.docx
-  call backstage {"action":"open"}
-  call backstage-page {"page":"info"}
-  call backstage-layout {}
-  assert reply.page is info
-  call-error pointer-click {"input":"info-title"} => File > Info has no Title property yet, see #1364
-  call-error field-read {"input":"info-title"} => File > Info has no Title property yet, see #1364
+# ---- File > Info's Properties: Title, Tags and Author (#1364).
 
-test backstage info-tags: says File > Info has no Tags yet
+test backstage info-title: focus by click
   open copy:../fixtures/basic.docx
   call backstage {"action":"open"}
   call backstage-page {"page":"info"}
-  call backstage-layout {}
-  assert reply.page is info
-  call-error pointer-click {"input":"info-tags"} => File > Info has no Tags property yet, see #1364
-  call-error field-read {"input":"info-tags"} => File > Info has no Tags property yet, see #1364
+  call field-read {"input":"info-title"}
+  assert reply.focused is false
+  call pointer-click {"input":"info-title"}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+  assert reply.caret is 0
 
-test backstage info-author: says File > Info has no Author yet
+test backstage info-title: focus by Tab
   open copy:../fixtures/basic.docx
   call backstage {"action":"open"}
   call backstage-page {"page":"info"}
-  call backstage-layout {}
-  assert reply.page is info
-  call-error pointer-click {"input":"info-author"} => File > Info has no Author property yet, see #1364
-  call-error field-read {"input":"info-author"} => File > Info has no Author property yet, see #1364
+  call pointer-click {"input":"info-author"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+  call field-read {"input":"info-author"}
+  assert reply.focused is false
+
+test backstage info-title: types
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test backstage info-title: edits
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"info-title"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"info-title"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"info-title"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"info-title"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"info-title"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+
+test backstage info-title: select-all replaces
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"info-title"}
+  assert reply.value is X
+
+test backstage info-title: copies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+
+test backstage info-title: pastes
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"info-title"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"info-title"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+
+test backstage info-title: Enter applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call field-read {"input":"info-title"}
+  assert reply.focused is false
+  assert reply.value is Report
+
+test backstage info-title: Escape restores
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call field-read {"input":"info-title"}
+  assert reply.focused is false
+  assert reply.value is exactly ""
+
+test backstage info-title: an unchanged value is no edit
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"info-title"}
+  assert reply.focused is false
+
+test backstage info-title: leaving Info applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"Report"}
+  call backstage {"action":"close"}
+  assert dirty is true
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-title"}
+  assert reply.value is Report
+
+test backstage info-title: undo and redo
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+z"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-title"}
+  assert reply.value is exactly ""
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+y"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-title"}
+  assert reply.value is Report
+
+test backstage info-tags: focus by click
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is false
+  call pointer-click {"input":"info-tags"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+  assert reply.caret is 0
+
+test backstage info-tags: focus by Tab
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-title"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+  call field-read {"input":"info-title"}
+  assert reply.focused is false
+
+test backstage info-tags: types
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test backstage info-tags: edits
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"info-tags"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"info-tags"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+
+test backstage info-tags: select-all replaces
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is X
+
+test backstage info-tags: copies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+
+test backstage info-tags: pastes
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"info-tags"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"info-tags"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+
+test backstage info-tags: Enter applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call field-read {"input":"info-tags"}
+  assert reply.focused is false
+  assert reply.value is Report
+
+test backstage info-tags: Escape restores
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call field-read {"input":"info-tags"}
+  assert reply.focused is false
+  assert reply.value is exactly ""
+
+test backstage info-tags: an unchanged value is no edit
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"info-tags"}
+  assert reply.focused is false
+
+test backstage info-tags: leaving Info applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"Report"}
+  call backstage {"action":"close"}
+  assert dirty is true
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is Report
+
+test backstage info-tags: undo and redo
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+z"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is exactly ""
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+y"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-tags"}
+  assert reply.value is Report
+
+test backstage info-author: focus by click
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is false
+  call pointer-click {"input":"info-author"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
+  assert reply.caret is 0
+
+test backstage info-author: focus by Tab
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-tags"}
+  call real-key {"key":"tab"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
+  call field-read {"input":"info-tags"}
+  assert reply.focused is false
+
+test backstage info-author: types
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"Ab1 "}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
+  assert reply.value is exactly "Ab1 "
+  assert reply.caret is 4
+
+test backstage info-author: edits
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"info-author"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"input":"info-author"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"input":"info-author"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"input":"info-author"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"input":"info-author"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+
+test backstage info-author: select-all replaces
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
+  assert reply.selection is [0,4]
+  call real-type {"text":"X"}
+  call field-read {"input":"info-author"}
+  assert reply.value is X
+
+test backstage info-author: copies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"old"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+
+test backstage info-author: pastes
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"input":"info-author"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"input":"info-author"}
+  assert reply.focused is true
+  assert reply.value is Pasted
+  assert reply.caret is 6
+
+test backstage info-author: Enter applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  assert dirty is true
+  call field-read {"input":"info-author"}
+  assert reply.focused is false
+  assert reply.value is Report
+
+test backstage info-author: Escape restores
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"escape"}
+  assert dirty is false
+  call field-read {"input":"info-author"}
+  assert reply.focused is false
+  assert reply.value is exactly ""
+
+test backstage info-author: an unchanged value is no edit
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-key {"key":"enter"}
+  assert dirty is false
+  call field-read {"input":"info-author"}
+  assert reply.focused is false
+
+test backstage info-author: leaving Info applies
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"Report"}
+  call backstage {"action":"close"}
+  assert dirty is true
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-author"}
+  assert reply.value is Report
+
+test backstage info-author: undo and redo
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call pointer-click {"input":"info-author"}
+  call real-type {"text":"Report"}
+  call real-key {"key":"enter"}
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+z"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-author"}
+  assert reply.value is exactly ""
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+y"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"info"}
+  call field-read {"input":"info-author"}
+  assert reply.value is Report

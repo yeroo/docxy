@@ -49,10 +49,12 @@ Every editable input in the suite is typed into with real keys by a case:
   name opens it, and each test opens its own copy of `basic.xlsx` and checks
   one step against what Excel does. The document tab and the title bar do not
   rename. Save As's file name is the OS's file dialog, which a harness instance
-  never opens: it is the manual case below. File > Info has no Title, Tags or
-  Author yet (#1364): the case pins what `pointer-click` and `field-read`
-  answer for each, and for Save As, and #1364 replaces those with the full
-  set of steps when it adds the Properties. Settings' typed
+  never opens: it is the manual case below, and the case pins what
+  `pointer-click` and `field-read` answer for it. File > Info's Title, Tags and
+  Author (#1364) are typed into like the document's Font box, each test on
+  its own copy of `basic.docx`, which has no core properties part (the first
+  edit adds it); the undo steps close File first, as it swallows Ctrl+Z.
+  Settings' typed
   values are the User name and Custom Lists dialogs, which the catalogue
   covers from Backstage (the #1027 path).
 - **Project's inputs** (#1203) are in the hand-written

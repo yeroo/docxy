@@ -103,8 +103,8 @@ impl crate::DocTab {
     }
 
     /// Write what an edit, undo or redo changed in Title, Tags and Author to
-    /// the package, and show it in the open header or footer's controls. A
-    /// package without the part keeps them in the editor only.
+    /// the package (adding the core properties part a file lacks), and show
+    /// it in the open header or footer's controls.
     pub(crate) fn sync_core_fields(&mut self) {
         self.seed_core_fields();
         let (Surface::Doc(ed), Some(pkg)) = (&mut self.surface, self.pkg.as_mut()) else {
@@ -115,6 +115,7 @@ impl crate::DocTab {
             return;
         }
         let step = ed.undo_serial();
+        pkg.ensure_core_properties();
         for (prop, text) in &unsynced {
             let written = pkg
                 .part_text(prop.part_name())
@@ -133,11 +134,13 @@ impl crate::DocTab {
         ed.core_synced();
     }
 
-    /// Whether the file has the part the properties are written to.
-    fn has_core_part(&self) -> bool {
+    /// Whether the file has, or can be given, the part the properties are
+    /// written to: a package whose content types and root relationships can
+    /// register it.
+    fn ensure_core_part(&mut self) -> bool {
         self.pkg
-            .as_ref()
-            .is_some_and(|p| p.part_text(CORE_PART).is_some())
+            .as_mut()
+            .is_some_and(|p| p.ensure_core_properties())
     }
 }
 
@@ -225,9 +228,9 @@ impl Docxy {
         if same {
             return;
         }
-        if !tab.has_core_part() {
+        if !tab.ensure_core_part() {
             self.info_note = Some(format!(
-                "Could not change {}: this file has no core properties part",
+                "Could not change {}: this file cannot hold document properties",
                 e.which.label()
             ));
             return;
@@ -340,7 +343,7 @@ mod tests {
         let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
             <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
         let mut parts: Vec<(&str, &str)> = vec![
-            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>"),
+            ("[Content_Types].xml", "<?xml version=\"1.0\"?><Types xmlns=\"t\"></Types>"),
             ("_rels/.rels", rels),
             ("word/document.xml", &document),
             ("word/styles.xml", "<?xml version=\"1.0\"?><w:styles/>"),
@@ -395,7 +398,26 @@ mod tests {
         );
         let (_, mut bare) = open("seed-none", None);
         assert_eq!(editor(&mut bare).core_fields(), &CoreFields::default());
-        assert!(!bare.has_core_part());
+    }
+
+    /// A file with no core properties part (most files other tools make)
+    /// gets one on the first edit, and a reopen shows the value.
+    #[test]
+    fn a_file_without_the_part_is_given_one_1364() {
+        let (path, mut tab) = open("bare", None);
+        assert!(tab.pkg.as_ref().unwrap().part_text(CORE_PART).is_none());
+        assert!(tab.ensure_core_part());
+        assert!(editor(&mut tab).set_core_field(BoundProp::Keywords, "q & r"));
+        tab.mark_dirty();
+        assert!(core_xml(&tab).contains("<cp:keywords>q &amp; r</cp:keywords>"));
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let mut again = tab_from_path(&path);
+        assert_eq!(editor(&mut again).core_fields().tags, "q & r");
+        // An edit that never asked for the part (undo of a value the file
+        // already held) adds none.
+        let (_, mut idle) = open("bare-idle", None);
+        idle.set_dirty();
+        assert!(idle.pkg.as_ref().unwrap().part_text(CORE_PART).is_none());
     }
 
     /// An edit reaches core.xml (escaped) through `set_dirty`, so do undo and

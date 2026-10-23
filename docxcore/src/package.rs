@@ -3080,6 +3080,52 @@ impl Package {
         self.set_part_text(name, &out);
     }
 
+    /// Make sure the package has a core properties part (`docProps/core.xml`,
+    /// #1364): one that is there stays as it is; else an empty one is added
+    /// with its content-type override and the package-root relationship.
+    /// False, and nothing added, when the package has no content types or no
+    /// root relationships to register it in.
+    pub fn ensure_core_properties(&mut self) -> bool {
+        const NAME: &str = "docProps/core.xml";
+        const ROOT_RELS: &str = "_rels/.rels";
+        const CT: &str = "application/vnd.openxmlformats-package.core-properties+xml";
+        const REL: &str =
+            "http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties";
+        if self.part(NAME).is_some() {
+            return true;
+        }
+        let (Some(ct), Some(rels)) = (
+            self.part_text("[Content_Types].xml"),
+            self.part_text(ROOT_RELS),
+        ) else {
+            return false;
+        };
+        if !ct.contains("</Types>") || !rels.contains("</Relationships>") {
+            return false;
+        }
+        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+            <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+            xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:dcterms=\"http://purl.org/dc/terms/\" \
+            xmlns:dcmitype=\"http://purl.org/dc/dcmitype/\" \
+            xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"></cp:coreProperties>";
+        self.parts
+            .push((NAME.to_string(), body.as_bytes().to_vec()));
+        let ov = format!("<Override PartName=\"/{NAME}\" ContentType=\"{CT}\"/>");
+        self.set_part_text(
+            "[Content_Types].xml",
+            &ct.replacen("</Types>", &format!("{ov}</Types>"), 1),
+        );
+        let rel = format!(
+            "<Relationship Id=\"{}\" Type=\"{REL}\" Target=\"{NAME}\"/>",
+            next_rid(&rels)
+        );
+        self.set_part_text(
+            ROOT_RELS,
+            &rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1),
+        );
+        true
+    }
+
     /// Add a new part with its content-type override and a relationship from
     /// the main document part.
     fn add_part_with_rel(&mut self, name: &str, content_type: &str, rel_type: &str, body: String) {
@@ -7797,6 +7843,42 @@ mod tests {
                 WatermarkKind::Picture,
             ]
         );
+    }
+
+    #[test]
+    fn ensure_core_properties_adds_the_part_once_1364() {
+        let ct = "<?xml version=\"1.0\"?><Types xmlns=\"t\"><Default Extension=\"xml\" ContentType=\"application/xml\"/></Types>";
+        let rels = "<?xml version=\"1.0\"?><Relationships xmlns=\"r\"><Relationship Id=\"rId1\" Type=\"o\" Target=\"word/document.xml\"/></Relationships>";
+        let zip = crate::zipwrite::write_zip(&[
+            ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+            ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+        ]);
+        let mut pkg = load_package(&zip).unwrap();
+        assert!(pkg.part_text("docProps/core.xml").is_none());
+        assert!(pkg.ensure_core_properties());
+        let core = pkg.part_text("docProps/core.xml").unwrap();
+        assert!(core.contains("<cp:coreProperties") && core.ends_with("</cp:coreProperties>"));
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        assert!(ct.contains("PartName=\"/docProps/core.xml\""), "{ct}");
+        let rels = pkg.part_text("_rels/.rels").unwrap();
+        assert!(
+            rels.contains("Id=\"rId2\"") && rels.contains("metadata/core-properties"),
+            "{rels}"
+        );
+        // A second call changes nothing, and the part survives a save.
+        assert!(pkg.ensure_core_properties());
+        assert_eq!(pkg.part_text("[Content_Types].xml").unwrap(), ct);
+        let again = load_package(&save_package(&pkg)).unwrap();
+        assert!(again.part_text("docProps/core.xml").is_some());
+        // No registry to put it in: nothing is added.
+        let bare = crate::zipwrite::write_zip(&[(
+            "word/document.xml".to_string(),
+            b"<w:document/>".to_vec(),
+        )]);
+        let mut bare = load_package(&bare).unwrap();
+        assert!(!bare.ensure_core_properties());
+        assert!(bare.part_text("docProps/core.xml").is_none());
     }
 
     #[test]
