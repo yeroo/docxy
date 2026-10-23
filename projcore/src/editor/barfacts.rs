@@ -42,6 +42,15 @@ fn named(name: &str, default: Field) -> Option<Named> {
     }))
 }
 
+/// Whether a From or To `name` is the task's own Start or Finish (`default`
+/// when empty): what a milestone's diamond stands for.
+pub fn is_own_date(name: &str, default: Field) -> bool {
+    matches!(
+        named(name, default),
+        Some(Named::Field(Field::Start | Field::Finish))
+    )
+}
+
 impl BarDateKind {
     /// The kind of the field a From or To `name` reads (`default` when it is
     /// empty): `Start`, `Task Start`, `Actual Start`, `Early/Late Start`,
@@ -151,14 +160,22 @@ impl Editor {
         Some(through.max(start).min(finish))
     }
 
-    /// How far through its working day `at` is on `task`'s calendar, 0 to 1:
-    /// 0 at the day's first working minute (or before), 1 at its last (or
-    /// after), linear between. A day without working time reads as 8:00 to
-    /// 17:00, as a typed date does.
-    pub fn bar_day_fraction(&self, task: &Task, at: DateTime) -> f64 {
+    /// How far through its working day `at` is on `task`'s calendar, 0 to 1,
+    /// for a bar that runs from `start` to `finish`: the day's first working
+    /// minute (or the bar's start on its first day) is 0 and the last (or the
+    /// bar's finish on its last day) is 1, linear between, so the first and
+    /// last days of a bar that does not fill them still span its whole frame.
+    /// A day without working time reads as 8:00 to 17:00, as a typed date does.
+    pub fn bar_day_fraction(
+        &self,
+        task: &Task,
+        at: DateTime,
+        start: DateTime,
+        finish: DateTime,
+    ) -> f64 {
         let proj = self.project();
-        let first = super::cells::day_start(proj, task, at);
-        let last = super::cells::day_end(proj, task, at);
+        let first = super::cells::day_start(proj, task, at).max(start);
+        let last = super::cells::day_end(proj, task, at).min(finish);
         let span = (last.minutes() - first.minutes()) as f64;
         if at >= last {
             1.

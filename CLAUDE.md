@@ -1191,8 +1191,8 @@
   equals `gantt_bar`; `CompleteThrough` is an instant (the task's `stop`, else
   its start plus its percent complete of the working time to its finish on its
   calendar, kept within start..finish) placed within its day by
-  `Editor::bar_day_fraction` (0 at the day's first working minute, 1 at its
-  last, so 100% ends where the bar does and a stop at the end of day 1 of 2 is
+  `Editor::bar_day_fraction` (0 at the day's first working minute, or the
+  bar's start on its first day, 1 at its last, or the bar's finish on its last, so 100% ends where the bar does and a stop at the end of day 1 of 2 is
   exactly one day; the weekend before it counts in the calendar-day frame as
   it does for the bar); every other date (Deadline, ...) is the instant
   (`instant_x`). Only a milestone task's row whose From and To are its own

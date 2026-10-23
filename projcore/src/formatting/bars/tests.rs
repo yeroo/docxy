@@ -560,6 +560,7 @@ fn project_names_for_scheduling_and_external_tasks_are_known() {
     assert!(task_row.applies(&auto));
     assert!(!task_row.applies(&manual));
     assert!(row("a", &["Manually Scheduled"], 1).applies(&manual));
+    assert!(row("a", &["manually  scheduled"], 1).applies(&manual));
     assert!(!row("a", &["manually  scheduled"], 1).applies(&auto));
     assert!(row("a", &["Automatically Scheduled"], 1).applies(&auto));
     assert!(!row("a", &["Automatically Scheduled"], 1).applies(&manual));
@@ -573,15 +574,30 @@ fn project_names_for_scheduling_and_external_tasks_are_known() {
 fn a_day_fraction_follows_the_calendar_and_complete_through_is_working_time() {
     let ed = editor();
     let task = ed.project().tasks[0].clone();
-    // 8:00 to 17:00 on a working day.
-    assert_eq!(ed.bar_day_fraction(&task, at(5, 8)), 0.);
-    assert_eq!(ed.bar_day_fraction(&task, at(5, 17)), 1.);
-    assert_eq!(ed.bar_day_fraction(&task, at(5, 19)), 1.);
-    assert_eq!(ed.bar_day_fraction(&task, at(5, 3)), 0.);
-    let noon = ed.bar_day_fraction(&task, at(5, 12).add_minutes(30));
-    assert_eq!(noon, 0.5);
+    // A bar filling its days: 8:00 to 17:00 on a working day.
+    let (from, to) = (at(1, 8), at(30, 17));
+    let f = |when: DateTime| ed.bar_day_fraction(&task, when, from, to);
+    assert_eq!(f(at(5, 8)), 0.);
+    assert_eq!(f(at(5, 17)), 1.);
+    assert_eq!(f(at(5, 19)), 1.);
+    assert_eq!(f(at(5, 3)), 0.);
+    assert_eq!(f(at(5, 12).add_minutes(30)), 0.5);
     // A weekend day reads 8:00 to 17:00 too.
-    assert_eq!(ed.bar_day_fraction(&task, at(10, 17)), 1.);
+    assert_eq!(f(at(10, 17)), 1.);
+    // A bar starting at 13:00 spans its first day from there (0 at 13:00,
+    // half at 15:00), and one finishing at 12:00 spans its last day to there.
+    let starts = |when: DateTime| ed.bar_day_fraction(&task, when, at(5, 13), at(30, 17));
+    assert_eq!(
+        (starts(at(5, 13)), starts(at(5, 15)), starts(at(5, 17))),
+        (0., 0.5, 1.)
+    );
+    assert_eq!(starts(at(6, 8)), 0.);
+    let ends = |when: DateTime| ed.bar_day_fraction(&task, when, at(1, 8), at(6, 12));
+    assert_eq!(
+        (ends(at(6, 8)), ends(at(6, 10)), ends(at(6, 12))),
+        (0., 0.5, 1.)
+    );
+    assert_eq!(ends(at(5, 17)), 1.);
 }
 
 #[test]

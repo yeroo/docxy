@@ -222,6 +222,7 @@ impl BarText {
     }
 
     /// Whether any position names `field` (case-insensitive).
+    #[cfg(test)]
     pub fn names(&self, field: &str) -> bool {
         self.positions()
             .iter()

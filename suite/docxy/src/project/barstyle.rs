@@ -13,7 +13,7 @@
 //! [`MARK`] px squares centred on the zone; the top and bottom texts sit in
 //! the bands above and below it and the left, right and inside ones on it.
 use super::*;
-use projcore::editor::{BarDateKind, Field};
+use projcore::editor::{BarDateKind, Field, is_own_date};
 use projcore::formatting::{BarRow, BarText, Mark, Middle, TextStyle as PlanStyle};
 
 /// Top of the bar zone within a band.
@@ -386,13 +386,17 @@ pub(crate) fn bar_rows(
         _ => (5., 14.),
     });
     let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
+    let (start, finish) = (ed.disp_start(task.uid), ed.disp_finish(task.uid));
     let at = |d: projcore::DateTime, kind: BarDateKind| match kind {
         BarDateKind::Start => day(d) * scale.day_w,
         BarDateKind::Finish => (day(d) + 1.) * scale.day_w,
         BarDateKind::Instant => instant_x(scale, 0., d),
         // A CompleteThrough instant lands within its working day, so the end
         // of the last working minute is the end of the day's frame (#1696).
-        BarDateKind::Through => (day(d) + ed.bar_day_fraction(task, d) as f32) * scale.day_w,
+        BarDateKind::Through => {
+            let (s, f) = (start.unwrap_or(d), finish.unwrap_or(d));
+            (day(d) + ed.bar_day_fraction(task, d, s, f) as f32) * scale.day_w
+        }
     };
     let mut out = Vec::new();
     for row in rows {
@@ -407,14 +411,17 @@ pub(crate) fn bar_rows(
         // the others. Only a milestone sits in the middle of its day, as the
         // palette's diamond does; any other row without a span is a point at
         // its date.
-        let (x0, x1) =
-            if task.is_milestone() && to <= from && own_date(&row.from) && own_date(&row.to) {
-                let mid = (day(from) + 0.5) * scale.day_w;
-                (mid, mid)
-            } else {
-                let x0 = at(from, BarDateKind::of(&row.from, Field::Start));
-                (x0, at(to, BarDateKind::of(&row.to, Field::Finish)).max(x0))
-            };
+        let (x0, x1) = if task.is_milestone()
+            && to <= from
+            && is_own_date(&row.from, Field::Start)
+            && is_own_date(&row.to, Field::Finish)
+        {
+            let mid = (day(from) + 0.5) * scale.day_w;
+            (mid, mid)
+        } else {
+            let x0 = at(from, BarDateKind::of(&row.from, Field::Start));
+            (x0, at(to, BarDateKind::of(&row.to, Field::Finish)).max(x0))
+        };
         let text = match over {
             Some(o) => row.text.clone().over(&o.text),
             None => row.text.clone(),
@@ -442,20 +449,6 @@ pub(crate) fn bar_rows(
         });
     }
     Some(out)
-}
-
-/// Whether a From or To name is the task's own Start or Finish (or empty, the
-/// default): what a milestone's diamond stands for.
-fn own_date(name: &str) -> bool {
-    let compact: String = name
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase();
-    matches!(
-        compact.as_str(),
-        "" | "start" | "finish" | "taskstart" | "taskfinish"
-    )
 }
 
 fn texts_of(text: &BarText) -> Vec<(&'static str, &str)> {
@@ -608,31 +601,22 @@ pub(crate) fn styled_children(
     let mut out: Vec<AnyElement> = Vec::new();
     let mut probed = false;
     for part in &parts {
-        if hit_box(part).is_none() {
+        let Some(rect) = hit_box(part) else {
             continue;
-        }
+        };
         let handler = on_right.clone();
         let press = move |e: &MouseDownEvent, w: &mut Window, a: &mut App| handler(e, w, a);
         let mut el = match part {
-            Part::Middle {
-                rect,
-                color,
-                pattern,
-                ..
-            } => middle_element(*rect, *color, pattern.as_deref()),
+            Part::Middle { color, pattern, .. } => middle_element(rect, *color, pattern.as_deref()),
             Part::Mark {
-                rect,
-                shape,
-                kind,
-                color,
-                ..
+                shape, kind, color, ..
             } => div()
                 .absolute()
                 .left(px(rect.0))
                 .top(px(rect.1))
                 .size(px(rect.2))
                 .child(mark_element(*shape, *kind, *color)),
-            Part::Text { .. } => continue,
+            Part::Text { .. } => unreachable!("a text has no hit box"),
         };
         if !probed {
             probed = true;

@@ -742,20 +742,18 @@ fn only_a_milestones_own_dates_are_centred() {
 
 #[test]
 fn only_painted_pieces_take_the_bars_press() {
-    // A bar and a far mark: the empty chart between them is outside every
-    // hit box, so it opens the chart's menu, not the bar's.
-    let mut r = draw(22., 66., 1);
-    r.end.shape = Some("circle".into());
-    r.end.color = Some(1);
-    r.start.shape = Some("square".into());
-    r.texts = vec![("right", "Name".into())];
-    let mut far = r.clone();
-    far.x0 = 22.;
-    far.x1 = 600.;
-    far.middle.shape = Some("narrow-top".into());
-    let parts = bar_parts(&[far]);
+    // A bar from 22 to 66 and a point row far to the right with an end mark,
+    // in one band: the empty chart between them is in no hit box, so a press
+    // there opens the chart's menu, not the bar's.
+    let mut bar = draw(22., 66., 1);
+    bar.start.shape = Some("square".into());
+    bar.texts = vec![("right", "Name".into())];
+    let mut far = draw(600., 600., 1);
+    far.end.shape = Some("circle".into());
+    let parts = bar_parts(&[bar, far]);
     let boxes: Vec<_> = parts.iter().filter_map(hit_box).collect();
-    // Middle, start mark, end mark; the text is not one.
+    // The bar's middle and start mark, the point's end mark; no text, and
+    // no box for the point row's zero-width middle.
     assert_eq!(boxes.len(), 3);
     let hit = |x: f32, y: f32| {
         boxes
@@ -763,11 +761,82 @@ fn only_painted_pieces_take_the_bars_press() {
             .any(|b| x >= b.0 && x < b.0 + b.2 && y >= b.1 && y < b.1 + b.3)
     };
     let y = BAR_Y + 2.;
-    assert!(hit(30., y) && hit(600., y + 3.));
-    // Below the narrow bar and its marks' reach, and past the end mark.
-    assert!(!hit(300., BAR_Y + BAR_H - 1.));
-    assert!(!hit(640., y));
-    // A zero-width middle is not pressable.
-    let point = bar_parts(&[draw(44., 44., 1)]);
-    assert!(point.iter().filter_map(hit_box).next().is_none());
+    assert!(hit(30., y) && hit(600., y));
+    assert!(!hit(300., y), "the gap is the chart's");
+    assert!(!hit(100., y), "the text beside the bar is not pressable");
+    assert!(!hit(30., BAR_Y + BAR_H + 4.));
+}
+
+#[test]
+fn the_models_vocabularies_are_the_ones_the_chart_draws() {
+    use projcore::formatting::bars::{MARK_KINDS, MARK_SHAPES, MIDDLE_SHAPES};
+    for name in MARK_SHAPES {
+        let shape = MarkShape::parse(Some(name));
+        assert_eq!(shape == MarkShape::None, name == "none", "{name}");
+        assert_eq!(shape.polygon().is_empty(), name == "none", "{name}");
+    }
+    let kinds: Vec<MarkKind> = MARK_KINDS
+        .iter()
+        .map(|k| MarkKind::parse(Some(k)))
+        .collect();
+    assert_eq!(kinds, [MarkKind::Solid, MarkKind::Dashed, MarkKind::Framed]);
+    let full = middle_geometry(Some("full"));
+    assert_eq!(full, (0., BAR_H));
+    assert_eq!(middle_geometry(Some("unknown")), full);
+    assert_eq!(MIDDLE_SHAPES[0], "full");
+    for name in &MIDDLE_SHAPES[1..] {
+        let (y, h) = middle_geometry(Some(name));
+        assert_ne!((y, h), full, "{name}");
+        assert!(h == MEDIUM_H || h == NARROW_H, "{name}");
+        assert!(y >= 0. && y + h <= BAR_H, "{name}");
+    }
+}
+
+/// A Monday 13:00 start (Start No Earlier Than) for a task of `days`.
+fn afternoon_editor(days: i64, pct: u8) -> ProjectEditor {
+    let mut t = task(1, days, 1);
+    t.percent_complete = Some(pct);
+    t.constraint = projcore::ConstraintType::StartNoEarlierThan;
+    t.constraint_date = Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 13, 0));
+    let mut p = untitled_project();
+    p.start_date = Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    p.tasks = vec![t];
+    p.formatting.set_bars(vec![progress_row()]);
+    let ed = ProjectEditor::new(p);
+    assert_eq!(
+        ed.disp_start(1),
+        Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 13, 0))
+    );
+    ed
+}
+
+#[test]
+fn progress_is_placed_against_the_bar_not_the_whole_working_day() {
+    let progress = |ed: &ProjectEditor| {
+        let scale = gantt_scale(ed);
+        let t = ed.project().task(1).unwrap();
+        let bar = gantt_bar(ed, t, scale).unwrap();
+        let r = bar_rows(ed, t, scale, look(1)).unwrap();
+        (r[0].x0, r[0].x1, bar, scale.day_w)
+    };
+    // A 13:00 start at 0%: nothing done, a zero-width middle at the bar's
+    // start, not 5/9 of a day of progress.
+    let (x0, x1, bar, dw) = progress(&afternoon_editor(1, 0));
+    assert_eq!((x0, x1), (bar.start as f32 * dw, bar.start as f32 * dw));
+    // One day from Monday 13:00 finishes Tuesday 12:00; at 100% the progress
+    // ends where the bar does, not 5/9 of a day short.
+    let ed = afternoon_editor(1, 100);
+    assert_eq!(
+        ed.disp_finish(1),
+        Some(projcore::DateTime::from_ymd_hm(2026, 1, 6, 12, 0))
+    );
+    let (x0, x1, bar, dw) = progress(&ed);
+    assert_eq!(x0, bar.start as f32 * dw);
+    assert_eq!(x1, (bar.end + 1) as f32 * dw);
+    // 50% is four of its eight working hours: the end of Monday, one day in.
+    let (x0, x1, _, dw) = progress(&afternoon_editor(1, 50));
+    assert_eq!(x1 - x0, dw);
+    // 25% is two hours into Monday's four: half of Monday.
+    let (x0, x1, _, dw) = progress(&afternoon_editor(1, 25));
+    assert_eq!(x1 - x0, dw * 0.5);
 }
