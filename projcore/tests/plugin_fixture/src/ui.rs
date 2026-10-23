@@ -11,8 +11,9 @@
 //!   "Fixture Format" declares `priority` 120 and holds five small labelled
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
 //! - Menus: a row-menu item `fixture.rename` after "Notes...".
-//! - Dialogs: a Task Information page "Fixture" with a multiline and a grid
-//!   (and a header label drawn above every page, #1609), and a dialog
+//! - Dialogs: a Task Information page "Fixture" with a multiline, a grid and
+//!   a `cell` grid (#1558: a dropdown, a checkbox, a date and a number in
+//!   one column) (and a header label drawn above every page, #1609), and a dialog
 //!   `fixture.options` (a number and a label the state fills from the number
 //!   and the first selected task's name in a `Numbers` group box, a grid of
 //!   the plan's task names whose selected row the state keeps on the
@@ -91,7 +92,8 @@ const MANIFEST: &str = r##"{
       {"name":"fixture.grid","label":"Fixture items","kind":"grid","columns":[{"name":"Name","kind":"text"},{"name":"Done","kind":"checkbox"}],"value":[["a","false"],["b","true"]]},
       {"name":"fixture.pick","label":"Fixture p&ick:","kind":"dropdown","items":["none"],"value":"none"},
       {"name":"fixture.locked","label":"Fixture locked","kind":"checkbox","value":true},
-      {"name":"fixture.rich","label":"Fixture &rich:","kind":"richtext","value":"","span":2}]}]},
+      {"name":"fixture.rich","label":"Fixture &rich:","kind":"richtext","value":"","span":2},
+      {"name":"fixture.cells","label":"Fixture cells","kind":"grid","span":2,"columns":[{"name":"Field","kind":"label"},{"name":"Value","kind":"cell"}],"value":[["Discipline",{"kind":"dropdown","items":["Civil","Electrical"],"value":"Civil"}],["Done",{"kind":"checkbox","value":false}],["Due",{"kind":"date","value":"2026-01-02"}],["Qty",{"kind":"number","value":3}]]}]}]},
     {"id":"fixture.options","title":"Fixture Options","size":[460,400],"header":[{"name":"fixture.title","label":"&Title:","kind":"text","value":"Fixture","span":2},{"name":"fixture.tag","label":"Ta&g:","kind":"text","value":""}],"pages":[{"name":"General","columns":2,"controls":[
       {"name":"n","label":"&Number:","kind":"number","value":"1","group":"Numbers"},
       {"name":"fixture.echo","label":"","kind":"label","value":"","group":"Numbers"},

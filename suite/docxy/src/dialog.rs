@@ -449,6 +449,11 @@ pub(crate) enum ControlKind {
     /// is committed, not dropped, when the cursor leaves it
     /// ([`Dialog::commit_pending`]).
     Grid,
+    /// A grid column kind only (#1558): each row's cell carries its own kind
+    /// and items ([`Control::cell_specs`]), so one column can hold a dropdown,
+    /// a checkbox, a date and a number side by side. A cell without a spec is
+    /// text. Never the kind of a control.
+    Cell,
     Label,
     /// A read-only preview box (#1609): the value is the sample's JSON
     /// (`{text, font, size, bold, italic, underline, strikethrough, color, background, pattern}`, or
@@ -482,6 +487,7 @@ impl ControlKind {
             Self::Dropdown => "dropdown",
             Self::List => "list",
             Self::Grid => "grid",
+            Self::Cell => "cell",
             Self::Label => "label",
             Self::Sample => "sample",
             Self::Multiline => "multiline",
@@ -590,6 +596,15 @@ pub(crate) enum Value {
     Checks(Vec<bool>),
 }
 
+/// What one cell of a [`ControlKind::Cell`] column is (#1558): its own kind
+/// (dropdown, combo, checkbox, check, number or date; anything else is text)
+/// and, for a dropdown or combo, the items it offers.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CellSpec {
+    pub kind: ControlKind,
+    pub items: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Control {
     /// Stable, for scripts; the label is what a person reads.
@@ -657,6 +672,10 @@ pub(crate) struct Control {
     /// kind decides that); another column's may hold the owner's data lined up
     /// with a combo's items (Predecessors' IDs, Resources' kinds).
     pub column_items: Vec<Vec<String>>,
+    /// A [`ControlKind::Cell`] column's per-cell kinds (#1558), `[row][col]`;
+    /// `None`, or off the end, is text. The cell text itself stays in the
+    /// rows, so what a plugin reads back is plain strings.
+    pub cell_specs: Vec<Vec<Option<CellSpec>>>,
     /// The item of a combo cell's narrowed list the arrows have reached,
     /// which Enter takes over the typed text.
     pub pick: Option<usize>,
@@ -692,6 +711,7 @@ impl Control {
             editable_grid: false,
             append_on_open: false,
             column_items: Vec::new(),
+            cell_specs: Vec::new(),
             pick: None,
             picked: None,
             group: None,
@@ -807,19 +827,49 @@ impl Control {
             .unwrap_or(ControlKind::Text)
     }
 
-    /// A grid cell's typed `text` as its column takes it (#1536): a dropdown
-    /// column takes one of its items, a combo column an item or any text.
-    /// An item is named exactly (case aside); a dropdown also takes the only
-    /// item that contains the text. A plugin's grid resolves nothing.
-    fn resolve_cell(&self, col: usize, text: &str) -> Result<String, String> {
-        let kind = self.column_kind(col);
-        if !self.editable_grid
+    /// The spec of grid cell (`row`, `col`) in a [`ControlKind::Cell`] column.
+    fn cell_spec(&self, row: usize, col: usize) -> Option<&CellSpec> {
+        if self.column_kind(col) != ControlKind::Cell {
+            return None;
+        }
+        self.cell_specs.get(row)?.get(col)?.as_ref()
+    }
+
+    /// The kind of grid cell (`row`, `col`) (#1558): its column's, or for a
+    /// `cell` column the cell's own (text without one).
+    pub fn cell_kind(&self, row: usize, col: usize) -> ControlKind {
+        match self.column_kind(col) {
+            ControlKind::Cell => self
+                .cell_spec(row, col)
+                .map_or(ControlKind::Text, |s| s.kind),
+            kind => kind,
+        }
+    }
+
+    /// The items cell (`row`, `col`) offers: its own in a `cell` column, else
+    /// its column's.
+    pub fn cell_items(&self, row: usize, col: usize) -> &[String] {
+        if self.column_kind(col) == ControlKind::Cell {
+            return self.cell_spec(row, col).map_or(&[], |s| s.items.as_slice());
+        }
+        self.column_items.get(col).map_or(&[], Vec::as_slice)
+    }
+
+    /// A grid cell's typed `text` as its cell takes it (#1536): a dropdown
+    /// takes one of its items, a combo an item or any text. An item is named
+    /// exactly (case aside); a dropdown also takes the only item that
+    /// contains the text. A plugin's grid resolves nothing, except in a
+    /// `cell` column, whose cells carry their own items (#1558).
+    fn resolve_cell(&self, row: usize, col: usize, text: &str) -> Result<String, String> {
+        let kind = self.cell_kind(row, col);
+        let own = self.column_kind(col) == ControlKind::Cell;
+        if !(self.editable_grid || own)
             || !matches!(kind, ControlKind::Dropdown | ControlKind::Combo)
             || text.trim().is_empty()
         {
             return Ok(text.to_string());
         }
-        let items = self.column_items.get(col).map_or(&[][..], Vec::as_slice);
+        let items = self.cell_items(row, col);
         let want = text.trim().to_lowercase();
         if let Some(item) = items.iter().find(|i| i.to_lowercase() == want) {
             return Ok(item.clone());
@@ -833,11 +883,16 @@ impl Control {
             .iter()
             .filter(|i| i.to_lowercase().contains(&want))
             .collect();
+        let heading = self.columns.get(col).map_or("", String::as_str);
+        let who = if own {
+            format!("'{heading}' {} cell", kind.name())
+        } else {
+            format!("'{heading}'")
+        };
         match hits.as_slice() {
             [one] => Ok((*one).clone()),
             [] => Err(format!(
-                "'{}' has no '{text}'; choose {}",
-                self.columns.get(col).map_or("", String::as_str),
+                "{who} has no '{text}'; choose {}",
                 items.join(", ")
             )),
             _ => Err(format!(
@@ -957,6 +1012,29 @@ impl Control {
                         .collect(),
                 ),
             ));
+            // The first `cell` column's kind and items per row (#1558).
+            if let Some(col) = self
+                .column_kinds
+                .iter()
+                .position(|k| *k == ControlKind::Cell)
+            {
+                out.push((
+                    "cell_kinds",
+                    Json::Arr(
+                        (0..rows.len())
+                            .map(|r| Json::Str(self.cell_kind(r, col).name().into()))
+                            .collect(),
+                    ),
+                ));
+                out.push((
+                    "cell_items",
+                    Json::Arr(
+                        (0..rows.len())
+                            .map(|r| strs(self.cell_items(r, col)))
+                            .collect(),
+                    ),
+                ));
+            }
             out.push(("rows", rows_json(rows)));
             out.push((
                 "selected_row",
@@ -1037,7 +1115,9 @@ impl Control {
             ControlKind::Sample => {
                 return Err(format!("'{label}' is a sample; it cannot be set"));
             }
-            ControlKind::Combo => return Err(format!("'{label}' is a grid column kind")),
+            ControlKind::Combo | ControlKind::Cell => {
+                return Err(format!("'{label}' is a grid column kind"));
+            }
             ControlKind::Richtext => unreachable!("set above"),
             ControlKind::Text
             | ControlKind::Date
@@ -1092,6 +1172,7 @@ impl Control {
                     _ => Vec::new(),
                 };
                 self.edit_grid(&mut rows, args)?;
+                self.shift_cell_specs(args);
                 Value::Rows(rows)
             }
             ControlKind::CheckList => Value::Checks(self.set_checks(args)?),
@@ -1149,6 +1230,23 @@ impl Control {
             _ => return Err(format!("'{label}' takes true, false or a list of labels")),
         }
         Ok(checks)
+    }
+
+    /// A row inserted or deleted by `dialog-set` moves the cells' specs with
+    /// the rows (#1558).
+    fn shift_cell_specs(&mut self, args: &Json) {
+        if self.cell_specs.is_empty() {
+            return;
+        }
+        if let Some(at) = args.get("insert_row").and_then(Json::as_usize) {
+            if at <= self.cell_specs.len() {
+                self.cell_specs.insert(at, Vec::new());
+            }
+        } else if let Some(at) = args.get("delete_row").and_then(Json::as_usize) {
+            if at < self.cell_specs.len() {
+                self.cell_specs.remove(at);
+            }
+        }
     }
 
     fn edit_grid(&self, rows: &mut Vec<Vec<String>>, args: &Json) -> Result<(), String> {
@@ -1209,11 +1307,17 @@ impl Control {
         // A cell takes what its column's kind takes (#1532): a number
         // column a finite number (as text or a number), a checkbox column
         // true or false, the rest text.
-        let kind = self.column_kind(column);
+        let kind = self.cell_kind(row, column);
         let heading = self.columns.get(column).map_or("", String::as_str);
+        // A `cell` column says which cell kind refused (#1558).
+        let col = if self.column_kind(column) == ControlKind::Cell {
+            format!("column '{heading}' ({} cell)", kind.name())
+        } else {
+            format!("column '{heading}'")
+        };
         // An editable grid's label column shows what the owner computed (#1536).
         if kind == ControlKind::Label && self.editable_grid {
-            return Err(format!("'{label}' column '{heading}' is read-only"));
+            return Err(format!("'{label}' {col} is read-only"));
         }
         let value = match (kind, args.get("value")) {
             (ControlKind::Checkbox | ControlKind::Check, Some(Json::Bool(b))) => b.to_string(),
@@ -1223,7 +1327,7 @@ impl Control {
                 s.to_ascii_lowercase()
             }
             (ControlKind::Checkbox | ControlKind::Check, _) => {
-                return Err(format!("'{label}' column '{heading}' takes true or false"));
+                return Err(format!("'{label}' {col} takes true or false"));
             }
             (ControlKind::Number, Some(Json::Num(n))) if n.is_finite() => n.to_string(),
             (ControlKind::Number, Some(Json::Str(s)))
@@ -1232,13 +1336,13 @@ impl Control {
                 s.clone()
             }
             (ControlKind::Number, _) => {
-                return Err(format!("'{label}' column '{heading}' takes a number"));
+                return Err(format!("'{label}' {col} takes a number"));
             }
             (_, Some(Json::Str(s))) => s.clone(),
             (_, Some(Json::Num(n))) => n.to_string(),
             _ => return Err(format!("'{label}' cells take text")),
         };
-        let value = self.resolve_cell(column, &value)?;
+        let value = self.resolve_cell(row, column, &value)?;
         if rows[row].len() < self.columns.len() {
             rows[row].resize(self.columns.len(), String::new());
         }
@@ -1897,7 +2001,7 @@ impl Dialog {
             return Ok(());
         };
         let col = c.col;
-        if !c.column_kind(col).toggles() {
+        if !c.cell_kind(row, col).toggles() {
             return Ok(());
         }
         let on = c.cell(row, col) != "true";
@@ -1977,7 +2081,7 @@ impl Dialog {
         let (Some(row), col) = (c.row, c.col) else {
             return Ok(());
         };
-        let items = c.column_items.get(col).cloned().unwrap_or_default();
+        let items = c.cell_items(row, col).to_vec();
         if items.is_empty() {
             return Ok(());
         }
@@ -2006,12 +2110,14 @@ impl Dialog {
         let c = &self.controls[i];
         let cols = c.columns.len();
         let (row, col, editing) = (c.row, c.col, c.edit.clone());
-        let kind = c.column_kind(col);
+        let kind = row.map_or_else(|| c.column_kind(col), |r| c.cell_kind(r, col));
         let toggles = kind.toggles();
         // A cell nothing is typed into: a check or a label column.
         let editable = self.controls[i].editable_grid;
         let fixed = toggles || (kind == ControlKind::Label && editable);
         let suggestions = c.suggestions();
+        // A `cell` column's dropdown cell steps in a plugin grid too (#1558).
+        let c_own = c.column_kind(col) == ControlKind::Cell;
         match key {
             // The arrows reach into a combo cell's narrowed list while it is
             // typed into (#1536).
@@ -2065,7 +2171,7 @@ impl Dialog {
             }
             // Space steps a dropdown cell to its next item (#1536).
             "space"
-                if editable
+                if (editable || c_own)
                     && kind == ControlKind::Dropdown
                     && editing.is_none()
                     && row.is_some() =>
@@ -2547,14 +2653,15 @@ impl Dialog {
                 }
                 c.row = Some(row);
                 c.col = col;
-                let toggles = c.column_kind(col).toggles();
+                let toggles = c.cell_kind(row, col).toggles();
                 self.row_moved(index);
                 if toggles {
                     return self.grid_toggle(index);
                 }
                 // A click on a dropdown cell steps it, as on a dropdown.
-                if self.controls[index].column_kind(col) == ControlKind::Dropdown
-                    && self.controls[index].editable_grid
+                let c = &self.controls[index];
+                if c.cell_kind(row, col) == ControlKind::Dropdown
+                    && (c.editable_grid || c.column_kind(col) == ControlKind::Cell)
                 {
                     return self.grid_step_item(index);
                 }

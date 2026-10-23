@@ -2095,3 +2095,186 @@ fn dialog_set_takes_markup_or_plain_text_and_reports_the_toolbar() {
     );
     let _ = i;
 }
+
+/// A UI plugin's grid with a `cell` column (#1558): a dropdown, a checkbox,
+/// a number, a date and a combo side by side.
+fn cell_grid() -> Dialog {
+    use super::CellSpec;
+    let mut d = form();
+    let mut g = Control::new(
+        "cells",
+        "Fields",
+        ControlKind::Grid,
+        Value::Rows(vec![
+            vec!["Discipline".into(), "Civil".into()],
+            vec!["Done".into(), "false".into()],
+            vec!["Qty".into(), "3".into()],
+            vec!["Due".into(), "2026-01-02".into()],
+            vec!["Area".into(), "North".into()],
+            vec!["Note".into(), "hi".into()],
+        ]),
+    );
+    g.page = Some(1);
+    g.plugin = true;
+    g.columns = vec!["Field".into(), "Value".into()];
+    g.column_kinds = vec![ControlKind::Label, ControlKind::Cell];
+    let spec = |kind, items: &[&str]| {
+        Some(CellSpec {
+            kind,
+            items: items.iter().map(|s| s.to_string()).collect(),
+        })
+    };
+    g.cell_specs = vec![
+        vec![
+            None,
+            spec(
+                ControlKind::Dropdown,
+                &["Civil", "Electrical", "Mechanical"],
+            ),
+        ],
+        vec![None, spec(ControlKind::Checkbox, &[])],
+        vec![None, spec(ControlKind::Number, &[])],
+        vec![None, spec(ControlKind::Date, &[])],
+        vec![None, spec(ControlKind::Combo, &["North", "South"])],
+        vec![None, None],
+    ];
+    d.controls.push(g);
+    d.tab = 1;
+    d.mark_opened();
+    d
+}
+
+fn cell_rows(d: &Dialog) -> Vec<String> {
+    match d.value("cells") {
+        Some(Value::Rows(r)) => r.iter().map(|row| row[1].clone()).collect(),
+        other => panic!("not rows: {other:?}"),
+    }
+}
+
+fn set_cell(d: &mut Dialog, row: usize, value: &str) -> Result<(), String> {
+    d.set(
+        &format!("cells[{row}].value"),
+        &Json::obj(vec![("value", Json::Str(value.into()))]),
+    )
+}
+
+#[test]
+fn a_cell_column_checks_a_value_against_its_own_cells_kind() {
+    let mut d = cell_grid();
+    // A dropdown cell names one of its items (case aside, or the only item
+    // that contains the text).
+    set_cell(&mut d, 0, "electrical").unwrap();
+    set_cell(&mut d, 0, "mech").unwrap();
+    assert_eq!(cell_rows(&d)[0], "Mechanical");
+    let err = set_cell(&mut d, 0, "Steel").unwrap_err();
+    assert!(
+        err.contains("dropdown cell") && err.contains("choose Civil"),
+        "{err}"
+    );
+    assert_eq!(cell_rows(&d)[0], "Mechanical");
+    // A checkbox cell takes true or false, a number cell a number.
+    let err = set_cell(&mut d, 1, "maybe").unwrap_err();
+    assert!(
+        err.contains("checkbox cell") && err.contains("true or false"),
+        "{err}"
+    );
+    set_cell(&mut d, 1, "TRUE").unwrap();
+    assert_eq!(cell_rows(&d)[1], "true");
+    let err = set_cell(&mut d, 2, "abc").unwrap_err();
+    assert!(
+        err.contains("number cell") && err.contains("takes a number"),
+        "{err}"
+    );
+    set_cell(&mut d, 2, "4.5").unwrap();
+    set_cell(&mut d, 2, "-").unwrap();
+    // A date, a combo (any text) and a cell with no spec take text.
+    set_cell(&mut d, 3, "2026-02-03").unwrap();
+    set_cell(&mut d, 4, "south").unwrap();
+    assert_eq!(cell_rows(&d)[4], "South");
+    set_cell(&mut d, 4, "East").unwrap();
+    set_cell(&mut d, 5, "anything").unwrap();
+    assert_eq!(cell_rows(&d)[3..], ["2026-02-03", "East", "anything"]);
+}
+
+#[test]
+fn a_plain_plugin_column_still_resolves_nothing() {
+    let mut d = cell_grid();
+    let i = d.controls.len() - 1;
+    d.controls[i].column_kinds = vec![ControlKind::Label, ControlKind::Text];
+    set_cell(&mut d, 0, "Steel").unwrap();
+    assert_eq!(cell_rows(&d)[0], "Steel");
+}
+
+#[test]
+fn a_cell_columns_cells_toggle_and_step_by_their_own_kind() {
+    let mut d = cell_grid();
+    assert_eq!(d.tabs_to("cells"), Ok(1));
+    let i = d.controls.len() - 1;
+    // A click on the checkbox cell toggles it; a dropdown cell steps through
+    // its items and wraps; a text cell only selects.
+    d.click_control(i, Some(256 + 1)).unwrap();
+    assert_eq!(cell_rows(&d)[1], "true");
+    d.click_control(i, Some(256 + 1)).unwrap();
+    assert_eq!(cell_rows(&d)[1], "false");
+    for want in ["Electrical", "Mechanical", "Civil"] {
+        d.click_control(i, Some(1)).unwrap();
+        assert_eq!(cell_rows(&d)[0], want);
+    }
+    d.click_control(i, Some(5 * 256 + 1)).unwrap();
+    assert_eq!(cell_rows(&d)[5], "hi");
+    // Space does the same from the keyboard.
+    d.select_row("cells", 1).unwrap();
+    d.controls[i].col = 1;
+    assert!(d.grid_key("space", None).unwrap());
+    assert_eq!(cell_rows(&d)[1], "true");
+    d.select_row("cells", 0).unwrap();
+    assert!(d.grid_key("space", None).unwrap());
+    assert_eq!(cell_rows(&d)[0], "Electrical");
+    // Delete leaves a checkbox cell alone.
+    d.select_row("cells", 1).unwrap();
+    assert!(d.grid_key("delete", None).unwrap());
+    assert_eq!(cell_rows(&d)[1], "true");
+    // Typing into a number cell edits it; a refused value keeps the edit.
+    d.select_row("cells", 2).unwrap();
+    assert!(d.grid_key("x", Some("x")).unwrap());
+    assert!(d.grid_key("enter", None).is_err());
+    assert_eq!(cell_rows(&d)[2], "3");
+}
+
+#[test]
+fn dialog_read_reports_the_cells_kinds_and_items_and_set_rows_move_them() {
+    let mut d = cell_grid();
+    let json = d.to_json(0);
+    let grid = json
+        .get("controls")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .find(|c| c.get_str("name") == Some("cells"))
+        .unwrap()
+        .clone();
+    let kinds: Vec<&str> = grid
+        .get("cell_kinds")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    assert_eq!(
+        kinds,
+        ["dropdown", "checkbox", "number", "date", "combo", "text"]
+    );
+    assert_eq!(
+        grid.get("cell_items").unwrap().as_array().unwrap()[0],
+        Json::parse(r#"["Civil","Electrical","Mechanical"]"#).unwrap()
+    );
+    assert_eq!(
+        grid.get("column_kinds").unwrap(),
+        &Json::parse(r#"["label","cell"]"#).unwrap()
+    );
+    // A row deleted with dialog-set takes its spec along.
+    d.set("cells", &args(r#"{"delete_row":0}"#)).unwrap();
+    let i = d.controls.len() - 1;
+    assert_eq!(d.controls[i].cell_kind(0, 1), ControlKind::Checkbox);
+    assert_eq!(d.controls[i].cell_kind(4, 1), ControlKind::Text);
+}

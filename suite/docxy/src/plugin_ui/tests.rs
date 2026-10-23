@@ -1228,3 +1228,94 @@ fn a_richtext_travels_as_markup_and_a_same_markup_refresh_leaves_it_alone() {
     assert_eq!(d.controls[ri].text(), "new");
     assert!(!d.tool_state(ri).pending_italic);
 }
+
+const CELL_GRID: &str = r##"{"dialogs":[{"id":"cells","pages":[{"name":"P","controls":[
+  {"name":"cf.grid","label":"Fields","kind":"grid",
+   "columns":[{"name":"Field","kind":"label"},{"name":"Value","kind":"cell"}],
+   "value":[["Discipline",{"kind":"dropdown","items":["Civil","Electrical"],"value":"Civil"}],
+            ["Done",{"kind":"checkbox","value":false}],
+            ["Due",{"kind":"date","value":"2026-01-02"}],
+            ["Qty",{"kind":"number","value":3}],
+            ["Plain","text"],
+            ["Odd",{"kind":"colour","value":"red"}],
+            ["Empty",{"kind":"dropdown"}]]}]}]}]}"##;
+
+fn cell_grid_control() -> dialog::Control {
+    let m = Manifest::parse(CELL_GRID).unwrap();
+    let spec = &m.dialog("cells").unwrap().pages[0].controls[0];
+    control_of_spec(spec, Some(0), &Prefill::default())
+}
+
+fn strings(rows: &[&[&str]]) -> Value {
+    Value::Rows(
+        rows.iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect(),
+    )
+}
+
+#[test]
+fn a_cell_columns_objects_become_plain_text_and_per_cell_specs() {
+    use crate::dialog::ControlKind as K;
+    let c = cell_grid_control();
+    assert_eq!(c.column_kinds, [K::Label, K::Cell]);
+    assert_eq!(
+        c.value,
+        strings(&[
+            &["Discipline", "Civil"],
+            &["Done", "false"],
+            &["Due", "2026-01-02"],
+            &["Qty", "3"],
+            &["Plain", "text"],
+            &["Odd", "red"],
+            &["Empty", ""],
+        ])
+    );
+    let kinds: Vec<K> = (0..7).map(|r| c.cell_kind(r, 1)).collect();
+    assert_eq!(
+        kinds,
+        [
+            K::Dropdown,
+            K::Checkbox,
+            K::Date,
+            K::Number,
+            K::Text,
+            K::Text,
+            K::Dropdown
+        ]
+    );
+    assert_eq!(c.cell_items(0, 1), ["Civil", "Electrical"]);
+    assert!(c.cell_items(6, 1).is_empty());
+    // The first column is no `cell` column: its kind is its own.
+    assert_eq!(c.cell_kind(0, 0), K::Label);
+    // What the plugin reads back is plain strings, as for any grid.
+    assert_eq!(
+        value_back(&c).to_string(),
+        r#"[["Discipline","Civil"],["Done","false"],["Due","2026-01-02"],["Qty","3"],["Plain","text"],["Odd","red"],["Empty",""]]"#
+    );
+}
+
+#[test]
+fn a_refresh_with_objects_replaces_the_specs_and_plain_strings_keep_them() {
+    use crate::dialog::ControlKind as K;
+    let mut c = cell_grid_control();
+    follow_value(
+        &mut c,
+        &Json::parse(r#"[["Discipline","Electrical"],["Done","true"]]"#).unwrap(),
+    );
+    assert_eq!(
+        c.value,
+        strings(&[&["Discipline", "Electrical"], &["Done", "true"]])
+    );
+    assert_eq!(c.cell_kind(0, 1), K::Dropdown);
+    assert_eq!(c.cell_kind(1, 1), K::Checkbox);
+    assert_eq!(c.cell_specs.len(), 2);
+    follow_value(
+        &mut c,
+        &Json::parse(r#"[["A",{"kind":"number","value":1}],["B",{"kind":"combo","items":["x"],"value":"x"}]]"#)
+            .unwrap(),
+    );
+    assert_eq!(c.cell_kind(0, 1), K::Number);
+    assert_eq!(c.cell_kind(1, 1), K::Combo);
+    assert_eq!(c.cell_items(1, 1), ["x"]);
+}

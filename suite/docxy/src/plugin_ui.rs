@@ -732,6 +732,7 @@ fn kind_of(kind: &str) -> dialog::ControlKind {
         "dropdown" => K::Dropdown,
         "list" => K::List,
         "grid" => K::Grid,
+        "cell" => K::Cell,
         "label" => K::Label,
         "sample" => K::Sample,
         // `color` and `font` are typed as text until the host has pickers.
@@ -790,6 +791,28 @@ fn follow_value(c: &mut dialog::Control, value: &Json) {
         if projcore::richtext::Rich::parse(&markup).to_markup() != c.markup() {
             c.set_markup(&markup);
         }
+    } else if c.kind == dialog::ControlKind::Grid
+        && c.column_kinds.contains(&dialog::ControlKind::Cell)
+    {
+        // Objects in a `cell` column give the cells' specs again; plain
+        // strings keep the specs the rows have (#1558).
+        let (rows, specs) = grid_cells(&c.column_kinds, value);
+        let carries = value.as_array().unwrap_or(&[]).iter().any(|row| {
+            row.as_array()
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .any(|(i, cell)| {
+                    c.column_kinds.get(i) == Some(&dialog::ControlKind::Cell)
+                        && matches!(cell, Json::Obj(_))
+                })
+        });
+        if carries {
+            c.cell_specs = specs;
+        } else {
+            c.cell_specs.truncate(rows.len());
+        }
+        c.value = dialog::Value::Rows(rows);
     } else {
         c.value = value_of(c.kind, &c.items, value);
     }
@@ -802,6 +825,59 @@ fn cell_text(value: &Json) -> String {
         Json::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// A cell of a `cell` column (#1558): `{"kind","items","value"}` gives the
+/// cell its own kind (dropdown, combo, checkbox, check, number or date; any
+/// other is text) and items; anything else is the cell's text. Lenient: an
+/// object without a value is empty.
+fn cell_spec_of(value: &Json) -> (String, Option<dialog::CellSpec>) {
+    use dialog::ControlKind as K;
+    let Json::Obj(_) = value else {
+        return (cell_text(value), None);
+    };
+    let text = value.get("value").map(cell_text).unwrap_or_default();
+    let kind = match value.get("kind").and_then(Json::as_str) {
+        Some("combo") => K::Combo,
+        Some(k @ ("number" | "date" | "checkbox" | "check" | "dropdown")) => kind_of(k),
+        _ => return (text, None),
+    };
+    let items = value
+        .get("items")
+        .and_then(Json::as_array)
+        .map(|a| a.iter().map(cell_text).collect())
+        .unwrap_or_default();
+    (text, Some(dialog::CellSpec { kind, items }))
+}
+
+/// A grid's rows and, for a control with `cell` columns, the cells' specs.
+fn grid_cells(
+    column_kinds: &[dialog::ControlKind],
+    value: &Json,
+) -> (Vec<Vec<String>>, Vec<Vec<Option<dialog::CellSpec>>>) {
+    let mut specs = Vec::new();
+    let rows = value
+        .as_array()
+        .unwrap_or(&[])
+        .iter()
+        .map(|row| {
+            let mut texts = Vec::new();
+            let mut row_specs = Vec::new();
+            for (c, cell) in row.as_array().unwrap_or(&[]).iter().enumerate() {
+                if column_kinds.get(c) == Some(&dialog::ControlKind::Cell) {
+                    let (text, spec) = cell_spec_of(cell);
+                    texts.push(text);
+                    row_specs.push(spec);
+                } else {
+                    texts.push(cell_text(cell));
+                    row_specs.push(None);
+                }
+            }
+            specs.push(row_specs);
+            texts
+        })
+        .collect();
+    (rows, specs)
 }
 
 /// A control's staged value as the plugin reads it: text (a number field's
@@ -871,6 +947,11 @@ fn control_of_spec(
     }
     out.columns = c.columns.iter().map(|col| col.name.clone()).collect();
     out.column_kinds = c.columns.iter().map(|col| kind_of(&col.kind)).collect();
+    if kind == dialog::ControlKind::Grid && out.column_kinds.contains(&dialog::ControlKind::Cell) {
+        let (rows, specs) = grid_cells(&out.column_kinds, value);
+        out.value = dialog::Value::Rows(rows);
+        out.cell_specs = specs;
+    }
     out.commit_command = c.commit_command;
     out.page = page;
     out.plugin = true;
