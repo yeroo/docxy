@@ -721,6 +721,46 @@ pub fn text_watermarks(xml: &str) -> Vec<TextWatermark> {
         .collect()
 }
 
+/// A picture watermark of a header part and how it is drawn (PDF export):
+/// the part's relationship to the image, resolved by the caller.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PictureWatermark {
+    pub rid: String,
+    /// Clockwise rotation in degrees, 0 when absent.
+    pub rotation: f32,
+    /// The shape's style `width` / `height` (VML), or its `wp:extent`
+    /// (DrawingML), in points.
+    pub width_pt: Option<f32>,
+    pub height_pt: Option<f32>,
+    /// The shape's `v:fill` opacity, 0..1; `None` when it has none.
+    pub opacity: Option<f32>,
+}
+
+/// The picture watermarks of a header part that name an image.
+pub fn picture_watermarks(xml: &str) -> Vec<PictureWatermark> {
+    watermark_shapes(xml)
+        .into_iter()
+        .filter_map(|shape| {
+            if shape.kind != WatermarkKind::Picture {
+                return None;
+            }
+            let rid = shape.rid?;
+            let look = shape.look.unwrap_or_default();
+            let style = look.style.as_deref().unwrap_or("");
+            let side = |name| css_prop(style, name).and_then(css_length_pt);
+            Some(PictureWatermark {
+                rid,
+                rotation: css_prop(style, "rotation")
+                    .and_then(leading_number)
+                    .unwrap_or(0.0),
+                width_pt: side("width").or(shape.extent_pt.map(|e| e.0)),
+                height_pt: side("height").or(shape.extent_pt.map(|e| e.1)),
+                opacity: look.opacity.as_deref().and_then(vml_fraction),
+            })
+        })
+        .collect()
+}
+
 /// The raw look of a watermark shape: its `style` and `fillcolor`, and its
 /// text path's `style`.
 #[derive(Debug, Clone, Default)]
@@ -737,6 +777,11 @@ struct ShapeLook {
 struct WatermarkShape {
     kind: WatermarkKind,
     look: Option<ShapeLook>,
+    /// A picture's relationship id: VML `v:imagedata r:id`, DrawingML
+    /// `a:blip r:embed`.
+    rid: Option<String>,
+    /// A DrawingML picture's `wp:extent` in points.
+    extent_pt: Option<(f32, f32)>,
 }
 
 /// One walk over a header part's watermark shapes, shared by
@@ -747,14 +792,33 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
         marked: bool,
         texts: Vec<String>,
         picture: bool,
+        rid: Option<String>,
         look: ShapeLook,
     }
 
     let mut parser = XmlParser::new(xml);
     let mut shapes: Vec<Shape> = Vec::new();
-    let mut out = Vec::new();
+    let mut out: Vec<WatermarkShape> = Vec::new();
+    // The last `wp:extent` seen (it comes before its `docPr`), and whether the
+    // last pushed DrawingML watermark still wants its `a:blip`.
+    let mut extent_pt = None;
+    let mut want_blip = false;
     loop {
         match parser.next() {
+            Event::Start if local_name(parser.name()) == "extent" => {
+                let emu = |name| {
+                    decoded_attr_by_local(&parser, name)
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .map(|v| v / 12700.0)
+                };
+                extent_pt = emu("cx").zip(emu("cy"));
+            }
+            Event::Start if local_name(parser.name()) == "blip" => {
+                if want_blip && let Some(last) = out.last_mut() {
+                    last.rid = decoded_attr_by_local(&parser, "embed");
+                    want_blip = false;
+                }
+            }
             Event::Start if local_name(parser.name()) == "shape" => {
                 shapes.push(Shape {
                     marked: marker_in_attrs(&parser),
@@ -789,6 +853,7 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
             Event::Start if local_name(parser.name()) == "imagedata" => {
                 if let Some(shape) = shapes.last_mut() {
                     shape.picture = true;
+                    shape.rid = decoded_attr_by_local(&parser, "id");
                     shape.marked |= marker_in_attrs(&parser);
                 }
             }
@@ -799,7 +864,10 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                     out.push(WatermarkShape {
                         kind: WatermarkKind::Picture,
                         look: None,
+                        rid: None,
+                        extent_pt: extent_pt.take(),
                     });
+                    want_blip = true;
                 }
             }
             Event::End if local_name(parser.name()) == "shape" => {
@@ -811,16 +879,22 @@ fn watermark_shapes(xml: &str) -> Vec<WatermarkShape> {
                     out.extend(shape.texts.into_iter().map(|text| WatermarkShape {
                         kind: WatermarkKind::Text(text),
                         look: look.clone(),
+                        rid: None,
+                        extent_pt: None,
                     }));
                 } else if shape.marked && shape.picture {
                     out.push(WatermarkShape {
                         kind: WatermarkKind::Picture,
                         look,
+                        rid: shape.rid,
+                        extent_pt: None,
                     });
                 } else if shape.marked {
                     out.push(WatermarkShape {
                         kind: WatermarkKind::Unknown,
                         look,
+                        rid: None,
+                        extent_pt: None,
                     });
                 }
             }

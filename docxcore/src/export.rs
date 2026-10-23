@@ -41,6 +41,25 @@ use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
 
 mod cid;
+mod pic;
+
+pub use pic::PdfImage;
+
+/// A picture watermark of a header part (#797).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PicWatermark {
+    /// Index into [`PdfOptions::images`].
+    pub image: usize,
+    /// Clockwise rotation in degrees.
+    pub rotation: f32,
+    /// The shape's size in points; a missing side follows the other by the
+    /// picture's aspect, and both missing mean its pixel size at 96 dpi,
+    /// shrunk to fit the margin box.
+    pub width_pt: Option<f32>,
+    pub height_pt: Option<f32>,
+    /// 0..1; washed out to one half when the shape sets none.
+    pub opacity: Option<f32>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PdfOptions {
@@ -57,6 +76,12 @@ pub struct PdfOptions {
     /// The text watermarks of each header part, keyed by part name; drawn
     /// behind the body on every page that applies the header.
     pub watermarks: HashMap<String, Vec<TextWatermark>>,
+    /// The picture watermarks of each header part, keyed by part name; drawn
+    /// washed out behind the body, after the text ones. Each names an entry
+    /// of `images`.
+    pub picture_watermarks: HashMap<String, Vec<PicWatermark>>,
+    /// The pictures `picture_watermarks` draw, written once each.
+    pub images: Vec<Rc<PdfImage>>,
     /// Main document relationships, resolving each section's header/footer
     /// references to part names.
     pub rels: Relationships,
@@ -93,6 +118,8 @@ impl Default for PdfOptions {
             styles: Rc::new(StyleSheet::default()),
             header_footer: HashMap::new(),
             watermarks: HashMap::new(),
+            picture_watermarks: HashMap::new(),
+            images: Vec::new(),
             rels: Relationships::default(),
             last_sect_pr: None,
             even_and_odd_headers: false,
@@ -115,6 +142,9 @@ impl PdfOptions {
         let rels = pkg.document_rels();
         let mut header_footer = HashMap::new();
         let mut watermarks = HashMap::new();
+        let mut picture_watermarks = HashMap::new();
+        let mut images: Vec<Rc<PdfImage>> = Vec::new();
+        let mut image_of: HashMap<String, Option<usize>> = HashMap::new();
         for (_, target, external) in rels.iter() {
             if external {
                 continue;
@@ -133,6 +163,30 @@ impl PdfOptions {
                 if !marks.is_empty() {
                     watermarks.insert(name.clone(), marks);
                 }
+                let mut pics = Vec::new();
+                for mark in crate::package::picture_watermarks(&xml) {
+                    let Some(media) = pkg.part_rel_target(&name, &mark.rid) else {
+                        continue;
+                    };
+                    let index = *image_of.entry(media.clone()).or_insert_with(|| {
+                        let image = PdfImage::parse(pkg.part(&media)?)?;
+                        images.push(Rc::new(image));
+                        Some(images.len() - 1)
+                    });
+                    let Some(image) = index else {
+                        continue;
+                    };
+                    pics.push(PicWatermark {
+                        image,
+                        rotation: mark.rotation,
+                        width_pt: mark.width_pt,
+                        height_pt: mark.height_pt,
+                        opacity: mark.opacity,
+                    });
+                }
+                if !pics.is_empty() {
+                    picture_watermarks.insert(name.clone(), pics);
+                }
             }
             if let Some(blocks) = pkg.header_footer_blocks(&name) {
                 header_footer.insert(name, Rc::new(blocks));
@@ -149,6 +203,8 @@ impl PdfOptions {
             styles,
             header_footer,
             watermarks,
+            picture_watermarks,
+            images,
             rels,
             last_sect_pr: Some(pkg.sect_pr().to_string()),
             even_and_odd_headers: pkg.has_even_odd(),
@@ -702,6 +758,49 @@ struct WatermarkDraw {
     color: (f32, f32, f32),
 }
 
+/// A picture watermark placed on a page: a `w` by `h` box centred on
+/// `(cx, cy)`, turned `angle` degrees counter-clockwise.
+#[derive(Debug, Clone)]
+struct PictureDraw {
+    image: usize,
+    w: f32,
+    h: f32,
+    cx: f32,
+    cy: f32,
+    angle: f32,
+    /// Percent, the name of the page's graphics state.
+    opacity: u32,
+}
+
+impl PictureDraw {
+    fn place(
+        mark: &PicWatermark,
+        image: &PdfImage,
+        (left, bottom, right, top): (f32, f32, f32, f32),
+    ) -> Self {
+        let aspect = image.width as f32 / image.height as f32;
+        let (w, h) = match (mark.width_pt, mark.height_pt) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, w / aspect),
+            (None, Some(h)) => (h * aspect, h),
+            (None, None) => {
+                let (w, h) = (image.width as f32 * 0.75, image.height as f32 * 0.75);
+                let fit = ((right - left) / w).min((top - bottom) / h).min(1.0);
+                (w * fit, h * fit)
+            }
+        };
+        PictureDraw {
+            image: 0,
+            w: w.max(1.0),
+            h: h.max(1.0),
+            cx: (left + right) / 2.0,
+            cy: (bottom + top) / 2.0,
+            angle: -mark.rotation,
+            opacity: (mark.opacity.unwrap_or(0.5) * 100.0).round() as u32,
+        }
+    }
+}
+
 impl WatermarkDraw {
     /// Place `mark` in the margin box `(left, bottom, right, top)`, Word's
     /// default (`mso-position-*-relative:margin`, centred).
@@ -780,6 +879,8 @@ struct Page {
     hf_links: Vec<Link>,
     /// Text watermarks from the page's header, drawn behind everything else.
     watermarks: Vec<WatermarkDraw>,
+    /// Picture watermarks, drawn after the text ones.
+    pictures: Vec<PictureDraw>,
     rules: Vec<Rule>,
     /// Every body line, in layout order (vertical alignment, column balancing).
     lines: Vec<LineRec>,
@@ -1509,6 +1610,19 @@ impl<'a> Pager<'a> {
             .flatten()
             .map(|mark| WatermarkDraw::place(mark, margin_box, Metrics::of(opts)))
             .collect();
+        let pictures: Vec<PictureDraw> = parts
+            .and_then(|p| p.headers[variant.index()].as_ref())
+            .and_then(|a| opts.picture_watermarks.get(&a.part_name))
+            .into_iter()
+            .flatten()
+            .filter_map(|mark| {
+                let image = opts.images.get(mark.image)?;
+                Some(PictureDraw {
+                    image: mark.image,
+                    ..PictureDraw::place(mark, image, margin_box)
+                })
+            })
+            .collect();
         let mut body_bottom = s.bottom;
         let mut hf_frags = Vec::new();
         let mut hf_links = Vec::new();
@@ -1572,6 +1686,7 @@ impl<'a> Pager<'a> {
             hf_frags,
             hf_links,
             watermarks,
+            pictures,
             rules: Vec::new(),
             lines: Vec::new(),
             min_base: f32::INFINITY,
@@ -2663,6 +2778,24 @@ fn build_content(page: &Page, opts: &PdfOptions, mut book: Option<&mut cid::Book
             s.extend(b") Tj ET\nQ\n");
         }
     }
+    for pic in &page.pictures {
+        let (sin, cos) = pic.angle.to_radians().sin_cos();
+        s.extend(
+            format!(
+                "q\n/GS{} gs\n{cos:.4} {sin:.4} {:.4} {cos:.4} {:.2} {:.2} cm\n{:.2} 0 0 {:.2} {:.2} {:.2} cm\n/Im{} Do\nQ\n",
+                pic.opacity,
+                -sin,
+                pic.cx,
+                pic.cy,
+                pic.w,
+                pic.h,
+                -pic.w / 2.0,
+                -pic.h / 2.0,
+                pic.image
+            )
+            .as_bytes(),
+        );
+    }
     for rule in &page.rules {
         if rule.shape != RuleShape::Line {
             s.extend(shaped_rule_ops(rule).as_bytes());
@@ -2758,25 +2891,36 @@ fn write_pdf(pages: &[Page], opts: &PdfOptions) -> (Vec<u8>, PdfReport) {
             missing_chars: book.missing,
         };
         if book.used() {
-            return (serialize_pdf(pages, contents, Some(&book)), report);
+            return (
+                serialize_pdf(pages, contents, Some(&book), &opts.images),
+                report,
+            );
         }
         // No embedded face showed anything: the plain Courier file.
         let contents = pages
             .iter()
             .map(|page| build_content(page, opts, None))
             .collect();
-        return (serialize_pdf(pages, contents, None), report);
+        return (serialize_pdf(pages, contents, None, &opts.images), report);
     }
     let contents = pages
         .iter()
         .map(|page| build_content(page, opts, None))
         .collect();
-    (serialize_pdf(pages, contents, None), PdfReport::default())
+    (
+        serialize_pdf(pages, contents, None, &opts.images),
+        PdfReport::default(),
+    )
 }
 
 /// The file for already-built page contents; `book` holds the embedded faces
 /// (and then the contents are Flate-compressed).
-fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book>) -> Vec<u8> {
+fn serialize_pdf(
+    pages: &[Page],
+    contents: Vec<Vec<u8>>,
+    book: Option<&cid::Book>,
+    images: &[Rc<PdfImage>],
+) -> Vec<u8> {
     // Object ids: 1=Catalog, 2=Pages, 3..6=Courier fonts, then 5 objects per
     // embedded face (Type0 first), then per-page content/annot/page.
     let mut objs: Vec<Vec<u8>> = vec![Vec::new(), Vec::new()];
@@ -2802,6 +2946,15 @@ fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book
             face_fonts.push_str(&format!(" /{name} {id} 0 R"));
         }
         objs.extend(book.objects(first));
+    }
+
+    // The pictures any page draws, one object each.
+    let mut image_ids: HashMap<usize, usize> = HashMap::new();
+    for pic in pages.iter().flat_map(|p| &p.pictures) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = image_ids.entry(pic.image) {
+            objs.push(images[pic.image].object());
+            slot.insert(objs.len());
+        }
     }
 
     let mut page_ids: Vec<usize> = Vec::new();
@@ -2838,8 +2991,26 @@ fn serialize_pdf(pages: &[Page], contents: Vec<Vec<u8>>, book: Option<&cid::Book
             annot_ids.push(objs.len());
         }
 
+        let mut extra = String::new();
+        if !page.pictures.is_empty() {
+            let mut names: Vec<usize> = page.pictures.iter().map(|p| p.image).collect();
+            names.sort_unstable();
+            names.dedup();
+            extra.push_str(" /XObject <<");
+            for n in names {
+                extra.push_str(&format!(" /Im{n} {} 0 R", image_ids[&n]));
+            }
+            let mut washes: Vec<u32> = page.pictures.iter().map(|p| p.opacity).collect();
+            washes.sort_unstable();
+            washes.dedup();
+            extra.push_str(" >> /ExtGState <<");
+            for pct in washes {
+                extra.push_str(&format!(" /GS{pct} << /ca {:.2} >>", pct as f32 / 100.0));
+            }
+            extra.push_str(" >>");
+        }
         let mut page_obj = format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R{face_fonts} >> >> /Contents {content_id} 0 R",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {:.2} {:.2}] /Resources << /Font << /F0 3 0 R /F1 4 0 R /F2 5 0 R /F3 6 0 R{face_fonts} >>{extra} >> /Contents {content_id} 0 R",
             page.w, page.h
         );
         if !annot_ids.is_empty() {
