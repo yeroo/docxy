@@ -14,7 +14,7 @@ mod barstyle;
 mod gantt;
 #[cfg(test)]
 pub(super) use barstyle::BAR_Y;
-pub(super) use barstyle::{Part, bar_parts, bar_rows, drawn_entries, first_middle};
+pub(super) use barstyle::{PaletteLook, bar_rows, bar_styled, drawn_entries, first_middle};
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;
@@ -824,19 +824,11 @@ pub(super) fn project_state(
         ]
     }));
     // The plan's bar styles (#1696): a task row's height, and the rows
-    // drawn as `<uid>:<row>:<name>` in task order.
+    // drawn as `<uid>:<row>:<name>`, for the shown rows in drawn order.
     entries.push(("row_height".into(), Json::Num(f64::from(v.row_h()))));
     entries.push((
         "bars_drawn".into(),
-        Json::Arr(
-            v.ed.project()
-                .tasks
-                .iter()
-                .filter_map(|t| bar_rows(&v.ed, t, scale, BRAND).map(|rows| (t.uid, rows)))
-                .flat_map(|(uid, rows)| drawn_entries(uid, &rows))
-                .map(Json::Str)
-                .collect(),
-        ),
+        Json::Arr(bars_drawn(v, scale).into_iter().map(Json::Str).collect()),
     ));
     entries.extend(project_cell_state(v));
     entries.extend(selection::selection_state(v));
@@ -844,6 +836,22 @@ pub(super) fn project_state(
     entries.push(("undo_depth".into(), Json::Num(v.ed.undo_depth() as f64)));
     entries.push(("redo_depth".into(), Json::Num(v.ed.redo_depth() as f64)));
     entries
+}
+
+/// The bar style rows drawn, `<uid>:<row>:<name>`: for each shown row, in
+/// drawn order, the rows its task's bar styles draw (#1696).
+fn bars_drawn(v: &ProjectView, scale: GanttScale) -> Vec<String> {
+    let tasks = &v.ed.project().tasks;
+    v.ed.display_rows()
+        .into_iter()
+        .filter_map(|i| tasks.get(i))
+        .filter_map(|t| {
+            let bar = gantt_bar(&v.ed, t, scale).map(|b| v.styled_bar(b));
+            let look = PaletteLook::of(bar, crate::plugin_ui::palette(v).as_ref());
+            bar_rows(&v.ed, t, scale, look).map(|rows| (t.uid, rows))
+        })
+        .flat_map(|(uid, rows)| drawn_entries(uid, &rows))
+        .collect()
 }
 
 /// Whether `path` opens as a Project tab: a type some project format reads
@@ -1804,11 +1812,11 @@ pub(super) fn project_el(
                                                 // The plan's bar style rows, when
                                                 // they cover this task (#1696).
                                                 let styled = task.and_then(|t| {
-                                                    let color = bar.map_or(BRAND, |b| {
-                                                        bar_look(b.kind, palette.as_ref().as_ref()).0
-                                                    });
-                                                    bar_rows(&v.ed, t, scale, color)
-                                                        .map(|rows| bar_parts(&rows))
+                                                    let look = PaletteLook::of(
+                                                        bar,
+                                                        palette.as_ref().as_ref(),
+                                                    );
+                                                    bar_styled(&v.ed, t, scale, look)
                                                 });
                                                 h_flex()
                                                     .id(("project-row", i))

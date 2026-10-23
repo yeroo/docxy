@@ -1367,9 +1367,7 @@ fn overlay_ctx(v: &ProjectView) -> OverlayCtx {
                 ed,
                 task,
                 scale,
-                bar.map_or(crate::BRAND, |b| {
-                    crate::bar_look(b.kind, palette.as_ref()).0
-                }),
+                crate::PaletteLook::of(bar, palette.as_ref()),
             )
             .map(|rows| crate::first_middle(&rows));
             let dated = !matches!(

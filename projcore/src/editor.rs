@@ -19,6 +19,7 @@ pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
 mod assignments;
 mod barfacts;
+pub use barfacts::BarDateKind;
 mod batch;
 mod cells;
 mod effort;

@@ -24,6 +24,14 @@ fn editor(tasks: Vec<Task>, bars: Vec<BarRow>, task_bars: Vec<TaskBar>) -> Proje
     ProjectEditor::new(p)
 }
 
+fn look(color: u32) -> PaletteLook {
+    PaletteLook {
+        color,
+        shape: BarShape::Bar,
+        inactive: false,
+    }
+}
+
 fn row(name: &str, show_for: &[&str], band: u8) -> BarRow {
     BarRow {
         name: name.into(),
@@ -44,6 +52,7 @@ fn draw(x0: f32, x1: f32, band: u8) -> DrawRow {
         end: Mark::default(),
         texts: Vec::new(),
         color: 0x112233,
+        palette_box: None,
     }
 }
 
@@ -285,7 +294,7 @@ fn rows_resolve_per_task_in_table_order_and_miss_dateless_ones() {
     let scale = gantt_scale(&ed);
     let names = |uid: i32| -> Vec<String> {
         let t = ed.project().task(uid).unwrap();
-        bar_rows(&ed, t, scale, 0x123456)
+        bar_rows(&ed, t, scale, look(0x123456))
             .unwrap()
             .into_iter()
             .map(|r| format!("{}@{}", r.name, r.band))
@@ -298,11 +307,11 @@ fn rows_resolve_per_task_in_table_order_and_miss_dateless_ones() {
     assert_eq!(names(2), ["Every@1", "Leaves@3"]);
     assert_eq!(names(3), ["Every@1"]);
     // The leaf spans its days; the milestone is a point.
-    let leaf = bar_rows(&ed, ed.project().task(2).unwrap(), scale, 1).unwrap();
+    let leaf = bar_rows(&ed, ed.project().task(2).unwrap(), scale, look(1)).unwrap();
     let bar = gantt_bar(&ed, ed.project().task(2).unwrap(), scale).unwrap();
     assert_eq!(leaf[0].x0, bar.start as f32 * scale.day_w);
     assert_eq!(leaf[0].x1, (bar.end + 1) as f32 * scale.day_w);
-    let ms = bar_rows(&ed, ed.project().task(3).unwrap(), scale, 1).unwrap();
+    let ms = bar_rows(&ed, ed.project().task(3).unwrap(), scale, look(1)).unwrap();
     assert_eq!(ms[0].x0, ms[0].x1);
     // The state lines name uid, band and row.
     assert_eq!(drawn_entries(2, &leaf), ["2:1:Every", "2:3:Leaves"]);
@@ -338,7 +347,7 @@ fn an_override_merges_over_every_row_it_draws() {
         vec![over],
     );
     let scale = gantt_scale(&ed);
-    let rows = bar_rows(&ed, ed.project().task(2).unwrap(), scale, 7).unwrap();
+    let rows = bar_rows(&ed, ed.project().task(2).unwrap(), scale, look(7)).unwrap();
     assert_eq!(rows.len(), 2);
     for r in &rows {
         assert_eq!(r.middle.color, Some(0x00AA00));
@@ -349,7 +358,7 @@ fn an_override_merges_over_every_row_it_draws() {
     assert_eq!(rows[1].end.shape.as_deref(), Some("circle"));
     assert_eq!(rows[0].texts, [("right", "Task 2".to_string())]);
     // The other task is untouched.
-    let rows = bar_rows(&ed, ed.project().task(1).unwrap(), scale, 7).unwrap();
+    let rows = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(7)).unwrap();
     assert_eq!(rows[0].middle.color, Some(0x111111));
     assert_eq!(rows[0].start.color, None);
 }
@@ -373,7 +382,7 @@ fn an_override_over_no_table_restyles_a_plain_leaf_bar_only() {
         vec![over(1), over(2), over(3)],
     );
     let scale = gantt_scale(&ed);
-    let get = |uid: i32| bar_rows(&ed, ed.project().task(uid).unwrap(), scale, 0x445566);
+    let get = |uid: i32| bar_rows(&ed, ed.project().task(uid).unwrap(), scale, look(0x445566));
     // The leaf is drawn as one full-height row over its palette colour.
     let rows = get(2).unwrap();
     assert_eq!(rows.len(), 1);
@@ -399,7 +408,7 @@ fn an_override_over_no_table_restyles_a_plain_leaf_bar_only() {
             &none,
             none.project().task(1).unwrap(),
             gantt_scale(&none),
-            1
+            look(1)
         ),
         None
     );
@@ -446,4 +455,190 @@ fn the_task_row_grows_with_the_highest_band() {
     // Back to no table: the original height.
     view.ed.edit_formatting(|f| f.set_bars(Vec::new()));
     assert_eq!(view.row_h(), ROW_H);
+}
+
+/// A plan with `tasks` whose first task starts Monday 5 January at 8:00,
+/// with the bars `bars` and the progress each task states.
+fn progress_editor(bars: Vec<BarRow>) -> ProjectEditor {
+    let mut one_day = task(1, 1, 1);
+    one_day.percent_complete = Some(10);
+    let mut three_days = task(2, 3, 1);
+    three_days.percent_complete = Some(10);
+    let mut two_days = task(3, 2, 1);
+    two_days.percent_complete = Some(50);
+    editor(vec![one_day, three_days, two_days], bars, Vec::new())
+}
+
+#[test]
+fn completed_through_is_an_instant_and_start_finish_stay_whole_days() {
+    let progress = BarRow {
+        to: "CompleteThrough".into(),
+        ..row("Progress", &[], 1)
+    };
+    let ed = progress_editor(vec![progress]);
+    let scale = gantt_scale(&ed);
+    let dw = scale.day_w;
+    for uid in [1, 2, 3] {
+        let t = ed.project().task(uid).unwrap();
+        let rows = bar_rows(&ed, t, scale, look(1)).unwrap();
+        let start = ed.disp_start(uid).unwrap();
+        let finish = ed.disp_finish(uid).unwrap();
+        let pct = i64::from(t.percent_complete.unwrap());
+        let through = start.add_minutes((finish.minutes() - start.minutes()) * pct / 100);
+        // From is the start of its day, To the instant itself.
+        let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
+        assert_eq!(rows[0].x0, day(start) * dw, "task {uid}");
+        assert_eq!(rows[0].x1, instant_x(scale, 0., through), "task {uid}");
+        // Never past the bar the palette draws.
+        let bar = gantt_bar(&ed, t, scale).unwrap();
+        assert!(rows[0].x1 <= (bar.end + 1) as f32 * dw, "task {uid}");
+    }
+    // 10% of a one-day task is a sliver of its day, not the whole day; 50% of
+    // two days is up to (and a bit into) the second day.
+    let x = |uid: i32| {
+        let r = bar_rows(&ed, ed.project().task(uid).unwrap(), scale, look(1)).unwrap();
+        r[0].x1 - r[0].x0
+    };
+    assert!(x(1) > 0. && x(1) < dw / 2., "{}", x(1));
+    assert!(x(2) > 0. && x(2) < dw, "{}", x(2));
+    assert!(x(3) >= dw && x(3) < 2. * dw, "{}", x(3));
+    // Finish -> Finish: both ends are the end of their day.
+    let ff = BarRow {
+        from: "Task Finish".into(),
+        to: "Baseline Finish".into(),
+        ..row("FF", &[], 1)
+    };
+    let mut t = task(1, 2, 1);
+    t.baselines = vec![projcore::Baseline {
+        number: 0,
+        start: Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, 12, 17, 0)),
+        ..Default::default()
+    }];
+    let ed = editor(vec![t], vec![ff], Vec::new());
+    let scale = gantt_scale(&ed);
+    let r = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
+    let end_of =
+        |d: projcore::DateTime| (d.day_number() - scale.origin_day + 1) as f32 * scale.day_w;
+    assert_eq!(r[0].x0, end_of(ed.disp_finish(1).unwrap()));
+    assert_eq!(
+        r[0].x1,
+        end_of(projcore::DateTime::from_ymd_hm(2026, 1, 12, 17, 0))
+    );
+}
+
+#[test]
+fn a_milestone_row_is_centred_in_its_day_like_the_palette_diamond() {
+    let mut ms = row("M", &[], 1);
+    ms.start.shape = Some("diamond".into());
+    let ed = editor(vec![task(1, 2, 1), task(2, 0, 1)], vec![ms], Vec::new());
+    let scale = gantt_scale(&ed);
+    let t = ed.project().task(2).unwrap();
+    let bar = gantt_bar(&ed, t, scale).unwrap();
+    let rows = bar_rows(&ed, t, scale, look(1)).unwrap();
+    // The diamond's 14 px box starts at milestone_x; its centre is the mark's.
+    let centre = milestone_x(bar.start, scale.day_w) + 7.;
+    assert_eq!((rows[0].x0, rows[0].x1), (centre, centre));
+    let marks: Vec<f32> = bar_parts(&rows)
+        .iter()
+        .filter_map(|p| match p {
+            Part::Mark { rect, .. } => Some(rect.0 + rect.2 / 2.),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marks, [centre]);
+    assert_eq!(first_middle(&rows).unwrap().2, 0.);
+}
+
+#[test]
+fn a_colour_only_override_keeps_the_palette_bar_in_place_and_size() {
+    let over = |uid, shape: Option<&str>| TaskBar {
+        uid,
+        middle: Middle {
+            color: Some(0x00AA00),
+            shape: shape.map(str::to_string),
+            ..Middle::default()
+        },
+        ..TaskBar::default()
+    };
+    let mut inactive = task(2, 2, 1);
+    inactive.active = Some(false);
+    let ed = editor(
+        vec![task(1, 3, 1), inactive, task(3, 3, 1)],
+        Vec::new(),
+        vec![over(1, None), over(2, None), over(3, Some("narrow-top"))],
+    );
+    let scale = gantt_scale(&ed);
+    let rect_of = |uid: i32| {
+        let t = ed.project().task(uid).unwrap();
+        let bar = gantt_bar(&ed, t, scale).unwrap();
+        let rows = bar_rows(&ed, t, scale, PaletteLook::of(Some(bar), None)).unwrap();
+        (bar_rect(&bar, scale.day_w), rows)
+    };
+    // Same rectangle as the palette bar.
+    let (palette, rows) = rect_of(1);
+    assert_eq!(first_middle(&rows), Some(palette));
+    assert!(matches!(
+        &bar_parts(&rows)[0],
+        Part::Middle {
+            color: 0x00AA00,
+            pattern: None,
+            ..
+        }
+    ));
+    // An inactive task stays an outline.
+    let (palette, rows) = rect_of(2);
+    assert_eq!(first_middle(&rows), Some(palette));
+    assert!(matches!(&bar_parts(&rows)[0], Part::Middle { pattern: Some(p), .. } if p == "hollow"));
+    // Naming a shape moves it to the standard bar zone.
+    let (_, rows) = rect_of(3);
+    assert_eq!(first_middle(&rows).unwrap().1, BAR_Y);
+    assert_eq!(first_middle(&rows).unwrap().3, NARROW_H);
+    // A thin palette bar keeps its place too.
+    let thin = PaletteLook {
+        shape: BarShape::Thin,
+        ..look(1)
+    };
+    let t = ed.project().task(1).unwrap();
+    let r = bar_rows(&ed, t, scale, thin).unwrap();
+    assert_eq!(first_middle(&r).map(|m| (m.1, m.3)), Some((11., 6.)));
+    // The table's presence ends the stand-in: BAR_Y zone, no palette box.
+    let with_table = editor(
+        vec![task(1, 3, 1)],
+        vec![row("A", &[], 1)],
+        vec![over(1, None)],
+    );
+    let r = bar_rows(
+        &with_table,
+        with_table.project().task(1).unwrap(),
+        gantt_scale(&with_table),
+        look(1),
+    )
+    .unwrap();
+    assert_eq!(first_middle(&r).map(|m| (m.1, m.3)), Some((BAR_Y, BAR_H)));
+    // An override keeps the baseline and delay marks, a table drops them.
+    let kept = bar_styled(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
+    assert!(kept.marks);
+    let dropped = bar_styled(
+        &with_table,
+        with_table.project().task(1).unwrap(),
+        gantt_scale(&with_table),
+        look(1),
+    )
+    .unwrap();
+    assert!(!dropped.marks);
+}
+
+#[test]
+fn bars_drawn_lists_the_shown_rows_in_drawn_order() {
+    let mut p = untitled_project();
+    p.tasks = vec![task(1, 0, 1), task(2, 2, 2), task(3, 2, 1)];
+    p.tasks[0].summary = true;
+    p.formatting.set_bars(vec![row("R", &[], 1)]);
+    let mut view = ProjectView::new(p, false);
+    let scale = view.chart_scale();
+    assert_eq!(bars_drawn(&view, scale), ["1:1:R", "2:1:R", "3:1:R"]);
+    // Collapsing the summary hides task 2: it is no longer drawn or listed.
+    view.ed.set_collapsed(1, true).unwrap();
+    assert_eq!(bars_drawn(&view, scale), ["1:1:R", "3:1:R"]);
 }

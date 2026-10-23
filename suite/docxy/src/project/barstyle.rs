@@ -13,7 +13,7 @@
 //! [`MARK`] px squares centred on the zone; the top and bottom texts sit in
 //! the bands above and below it and the left, right and inside ones on it.
 use super::*;
-use projcore::editor::Field;
+use projcore::editor::{BarDateKind, Field};
 use projcore::formatting::{BarRow, BarText, Mark, Middle, TextStyle as PlanStyle};
 
 /// Top of the bar zone within a band.
@@ -47,6 +47,40 @@ pub(crate) struct DrawRow {
     pub texts: Vec<(&'static str, String)>,
     /// The colour a part without its own takes: the task's palette colour.
     pub color: u32,
+    /// `(y, h)` within the band of the palette bar this row stands in for
+    /// (an override over no table): the middle keeps it until the override
+    /// names a shape.
+    pub palette_box: Option<(f32, f32)>,
+}
+
+/// How the palette drew a task's bar: what an override over no table, and a
+/// row without a colour of its own, keep (#1696).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PaletteLook {
+    pub color: u32,
+    pub shape: BarShape,
+    pub inactive: bool,
+}
+
+impl PaletteLook {
+    /// The look of `bar` under `palette`; the built-in blue bar without one.
+    pub fn of(bar: Option<GanttBar>, palette: Option<&projcore::uiplugin::Palette>) -> Self {
+        match bar {
+            Some(b) => {
+                let (color, shape) = bar_look(b.kind, palette);
+                PaletteLook {
+                    color,
+                    shape,
+                    inactive: b.inactive,
+                }
+            }
+            None => PaletteLook {
+                color: BRAND,
+                shape: BarShape::Bar,
+                inactive: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +234,10 @@ pub(crate) fn bar_parts(rows: &[DrawRow]) -> Vec<Part> {
     for row in rows {
         let band_y = f32::from(row.band.saturating_sub(1)) * ROW_H;
         let zone = band_y + BAR_Y;
-        let (dy, h) = middle_geometry(row.middle.shape.as_deref());
+        let (dy, h) = match (&row.middle.shape, row.palette_box) {
+            (None, Some((y, h))) => (y - BAR_Y, h),
+            _ => middle_geometry(row.middle.shape.as_deref()),
+        };
         let color = row.middle.color.unwrap_or(row.color);
         parts.push(Part::Middle {
             band: row.band,
@@ -289,15 +326,40 @@ fn engaged(f: &projcore::formatting::Formatting, task: &Task) -> bool {
     !f.bars.is_empty() || (f.task_bar(task.uid).is_some() && !task.summary && !task.is_milestone())
 }
 
+/// What a task's bar styles draw: its parts, and whether the palette's
+/// baseline and leveling-delay marks stay (an override over a plain leaf
+/// bar; a table replaces them).
+pub(crate) struct BarStyled {
+    pub parts: Vec<Part>,
+    pub marks: bool,
+}
+
+/// `task`'s [`BarStyled`] under the plan, or `None` when the palette drawing
+/// applies.
+pub(crate) fn bar_styled(
+    ed: &ProjectEditor,
+    task: &Task,
+    scale: GanttScale,
+    look: PaletteLook,
+) -> Option<BarStyled> {
+    let rows = bar_rows(ed, task, scale, look)?;
+    Some(BarStyled {
+        parts: bar_parts(&rows),
+        marks: ed.project().formatting.bars.is_empty(),
+    })
+}
+
 /// `task`'s rows as drawn under the plan's bar styles, or `None` when the
 /// palette drawing applies (no table, and no override of a plain leaf bar).
-/// `color` is the task's palette colour. Rows whose From or To date the task
-/// does not have draw nothing. An override only changes a row's looks.
+/// `look` is how the palette drew the task. Rows whose From or To date the
+/// task does not have draw nothing. An override only changes a row's looks;
+/// over no table it restyles the palette's own bar, which keeps its place
+/// and size until the override says otherwise.
 pub(crate) fn bar_rows(
     ed: &ProjectEditor,
     task: &Task,
     scale: GanttScale,
-    color: u32,
+    look: PaletteLook,
 ) -> Option<Vec<DrawRow>> {
     let f = &ed.project().formatting;
     if !engaged(f, task) || task.is_null {
@@ -307,13 +369,26 @@ pub(crate) fn bar_rows(
     let reader = FieldReader::new(ed);
     let synthesized;
     let rows: Vec<&BarRow> = if f.bars.is_empty() {
-        synthesized = BarRow::default();
+        let mut row = BarRow::default();
+        if look.inactive || look.shape == BarShape::Hollow {
+            row.middle.pattern = Some("hollow".into());
+        }
+        synthesized = row;
         vec![&synthesized]
     } else {
         let facts = ed.bar_facts(&reader, task, f.bars_use_flags());
         f.bars_for(&facts)
     };
+    let palette_box = f.bars.is_empty().then_some(match look.shape {
+        BarShape::Thin => (11., 6.),
+        _ => (5., 14.),
+    });
     let day = |d: projcore::DateTime| (d.day_number() - scale.origin_day) as f32;
+    let at = |d: projcore::DateTime, kind: BarDateKind| match kind {
+        BarDateKind::Start => day(d) * scale.day_w,
+        BarDateKind::Finish => (day(d) + 1.) * scale.day_w,
+        BarDateKind::Instant => instant_x(scale, 0., d),
+    };
     let mut out = Vec::new();
     for row in rows {
         let (Some(from), Some(to)) = (
@@ -322,11 +397,15 @@ pub(crate) fn bar_rows(
         ) else {
             continue;
         };
-        let x0 = day(from) * scale.day_w;
-        let x1 = if to > from {
-            (day(to) + 1.) * scale.day_w
+        // Whole days for the start and finish fields (the palette's bars),
+        // the instant itself for the others; no span (a milestone) sits in
+        // the middle of its day, as the palette's diamond does.
+        let (x0, x1) = if to > from {
+            let x0 = at(from, BarDateKind::of(&row.from, Field::Start));
+            (x0, at(to, BarDateKind::of(&row.to, Field::Finish)).max(x0))
         } else {
-            x0
+            let mid = (day(from) + 0.5) * scale.day_w;
+            (mid, mid)
         };
         let text = match over {
             Some(o) => row.text.clone().over(&o.text),
@@ -350,7 +429,8 @@ pub(crate) fn bar_rows(
                     (!s.is_empty()).then_some((pos, s))
                 })
                 .collect(),
-            color,
+            color: look.color,
+            palette_box,
         });
     }
     Some(out)

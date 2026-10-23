@@ -147,9 +147,21 @@ fn show_for_evaluates_categories() {
     assert!(!row("a", &["Critical"], 1).applies(&plain));
     assert!(row("a", &["noncritical"], 1).applies(&plain));
     assert!(!row("a", &["Noncritical"], 1).applies(&crit));
-    // Any positive entry matches; Not removes.
-    let r = row("a", &["Critical", "Milestone"], 1);
-    assert!(r.applies(&crit) && r.applies(&milestone) && !r.applies(&plain));
+    // Every listed category must match (Project's list is a conjunction);
+    // Not removes.
+    let r = row("a", &["Milestone", "Critical"], 1);
+    let crit_milestone = facts(|f| {
+        f.critical = true;
+        f.milestone = true;
+    });
+    assert!(r.applies(&crit_milestone));
+    assert!(!r.applies(&crit) && !r.applies(&milestone) && !r.applies(&plain));
+    // Project's default Task row: Normal, Active, Not Manually Scheduled.
+    let task_row = row("Task", &["Normal", "Active", "Not Manual"], 1);
+    assert!(task_row.applies(&plain));
+    assert!(!task_row.applies(&summary));
+    assert!(!task_row.applies(&facts(|f| f.manual = true)));
+    assert!(!task_row.applies(&Facts::default()));
     let r = row("a", &["Critical", "Not Summary"], 1);
     assert!(r.applies(&crit));
     assert!(!r.applies(&facts(|f| {
@@ -480,4 +492,63 @@ fn set_bars_clamps_the_row() {
     f.set_bars(vec![row("a", &[], 0), row("b", &[], 9)]);
     assert_eq!(f.bars.iter().map(|r| r.row).collect::<Vec<_>>(), [1, 4]);
     assert_eq!(f.max_bar_row(), 4);
+}
+
+#[test]
+fn a_comma_list_inside_a_json_entry_splits_like_the_xml_form() {
+    let mut f = Formatting::default();
+    f.apply_view(
+        &Json::parse(r#"{"bars":[{"name":"a","show_for":["Normal, Active","Not Manual"]}]}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(f.bars[0].show_for, ["Normal", "Active", "Not Manual"]);
+    let xml = f.to_xml();
+    assert!(
+        xml.contains(r#"show-for="Normal,Active,Not Manual""#),
+        "{xml}"
+    );
+    assert_eq!(Formatting::from_xml(&xml).unwrap(), f);
+    let mut g = Formatting::default();
+    g.apply_view(&Json::obj(vec![("bars", f.bars_json())]))
+        .unwrap();
+    assert_eq!(g, f);
+}
+
+#[test]
+fn date_names_land_on_the_day_scale_by_kind() {
+    use crate::editor::BarDateKind::{Finish, Instant, Start};
+    let kind = |name: &str, default| crate::editor::BarDateKind::of(name, default);
+    assert_eq!(kind("", Field::Start), Start);
+    assert_eq!(kind("", Field::Finish), Finish);
+    for name in [
+        "Start",
+        "Task Start",
+        " actual start ",
+        "Baseline Start",
+        "Baseline3 Start",
+        "Start4",
+        "Early Start",
+    ] {
+        assert_eq!(kind(name, Field::Finish), Start, "{name}");
+    }
+    for name in [
+        "Finish",
+        "Task Finish",
+        "Actual Finish",
+        "Baseline Finish",
+        "Finish10",
+        "Late Finish",
+    ] {
+        assert_eq!(kind(name, Field::Start), Finish, "{name}");
+    }
+    for name in [
+        "CompleteThrough",
+        "Complete Through",
+        "Deadline",
+        "Date1",
+        "Nonsense",
+    ] {
+        assert_eq!(kind(name, Field::Start), Instant, "{name}");
+    }
 }

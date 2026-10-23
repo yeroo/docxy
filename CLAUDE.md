@@ -1172,9 +1172,12 @@
   unknown shape, pattern or category is drawn as the default / never matches,
   a wrongly typed JSON value is ignored, `row` clamps to 1..=4
   (`Formatting::set_bars`). One `edit_formatting` is one undo step for both.
-- `show_for` is any positive entry (`Not ` entries only pass everything they
-  do not match) and no negated entry (`BarRow::applies`, `Facts::is`); an
-  empty list shows for every task. `Facts` is built by `Editor::bar_facts`
+- `show_for` is a conjunction, as Project's comma list is (its default Task
+  row is `Normal, Active, Not Manually Scheduled`): every listed category must
+  match and no `Not` one may (`BarRow::applies`, `Facts::is`); an empty list
+  shows for every task, and a category with no plan data never matches, so a
+  row listing one shows for no task. A JSON array entry holding a comma list
+  is split like the XML attribute. `Facts` is built by `Editor::bar_facts`
   (Normal, Milestone, Summary, Critical, Noncritical, Active, Inactive,
   Manual, Auto, External, Late = Status text, Flag1..20 read only when a row
   names one). `Marked` and the Task Path kinds have no plan data: they parse
@@ -1182,10 +1185,18 @@
   Finish; `Task Start`/`Task Finish`; any `Field` date name; `CompleteThrough`
   = the task's `stop`, else start plus its percent complete of the span, which
   is unmeasured against Project); a task without the date draws no such row.
+  `BarDateKind::of` says how a date lands on the day scale: start-type
+  fields (Start, Actual/Early/Late Start, Baseline Start, Start1..10) are the
+  start of their day and finish-type ones the end of it, so a Start-Finish row
+  equals `gantt_bar`; every other date (CompleteThrough, Deadline, ...) is the
+  instant (`instant_x`). A row with no span (To not after From, a milestone)
+  sits in the middle of the From day, as the palette's diamond does.
 - The suite draws it in `suite/docxy/src/project/barstyle.rs`: `bar_rows`
   (the plan against one task: `None` means the palette drawing, as with no
   table and no override; an override with no table restyles a plain leaf bar
-  only, never a summary or milestone) -> `bar_parts` (pure geometry, tested)
+  only, never a summary or milestone; that override keeps the palette bar's
+  place, size, outline for an inactive task, and its baseline and delay marks,
+  until it names a middle shape) -> `bar_parts` (pure geometry, tested)
   -> `styled_children`. A band is `ROW_H` tall, `row` picks the band; the bar
   zone is `BAR_Y`..+`BAR_H` (full), medium 8 px and narrow 4 px at its top,
   middle or bottom; marks are 10 px (solid, dashed outline, framed = filled
@@ -1199,7 +1210,7 @@
   (`page_rows_of`) uses it; the headers stay `ROW_H`. With no table everything
   is as before. `OverlayCtx.row_h` and `OverlayRow.bar` follow: the bar is the
   first drawn row's middle. The harness state reports `row_height` and
-  `bars_drawn` (`<uid>:<row>:<name>`); the fixture's `fixture.bars` sets two
+  `bars_drawn` (`<uid>:<row>:<name>` for the shown rows, in drawn order); the fixture's `fixture.bars` sets two
   rows and an override (and its overlay stops writing Resource Names when a row
   names them). Not drawn: terminal `yppxy` (it sends the JSON), the built-in
   Bar Styles / Format Bar dialogs, printing.

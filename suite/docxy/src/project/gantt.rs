@@ -1,5 +1,5 @@
 //! Day-scale geometry shared by the renderer and harness.
-use super::barstyle::styled_children;
+use super::barstyle::{BarStyled, styled_children};
 use super::*;
 use projcore::formatting::gridlines::{Gridline, Gridlines, Line, LineType};
 
@@ -774,6 +774,34 @@ fn header_cells(
     cells
 }
 
+/// The leveling delay and the baseline under a bar: the palette's marks.
+fn delay_and_baseline(mut strip: Div, bar: GanttBar, dw: f32, pal: Pal) -> Div {
+    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla| {
+        div()
+            .absolute()
+            .left(px(s as f32 * dw))
+            .top(px(y))
+            .w(px((e - s + 1).max(1) as f32 * dw))
+            .h(px(h))
+            .bg(color)
+    };
+    if let Some((s, e)) = bar.delay {
+        strip = strip.child(
+            div()
+                .absolute()
+                .left(px(s as f32 * dw))
+                .top(px(8.))
+                .w(px((e - s).max(0) as f32 * dw))
+                .h(px(8.))
+                .bg(Hsla { a: 0.4, ..pal.dim }),
+        );
+    }
+    if let Some((s, e)) = bar.baseline {
+        strip = strip.child(span(s, e, 22., 4., pal.dim));
+    }
+    strip
+}
+
 /// One row's Gantt strip. `on_right` is the bar's own right-press (#1207):
 /// it is attached to the drawn bar (or milestone diamond) only, so a press
 /// on the chart beside it is not the bar's.
@@ -785,7 +813,7 @@ pub(crate) fn gantt_strip(
     palette: Option<&projcore::uiplugin::Palette>,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     row_h: f32,
-    styled: Option<Vec<Part>>,
+    styled: Option<BarStyled>,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_chart_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -797,11 +825,15 @@ pub(crate) fn gantt_strip(
         .h(px(row_h))
         .on_mouse_down(MouseButton::Right, on_chart_right);
     // The plan's bar style rows replace the palette drawing of a task they
-    // cover (#1696); the baseline and leveling-delay marks are not part of
-    // them.
-    if let Some(parts) = styled {
+    // cover (#1696); an override over a plain leaf bar keeps its baseline
+    // and leveling-delay marks.
+    if let Some(styled) = styled {
+        let strip = match bar.filter(|_| styled.marks) {
+            Some(bar) => delay_and_baseline(strip, bar, scale.day_w, pal),
+            None => strip,
+        };
         return strip.children(styled_children(
-            parts,
+            styled.parts,
             id,
             pal,
             probes,
@@ -823,21 +855,8 @@ pub(crate) fn gantt_strip(
             .when(hollow, |d| d.border_1().border_color(color))
             .when(!hollow, |d| d.bg(color))
     };
+    let strip = delay_and_baseline(strip, bar, dw, pal);
     let mut strip = strip;
-    if let Some((s, e)) = bar.delay {
-        strip = strip.child(
-            div()
-                .absolute()
-                .left(px(s as f32 * dw))
-                .top(px(8.))
-                .w(px((e - s).max(0) as f32 * dw))
-                .h(px(8.))
-                .bg(Hsla { a: 0.4, ..pal.dim }),
-        );
-    }
-    if let Some((s, e)) = bar.baseline {
-        strip = strip.child(span(s, e, 22., 4., pal.dim, false));
-    }
     if bar.inactive {
         if let Some((s, e)) = bar.rollup {
             strip = strip.child(span(s, e, 3., 4., hsla_u(color), true));

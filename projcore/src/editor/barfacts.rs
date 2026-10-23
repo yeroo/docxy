@@ -6,6 +6,55 @@ use super::fields::CustomKind;
 use super::*;
 use crate::formatting::Facts;
 
+/// How a bar row's From or To date lands on the day scale: a start-type date
+/// is the start of its day and a finish-type one the end of it (the
+/// chart's whole-day task bars), anything else is the instant itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarDateKind {
+    Start,
+    Finish,
+    Instant,
+}
+
+impl BarDateKind {
+    /// The kind of the field a From or To `name` reads (`default` when it is
+    /// empty): `Start`, `Task Start`, `Actual Start`, `Early/Late Start`,
+    /// `Baseline<n> Start` and `Start1..10` start; the Finish twins finish;
+    /// `CompleteThrough`, `Deadline` and the other dates are instants.
+    pub fn of(name: &str, default: Field) -> BarDateKind {
+        let compact: String = name
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let field = match compact.as_str() {
+            "" => default,
+            "taskstart" => Field::Start,
+            "taskfinish" => Field::Finish,
+            "completethrough" => return BarDateKind::Instant,
+            _ => match Field::parse(name) {
+                Ok(f) => f,
+                Err(_) => return BarDateKind::Instant,
+            },
+        };
+        match field {
+            Field::Start
+            | Field::ActualStart
+            | Field::EarlyStart
+            | Field::LateStart
+            | Field::Baseline(_, BaselinePart::Start)
+            | Field::Custom(CustomKind::Start, _) => BarDateKind::Start,
+            Field::Finish
+            | Field::ActualFinish
+            | Field::EarlyFinish
+            | Field::LateFinish
+            | Field::Baseline(_, BaselinePart::Finish)
+            | Field::Custom(CustomKind::Finish, _) => BarDateKind::Finish,
+            _ => BarDateKind::Instant,
+        }
+    }
+}
+
 impl Editor {
     /// The task's categories. `flags` reads Flag1 to Flag20 (twenty field
     /// reads), which a host asks for only when a row names one

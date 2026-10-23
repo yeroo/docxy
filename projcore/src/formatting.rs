@@ -314,9 +314,13 @@ impl Formatting {
     /// null to clear), `text_styles` (an object of category to style, a
     /// null clearing one), `cells` (an array of `{uid, column, ...style}`,
     /// an empty style clearing one), `gridlines` (an object of line name to
-    /// its drawing, or null for every default: [`Gridlines::apply`], #1575)
-    /// and `link_style` (a string or null). Other keys are the host's (its
-    /// view switches) and ignored here. `true` when something changed.
+    /// its drawing, or null for every default: [`Gridlines::apply`], #1575),
+    /// `link_style` (a string or null), `switches` (an object of name to a
+    /// boolean, null clearing one), and the bar styles `bars` (an array
+    /// replacing the Bar Styles table, null clearing it) and `task_bars`
+    /// (an array of per-task overrides, null clearing all; see [`bars`],
+    /// #1696). Other keys are the host's and ignored here. `true` when
+    /// something changed.
     pub fn apply_view(&mut self, view: &Json) -> Result<bool, String> {
         let before = self.clone();
         let text = |v: &Json, key: &str| -> Result<Option<Option<String>>, String> {

@@ -385,27 +385,16 @@ fn split_not(entry: &str) -> (bool, &str) {
 }
 
 impl BarRow {
-    /// Whether the row shows for a task: any positive entry matches (none
-    /// listed, as in `Not Summary` alone, passes) and no negated entry does.
-    /// An empty list shows for every task.
+    /// Whether the row shows for a task: every listed category matches and
+    /// no `Not` one does, as Project's comma list is a conjunction (its
+    /// default Task row, `Normal, Active, Not Manually Scheduled`, is one).
+    /// An empty list shows for every task; a category the plan holds no data
+    /// for never matches, so a row listing one shows for no task.
     pub fn applies(&self, facts: &Facts) -> bool {
-        let mut positive = false;
-        let mut any_positive = false;
-        for entry in &self.show_for {
+        self.show_for.iter().all(|entry| {
             let (not, name) = split_not(entry);
-            if name.is_empty() {
-                continue;
-            }
-            if not {
-                if facts.is(name) {
-                    return false;
-                }
-            } else {
-                any_positive = true;
-                positive |= facts.is(name);
-            }
-        }
-        positive || !any_positive
+            name.is_empty() || facts.is(name) != not
+        })
     }
 
     fn from_json(v: &Json) -> BarRow {
@@ -413,8 +402,7 @@ impl BarRow {
             Some(Json::Arr(items)) => items
                 .iter()
                 .filter_map(|i| i.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .flat_map(split_list)
                 .collect(),
             Some(Json::Str(s)) => split_list(s),
             _ => Vec::new(),
