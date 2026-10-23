@@ -1086,7 +1086,7 @@ fn a_core_field_is_an_undo_step_that_the_controls_follow_1364() {
         content: core_property_control(BoundProp::Title, "Old", 1, &RunProps::default()),
     })];
     let mut ed = Editor::new(Document { body });
-    ed.seed_core_fields(CoreFields {
+    ed.reseed_core_fields(CoreFields {
         title: "Old".into(),
         ..CoreFields::default()
     });
@@ -1114,8 +1114,25 @@ fn a_core_field_is_an_undo_step_that_the_controls_follow_1364() {
     assert_eq!(ed.core_fields().title, "New");
     assert_eq!(ed.core_fields().tags, "a, b");
     assert_eq!(text(&ed), "New");
-    // A control typed in is noted without a step of its own.
+    // The host sees what an edit, undo or redo changed, and writes it.
+    assert_eq!(
+        ed.core_unsynced(),
+        [
+            (BoundProp::Title, "New".to_string()),
+            (BoundProp::Keywords, "a, b".to_string())
+        ]
+    );
+    ed.core_synced();
+    assert_eq!(ed.core_unsynced(), []);
+    assert!(ed.undo());
+    assert_eq!(ed.core_unsynced(), [(BoundProp::Keywords, String::new())]);
+    // A control typed in is noted without a step of its own, and is synced.
     ed.note_core_field(BoundProp::Author, "Ann");
     assert_eq!(ed.core_fields().author, "Ann");
     ed.note_core_field(BoundProp::Subject, "ignored");
+    // Reseeding changes every step: an undo cannot bring back the old file.
+    ed.reseed_core_fields(CoreFields::default());
+    assert!(ed.undo());
+    assert_eq!(ed.core_fields(), &CoreFields::default());
+    assert_eq!(ed.core_unsynced(), []);
 }

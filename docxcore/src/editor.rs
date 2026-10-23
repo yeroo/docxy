@@ -708,6 +708,11 @@ pub struct Editor {
     settings: DocSettings,
     /// See [`Editor::core_fields`].
     core: Arc<CoreFields>,
+    /// What the host last wrote to (or read from) the package: the fields
+    /// that differ from [`Self::core`] are [`Editor::core_unsynced`].
+    core_base: Arc<CoreFields>,
+    /// [`Editor::reseed_core_fields`] has run.
+    core_seeded: bool,
     /// A [`Editor::preview_copy`]: its edits keep no history and issue no
     /// undo serial, which hosts read as "an edit happened" (#764).
     display_only: bool,
@@ -799,6 +804,8 @@ impl Editor {
             after_object: None,
             settings: DocSettings::default(),
             core: Arc::default(),
+            core_base: Arc::default(),
+            core_seeded: false,
             display_only: false,
         }
     }
@@ -828,6 +835,8 @@ impl Editor {
             after_object: self.after_object.clone(),
             settings: self.settings,
             core: self.core.clone(),
+            core_base: self.core_base.clone(),
+            core_seeded: self.core_seeded,
             display_only: true,
             bound_seen: self.bound_seen.clone(),
             sync_step: None,
@@ -879,18 +888,53 @@ impl Editor {
         &self.core
     }
 
-    /// Take the core properties the document was opened with: no undo step.
-    pub fn seed_core_fields(&mut self, fields: CoreFields) {
-        self.core = Arc::new(fields);
+    /// Whether the host has given the editor the file's core properties.
+    pub fn core_seeded(&self) -> bool {
+        self.core_seeded
+    }
+
+    /// Take the core properties the file holds now (opened, or changed by
+    /// something other than an edit, as Inspect Document's Remove All does):
+    /// no undo step, and every step in the history takes them too, so an
+    /// undo cannot put back what the file no longer has.
+    pub fn reseed_core_fields(&mut self, fields: CoreFields) {
+        let fields = Arc::new(fields);
+        self.core = fields.clone();
+        self.core_base = fields.clone();
+        self.core_seeded = true;
+        for step in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            step.core = fields.clone();
+        }
+    }
+
+    /// The properties whose editor value is not the one the host last
+    /// wrote: an edit, undo or redo changed them. Write each, then call
+    /// [`Editor::core_synced`].
+    pub fn core_unsynced(&self) -> Vec<(crate::sdt::BoundProp, String)> {
+        use crate::sdt::BoundProp;
+        [BoundProp::Title, BoundProp::Keywords, BoundProp::Author]
+            .into_iter()
+            .filter_map(|p| {
+                let now = self.core.get(p)?;
+                (self.core_base.get(p)? != now).then(|| (p, now.to_string()))
+            })
+            .collect()
+    }
+
+    /// The host has written [`Editor::core_unsynced`].
+    pub fn core_synced(&mut self) {
+        self.core_base = self.core.clone();
     }
 
     /// Record that the file's `prop` now reads `text` (a document property
-    /// control was typed in): no undo step, the control edit's own covers it.
-    /// Only Title, Tags and Author are kept.
+    /// control was typed in and the host wrote it): no undo step, the control
+    /// edit's own covers it. Only Title, Tags and Author are kept.
     pub fn note_core_field(&mut self, prop: crate::sdt::BoundProp, text: &str) {
-        if self.core.get(prop).is_some_and(|v| v != text) {
-            if let Some(slot) = Arc::make_mut(&mut self.core).slot(prop) {
-                *slot = text.to_string();
+        for fields in [&mut self.core, &mut self.core_base] {
+            if fields.get(prop).is_some_and(|v| v != text) {
+                if let Some(slot) = Arc::make_mut(fields).slot(prop) {
+                    *slot = text.to_string();
+                }
             }
         }
     }
@@ -914,7 +958,9 @@ impl Editor {
             };
             step.name = StepName::Named(name.to_string());
         }
-        self.note_core_field(prop, text);
+        if let Some(slot) = Arc::make_mut(&mut self.core).slot(prop) {
+            *slot = text.to_string();
+        }
         self.set_bound_property(prop, text, PropSource::Here);
         true
     }

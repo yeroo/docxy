@@ -327,6 +327,14 @@ pub(crate) fn inspect_remove(
                 .pkg
                 .as_mut()
                 .is_some_and(docxcore::inspect::remove_personal_properties);
+            // The editor holds Title, Tags and Author too (#1364): it takes
+            // what the file has left, in every undo step, so no undo or
+            // later sync writes the removed values back.
+            if changed {
+                if let (Surface::Doc(ed), Some(pkg)) = (&mut tab.surface, &tab.pkg) {
+                    ed.reseed_core_fields(crate::info_props::core_fields_of(pkg));
+                }
+            }
             (
                 "Removed document properties and personal information".to_string(),
                 changed,
