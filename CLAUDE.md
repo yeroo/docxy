@@ -563,6 +563,41 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Rich-text dialog control (#1557)
+
+- A UI plugin control `"kind":"richtext"` (`ControlKind::Richtext`) is a
+  multiline with a toolbar (Bold, Italic, Align Left/Center/Right, Bulleted
+  List). Its wire value (spec `value`, a prefill, the state's `values`, the
+  command's `values`, `dialog-read`/`dialog-set`) is the markup of
+  `projcore::richtext` (dependency-free; a plugin converts it to RTF
+  itself): one `<p>` or `<li>` (`align="center|right"`) per line, inline
+  `<b>`/`<i>`, `&amp; &lt; &gt;`. The writer is canonical; a value is markup
+  only when it starts with `<p`/`<li` followed by `>` or a space, anything
+  else is verbatim plain text, so `if a<b>c` is safe. A host without the kind
+  draws plain text.
+- `Control::value` stays `Value::Text(plain)`, so every caret, selection and
+  paste path of a multiline works unchanged (`ControlKind::is_multiline`
+  covers both kinds at every such site). The attributes are
+  `Control::rich_state` (`dialog/richtext.rs` `RichState`: a style byte per
+  character, a `Para` per line, the pending style), always read through
+  `rich()`/`rich_mut()`, which pad it to the text. Typing goes through
+  `Control::rich_replace` (splice in step, never re-read as markup); only
+  `set_markup` (dialog-set, prefill, refresh) parses. `snapshot()` (markup)
+  is what `changed`/`mark_opened` compare, so a style-only edit counts.
+- Typed text takes the style before the caret (the line's first character at
+  a line start, plain in an empty line) unless the toolbar set a pending style
+  at a bare caret; the pending style is dropped by a caret move, a focus
+  change, a typed character and `set_markup`. A refresh that gives the markup
+  the control holds leaves it alone (`plugin_ui::follow_value`).
+- The host draws pieces from `line_segments` (the caret and selection cut
+  the runs) and offsets clicks by `line_offset` (bullet gutter, alignment);
+  `char_at_rich_x` measures runs in their own bold/italic. Toolbar buttons
+  are probes `dialog-richtool:<field>:<tool>` (`pointer-click
+  {"dialog-richtool":"<field>:<tool>"}`); Ctrl/Cmd+B, I, L, E, R do the same.
+  `dialog-read` adds `richtext {bold, italic, align, bullets, pending_*}`.
+  Out of scope: font, size, colour, underline, numbered lists, indents, undo
+  inside the control, Shift+word moves.
+
 ## Text style strikethrough and pattern (#1664)
 
 - `projcore::formatting::TextStyle` has `strikethrough: Option<bool>` and

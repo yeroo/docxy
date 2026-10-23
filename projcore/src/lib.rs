@@ -45,6 +45,7 @@ pub mod model;
 pub mod mspdi;
 pub mod plugin_abi;
 pub mod report;
+pub mod richtext;
 pub mod schedule;
 pub mod tableview;
 pub mod text;

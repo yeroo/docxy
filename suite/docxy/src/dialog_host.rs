@@ -578,6 +578,15 @@ pub(crate) fn edit_key(
         return Ok(());
     }
     if m.control || m.platform {
+        // A richtext's toolbar chords (#1557): Ctrl or Cmd with B, I, L, E, R.
+        if !m.shift
+            && let Some(tool) = rich_chord(key)
+            && let Some(i) = d
+                .focus
+                .filter(|&i| d.controls[i].kind == dialog::ControlKind::Richtext)
+        {
+            return d.rich_tool_at(i, tool);
+        }
         // Only select-all and paste; any other chord is swallowed.
         return match (key, clip) {
             ("a", _) => {
@@ -586,9 +595,7 @@ pub(crate) fn edit_key(
             }
             ("v", Some(text)) => {
                 // A multiline field keeps the pasted text's line breaks.
-                let multiline = d
-                    .focused()
-                    .is_some_and(|c| c.kind == dialog::ControlKind::Multiline);
+                let multiline = d.focused().is_some_and(|c| c.kind.is_multiline());
                 let line: String = text
                     .replace("\r\n", "\n")
                     .chars()
@@ -977,17 +984,93 @@ impl Docxy {
             .ok()
             .filter(|d| d.focus == Some(index))
         {
-            let (text, multiline) = d
+            let (text, multiline, rich) = d
                 .focused()
-                .map(|c| (c.text(), c.kind == ControlKind::Multiline))
+                .map(|c| {
+                    (
+                        c.text(),
+                        c.kind.is_multiline(),
+                        (c.kind == ControlKind::Richtext).then(|| c.rich()),
+                    )
+                })
                 .unwrap_or_default();
-            let to = if multiline {
+            let to = if let Some(rich) = rich {
+                // The line's offset (gutter, alignment) is taken off x, and
+                // its runs measured in their own bold and italic.
+                let box_w = f32::from(bounds.size.width) - 2. * FIELD_INSET;
+                char_at_rich_x(&rich, y, x, box_w, |s, b, i| measurer.width(s, 12., b, i))
+            } else if multiline {
                 char_at_line_x(&text, y, x, |s| measurer.width(s, 12., false, false))
             } else {
                 char_at_x(&text, x, |s| measurer.width(s, 12., false, false))
             };
             d.move_caret_to(to, false);
         }
+        cx.notify();
+    }
+
+    /// A richtext's toolbar (#1557): Bold, Italic, Align Left / Center /
+    /// Right and Bulleted List, each lit while the caret or selection has it.
+    fn rich_toolbar(&self, d: &Dialog, i: usize, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let st = d.tool_state(i);
+        let name = d.controls[i].name;
+        let on = d.controls[i].enabled;
+        h_flex()
+            .gap_1()
+            .children(dialog::RichTool::ALL.into_iter().map(|tool| {
+                let (label, checked) = match tool {
+                    dialog::RichTool::Bold => ("B", st.bold),
+                    dialog::RichTool::Italic => ("I", st.italic),
+                    dialog::RichTool::Left => ("L", st.align == projcore::richtext::Align::Left),
+                    dialog::RichTool::Center => {
+                        ("C", st.align == projcore::richtext::Align::Center)
+                    }
+                    dialog::RichTool::Right => ("R", st.align == projcore::richtext::Align::Right),
+                    dialog::RichTool::Bullets => ("\u{2022}", st.bullets),
+                };
+                div()
+                    .id(SharedString::from(format!(
+                        "dialog-richtool:{name}:{}",
+                        tool.name()
+                    )))
+                    .relative()
+                    .w(px(22.))
+                    .h(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(if checked { hsla_u(BRAND) } else { pal.dim })
+                    .when(checked, |b| b.bg(hsla_u(BRAND).opacity(0.35)))
+                    .when(tool == dialog::RichTool::Bold, |b| {
+                        b.font_weight(FontWeight::BOLD)
+                    })
+                    .when(tool == dialog::RichTool::Italic, |b| b.italic())
+                    .child(probe(
+                        &self.probes,
+                        format!("dialog-richtool:{name}:{}", tool.name()),
+                    ))
+                    .child(label)
+                    .when(on, |b| {
+                        b.cursor_pointer().on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| this.dialog_rich_tool(i, tool, cx),
+                        ))
+                    })
+                    .into_any_element()
+            }))
+            .into_any_element()
+    }
+
+    /// A press on richtext `index`'s toolbar button `tool` (#1557).
+    fn dialog_rich_tool(&mut self, index: usize, tool: dialog::RichTool, cx: &mut Context<Self>) {
+        if let Err(e) = self
+            .active_dialogs_mut()
+            .top_dialog_mut()
+            .and_then(|d| d.rich_tool_at(index, tool))
+        {
+            self.set_status(e);
+        }
+        self.dialog_touched();
         cx.notify();
     }
 
@@ -1157,9 +1240,10 @@ impl Docxy {
         match c.kind {
             // A multiline field (#1532): the lines one under another, the
             // caret's line drawn with its caret and selection like a field's.
-            ControlKind::Multiline => {
+            ControlKind::Multiline | ControlKind::Richtext => {
                 let name = c.name;
                 let text = c.text();
+                let rich = (c.kind == ControlKind::Richtext).then(|| c.rich());
                 let chars: Vec<char> = text.chars().collect();
                 let caret = d.caret_at().min(chars.len());
                 let (from, to) = d.selection().unwrap_or((caret, caret));
@@ -1175,7 +1259,17 @@ impl Docxy {
                     if on_line {
                         caret_line = n;
                     }
-                    let shown: AnyElement = if focused && on_line {
+                    let shown: AnyElement = if let Some(r) = &rich {
+                        rich_line(
+                            &chars[start..end],
+                            &r.chars[start.min(r.chars.len())..end.min(r.chars.len())],
+                            r.paras.get(n).copied().unwrap_or_default(),
+                            start,
+                            if focused { (from, to) } else { (0, 0) },
+                            (focused && on_line).then_some(caret),
+                            pal.fg,
+                        )
+                    } else if focused && on_line {
                         let part = |a: usize, b: usize| {
                             SharedString::from(
                                 chars[a.min(end)..b.min(end)].iter().collect::<String>(),
@@ -1227,6 +1321,9 @@ impl Docxy {
                     .when(fill, |v| v.flex_1().min_h_0().w_full())
                     .child(probe(&self.probes, format!("dialog-control:{}", c.name)))
                     .when(!label.is_empty(), |v| v.child(label))
+                    .when(rich.is_some(), |v| {
+                        v.child(self.rich_toolbar(d, i, pal, cx))
+                    })
                     .child(
                         div()
                             .relative()
@@ -1242,7 +1339,9 @@ impl Docxy {
                                     // A built-in dialog's box keeps its
                                     // width; in a cell of several columns
                                     // (#1609 r9) it is the cell's width.
-                                    .when(d.cell_columns(c) == 1, |v| v.min_w(px(240.)))
+                                    .when(d.cell_columns(c) == 1, |v| {
+                                        v.min_w(px(if rich.is_some() { 320. } else { 240. }))
+                                    })
                                     .when(d.cell_columns(c) > 1, |v| v.w_full())
                                     .min_h(px(16. * 3. + 4.))
                                     // A filling box scrolls its lines, the
@@ -1819,6 +1918,7 @@ impl Docxy {
                         if !matches!(
                             c.kind,
                             ControlKind::Multiline
+                                | ControlKind::Richtext
                                 | ControlKind::Grid
                                 | ControlKind::List
                                 | ControlKind::Sample
@@ -2277,6 +2377,112 @@ fn char_at_line_x(text: &str, y: f32, x: f32, width: impl Fn(&str) -> f32) -> us
     before + char_at_x(lines[line], x, width)
 }
 
+/// A richtext's toolbar chord: B, I, L (left), E (center), R (right).
+fn rich_chord(key: &str) -> Option<dialog::RichTool> {
+    match key {
+        "b" => Some(dialog::RichTool::Bold),
+        "i" => Some(dialog::RichTool::Italic),
+        "l" => Some(dialog::RichTool::Left),
+        "e" => Some(dialog::RichTool::Center),
+        "r" => Some(dialog::RichTool::Right),
+        _ => None,
+    }
+}
+
+/// One line of a richtext (#1557): the bullet in its gutter, the pieces of
+/// the line in their looks, aligned in the box, with the selection and, when
+/// the caret is on this line, the caret.
+fn rich_line(
+    line: &[char],
+    styles: &[u8],
+    para: projcore::richtext::Para,
+    start: usize,
+    sel: (usize, usize),
+    caret: Option<usize>,
+    caret_color: Hsla,
+) -> AnyElement {
+    use projcore::richtext::Align;
+    let pieces = dialog::richtext::line_segments(line, styles, start, sel, caret)
+        .into_iter()
+        .map(|seg| {
+            let mut piece = h_flex();
+            if seg.caret_before {
+                piece = piece.child(caret_bar(caret_color));
+            }
+            if !seg.text.is_empty() {
+                piece = piece.child(
+                    div()
+                        .when(seg.bold, |d| d.font_weight(FontWeight::BOLD))
+                        .when(seg.italic, |d| d.italic())
+                        .when(seg.selected, |d| d.bg(hsla_u(BRAND).opacity(0.35)))
+                        .child(SharedString::from(seg.text)),
+                );
+            }
+            piece
+        });
+    h_flex()
+        .h(px(16.))
+        .w_full()
+        .when(para.bullet, |r| {
+            r.child(
+                div()
+                    .w(px(dialog::richtext::BULLET_GUTTER))
+                    .flex_none()
+                    .child("\u{2022}"),
+            )
+        })
+        .child(
+            h_flex()
+                .flex_1()
+                .when(para.align == Align::Center, |r| r.justify_center())
+                .when(para.align == Align::Right, |r| r.justify_end())
+                .children(pieces),
+        )
+        .into_any_element()
+}
+
+/// The character offset nearest to the point `x`, `y` (in pixels from the
+/// first line's left edge and top, inside the padding) of a richtext whose
+/// lines are `box_w` wide: the line under `y`, the line's gutter and
+/// alignment taken off `x`, its characters measured in their own looks.
+fn char_at_rich_x(
+    rich: &projcore::richtext::Rich,
+    y: f32,
+    x: f32,
+    box_w: f32,
+    width: impl Fn(&str, bool, bool) -> f32,
+) -> usize {
+    use projcore::richtext::{BOLD, ITALIC};
+    let lines: Vec<&str> = rich.text.split('\n').collect();
+    let n = ((y / 16.).floor().max(0.) as usize).min(lines.len().saturating_sub(1));
+    let start: usize = lines[..n].iter().map(|l| l.chars().count() + 1).sum();
+    let line = lines[n];
+    let len = line.chars().count();
+    let styles: Vec<u8> = (start..start + len)
+        .map(|k| rich.chars.get(k).copied().unwrap_or(0))
+        .collect();
+    let chars: Vec<char> = line.chars().collect();
+    // The width of the first `upto` characters, a run at a time.
+    let upto_w = |upto: usize| -> f32 {
+        let mut w = 0.;
+        let mut k = 0;
+        while k < upto {
+            let style = styles[k];
+            let mut e = k;
+            while e < upto && styles[e] == style {
+                e += 1;
+            }
+            let run: String = chars[k..e].iter().collect();
+            w += width(&run, style & BOLD != 0, style & ITALIC != 0);
+            k = e;
+        }
+        w
+    };
+    let para = rich.paras.get(n).copied().unwrap_or_default();
+    let x = (x - dialog::richtext::line_offset(para, box_w, upto_w(len))).max(0.);
+    start + char_at_x(line, x, |prefix| upto_w(prefix.chars().count()))
+}
+
 /// The character gap nearest to `x` pixels along `text` (a gap is between
 /// characters, i.e. grapheme clusters, never inside one), whose prefixes
 /// measure as `width` says.
@@ -2314,6 +2520,81 @@ mod tests {
     use crate::dialog::{Button, ButtonRole, Control, Value};
     use crate::text_input::ImeState;
     use core::prelude::v1::test;
+
+    /// #1557: a click in a richtext takes the line's bullet gutter and
+    /// alignment off, and measures its bold runs in their own width.
+    #[test]
+    fn a_richtext_click_takes_off_the_gutter_and_alignment_and_measures_runs() {
+        use projcore::richtext::{Align, BOLD, Para, Rich};
+        // 7 px a character, 10 px a bold one.
+        let width =
+            |s: &str, bold: bool, _i: bool| s.chars().count() as f32 * if bold { 10. } else { 7. };
+        let rich = |text: &str, chars: Vec<u8>, paras: Vec<Para>| Rich {
+            text: text.into(),
+            chars,
+            paras,
+        };
+        // Left: as a plain line.
+        let left = rich("abcd", vec![0; 4], vec![Para::default()]);
+        assert_eq!(char_at_rich_x(&left, 0., 0., 200., width), 0);
+        assert_eq!(char_at_rich_x(&left, 0., 15., 200., width), 2);
+        assert_eq!(char_at_rich_x(&left, 0., 500., 200., width), 4);
+        // Centred in 200 px: the 28 px line starts at 86.
+        let centre = rich(
+            "abcd",
+            vec![0; 4],
+            vec![Para {
+                align: Align::Center,
+                bullet: false,
+            }],
+        );
+        assert_eq!(char_at_rich_x(&centre, 0., 80., 200., width), 0);
+        assert_eq!(char_at_rich_x(&centre, 0., 86. + 15., 200., width), 2);
+        // Right: it starts at 172.
+        let right = rich(
+            "abcd",
+            vec![0; 4],
+            vec![Para {
+                align: Align::Right,
+                bullet: false,
+            }],
+        );
+        assert_eq!(char_at_rich_x(&right, 0., 100., 200., width), 0);
+        assert_eq!(char_at_rich_x(&right, 0., 172. + 15., 200., width), 2);
+        assert_eq!(char_at_rich_x(&right, 0., 199., 200., width), 4);
+        // A bullet's gutter shifts a left line by 14 px.
+        let bullet = rich(
+            "abcd",
+            vec![0; 4],
+            vec![Para {
+                align: Align::Left,
+                bullet: true,
+            }],
+        );
+        assert_eq!(char_at_rich_x(&bullet, 0., 10., 200., width), 0);
+        assert_eq!(char_at_rich_x(&bullet, 0., 14. + 15., 200., width), 2);
+        // Bold runs measure wider: "ab" bold is 20 px, so x = 24 is past
+        // the middle of the first plain "c" (20..27), at gap 2.
+        let mixed = rich("abcd", vec![BOLD, BOLD, 0, 0], vec![Para::default()]);
+        assert_eq!(char_at_rich_x(&mixed, 0., 21., 200., width), 2);
+        assert_eq!(char_at_rich_x(&mixed, 0., 24., 200., width), 3);
+        // The second line is the one under y, its own alignment taken off,
+        // the first line's characters counted before it.
+        let two = rich(
+            "ab\ncd",
+            vec![0; 5],
+            vec![
+                Para::default(),
+                Para {
+                    align: Align::Right,
+                    bullet: false,
+                },
+            ],
+        );
+        assert_eq!(char_at_rich_x(&two, 20., 200., 200., width), 5);
+        assert_eq!(char_at_rich_x(&two, 20., 196., 200., width), 4);
+        assert_eq!(char_at_rich_x(&two, 20., 0., 200., width), 3);
+    }
 
     /// #988 r1: a list's choice that moves is scrolled into view once; a
     /// frame with the same choice asks for no scroll (a wheel scroll stays),

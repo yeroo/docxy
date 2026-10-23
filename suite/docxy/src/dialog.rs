@@ -24,6 +24,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) mod calendar;
 pub(crate) mod catalog;
+pub(crate) mod richtext;
 pub(crate) use catalog::DialogId;
 
 /// What an accept button applies the dialog to. The app matches it in
@@ -455,6 +456,11 @@ pub(crate) enum ControlKind {
     Sample,
     /// A text field of several lines: Enter is a new line, not OK (#1532).
     Multiline,
+    /// A multiline with a toolbar (#1557): bold, italic, alignment and
+    /// bullets. The value is the plain text (edited like a multiline's) with
+    /// its attributes in [`Control::rich`]; `dialog-read` and `dialog-set`
+    /// and a plugin's values carry the markup of `projcore::richtext`.
+    Richtext,
     /// Items each checked or not, a tree by `Control::depths`: checking an
     /// item checks the items under it, and an item with items under it is
     /// checked when they all are (the AutoFilter value list, #690).
@@ -479,6 +485,7 @@ impl ControlKind {
             Self::Label => "label",
             Self::Sample => "sample",
             Self::Multiline => "multiline",
+            Self::Richtext => "richtext",
             Self::CheckList => "checklist",
         }
     }
@@ -495,7 +502,13 @@ impl ControlKind {
                 | Self::DateCombo
                 | Self::Duration
                 | Self::Multiline
+                | Self::Richtext
         )
+    }
+    /// A field of several lines: Enter is a new line, paste keeps the line
+    /// breaks, focus does not select all, and `fill` applies.
+    pub fn is_multiline(self) -> bool {
+        matches!(self, Self::Multiline | Self::Richtext)
     }
     /// A control the keyboard and pointer can edit: a grid is a read-only
     /// widget unless a plugin's or an editable one ([`Control::interactive`]), and a label is
@@ -526,6 +539,39 @@ fn partial_number(s: &str) -> bool {
     let t = s.trim();
     let body = t.strip_prefix(['-', '+']).unwrap_or(t);
     body.chars().all(|c| c.is_ascii_digit() || c == '.') && body.matches('.').count() <= 1
+}
+
+/// A richtext's toolbar button (#1557).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RichTool {
+    Bold,
+    Italic,
+    Left,
+    Center,
+    Right,
+    Bullets,
+}
+
+impl RichTool {
+    pub const ALL: [RichTool; 6] = [
+        Self::Bold,
+        Self::Italic,
+        Self::Left,
+        Self::Center,
+        Self::Right,
+        Self::Bullets,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bold => "bold",
+            Self::Italic => "italic",
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+            Self::Bullets => "bullets",
+        }
+    }
 }
 
 /// A control's staged value.
@@ -617,6 +663,10 @@ pub(crate) struct Control {
     /// The item of the active column's list being committed as a pick, for
     /// the owner's reaction (see `Dialog::grid_commit_pick`).
     pub picked: Option<usize>,
+    /// A richtext's attributes (#1557), for [`ControlKind::Richtext`] only;
+    /// read through [`Control::rich`], which pads what an assignment to
+    /// `value` left short.
+    pub(crate) rich_state: Option<Box<richtext::RichState>>,
 }
 
 impl Control {
@@ -649,7 +699,64 @@ impl Control {
             min_rows: None,
             fill: false,
             header: false,
+            rich_state: None,
         }
+    }
+
+    /// A richtext's rich text, its attributes padded to the plain text.
+    pub(crate) fn rich(&self) -> projcore::richtext::Rich {
+        self.rich_state
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
+            .rich(&self.text())
+    }
+
+    /// A richtext's attributes, synced to its text.
+    pub(crate) fn rich_mut(&mut self) -> &mut richtext::RichState {
+        let text = self.text();
+        let state = self.rich_state.get_or_insert_with(Box::default);
+        state.sync(&text);
+        state
+    }
+
+    /// A richtext's value on the wire: the canonical markup.
+    pub fn markup(&self) -> String {
+        self.rich().to_markup()
+    }
+
+    /// Take a richtext's value from markup or plain text; the pending style
+    /// is dropped.
+    pub fn set_markup(&mut self, markup: &str) {
+        let rich = projcore::richtext::Rich::parse(markup);
+        self.rich_state = Some(Box::new(richtext::RichState::from_rich(&rich)));
+        self.value = Value::Text(rich.text);
+    }
+
+    /// What `changed` compares: a richtext's markup, so a change of style
+    /// alone counts; any other control's value.
+    pub(crate) fn snapshot(&self) -> Value {
+        if self.kind == ControlKind::Richtext {
+            Value::Text(self.markup())
+        } else {
+            self.value.clone()
+        }
+    }
+
+    /// Replace characters `from..to` of a richtext with `with` typed in the
+    /// style the caret has, the attributes in step. Never re-reads the text
+    /// as markup.
+    fn rich_replace(&mut self, from: usize, to: usize, with: &str) {
+        let text = self.text();
+        let chars: Vec<char> = text.chars().collect();
+        let (from, to) = (from.min(chars.len()), to.min(chars.len()));
+        let state = self.rich_mut();
+        let style = state.insert_style(&chars, from);
+        state.splice(&text, from, to.max(from), with, style);
+        let mut next: String = chars[..from].iter().collect();
+        next.push_str(with);
+        next.extend(&chars[to.max(from)..]);
+        self.value = Value::Text(next);
     }
 
     /// A sample's style (#1609): the value's JSON object, or a bare text as
@@ -802,7 +909,13 @@ impl Control {
     }
 
     fn to_json(&self) -> Json {
+        self.to_json_with(None)
+    }
+
+    /// [`Control::to_json`], a richtext also reporting the toolbar's `state`.
+    fn to_json_with(&self, state: Option<richtext::ToolState>) -> Json {
         let value = match &self.value {
+            Value::Text(_) if self.kind == ControlKind::Richtext => Json::Str(self.markup()),
             Value::Text(s) if self.kind == ControlKind::Number => s
                 .trim()
                 .parse::<f64>()
@@ -874,6 +987,12 @@ impl Control {
         if self.kind == ControlKind::Sample {
             out.push(("sample", self.sample()));
         }
+        if self.kind == ControlKind::Richtext {
+            out.push((
+                "richtext",
+                state.map_or(Json::Null, richtext::ToolState::to_json),
+            ));
+        }
         if self.kind == ControlKind::CheckList {
             out.push(("items", strs(&self.items)));
             out.push((
@@ -908,12 +1027,18 @@ impl Control {
             Json::Str(s) => Ok(s.clone()),
             _ => Err(format!("'{label}' takes text")),
         };
+        if self.kind == ControlKind::Richtext {
+            // Markup, or plain text (`projcore::richtext::Rich::parse`).
+            self.set_markup(&text()?);
+            return Ok(());
+        }
         self.value = match self.kind {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
             ControlKind::Sample => {
                 return Err(format!("'{label}' is a sample; it cannot be set"));
             }
             ControlKind::Combo => return Err(format!("'{label}' is a grid column kind")),
+            ControlKind::Richtext => unreachable!("set above"),
             ControlKind::Text
             | ControlKind::Date
             | ControlKind::DateCombo
@@ -1395,7 +1520,7 @@ impl Dialog {
     /// Whether `c` fills the page's remaining height (#1609): a `fill`
     /// multiline in a dialog with a fixed size.
     pub fn fills(&self, c: &Control) -> bool {
-        c.fill && c.kind == ControlKind::Multiline && self.size.is_some()
+        c.fill && c.kind.is_multiline() && self.size.is_some()
     }
 
     /// The shown controls laid out as Project's (#1609): the header first
@@ -1692,6 +1817,12 @@ impl Dialog {
         }
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
+        self.after_set(i, args, before);
+        Ok(())
+    }
+
+    /// What follows a control's value changing (see [`Dialog::set_at`]).
+    fn after_set(&mut self, i: usize, args: &Json, before: Value) {
         if self.controls[i].editable_grid {
             self.controls[i].keep_blank_row();
         }
@@ -1719,7 +1850,6 @@ impl Dialog {
         if let Some(Reaction(react)) = self.react {
             react(self, i, &before);
         }
-        Ok(())
     }
 
     /// Select row `row` of grid `name` (#1602), the focus moving to it. A cell
@@ -1741,6 +1871,7 @@ impl Dialog {
         if row >= rows {
             return Err(no_row(&shown(&c.label), row, rows));
         }
+        self.clear_pending();
         self.focus = Some(i);
         self.close_calendar_unless(i);
         let c = &mut self.controls[i];
@@ -2013,12 +2144,12 @@ impl Dialog {
         let Some(i) = self.controls.iter().position(|c| c.name == name) else {
             return false;
         };
-        self.opened.get(i) != Some(&self.controls[i].value)
+        self.opened.get(i) != Some(&self.controls[i].snapshot())
     }
 
     /// Take the current values as the ones the dialog opened on.
     pub fn mark_opened(&mut self) {
-        self.opened = self.controls.iter().map(|c| c.value.clone()).collect();
+        self.opened = self.controls.iter().map(Control::snapshot).collect();
     }
 
     /// The controls Tab steps through on the current tab, in order.
@@ -2089,13 +2220,14 @@ impl Dialog {
     /// takes the focus has its whole value selected, as in Word, so typing
     /// replaces it (#1314).
     fn focus_control(&mut self, i: usize) {
+        self.clear_pending();
         self.focus = Some(i);
         self.caret = None;
         self.anchor = None;
         self.calendar = None;
         if self
             .focused()
-            .is_some_and(|c| c.kind.is_text() && c.kind != ControlKind::Multiline)
+            .is_some_and(|c| c.kind.is_text() && !c.kind.is_multiline())
         {
             self.select_all();
         }
@@ -2152,8 +2284,74 @@ impl Dialog {
         self.caret.filter(|_| self.caret_for == self.focus)
     }
 
+    /// Drop the focused richtext's pending style (#1557): it lasts only
+    /// while the caret stays where the toolbar set it.
+    fn clear_pending(&mut self) {
+        if let Some(st) = self
+            .focus
+            .and_then(|i| self.controls.get_mut(i))
+            .and_then(|c| c.rich_state.as_mut())
+        {
+            st.pending = None;
+        }
+    }
+
+    /// Press toolbar button `tool` of richtext control `i` (#1557): the
+    /// control takes the focus (its caret and selection kept when it had it),
+    /// and the selection, else the caret's line or the pending style, changes.
+    pub fn rich_tool_at(&mut self, i: usize, tool: RichTool) -> Result<(), String> {
+        let c = self.controls.get(i).ok_or("no such control")?;
+        if c.kind != ControlKind::Richtext {
+            return Err(format!("'{}' is not a richtext", shown(&c.label)));
+        }
+        if !c.enabled || !c.visible || !self.focusable().contains(&i) {
+            return Err(format!("'{}' cannot be edited", shown(&c.label)));
+        }
+        if self.focus != Some(i) {
+            self.focus_control(i);
+        }
+        let (from, to) = self
+            .selection()
+            .unwrap_or_else(|| (self.caret_at(), self.caret_at()));
+        let c = &mut self.controls[i];
+        let text = c.text();
+        let before = c.snapshot();
+        let st = c.rich_mut();
+        match tool {
+            RichTool::Bold => st.toggle(&text, from, to, projcore::richtext::BOLD),
+            RichTool::Italic => st.toggle(&text, from, to, projcore::richtext::ITALIC),
+            RichTool::Left => st.set_align(&text, from, to, projcore::richtext::Align::Left),
+            RichTool::Center => st.set_align(&text, from, to, projcore::richtext::Align::Center),
+            RichTool::Right => st.set_align(&text, from, to, projcore::richtext::Align::Right),
+            RichTool::Bullets => st.toggle_bullets(&text, from, to),
+        }
+        if c.plugin && c.snapshot() != before {
+            // The plugin's state is asked again before the next read (#1602).
+            self.stale = true;
+        }
+        Ok(())
+    }
+
+    /// What richtext control `i`'s toolbar shows: the caret's or selection's
+    /// state while it has the focus, else the start of its text.
+    pub fn tool_state(&self, i: usize) -> richtext::ToolState {
+        let c = &self.controls[i];
+        let (from, to) = if self.focus == Some(i) {
+            self.selection()
+                .unwrap_or_else(|| (self.caret_at(), self.caret_at()))
+        } else {
+            (0, 0)
+        };
+        let mut st = c.rich_state.as_deref().cloned().unwrap_or_default();
+        if self.focus != Some(i) {
+            st.pending = None;
+        }
+        st.state_at(&c.text(), from, to)
+    }
+
     /// Put the caret at character `at` of the focused control, with no selection.
     fn put_caret(&mut self, at: usize) {
+        self.clear_pending();
         self.caret = Some(at);
         self.anchor = None;
         self.caret_for = self.focus;
@@ -2187,7 +2385,17 @@ impl Dialog {
         next.push_str(with);
         next.extend(&chars[to..]);
         let i = self.focus.unwrap_or_default();
-        self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        if self.controls[i].kind == ControlKind::Richtext {
+            // The attributes follow the edit; the text is not markup.
+            if self.calendar.is_some_and(|k| k.control == i) {
+                self.calendar = None;
+            }
+            let before = self.controls[i].value.clone();
+            self.controls[i].rich_replace(from, to, with);
+            self.after_set(i, &Json::obj(Vec::new()), before);
+        } else {
+            self.set_at(i, &Json::obj(vec![("value", Json::Str(next))]))?;
+        }
         self.edits += 1;
         self.put_caret(from + with.chars().count());
         Ok(())
@@ -2313,6 +2521,7 @@ impl Dialog {
             self.caret = None;
             self.anchor = None;
         }
+        self.clear_pending();
         self.focus = Some(index);
         self.close_calendar_unless(index);
         let c = &self.controls[index];
@@ -2422,6 +2631,7 @@ impl Dialog {
             self.caret = None;
             self.anchor = None;
         }
+        self.clear_pending();
         self.focus = Some(index);
         self.calendar = Some(calendar::Calendar::open(index, &text, today));
         Ok(())
@@ -2620,7 +2830,17 @@ impl Dialog {
             ),
             (
                 "controls",
-                Json::Arr(self.page_controls().map(Control::to_json).collect()),
+                Json::Arr(
+                    self.controls
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| self.on_page(c))
+                        .map(|(i, c)| match c.kind {
+                            ControlKind::Richtext => c.to_json_with(Some(self.tool_state(i))),
+                            _ => c.to_json(),
+                        })
+                        .collect(),
+                ),
             ),
             (
                 "buttons",
@@ -2839,11 +3059,7 @@ impl DialogStack {
             return None;
         }
         // Enter in a multiline field is a new line (#1532), not OK.
-        if key == "enter"
-            && top
-                .focused()
-                .is_some_and(|c| c.kind == ControlKind::Multiline)
-        {
+        if key == "enter" && top.focused().is_some_and(|c| c.kind.is_multiline()) {
             return None;
         }
         // An open calendar takes Enter and Escape (#1536).

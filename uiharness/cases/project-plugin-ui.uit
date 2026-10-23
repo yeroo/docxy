@@ -583,6 +583,45 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.controls.5.value is task
   assert reply.controls.6.name is fixture.locked
   assert reply.controls.6.enabled is false
+  # The richtext (#1557): its value is the markup the state gave, its text
+  # the plain text; it is edited at a caret like the multiline.
+  assert reply.controls.7.name is fixture.rich
+  assert reply.controls.7.kind is richtext
+  assert reply.controls.7.plugin is true
+  assert reply.controls.7.value is <p>rich <b>text</b> for task 2</p>
+  assert reply.controls.7.text is rich text for task 2
+  # Plain letters and keys only (escaping is unit-tested): the page scrolls, so the toolbar's buttons may be below the
+  # fold (their clicks are covered by unit tests).
+  call real-key {"key":"tab","to-field":"fixture.rich"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"ab"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p>ab</p>
+  assert reply.controls.7.text is ab
+  # The chords over the selection: bold, then italic, then bold off and on.
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><b>ab</b></p>
+  assert reply.controls.7.richtext.bold is true
+  assert reply.controls.7.richtext.italic is false
+  call real-key {"key":"ctrl+i"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><b><i>ab</i></b></p>
+  call real-key {"key":"ctrl+b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><i>ab</i></p>
+  call real-key {"key":"ctrl+b"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><b><i>ab</i></b></p>
+  # A bare caret toggles the style of the next typed text.
+  call real-key {"key":"end"}
+  call real-key {"key":"ctrl+i"}
+  call dialog-read {}
+  assert reply.controls.7.richtext.pending_italic is false
+  call real-type {"text":"z"}
+  call dialog-read {}
+  assert reply.controls.7.value is <p><b><i>ab</i></b><b>z</b></p>
   # Enter in the multiline is a new line, not OK.
   call pointer-click {"dialog-field":"fixture.note"}
   call real-key {"key":"end"}
@@ -596,7 +635,7 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert reply.id is task-information
   call dialog-click {"button":"OK"}
   assert dialog is none
-  assert status is Fixture: note saved (20 chars)
+  assert status is Fixture: note saved (20 chars); rich <p><b><i>ab</i></b><b>z</b></p>
 
 test the overlay returns the fixture's shapes for the chart
   open copy:../fixtures/project-clipboard.xml

@@ -471,7 +471,11 @@ pub struct DialogPage {
 }
 
 /// A dialog control. `kind` is one of `text`, `number`, `date`, `duration`,
-/// `checkbox`, `radio`, `dropdown`, `list`, `grid`, `multiline`, `label`,
+/// `checkbox`, `radio`, `dropdown`, `list`, `grid`, `multiline`, `richtext`
+/// (#1557: a multiline with a toolbar for bold, italic, alignment and
+/// bullets; its `value`, in a spec, a reply and the dialog's `values`, is the
+/// markup of [`crate::richtext`], and a host without it draws plain text),
+/// `label`,
 /// `sample` (a read-only preview box, #1609: its `value` is `{text, font,
 /// size, bold, italic, underline, strikethrough, color, background, pattern}` or a bare text),
 /// `color`, `font`; the host draws the ones it has and the rest as text.
