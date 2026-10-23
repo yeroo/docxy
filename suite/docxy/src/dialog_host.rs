@@ -1449,7 +1449,7 @@ impl Docxy {
                         .children((0..c.columns.len()).map(|col| {
                             let text = row.get(col).cloned().unwrap_or_default();
                             let active = selected && sel_col == col && focused;
-                            let content: AnyElement = match (c.column_kind(col), text.as_str()) {
+                            let content: AnyElement = match (c.cell_kind(r, col), text.as_str()) {
                                 (ControlKind::Checkbox, "true") => text_cell("\u{2611}".into()),
                                 (ControlKind::Checkbox, _) => text_cell("\u{2610}".into()),
                                 // Project's check mark column: a mark or nothing.
@@ -1461,7 +1461,8 @@ impl Docxy {
                                         .child(caret_bar(pal.fg))
                                         .into_any_element(),
                                     _ if kind == ControlKind::Dropdown
-                                        && c.editable_grid
+                                        && (c.editable_grid
+                                            || c.column_kind(col) == ControlKind::Cell)
                                         && selected =>
                                     {
                                         text_cell(format!("{text} \u{25BE}"))

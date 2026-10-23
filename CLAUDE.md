@@ -598,6 +598,29 @@
   Out of scope: font, size, colour, underline, numbered lists, indents, undo
   inside the control, Shift+word moves.
 
+## Grid column `cell` (#1558)
+
+- A plugin grid column of kind `cell` (`ControlKind::Cell`, a column kind
+  only) lets each row's cell have its own kind: the value in the prefill, the
+  manifest or a state refresh is `{"kind","items","value"}` (dropdown, combo,
+  checkbox, check, number, date; anything else, a bare scalar included, is
+  text; an object without `value` is empty). `Value::Rows` stays plain
+  strings, so `values`, `dialog-read` rows and every consumer are unchanged;
+  the kinds live in `Control::cell_specs` (`[row][col]`, `CellSpec`), read
+  through `cell_kind(row, col)` / `cell_items(row, col)`, which the cell's
+  set, toggle, step, click, Space and drawing use instead of `column_kind`.
+- `dialog-set name[row].column` checks the cell's own kind (a dropdown cell
+  names an item as an editable grid's dropdown column does, a combo keeps any
+  text; `resolve_cell` is otherwise still for editable grids only), and a
+  click or Space on a dropdown cell steps its items, also in a plugin grid
+  (its other columns are unchanged). `dialog-read` adds `cell_kinds` and
+  `cell_items` per row for the first `cell` column. `dialog-set`'s
+  `insert_row`/`delete_row` move the specs; a refresh with objects replaces
+  them and one with plain strings keeps them by row index (a plugin that
+  reorders rows resends the objects). Out of scope: colour, font, list,
+  richtext and multiline cells (text), a calendar or combo list in a plugin
+  grid's cell.
+
 ## Text style strikethrough and pattern (#1664)
 
 - `projcore::formatting::TextStyle` has `strikethrough: Option<bool>` and

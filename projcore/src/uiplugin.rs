@@ -511,6 +511,11 @@ pub struct DialogControl {
     pub fill: bool,
 }
 
+/// A grid column. Its `kind` names the kind of every cell (`text`, `number`,
+/// `checkbox`, ...), or is `cell` (#1558): each row then carries its own, the
+/// column's value in a row being `{"kind","items","value"}` (kind dropdown,
+/// combo, checkbox, check, number or date, else text; a bare scalar is text).
+/// The grid's values go back to the plugin as plain cell text.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct GridColumn {
     pub name: String,

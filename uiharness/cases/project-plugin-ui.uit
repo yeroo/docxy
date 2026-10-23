@@ -630,6 +630,27 @@ test Task Information gains the plugin's page, prefilled, with a multiline and a
   assert dialog is task-information
   call field-read {"dialog-field":"fixture.note"}
   assert reply.caret is 20
+  # A `cell` column (#1558): each row's cell has its own kind and items; a
+  # value is checked against the cell's kind, and the rows stay plain text.
+  call dialog-read {}
+  assert reply.controls.8.name is fixture.cells
+  assert reply.controls.8.column_kinds.1 is cell
+  assert reply.controls.8.cell_kinds.0 is dropdown
+  assert reply.controls.8.cell_kinds.1 is checkbox
+  assert reply.controls.8.cell_kinds.2 is date
+  assert reply.controls.8.cell_kinds.3 is number
+  assert reply.controls.8.cell_items.0.1 is Electrical
+  assert reply.controls.8.rows.0.1 is Civil
+  assert reply.controls.8.rows.1.1 is false
+  assert reply.controls.8.rows.3.1 is 3
+  call dialog-set {"control":"fixture.cells[0].Value","value":"electrical"}
+  call-error dialog-set {"control":"fixture.cells[0].Value","value":"Steel"} => dropdown cell
+  call dialog-set {"control":"fixture.cells[1].Value","value":true}
+  call-error dialog-set {"control":"fixture.cells[1].Value","value":"maybe"} => takes true or false
+  call-error dialog-set {"control":"fixture.cells[3].Value","value":"abc"} => takes a number
+  call dialog-read {}
+  assert reply.controls.8.rows.0.1 is Electrical
+  assert reply.controls.8.rows.1.1 is true
   # The catalogue check leaves the plugin's controls out.
   call dialog-catalog-check {}
   assert reply.id is task-information
