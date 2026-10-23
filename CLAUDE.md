@@ -969,11 +969,14 @@
   files other tools make, every `uiharness/fixtures` document) gets an empty
   one on the first edit (`Package::ensure_core_properties`: content-type
   override and package-root relationship; it stays after an undo). A document with
-  no package yet (a new one) is given the one a save makes on its first Info
-  edit (`DocTab::ensure_core_part`, as `mailings_tab::package` does), so the
-  editor never holds values the package lacks; a Markdown, Plain Text, Rich
-  Text or editable-HTML tab, which saves without the package, refuses the
-  edit with a note.
+  no package yet (a new one) is given one on its first Info edit
+  (`DocTab::ensure_package`, shared with `mailings_tab::package`: the
+  Markdown package, which also defines the Bullets/Numbering `numId`s 1 and
+  2, so lists applied later still save), so the editor never holds values
+  the package lacks. A tab whose save writes no package (Markdown, Plain
+  Text, Rich Text, or a new document saved as an editable-HTML page, which
+  has none) refuses the edit with a note; an opened HTML page keeps them in
+  the package it embeds.
 - Anything that changes core.xml other than an edit must call
   `Editor::reseed_core_fields`, which also rewrites every undo and redo step,
   or a later sync or undo writes the old values back: Inspect Document's

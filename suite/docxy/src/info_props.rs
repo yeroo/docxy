@@ -134,44 +134,67 @@ impl crate::DocTab {
         ed.core_synced();
     }
 
-    /// Whether the tab will save as a Word package, so a property edit is
-    /// kept: not Markdown, Plain Text, Rich Text or an editable-HTML page
-    /// (`save_doc_tab` writes those without the package).
+    /// Whether a save of the tab writes its package, so a property edit is
+    /// kept: a Word file name, or an editable-HTML page that has the package
+    /// it embeds. Not Markdown, Plain Text, Rich Text, or a page with no
+    /// package (`save_doc_tab` writes those without it).
     fn saves_as_word(&self) -> bool {
-        !self.markdown
-            && self.bundle_html.is_none()
-            && self.path.as_ref().is_none_or(|p| {
-                matches!(
-                    crate::html_bundle::doc_target(p, crate::is_markdown_path(p)),
-                    crate::html_bundle::DocTarget::Docx(_)
-                )
-            })
+        use crate::html_bundle::DocTarget;
+        if self.markdown {
+            return false;
+        }
+        match self
+            .path
+            .as_ref()
+            .map(|p| crate::html_bundle::doc_target(p, crate::is_markdown_path(p)))
+        {
+            None | Some(DocTarget::Docx(_)) => true,
+            Some(DocTarget::Html) => self.pkg.is_some(),
+            Some(_) => false,
+        }
+    }
+
+    /// Give a document with no package yet (a new one) the one a save would
+    /// make, with the Markdown package's numbering so Bullets and Numbering
+    /// applied later still save (Mailings does the same). A converted tab
+    /// has its own package.
+    pub(crate) fn ensure_package(&mut self) -> Result<(), String> {
+        if self.pkg.is_some() {
+            return Ok(());
+        }
+        let Surface::Doc(ed) = &self.surface else {
+            return Err("this tab is not a document".into());
+        };
+        let bytes = crate::doc_to_docx_styled(
+            &ed.doc,
+            &crate::live_comments(self, &ed.doc),
+            None,
+            true,
+        );
+        self.pkg = Some(docxcore::package::load_package(&bytes).map_err(|e| e.to_string())?);
+        Ok(())
     }
 
     /// Whether the file has, or can be given, the part the properties are
-    /// written to. A document with no package yet (a new one, or a file read
-    /// by hand) is given the one a save would make, as Mailings does
-    /// (`mailings_tab::package`), when it saves as a Word package; the part
-    /// is added to a package that lacks it. False for a tab that cannot hold
+    /// written to. A document with no package yet is given one
+    /// ([`DocTab::ensure_package`]) when it saves as a Word package; the part
+    /// is added to a package that lacks it. Err for a tab that cannot hold
     /// properties and for a package that cannot register the part.
-    pub(crate) fn ensure_core_part(&mut self) -> bool {
-        if self.pkg.is_none() {
-            let Surface::Doc(ed) = &self.surface else {
-                return false;
-            };
-            if !self.saves_as_word() {
-                return false;
-            }
-            let bytes = crate::doc_to_docx(&ed.doc, &crate::live_comments(self, &ed.doc), None);
-            match docxcore::package::load_package(&bytes) {
-                Ok(pkg) => self.pkg = Some(pkg),
-                Err(_) => return false,
-            }
+    fn ensure_core_part(&mut self) -> Result<(), String> {
+        if !self.saves_as_word() {
+            return Err("this file cannot hold document properties".into());
         }
+        self.ensure_package()?;
         self.seed_core_fields();
-        self.pkg
+        if self
+            .pkg
             .as_mut()
             .is_some_and(|p| p.ensure_core_properties())
+        {
+            Ok(())
+        } else {
+            Err("this file cannot hold document properties".into())
+        }
     }
 }
 
@@ -209,8 +232,8 @@ impl Docxy {
         if self.info_edit_live() && self.info_edit.as_ref().is_some_and(|e| e.which == which) {
             return;
         }
-        // Apply the field being left first: its refusal note must outlive the
-        // clearing below.
+        // Clear the note before applying the field being left, so that
+        // field's refusal survives.
         self.info_note = None;
         self.info_edit_apply(cx);
         if self.active_locked() {
@@ -267,13 +290,10 @@ impl Docxy {
         if same {
             return;
         }
-        if !tab.ensure_core_part() {
+        if let Err(why) = tab.ensure_core_part() {
             self.info_note = Some((
                 e.tab.clone(),
-                format!(
-                    "Could not change {}: this file cannot hold document properties",
-                    e.which.label()
-                ),
+                format!("Could not change {}: {why}", e.which.label()),
             ));
             return;
         }
@@ -453,7 +473,7 @@ mod tests {
     fn a_file_without_the_part_is_given_one_1364() {
         let (path, mut tab) = open("bare", None);
         assert!(tab.pkg.as_ref().unwrap().part_text(CORE_PART).is_none());
-        assert!(tab.ensure_core_part());
+        assert!(tab.ensure_core_part().is_ok());
         assert!(editor(&mut tab).set_core_field(BoundProp::Keywords, "q & r"));
         tab.mark_dirty();
         assert!(core_xml(&tab).contains("<cp:keywords>q &amp; r</cp:keywords>"));
@@ -535,7 +555,7 @@ mod tests {
     fn a_new_document_is_given_a_package_and_saves_its_properties_1364() {
         let mut tab = crate::blank_docx_tab("Document1");
         assert!(tab.pkg.is_none());
-        assert!(tab.ensure_core_part());
+        assert!(tab.ensure_core_part().is_ok());
         assert!(tab.pkg.is_some());
         let ed = editor(&mut tab);
         assert!(ed.set_core_field(BoundProp::Title, "New & Shiny"));
@@ -556,68 +576,122 @@ mod tests {
         assert_eq!(part(&path, CORE_PART), "");
     }
 
-    /// A tab that saves without the Word package (Markdown, Plain Text, Rich
-    /// Text, an editable-HTML page) refuses, and stays package-less.
+    /// A tab whose save writes no package (Markdown, Plain Text, Rich Text,
+    /// a new document saved as an HTML page) refuses and stays as it was; so
+    /// does a Word document Save As has moved to such a name. An opened HTML
+    /// page keeps the package it embeds and accepts.
     #[test]
-    fn a_tab_that_does_not_save_as_word_refuses_properties_1364() {
+    fn a_tab_that_does_not_save_the_package_refuses_properties_1364() {
         let mut md = crate::blank_docx_tab("notes.md");
         md.markdown = true;
-        assert!(!md.ensure_core_part());
+        assert!(md.ensure_core_part().is_err());
         assert!(md.pkg.is_none());
         for name in ["a.txt", "a.rtf", "a.md", "a.docx.html"] {
             let mut tab = crate::blank_docx_tab(name);
             tab.path = Some(PathBuf::from(name));
-            assert!(!tab.ensure_core_part(), "{name}");
+            assert!(tab.ensure_core_part().is_err(), "{name}");
             assert!(tab.pkg.is_none(), "{name}");
         }
         let mut word = crate::blank_docx_tab("a.docx");
         word.path = Some(PathBuf::from("a.docx"));
-        assert!(word.ensure_core_part());
+        assert!(word.ensure_core_part().is_ok());
+        // A loaded .docx Save As has renamed to .md / .txt / .rtf keeps its
+        // package and still refuses: those saves drop it.
+        for name in ["moved.md", "moved.txt", "moved.rtf"] {
+            let (_, mut loaded) = open("moved", Some(CORE));
+            loaded.path = Some(PathBuf::from(name));
+            assert!(loaded.pkg.is_some());
+            assert!(loaded.ensure_core_part().is_err(), "{name}");
+        }
+        // An opened editable-HTML page has the package its page embeds.
+        let (_, mut page) = open("page", Some(CORE));
+        page.path = Some(PathBuf::from("a.docx.html"));
+        assert!(page.ensure_core_part().is_ok());
     }
 
-    /// The package Mailings gives a new document before any Info edit holds
-    /// no properties, so nothing is wiped; an Info edit after it keeps its
-    /// undo history, and one before it leaves Mailings the package it made.
+    /// A new document given a package by the first Info edit still saves a
+    /// list applied afterwards: the package defines numIds 1 and 2.
+    #[test]
+    fn lists_applied_after_an_info_edit_on_a_new_document_save_1364() {
+        let mut tab = crate::blank_docx_tab("Document1");
+        assert!(tab.ensure_core_part().is_ok());
+        assert!(editor(&mut tab).set_core_field(BoundProp::Title, "T"));
+        tab.mark_dirty();
+        let ed = editor(&mut tab);
+        ed.insert_str("item");
+        ed.set_list(Some(crate::NUM_BULLET));
+        tab.mark_dirty();
+        let path = temp("newlist").join("list.docx");
+        assert!(save_doc_tab(&mut tab, Some(path.clone())), "{}", tab.status);
+        let numbering = part(&path, "word/numbering.xml");
+        assert!(numbering.contains("w:numId=\"1\""), "{numbering}");
+        let doc = part(&path, "word/document.xml");
+        assert!(doc.contains("<w:numId w:val=\"1\"/>"), "{doc}");
+        assert!(part(&path, CORE_PART).contains("<dc:title>T</dc:title>"));
+    }
+
+    /// The package Mailings gives a new document (`mailings_tab::package`,
+    /// the real path) before any Info edit holds no properties, so nothing is
+    /// wiped and an Info edit after it keeps the undo history; an Info edit
+    /// first leaves Mailings that package.
     #[test]
     fn mailings_and_info_share_the_new_documents_package_1364() {
         let mut tab = crate::blank_docx_tab("Document1");
-        let ed = editor(&mut tab);
-        ed.insert_str("Body");
-        let bytes = crate::doc_to_docx(&editor(&mut tab).doc.clone(), &[], None);
-        tab.pkg = Some(docxcore::package::load_package(&bytes).unwrap());
-        assert!(tab.ensure_core_part());
+        editor(&mut tab).insert_str("Body");
+        crate::mailings_tab::package(&mut tab).unwrap();
+        assert!(tab.ensure_core_part().is_ok());
         assert!(editor(&mut tab).set_core_field(BoundProp::Title, "T"));
         tab.mark_dirty();
         assert!(core_xml(&tab).contains("<dc:title>T</dc:title>"));
-        // Mailings' lazy package is a no-op once there is one.
         let made = core_xml(&tab);
-        assert!(tab.ensure_core_part());
-        assert_eq!(core_xml(&tab), made);
+        crate::mailings_tab::package(&mut tab).unwrap();
+        assert_eq!(core_xml(&tab), made, "Mailings keeps the package");
         assert!(editor(&mut tab).undo());
         tab.set_dirty();
         assert!(!core_xml(&tab).contains("<dc:title>T</dc:title>"));
         assert_eq!(editor(&mut tab).core_fields().title, "");
         assert!(editor(&mut tab).undo(), "the typing step survived the seed");
         assert_eq!(editor(&mut tab).doc.body[0].plain_text(), "");
+        // Info first, then Mailings.
+        let mut other = crate::blank_docx_tab("Document2");
+        assert!(other.ensure_core_part().is_ok());
+        assert!(editor(&mut other).set_core_field(BoundProp::Author, "Ann"));
+        other.mark_dirty();
+        crate::mailings_tab::package(&mut other).unwrap();
+        assert!(core_xml(&other).contains("<dc:creator>Ann</dc:creator>"));
     }
 
     /// A Title control inserted after an Info edit shows it, and typing in
-    /// the control updates Info and core.xml.
+    /// the control updates Info and core.xml, on a new document.
     #[test]
     fn a_title_control_and_info_agree_on_a_new_document_1364() {
+        use docxcore::model::{Block, Document, Inline, ParProps, Paragraph};
         let mut tab = crate::blank_docx_tab("Document1");
-        assert!(tab.ensure_core_part());
+        assert!(tab.ensure_core_part().is_ok());
         assert!(editor(&mut tab).set_core_field(BoundProp::Title, "Info"));
         tab.mark_dirty();
-        let control = crate::hf_insert::property_control(&tab, BoundProp::Title);
-        let shown: String = control
+        let content = crate::hf_insert::property_control(&tab, BoundProp::Title);
+        let shown: String = content
             .iter()
             .map(|i| match i {
-                docxcore::model::Inline::Run(r) => r.text.clone(),
+                Inline::Run(r) => r.text.clone(),
                 _ => String::new(),
             })
             .collect();
         assert!(shown.contains("Info"), "{shown:?}");
+        let body = vec![Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content,
+        })];
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.reseed_core_fields(core_fields_of(tab.pkg.as_ref().unwrap()));
+        tab.surface = Surface::Doc(ed);
+        let ed = editor(&mut tab);
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], 4));
+        ed.insert_char('!');
+        tab.set_dirty();
+        assert_eq!(editor(&mut tab).core_fields().title, "Info!");
+        assert!(core_xml(&tab).contains("<dc:title>Info!</dc:title>"), "{}", core_xml(&tab));
     }
 
     /// A property control typed in updates what Info shows and core.xml,
