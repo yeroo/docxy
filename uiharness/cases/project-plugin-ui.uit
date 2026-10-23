@@ -157,6 +157,38 @@ test a command's view.gridlines draws the table and chart rules from the plan (#
   key ctrl+z
   assert gridlines_set is 0
 
+test a command's view.bars draws the bar style rows, grows the rows and resets (#1696)
+  # The fixture's Bars sets two rows (Main for normal tasks in row 1, Detail
+  # for every task but summaries in row 2) and an override of task 1, in one
+  # undo step; the rows are two bands tall, the state lists each row drawn
+  # as <uid>:<row>:<name> in task order, and a second press clears the table
+  # and the override. (The Resource Names the rows write are dropped from the
+  # plugin's overlay by the projcore plugin test: this plan has no resources.)
+  open copy:../fixtures/project-clipboard.xml
+  assert row_height is 28
+  assert bars_drawn is []
+  call project-overlay {}
+  assert reply.count is 4
+  shot gantt
+  call ribbon-click {"tab":"Task","command":"fixture.bars"}
+  assert status is Fixture: bars
+  assert dirty is true
+  assert row_height is 56
+  assert bars_drawn.0 is 1:1:Main
+  assert bars_drawn.1 is 1:2:Detail
+  assert bars_drawn.2 is 2:1:Main
+  assert bars_drawn.3 is 2:2:Detail
+  shot window
+  shot gantt
+  call ribbon-click {"tab":"Task","command":"fixture.bars"}
+  assert status is Fixture: bars reset
+  assert row_height is 28
+  assert bars_drawn is []
+  key ctrl+z
+  assert row_height is 56
+  key ctrl+z
+  assert row_height is 28
+
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false

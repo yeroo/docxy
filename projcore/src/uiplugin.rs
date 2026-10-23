@@ -1451,7 +1451,10 @@ pub struct OverlayCtx {
     /// (#1548; since #1575 an object of every gridline as drawn, by
     /// Project's name), the plugins' `switches` (#1553), and the
     /// formatting's `text_styles` and the selected cells' `cells` (#1572),
-    /// by key.
+    /// and its Bar Styles table `bars` and Format Bar overrides `task_bars`
+    /// (#1696, the shape `Formatting::apply_view` reads), by key. An
+    /// `OverlayRow::bar` is the first drawn bar row's middle when `bars` is
+    /// not empty.
     pub flags: Json,
 }
 

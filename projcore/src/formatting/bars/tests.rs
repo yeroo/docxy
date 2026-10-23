@@ -473,3 +473,11 @@ fn bars_and_overrides_in_one_reply_are_one_undo_step() {
     assert!(ed.redo());
     assert_eq!(ed.project().formatting.bars.len(), 1);
 }
+
+#[test]
+fn set_bars_clamps_the_row() {
+    let mut f = Formatting::default();
+    f.set_bars(vec![row("a", &[], 0), row("b", &[], 9)]);
+    assert_eq!(f.bars.iter().map(|r| r.row).collect::<Vec<_>>(), [1, 4]);
+    assert_eq!(f.max_bar_row(), 4);
+}

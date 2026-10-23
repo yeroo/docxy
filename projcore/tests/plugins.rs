@@ -269,6 +269,7 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             ("fixture.palette", ControlKind::Gallery),
             ("fixture.bold", ControlKind::Toggle),
             ("fixture.sheet", ControlKind::Button),
+            ("fixture.bars", ControlKind::Button),
         ]
     );
     assert!(group.controls[0].large && group.controls[0].keytip == "XH");
@@ -627,6 +628,39 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             .unwrap()
     );
     assert!(formatting.gridlines.is_empty());
+    // The bars command (#1696) sets two rows and one override through the
+    // view; the model takes them losslessly, and a second press, seeing the
+    // rows, clears them.
+    let bars = ui
+        .command(&cmd("fixture.bars", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(bars.status.as_deref(), Some("Fixture: bars"));
+    let mut plan = projcore::formatting::Formatting::default();
+    assert!(plan.apply_view(bars.view.as_ref().unwrap()).unwrap());
+    assert_eq!(plan.bars.len(), 2);
+    assert_eq!(plan.bars[0].name, "Main");
+    assert_eq!(plan.bars[0].show_for, ["Normal"]);
+    assert_eq!(plan.bars[0].start.kind.as_deref(), Some("framed"));
+    assert_eq!(plan.bars[0].text.right.as_deref(), Some("Resource Names"));
+    assert_eq!(
+        (plan.bars[1].row, plan.bars[1].show_for[0].as_str()),
+        (2, "Not Summary")
+    );
+    assert_eq!(plan.bars[1].end.kind.as_deref(), Some("dashed"));
+    assert_eq!(plan.task_bar(1).unwrap().middle.color, Some(0x33AA33));
+    assert_eq!(plan.switch("fixture.names"), Some(true));
+    assert_eq!(
+        projcore::formatting::Formatting::from_xml(&plan.to_xml()).unwrap(),
+        plan
+    );
+    let mut seen = cmd("fixture.bars", vec![], None);
+    seen.view = Json::obj(vec![("bars", plan.bars_json())]);
+    let reset = ui.command(&seen).unwrap().unwrap();
+    assert_eq!(reset.status.as_deref(), Some("Fixture: bars reset"));
+    assert!(plan.apply_view(reset.view.as_ref().unwrap()).unwrap());
+    assert!(plan.bars.is_empty() && plan.task_bars.is_empty());
+    assert_eq!(plan.switch("fixture.names"), Some(true));
     assert_eq!(
         ui.state(&ctx(Vec::new(), None))
             .unwrap()
@@ -755,9 +789,44 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     );
     let one_bar = OverlayCtx {
         rows: overlay.rows[..2].to_vec(),
-        ..overlay
+        ..overlay.clone()
     };
     assert_eq!(ui.overlay(&one_bar).unwrap().len(), 1);
+
+    // Resource Names beside each bar with the fixture's switch on, until a
+    // bar style row of the view writes them itself (#1696).
+    let named = |flags: Json| {
+        let mut rows = overlay.rows.clone();
+        rows[0].resource_names = "Ann".into();
+        OverlayCtx {
+            rows,
+            flags,
+            ..overlay.clone()
+        }
+    };
+    let on = || Json::parse(r#"{"switches":{"fixture.names":true}}"#).unwrap();
+    let texts = |ctx: &OverlayCtx| -> Vec<String> {
+        ui.overlay(ctx)
+            .unwrap()
+            .into_iter()
+            .filter_map(|s| match s {
+                Shape::Text { text, .. } if text.starts_with("names ") => Some(text),
+                _ => None,
+            })
+            .collect()
+    };
+    assert!(texts(&named(Json::Obj(Vec::new()))).is_empty());
+    assert_eq!(texts(&named(on())), ["names Ann"]);
+    let writes = Json::parse(
+        r#"{"switches":{"fixture.names":true},"bars":[{"name":"a","text":{"left":"Name"}},{"name":"b","text":{"inside":"Resource Names"}}]}"#,
+    )
+    .unwrap();
+    assert!(texts(&named(writes)).is_empty());
+    let other = Json::parse(
+        r#"{"switches":{"fixture.names":true},"bars":[{"name":"a","text":{"right":"Cost"}}]}"#,
+    )
+    .unwrap();
+    assert_eq!(texts(&named(other)), ["names Ann"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 

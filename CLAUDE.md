@@ -1157,6 +1157,53 @@
   cannot carry one, so the colours are pinned by `projcore/tests/plugins.rs`)
   and shoots the rest (the default rules are too faint for a `border`).
 
+## Bar style rows (#1696)
+
+- `Formatting::bars` (`projcore::formatting::bars`) is Project's Bar Styles
+  table for the view: `BarRow` (`name`, `show_for`, `row` 1 to 4, `from`/`to`,
+  `start`/`end` `Mark`, `middle` `Middle`, five `BarText` fields) in table
+  order, and `Formatting::task_bars` are Format Bar's `TaskBar` overrides per
+  UID (a set part wins over every row drawn for the task; a part with nothing
+  set, or `"reset": true`, removes the entry). Both are in the view JSON
+  (`view.bars`, `view.task_bars`: absent keeps, null clears, `bars` an array
+  replaces the table, `task_bars` entries replace per task) and in
+  `formatting.xml` (`<bar>`, `<task-bar>`, fixed attribute order, absent when
+  empty so an old plan saves byte-identically). Names stay as typed: an
+  unknown shape, pattern or category is drawn as the default / never matches,
+  a wrongly typed JSON value is ignored, `row` clamps to 1..=4
+  (`Formatting::set_bars`). One `edit_formatting` is one undo step for both.
+- `show_for` is any positive entry (`Not ` entries only pass everything they
+  do not match) and no negated entry (`BarRow::applies`, `Facts::is`); an
+  empty list shows for every task. `Facts` is built by `Editor::bar_facts`
+  (Normal, Milestone, Summary, Critical, Noncritical, Active, Inactive,
+  Manual, Auto, External, Late = Status text, Flag1..20 read only when a row
+  names one). `Marked` and the Task Path kinds have no plan data: they parse
+  and never match. `Editor::bar_date` resolves From/To (empty = Start /
+  Finish; `Task Start`/`Task Finish`; any `Field` date name; `CompleteThrough`
+  = the task's `stop`, else start plus its percent complete of the span, which
+  is unmeasured against Project); a task without the date draws no such row.
+- The suite draws it in `suite/docxy/src/project/barstyle.rs`: `bar_rows`
+  (the plan against one task: `None` means the palette drawing, as with no
+  table and no override; an override with no table restyles a plain leaf bar
+  only, never a summary or milestone) -> `bar_parts` (pure geometry, tested)
+  -> `styled_children`. A band is `ROW_H` tall, `row` picks the band; the bar
+  zone is `BAR_Y`..+`BAR_H` (full), medium 8 px and narrow 4 px at its top,
+  middle or bottom; marks are 10 px (solid, dashed outline, framed = filled
+  with a black outline); the middle's pattern goes through `plugin_ui`'s
+  `pattern_layer`; the five texts are 10 px (left/right beside the marks,
+  top/bottom in the bands above and below the zone, inside clipped to the
+  middle). `show_critical` does not apply to rows (the category decides);
+  baseline and leveling-delay marks are not drawn for a covered task.
+- `ProjectView::row_h()` is `ROW_H * max(1, max_bar_row)`: every task row,
+  chart strip, pane, rule (`ruled_rows_of`), filler (`filler_rows_of`) and page
+  (`page_rows_of`) uses it; the headers stay `ROW_H`. With no table everything
+  is as before. `OverlayCtx.row_h` and `OverlayRow.bar` follow: the bar is the
+  first drawn row's middle. The harness state reports `row_height` and
+  `bars_drawn` (`<uid>:<row>:<name>`); the fixture's `fixture.bars` sets two
+  rows and an override (and its overlay stops writing Resource Names when a row
+  names them). Not drawn: terminal `yppxy` (it sends the JSON), the built-in
+  Bar Styles / Format Bar dialogs, printing.
+
 ## Project timescale and Timeline pane (#1535)
 
 - `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days

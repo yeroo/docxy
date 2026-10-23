@@ -266,6 +266,8 @@ impl Formats {
             view: projcore::json::Json::obj(vec![
                 ("switches", ed.project().formatting.switches_json()),
                 ("gridlines", ed.project().formatting.gridlines.to_json()),
+                ("bars", ed.project().formatting.bars_json()),
+                ("task_bars", ed.project().formatting.task_bars_json()),
             ]),
             values,
             button: None,

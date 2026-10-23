@@ -531,8 +531,12 @@ impl TaskBar {
 }
 
 impl Formatting {
-    /// Replace the Bar Styles table.
-    pub fn set_bars(&mut self, bars: Vec<BarRow>) {
+    /// Replace the Bar Styles table; every row's `row` is clamped to
+    /// 1..=[`MAX_ROW`].
+    pub fn set_bars(&mut self, mut bars: Vec<BarRow>) {
+        for bar in &mut bars {
+            bar.row = clamp_row(i64::from(bar.row));
+        }
         self.bars = bars;
     }
 
@@ -589,7 +593,7 @@ impl Formatting {
                     }
                     rows.push(BarRow::from_json(item));
                 }
-                self.bars = rows;
+                self.set_bars(rows);
             }
             Some(_) => return Err("view.bars is not an array or null".into()),
         }

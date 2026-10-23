@@ -10,7 +10,9 @@ use projcore::{LinkType, Project, Task};
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+mod barstyle;
 mod gantt;
+pub(super) use barstyle::{BAR_Y, Part, bar_parts, bar_rows, drawn_entries, first_middle};
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;
@@ -37,8 +39,14 @@ pub(super) use autofilter::{AUTO_FILTER_STATUS, MENU_ROW_H, autofilter_click, me
 /// Whole rows a PageUp/PageDown steps by: the rows that fit in the
 /// `project-body` probe, less one, so the cursor's landing row stays on
 /// screen. Always at least 1.
+#[cfg(test)]
 fn page_rows_for(body_h: f32) -> usize {
-    ((body_h / ROW_H).floor() as usize).saturating_sub(1).max(1)
+    page_rows_of(body_h, ROW_H)
+}
+
+/// [`page_rows_for`] for rows `row_h` tall.
+fn page_rows_of(body_h: f32, row_h: f32) -> usize {
+    ((body_h / row_h).floor() as usize).saturating_sub(1).max(1)
 }
 
 pub(super) struct ProjectView {
@@ -180,6 +188,12 @@ impl ProjectView {
             width_drag: None,
             source: None,
         }
+    }
+
+    /// A task row's height: one band per sub-row the plan's bar styles use
+    /// (Project grows every row alike), at least one (#1696).
+    pub fn row_h(&self) -> f32 {
+        ROW_H * f32::from(self.ed.project().formatting.max_bar_row().max(1))
     }
 
     /// `bar` as the Gantt draws it under the Gantt Chart Format toggles.
@@ -742,7 +756,7 @@ pub(super) fn project_state(
         ("filtered".into(), Json::Bool(v.ed.is_filtered())),
         (
             "filler_rows".into(),
-            Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, shown)) as f64),
+            Json::Num(body_h.map_or(0, |h| filler_rows_of(h, scroll_y, shown, v.row_h())) as f64),
         ),
         (
             "prompt".into(),
@@ -807,6 +821,21 @@ pub(super) fn project_state(
             ),
         ]
     }));
+    // The plan's bar styles (#1696): a task row's height, and the rows
+    // drawn as `<uid>:<row>:<name>` in task order.
+    entries.push(("row_height".into(), Json::Num(f64::from(v.row_h()))));
+    entries.push((
+        "bars_drawn".into(),
+        Json::Arr(
+            v.ed.project()
+                .tasks
+                .iter()
+                .filter_map(|t| bar_rows(&v.ed, t, scale, BRAND).map(|rows| (t.uid, rows)))
+                .flat_map(|(uid, rows)| drawn_entries(uid, &rows))
+                .map(Json::Str)
+                .collect(),
+        ),
+    ));
     entries.extend(project_cell_state(v));
     entries.extend(selection::selection_state(v));
     entries.extend(timeline_state(v));
@@ -1337,6 +1366,7 @@ fn editable_row_cells(
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
     let inactive = inactive_row(v.ed.project(), row);
+    let row_h = v.row_h();
     let values = task.map(|t| project_row(&v.ed, t)).unwrap_or_default();
     let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
     // The plan's text styles (#1532): the row's categories, then each
@@ -1362,7 +1392,7 @@ fn editable_row_cells(
     };
     let cells = h_flex()
         .relative()
-        .h(px(ROW_H))
+        .h(px(row_h))
         .items_center()
         .when(inactive, |d| d.text_color(pal.dim).line_through());
     let cells = match &row_style {
@@ -1429,7 +1459,7 @@ fn editable_row_cells(
                 .flex()
                 .items_center()
                 .w(px(widths[col]))
-                .h(px(ROW_H))
+                .h(px(row_h))
                 .flex_none()
                 .px_2()
                 .overflow_hidden()
@@ -1526,11 +1556,11 @@ fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
         .is_some_and(|t| !t.is_null && !proj.effectively_active(index))
 }
 
-fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement {
+fn pane(width: f32, offset: f32, height: f32, content: impl IntoElement) -> impl IntoElement {
     div()
         .relative()
         .w(px(width))
-        .h(px(ROW_H))
+        .h(px(height))
         .flex_none()
         .overflow_hidden()
         .child(div().absolute().left(px(-offset)).top_0().child(content))
@@ -1541,12 +1571,13 @@ fn chart_pane(
     offset: f32,
     pal: Pal,
     hot: bool,
+    height: f32,
     content: impl IntoElement,
 ) -> impl IntoElement {
     h_flex()
         .when(hot, |d| d.bg(pal.sel))
         .w(px(width + GANTT_INSET))
-        .h(px(ROW_H))
+        .h(px(height))
         .flex_none()
         .child(
             div()
@@ -1556,7 +1587,7 @@ fn chart_pane(
                 .border_l(px(1.))
                 .border_color(pal.border),
         )
-        .child(pane(width, offset, content))
+        .child(pane(width, offset, height, content))
 }
 
 /// The task index list row `r` draws, given the visible rows: the `r`th
@@ -1677,12 +1708,18 @@ pub(super) fn project_el(
                         .flex_none()
                         .bg(pal.panel)
                         .font_weight(FontWeight::BOLD)
-                        .child(pane(table_w, table_x, heading_cells(view, pal, index, probes, cx)))
+                        .child(pane(
+                            table_w,
+                            table_x,
+                            ROW_H,
+                            heading_cells(view, pal, index, probes, cx),
+                        ))
                         .child(chart_pane(
                             gantt_w,
                             gantt_x,
                             pal,
                             false,
+                            ROW_H,
                             gantt_header(
                                 scale,
                                 view.ed.project().project_shading_calendar(),
@@ -1742,6 +1779,7 @@ pub(super) fn project_el(
                                             return vec![];
                                         };
                                         let cursor_row = v.cursor_row();
+                                        let row_h = v.row_h();
                                         let tasks = &v.ed.project().tasks;
                                         let rows = v.ed.display_rows();
                                         // List rows are shown rows; `i` is the task index,
@@ -1758,9 +1796,21 @@ pub(super) fn project_el(
                                                     .min(20)
                                                     as f32
                                                     * 12.;
+                                                let bar = task
+                                                    .and_then(|t| gantt_bar(&v.ed, t, scale))
+                                                    .map(|b| v.styled_bar(b));
+                                                // The plan's bar style rows, when
+                                                // they cover this task (#1696).
+                                                let styled = task.and_then(|t| {
+                                                    let color = bar.map_or(BRAND, |b| {
+                                                        bar_look(b.kind, palette.as_ref().as_ref()).0
+                                                    });
+                                                    bar_rows(&v.ed, t, scale, color)
+                                                        .map(|rows| bar_parts(&rows))
+                                                });
                                                 h_flex()
                                                     .id(("project-row", i))
-                                                    .h(px(ROW_H))
+                                                    .h(px(row_h))
                                                     .w_full()
                                                     .cursor_pointer()
                                                     .when(task.is_some_and(|t| t.summary), |d| {
@@ -1796,6 +1846,7 @@ pub(super) fn project_el(
                                                             .child(pane(
                                                                 table_w,
                                                                 table_x,
+                                                                row_h,
                                                                 editable_row_cells(
                                                                     v,
                                                                     pal,
@@ -1816,17 +1867,17 @@ pub(super) fn project_el(
                                                         // The table's selection is cell-wise
                                                         // (#1534); the chart keeps the row.
                                                         task.is_some() && i == cursor_row,
+                                                        row_h,
                                                         // The entry row has no bar, so no `bar:` probe.
                                                         gantt_strip(
-                                                            task.and_then(|t| {
-                                                                gantt_bar(&v.ed, t, scale)
-                                                            })
-                                                            .map(|b| v.styled_bar(b)),
+                                                            bar,
                                                             task.map_or(0, |t| t.id),
                                                             scale,
                                                             pal,
                                                             palette.as_ref().as_ref(),
                                                             &row_probes,
+                                                            row_h,
+                                                            styled,
                                                             // A right-press on the bar
                                                             // selects its row and opens
                                                             // the bar's menu.
