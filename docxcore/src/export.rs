@@ -858,6 +858,7 @@ enum RuleShape {
     Motif(Motif),
 }
 
+#[derive(Clone)]
 struct Page {
     w: f32,
     h: f32,
@@ -965,6 +966,12 @@ trait Flow {
     fn hard_break(&mut self, kind: BreakKind);
     /// Nothing has been laid out on the current page yet.
     fn at_top(&self) -> bool;
+}
+
+/// Whether every column of a set is as wide as the first.
+fn equal_widths(xs: &[(f32, f32)]) -> bool {
+    xs.first()
+        .is_none_or(|&(_, w0)| xs.iter().all(|&(_, w)| (w - w0).abs() <= 0.01))
 }
 
 fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
@@ -1446,6 +1453,7 @@ impl Flow for BandFlow {
 }
 
 /// A column set on one page, belonging to one section.
+#[derive(Clone)]
 struct Region {
     /// Unique per column set per page, tying [`LineRec`]s to it.
     id: u32,
@@ -1483,10 +1491,34 @@ struct Pager<'a> {
     chapters: HashMap<*const Paragraph, (u8, Option<String>)>,
     /// The heading begun, until its first line settles on a page.
     pending_chapter: Option<(u8, Option<String>)>,
+    /// The body's paragraphs and tables in order: paragraph ordinal `n`
+    /// (`para`) is `blocks[n - 1]`.
+    blocks: Vec<&'a Block>,
+    /// The page as it was before the first line of the current column set
+    /// with unequal widths landed on it, to lay it out again balanced.
+    region_snap: Option<RegionSnap>,
+    /// Set while a column set is laid out again at a trial height.
+    trial: Option<Trial>,
+}
+
+/// A page and counters before a column set's first line on it (#797).
+struct RegionSnap {
+    region: u32,
+    /// The ordinal of the paragraph that line belongs to.
+    para: u32,
+    page: Page,
+    line_count: LineCount,
+}
+
+/// A trial layout of a column set: columns hold `bottom` and no more, and
+/// running out of columns (or breaking the page) fails it.
+struct Trial {
+    bottom: Option<f32>,
+    failed: bool,
 }
 
 /// The line-number counter and where it last counted, for `w:restart`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LineCount {
     count: u32,
     /// The page index and section of the last counted line.
@@ -1494,7 +1526,7 @@ struct LineCount {
 }
 
 impl<'a> Pager<'a> {
-    fn run(doc: &Document, opts: &'a PdfOptions) -> Vec<Page> {
+    fn run(doc: &'a Document, opts: &'a PdfOptions) -> Vec<Page> {
         let sections = split_sections(doc, opts);
         let raws: Vec<&str> = sections.iter().map(|(_, raw)| *raw).collect();
         let sects: Vec<SectionLayout> = raws
@@ -1529,6 +1561,13 @@ impl<'a> Pager<'a> {
             line_count: LineCount::default(),
             chapters,
             pending_chapter: None,
+            blocks: doc
+                .body
+                .iter()
+                .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
+                .collect(),
+            region_snap: None,
+            trial: None,
         };
         for (i, (range, _)) in sections.iter().enumerate() {
             pager.start_section(i);
@@ -1711,6 +1750,7 @@ impl<'a> Pager<'a> {
             x += w + space;
         }
         self.next_region += 1;
+        self.region_snap = None;
         self.region = Region {
             id: self.next_region,
             sect,
@@ -1756,6 +1796,9 @@ impl<'a> Pager<'a> {
         if self.region.col + 1 < self.region.xs.len() {
             self.region.col += 1;
             self.y = self.region.top;
+        } else if let Some(trial) = self.trial.as_mut() {
+            trial.failed = true;
+            self.y = self.region.top;
         } else {
             self.new_page(self.region.sect, false, false);
         }
@@ -1763,18 +1806,17 @@ impl<'a> Pager<'a> {
 
     /// Balance the ending column set's lines on this page before a continuous
     /// section starts below it, as Word does: re-pour them in order into its
-    /// columns so the tallest column is as short as possible. Lines don't
-    /// re-wrap, so only equal-width columns are balanced, and not after a
-    /// column break (which placed the lines deliberately).
+    /// columns so the tallest column is as short as possible. Equal-width
+    /// columns re-pour the lines as they are; unequal ones lay the paragraphs
+    /// out again ([`Pager::balance_unequal`]). Neither balances after a column
+    /// break (which placed the lines deliberately).
     fn balance_region(&mut self) {
         let region = &self.region;
-        let Some(&(_, w0)) = region.xs.first() else {
+        if region.xs.len() < 2 || region.column_break {
             return;
-        };
-        if region.xs.len() < 2
-            || region.column_break
-            || region.xs.iter().any(|&(_, w)| (w - w0).abs() > 0.01)
-        {
+        }
+        if !equal_widths(&region.xs) {
+            self.balance_unequal();
             return;
         }
         let Some(page) = self.pages.last_mut() else {
@@ -1856,6 +1898,100 @@ impl<'a> Pager<'a> {
         }
         page.min_base = page.lines.iter().map(|l| l.y).fold(f32::INFINITY, f32::min);
         self.region.low = low;
+    }
+
+    /// Balance a column set whose columns differ in width (#797). Lines
+    /// wrap per column, so its paragraphs are laid out again from the
+    /// snapshot taken before its first line, with the columns held to a trial
+    /// height that is bisected for the smallest one all the paragraphs still
+    /// fit in. The first, unlimited, layout must reproduce the lines already
+    /// placed, or the set is left as it is (a page break, or a paragraph
+    /// that began on the page before); so must a result that is no shorter.
+    fn balance_unequal(&mut self) {
+        let Some(snap) = self.region_snap.take() else {
+            return;
+        };
+        let last = self.pages.len() - 1;
+        let p0 = snap.para as usize;
+        if snap.region != self.region.id || p0 == 0 || p0 > self.para as usize {
+            return;
+        }
+        let ended = self.para as usize;
+        let Some(blocks) = self.blocks.get(p0 - 1..ended) else {
+            return;
+        };
+        let blocks: Vec<&Block> = blocks.to_vec();
+        // A paragraph that began on the page before can't start over.
+        if last > 0
+            && self.pages[last - 1]
+                .lines
+                .iter()
+                .any(|l| l.para as usize == p0)
+        {
+            return;
+        }
+        let first = snap.page.lines.len();
+        let original = self.pages[last].clone();
+        let saved = (
+            self.region.clone(),
+            self.y,
+            self.para,
+            self.numbered,
+            self.line_count.clone(),
+            self.pending_chapter.clone(),
+        );
+        let top = self.region.top;
+        let room = top - snap.page.body_bottom;
+        let opts = self.opts;
+        let layout = |pager: &mut Self, height: Option<f32>| -> bool {
+            pager.pages[last] = snap.page.clone();
+            pager.line_count = snap.line_count.clone();
+            pager.region.col = 0;
+            pager.region.low = top;
+            pager.region.placed = false;
+            pager.y = top;
+            pager.para = (p0 - 1) as u32;
+            pager.pending_chapter = None;
+            pager.trial = Some(Trial {
+                bottom: height.map(|h| top - h),
+                failed: false,
+            });
+            for block in &blocks {
+                emit_block(pager, block, opts);
+            }
+            !pager.trial.take().is_some_and(|t| t.failed)
+        };
+        let reproduced = layout(self, None) && {
+            let (now, was) = (&self.pages[last].lines[first..], &original.lines[first..]);
+            now.len() == was.len()
+                && now.iter().zip(was).all(|(a, b)| {
+                    a.col == b.col && (a.y - b.y).abs() < 0.01 && (a.lh - b.lh).abs() < 0.01
+                })
+        };
+        let mut best = None;
+        if reproduced {
+            let (mut lo, mut hi) = (0.0_f32, room);
+            for _ in 0..30 {
+                let mid = (lo + hi) / 2.0;
+                if layout(self, Some(mid)) {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            if layout(self, Some(hi)) && self.region.low > saved.0.low + 0.001 {
+                best = Some(self.region.low);
+            }
+        }
+        if best.is_none() {
+            self.pages[last] = original;
+            self.region = saved.0;
+            self.line_count = saved.4;
+        }
+        self.y = saved.1;
+        self.para = saved.2;
+        self.numbered = saved.3;
+        self.pending_chapter = saved.5;
     }
 
     /// Count a body line just placed for line numbering (`w:lnNumType`): the
@@ -2252,7 +2388,14 @@ impl Flow for Pager<'_> {
         // on the page can have no room in any of its columns. A line taller
         // than an empty page is placed anyway.
         loop {
-            let bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
+            let mut bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
+            if let Some(Trial {
+                bottom: Some(limit),
+                ..
+            }) = &self.trial
+            {
+                bottom = bottom.max(*limit);
+            }
             if self.y >= bottom {
                 break;
             }
@@ -2265,6 +2408,14 @@ impl Flow for Pager<'_> {
         }
         self.mark_low();
         let (x, w) = self.region.xs[self.region.col];
+        if !self.region.placed && self.trial.is_none() && !equal_widths(&self.region.xs) {
+            self.region_snap = Some(RegionSnap {
+                region: self.region.id,
+                para: self.para,
+                page: self.pages.last().expect("a page exists").clone(),
+                line_count: self.line_count.clone(),
+            });
+        }
         let number = self.count_line();
         let page = self.pages.last_mut().expect("a page exists");
         // A heading counts on the page its first line settled on.
@@ -2335,7 +2486,10 @@ impl Flow for Pager<'_> {
     }
     fn hard_break(&mut self, kind: BreakKind) {
         match kind {
-            BreakKind::Page => self.new_page(self.region.sect, false, false),
+            BreakKind::Page => match self.trial.as_mut() {
+                Some(trial) => trial.failed = true,
+                None => self.new_page(self.region.sect, false, false),
+            },
             BreakKind::Column => {
                 self.region.column_break = true;
                 self.advance_column();
@@ -4750,6 +4904,91 @@ mod tests {
     }
 
     #[test]
+    fn unequal_columns_rewrap_and_balance_before_a_continuous_break_797() {
+        // 150 pt and 300 pt columns: each 39-character paragraph wraps to two
+        // lines in the first and fits one line in the second.
+        let sect = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+        let words = "aaaa bbbb cccc dddd eeee ffff gggg";
+        let mut blocks: Vec<Block> = (0..9)
+            .map(|i| text_para(&format!("p{i} {words}")))
+            .collect();
+        blocks.push(sect_para(&format!("p9 {words}"), sect));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        // Lines flow: three two-line paragraphs and the first line of the
+        // fourth on the left, its second line (rewrapped to the wider column,
+        // 258 = 72 + 150 + 36) and six one-line paragraphs on the right.
+        for i in 0..4 {
+            assert!(
+                close(page.at(&format!("p{i} ")).0, 72.0),
+                "{:?}",
+                page.texts
+            );
+        }
+        let tail = page
+            .texts
+            .iter()
+            .filter(|(x, _, t)| close(*x, 258.0) && t == "eeee ffff gggg")
+            .count();
+        assert_eq!(tail, 1, "{:?}", page.texts);
+        for i in 4..10 {
+            let line = format!("p{i} {words}");
+            assert!(
+                page.texts
+                    .iter()
+                    .any(|(x, _, t)| close(*x, 258.0) && *t == line),
+                "p{i} on one line in the wide column: {:?}",
+                page.texts
+            );
+        }
+        // The next section starts below the taller (right) column: seven
+        // lines and the six gaps between its paragraphs, then the last gap.
+        let low = 720.0 - 7.0 * LH - 6.0 * 4.4 - 4.4;
+        assert!(close(page.at("next").1, low - LH), "{:?}", page.at("next"));
+    }
+
+    #[test]
+    fn unequal_columns_leave_a_set_that_spilled_or_broke_alone_797() {
+        let sect = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="3000" w:space="720"/><w:col w:w="6000"/></w:cols></w:sectPr>"#;
+        // Several pages of columns, the last page's set continuing a flow.
+        let mut blocks = paras("q", 119);
+        blocks.push(sect_para("q119", sect));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert!(pages.len() >= 2, "{}", pages.len());
+        for i in 0..120 {
+            let label = format!("q{i}");
+            assert!(
+                pages
+                    .iter()
+                    .any(|p| p.texts.iter().any(|(_, _, t)| *t == label)),
+                "{label} printed"
+            );
+        }
+        assert!(
+            pages
+                .last()
+                .unwrap()
+                .texts
+                .iter()
+                .any(|(_, _, t)| t == "next")
+        );
+        // A page break inside the set: the lines are as they were laid out.
+        let mut blocks = paras("a", 3);
+        blocks.push(para(vec![run("b", RunProps::default()), page_break()]));
+        blocks.push(sect_para("c", sect));
+        blocks.push(text_para("next"));
+        blocks.push(trailing(CONTINUOUS));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        assert!(close(pages[1].at("c").0, 72.0), "{:?}", pages[1].texts);
+    }
+
+    #[test]
     fn columns_balance_before_continuous_break() {
         let pages = pages_of(
             &balanced_doc(10, &two_col_sect(r#" w:sep="1""#)),
@@ -4811,17 +5050,19 @@ mod tests {
     }
 
     #[test]
-    fn columns_are_not_balanced_at_the_end_after_a_break_or_when_unequal() {
+    fn columns_are_not_balanced_at_the_end_or_after_a_break() {
         // At the end of the document: everything stays in column one.
         let mut blocks = paras("l", 10);
         blocks.push(trailing(&two_col_sect("")));
         let pages = pages_of(&doc(blocks), &PdfOptions::default());
         assert!(close(pages[0].at("l9").0, 72.0));
 
-        // Unequal explicit widths would need re-wrapping.
+        // Unequal explicit widths balance too (#797): single-line paragraphs
+        // split five and five, the second column starting 250 + 36 pt in.
         let unequal = r#"<w:sectPr><w:cols w:num="2" w:equalWidth="0"><w:col w:w="5000" w:space="720"/><w:col w:w="3000"/></w:cols></w:sectPr>"#;
         let pages = pages_of(&balanced_doc(10, unequal), &PdfOptions::default());
-        assert!(close(pages[0].at("l9").0, 72.0), "{:?}", pages[0].texts);
+        assert!(close(pages[0].at("l4").0, 72.0), "{:?}", pages[0].texts);
+        assert!(close(pages[0].at("l5").0, 358.0), "{:?}", pages[0].texts);
 
         // A column break placed the lines deliberately.
         let d = doc(vec![
