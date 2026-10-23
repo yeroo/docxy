@@ -14,6 +14,8 @@ use opccore::xml::{Event, XmlParser};
 
 pub mod bars;
 pub mod gridlines;
+pub mod layout;
+pub use layout::Layout;
 pub use bars::{BarRow, BarText, Facts, Mark, Middle, TaskBar};
 pub use gridlines::{Gridline, Gridlines, LineType};
 
@@ -227,6 +229,8 @@ pub struct Formatting {
     pub bars: Vec<BarRow>,
     /// Format Bar's per-task overrides (#1696); see [`bars`].
     pub task_bars: Vec<TaskBar>,
+    /// The Layout dialog's chart settings (#1695); see [`layout`].
+    pub layout: Layout,
 }
 
 impl Formatting {
@@ -341,6 +345,7 @@ impl Formatting {
             self.link_style = l;
         }
         self.apply_bars(view)?;
+        self.layout.apply(view.get("layout"))?;
         match view.get("switches") {
             None | Some(Json::Null) => {}
             Some(Json::Obj(pairs)) => {
@@ -415,6 +420,7 @@ impl Formatting {
         }
         self.bars_to_xml(&mut out);
         self.gridlines.to_xml(&mut out);
+        self.layout.to_xml(&mut out);
         out.push_str("</formatting>\n");
         out
     }
@@ -471,6 +477,7 @@ impl Formatting {
                             }
                             "bar" | "task-bar" => out.read_bar_xml(name, &parser),
                             "gridline" => out.gridlines.read_xml(&parser),
+                            "layout" => out.layout.read_xml(&parser),
                             _ => {}
                         }
                     }
