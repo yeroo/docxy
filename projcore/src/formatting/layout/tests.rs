@@ -66,7 +66,7 @@ fn bar_height_clamps_and_unset_differs_from_twelve() {
     assert_eq!(applied(r#"{"bar_height":99}"#).bar_height, Some(24));
     assert_eq!(applied(r#"{"bar_height":12}"#).bar_height_px(), Some(16.));
     assert_eq!(applied(r#"{"bar_height":6}"#).bar_height_px(), Some(8.));
-    assert_eq!(points_to_px(10) , 40. / 3.);
+    assert_eq!(points_to_px(10), 40. / 3.);
     assert_ne!(applied(r#"{"bar_height":12}"#), Layout::default());
 }
 
@@ -143,7 +143,10 @@ fn xml_reads_leniently() {
     assert_eq!(f.layout.rollup, None);
     assert_eq!(f.layout.round_bars, Some(false));
     let big = r#"<formatting><layout bar-height="400"/></formatting>"#;
-    assert_eq!(Formatting::from_xml(big).unwrap().layout.bar_height, Some(24));
+    assert_eq!(
+        Formatting::from_xml(big).unwrap().layout.bar_height,
+        Some(24)
+    );
 }
 
 #[test]

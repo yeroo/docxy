@@ -189,6 +189,36 @@ test a command's view.bars draws the bar style rows, grows the rows and resets (
   key ctrl+z
   assert row_height is 28
 
+test a command's view.layout sets the Layout fields, draws taller bars and clears (#1695)
+  # The fixture's Layout sets 12 pt bars, roll-up on, round bars off and the
+  # stored-only fields, in one undo step; a second press, seeing the bar
+  # height, clears them. The shots show the 16 px bars (12 pt); their
+  # rectangles are `bar_rects` in the state, pinned by the unit tests (the
+  # case was written without being run: macOS cannot drive the window).
+  open copy:../fixtures/project-clipboard.xml
+  assert layout.bar_height is nothing
+  assert dirty is false
+  shot gantt
+  call ribbon-click {"tab":"Task","command":"fixture.layout"}
+  assert status is Fixture: layout
+  assert dirty is true
+  assert layout.bar_height is 12
+  assert layout.rollup is true
+  assert layout.hide_rollup_expanded is false
+  assert layout.round_bars is false
+  assert layout.show_splits is false
+  assert layout.show_drawings is false
+  assert layout.bar_text_date_format is 1/28
+  shot gantt
+  call ribbon-click {"tab":"Task","command":"fixture.layout"}
+  assert status is Fixture: layout reset
+  assert layout.bar_height is nothing
+  key ctrl+z
+  assert layout.bar_height is 12
+  key ctrl+z
+  assert layout.bar_height is nothing
+  assert dirty is false
+
 test a toggle runs its command and reads back checked as the plugin says
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false
@@ -216,12 +246,12 @@ test a toggle runs its command and reads back checked as the plugin says
 test a Bold toggle styles the selected cell and reads its state from the view's cells
   # The view JSON carries the selected cells' styles (#1572): the fixture's
   # Bold writes view.cells and shows checked where the cursor cell is bold.
-  # (Bold is third from last in the group: Sheet and Bars follow it.)
+  # (Bold is fourth from last in the group: Sheet, Bars and Layout follow it.)
   open copy:../fixtures/project-clipboard.xml
   click C2
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-3.id is fixture.bold
-  assert reply.tabs.1.groups.-1.commands.-3.checked is false
+  assert reply.tabs.1.groups.-1.commands.-4.id is fixture.bold
+  assert reply.tabs.1.groups.-1.commands.-4.checked is false
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold on
   assert dirty is true
@@ -229,19 +259,19 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
   assert cell_styles.0.strikethrough is true
   assert cell_styles.0.pattern is dark-diagonal-left
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-3.checked is true
+  assert reply.tabs.1.groups.-1.commands.-4.checked is true
   click C1
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-3.checked is false
+  assert reply.tabs.1.groups.-1.commands.-4.checked is false
   click C2
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-3.checked is true
+  assert reply.tabs.1.groups.-1.commands.-4.checked is true
   call ribbon-click {"tab":"Task","command":"fixture.bold"}
   assert status is Fixture: bold off
   assert cell_styles.0.strikethrough is false
   assert cell_styles.0.pattern is solid
   call ribbon-read {}
-  assert reply.tabs.1.groups.-1.commands.-3.checked is false
+  assert reply.tabs.1.groups.-1.commands.-4.checked is false
 
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml

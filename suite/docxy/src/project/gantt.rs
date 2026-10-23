@@ -96,6 +96,7 @@ pub(crate) fn bar_kind_name(kind: BarKind) -> &'static str {
 }
 
 /// The left of a milestone's 14 px diamond: centred in its day.
+#[cfg(test)]
 pub(crate) fn milestone_x(start: i64, day_w: f32) -> f32 {
     start as f32 * day_w + day_w / 2. - 7.
 }

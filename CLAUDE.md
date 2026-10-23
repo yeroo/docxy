@@ -1226,6 +1226,51 @@
   names them). Not drawn: terminal `yppxy` (it sends the JSON), the built-in
   Bar Styles / Format Bar dialogs, printing.
 
+## Layout fields (#1695)
+
+- `Formatting::layout` (`projcore::formatting::layout::Layout`) is Project's
+  Layout dialog, Bars and Other sections: `bar_height` (points, 6 to 24,
+  clamped on read; unset draws the built-in 14 px bar, which is not 12 pt =
+  16 px), `rollup`, `hide_rollup_expanded`, `round_bars`, `show_splits`,
+  `show_drawings` and `bar_text_date_format` (an opaque string, no validation).
+  `view.layout` is an object (a key set to null clears it, unknown keys are
+  ignored) or null (clears all); all keys are checked before any applies, so a
+  wrong type (`view.layout.bar_height is not a number or null`) leaves the
+  layout as it was. It is the `<layout>` element of `formatting.xml` (absent
+  when empty, so an old plan saves byte-identically) and every state, overlay
+  and command request's `view.layout` / `flags.layout` (all seven keys, null
+  for unset), one undo step through `edit_formatting`.
+- The suite reads it in `gantt_bar`: `GanttBar::geom` (`BarGeom`) carries the
+  height and, with round bars off, the start and finish as fractional days.
+  `bar_boxes(height)` is the one geometry: a leaf bar centred on y 12, a
+  summary and a thin bar on y 14, a milestone's diamond on y 12, scaled by
+  `height/14`, capped at the 28 px row and kept inside it (the default gives
+  the original 5/14, 9/10, 11/6, 5/14). `gantt_strip`, the inactive outline,
+  `bar_rect` (so the overlay's `OverlayRow.bar`) and the palette stand-in
+  under an override with no Bar Styles table all read it. Round bars off
+  places a bar on its instants (`span_x`) and a milestone's centre on its start
+  instant; the Bar Styles table (#1696) already places by instants and is
+  unchanged; baseline and leveling-delay marks stay whole-day, so they no
+  longer line up with a bar that starts or ends mid-day (known mismatch).
+- Roll-up is `project/rolled.rs` (`rolled_parts`, per frame for the summary
+  rows drawn): with `rollup` on and the summary collapsed, or expanded unless
+  `hide_rollup_expanded`, the row also draws its descendant leaves and
+  milestones (inactive ones skipped, nested summaries only through their
+  leaves, rows an AutoFilter hides still roll up), 4s px bars and 8s px
+  diamonds centred on y 14 (`s` = bar height / 14) with a 1 px panel outline,
+  in the kind's palette colour (the view's critical toggle applies). They take
+  the place of a manual summary's own rolled-up strip (`GanttBar::rollup`, a
+  different thing) while roll-up is on. The task's own `Rollup` flag (Task
+  Information) is still not drawn.
+- `show_splits`, `show_drawings` and `bar_text_date_format` are stored and
+  round-tripped only (no `Task.Split`, no drawings, and Project's 21
+  `PjDateFormat` samples are not in this repository). The harness state
+  reports `layout`, `bar_rects` (`<uid>:<x>:<y>:<w>:<h>`, chart px from the
+  first row's top) and `rolled_bars` (`<summary uid>:<children drawn>`); the
+  fixture's `fixture.layout` sets and clears the object
+  (`project-plugin-ui.uit`, not run on macOS). Not drawn: terminal `yppxy`,
+  row height following the bar height, the Layout dialog itself.
+
 ## Project timescale and Timeline pane (#1535)
 
 - `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days

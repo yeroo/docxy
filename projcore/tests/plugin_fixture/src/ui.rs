@@ -44,6 +44,10 @@
 //!   row 2 with other marks, one `view.task_bars` override of task 1 and
 //!   the `fixture.names` switch; a second press, seeing rows in the view,
 //!   clears both with null and leaves the switch on).
+//!   and `fixture.layout` (#1695: sets the Layout object through `view.layout`:
+//!   12 pt bars, roll-up on, round bars off, splits and drawings off and the
+//!   date format `1/28`; a second press, seeing a bar height in the view,
+//!   clears it with null).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565).
@@ -68,7 +72,8 @@ const MANIFEST: &str = r##"{
       {"id":"fixture.red","label":"Red","color":"#CC3333","preview":"fixture.red"}]},
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"},
-    {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"}]}]},
+    {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"},
+    {"id":"fixture.layout","kind":"button","label":"Layout (fixture)","tip":"Sets or clears the Layout dialog's chart settings (#1695)","keytip":"XL","icon":"table"}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
     {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
     {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]},
@@ -423,6 +428,23 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                        "end":{"shape":"circle","type":"dashed"},
                        "text":{"inside":"Name"}}],
                     "task_bars":[{"uid":1,"middle":{"color":"#33AA33"},"text":{"top":"Overridden"}}]}}"##
+                    .to_string()
+            }
+        }
+        // The Layout fields (#1695): set them, or, seeing a bar height in
+        // the view, clear them all.
+        "fixture.layout" => {
+            let set = req
+                .get("view")
+                .and_then(|v| v.get("layout"))
+                .and_then(|l| l.get("bar_height"))
+                .is_some_and(|h| !h.is_null());
+            if set {
+                r#"{"ops":[],"status":"Fixture: layout reset","view":{"layout":null}}"#.to_string()
+            } else {
+                r#"{"ops":[],"status":"Fixture: layout","view":{"layout":{"bar_height":12,
+                    "rollup":true,"hide_rollup_expanded":false,"round_bars":false,
+                    "show_splits":false,"show_drawings":false,"bar_text_date_format":"1/28"}}}"#
                     .to_string()
             }
         }

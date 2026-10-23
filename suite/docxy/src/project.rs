@@ -827,12 +827,50 @@ pub(super) fn project_state(
         "bars_drawn".into(),
         Json::Arr(bars_drawn(v, scale).into_iter().map(Json::Str).collect()),
     ));
+    // The Layout fields (#1695), the palette bars' rectangles in chart px as
+    // `<uid>:<x>:<y>:<w>:<h>` and each roll-up row as `<summary uid>:<count>`.
+    let mut layout = String::new();
+    v.ed.project().formatting.layout_json().write(&mut layout);
+    entries.push((
+        "layout".into(),
+        ctlcore::json::Json::parse(&layout).unwrap_or(ctlcore::json::Json::Null),
+    ));
+    let (rects, rolls) = layout_drawn(v, scale);
+    entries.push(("bar_rects".into(), Json::Arr(rects.into_iter().map(Json::Str).collect())));
+    entries.push(("rolled_bars".into(), Json::Arr(rolls.into_iter().map(Json::Str).collect())));
     entries.extend(project_cell_state(v));
     entries.extend(selection::selection_state(v));
     entries.extend(timeline_state(v));
     entries.push(("undo_depth".into(), Json::Num(v.ed.undo_depth() as f64)));
     entries.push(("redo_depth".into(), Json::Num(v.ed.redo_depth() as f64)));
     entries
+}
+
+/// What Layout changes in the palette drawing (#1695): each shown task's bar
+/// rectangle, `<uid>:<x>:<y>:<w>:<h>` with y from the top of the first row
+/// (the chart pixels `OverlayRow.bar` reports), and each summary row that
+/// rolls up, `<uid>:<children drawn>`.
+fn layout_drawn(v: &ProjectView, scale: GanttScale) -> (Vec<String>, Vec<String>) {
+    let tasks = &v.ed.project().tasks;
+    let (mut rects, mut rolls) = (Vec::new(), Vec::new());
+    for (row, t) in v
+        .ed
+        .display_rows()
+        .into_iter()
+        .filter_map(|i| tasks.get(i))
+        .enumerate()
+    {
+        let Some(bar) = gantt_bar(&v.ed, t, scale).map(|b| v.styled_bar(b)) else {
+            continue;
+        };
+        let (x, y, w, h) = bar_rect(&bar, scale.day_w);
+        let y = y + row as f32 * v.row_h();
+        rects.push(format!("{}:{x}:{y}:{w}:{h}", t.uid));
+        if let Some(children) = rolled_parts(&v.ed, t, scale, |b| v.styled_bar(b)) {
+            rolls.push(format!("{}:{}", t.uid, children.len()));
+        }
+    }
+    (rects, rolls)
 }
 
 /// The bar style rows drawn, `<uid>:<row>:<name>`: for each shown row, in

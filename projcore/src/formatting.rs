@@ -15,9 +15,9 @@ use opccore::xml::{Event, XmlParser};
 pub mod bars;
 pub mod gridlines;
 pub mod layout;
-pub use layout::Layout;
 pub use bars::{BarRow, BarText, Facts, Mark, Middle, TaskBar};
 pub use gridlines::{Gridline, Gridlines, LineType};
+pub use layout::Layout;
 
 /// The `.yppx` part the formatting is saved in.
 pub const PART: &str = "formatting.xml";
