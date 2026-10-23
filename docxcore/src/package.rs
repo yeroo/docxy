@@ -7047,13 +7047,14 @@ mod tests {
             .map(|m| m.rid)
             .collect();
         assert_eq!(rids, ["rId1", "rId2"]);
-        // An extent of an unmarked drawing doesn't size the next mark.
-        let xml = wrap(format!(
-            "{}{}",
-            drawing("Logo", Some("rIdLogo")).replace("127000", "999999"),
-            drawing("WordPictureWatermark1", Some("rId1"))
-        ));
-        assert_eq!(picture_watermarks(&xml)[0].width_pt, Some(10.0));
+        // An extent of an unmarked drawing doesn't size the next mark, which
+        // has none of its own.
+        let no_extent = drawing("WordPictureWatermark1", Some("rId1"))
+            .replace(r#"<wp:extent cx="127000" cy="127000"/>"#, "");
+        let xml = wrap(format!("{}{no_extent}", drawing("Logo", Some("rIdLogo"))));
+        let marks = picture_watermarks(&xml);
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].width_pt, marks[0].height_pt), (None, None));
     }
 
     #[test]
