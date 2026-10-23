@@ -2245,7 +2245,7 @@ impl Workbook {
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables
             .iter()
-            .find(|t| t.name.to_lowercase() == name.to_lowercase())
+            .find(|t| t.name.eq_ignore_ascii_case(name))
     }
 
     /// The table containing a cell, if any (for bare `[@Col]` references).

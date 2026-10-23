@@ -4400,7 +4400,7 @@ impl TableInfo {
         let col_of = |name: &str| -> Result<u32, ExcelError> {
             self.columns
                 .iter()
-                .position(|c| c.to_lowercase() == name.to_lowercase())
+                .position(|c| c.eq_ignore_ascii_case(name))
                 .map(|i| c1 + i as u32)
                 .ok_or(ref_err)
         };
