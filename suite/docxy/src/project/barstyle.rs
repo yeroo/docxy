@@ -67,7 +67,7 @@ impl PaletteLook {
     pub fn of(bar: Option<GanttBar>, palette: Option<&projcore::uiplugin::Palette>) -> Self {
         match bar {
             Some(b) => {
-                let (color, shape) = bar_look(b.kind, palette);
+                let (color, shape) = bar_look_of(b, palette);
                 PaletteLook {
                     color,
                     shape,
