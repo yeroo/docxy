@@ -2983,6 +2983,10 @@ pub fn date_unrepresentable(xf: &Xf, value: &CellValue, date1904: bool) -> bool 
 /// Render a cell value through its full style: the real format-code runtime
 /// when the code is known and renderable, the classified approximation
 /// otherwise. A date or time that cannot be shown is [`UNREPRESENTABLE`].
+/// A text value always shows whole, but what its format adds (a value
+/// repeated by many `@`, literals) is cut where the result passes
+/// [`crate::entry::MAX_CELL_CHARS`] UTF-16 units, or the value's own length
+/// when a loaded value is longer, so nothing past that is built.
 pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
     if date_unrepresentable(xf, value, date1904) {
         return UNREPRESENTABLE.to_string();
@@ -2995,7 +2999,10 @@ pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
                         return s;
                     }
                 }
-                CellValue::Text(s) => return fmt.format_text(s),
+                CellValue::Text(s) => {
+                    let cap = crate::entry::MAX_CELL_CHARS.max(s.encode_utf16().count());
+                    return fmt.format_text_truncated(s, cap);
+                }
                 _ => {}
             }
         }
@@ -3185,6 +3192,50 @@ mod tests {
                 (7, 900),
                 (1_048_575, 16_383)
             ]
+        );
+    }
+
+    #[test]
+    fn format_with_caps_an_at_repeating_format() {
+        use crate::entry::MAX_CELL_CHARS;
+        let coded = |code: String| Xf {
+            numfmt: classify_format_code(&code),
+            code: Some(code),
+            ..Xf::default()
+        };
+        // 2,000 `@` on a full-length value would be 65.5 M units uncapped.
+        let value = "x".repeat(MAX_CELL_CHARS);
+        let out = format_with(
+            &coded("@".repeat(2000)),
+            &CellValue::Text(value.as_str().into()),
+            false,
+        );
+        assert_eq!(out.encode_utf16().count(), MAX_CELL_CHARS);
+        assert_eq!(out, value);
+        // Never built past the cap: at most 4 bytes a unit, plus growth.
+        assert!(
+            out.capacity() <= 4 * MAX_CELL_CHARS * 2,
+            "{}",
+            out.capacity()
+        );
+        // A loaded value longer than a cell may hold still shows whole;
+        // only what the format adds is cut.
+        let long = "y".repeat(40_000);
+        let long_cell = CellValue::Text(long.as_str().into());
+        assert_eq!(
+            format_with(&coded("General".into()), &long_cell, false),
+            long
+        );
+        assert_eq!(format_with(&coded("@".into()), &long_cell, false), long);
+        assert_eq!(format_with(&coded("@@".into()), &long_cell, false), long);
+        // A small result renders whole.
+        assert_eq!(
+            format_with(
+                &coded("\"<\"@@\">\"".to_string()),
+                &CellValue::Text("ab".into()),
+                false
+            ),
+            "<abab>"
         );
     }
 
