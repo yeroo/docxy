@@ -622,6 +622,45 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(style.bold, Some(true));
     assert_eq!(style.strikethrough, Some(true));
     assert_eq!(style.pattern.as_deref(), Some("dark-diagonal-left"));
+    // The cursor cell is the selection's first uid and first column
+    // (#1756): a range Name..Duration on task 3 whose cursor is on Duration
+    // (not bold) turns bold on; the same range with the cursor on Name
+    // (bold) turns it off.
+    let range = |cursor_col: &str| {
+        Selection::cursor_first(
+            Some(3),
+            Some(cursor_col.into()),
+            [3],
+            ["Name".to_string(), "Duration".to_string()],
+        )
+    };
+    let bold_name = Json::parse(r#"{"cells":[{"uid":3,"column":"Name","bold":true}]}"#).unwrap();
+    for (cursor_col, checked, status) in [
+        ("Duration", false, "Fixture: bold on"),
+        ("Name", true, "Fixture: bold off"),
+    ] {
+        let state = ui
+            .state(&StateCtx {
+                view: bold_name.clone(),
+                selection: range(cursor_col),
+                ..ctx(Vec::new(), None)
+            })
+            .unwrap();
+        assert_eq!(
+            state.control("fixture.bold").checked,
+            Some(checked),
+            "{cursor_col}"
+        );
+        let done = ui
+            .command(&Command {
+                view: bold_name.clone(),
+                selection: range(cursor_col),
+                ..cmd("fixture.bold", Vec::new(), None)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status.as_deref(), Some(status), "{cursor_col}");
+    }
     let renamed = ui
         .command(&cmd("fixture.rename", vec![3, 4], None))
         .unwrap()

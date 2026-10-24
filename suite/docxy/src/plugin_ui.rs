@@ -412,7 +412,8 @@ fn flags_of(v: &ProjectView) -> (bool, bool, bool) {
     (v.show_critical, v.show_baseline, v.timeline)
 }
 
-/// The table's selection: the cursor's task first, then the range's.
+/// The table's selection: the cursor's task and column first, then the
+/// range's (#1756).
 fn selection_of(v: &ProjectView) -> Selection {
     let column = |c: usize| {
         crate::COLUMNS
@@ -421,21 +422,11 @@ fn selection_of(v: &ProjectView) -> Selection {
             .unwrap_or_default()
             .to_string()
     };
-    let cursor = v.selected_uid();
-    match v.selection() {
-        Some(sel) => {
-            let mut uids: Vec<i32> = cursor.into_iter().collect();
-            uids.extend(sel.uids.iter().copied().filter(|u| Some(*u) != cursor));
-            Selection {
-                uids,
-                cols: sel.cols.clone().map(column).collect(),
-            }
-        }
-        None => Selection {
-            uids: cursor.into_iter().collect(),
-            cols: vec![column(v.col)],
-        },
-    }
+    let (uids, cols) = match v.selection() {
+        Some(sel) => (sel.uids, sel.cols.map(column).collect()),
+        None => (Vec::new(), Vec::new()),
+    };
+    Selection::cursor_first(v.selected_uid(), Some(column(v.col)), uids, cols)
 }
 
 /// `yppx_ui_state` for the view as it is, asked again only when the plan's

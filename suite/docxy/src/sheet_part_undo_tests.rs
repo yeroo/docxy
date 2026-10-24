@@ -87,7 +87,7 @@ fn undoing_format_as_table_takes_the_table_part_out_of_the_saved_file() {
     assert!(v.undo_step());
     let saved = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
     assert!(saved.workbook.tables.is_empty());
-    assert!(!saved.part("xl/tables/table1.xml").is_some());
+    assert!(saved.part("xl/tables/table1.xml").is_none());
     assert!(v.redo_step());
     assert!(saved_has_table(&v));
 }

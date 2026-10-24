@@ -1090,11 +1090,38 @@ impl Manifest {
 pub struct Selection {
     /// The selected tasks' uids, the cursor's first.
     pub uids: Vec<i32>,
-    /// The selected columns by heading.
+    /// The selected columns by heading, the cursor's first (#1756), then the
+    /// range's others left to right; a plugin reads the cursor cell as the
+    /// first uid's first column.
     pub cols: Vec<String>,
 }
 
 impl Selection {
+    /// The selection a host sends: the cursor's task and column first, then
+    /// the range's others in order, each listed once (#1756).
+    pub fn cursor_first(
+        cursor_uid: Option<i32>,
+        cursor_col: Option<String>,
+        uids: impl IntoIterator<Item = i32>,
+        cols: impl IntoIterator<Item = String>,
+    ) -> Selection {
+        let mut sel = Selection {
+            uids: cursor_uid.into_iter().collect(),
+            cols: cursor_col.into_iter().collect(),
+        };
+        for u in uids {
+            if !sel.uids.contains(&u) {
+                sel.uids.push(u);
+            }
+        }
+        for c in cols {
+            if !sel.cols.contains(&c) {
+                sel.cols.push(c);
+            }
+        }
+        sel
+    }
+
     /// From the `selection` object of a request.
     pub fn from_json(v: &Json) -> Selection {
         Selection {
@@ -2071,6 +2098,24 @@ pub fn parse_shapes(json: &str) -> Result<Vec<Shape>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_selection_lists_the_cursor_task_and_column_first() {
+        let names = |c: &[&str]| c.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        let sel = super::Selection::cursor_first(
+            Some(4),
+            Some("Duration".into()),
+            [2, 3, 4, 5],
+            names(&["Name", "Duration", "Start"]),
+        );
+        assert_eq!(sel.uids, vec![4, 2, 3, 5]);
+        assert_eq!(sel.cols, names(&["Duration", "Name", "Start"]));
+        // A cursor column the range lacks still comes first; none adds nothing.
+        let sel = super::Selection::cursor_first(None, Some("Start".into()), [1], names(&["Name"]));
+        assert_eq!((sel.uids, sel.cols), (vec![1], names(&["Start", "Name"])));
+        let sel = super::Selection::cursor_first(Some(1), None, [], names(&["Name"]));
+        assert_eq!((sel.uids, sel.cols), (vec![1], names(&["Name"])));
+    }
+
     use super::*;
 
     #[test]
