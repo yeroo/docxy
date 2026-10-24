@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven` and `milestone` booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, marked?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven`, `milestone` and `marked` (Project's Marked flag, #1667, saved in `.yppx` only) booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -36,6 +36,7 @@
 //! | `resource.set` | `{uid, name?, type?, …the same fields}` | the updated resource (#1588): `null` or `""` clears an optional text or rate; `type` changes only while the resource has no assignments; a rate edit keeps cost rate table A's current row, and a `max_units` edit the availability period in effect, in step |
 //! | `resource.del` | `{uid}` | `{deleted, assignments: [uid…]}` (#1588): its assignments go with it, each as the Resource Names cell removes a name, and its own derived calendar when nothing else uses it; later resources move up one ID |
 //! | `proj.get` | `{}` | the plan's settings (#1587): `{title, start, finish, status_date, current_date, calendar: {uid, name}, calendars: [{uid, name}], new_tasks}` (dates `YYYY-MM-DD HH:MM`, the status and current dates `null` when unset, `calendars` the base calendars, `new_tasks` `auto` or `manual`: how tasks added to the plan are scheduled, #1585) |
+//! | `proj.highlight` | `{field, values}`, `{field, values: null}`, `{clear: true}` or `{}` | `{highlight: [{field, values}]}` (#1667): highlight the rows whose `field` reads one of `values` (the AutoFilter's spec grammar: a value as shown, `(Blanks)`, `YYYY[-MM[-DD]]` on a date column; columns AND), clear one column, clear all, or read. View state like the AutoFilter, hiding nothing and no edit of the plan (not in `MUTATING`) |
 //! | `level.all` | `{}` | `{leveled: true, overallocated}` (#1589): show the plan leveled, as Resource > Level > Level All's display overlay; `overallocated` counts the work resources still booked past their capacity. Not an undo step: the overlay is a display setting |
 //! | `level.clear` | `{}` | `{leveled: false, overallocated}` (#1589): show the plan as scheduled again. With `{uids: [uid…]}` or `{all: true}` (#1594) it is Clear Leveling as a plan edit instead: the tasks' stored `LevelingDelay` and pre-leveled dates are removed, one undo step, replying `{cleared, overallocated}` |
 //! | `level.overallocations` | `{}` | `{count, resources: [{uid, name, max_units, peak_units, first}]}` (#1589): the work resources booked past their capacity on the plan as shown, each with its peak (1.0 = 100%) and the first overallocated instant, earliest first (Next Overallocation) |
@@ -172,6 +173,7 @@ pub fn is_editor_verb(verb: &str) -> bool {
         || matches!(
             verb,
             "proj.get"
+                | "proj.highlight"
                 | "task.list"
                 | "task.get"
                 | "task.fields"
@@ -220,6 +222,7 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
     Some(match verb {
         "proj.get" => Ok(proj_get(ed)),
         "proj.set" => proj_set(ed, args),
+        "proj.highlight" => proj_highlight(ed, args),
         "task.list" => task_list(ed, args),
         "task.get" => task_get(ed, args),
         "task.fields" => Ok(task_fields()),
@@ -790,6 +793,8 @@ struct TaskInfoArgs {
     effort_driven: Option<bool>,
     notes: Option<String>,
     milestone: Option<bool>,
+    /// Project's Marked flag (#1667).
+    marked: Option<bool>,
     /// `Some(None)` is the project's calendar.
     calendar: Option<Option<i32>>,
     ignore_resource_calendar: Option<bool>,
@@ -835,6 +840,7 @@ impl TaskInfoArgs {
             || self.effort_driven.is_some()
             || self.notes.is_some()
             || self.milestone.is_some()
+            || self.marked.is_some()
             || self.calendar.is_some()
             || self.ignore_resource_calendar.is_some()
             || self.wbs.is_some()
@@ -1050,6 +1056,7 @@ impl TaskInfoArgs {
             effort_driven: flag("effort_driven")?,
             notes: text("notes")?,
             milestone: flag("milestone")?,
+            marked: flag("marked")?,
             calendar,
             ignore_resource_calendar: flag("ignore_resource_calendar")?,
             wbs: text("wbs")?,
@@ -1184,6 +1191,9 @@ impl TaskInfoArgs {
         if let Some(notes) = &self.notes {
             ed.set_notes(uid, &projcore::text::notes_from_line(notes))?;
         }
+        if let Some(on) = self.marked {
+            ed.set_marked(uid, on)?;
+        }
         for (field, text) in &self.custom {
             ed.set_custom_field(uid, *field, text)?;
         }
@@ -1251,6 +1261,58 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         Ok(())
     })?;
     task_reply(ed, uid, asked.as_deref())
+}
+
+/// `proj.highlight` (#1667): the highlight, view state that is no edit of
+/// the plan (not in [`MUTATING`]). `{field, values: [..]}` highlights the
+/// rows whose `field` reads one of `values` (the AutoFilter's spec grammar:
+/// a value as shown, `(Blanks)`, `YYYY[-MM[-DD]]` on a date column);
+/// `values: null` clears that column; `{clear: true}` clears all; `{}`
+/// reads. Every call replies with the highlight as it now stands.
+fn proj_highlight(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let clear = match args.get("clear") {
+        None | Some(Json::Null) => false,
+        Some(c) => c.as_bool().ok_or("'clear' must be true or false")?,
+    };
+    if clear {
+        ed.clear_highlight();
+    } else if let Some(name) = args.get("field") {
+        let name = name.as_str().ok_or("'field' must be a task field name")?;
+        let field = Field::parse(name)?;
+        match args.get("values") {
+            None => return Err("'values' must be a list of values, or null to clear".into()),
+            Some(Json::Null) => ed.set_highlight(field, None),
+            Some(Json::Arr(values)) => {
+                let specs = values
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or("'values' must be a list of values, or null to clear")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let allowed = ed.highlight_texts(field, &specs)?;
+                ed.set_highlight(field, Some(allowed));
+            }
+            Some(_) => return Err("'values' must be a list of values, or null to clear".into()),
+        }
+    } else if args.get("values").is_some() {
+        return Err("'values' needs a 'field'".into());
+    }
+    let highlight = ed
+        .highlights()
+        .into_iter()
+        .map(|(field, allowed)| {
+            Json::obj(vec![
+                ("field", Json::Str(field.name())),
+                (
+                    "values",
+                    Json::Arr(allowed.iter().map(|t| Json::Str(t.clone())).collect()),
+                ),
+            ])
+        })
+        .collect();
+    Ok(Json::obj(vec![("highlight", Json::Arr(highlight))]))
 }
 
 /// `proj.get`: the plan's settings (#1587).
@@ -3907,6 +3969,46 @@ mod tests {
         }
     }
 
+    /// Marked (#1667): `task.set {marked}` is one undo step, the same value
+    /// again none, and the `Marked` field reads it back.
+    #[test]
+    fn task_set_marks_a_task_as_one_step() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let set = |a: &mut Editor, on: bool| {
+            dispatch_editor(
+                a,
+                "task.set",
+                &Json::obj(vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("marked", Json::Bool(on)),
+                    ("fields", Json::Arr(vec![Json::Str("Marked".into())])),
+                ]),
+            )
+            .unwrap()
+        };
+        let depth = a.undo_depth();
+        let r = set(&mut a, true).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        assert_eq!(a.project().task(uid as i32).unwrap().marked, Some(true));
+        let marked = r.get("fields").and_then(|f| f.get("Marked")).unwrap();
+        assert_eq!(marked.get_str("text"), Some("Yes"));
+        set(&mut a, true).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1, "unchanged is no step");
+        assert!(set(&mut a, false).is_ok());
+        assert_eq!(a.project().task(uid as i32).unwrap().marked, Some(false));
+        let bad = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("marked", Json::Str("yes".into())),
+            ]),
+        )
+        .unwrap();
+        assert!(bad.is_err());
+    }
+
     /// The Task Information fields (#1550): every argument applies in the
     /// one undo step, and a refused one undoes them all.
     #[test]
@@ -4216,6 +4318,85 @@ it"
         });
         p.resources = vec![ann, resource(2, "Bob", "30")];
         Editor::new(p)
+    }
+
+    /// `proj.highlight` (#1667): an editor verb that changes no plan, so a
+    /// plugin command's ops and both hosts' control reach it without a
+    /// dirty mark.
+    #[test]
+    fn proj_highlight_sets_reads_and_clears_the_highlight() {
+        assert!(is_editor_verb("proj.highlight"));
+        assert!(!MUTATING.contains(&"proj.highlight"));
+        assert!(!mutates(
+            "proj.highlight",
+            &Json::parse(r#"{"clear":true}"#).unwrap()
+        ));
+        let mut ed = Editor::new(new_project());
+        let name = ed
+            .project()
+            .tasks
+            .iter()
+            .find(|t| !t.is_null && !t.is_project_summary())
+            .unwrap()
+            .name
+            .clone();
+        let empty = run(&mut ed, "proj.highlight", "{}").unwrap();
+        assert_eq!(empty.to_string(), r#"{"highlight":[]}"#);
+        let depth = ed.undo_depth();
+        let dirty = ed.dirty();
+        let set = run(
+            &mut ed,
+            "proj.highlight",
+            &format!(r#"{{"field":"name","values":["{}"]}}"#, name.to_uppercase()),
+        )
+        .unwrap();
+        assert_eq!(
+            set.to_string(),
+            format!(r#"{{"highlight":[{{"field":"Name","values":["{name}"]}}]}}"#)
+        );
+        assert_eq!((ed.undo_depth(), ed.dirty()), (depth, dirty));
+        assert!(ed.highlighted_rows().iter().any(|h| *h));
+        assert_eq!(run(&mut ed, "proj.highlight", "{}").unwrap(), set);
+        assert!(
+            run(
+                &mut ed,
+                "proj.highlight",
+                r#"{"field":"Name","values":["nope"]}"#
+            )
+            .is_err()
+        );
+        assert!(run(&mut ed, "proj.highlight", r#"{"field":"Name"}"#).is_err());
+        assert!(run(&mut ed, "proj.highlight", r#"{"values":[]}"#).is_err());
+        assert!(run(&mut ed, "proj.highlight", r#"{"field":"Nope","values":[]}"#).is_err());
+        let cleared = run(
+            &mut ed,
+            "proj.highlight",
+            r#"{"field":"Name","values":null}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.to_string(), r#"{"highlight":[]}"#);
+        run(
+            &mut ed,
+            "proj.highlight",
+            &format!(r#"{{"field":"Name","values":["{name}"]}}"#),
+        )
+        .unwrap();
+        let all = run(&mut ed, "proj.highlight", r#"{"clear":true}"#).unwrap();
+        assert_eq!(all.to_string(), r#"{"highlight":[]}"#);
+        // As a plugin command's op: kept, no undo step.
+        apply_ops(
+            &mut ed,
+            &[projcore::uiplugin::Op {
+                verb: "proj.highlight".into(),
+                args: projcore::json::Json::parse(&format!(
+                    r#"{{"field":"Name","values":["{name}"]}}"#
+                ))
+                .unwrap(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(ed.highlights().len(), 1);
+        assert_eq!(ed.undo_depth(), depth);
     }
 
     #[test]

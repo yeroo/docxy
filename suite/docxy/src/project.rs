@@ -713,6 +713,23 @@ fn row_categories_lines(
         .collect()
 }
 
+/// The changed cells for the harness state (#1667): computed whenever a
+/// plugin opts `Changed Cells` in, styled or not; `[]` otherwise.
+fn changed_cells_json(v: &ProjectView) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    if !crate::plugin_ui::any() || !crate::plugin_ui::optins().changed_cells {
+        return Json::Arr(Vec::new());
+    }
+    Json::Arr(changed_cells_lines(v))
+}
+
+fn changed_cells_lines(v: &ProjectView) -> Vec<ctlcore::json::Json> {
+    crate::plugin_ui::changed_cells(v)
+        .iter()
+        .map(|(uid, column)| ctlcore::json::Json::Str(format!("{uid}:{column}")))
+        .collect()
+}
+
 /// The plan's cell text styles for the harness state (#1664).
 fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
     let mut text = String::new();
@@ -840,6 +857,9 @@ pub(super) fn project_state(
         // The text style categories of each shown task row (#1665), as
         // `<uid>:<cat>|<cat>...`, while a UI plugin is loaded.
         ("row_categories".into(), row_categories_json(v)),
+        // The grid cells the last change of the plan changed (#1667), as
+        // `<uid>:<column>`, while a UI plugin opts `Changed Cells` in.
+        ("changed_cells".into(), changed_cells_json(v)),
         // The cells' own text styles (#1664), each `{uid, column, ..style}`.
         (
             "cell_styles".into(),

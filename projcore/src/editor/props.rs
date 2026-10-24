@@ -129,6 +129,11 @@ impl Editor {
         self.set_bar_flag(uid, on, |t| &mut t.display_on_timeline)
     }
 
+    /// Set Marked (#1667; saved in the `.yppx` marked part only).
+    pub fn set_marked(&mut self, uid: i32, on: bool) -> Result<bool, String> {
+        self.set_bar_flag(uid, on, |t| &mut t.marked)
+    }
+
     /// A task's yes/no flag that is off when absent: one undo step, and
     /// `Ok(false)` when it already reads `on`.
     fn set_bar_flag(

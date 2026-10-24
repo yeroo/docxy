@@ -323,8 +323,18 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(m.palettes.len(), 2);
     assert_eq!(
         m.text_style_categories,
-        ["Fixture Tasks", "Late Tasks", "Placeholder Tasks"]
+        [
+            "Fixture Tasks",
+            "Late Tasks",
+            "Placeholder Tasks",
+            "External Tasks",
+            "Marked Tasks",
+            "Highlighted Tasks",
+            "Changed Cells"
+        ]
     );
+    assert_eq!(m.menus[0].items[1].id, "fixture.mark");
+    assert_eq!(m.menus[0].items[1].after, "Rename (fixture)");
 
     // State: the toggle off, the row item disabled without a selection,
     // the blue palette checked; a Task Information prefill by uid.
@@ -624,6 +634,44 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         renamed.status.as_deref(),
         Some("Fixture: renamed task 3 of 2 selected")
     );
+    // #1667: the mark command's two ops, then the three styles it views.
+    let marked = ui
+        .command(&cmd("fixture.mark", vec![3], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(marked.status.as_deref(), Some("Fixture: marked task 3"));
+    assert_eq!(marked.ops.len(), 2);
+    assert_eq!(marked.ops[0].verb, "task.set");
+    assert_eq!(marked.ops[0].args.int("uid"), Some(3));
+    assert_eq!(marked.ops[0].args.get("marked"), Some(&Json::Bool(true)));
+    assert_eq!(marked.ops[0].args.text("duration"), "3d");
+    assert_eq!(marked.ops[1].verb, "proj.highlight");
+    assert_eq!(marked.ops[1].args.text("field"), "Name");
+    assert_eq!(
+        marked.ops[1].args.get("values"),
+        Some(&Json::Arr(vec![Json::str("B")]))
+    );
+    let mut formatting = projcore::formatting::Formatting::default();
+    formatting
+        .apply_view(marked.view.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        formatting.category("Marked Tasks").unwrap().bold,
+        Some(true)
+    );
+    assert_eq!(
+        formatting.category("Highlighted Tasks").unwrap().background,
+        Some(0xFFFF99)
+    );
+    assert_eq!(
+        formatting.category("Changed Cells").unwrap().color,
+        Some(0xC00000)
+    );
+    let unmarked = ui
+        .command(&cmd("fixture.mark", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert!(unmarked.ops.is_empty());
     let none = ui
         .command(&cmd("fixture.rename", vec![], None))
         .unwrap()

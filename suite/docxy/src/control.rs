@@ -264,7 +264,11 @@ pub(crate) fn project_verb(
                 };
                 let result = projctl::dispatch_editor(&mut v.ed, verb, args)
                     .expect("recognized editor verb")?;
-                let mut effect = Effect::default();
+                // A highlight (#1667) is view state: no edit, but redrawn.
+                let mut effect = Effect {
+                    repaint: verb == "proj.highlight",
+                    ..Effect::default()
+                };
                 if projctl::mutates(verb, args) {
                     tab.dirty = v.ed.dirty();
                     crate::bump_edit_generation();

@@ -36,11 +36,13 @@
 pub mod assign;
 pub mod datetime;
 pub mod editor;
+pub mod flagpart;
 pub mod formats;
 pub mod formatting;
 pub mod gantt;
 pub mod json;
 pub mod leveling;
+pub mod marked;
 pub mod model;
 pub mod mspdi;
 pub mod plugin_abi;

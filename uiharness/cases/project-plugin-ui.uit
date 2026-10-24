@@ -549,7 +549,8 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   assert reply.items.20.label is Rename (fixture)
   assert reply.items.20.plugin is true
   assert reply.items.20.enabled is true
-  assert reply.items.21.label is Add to Timeline
+  assert reply.items.21.label is Mark (fixture)
+  assert reply.items.22.label is Add to Timeline
   call menu-click {"label":"Rename (fixture)"}
   assert selected_name is Renamed by fixture
   assert status is Fixture: renamed task 2
@@ -573,6 +574,38 @@ test the row menu's item comes after Notes..., needs a task and renames it as on
   assert reply.items.20.label is Rename (fixture)
   assert reply.items.20.enabled is false
   key escape
+
+test the mark command styles marked, highlighted rows and the cells its change changed
+  # #1667: the fixture names Marked Tasks, Highlighted Tasks, External
+  # Tasks and Changed Cells in its text_style_categories, so the host
+  # computes them. `fixture.mark` (a row-menu item after Rename) marks the
+  # first selected task, makes it 3 days long (2 before), highlights it by
+  # name and styles the three categories, in one undo step. A 3-day A is the
+  # project's critical path and leaves B (2 days, unlinked) with slack; the
+  # changed cells are A's Duration and Finish, never the ID. Pinned by the
+  # suite's `the_fixture_mark_command_on_the_harness_plan` test.
+  open copy:../fixtures/project-clipboard.xml
+  assert changed_cells is []
+  click C1
+  assert selected_name is A
+  call menu-open {"target":{"row":1}}
+  call menu-click {"label":"Mark (fixture)"}
+  assert status is Fixture: marked task 1
+  assert dirty is true
+  assert row_categories.0 is 1:All|Critical Tasks|Marked Tasks|Highlighted Tasks
+  assert row_categories.1 is 2:All|Noncritical Tasks
+  assert changed_cells.0 is 1:Duration
+  assert changed_cells.1 is 1:Finish
+  shot window
+  # Undo is a change too: it reports the same cells back, and the
+  # highlight (view state) stays while the mark goes.
+  key ctrl+z
+  assert row_categories.0 is 1:All|Critical Tasks|Highlighted Tasks
+  assert changed_cells.0 is 1:Duration
+  assert changed_cells.1 is 1:Finish
+  call proj.highlight {"clear":true}
+  assert reply.highlight is []
+  assert row_categories.0 is 1:All|Critical Tasks
 
 test the chart menu opens beside the bars with Project's unbuilt items greyed
   open copy:../fixtures/project-clipboard.xml

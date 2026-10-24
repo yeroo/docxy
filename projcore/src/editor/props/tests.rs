@@ -395,3 +395,27 @@ fn custom_fields_set_from_text_by_the_plans_definitions() {
     assert!(ed.undo());
     assert_eq!(read(&ed, "Text2"), "north wing");
 }
+
+/// Marked (#1667): one undo step, none when unchanged, read as the
+/// `Marked` field (`No` when absent).
+#[test]
+fn marked_is_one_step_and_reads_as_its_field() {
+    use crate::editor::{Field, FieldReader, FieldValue};
+    let mut ed = editor();
+    let read = |ed: &Editor| {
+        let task = ed.project().task(2).unwrap().clone();
+        let r = FieldReader::new(ed).read(&task, Field::Marked);
+        (r.text, r.value)
+    };
+    assert_eq!(Field::parse("marked"), Ok(Field::Marked));
+    assert_eq!(read(&ed), ("No".into(), FieldValue::Bool(false)));
+    assert_eq!(ed.set_marked(2, false), Ok(false));
+    assert_eq!(ed.undo_depth(), 0);
+    assert_eq!(ed.set_marked(2, true), Ok(true));
+    assert_eq!(ed.set_marked(2, true), Ok(false));
+    assert_eq!(ed.undo_depth(), 1);
+    assert_eq!(read(&ed), ("Yes".into(), FieldValue::Bool(true)));
+    assert!(ed.undo());
+    assert_eq!(ed.project().task(2).unwrap().marked, None);
+    assert!(ed.set_marked(99, true).is_err());
+}

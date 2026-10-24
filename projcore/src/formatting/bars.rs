@@ -333,8 +333,8 @@ pub fn clamp_row(n: i64) -> u8 {
 }
 
 /// What a task is, for `Show For ... Tasks`. The editor builds it
-/// (`Editor::bar_facts`); a category the plan holds no data for
-/// (`Marked`, the Task Path kinds) is never true.
+/// (`Editor::bar_facts`); a category the plan holds no data for (the
+/// Task Path kinds) is never true.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Facts {
     pub summary: bool,
@@ -345,6 +345,8 @@ pub struct Facts {
     pub external: bool,
     /// Status reads `Late`.
     pub late: bool,
+    /// The task's Marked flag (#1667).
+    pub marked: bool,
     /// Bit `n - 1` is `Flag<n>`.
     pub flags: u32,
 }
@@ -371,6 +373,7 @@ impl Facts {
             "auto" | "automatically scheduled" => !self.manual,
             "external" | "external task" | "external tasks" => self.external,
             "late" => self.late,
+            "marked" | "marked tasks" => self.marked,
             _ => c
                 .strip_prefix("flag")
                 .and_then(|n| n.parse::<u32>().ok())

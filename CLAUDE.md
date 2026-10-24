@@ -755,6 +755,50 @@
   included (a hatch may jog at column rules). Without one the row draws as
   before. The inactive dim and strike stay on the row.
 
+## Text style categories that need a model feature (#1667)
+
+- `Task::marked` (Project's Marked, `Field::Marked` Yes/No,
+  `Editor::set_marked`, projctl `task.set {marked}`) is saved only in the
+  `.yppx` part `marked.xml`, as Display on Timeline is in `timeline.xml`:
+  both are a `flagpart::TaskFlagPart` (one `<task uid attr>` per stating
+  task, written only when one states a value, an unreadable part kept as a
+  retained extra) and `yppx::FLAG_PARTS` writes them in order, so a plan
+  without marks saves byte-identically. Bar Styles `Marked` reads it.
+- Highlight (View > Highlight, no UI yet) is view state beside the
+  AutoFilter: `Editor::set_highlight` / `clear_highlight` /
+  `is_highlighted(_by)` / `highlighted_rows`, the filters' checklists
+  without the summary rule or any hiding; blank rows and UID 0 never.
+  projctl `proj.highlight` (`{field, values}` / `values: null` / `{clear:
+  true}` / `{}` reads, `filter_texts`' spec grammar) is an editor verb not
+  in `MUTATING`: a plugin command's op or control, no dirty mark, the suite
+  repaints. A batch that ends Ok with the plan unchanged keeps it and moves
+  the revision; a refused batch drops it.
+- Changed cells: every change of the plan (edit, batch step, undo, redo)
+  keeps the plan it started from, with that moment's schedule and leveling
+  overlay, as a read-only editor (`Editor::frozen`, `last_change`), and
+  `Editor::changed_cells(fields)` lists each field whose display text
+  differs, for tasks not blank before and now (a new task has none). A
+  change of only the formatting or the table view keeps the record (the
+  Text Styles OK that styles Changed Cells must not clear them), a refused
+  batch restores it, a save keeps it, `replace_project` drops it; a
+  leveling toggle does not touch it (known limit: the record keeps the
+  overlay it had). Unmeasured against Project, undo included.
+- The suite (`plugin_ui`): `Optins` adds `external`, `marked`,
+  `highlighted`, `changed_cells`; row order ends Placeholder, Late,
+  External (`external_task == Some(true)`, summaries too), Marked,
+  Highlighted, Inactive, and `row_style` narrows each to a styled one.
+  `Changed Cells` is per cell: `cell_style` lays it over the row's style,
+  under the cell's own (`changed_cell_style`), for the grid columns but ID
+  (the row header, which also renumbers), read through `changed_cells(v)`
+  once per `Editor::revision`. The harness state's `changed_cells`
+  (`<uid>:<column>`) is computed whenever a plugin opts in, styled or not.
+  The fixture's row-menu `fixture.mark` marks, lengthens and highlights the
+  first selected task and styles the three (`project-plugin-ui.uit`, not
+  run on macOS; pinned by `the_fixture_mark_command_on_the_harness_plan`).
+  Not done: the Highlight dropdown and named filters, a Marked column,
+  Marked from `.mpp`, ghost rows for cross-project links with no
+  ExternalTask row, terminal `yppxy` drawing.
+
 ## Timescale tier text styles (#1666)
 
 - The Gantt header's two tiers draw by the plan's text styles, as its
@@ -1425,9 +1469,9 @@
   row listing one shows for no task. A JSON array entry holding a comma list
   is split like the XML attribute. `Facts` is built by `Editor::bar_facts`
   (Normal, Milestone, Summary, Critical, Noncritical, Active, Inactive,
-  Manual, Auto, External, Late = Status text, Flag1..20 read only when a row
-  names one). `Marked` and the Task Path kinds have no plan data: they parse
-  and never match. `Editor::bar_date` resolves From/To (empty = Start /
+  Manual, Auto, External, Late = Status text, Marked = `Task::marked`
+  (#1667), Flag1..20 read only when a row names one). The Task Path kinds
+  have no plan data: they parse and never match. `Editor::bar_date` resolves From/To (empty = Start /
   Finish; `Task Start`/`Task Finish`; any `Field` date name; `CompleteThrough`
   = the task's `stop`, else start plus its percent complete of the span, which
   is unmeasured against Project); a task without the date draws no such row.

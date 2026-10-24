@@ -22,6 +22,7 @@ mod barfacts;
 pub use barfacts::{BarDateKind, is_own_date};
 mod batch;
 mod cells;
+mod changes;
 mod effort;
 mod fields;
 mod links;
@@ -145,6 +146,10 @@ pub struct Editor {
     /// the model, history and saved files (see [`Self::display_rows`]).
     sort: Option<Sort>,
     filters: Vec<display::Filter>,
+    /// The highlighted columns' checklists (#1667): view state like
+    /// `filters`, matched the same way but hiding nothing
+    /// ([`Self::is_highlighted`]).
+    highlights: Vec<display::Filter>,
     /// The displayed rows (uids) and the selection's place in them, as they
     /// were just before the edit in flight, while a filter is on: where a
     /// selection the edit hides goes ([`Self::sel_into_display`]).
@@ -170,6 +175,14 @@ pub struct Editor {
     /// edit, undo, redo, a replaced project), so a host can cache what it
     /// derives from the plan by it ([`Self::revision`]).
     revision: u64,
+    /// The plan as it was before the last change of it (#1667): a read-only
+    /// editor over that plan, its schedule and leveling overlay, which
+    /// [`Self::changed_cells`] compares with. A change of the formatting or
+    /// the table view alone keeps it; a new document has none.
+    last_change: Option<Box<Editor>>,
+    /// The state the edit in flight started from, until [`Self::changed`]
+    /// settles it into `last_change`.
+    change_from: Option<Box<Editor>>,
 }
 
 impl Editor {
@@ -181,6 +194,12 @@ impl Editor {
     pub fn restored(mut proj: Project, dirty: bool) -> Self {
         recompute_summaries(&mut proj);
         let sched = schedule(&proj);
+        Self::assembled(proj, sched, dirty)
+    }
+
+    /// An editor over `proj` and its already computed schedule, with no
+    /// history or view state.
+    fn assembled(proj: Project, sched: Schedule, dirty: bool) -> Self {
         // The project summary row is hidden: start on the first real row.
         let sel = usize::from(
             proj.tasks.len() > 1 && proj.tasks.first().is_some_and(|t| t.is_project_summary()),
@@ -195,6 +214,7 @@ impl Editor {
             sel_pinned: false,
             sort: None,
             filters: Vec::new(),
+            highlights: Vec::new(),
             pre_view: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -207,6 +227,8 @@ impl Editor {
             pending: None,
             batching: false,
             revision: 0,
+            last_change: None,
+            change_from: None,
         }
     }
 
@@ -253,10 +275,13 @@ impl Editor {
         self.collapsed.clear();
         self.sort = None;
         self.filters.clear();
+        self.highlights.clear();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
         self.pending = None;
+        self.last_change = None;
+        self.change_from = None;
         self.reschedule();
         // After the summaries are recomputed: only then is UID 0 a summary.
         self.sel_off_hidden_summary();
@@ -468,6 +493,16 @@ impl Editor {
     /// Every edit comes through here, so it also opens the edit's refresh
     /// (see `pending`).
     fn push_undo(&mut self, prev: Project) {
+        // A batch records its one change from the state before it, so its
+        // steps keep no copy of their own (#1667).
+        if !self.batching {
+            self.change_from = Some(self.frozen(prev.clone()));
+        }
+        self.record_undo(prev);
+    }
+
+    /// [`Self::push_undo`] without noting where the change started.
+    fn record_undo(&mut self, prev: Project) {
         self.pending = Some(self.sched.clone());
         self.pushes += 1;
         self.undo.push(prev);
@@ -511,6 +546,7 @@ impl Editor {
             self.sel_into_display();
         }
         self.pre_view = None;
+        self.settle_change();
     }
 
     /// Validate newly created/exposed leaves before touching history or UI state.
@@ -540,6 +576,9 @@ impl Editor {
         };
         self.pending = None;
         self.pre_view = None;
+        if !self.batching {
+            self.change_from = Some(self.frozen(self.proj.clone()));
+        }
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -551,6 +590,9 @@ impl Editor {
         };
         self.pending = None;
         self.pre_view = None;
+        if !self.batching {
+            self.change_from = Some(self.frozen(self.proj.clone()));
+        }
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true

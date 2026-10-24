@@ -106,7 +106,8 @@ Verbs: `proj.path`, `task.list`, `task.get`, `task.fields`, `task.set`, `task.ad
 `cal.add`, `cal.set`, `cal.exception.set`, `cal.exception.del`,
 `cal.workweek.set`, `cal.workweek.del`, `cal.del`, `proj.save`,
 `proj.reload`, `proj.open`, and the grid's view: `proj.view`,
-`proj.sort {column?, descending?}`, `proj.filter {column, values? | clear}` (`values` are
+`proj.sort {column?, descending?}`, `proj.highlight {field, values}` (`values: null` or
+`{clear: true}` clears; #1667, view state the terminal does not draw), `proj.filter {column, values? | clear}` (`values` are
 cell texts, `(Blanks)` for an empty cell, or on a date column `YYYY`, `YYYY-MM`,
 `YYYY-MM-DD`).
 

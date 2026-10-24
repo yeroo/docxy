@@ -1184,8 +1184,8 @@ fn the_harness_lists_each_shown_rows_categories() {
     ];
     let v = ProjectView::new(project, false);
     let on = crate::plugin_ui::Optins {
-        late: false,
         placeholder: true,
+        ..crate::plugin_ui::Optins::default()
     };
     let lines: Vec<String> = row_categories_lines(&v, on)
         .into_iter()
@@ -1200,5 +1200,30 @@ fn the_harness_lists_each_shown_rows_categories() {
             "1:All|Critical Tasks",
             "3:All|Critical Tasks|Manually Scheduled Tasks|Placeholder Tasks"
         ]
+    );
+}
+
+/// The harness state's `changed_cells` (#1667): `<uid>:<column>` for the
+/// grid cells the last change of the plan changed.
+#[test]
+fn changed_cells_lines_name_the_uid_and_column() {
+    let mut project = projcore::Project {
+        start_date: Some(projcore::DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+        ..projcore::Project::default()
+    };
+    project.tasks = vec![Task {
+        uid: 1,
+        id: 1,
+        name: "A".into(),
+        outline_level: 1,
+        duration_min: 480,
+        ..Task::default()
+    }];
+    let mut v = ProjectView::new(project, false);
+    assert!(changed_cells_lines(&v).is_empty());
+    v.ed.rename(1, "Ay").unwrap();
+    assert_eq!(
+        changed_cells_lines(&v),
+        [ctlcore::json::Json::Str("1:Name".into())]
     );
 }

@@ -14,7 +14,8 @@
 //!   On the Gantt Chart Format tab a second group "Fixture Percent" after
 //!   "Fixture Format" declares `priority` 120 and holds five small labelled
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
-//! - Menus: a row-menu item `fixture.rename` after "Notes...".
+//! - Menus: a row-menu item `fixture.rename` after "Notes...", and
+//!   `fixture.mark` after it (#1667).
 //! - Dialogs: a Task Information page "Fixture" with a multiline, a grid and
 //!   a `cell` grid (#1558: a dropdown, a checkbox, a date and a number in
 //!   one column) (and a header label drawn above every page, #1609), and a dialog
@@ -57,6 +58,11 @@
 //!   date format `1/28`; a second press, seeing a bar height in the view,
 //!   clears it with null).
 //!   and `fixture.font` (#1669: the Fixture group's launcher; a status only).
+//!   and `fixture.mark` (#1667, a row-menu item after Rename: one
+//!   `task.set` marking the first selected task and making it 3 days long,
+//!   one `proj.highlight` of its name, and `view.text_styles` styling Marked
+//!   Tasks bold, Highlighted Tasks on pale yellow and Changed Cells red
+//!   italic).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565),
@@ -95,7 +101,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
     {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]}],
-  "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."}]}],
+  "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."},{"id":"fixture.mark","label":"Mark (fixture)","icon":"comment","after":"Rename (fixture)"}]}],
   "dialogs":[
     {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
      "pages":[{"name":"Fixture","columns":2,"controls":[
@@ -122,7 +128,7 @@ const MANIFEST: &str = r##"{
   "palettes":[
     {"id":"fixture.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#1F3763","shape":"bar"}]},
     {"id":"fixture.red","label":"Red","bars":[{"kind":"on-track","color":"#CC3333","shape":"bar"},{"kind":"critical","color":"#7F0000","shape":"bar"}]}],
-  "text_style_categories":["Fixture Tasks","Late Tasks","Placeholder Tasks"]
+  "text_style_categories":["Fixture Tasks","Late Tasks","Placeholder Tasks","External Tasks","Marked Tasks","Highlighted Tasks","Changed Cells"]
 }"##;
 
 /// The chosen palette, kept across calls.
@@ -308,7 +314,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
         flag(&req),
         switch_on(&req, "fixture.plain"),
         switch_on(&req, "fixture.flat"),
@@ -498,6 +504,27 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                     .to_string()
             }
         }
+        // The categories that need a model feature (#1667): marks the first
+        // selected task and makes it 3 days long (a visible change, so its
+        // Duration and Finish are changed cells), highlights it by name, and
+        // styles Marked Tasks, Highlighted Tasks and Changed Cells, all in
+        // the command's one batch.
+        "fixture.mark" => match first_uid(&req) {
+            Some(uid) => {
+                let name = task_name_of(&req, uid).unwrap_or_default();
+                format!(
+                    r##"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"marked":true,"duration":"3d"}}}},
+                    {{"verb":"proj.highlight","args":{{"field":"Name","values":[{}]}}}}],
+                    "status":{},"view":{{"text_styles":{{
+                    "Marked Tasks":{{"bold":true}},
+                    "Highlighted Tasks":{{"background":"#FFFF99"}},
+                    "Changed Cells":{{"color":"#C00000","italic":true}}}}}}}}"##,
+                    quote(&name),
+                    quote(&format!("Fixture: marked task {uid}"))
+                )
+            }
+            None => r#"{"ops":[],"status":"Fixture: select a task first"}"#.to_string(),
+        },
         // The Fixture group's dialog launcher (#1669).
         "fixture.font" => r#"{"ops":[],"status":"Fixture: font launcher"}"#.to_string(),
         "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {

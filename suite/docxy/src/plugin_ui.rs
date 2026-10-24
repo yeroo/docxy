@@ -32,6 +32,7 @@ use projcore::uiplugin::{
     Palette, Selection, Shape, State, StateCtx,
 };
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -348,6 +349,15 @@ pub(crate) struct PluginCache {
     states: Vec<State>,
     overlay_key: Option<OverlayKey>,
     shapes: Rc<Vec<Shape>>,
+    /// The grid's changed cells (#1667) and the revision they were read at,
+    /// as a list and as a set for the per-cell look-up.
+    changed_key: Option<u64>,
+    changed: Rc<Vec<(i32, &'static str)>>,
+    changed_set: HashSet<(i32, &'static str)>,
+    /// [`projcore::editor::Editor::highlighted_rows`] (#1667) and the
+    /// revision it was read at.
+    highlight_key: Option<u64>,
+    highlighted: Rc<Vec<bool>>,
 }
 
 /// The view's switches as the plugins see them (`view` in every request),
@@ -1778,6 +1788,13 @@ pub(crate) struct RowFacts {
     /// [`projcore::Task::is_placeholder`], and a plugin opted
     /// `Placeholder Tasks` in.
     pub placeholder: bool,
+    /// MSPDI's ExternalTask (#1667), and a plugin opted `External Tasks` in.
+    pub external: bool,
+    /// The task's Marked flag (#1667), and a plugin opted `Marked Tasks` in.
+    pub marked: bool,
+    /// [`projcore::editor::Editor::is_highlighted`] (#1667), and a plugin
+    /// opted `Highlighted Tasks` in.
+    pub highlighted: bool,
 }
 
 /// The categories a UI plugin opts in by naming them in its manifest's
@@ -1786,10 +1803,19 @@ pub(crate) struct RowFacts {
 pub(crate) struct Optins {
     pub late: bool,
     pub placeholder: bool,
+    pub external: bool,
+    pub marked: bool,
+    pub highlighted: bool,
+    /// `Changed Cells` (#1667): a per-cell category, not a row's.
+    pub changed_cells: bool,
 }
 
 pub(crate) const LATE_TASKS: &str = "Late Tasks";
 pub(crate) const PLACEHOLDER_TASKS: &str = "Placeholder Tasks";
+pub(crate) const EXTERNAL_TASKS: &str = "External Tasks";
+pub(crate) const MARKED_TASKS: &str = "Marked Tasks";
+pub(crate) const HIGHLIGHTED_TASKS: &str = "Highlighted Tasks";
+pub(crate) const CHANGED_CELLS: &str = "Changed Cells";
 
 impl Optins {
     /// What `manifests` name, by exact string.
@@ -1802,6 +1828,10 @@ impl Optins {
         Optins {
             late: named(LATE_TASKS),
             placeholder: named(PLACEHOLDER_TASKS),
+            external: named(EXTERNAL_TASKS),
+            marked: named(MARKED_TASKS),
+            highlighted: named(HIGHLIGHTED_TASKS),
+            changed_cells: named(CHANGED_CELLS),
         }
     }
 }
@@ -1845,6 +1875,15 @@ pub(crate) fn row_categories(task: &projcore::Task, facts: RowFacts) -> Vec<&'st
     if facts.late {
         out.push(LATE_TASKS);
     }
+    if facts.external {
+        out.push(EXTERNAL_TASKS);
+    }
+    if facts.marked {
+        out.push(MARKED_TASKS);
+    }
+    if facts.highlighted {
+        out.push(HIGHLIGHTED_TASKS);
+    }
     if facts.inactive {
         out.push("Inactive Tasks");
     }
@@ -1874,6 +1913,9 @@ fn task_facts(v: &ProjectView, task: &projcore::Task, row: usize, optins: Optins
         inactive: crate::inactive_row(v.ed.project(), row),
         late,
         placeholder: optins.placeholder && task.is_placeholder(),
+        external: optins.external && task.external_task == Some(true) && !task.is_null,
+        marked: optins.marked && task.marked == Some(true),
+        highlighted: optins.highlighted && highlighted(v, row),
     }
 }
 
@@ -1888,6 +1930,9 @@ pub(crate) fn row_style(v: &ProjectView, task: &projcore::Task, row: usize) -> O
     let mut optins = optins();
     optins.late &= formatting.category(LATE_TASKS).is_some();
     optins.placeholder &= formatting.category(PLACEHOLDER_TASKS).is_some();
+    optins.external &= formatting.category(EXTERNAL_TASKS).is_some();
+    optins.marked &= formatting.category(MARKED_TASKS).is_some();
+    optins.highlighted &= formatting.category(HIGHLIGHTED_TASKS).is_some();
     let style = formatting.style_for(&task_categories(v, task, row, optins));
     (!style.is_empty()).then_some(style)
 }
@@ -1992,15 +2037,91 @@ pub(crate) fn cell_style_under(
     }
 }
 
-/// A cell's style: the row's with the cell's own on top.
+/// A cell's style: the row's, then `Changed Cells` when the last change of
+/// the plan changed it (#1667), with the cell's own on top.
 pub(crate) fn cell_style(
     v: &ProjectView,
     row: Option<&TextStyle>,
     uid: Option<i32>,
     column: &str,
 ) -> Option<TextStyle> {
-    let own = uid.and_then(|uid| v.ed.project().formatting.cell(uid, column));
-    merged(row, own)
+    let formatting = &v.ed.project().formatting;
+    let own = uid.and_then(|uid| formatting.cell(uid, column));
+    let changed = uid.filter(|_| optins().changed_cells).and_then(|uid| {
+        let style = formatting.category(CHANGED_CELLS)?;
+        is_changed_cell(v, uid, column).then_some(style)
+    });
+    changed_cell_style(row, changed, own)
+}
+
+/// The row's style, `Changed Cells` over it when the cell changed, the
+/// cell's own on top (#1667).
+pub(crate) fn changed_cell_style(
+    row: Option<&TextStyle>,
+    changed: Option<&TextStyle>,
+    own: Option<&TextStyle>,
+) -> Option<TextStyle> {
+    match changed {
+        Some(changed) => merged(merged(row, Some(changed)).as_ref(), own),
+        None => merged(row, own),
+    }
+}
+
+/// The grid columns a change can mark (#1667): every one but ID, which is
+/// the row header (drawn by the titles style) and renumbers on an insert.
+fn changeable_columns() -> Vec<(&'static str, projcore::editor::Field)> {
+    crate::COLUMNS
+        .iter()
+        .filter(|c| **c != crate::COLUMNS[crate::COL_ID])
+        .filter_map(|c| Some((*c, projcore::editor::Field::parse(c).ok()?)))
+        .collect()
+}
+
+/// The grid cells the last change of the plan changed, `(uid, column)` in
+/// task then column order (#1667), read once per revision.
+pub(crate) fn changed_cells(v: &ProjectView) -> Rc<Vec<(i32, &'static str)>> {
+    let mut cache = v.plugin_cache.borrow_mut();
+    refresh_changed(v, &mut cache);
+    Rc::clone(&cache.changed)
+}
+
+/// Whether the last change of the plan changed task `uid`'s `column` cell.
+fn is_changed_cell(v: &ProjectView, uid: i32, column: &str) -> bool {
+    let Some(&column) = crate::COLUMNS.iter().find(|c| **c == column) else {
+        return false;
+    };
+    let mut cache = v.plugin_cache.borrow_mut();
+    refresh_changed(v, &mut cache);
+    cache.changed_set.contains(&(uid, column))
+}
+
+fn refresh_changed(v: &ProjectView, cache: &mut PluginCache) {
+    let revision = v.ed.revision();
+    if cache.changed_key == Some(revision) {
+        return;
+    }
+    let columns = changeable_columns();
+    let fields: Vec<_> = columns.iter().map(|(_, f)| *f).collect();
+    let cells: Vec<_> =
+        v.ed.changed_cells(&fields)
+            .into_iter()
+            .filter_map(|(uid, f)| Some((uid, columns.iter().find(|(_, g)| *g == f)?.0)))
+            .collect();
+    cache.changed_set = cells.iter().copied().collect();
+    cache.changed = Rc::new(cells);
+    cache.changed_key = Some(revision);
+}
+
+/// Whether task `row` (its index in the plan's tasks) is highlighted
+/// (#1667): the editor's rows, read once per revision.
+fn highlighted(v: &ProjectView, row: usize) -> bool {
+    let revision = v.ed.revision();
+    let mut cache = v.plugin_cache.borrow_mut();
+    if cache.highlight_key != Some(revision) {
+        cache.highlighted = Rc::new(v.ed.highlighted_rows());
+        cache.highlight_key = Some(revision);
+    }
+    cache.highlighted.get(row).copied().unwrap_or(false)
 }
 
 /// The pattern colour when the style sets no text colour, and Project's
