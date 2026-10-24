@@ -117,6 +117,8 @@ pub enum Field {
     ConstraintDate,
     Deadline,
     Active,
+    /// Project's Marked flag (#1667), No when absent.
+    Marked,
     OutlineNumber,
     OutlineLevel,
     Wbs,
@@ -239,6 +241,7 @@ const TAIL: &[(Field, &str)] = &[
     (Field::ConstraintDate, "Constraint Date"),
     (Field::Deadline, "Deadline"),
     (Field::Active, "Active"),
+    (Field::Marked, "Marked"),
     (Field::OutlineNumber, "Outline Number"),
     (Field::OutlineLevel, "Outline Level"),
     (Field::Wbs, "WBS"),
@@ -494,6 +497,7 @@ impl<'a> FieldReader<'a> {
             Field::ConstraintDate => date(task.constraint_date),
             Field::Deadline => date(task.deadline),
             Field::Active => flag(task.is_active()),
+            Field::Marked => flag(task.marked == Some(true)),
             Field::OutlineNumber => optional_text(self.outline_number(task.uid)),
             Field::OutlineLevel => int(i64::from(task.outline_level)),
             // The stored code (a file's, or an MPP override), else the outline

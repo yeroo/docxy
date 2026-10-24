@@ -192,14 +192,19 @@ fn show_for_evaluates_categories() {
     assert!(!row("a", &["Flag0"], 1).applies(&flagged));
     assert!(row("a", &["Not Flag2"], 1).applies(&flagged));
     // Categories the plan holds no data for never match.
-    for unknown in ["Marked", "Driving", "Nonsense", ""] {
+    for unknown in ["Driving", "Nonsense", ""] {
         assert!(
             !row("a", &[unknown, "Critical"], 1).applies(&plain),
             "{unknown}"
         );
         assert!(!row("a", &[unknown, "Critical"], 1).applies(&facts(|_| {})));
     }
+    // Marked (#1667) reads the task's flag.
     assert!(!row("a", &["Marked"], 1).applies(&crit));
+    let marked = facts(|f| f.marked = true);
+    assert!(row("a", &["Marked"], 1).applies(&marked));
+    assert!(row("a", &["Not Marked"], 1).applies(&crit));
+    assert!(!row("a", &["Not Marked"], 1).applies(&marked));
     // bars_for keeps table order.
     let mut f = Formatting::default();
     f.set_bars(vec![

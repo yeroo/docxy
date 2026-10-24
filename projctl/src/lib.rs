@@ -790,6 +790,8 @@ struct TaskInfoArgs {
     effort_driven: Option<bool>,
     notes: Option<String>,
     milestone: Option<bool>,
+    /// Project's Marked flag (#1667).
+    marked: Option<bool>,
     /// `Some(None)` is the project's calendar.
     calendar: Option<Option<i32>>,
     ignore_resource_calendar: Option<bool>,
@@ -835,6 +837,7 @@ impl TaskInfoArgs {
             || self.effort_driven.is_some()
             || self.notes.is_some()
             || self.milestone.is_some()
+            || self.marked.is_some()
             || self.calendar.is_some()
             || self.ignore_resource_calendar.is_some()
             || self.wbs.is_some()
@@ -1050,6 +1053,7 @@ impl TaskInfoArgs {
             effort_driven: flag("effort_driven")?,
             notes: text("notes")?,
             milestone: flag("milestone")?,
+            marked: flag("marked")?,
             calendar,
             ignore_resource_calendar: flag("ignore_resource_calendar")?,
             wbs: text("wbs")?,
@@ -1183,6 +1187,9 @@ impl TaskInfoArgs {
         }
         if let Some(notes) = &self.notes {
             ed.set_notes(uid, &projcore::text::notes_from_line(notes))?;
+        }
+        if let Some(on) = self.marked {
+            ed.set_marked(uid, on)?;
         }
         for (field, text) in &self.custom {
             ed.set_custom_field(uid, *field, text)?;
@@ -3905,6 +3912,46 @@ mod tests {
             assert!(err.contains("read-only"), "{err}");
             assert_eq!(*a.project(), before);
         }
+    }
+
+    /// Marked (#1667): `task.set {marked}` is one undo step, the same value
+    /// again none, and the `Marked` field reads it back.
+    #[test]
+    fn task_set_marks_a_task_as_one_step() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let set = |a: &mut Editor, on: bool| {
+            dispatch_editor(
+                a,
+                "task.set",
+                &Json::obj(vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("marked", Json::Bool(on)),
+                    ("fields", Json::Arr(vec![Json::Str("Marked".into())])),
+                ]),
+            )
+            .unwrap()
+        };
+        let depth = a.undo_depth();
+        let r = set(&mut a, true).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1);
+        assert_eq!(a.project().task(uid as i32).unwrap().marked, Some(true));
+        let marked = r.get("fields").and_then(|f| f.get("Marked")).unwrap();
+        assert_eq!(marked.get_str("text"), Some("Yes"));
+        set(&mut a, true).unwrap();
+        assert_eq!(a.undo_depth(), depth + 1, "unchanged is no step");
+        assert!(set(&mut a, false).is_ok());
+        assert_eq!(a.project().task(uid as i32).unwrap().marked, Some(false));
+        let bad = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("marked", Json::Str("yes".into())),
+            ]),
+        )
+        .unwrap();
+        assert!(bad.is_err());
     }
 
     /// The Task Information fields (#1550): every argument applies in the

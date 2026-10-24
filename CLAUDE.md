@@ -1425,9 +1425,9 @@
   row listing one shows for no task. A JSON array entry holding a comma list
   is split like the XML attribute. `Facts` is built by `Editor::bar_facts`
   (Normal, Milestone, Summary, Critical, Noncritical, Active, Inactive,
-  Manual, Auto, External, Late = Status text, Flag1..20 read only when a row
-  names one). `Marked` and the Task Path kinds have no plan data: they parse
-  and never match. `Editor::bar_date` resolves From/To (empty = Start /
+  Manual, Auto, External, Late = Status text, Marked = `Task::marked`
+  (#1667), Flag1..20 read only when a row names one). The Task Path kinds
+  have no plan data: they parse and never match. `Editor::bar_date` resolves From/To (empty = Start /
   Finish; `Task Start`/`Task Finish`; any `Field` date name; `CompleteThrough`
   = the task's `stop`, else start plus its percent complete of the span, which
   is unmeasured against Project); a task without the date draws no such row.

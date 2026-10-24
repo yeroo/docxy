@@ -95,6 +95,7 @@ impl Editor {
             manual: task.manual,
             external: task.external_task == Some(true),
             late: reader.read(task, Field::Status).text == "Late",
+            marked: task.marked == Some(true),
             flags: 0,
         };
         if flags {
