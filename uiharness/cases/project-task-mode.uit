@@ -21,11 +21,14 @@ test project task mode switches from the cell and the ribbon
   key escape
   assert cell_edit is none
   click C3
+  assert bar_3 is critical 0-3
   key alt t h
   assert cell B3 is Manually Scheduled
+  assert bar_3 is critical 0-3 manual
   assert undo_depth is 1
   key alt t a
   assert cell B3 is Auto Scheduled
+  assert bar_3 is critical 0-3
   assert undo_depth is 2
   click H2
   assert cell is Resource Names
