@@ -8,6 +8,9 @@
 //! (Project's "Keep outline structure"). Pinned: the project summary row
 //! (UID 0, when shown) stays first, and a blank row is never filtered; it
 //! sorts after its siblings.
+//!
+//! A highlight (#1667, Project's View > Highlight) matches rows by the same
+//! checklists but hides nothing ([`Editor::is_highlighted`]).
 use super::*;
 use std::collections::BTreeSet;
 
@@ -102,6 +105,82 @@ impl Editor {
             self.filters.clear();
             self.revision += 1;
         }
+    }
+
+    /// The highlighted columns and the texts each highlights (#1667), in
+    /// the order they were first set.
+    pub fn highlights(&self) -> Vec<(Field, &BTreeSet<String>)> {
+        self.highlights
+            .iter()
+            .map(|f| (f.field, &f.allowed))
+            .collect()
+    }
+
+    /// Highlight the rows whose `field` display text is in `allowed`
+    /// (`None` clears that column). Columns AND, as the filters do, but a
+    /// highlight hides nothing and a summary is highlighted only by its own
+    /// text. View state, like the filters; a change moves
+    /// [`Self::revision`].
+    pub fn set_highlight(&mut self, field: Field, allowed: Option<BTreeSet<String>>) {
+        let before = self.highlights.clone();
+        match allowed {
+            Some(allowed) => match self.highlights.iter_mut().find(|f| f.field == field) {
+                Some(f) => f.allowed = allowed,
+                None => self.highlights.push(Filter { field, allowed }),
+            },
+            None => self.highlights.retain(|f| f.field != field),
+        }
+        if self.highlights != before {
+            self.revision += 1;
+        }
+    }
+
+    /// Clear every column's highlight.
+    pub fn clear_highlight(&mut self) {
+        if !self.highlights.is_empty() {
+            self.highlights.clear();
+            self.revision += 1;
+        }
+    }
+
+    /// Whether task `index` is highlighted: some column is highlighted and
+    /// every highlighted column's text is one it allows. A blank row and the
+    /// project summary row never are.
+    pub fn is_highlighted(&self, index: usize) -> bool {
+        self.is_highlighted_by(&FieldReader::new(self), index)
+    }
+
+    /// [`Self::is_highlighted`] with a reader the caller keeps across rows,
+    /// so an Outline Number highlight numbers the outline once.
+    pub fn is_highlighted_by(&self, reader: &FieldReader, index: usize) -> bool {
+        let Some(task) = self.proj.tasks.get(index) else {
+            return false;
+        };
+        !self.highlights.is_empty()
+            && !task.is_null
+            && !task.is_project_summary()
+            && self
+                .highlights
+                .iter()
+                .all(|f| f.allowed.contains(&reader.read(task, f.field).text))
+    }
+
+    /// [`Self::is_highlighted`] for every task, by index.
+    pub fn highlighted_rows(&self) -> Vec<bool> {
+        let reader = FieldReader::new(self);
+        (0..self.proj.tasks.len())
+            .map(|i| self.is_highlighted_by(&reader, i))
+            .collect()
+    }
+
+    /// The display texts `specs` name in column `field`, for a highlight:
+    /// [`Self::filter_texts`]' grammar and values.
+    pub fn highlight_texts(
+        &self,
+        field: Field,
+        specs: &[String],
+    ) -> Result<BTreeSet<String>, String> {
+        self.filter_texts(field, specs)
     }
 
     /// A structural edit that depends on where a row sits (insert above or

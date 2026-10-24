@@ -529,3 +529,100 @@ fn toggling_leveling_bumps_the_revision_and_keeps_the_selection_displayed() {
     ed.toggle_level();
     assert!(ed.display_rows().contains(&ed.sel()));
 }
+
+/// Highlight (#1667): the filters' matching without the summary rule or any
+/// hiding; columns AND; blank rows never; view state that moves the
+/// revision only when it changes.
+#[test]
+fn highlight_matches_own_rows_and_hides_nothing() {
+    let mut ed = sample();
+    let shown = ed.display_rows();
+    let rev = ed.revision();
+    assert!(ed.highlighted_rows().iter().all(|h| !h));
+    ed.set_highlight(Field::Name, only(&["Dd", "B", "S"]));
+    assert_eq!(ed.revision(), rev + 1);
+    let lit: Vec<&str> = ed
+        .highlighted_rows()
+        .iter()
+        .zip(&ed.project().tasks)
+        .filter(|(h, _)| **h)
+        .map(|(_, t)| t.name.as_str())
+        .collect();
+    // S by its own name; its parent-of-Dd status lights nothing else.
+    assert_eq!(lit, ["S", "Dd", "B"]);
+    assert_eq!(ed.display_rows(), shown, "a highlight hides nothing");
+    assert!(ed.is_highlighted(5) && !ed.is_highlighted(4) && !ed.is_highlighted(99));
+    // The same highlight again is no change.
+    ed.set_highlight(Field::Name, only(&["Dd", "B", "S"]));
+    assert_eq!(ed.revision(), rev + 1);
+    // Columns AND: of the three, only those 4 days long.
+    let four = ed
+        .highlight_texts(Field::Duration, &["4 days".into()])
+        .unwrap();
+    ed.set_highlight(Field::Duration, Some(four));
+    assert_eq!(ed.highlighted_rows().iter().filter(|h| **h).count(), 1);
+    assert!(ed.is_highlighted(5));
+    assert_eq!(ed.highlights().len(), 2);
+    ed.set_highlight(Field::Duration, None);
+    assert_eq!(ed.highlights().len(), 1);
+    ed.clear_highlight();
+    assert!(ed.highlights().is_empty());
+    let rev = ed.revision();
+    ed.clear_highlight();
+    assert_eq!(ed.revision(), rev);
+    // A blank row never highlights, even when its (empty) text is allowed.
+    ed.set_highlight(Field::Name, only(&[""]));
+    assert!(!ed.is_highlighted(6));
+    // Not in history; a new document clears it.
+    assert_eq!(ed.undo_depth(), 0);
+    ed.set_highlight(Field::Name, only(&["A"]));
+    ed.replace_project(sample().project().clone());
+    assert!(ed.highlights().is_empty());
+}
+
+#[test]
+fn highlight_never_lights_the_project_summary_row() {
+    let mut proj = sample().project().clone();
+    proj.tasks.insert(
+        0,
+        Task {
+            uid: 0,
+            id: 0,
+            name: "Plan".into(),
+            outline_level: 0,
+            summary: true,
+            ..Task::default()
+        },
+    );
+    let mut ed = Editor::new(proj);
+    ed.set_highlight(Field::Name, only(&["Plan", "A"]));
+    assert!(!ed.is_highlighted(0));
+    assert!(ed.is_highlighted(1));
+}
+
+/// A highlight set inside a batch that leaves the plan unchanged (a plugin
+/// command whose only op is `proj.highlight`) is kept and moves the
+/// revision; a refused batch drops it.
+#[test]
+fn a_batch_keeps_a_highlight_unless_it_is_refused() {
+    let mut ed = sample();
+    let rev = ed.revision();
+    ed.batch(|ed| {
+        ed.set_highlight(Field::Name, only(&["A"]));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(ed.highlights().len(), 1);
+    assert!(ed.revision() > rev);
+    assert_eq!(ed.undo_depth(), 0);
+    let rev = ed.revision();
+    let refused: Result<(), String> = ed.batch(|ed| {
+        ed.set_highlight(Field::Name, only(&["B"]));
+        ed.rename(1, "Ay")?;
+        Err("no".into())
+    });
+    assert!(refused.is_err());
+    assert_eq!(ed.revision(), rev);
+    assert_eq!(ed.highlights()[0].1, &only(&["A"]).unwrap());
+    assert_eq!(ed.project().tasks[0].name, "A");
+}

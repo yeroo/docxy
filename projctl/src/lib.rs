@@ -172,6 +172,7 @@ pub fn is_editor_verb(verb: &str) -> bool {
         || matches!(
             verb,
             "proj.get"
+                | "proj.highlight"
                 | "task.list"
                 | "task.get"
                 | "task.fields"
@@ -220,6 +221,7 @@ pub fn dispatch_editor(ed: &mut Editor, verb: &str, args: &Json) -> Option<Resul
     Some(match verb {
         "proj.get" => Ok(proj_get(ed)),
         "proj.set" => proj_set(ed, args),
+        "proj.highlight" => proj_highlight(ed, args),
         "task.list" => task_list(ed, args),
         "task.get" => task_get(ed, args),
         "task.fields" => Ok(task_fields()),
@@ -1258,6 +1260,58 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         Ok(())
     })?;
     task_reply(ed, uid, asked.as_deref())
+}
+
+/// `proj.highlight` (#1667): the highlight, view state that is no edit of
+/// the plan (not in [`MUTATING`]). `{field, values: [..]}` highlights the
+/// rows whose `field` reads one of `values` (the AutoFilter's spec grammar:
+/// a value as shown, `(Blanks)`, `YYYY[-MM[-DD]]` on a date column);
+/// `values: null` clears that column; `{clear: true}` clears all; `{}`
+/// reads. Every call replies with the highlight as it now stands.
+fn proj_highlight(ed: &mut Editor, args: &Json) -> Result<Json, String> {
+    let clear = match args.get("clear") {
+        None | Some(Json::Null) => false,
+        Some(c) => c.as_bool().ok_or("'clear' must be true or false")?,
+    };
+    if clear {
+        ed.clear_highlight();
+    } else if let Some(name) = args.get("field") {
+        let name = name.as_str().ok_or("'field' must be a task field name")?;
+        let field = Field::parse(name)?;
+        match args.get("values") {
+            None => return Err("'values' must be a list of values, or null to clear".into()),
+            Some(Json::Null) => ed.set_highlight(field, None),
+            Some(Json::Arr(values)) => {
+                let specs = values
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or("'values' must be a list of values, or null to clear")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let allowed = ed.highlight_texts(field, &specs)?;
+                ed.set_highlight(field, Some(allowed));
+            }
+            Some(_) => return Err("'values' must be a list of values, or null to clear".into()),
+        }
+    } else if args.get("values").is_some() {
+        return Err("'values' needs a 'field'".into());
+    }
+    let highlight = ed
+        .highlights()
+        .into_iter()
+        .map(|(field, allowed)| {
+            Json::obj(vec![
+                ("field", Json::Str(field.name())),
+                (
+                    "values",
+                    Json::Arr(allowed.iter().map(|t| Json::Str(t.clone())).collect()),
+                ),
+            ])
+        })
+        .collect();
+    Ok(Json::obj(vec![("highlight", Json::Arr(highlight))]))
 }
 
 /// `proj.get`: the plan's settings (#1587).
@@ -4263,6 +4317,85 @@ it"
         });
         p.resources = vec![ann, resource(2, "Bob", "30")];
         Editor::new(p)
+    }
+
+    /// `proj.highlight` (#1667): an editor verb that changes no plan, so a
+    /// plugin command's ops and both hosts' control reach it without a
+    /// dirty mark.
+    #[test]
+    fn proj_highlight_sets_reads_and_clears_the_highlight() {
+        assert!(is_editor_verb("proj.highlight"));
+        assert!(!MUTATING.contains(&"proj.highlight"));
+        assert!(!mutates(
+            "proj.highlight",
+            &Json::parse(r#"{"clear":true}"#).unwrap()
+        ));
+        let mut ed = Editor::new(new_project());
+        let name = ed
+            .project()
+            .tasks
+            .iter()
+            .find(|t| !t.is_null && !t.is_project_summary())
+            .unwrap()
+            .name
+            .clone();
+        let empty = run(&mut ed, "proj.highlight", "{}").unwrap();
+        assert_eq!(empty.to_string(), r#"{"highlight":[]}"#);
+        let depth = ed.undo_depth();
+        let dirty = ed.dirty();
+        let set = run(
+            &mut ed,
+            "proj.highlight",
+            &format!(r#"{{"field":"name","values":["{}"]}}"#, name.to_uppercase()),
+        )
+        .unwrap();
+        assert_eq!(
+            set.to_string(),
+            format!(r#"{{"highlight":[{{"field":"Name","values":["{name}"]}}]}}"#)
+        );
+        assert_eq!((ed.undo_depth(), ed.dirty()), (depth, dirty));
+        assert!(ed.highlighted_rows().iter().any(|h| *h));
+        assert_eq!(run(&mut ed, "proj.highlight", "{}").unwrap(), set);
+        assert!(
+            run(
+                &mut ed,
+                "proj.highlight",
+                r#"{"field":"Name","values":["nope"]}"#
+            )
+            .is_err()
+        );
+        assert!(run(&mut ed, "proj.highlight", r#"{"field":"Name"}"#).is_err());
+        assert!(run(&mut ed, "proj.highlight", r#"{"values":[]}"#).is_err());
+        assert!(run(&mut ed, "proj.highlight", r#"{"field":"Nope","values":[]}"#).is_err());
+        let cleared = run(
+            &mut ed,
+            "proj.highlight",
+            r#"{"field":"Name","values":null}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.to_string(), r#"{"highlight":[]}"#);
+        run(
+            &mut ed,
+            "proj.highlight",
+            &format!(r#"{{"field":"Name","values":["{name}"]}}"#),
+        )
+        .unwrap();
+        let all = run(&mut ed, "proj.highlight", r#"{"clear":true}"#).unwrap();
+        assert_eq!(all.to_string(), r#"{"highlight":[]}"#);
+        // As a plugin command's op: kept, no undo step.
+        apply_ops(
+            &mut ed,
+            &[projcore::uiplugin::Op {
+                verb: "proj.highlight".into(),
+                args: projcore::json::Json::parse(&format!(
+                    r#"{{"field":"Name","values":["{name}"]}}"#
+                ))
+                .unwrap(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(ed.highlights().len(), 1);
+        assert_eq!(ed.undo_depth(), depth);
     }
 
     #[test]

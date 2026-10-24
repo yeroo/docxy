@@ -14,6 +14,8 @@ struct Saved {
     level: Option<Leveled>,
     leveled: bool,
     revision: u64,
+    highlights: Vec<display::Filter>,
+    last_change: Option<Box<Editor>>,
 }
 
 impl Editor {
@@ -23,8 +25,10 @@ impl Editor {
     /// before it once, which clears redo. A batch that ends where it began
     /// records nothing and keeps redo. On `Err` every piece of editor state
     /// (the plan, history, redo, dirty flag, selection, collapsed summaries,
-    /// the derived schedule and the revision) is restored exactly, whatever `edit` had
-    /// already applied. A batch opened inside another (a control verb that
+    /// the derived schedule, the revision, the highlights and the last change's
+    /// record) is restored exactly, whatever `edit` had already applied. A
+    /// batch that ends Ok with the plan unchanged keeps a highlight it set,
+    /// moving the revision for it. A batch opened inside another (a control verb that
     /// batches its own setters, run as one of a plugin command's ops) is
     /// part of the outer step: it runs `edit` and leaves the rollback to
     /// the batch that holds it.
@@ -47,6 +51,8 @@ impl Editor {
             level: self.level.clone(),
             leveled: self.leveled,
             revision: self.revision,
+            highlights: self.highlights.clone(),
+            last_change: self.last_change.take(),
         };
         let undo = std::mem::take(&mut self.undo);
         let redo = std::mem::take(&mut self.redo);
@@ -56,6 +62,10 @@ impl Editor {
         let changed = self.pushes != saved.pushes && self.proj != saved.proj;
         match result {
             Ok(value) if changed => {
+                // The batch is one change, from the state before it.
+                let mut from = Editor::assembled(saved.proj.clone(), saved.sched.clone(), false);
+                from.leveled = saved.leveled;
+                from.level = saved.level;
                 self.undo = undo;
                 self.pushes = saved.pushes;
                 // Clears redo, caps history and counts one snapshot.
@@ -63,13 +73,24 @@ impl Editor {
                 // Pair the edit's refresh with the state before the batch,
                 // as after any single edit (see `pending`).
                 self.pending = Some(saved.sched);
+                self.change_from = None;
+                self.record_change(Box::new(from), Some(saved.last_change));
                 Ok(value)
             }
             result => {
                 // The leveling overlay is not plan state: a batch that only
                 // switched it (a plugin's Level All, #1589) keeps the switch.
                 let leveled = result.is_ok().then_some(self.leveled);
+                // A highlight is view state too (#1667): kept by a batch that
+                // ends Ok, moving the revision a host caches by.
+                let highlights = result.is_ok().then(|| self.highlights.clone());
                 self.restore(saved, undo, redo);
+                if let Some(highlights) = highlights
+                    && highlights != self.highlights
+                {
+                    self.highlights = highlights;
+                    self.revision += 1;
+                }
                 if let Some(on) = leveled {
                     self.set_leveled(on);
                 }
@@ -92,6 +113,9 @@ impl Editor {
         // The revision too: a rolled-back batch changed nothing a host
         // caches by it (a plugin dialog's values, #1610).
         self.revision = saved.revision;
+        self.highlights = saved.highlights;
+        self.last_change = saved.last_change;
+        self.change_from = None;
         self.undo = undo;
         self.redo = redo;
     }
