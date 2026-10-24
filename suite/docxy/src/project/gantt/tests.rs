@@ -1053,6 +1053,7 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
     // A finish later on the summary's own last day warns on that day.
     let same_day = GanttBar {
         kind: BarKind::Summary,
+        manual: false,
         inactive: false,
         start: 0,
         end: 3,
@@ -1139,7 +1140,7 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
     };
     let ed = editor(vec![manual_summary(1, 1, 5, 6), leaf]);
     assert!(ed.summary_warning(2));
-    assert_eq!(bar(&ed, 2).state(), "critical 0-4");
+    assert_eq!(bar(&ed, 2).state(), "critical 0-4 manual");
     assert_eq!(bar(&ed, 2).warning_days(), None);
     assert_eq!(bar(&ed, 1).state(), "summary 0-1 rollup 0-4 warning");
 }
@@ -1148,6 +1149,7 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
 fn bar_styles_hide_critical_colour_and_baseline_only() {
     let base = GanttBar {
         inactive: false,
+        manual: false,
         kind: BarKind::Critical,
         start: 2,
         end: 5,
@@ -1162,6 +1164,7 @@ fn bar_styles_hide_critical_colour_and_baseline_only() {
         styled_bar(base, false, true),
         GanttBar {
             kind: BarKind::OnTrack,
+            manual: false,
             ..base
         }
     );
@@ -1243,6 +1246,7 @@ fn set_layout(ed: &mut ProjectEditor, json: &str) {
 fn plain(kind: BarKind) -> GanttBar {
     GanttBar {
         kind,
+        manual: false,
         inactive: false,
         start: 3,
         end: 5,
@@ -1495,4 +1499,137 @@ fn a_tier_label_fits_at_its_drawn_size_and_weight() {
         tier_char_w(&tier_cell_style(Some(&thin), true)),
         zoom::CHAR_W / 1.1,
     );
+}
+
+fn palette_of(entries: &[(&str, u32, &str)]) -> projcore::uiplugin::Palette {
+    projcore::uiplugin::Palette {
+        id: "p".into(),
+        label: "P".into(),
+        bars: entries
+            .iter()
+            .map(|&(kind, color, shape)| projcore::uiplugin::BarStyle {
+                kind: kind.into(),
+                color,
+                shape: shape.into(),
+            })
+            .collect(),
+    }
+}
+
+fn manual_leaf(uid: i32, days: i64) -> Task {
+    Task {
+        manual: true,
+        ..task(uid, days, 1)
+    }
+}
+
+#[test]
+fn manual_leaf_takes_the_palette_manual_entry() {
+    let ed = editor(vec![manual_leaf(1, 3)]);
+    let b = bar(&ed, 1);
+    assert!(b.manual);
+    let p = palette_of(&[
+        ("on-track", 0x3366CC, "bar"),
+        ("critical", 0xCC0000, "bar"),
+        ("manual", 0x55AA55, "hollow"),
+    ]);
+    assert_eq!(bar_look_of(b, Some(&p)), (0x55AA55, BarShape::Hollow));
+    // Critical or not, the manual entry wins.
+    for kind in [BarKind::Critical, BarKind::OnTrack] {
+        let b = GanttBar { kind, ..b };
+        assert_eq!(bar_look_of(b, Some(&p)), (0x55AA55, BarShape::Hollow));
+    }
+    // An empty or unknown shape draws a bar.
+    let p = palette_of(&[("manual", 0x55AA55, "")]);
+    assert_eq!(bar_look_of(b, Some(&p)), (0x55AA55, BarShape::Bar));
+}
+
+#[test]
+fn manual_leaf_without_a_manual_entry_looks_as_before() {
+    let ed = editor(vec![manual_leaf(1, 3)]);
+    let b = bar(&ed, 1);
+    let p = palette_of(&[
+        ("on-track", 0x3366CC, "thin"),
+        ("critical", 0xCC0000, "bar"),
+    ]);
+    for kind in [BarKind::Critical, BarKind::OnTrack] {
+        let b = GanttBar { kind, ..b };
+        assert_eq!(bar_look_of(b, Some(&p)), bar_look(kind, Some(&p)));
+        assert_eq!(bar_look_of(b, None), bar_look(kind, None));
+    }
+    // A manual entry does not touch an automatic bar.
+    let auto = GanttBar { manual: false, ..b };
+    let p = palette_of(&[("manual", 0x55AA55, "hollow")]);
+    assert_eq!(bar_look_of(auto, Some(&p)), bar_look(auto.kind, None));
+}
+
+#[test]
+fn manual_summary_and_milestone_keep_their_kinds() {
+    let summary = Task {
+        manual: true,
+        ..manual_summary(1, 1, 5, 6)
+    };
+    let milestone = Task {
+        manual: true,
+        ..task(3, 0, 2)
+    };
+    let ed = editor(vec![summary, task(2, 2, 2), milestone]);
+    let p = palette_of(&[("manual", 0x55AA55, "hollow")]);
+    for (uid, kind) in [(1, BarKind::Summary), (3, BarKind::Milestone)] {
+        let b = bar(&ed, uid);
+        assert_eq!(b.kind, kind);
+        assert!(!b.manual, "{uid}");
+        assert_eq!(bar_look_of(b, Some(&p)), bar_look(kind, Some(&p)));
+    }
+}
+
+#[test]
+fn inactive_bar_takes_the_palette_inactive_colour() {
+    let with = palette_of(&[
+        ("summary", 0x111111, "summary"),
+        ("manual", 0x55AA55, "thin"),
+        ("inactive", 0xDDDDDD, "bar"),
+    ]);
+    let without = palette_of(&[("summary", 0x111111, "summary")]);
+    for kind in [BarKind::OnTrack, BarKind::Summary, BarKind::Milestone] {
+        let b = GanttBar {
+            inactive: true,
+            ..plain(kind)
+        };
+        let (_, shape) = bar_look(kind, Some(&with));
+        // The colour changes, the shape (which decides the outline) stays.
+        assert_eq!(bar_look_of(b, Some(&with)), (0xDDDDDD, shape));
+        assert_eq!(
+            bar_look_of(b, Some(&without)),
+            bar_look(kind, Some(&without))
+        );
+        assert_eq!(bar_look_of(b, None), bar_look(kind, None));
+        // An active bar ignores the entry.
+        let active = GanttBar {
+            inactive: false,
+            ..b
+        };
+        assert_eq!(
+            bar_look_of(active, Some(&with)),
+            bar_look(kind, Some(&with))
+        );
+    }
+    // An inactive manual bar keeps the manual shape in the inactive colour.
+    let b = GanttBar {
+        inactive: true,
+        manual: true,
+        ..plain(BarKind::OnTrack)
+    };
+    assert_eq!(bar_look_of(b, Some(&with)), (0xDDDDDD, BarShape::Thin));
+}
+
+#[test]
+fn state_reports_a_manual_bar() {
+    let mut inactive = manual_leaf(2, 2);
+    inactive.active = Some(false);
+    let ed = editor(vec![manual_leaf(1, 3), inactive]);
+    assert_eq!(bar(&ed, 1).state(), "critical 0-2 manual");
+    assert_eq!(bar(&ed, 2).state(), "on-track 0-1 manual inactive");
+    let auto = editor(vec![task(1, 3, 1)]);
+    assert_eq!(bar(&auto, 1).state(), "critical 0-2");
 }

@@ -837,8 +837,14 @@ restores is checked by the ignored desktop test
 dirty and another active, relaunches the same sandbox and requires the same
 `tab-list` reply back. A relaunch is not a script step.
 
-Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
-from the Gantt chart's scale origin, or `none` when the task has no schedule result.
+Project `bar_<id>` values are
+`<kind> <start>-<end>[ rollup <s>-<e>][ warning][ manual][ inactive]` in
+inclusive day offsets from the Gantt chart's scale origin, or `none` when the
+task has no schedule result. The suffixes appear in that order: `rollup` is a
+manual summary's rolled-up span, `warning` a manual summary's warning (its
+subtasks finish after it, or it finishes after its manual parent), `manual` a
+manually scheduled task that is neither a summary nor a milestone (#1760), and
+`inactive` an inactive task.
 Kinds are `critical`, `on-track`, `summary`, and `milestone`. The kind is the one
 drawn after the Gantt Chart Format toggles: with Bar Styles › Critical Tasks off,
 a critical task reads `on-track`. `baseline_<id>` is the drawn baseline bar,

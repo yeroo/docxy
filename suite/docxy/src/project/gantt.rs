@@ -21,6 +21,10 @@ pub(crate) enum BarKind {
 pub(crate) struct GanttBar {
     pub kind: BarKind,
     pub inactive: bool,
+    /// A manually scheduled task's bar that is neither a summary nor a
+    /// milestone: drawn with the palette's `manual` entry when it has one
+    /// (#1760). `kind` stays Critical/OnTrack.
+    pub manual: bool,
     pub start: i64,
     pub end: i64,
     pub baseline: Option<(i64, i64)>,
@@ -160,19 +164,48 @@ pub(crate) fn bar_look(
         BarKind::Milestone => BarShape::Diamond,
         BarKind::Critical | BarKind::OnTrack => BarShape::Bar,
     };
-    let Some(style) = palette.and_then(|p| p.bars.iter().find(|b| b.kind == bar_kind_name(kind)))
-    else {
-        return (bar_kind_color(kind), builtin_shape);
-    };
+    palette_entry(palette, bar_kind_name(kind), builtin_shape)
+        .unwrap_or((bar_kind_color(kind), builtin_shape))
+}
+
+/// The palette's entry for `kind` (its colour and shape, `fallback` for an
+/// unknown shape name), if it has one.
+fn palette_entry(
+    palette: Option<&projcore::uiplugin::Palette>,
+    kind: &str,
+    fallback: BarShape,
+) -> Option<(u32, BarShape)> {
+    let style = palette?.bars.iter().find(|b| b.kind == kind)?;
     let shape = match style.shape.as_str() {
         "hollow" => BarShape::Hollow,
         "thin" => BarShape::Thin,
         "summary" => BarShape::Summary,
         "diamond" => BarShape::Diamond,
         "bar" => BarShape::Bar,
-        _ => builtin_shape,
+        _ => fallback,
     };
-    (style.color, shape)
+    Some((style.color, shape))
+}
+
+/// How `bar` is drawn under `palette` (#1760): a manual bar takes the
+/// palette's `manual` entry when it names one, else its kind's look; an
+/// inactive bar's outline takes the palette's `inactive` colour when it names
+/// one, keeping the shape.
+pub(crate) fn bar_look_of(
+    bar: GanttBar,
+    palette: Option<&projcore::uiplugin::Palette>,
+) -> (u32, BarShape) {
+    let (color, shape) = bar
+        .manual
+        .then(|| palette_entry(palette, "manual", BarShape::Bar))
+        .flatten()
+        .unwrap_or_else(|| bar_look(bar.kind, palette));
+    let color = bar
+        .inactive
+        .then(|| palette_entry(palette, "inactive", shape))
+        .flatten()
+        .map_or(color, |(c, _)| c);
+    (color, shape)
 }
 
 impl GanttBar {
@@ -189,6 +222,9 @@ impl GanttBar {
         }
         if self.warning {
             state += " warning";
+        }
+        if self.manual {
+            state += " manual";
         }
         if self.inactive {
             state += " inactive";
@@ -280,6 +316,7 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
         .is_some_and(|i| inactive_row(ed.project(), i));
     Some(GanttBar {
         inactive,
+        manual: task.manual && !task.summary && !milestone,
         kind: if task.summary {
             BarKind::Summary
         } else if task.is_milestone() {
@@ -947,7 +984,7 @@ pub(crate) fn gantt_strip(
     let Some(bar) = bar else {
         return strip;
     };
-    let (color, shape) = bar_look(bar.kind, palette);
+    let (color, shape) = bar_look_of(bar, palette);
     let dw = scale.day_w;
     let boxes = bar_boxes(bar.geom.height);
     let (bx, bw) = span_x(&bar, dw);

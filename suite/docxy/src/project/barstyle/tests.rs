@@ -848,3 +848,54 @@ fn a_milestone_under_a_progress_row_is_a_point() {
     let r = bar_rows(&ed, ed.project().task(1).unwrap(), scale, look(1)).unwrap();
     assert_eq!(r[0].x0, r[0].x1);
 }
+
+#[test]
+fn palette_look_keeps_manual_and_inactive_colours() {
+    let style = |kind: &str, color: u32, shape: &str| projcore::uiplugin::BarStyle {
+        kind: kind.into(),
+        color,
+        shape: shape.into(),
+    };
+    let p = projcore::uiplugin::Palette {
+        id: "p".into(),
+        label: "P".into(),
+        bars: vec![
+            style("on-track", 0x3366CC, "bar"),
+            style("manual", 0x55AA55, "hollow"),
+            style("inactive", 0xDDDDDD, ""),
+        ],
+    };
+    let bar = GanttBar {
+        kind: BarKind::OnTrack,
+        inactive: false,
+        manual: true,
+        start: 0,
+        end: 2,
+        baseline: None,
+        delay: None,
+        rollup: None,
+        warning: false,
+        geom: Default::default(),
+    };
+    let look = PaletteLook::of(Some(bar), Some(&p));
+    assert_eq!((look.color, look.shape), (0x55AA55, BarShape::Hollow));
+    let look = PaletteLook::of(
+        Some(GanttBar {
+            inactive: true,
+            ..bar
+        }),
+        Some(&p),
+    );
+    assert_eq!(
+        (look.color, look.shape, look.inactive),
+        (0xDDDDDD, BarShape::Hollow, true)
+    );
+    let auto = PaletteLook::of(
+        Some(GanttBar {
+            manual: false,
+            ..bar
+        }),
+        Some(&p),
+    );
+    assert_eq!((auto.color, auto.shape), (0x3366CC, BarShape::Bar));
+}

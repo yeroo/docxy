@@ -1570,6 +1570,20 @@
   (`project-plugin-ui.uit`, not run on macOS). Not drawn: terminal `yppxy`,
   row height following the bar height, the Layout dialog itself.
 
+## Palette manual and inactive bars (#1760)
+
+- A palette's `manual` entry colours (and shapes) the bar of a manually
+  scheduled task that is neither a summary nor a milestone: `GanttBar::manual`
+  (set in `gantt_bar`) beside a `kind` that stays Critical/OnTrack, so the
+  critical toggle and the overlay's `kind`/`critical` are unchanged.
+  Without the entry the bar keeps its `critical` / `on-track` look. An
+  inactive bar's outline takes the palette's `inactive` colour when there is
+  one, in the shape it had. `bar_look_of` is the one look of a drawn bar
+  (`gantt_strip`, `PaletteLook::of`); Bar Styles rows (#1696) still win, and
+  rolled-up children keep their kind's look. `GanttBar::state` adds
+  ` manual` before ` inactive`. yppxy draws no palette, so it has nothing to
+  change.
+
 ## Project timescale and Timeline pane (#1535)
 
 - `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days

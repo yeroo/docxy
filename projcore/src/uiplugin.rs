@@ -610,8 +610,12 @@ pub struct Palette {
 /// One bar kind's colour and shape in a palette.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BarStyle {
-    /// `critical`, `on-track`, `summary`, `milestone`, `baseline`,
-    /// `progress`, `delay`, `inactive`.
+    /// `critical`, `on-track`, `summary`, `milestone`, `manual`, `baseline`,
+    /// `progress`, `delay`, `inactive`. `manual` is a manually scheduled
+    /// task's bar that is neither a summary nor a milestone (its middle only),
+    /// drawn in its `critical` / `on-track` look when absent; `inactive` is
+    /// the colour of an inactive bar's outline (its shape is ignored), the
+    /// bar's own colour when absent (#1760).
     pub kind: String,
     /// `0xRRGGBB`.
     pub color: u32,

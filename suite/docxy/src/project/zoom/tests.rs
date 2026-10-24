@@ -193,6 +193,7 @@ fn geometry_follows_the_scales_own_width() {
     assert_eq!(scale.visible(60., 30.), 10..15);
     let bar = GanttBar {
         kind: BarKind::OnTrack,
+        manual: false,
         inactive: false,
         start: 10,
         end: 14,
@@ -206,6 +207,7 @@ fn geometry_follows_the_scales_own_width() {
     assert_eq!(bar_rect(&bar, 22.), (220., 5., 110., 14.));
     let milestone = GanttBar {
         kind: BarKind::Milestone,
+        manual: false,
         ..bar
     };
     // The diamond is centred in its day at any zoom.
