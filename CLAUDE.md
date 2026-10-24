@@ -495,6 +495,10 @@
   `version_satisfies`, `Manifest`, `StateCtx`/`State`, `Command`/
   `CommandResult`, `OverlayCtx`/`Shape`); `projcore::json` is the value type
   (strict parser, compact writer; the formats declaration uses it too).
+- The state and command requests' `selection {uids, cols}` lists the
+  cursor's task first and the cursor's column first (#1756), then the
+  range's others in order (`Selection::cursor_first`), so the cursor cell is
+  the first uid's first column; no field says it apart.
 - Command ops are `projctl` editor verbs applied by `projctl::apply_ops` in
   one `Editor::batch`. yppxy's `--command <id>` runs one headless (first
   task selected) and prints the status. Both hosts' `app-info` reports

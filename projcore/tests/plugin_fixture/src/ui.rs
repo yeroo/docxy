@@ -134,7 +134,8 @@ const MANIFEST: &str = r##"{
 /// The chosen palette, kept across calls.
 static PALETTE: Mutex<String> = Mutex::new(String::new());
 
-/// The selection's first task and column, when the request has them.
+/// The selection's first task and column, when the request has them: the
+/// cursor cell, as the host lists the cursor's task and column first (#1756).
 fn cursor_cell(req: &Json) -> Option<(i64, String)> {
     let sel = req.get("selection")?;
     let uid = sel.get("uids")?.list().first()?.num()? as i64;
