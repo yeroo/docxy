@@ -31409,8 +31409,13 @@ fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
 /// Whether some command KeyTip on a tab is longer than `typed` and starts
 /// with it, so the next letter can still complete it.
 fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
+    // `get`: a plugin's KeyTip may hold a character of more than one byte.
     let starts = |cmd: &rs::Cmd<Act>| {
-        cmd.key_tip.len() > typed.len() && cmd.key_tip[..typed.len()].eq_ignore_ascii_case(typed)
+        cmd.key_tip.len() > typed.len()
+            && cmd
+                .key_tip
+                .get(..typed.len())
+                .is_some_and(|k| k.eq_ignore_ascii_case(typed))
     };
     let commands = tab
         .groups
@@ -31432,7 +31437,6 @@ fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
     commands
         || tab.groups.iter().any(|g| {
             let key = g.launcher_key;
-            // `get`: a plugin's KeyTip may hold a character of more than one byte.
             g.launcher.is_some()
                 && key.len() > typed.len()
                 && key

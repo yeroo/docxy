@@ -1436,3 +1436,17 @@ fn a_launcher_keytip_runs_it_after_its_first_letter_waits() {
     let plain = extended(r##"{"ribbon":[]}"##);
     assert!(!crate::tab_keytip_starts(&plain, "Z"));
 }
+
+#[test]
+fn a_multibyte_keytip_never_panics_the_keytip_lookups() {
+    // "ÉX" and "ZÉ": a typed first letter must not slice inside the É.
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Accents","launcher":{"id":"a.more","keytip":"ZÉ"},"controls":[{"id":"a.e","kind":"button","label":"E","keytip":"ÉX","large":true}]}]}]}"##,
+    );
+    assert!(crate::tab_keytip_starts(&task, "Z"));
+    assert!(!crate::tab_keytip_starts(&task, "Q"));
+    assert!(crate::tab_keytip_starts(&task, "É"));
+    assert_eq!(crate::tab_keytip_cmd(&task, "ÉX"), Some(act_of("a.e")));
+    assert_eq!(crate::tab_keytip_cmd(&task, "ZÉ"), Some(act_of("a.more")));
+}

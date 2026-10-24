@@ -234,12 +234,6 @@ impl<A> Group<A> {
         self.launcher = Some(act);
         self
     }
-    /// The launcher's screentip and KeyTip.
-    pub fn launcher_tip(mut self, tip: &'static str, key: &'static str) -> Self {
-        self.launcher_tip = tip;
-        self.launcher_key = key;
-        self
-    }
 }
 
 /// The most small-button rows a [`Control::Column`] or [`Control::Rows`] stack
