@@ -2983,8 +2983,10 @@ pub fn date_unrepresentable(xf: &Xf, value: &CellValue, date1904: bool) -> bool 
 /// Render a cell value through its full style: the real format-code runtime
 /// when the code is known and renderable, the classified approximation
 /// otherwise. A date or time that cannot be shown is [`UNREPRESENTABLE`].
-/// A text value is cut at [`crate::entry::MAX_CELL_CHARS`] UTF-16 units, so
-/// a format repeating it with many `@` never builds more than a cell holds.
+/// A text value always shows whole, but what its format adds (a value
+/// repeated by many `@`, literals) is cut where the result passes
+/// [`crate::entry::MAX_CELL_CHARS`] UTF-16 units, or the value's own length
+/// when a loaded value is longer, so nothing past that is built.
 pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
     if date_unrepresentable(xf, value, date1904) {
         return UNREPRESENTABLE.to_string();
@@ -2998,7 +3000,8 @@ pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
                     }
                 }
                 CellValue::Text(s) => {
-                    return fmt.format_text_truncated(s, crate::entry::MAX_CELL_CHARS);
+                    let cap = crate::entry::MAX_CELL_CHARS.max(s.encode_utf16().count());
+                    return fmt.format_text_truncated(s, cap);
                 }
                 _ => {}
             }
@@ -3215,6 +3218,16 @@ mod tests {
             "{}",
             out.capacity()
         );
+        // A loaded value longer than a cell may hold still shows whole;
+        // only what the format adds is cut.
+        let long = "y".repeat(40_000);
+        let long_cell = CellValue::Text(long.as_str().into());
+        assert_eq!(
+            format_with(&coded("General".into()), &long_cell, false),
+            long
+        );
+        assert_eq!(format_with(&coded("@".into()), &long_cell, false), long);
+        assert_eq!(format_with(&coded("@@".into()), &long_cell, false), long);
         // A small result renders whole.
         assert_eq!(
             format_with(

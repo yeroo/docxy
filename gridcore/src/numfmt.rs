@@ -1452,21 +1452,22 @@ mod tests {
 
     #[test]
     fn format_text_truncated_matches_format_text_under_the_cap() {
-        for code in [
-            "@",
-            "@@",
-            "\"Item: \"@\" end\"",
-            "0.00;-0.00;0;\"Item: \"@",
-            "0.00",
-            "General",
-        ] {
+        let cases = [
+            ("@", "pen", "pen"),
+            ("@@", "pen", "penpen"),
+            ("\"Item: \"@\" end\"", "pen", "Item: pen end"),
+            ("0.00;-0.00;0;\"Item: \"@", "pen", "Item: pen"),
+            ("0;0;0;General\"!\"", "pen", "pen!"),
+            ("0;0;0;\"x\"", "pen", "x"),
+            ("0.00", "pen", "pen"),
+            ("@@", "\u{1F600}x", "\u{1F600}x\u{1F600}x"),
+            ("@", "", ""),
+        ];
+        for (code, s, want) in cases {
             let f = parse_format(code).unwrap();
-            for s in ["", "pen", "\u{1F600}x"] {
-                let whole = f.format_text(s);
-                let units = whole.encode_utf16().count();
-                assert_eq!(f.format_text_truncated(s, units), whole, "{code} {s}");
-                assert_eq!(f.format_text_truncated(s, usize::MAX), whole, "{code} {s}");
-            }
+            assert_eq!(f.format_text(s), want, "{code} {s}");
+            let units = want.encode_utf16().count();
+            assert_eq!(f.format_text_truncated(s, units), want, "{code} {s}");
         }
     }
 
