@@ -1342,3 +1342,111 @@ fn a_plain_string_prefill_keeps_the_manifests_cell_specs() {
     assert_eq!(c.cell_kind(1, 1), K::Checkbox);
     assert_eq!(c.cell_specs.len(), 2);
 }
+
+fn group_of<'a>(tab: &'a rs::Tab<Act>, title: &str) -> &'a rs::Group<Act> {
+    tab.groups
+        .iter()
+        .find(|g| g.title == title)
+        .unwrap_or_else(|| panic!("no group {title}"))
+}
+
+#[test]
+fn a_contributed_group_launcher_runs_its_command() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Launched","launcher":{"id":"l.font","tip":"Font","keytip":"ZN"},"controls":[{"id":"l.a","kind":"button","label":"A"}]},
+          {"title":"Plain","controls":[{"id":"p.a","kind":"button","label":"A"}]}]}]}"##,
+    );
+    let g = group_of(&task, "Launched");
+    assert_eq!(g.launcher, Some(act_of("l.font")));
+    assert_eq!((g.launcher_tip, g.launcher_key), ("Font", "ZN"));
+    let plain = group_of(&task, "Plain");
+    assert_eq!(plain.launcher, None);
+    assert_eq!((plain.launcher_tip, plain.launcher_key), ("", ""));
+}
+
+#[test]
+fn a_launcher_joins_a_built_in_group_even_when_no_control_is_added() {
+    // "Schedule"'s one control replaces a built-in in place: the group still
+    // takes the launcher (#1669).
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Schedule","launcher":{"id":"s.more","tip":"","keytip":""},"controls":[{"id":"pr-indent","kind":"button","label":"In"}]},
+          {"title":"NewButEmpty","launcher":{"id":"e.more"},"controls":[{"id":"pr-outdent","kind":"button","label":"Out"}]}]}]}"##,
+    );
+    let schedule = group_of(&task, "Schedule");
+    assert_eq!(schedule.launcher, Some(act_of("s.more")));
+    assert_eq!(schedule.launcher_tip, "", "no tip: the host's own");
+    // A new group all of whose controls replaced built-ins is not made.
+    assert!(!task.groups.iter().any(|g| g.title == "NewButEmpty"));
+
+    // A later plugin's group without a launcher leaves it; one with a
+    // launcher replaces it.
+    let first = Manifest::parse(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Schedule","launcher":{"id":"s.one","tip":"One","keytip":"ZO"},"controls":[]}]}]}"##,
+    )
+    .unwrap();
+    let plain = Manifest::parse(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Schedule","controls":[{"id":"s.x","kind":"button","label":"X"}]}]}]}"##,
+    )
+    .unwrap();
+    let second = Manifest::parse(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"schedule","launcher":{"id":"s.two","tip":"Two","keytip":"ZT"},"controls":[]}]}]}"##,
+    )
+    .unwrap();
+    let task_tab = || {
+        let mut ribbon = crate::project_ribbon();
+        let i = ribbon.tabs.iter().position(|t| t.name == "Task").unwrap();
+        ribbon.tabs.remove(i)
+    };
+    let mut kept = task_tab();
+    extend_tab_with(&mut kept, &[&first, &plain]);
+    let g = group_of(&kept, "Schedule");
+    assert_eq!(g.launcher, Some(act_of("s.one")));
+    assert_eq!((g.launcher_tip, g.launcher_key), ("One", "ZO"));
+    let mut replaced = task_tab();
+    extend_tab_with(&mut replaced, &[&first, &second]);
+    let g = group_of(&replaced, "Schedule");
+    assert_eq!(g.launcher, Some(act_of("s.two")));
+    assert_eq!((g.launcher_tip, g.launcher_key), ("Two", "ZT"));
+}
+
+#[test]
+fn a_launcher_keytip_runs_it_after_its_first_letter_waits() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Fixture","launcher":{"id":"fixture.font","tip":"Font","keytip":"ZN"},"controls":[{"id":"fixture.hello","kind":"button","label":"Hello","keytip":"XH","large":true}]}]}]}"##,
+    );
+    assert!(crate::tab_keytip_starts(&task, "Z"));
+    assert!(crate::tab_keytip_starts(&task, "z"));
+    assert!(!crate::tab_keytip_starts(&task, "ZN"));
+    assert_eq!(
+        crate::tab_keytip_cmd(&task, "ZN"),
+        Some(act_of("fixture.font"))
+    );
+    assert_eq!(
+        crate::tab_keytip_cmd(&task, "zn"),
+        Some(act_of("fixture.font"))
+    );
+    assert_eq!(crate::tab_keytip_cmd(&task, "Z"), None);
+    // Without the launcher, Z starts nothing on the Task tab.
+    let plain = extended(r##"{"ribbon":[]}"##);
+    assert!(!crate::tab_keytip_starts(&plain, "Z"));
+}
+
+#[test]
+fn a_multibyte_keytip_never_panics_the_keytip_lookups() {
+    // "ÉX" and "ZÉ": a typed first letter must not slice inside the É.
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[
+          {"title":"Accents","launcher":{"id":"a.more","keytip":"ZÉ"},"controls":[{"id":"a.e","kind":"button","label":"E","keytip":"ÉX","large":true}]}]}]}"##,
+    );
+    assert!(crate::tab_keytip_starts(&task, "Z"));
+    assert!(!crate::tab_keytip_starts(&task, "Q"));
+    assert!(crate::tab_keytip_starts(&task, "É"));
+    assert_eq!(crate::tab_keytip_cmd(&task, "ÉX"), Some(act_of("a.e")));
+    assert_eq!(crate::tab_keytip_cmd(&task, "ZÉ"), Some(act_of("a.more")));
+}

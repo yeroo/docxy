@@ -216,7 +216,8 @@ fn comparator_holds(part: &str, v: Version) -> Result<bool, String> {
 /// What `yppx_ui_manifest` returns: the plugin's static contributions.
 ///
 /// A new group may add `"priority":N` (its collapse priority, #1685) beside
-/// `before` / `after`.
+/// `before` / `after`, and any group a dialog launcher
+/// `"launcher":{"id":"x.font","tip":"Font","keytip":"ZN"}` (#1669).
 ///
 /// ```json
 /// {"ribbon":[{"tab":"Task","groups":[{"title":"Extras","controls":[
@@ -265,6 +266,22 @@ pub struct RibbonGroup {
     /// group; absent, it takes the priority of the group (built-in or already
     /// contributed) named by `before`, else `after`, else 50 (#1685).
     pub priority: Option<u8>,
+    /// The group's dialog-box launcher (the small arrow by its title), drawn
+    /// as a built-in group's; its press runs the command `id` (#1669). On a
+    /// group that joins a built-in one it replaces that group's launcher; a
+    /// new group that adds no control is not drawn, launcher and all.
+    pub launcher: Option<Launcher>,
+}
+
+/// A contributed group's dialog launcher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Launcher {
+    /// The command `yppx_ui_command` receives on a press.
+    pub id: String,
+    /// The screentip; empty, the host's own.
+    pub tip: String,
+    /// The Alt-access letters.
+    pub keytip: String,
 }
 
 /// A ribbon control. Its `id` is what `yppx_ui_state` reports on and what
@@ -675,12 +692,30 @@ impl Manifest {
                             .collect(),
                     });
                 }
+                let launcher = match g.get("launcher") {
+                    Some(l) if l.as_object().is_some() => {
+                        let id = l.text("id");
+                        if id.is_empty() {
+                            return Err(format!(
+                                "the launcher of group \"{}\" has no id",
+                                g.text("title")
+                            ));
+                        }
+                        Some(Launcher {
+                            id,
+                            tip: l.text("tip"),
+                            keytip: l.text("keytip"),
+                        })
+                    }
+                    _ => None,
+                };
                 groups.push(RibbonGroup {
                     title: g.text("title"),
                     controls,
                     before: g.text("before"),
                     after: g.text("after"),
                     priority: g.num("priority").map(|n| n.clamp(0.0, 255.0).round() as u8),
+                    launcher,
                 });
             }
             m.ribbon.push(RibbonTab {
@@ -891,6 +926,16 @@ impl Manifest {
                                         if let Some(p) = g.priority {
                                             pairs
                                                 .push(("priority".into(), Json::Num(f64::from(p))));
+                                        }
+                                        if let Some(l) = &g.launcher {
+                                            pairs.push((
+                                                "launcher".into(),
+                                                Json::obj(vec![
+                                                    ("id", Json::str(l.id.clone())),
+                                                    ("tip", Json::str(l.tip.clone())),
+                                                    ("keytip", Json::str(l.keytip.clone())),
+                                                ]),
+                                            ));
                                         }
                                     }
                                     obj
@@ -2133,6 +2178,59 @@ mod tests {
         .unwrap();
         assert!(m.json().contains(r#""priority":30"#));
         assert_eq!(Manifest::parse(&m.json()).unwrap(), m);
+    }
+
+    #[test]
+    fn a_group_launcher_parses_and_round_trips() {
+        let parse = |l: &str| {
+            let text = format!(
+                r#"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"G","controls":[]{l}}}]}}]}}"#
+            );
+            Manifest::parse(&text).map(|m| m.ribbon[0].groups[0].launcher.clone())
+        };
+        assert_eq!(parse(""), Ok(None));
+        assert_eq!(parse(r#","launcher":"x""#), Ok(None));
+        assert_eq!(
+            parse(r#","launcher":{}"#),
+            Err(r#"the launcher of group "G" has no id"#.to_string())
+        );
+        assert_eq!(
+            parse(r#","launcher":{"id":"","tip":"T"}"#),
+            Err(r#"the launcher of group "G" has no id"#.to_string())
+        );
+        assert_eq!(
+            parse(r#","launcher":{"id":"x.font","tip":"Font","keytip":"ZN"}"#),
+            Ok(Some(Launcher {
+                id: "x.font".into(),
+                tip: "Font".into(),
+                keytip: "ZN".into(),
+            }))
+        );
+        assert_eq!(
+            parse(r#","launcher":{"id":"x.font"}"#),
+            Ok(Some(Launcher {
+                id: "x.font".into(),
+                tip: String::new(),
+                keytip: String::new(),
+            }))
+        );
+        let m = Manifest::parse(
+            r#"{"ribbon":[{"tab":"Task","groups":[{"title":"G","controls":[],"priority":30,"launcher":{"id":"x.font","tip":"Font","keytip":"ZN"}}]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            m.json()
+                .contains(r#""priority":30,"launcher":{"id":"x.font","tip":"Font","keytip":"ZN"}"#),
+            "{}",
+            m.json()
+        );
+        assert_eq!(Manifest::parse(&m.json()).unwrap(), m);
+        // A group without one writes no key.
+        let plain = Manifest::parse(
+            r#"{"ribbon":[{"tab":"Task","groups":[{"title":"G","controls":[]}]}]}"#,
+        )
+        .unwrap();
+        assert!(!plain.json().contains("launcher"));
     }
 
     #[test]

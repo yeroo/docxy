@@ -52,6 +52,40 @@ test a contributed group goes before the built-in group its manifest names
   call ribbon-click {"tab":"Gantt Chart Format","command":"fixture.format"}
   assert status is Fixture: format
 
+test a contributed group's dialog launcher runs its command by click and by KeyTip
+  # #1669: the Task tab's "Fixture" group and the Gantt Chart Format tab's
+  # "Fixture Format" declare the launcher fixture.font (tip, KeyTip ZN).
+  # Fixture Format fits at every CI width, so its launcher is drawn in place
+  # and clicked there; the Task tab's group is collapsed at 1180 px, where
+  # its KeyTip still runs the launcher.
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  assert reply.tabs.1.groups.-1.title is Fixture
+  assert reply.tabs.1.groups.-1.launcher is true
+  assert reply.tabs.1.groups.-1.launcher_tip is Font (fixture launcher)
+  assert reply.tabs.1.groups.-1.launcher_key_tip is ZN
+  assert reply.tabs.1.groups.0.launcher is false
+  assert reply.tabs.-1.groups.0.title is Fixture Format
+  assert reply.tabs.-1.groups.0.launcher is true
+  assert reply.tabs.-1.groups.1.launcher is false
+  call ribbon-layout {"tab":"Gantt Chart Format"}
+  shot window
+  shot window
+  # The title is matched without regard to case.
+  call pointer-click {"region":"ribbon-launch:fixture format"}
+  assert status is Fixture: font launcher
+  call-error pointer-click {"region":"ribbon-launch:Fixture Percent"} => the ribbon group Fixture Percent draws no launcher
+  call ribbon-layout {"tab":"Task"}
+  shot window
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call real-key {"key":"t"}
+  call real-key {"key":"z"}
+  assert keytips_up is true
+  call real-key {"key":"n"}
+  assert keytips_up is false
+  assert status is Fixture: font launcher
+
 test the Task tab with a contributed group collapses whole groups, never a label
   # #1608: at 1180 px the tab overflows, so the lowest-priority group (the
   # fixture's, priority 50) collapses into one labelled button while every

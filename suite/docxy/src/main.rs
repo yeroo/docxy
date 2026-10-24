@@ -17433,11 +17433,26 @@ impl Docxy {
                 .ok_or_else(|| "the ribbon's groups are not shown".to_string()),
             Region::RibbonFlyout => lookup(&self.probes.borrow(), "ribbon-flyout")
                 .ok_or_else(|| "no ribbon flyout is open".to_string()),
-            Region::RibbonLaunch(title) => lookup(
-                &self.probes.borrow(),
-                &harness::region_name(region),
-            )
-            .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn")),
+            Region::RibbonLaunch(asked) => {
+                // The shown tab's groups, the model ribbon's (a plugin's
+                // included, #1669) or the sheet's, name the drawn title.
+                let groups: Vec<(&'static str, bool)> = if self.ribbon_is_model() {
+                    self.active_ribbon_tab_def()
+                        .groups
+                        .iter()
+                        .map(|g| (g.title, g.launcher.is_some()))
+                        .collect()
+                } else {
+                    sheet_ribbon::tab_def(self.ribbon_tab)
+                        .groups
+                        .iter()
+                        .map(|g| (g.title, g.launcher))
+                        .collect()
+                };
+                let title = harness::launch_title(&groups, asked)?;
+                lookup(&self.probes.borrow(), &format!("ribbon-launch:{title}"))
+                    .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn"))
+            }
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -31394,10 +31409,16 @@ fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
 /// Whether some command KeyTip on a tab is longer than `typed` and starts
 /// with it, so the next letter can still complete it.
 fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
+    // `get`: a plugin's KeyTip may hold a character of more than one byte.
     let starts = |cmd: &rs::Cmd<Act>| {
-        cmd.key_tip.len() > typed.len() && cmd.key_tip[..typed.len()].eq_ignore_ascii_case(typed)
+        cmd.key_tip.len() > typed.len()
+            && cmd
+                .key_tip
+                .get(..typed.len())
+                .is_some_and(|k| k.eq_ignore_ascii_case(typed))
     };
-    tab.groups
+    let commands = tab
+        .groups
         .iter()
         .flat_map(|g| g.items.iter())
         .any(|c| match c {
@@ -31411,15 +31432,33 @@ fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
                 rs::Cell::Btn(cmd) | rs::Cell::Combo { cmd, .. } => starts(cmd),
             }),
             _ => false,
+        });
+    // A group launcher's KeyTip (a plugin's, #1669) waits the same way.
+    commands
+        || tab.groups.iter().any(|g| {
+            let key = g.launcher_key;
+            g.launcher.is_some()
+                && key.len() > typed.len()
+                && key
+                    .get(..typed.len())
+                    .is_some_and(|k| k.eq_ignore_ascii_case(typed))
         })
 }
 
-/// Find a command in a tab by its KeyTip letter.
+/// Find a command in a tab by its KeyTip letter, else a group launcher with
+/// that KeyTip (#1669).
 fn tab_keytip_cmd(tab: &rs::Tab<Act>, key: &str) -> Option<Act> {
     tab.groups
         .iter()
         .flat_map(|g| g.items.iter())
         .find_map(|c| control_keytip(c, key))
+        .or_else(|| {
+            tab.groups.iter().find_map(|g| {
+                (!g.launcher_key.is_empty() && g.launcher_key.eq_ignore_ascii_case(key))
+                    .then_some(g.launcher)
+                    .flatten()
+            })
+        })
 }
 
 /// The split button on a tab whose KeyTip is `key`: its primary's id. The
@@ -37309,15 +37348,32 @@ impl Docxy {
             ))
             .child(div().text_size(px(9.)).text_color(pal.dim).child(g.title))
             .when_some(g.launcher, |d, act| {
+                // A plugin's launcher names its tip and KeyTip (#1669); the
+                // badge shows on the group in the ribbon, not a flyout's copy.
+                let tip = if g.launcher_tip.is_empty() {
+                    "More options"
+                } else {
+                    g.launcher_tip
+                };
+                let keytip = (self.keytips == KeyTip::Commands
+                    && wrap.is_none()
+                    && !g.launcher_key.is_empty())
+                .then_some(g.launcher_key);
                 d.child(
                     div()
                         .id(SharedString::from(format!("launch-{}", g.title)))
+                        .relative()
+                        .child(probe(
+                            &self.probes,
+                            format!("{prefix}ribbon-launch:{}", g.title),
+                        ))
                         .text_size(px(10.))
                         .text_color(pal.dim)
                         .cursor_pointer()
                         .hover(|d| d.text_color(pal.fg))
                         .child("\u{2922}")
-                        .tooltip(|w, cx| Tooltip::new("More options").build(w, cx))
+                        .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+                        .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
                         .on_click(cx.listener(move |this, _, w, cx| this.dispatch(act, w, cx))),
                 )
             });

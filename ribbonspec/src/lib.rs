@@ -99,6 +99,10 @@ pub struct Group<A> {
     /// The dialog-box launcher action (the small ⤢ at the group's corner), if the
     /// group opens an advanced dialog. `None` = no launcher.
     pub launcher: Option<A>,
+    /// The launcher's screentip (empty: the renderer's own) and KeyTip
+    /// (empty: none), as a UI plugin's launcher names them (#1669).
+    pub launcher_tip: &'static str,
+    pub launcher_key: &'static str,
     /// Responsive-collapse order: as the ribbon runs out of width, groups with the
     /// LOWEST priority shrink/collapse to an overflow popup first. Higher = kept
     /// large longer. (Typical: 0 = least important … 255 = pin.)
@@ -217,6 +221,8 @@ pub fn group<A>(title: &'static str, priority: u8, items: Vec<Control<A>>) -> Gr
     Group {
         title,
         launcher: None,
+        launcher_tip: "",
+        launcher_key: "",
         priority,
         items,
     }
