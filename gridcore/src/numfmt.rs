@@ -639,21 +639,33 @@ impl NumFormat {
 
     /// Render a text value (through the `@` section when present).
     pub fn format_text(&self, s: &str) -> String {
+        self.format_text_truncated(s, usize::MAX)
+    }
+
+    /// [`Self::format_text`] cut to its first `max_units` UTF-16 units (a
+    /// character that would straddle the cap is left out whole). Nothing
+    /// past the cap is built, so a value repeated by many `@` stays small.
+    pub fn format_text_truncated(&self, s: &str, max_units: usize) -> String {
+        let mut out = String::new();
+        let mut budget = max_units;
         match self.text_section() {
-            None => s.to_string(),
+            None => {
+                push_capped(&mut out, s, &mut budget);
+            }
             Some(sect) => {
-                let mut out = String::new();
                 for t in &sect.toks {
-                    match t {
-                        Tok::TextValue => out.push_str(s),
-                        Tok::Lit(l) => out.push_str(l),
-                        Tok::General => out.push_str(s),
-                        _ => {}
+                    let piece = match t {
+                        Tok::TextValue | Tok::General => s,
+                        Tok::Lit(l) => l.as_str(),
+                        _ => continue,
+                    };
+                    if !push_capped(&mut out, piece, &mut budget) {
+                        break;
                     }
                 }
-                out
             }
         }
+        out
     }
 
     /// [`Self::format_text`], or `None` when the result would be longer than
@@ -1268,6 +1280,27 @@ fn date_code(lower: &str) -> Option<&'static str> {
     text_month.then_some("D3")
 }
 
+/// Append `piece` to `out` within `budget` UTF-16 units, whole when it
+/// fits, else up to the last character that does. `false` once the budget
+/// stopped it.
+fn push_capped(out: &mut String, piece: &str, budget: &mut usize) -> bool {
+    let units = piece.encode_utf16().count();
+    if units <= *budget {
+        out.push_str(piece);
+        *budget -= units;
+        return true;
+    }
+    for ch in piece.chars() {
+        let n = ch.len_utf16();
+        if n > *budget {
+            break;
+        }
+        out.push(ch);
+        *budget -= n;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1415,6 +1448,48 @@ mod tests {
         assert_eq!(f.format_text("pen"), "Item: pen");
         let f = parse_format("@").unwrap();
         assert_eq!(f.format_text("x"), "x");
+    }
+
+    #[test]
+    fn format_text_truncated_matches_format_text_under_the_cap() {
+        for code in [
+            "@",
+            "@@",
+            "\"Item: \"@\" end\"",
+            "0.00;-0.00;0;\"Item: \"@",
+            "0.00",
+            "General",
+        ] {
+            let f = parse_format(code).unwrap();
+            for s in ["", "pen", "\u{1F600}x"] {
+                let whole = f.format_text(s);
+                let units = whole.encode_utf16().count();
+                assert_eq!(f.format_text_truncated(s, units), whole, "{code} {s}");
+                assert_eq!(f.format_text_truncated(s, usize::MAX), whole, "{code} {s}");
+            }
+        }
+    }
+
+    #[test]
+    fn format_text_truncated_cuts_at_the_cap() {
+        let f = parse_format("@@@").unwrap();
+        assert_eq!(f.format_text_truncated("ab", 5), "ababa");
+        assert_eq!(f.format_text_truncated("ab", 0), "");
+        // A literal before the value is cut too.
+        let f = parse_format("\"Item: \"@").unwrap();
+        assert_eq!(f.format_text_truncated("pen", 3), "Ite");
+        assert_eq!(f.format_text_truncated("pen", 8), "Item: pe");
+        // No text section: the value cut.
+        let f = parse_format("0.00").unwrap();
+        assert_eq!(f.format_text_truncated("abc", 2), "ab");
+    }
+
+    #[test]
+    fn format_text_truncated_keeps_surrogate_pairs_whole() {
+        let f = parse_format("@@").unwrap();
+        assert_eq!(f.format_text_truncated("\u{1F600}", 3), "\u{1F600}");
+        assert_eq!(f.format_text_truncated("\u{1F600}", 1), "");
+        assert_eq!(f.format_text_truncated("a\u{1F600}", 4), "a\u{1F600}a");
     }
 
     #[test]
