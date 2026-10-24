@@ -794,17 +794,19 @@ pub(crate) fn gantt_header(
         .children(header_cells(scale, offset, width, pal, grid, styles))
 }
 
-/// The px a tier's label character is fitted at: [`zoom::CHAR_W`] while the
-/// plan gives the tier no style, so the default header is unchanged; else
-/// scaled from the 10 px text by the drawn size, a tenth wider when bold
-/// (#1666).
-pub(crate) fn tier_char_w(plan: Option<&PlanStyle>, drawn: &PlanStyle) -> f32 {
-    if plan.is_none() {
-        return zoom::CHAR_W;
-    }
+/// The px a tier's label character is fitted at, from the drawn cell style
+/// (#1666): [`zoom::CHAR_W`] is the bold 10 px text the header row draws in
+/// (it sets bold, so a tier inherits it), scaled by the drawn size and a
+/// tenth narrower only when the style makes the tier regular weight. A
+/// style that sets neither (colour, italic, pattern) fits as the plain header.
+pub(crate) fn tier_char_w(drawn: &PlanStyle) -> f32 {
     let size_px = drawn.size.unwrap_or(7.5) * 96. / 72.;
-    let bold = if drawn.bold == Some(true) { 1.1 } else { 1. };
-    zoom::CHAR_W * size_px / 10. * bold
+    let regular = if drawn.bold == Some(false) {
+        1. / 1.1
+    } else {
+        1.
+    };
+    zoom::CHAR_W * size_px / 10. * regular
 }
 
 /// The header's two tiers, 14 px each: the major unit over the minor, each
@@ -825,10 +827,7 @@ fn header_cells(
     let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
     let major_look = crate::plugin_ui::tier_cell_style(styles.0.as_ref(), true);
     let minor_look = crate::plugin_ui::tier_cell_style(styles.1.as_ref(), false);
-    let char_w = (
-        tier_char_w(styles.0.as_ref(), &major_look),
-        tier_char_w(styles.1.as_ref(), &minor_look),
-    );
+    let char_w = (tier_char_w(&major_look), tier_char_w(&minor_look));
     let (major, minor) = zoom::tiers(scale, level, offset, width, char_w);
     let half = ROW_H / 2.;
     let rule = Hsla {

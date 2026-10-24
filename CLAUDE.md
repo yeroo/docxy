@@ -768,9 +768,11 @@
   wins, and `header_cells` draws it through `styled` and `pattern_layer`.
 - A cell's background or pattern covers the header's non-working shading
   there. A large size is clipped: the tier stays 14 px (Project grows it).
-  Labels fit at `gantt::tier_char_w` px a character: `zoom::CHAR_W` (6)
-  while the plan gives the tier no style, else scaled by the drawn size from
-  10 px, a tenth wider when bold.
+  Labels fit at `gantt::tier_char_w` px a character, from the drawn cell
+  style: `zoom::CHAR_W` (6) is the bold 10 px text (the header row sets
+  bold, so both tiers inherit it), scaled by the drawn size, a tenth
+  narrower only for an explicit `bold: false`; a colour, italic or pattern
+  style fits as the plain header.
 - The harness state reports `timescale_styles` `{middle, bottom}` (`null`
   for an unstyled tier). The fixture's `fixture.format` sets both with its
   gridlines and clears them on the next press (`project-plugin-ui.uit`, not
