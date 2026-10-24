@@ -1378,3 +1378,59 @@ fn layout_drawn_lists_rects_with_the_row_offset_and_skips_table_rows_for_rollups
     assert_eq!(rects.len(), 4);
     assert!(rolls.is_empty());
 }
+
+#[test]
+fn overlay_text_takes_the_shapes_text_style() {
+    use projcore::uiplugin::Shape;
+    let base = Font {
+        family: "Segoe UI".into(),
+        ..Default::default()
+    };
+    let text = |font: Option<&str>, on: Option<bool>| Shape::Text {
+        x: 0.,
+        y: 0.,
+        text: "names Ann".into(),
+        color: 0xFF0000,
+        size: 10.,
+        font: font.map(str::to_string),
+        bold: on,
+        italic: on,
+        underline: on,
+        strikethrough: on,
+    };
+    let red = Hsla::from(rgb(0xFF0000));
+    // Unset: the overlay's own font, plain, as before #1668.
+    let plain = overlay_text_run(&text(None, None), &base).unwrap();
+    assert_eq!(plain.len, "names Ann".len());
+    assert_eq!(plain.font, base);
+    assert_eq!(plain.color, red);
+    assert!(plain.underline.is_none() && plain.strikethrough.is_none());
+    // Every key on.
+    let on = overlay_text_run(&text(Some("Arial"), Some(true)), &base).unwrap();
+    assert_eq!(on.font.family.as_ref(), "Arial");
+    assert_eq!(on.font.weight, FontWeight::BOLD);
+    assert_eq!(on.font.style, FontStyle::Italic);
+    let under = on.underline.unwrap();
+    assert_eq!(
+        (under.thickness, under.color, under.wavy),
+        (px(1.), Some(red), false)
+    );
+    let strike = on.strikethrough.unwrap();
+    assert_eq!((strike.thickness, strike.color), (px(1.), Some(red)));
+    // An explicit off is plain: nothing is inherited.
+    let off = overlay_text_run(&text(None, Some(false)), &base).unwrap();
+    assert_eq!(off.font.weight, FontWeight::NORMAL);
+    assert_eq!(off.font.style, FontStyle::Normal);
+    assert_eq!(off.font.family, base.family);
+    assert!(off.underline.is_none() && off.strikethrough.is_none());
+    // Any other shape has no run.
+    let rect = Shape::Rect {
+        x: 0.,
+        y: 0.,
+        w: 1.,
+        h: 1.,
+        color: 0,
+        filled: true,
+    };
+    assert!(overlay_text_run(&rect, &base).is_none());
+}

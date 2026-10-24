@@ -1260,14 +1260,11 @@ fn paint_shape(
             x,
             y,
             text,
-            color,
             size: text_size,
+            ..
         } => {
-            let run = TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color: rgb(*color).into(),
-                ..Default::default()
+            let Some(run) = overlay_text_run(shape, font) else {
+                return;
             };
             let line = window.text_system().shape_line(
                 SharedString::from(text.clone()),
@@ -1285,6 +1282,57 @@ fn paint_shape(
             );
         }
     }
+}
+
+/// The run an overlay text draws with (#1668): `base` (the overlay's font)
+/// with the shape's font family, weight and slant when it sets them, and a
+/// 1 px underline and strikethrough in its colour, as `plugin_ui::styled`
+/// draws a table cell. An explicit off draws plain: an overlay text inherits
+/// nothing. `None` for any other shape.
+fn overlay_text_run(shape: &projcore::uiplugin::Shape, base: &Font) -> Option<TextRun> {
+    let projcore::uiplugin::Shape::Text {
+        text,
+        color,
+        font,
+        bold,
+        italic,
+        underline,
+        strikethrough,
+        ..
+    } = shape
+    else {
+        return None;
+    };
+    let mut run_font = base.clone();
+    if let Some(family) = font {
+        run_font.family = family.clone().into();
+    }
+    match bold {
+        Some(true) => run_font.weight = FontWeight::BOLD,
+        Some(false) => run_font.weight = FontWeight::NORMAL,
+        None => {}
+    }
+    match italic {
+        Some(true) => run_font.style = FontStyle::Italic,
+        Some(false) => run_font.style = FontStyle::Normal,
+        None => {}
+    }
+    let line = Hsla::from(rgb(*color));
+    Some(TextRun {
+        len: text.len(),
+        font: run_font,
+        color: line,
+        underline: (*underline == Some(true)).then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(line),
+            wavy: false,
+        }),
+        strikethrough: (*strikethrough == Some(true)).then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(line),
+        }),
+        ..Default::default()
+    })
 }
 
 fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
