@@ -916,8 +916,9 @@ pub enum Region {
     /// Group `.0` of the ribbon tab shown, as drawn: in place, or its
     /// collapsed button (#1020).
     RibbonGroup(usize),
-    /// The dialog launcher (↘) of the sheet ribbon group titled `.0`, in
-    /// place on the tab shown (#1164).
+    /// The dialog launcher of the ribbon group titled `.0` (any case), in
+    /// place on the tab shown (#1164; any ribbon's group, a plugin's
+    /// included, #1669).
     RibbonLaunch(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
@@ -1015,18 +1016,10 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             let a = arg
                 .filter(|a| !a.is_empty())
                 .ok_or("'ribbon-launch' needs a group title, e.g. ribbon-launch:Number")?;
-            let group = crate::sheet_ribbon::SHEET_RIBBON
-                .iter()
-                .flat_map(|t| t.groups.iter())
-                .find(|g| g.title.eq_ignore_ascii_case(a))
-                .ok_or_else(|| format!("no sheet ribbon group is titled '{a}'"))?;
-            if !group.launcher {
-                return Err(format!(
-                    "the ribbon group {} draws no launcher",
-                    group.title
-                ));
-            }
-            Ok(Region::RibbonLaunch(group.title))
+            // Any title: a plugin's group may have one (#1669). It is
+            // matched against the shown tab's groups when the region is
+            // measured (`launch_title`).
+            Ok(Region::RibbonLaunch(crate::plugin_ui::intern(a)))
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
@@ -1120,6 +1113,21 @@ fn project_column(name: &str) -> Result<usize, String> {
         .iter()
         .position(|c| c.eq_ignore_ascii_case(name.trim()))
         .ok_or_else(|| format!("no Project column '{name}' ({})", crate::COLUMNS.join(", ")))
+}
+
+/// The drawn title of the group `asked` names (any case) among the shown
+/// tab's `groups` (title, draws a launcher), for its `ribbon-launch:` probe:
+/// an error when that group draws no launcher. A title the tab lacks is
+/// passed on as asked, so the probe lookup says it is not drawn (#1669).
+pub(crate) fn launch_title(
+    groups: &[(&'static str, bool)],
+    asked: &'static str,
+) -> Result<&'static str, String> {
+    match groups.iter().find(|(t, _)| t.eq_ignore_ascii_case(asked)) {
+        Some((title, true)) => Ok(title),
+        Some((title, false)) => Err(format!("the ribbon group {title} draws no launcher")),
+        None => Ok(asked),
+    }
 }
 
 /// The name a region reports itself under — [`parse_region`]'s inverse, so a
@@ -2852,7 +2860,7 @@ fn tab_json(
                     ]));
                 }
             }
-            Json::obj(vec![
+            let mut obj = Json::obj(vec![
                 ("title", Json::Str(group.title.into())),
                 ("launcher", Json::Bool(group.launcher.is_some())),
                 (
@@ -2860,7 +2868,19 @@ fn tab_json(
                     Json::Arr(commands.iter().map(|c| c.json(checked, enabled)).collect()),
                 ),
                 ("galleries", Json::Arr(galleries)),
-            ])
+            ]);
+            // A plugin launcher's tip and KeyTip, when it names them (#1669).
+            if let (Some(_), Json::Obj(pairs)) = (group.launcher, &mut obj) {
+                for (key, value) in [
+                    ("launcher_tip", group.launcher_tip),
+                    ("launcher_key_tip", group.launcher_key),
+                ] {
+                    if !value.is_empty() {
+                        pairs.push((key.into(), Json::Str(value.into())));
+                    }
+                }
+            }
+            obj
         })
         .collect();
     Json::obj(vec![
@@ -9717,15 +9737,31 @@ mod tests {
         assert!(parse_region("bar:").is_err());
         assert!(parse_region("tab-chip").is_err());
         assert!(parse_region("tab-chip:x").is_err());
-        // A launcher is named by its group's title, as drawn (#1164).
+        // A launcher is named by its group's title (#1164), any title: a
+        // plugin's group may draw one (#1669); `launch_title` resolves it.
         assert_eq!(
             parse_region("ribbon-launch:number"),
-            Ok(Region::RibbonLaunch("Number"))
+            Ok(Region::RibbonLaunch("number"))
+        );
+        assert_eq!(
+            parse_region("ribbon-launch:Nope"),
+            Ok(Region::RibbonLaunch("Nope"))
         );
         assert!(parse_region("ribbon-launch").is_err());
-        assert!(parse_region("ribbon-launch:Nope").is_err());
-        let e = parse_region("ribbon-launch:Styles").unwrap_err();
-        assert!(e.contains("draws no launcher"), "{e}");
+        assert!(parse_region("ribbon-launch:").is_err());
+    }
+
+    /// #1669: a launcher region names its group in any case, and finds the
+    /// title as drawn; a group without a launcher is an error, and a title
+    /// the tab lacks is left for the probe lookup to report.
+    #[test]
+    fn a_launcher_title_resolves_on_the_shown_tab() {
+        let groups = [("Number", true), ("Styles", false), ("Fixture", true)];
+        assert_eq!(launch_title(&groups, "number"), Ok("Number"));
+        assert_eq!(launch_title(&groups, "fixture"), Ok("Fixture"));
+        let e = launch_title(&groups, "styles").unwrap_err();
+        assert_eq!(e, "the ribbon group Styles draws no launcher");
+        assert_eq!(launch_title(&groups, "Nope"), Ok("Nope"));
     }
 
     /// #545: the drag arms once a pressed move lands more than 2px from the

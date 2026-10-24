@@ -223,7 +223,8 @@ fn cmd_mut<'a>(control: &'a mut Control<Act>, id: &str) -> Option<(&'a mut rs::C
 /// control whose id is a built-in command's replaces that command in place
 /// (its label, icon, tip, KeyTip and act; the control keeps its shape); the
 /// rest go into the group of that title, or into a new group after the
-/// tab's own.
+/// tab's own. A group's launcher (#1669) replaces the launcher of the group
+/// it joins, or is the new group's; a new group with no control is not made.
 pub(crate) fn extend_tab(tab: &mut rs::Tab<Act>) {
     extend_tab_with(tab, &manifests());
 }
@@ -252,9 +253,19 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                         None => added.push(c),
                     }
                 }
-                if added.is_empty() {
-                    continue;
-                }
+                // The group's dialog launcher (#1669): a press runs its
+                // command, as a button's does.
+                let launcher = group
+                    .launcher
+                    .as_ref()
+                    .map(|l| (act_of(&l.id), intern(&l.tip), intern(&l.keytip)));
+                let set_launcher = |g: &mut rs::Group<Act>| {
+                    if let Some((act, tip, key)) = launcher {
+                        g.launcher = Some(act);
+                        g.launcher_tip = tip;
+                        g.launcher_key = key;
+                    }
+                };
                 let controls: Vec<ui::Control> = added.into_iter().cloned().collect();
                 let controls = controls_of(&controls);
                 match tab
@@ -262,7 +273,14 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                     .iter_mut()
                     .find(|g| g.title.eq_ignore_ascii_case(&group.title))
                 {
-                    Some(g) => g.items.extend(controls),
+                    // A joined group takes the launcher even when every
+                    // control replaced a built-in one.
+                    Some(g) => {
+                        g.items.extend(controls);
+                        set_launcher(g);
+                    }
+                    // A new group needs a control to be drawn at all.
+                    None if controls.is_empty() => {}
                     None => {
                         // Before or after the built-in group the manifest
                         // names (#1574), else after the tab's own.
@@ -285,15 +303,9 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                             .priority
                             .or_else(|| beside.map(|i| tab.groups[i].priority))
                             .unwrap_or(50);
-                        tab.groups.insert(
-                            at,
-                            rs::Group {
-                                title: intern(&group.title),
-                                launcher: None,
-                                priority,
-                                items: controls,
-                            },
-                        );
+                        let mut new = rs::group(intern(&group.title), priority, controls);
+                        set_launcher(&mut new);
+                        tab.groups.insert(at, new);
                     }
                 }
             }
