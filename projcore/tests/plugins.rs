@@ -811,6 +811,35 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         ui.state(&with_title).unwrap().value("fixture.echo"),
         Some(&Json::str("Number 7 for Phase (Plan)"))
     );
+    // The font style follows a number changed since the label last showed
+    // it (#1670): a changed number names it in `follow`; the same number
+    // (the style itself changed), a rename and the open (no label yet) do
+    // not.
+    let asked = |echo: &str, n: f64| {
+        ui.state(&StateCtx {
+            dialog_values: Some(Json::obj(vec![
+                ("n", Json::Num(n)),
+                ("fixture.echo", Json::str(echo)),
+                ("fixture.style", Json::str("Italic")),
+            ])),
+            ..ctx(vec![1], Some(("fixture.options".into(), None)))
+        })
+        .unwrap()
+    };
+    let changed = asked("Number 3 for Phase (?)", 4.0);
+    assert_eq!(changed.follow, vec!["fixture.style".to_string()]);
+    assert_eq!(changed.value("fixture.style"), Some(&Json::str("Regular")));
+    let odd = asked("Number 4 for Phase (?)", 3.0);
+    assert_eq!(odd.value("fixture.style"), Some(&Json::str("Bold")));
+    for (echo, n) in [
+        ("Number 4 for Phase (?)", 4.0),
+        ("Number 4 for Bumped by fixture (?)", 4.0),
+        ("", 4.0),
+    ] {
+        let same = asked(echo, n);
+        assert!(same.follow.is_empty(), "{echo:?}");
+        assert_eq!(same.value("fixture.style"), None, "{echo:?}");
+    }
 
     // The overlay: a label at the first bar, a link from the first bar's
     // end to the second bar's start.

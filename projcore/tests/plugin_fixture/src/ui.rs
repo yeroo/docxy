@@ -21,7 +21,8 @@
 //!   `fixture.options` (a number and a label the state fills from the number
 //!   and the first selected task's name in a `Numbers` group box, a grid of
 //!   the plan's task names whose selected row the state keeps on the
-//!   selected task (#1610), a sample box the state styles, a filling memo; a
+//!   selected task (#1610), a sample box the state styles, a filling memo,
+//!   a Styles page whose font style follows a changed number (#1670); a
 //!   fixed size, two columns, Help bottom left, #1609; a Bump button) that
 //!   `fixture.hello` opens; OK sends `fixture.hello` again with the values,
 //!   Bump sends it with `button: "bump"` (one `task.set` op naming the task
@@ -355,10 +356,38 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
                 })
                 .map_or("null".to_string(), |i| i.to_string());
             let n_val: f64 = n.parse().unwrap_or(0.0);
+            // The number is the dialog's "item to change" (#1670): when it
+            // differs from the one the label last showed (the label is the
+            // fixture's memory, empty at open), the font style follows it
+            // (odd: Bold, even: Regular); a re-ask the style itself caused,
+            // a rename or a title edit leaves the style as picked.
+            let shown = dialog
+                .get("values")
+                .and_then(|v| v.get("fixture.echo"))
+                .and_then(Json::str)
+                .and_then(|echo| echo.strip_prefix("Number "))
+                .and_then(|rest| rest.split_once(" for "))
+                .map(|(shown, _)| shown.to_string());
+            let style = match shown {
+                Some(shown) if shown != n => format!(
+                    r#","fixture.style":{}"#,
+                    quote(if n_val as i64 % 2 == 1 {
+                        "Bold"
+                    } else {
+                        "Regular"
+                    })
+                ),
+                _ => String::new(),
+            };
+            let follow = if style.is_empty() {
+                ""
+            } else {
+                r#","follow":["fixture.style"]"#
+            };
             // Help is greyed while the number is 0 (#1609: the host refuses a
             // disabled Help like any button).
             reply.push_str(&format!(
-                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}}},"enabled":{{"help":{}}}"#,
+                r#","values":{{"fixture.echo":{},"fixture.tasks":[{}],"fixture.tasks.selected_row":{selected},"fixture.sample":{{"text":"AaBbYyZz","bold":{},"size":{}}}{style}}},"enabled":{{"help":{}}}{follow}"#,
                 quote(&format!("Number {n} for {name} ({title})")),
                 rows.join(","),
                 n_val as i64 % 2 == 1,

@@ -373,6 +373,31 @@ test the button's command opens the plugin's dialog, whose OK sends the values b
   assert reply.controls.2.items.5 is 14
   assert reply.controls.-1.name is fixture.tag
   shot window
+  # The style follows the number (#1670): a changed number makes the state
+  # name `fixture.style` in `follow`, so the field takes its value (odd:
+  # Bold, even: Regular); a style picked by hand is a re-ask with the same
+  # number, so it stays.
+  # The number is on General: `dialog-set` refuses a control on another
+  # page, so each set switches there and back.
+  call dialog-tab {"tab":"General"}
+  call dialog-set {"control":"n","value":3}
+  call dialog-tab {"tab":"Styles"}
+  call dialog-read {}
+  assert reply.controls.1.name is fixture.style
+  assert reply.controls.1.value is Bold
+  call dialog-set {"control":"fixture.style","value":"Italic"}
+  call dialog-read {}
+  assert reply.controls.1.value is Italic
+  call dialog-tab {"tab":"General"}
+  call dialog-set {"control":"n","value":4}
+  call dialog-tab {"tab":"Styles"}
+  call dialog-read {}
+  assert reply.controls.1.value is Regular
+  call dialog-tab {"tab":"General"}
+  call dialog-set {"control":"n","value":1}
+  call dialog-tab {"tab":"Styles"}
+  call dialog-read {}
+  assert reply.controls.1.value is Bold
   call dialog-tab {"tab":"General"}
   call dialog-read {}
   assert reply.columns is 2

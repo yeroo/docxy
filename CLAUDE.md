@@ -603,6 +603,22 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Dialog values that follow (#1670)
+
+- A state reply may name editable dialog controls in `"follow": [names]`
+  (`uiplugin::State::follow`; non-strings skipped, any other value none,
+  written only when non-empty). On a re-ask (`refresh_dialog`) a named
+  control takes the reply's value like a label does, though neither the
+  plan nor the selection moved; without a value it is untouched. The plugin
+  decides when (Text Styles: when `Item to Change` changed, seen in
+  `dialog.values`), so a re-ask the field itself caused overwrites nothing;
+  the host only obeys, per re-ask (each typed digit of a followed-from
+  field is one). A name follows only for the plugin whose value is taken
+  (`Prefill::merge`). `apply_refresh(d, prefill, moved)` is the apply step,
+  unit-tested without a plugin. The fixture's Fixture Options style follows
+  a number changed since its echo label last showed it
+  (`project-plugin-ui.uit`, not run on macOS).
+
 ## Contributed group launchers (#1669)
 
 - A manifest group may carry `"launcher":{"id","tip","keytip"}`

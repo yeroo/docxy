@@ -1187,7 +1187,8 @@ impl StateCtx {
 /// ```json
 /// {"controls":{"x.toggle":{"enabled":true,"checked":false}},
 ///  "gallery":{"x.palette":"x.blue"},
-///  "values":{"note":"text","done":true,"grid":[["a","1"]]}}
+///  "values":{"note":"text","done":true,"grid":[["a","1"]]},
+///  "follow":["note"]}
 /// ```
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct State {
@@ -1201,6 +1202,11 @@ pub struct State {
     pub items: Vec<(String, Vec<String>)>,
     /// A dialog's controls to enable or grey by name (#1556).
     pub enabled: Vec<(String, bool)>,
+    /// The editable dialog controls whose `values` follow this re-ask
+    /// (#1670): on a control change the host otherwise applies a value to
+    /// a label or a sample only, so the plugin names a field here when it
+    /// should refill (as Text Styles' fields when `Item to Change` moves).
+    pub follow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1248,14 +1254,18 @@ impl State {
             .iter()
             .map(|(name, on)| (name.clone(), Json::Bool(*on)))
             .collect();
-        Json::obj(vec![
+        let mut pairs = vec![
             ("controls", Json::Obj(controls)),
             ("gallery", Json::Obj(gallery)),
             ("values", Json::Obj(values)),
             ("items", Json::Obj(items)),
             ("enabled", Json::Obj(enabled)),
-        ])
-        .to_string()
+        ];
+        // Written only when set, so a state without it is as before.
+        if !self.follow.is_empty() {
+            pairs.push(("follow", Json::strs(&self.follow)));
+        }
+        Json::obj(pairs).to_string()
     }
 
     pub fn parse(json: &str) -> Result<State, String> {
@@ -1294,6 +1304,13 @@ impl State {
                 state.enabled.push((name.clone(), on));
             }
         }
+        state.follow = v
+            .get("follow")
+            .and_then(Json::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect();
         Ok(state)
     }
 
@@ -2298,15 +2315,22 @@ mod tests {
             values: vec![("note".into(), Json::str("hi"))],
             items: vec![("pick".into(), vec!["a".into(), "b".into()])],
             enabled: vec![("locked".into(), false)],
+            follow: vec!["note".into()],
         };
         assert_eq!(State::parse(&state.json()).unwrap(), state);
+        // `follow` keeps its strings only; any other value is none (#1670),
+        // and a state without it writes no key.
+        let mixed = State::parse(r#"{"follow":["a",1,null,"b"]}"#).unwrap();
+        assert_eq!(mixed.follow, vec!["a".to_string(), "b".to_string()]);
+        assert!(State::parse(r#"{"follow":"a"}"#).unwrap().follow.is_empty());
+        assert!(!State::default().json().contains("follow"));
         assert_eq!(state.items_of("pick").map(<[String]>::len), Some(2));
         assert_eq!(state.items_of("note"), None);
         assert_eq!(state.enabled_of("locked"), Some(false));
         assert_eq!(state.enabled_of("pick"), None);
         // An older reply without them reads as none.
         let old = State::parse(r#"{"controls":{},"gallery":{},"values":{}}"#).unwrap();
-        assert!(old.items.is_empty() && old.enabled.is_empty());
+        assert!(old.items.is_empty() && old.enabled.is_empty() && old.follow.is_empty());
     }
 
     #[test]
