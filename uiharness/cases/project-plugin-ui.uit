@@ -667,8 +667,11 @@ test the overlay returns the fixture's shapes for the chart
   assert reply.shapes.1.kind is polyline
   assert reply.shapes.2.kind is arrow
   # The request carries the selection, and the overlay follows the cursor
-  # (#1565): the fixture labels the selected task's bar.
+  # (#1565): the fixture labels the selected task's bar, italic and
+  # underlined, so the text style keys come through (#1668).
   assert reply.shapes.3.kind is text
+  assert reply.shapes.3.italic is true
+  assert reply.shapes.3.underline is true
   click C2
   call project-overlay {}
   assert reply.count is 4

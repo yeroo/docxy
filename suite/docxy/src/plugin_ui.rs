@@ -1693,14 +1693,36 @@ pub(crate) fn overlay_json(v: &ProjectView) -> CtlJson {
                 text,
                 color: c,
                 size,
-            } => CtlJson::obj(vec![
-                ("kind", CtlJson::Str("text".into())),
-                ("x", num(*x)),
-                ("y", num(*y)),
-                ("text", CtlJson::Str(text.clone())),
-                ("color", color(*c)),
-                ("size", num(*size)),
-            ]),
+                font,
+                bold,
+                italic,
+                underline,
+                strikethrough,
+            } => {
+                let mut fields = vec![
+                    ("kind", CtlJson::Str("text".into())),
+                    ("x", num(*x)),
+                    ("y", num(*y)),
+                    ("text", CtlJson::Str(text.clone())),
+                    ("color", color(*c)),
+                    ("size", num(*size)),
+                ];
+                // The text style keys only when the plugin set them (#1668).
+                if let Some(font) = font {
+                    fields.push(("font", CtlJson::Str(font.clone())));
+                }
+                for (key, flag) in [
+                    ("bold", bold),
+                    ("italic", italic),
+                    ("underline", underline),
+                    ("strikethrough", strikethrough),
+                ] {
+                    if let Some(on) = flag {
+                        fields.push((key, CtlJson::Bool(*on)));
+                    }
+                }
+                CtlJson::obj(fields)
+            }
         })
         .collect();
     CtlJson::obj(vec![

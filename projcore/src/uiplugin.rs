@@ -1775,13 +1775,21 @@ pub enum Shape {
         color: u32,
         filled: bool,
     },
-    /// Text with its top-left corner at `(x, y)`, `size` pixels tall.
+    /// Text with its top-left corner at `(x, y)`, `size` pixels tall, and
+    /// the rest of a text style when the plugin sets it (#1668): the font
+    /// family and bold, italic, underline and strikethrough (`None` is the
+    /// host's default: its overlay font, plain).
     Text {
         x: f32,
         y: f32,
         text: String,
         color: u32,
         size: f32,
+        font: Option<String>,
+        bold: Option<bool>,
+        italic: Option<bool>,
+        underline: Option<bool>,
+        strikethrough: Option<bool>,
     },
 }
 
@@ -1865,14 +1873,35 @@ pub fn shapes_json(shapes: &[Shape]) -> String {
                 text,
                 color: c,
                 size,
-            } => Json::obj(vec![
-                ("kind", Json::str("text")),
-                ("x", num(*x)),
-                ("y", num(*y)),
-                ("text", Json::str(text.clone())),
-                ("color", color(*c)),
-                ("size", num(*size)),
-            ]),
+                font,
+                bold,
+                italic,
+                underline,
+                strikethrough,
+            } => {
+                let mut fields = vec![
+                    ("kind", Json::str("text")),
+                    ("x", num(*x)),
+                    ("y", num(*y)),
+                    ("text", Json::str(text.clone())),
+                    ("color", color(*c)),
+                    ("size", num(*size)),
+                ];
+                if let Some(font) = font {
+                    fields.push(("font", Json::str(font.clone())));
+                }
+                for (key, flag) in [
+                    ("bold", bold),
+                    ("italic", italic),
+                    ("underline", underline),
+                    ("strikethrough", strikethrough),
+                ] {
+                    if let Some(on) = flag {
+                        fields.push((key, Json::Bool(*on)));
+                    }
+                }
+                Json::obj(fields)
+            }
         })
         .collect();
     Json::obj(vec![("shapes", Json::Arr(items))]).to_string()
@@ -1887,8 +1916,12 @@ pub fn shapes_json(shapes: &[Shape]) -> String {
 ///   {"kind":"bracket","x0":0,"x1":100,"y":12,"tick":6,"color":"#333333"},
 ///   {"kind":"rect","x":0,"y":8,"w":50,"h":4,"color":"#2AA79B","filled":true},
 ///   {"kind":"dashed","points":[[60,0],[60,200]],"color":"#DC322F"},
-///   {"kind":"text","x":120,"y":4,"text":"Alice","color":"#333333","size":11}]}
+///   {"kind":"text","x":120,"y":4,"text":"Alice","color":"#333333","size":11,
+///    "font":"Arial","bold":true,"italic":true,"underline":true,"strikethrough":false}]}
 /// ```
+///
+/// A text's `font`, `bold`, `italic`, `underline` and `strikethrough` are
+/// optional: absent, wrongly typed or (the font) blank is `None`.
 pub fn parse_shapes(json: &str) -> Result<Vec<Shape>, String> {
     let v = Json::parse(json).map_err(|e| format!("the overlay JSON: {e}"))?;
     let items = match &v {
@@ -1957,6 +1990,15 @@ pub fn parse_shapes(json: &str) -> Result<Vec<Shape>, String> {
                 text: o.text("text"),
                 color: color(o),
                 size: f(o, "size").unwrap_or(11.0),
+                font: o
+                    .get("font")
+                    .and_then(Json::as_str)
+                    .filter(|f| !f.trim().is_empty())
+                    .map(str::to_string),
+                bold: o.get("bold").and_then(Json::as_bool),
+                italic: o.get("italic").and_then(Json::as_bool),
+                underline: o.get("underline").and_then(Json::as_bool),
+                strikethrough: o.get("strikethrough").and_then(Json::as_bool),
             },
             other => return Err(format!("shape {}: unknown kind \"{other}\"", n + 1)),
         };
@@ -2250,10 +2292,78 @@ mod tests {
                 text: "Alice".into(),
                 color: 0x333333,
                 size: 11.0,
+                font: None,
+                bold: None,
+                italic: None,
+                underline: None,
+                strikethrough: None,
+            },
+            Shape::Text {
+                x: 5.0,
+                y: 34.0,
+                text: "Bob".into(),
+                color: 0xFF0000,
+                size: 12.0,
+                font: Some("Arial".into()),
+                bold: Some(true),
+                italic: Some(false),
+                underline: Some(true),
+                strikethrough: Some(true),
             },
         ];
         assert_eq!(parse_shapes(&shapes_json(&shapes)).unwrap(), shapes);
         assert_eq!(shapes_json(&[]), r#"{"shapes":[]}"#);
+    }
+
+    #[test]
+    fn text_style_keys_are_optional_and_written_only_when_set() {
+        let plain = Shape::Text {
+            x: 1.0,
+            y: 2.0,
+            text: "a".into(),
+            color: 0x333333,
+            size: 10.0,
+            font: None,
+            bold: None,
+            italic: None,
+            underline: None,
+            strikethrough: None,
+        };
+        // An unstyled text writes the five keys it always had, nothing more.
+        assert_eq!(
+            shapes_json(std::slice::from_ref(&plain)),
+            r##"{"shapes":[{"kind":"text","x":1,"y":2,"text":"a","color":"#333333","size":10}]}"##
+        );
+        let styled = Shape::Text {
+            x: 1.0,
+            y: 2.0,
+            text: "a".into(),
+            color: 0x333333,
+            size: 10.0,
+            font: Some("Arial".into()),
+            bold: None,
+            italic: Some(true),
+            underline: None,
+            strikethrough: Some(false),
+        };
+        assert_eq!(
+            shapes_json(&[styled]),
+            r##"{"shapes":[{"kind":"text","x":1,"y":2,"text":"a","color":"#333333","size":10,"font":"Arial","italic":true,"strikethrough":false}]}"##
+        );
+        // The five-field form parses with every style key unset.
+        let five = parse_shapes(
+            r##"[{"kind":"text","x":1,"y":2,"text":"a","color":"#333333","size":10}]"##,
+        )
+        .unwrap();
+        assert_eq!(five, std::slice::from_ref(&plain));
+        // A wrongly typed value, or a blank font, is ignored, never an error.
+        let wrong = parse_shapes(
+            r##"[{"kind":"text","x":1,"y":2,"text":"a","color":"#333333","size":10,
+                 "font":3,"bold":"yes","italic":1,"underline":null,"strikethrough":[true]},
+                {"kind":"text","x":1,"y":2,"text":"a","color":"#333333","size":10,"font":"  "}]"##,
+        )
+        .unwrap();
+        assert_eq!(wrong, [plain.clone(), plain]);
     }
 
     #[test]

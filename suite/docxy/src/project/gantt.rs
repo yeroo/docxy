@@ -1262,13 +1262,22 @@ fn paint_shape(
             text,
             color,
             size: text_size,
+            font: family,
+            bold,
+            italic,
+            underline,
+            strikethrough,
         } => {
-            let run = TextRun {
-                len: text.len(),
-                font: font.clone(),
-                color: rgb(*color).into(),
-                ..Default::default()
-            };
+            let run = overlay_text_run(
+                font,
+                text.len(),
+                *color,
+                family.as_deref(),
+                *bold,
+                *italic,
+                *underline,
+                *strikethrough,
+            );
             let line = window.text_system().shape_line(
                 SharedString::from(text.clone()),
                 px(*text_size),
@@ -1284,6 +1293,54 @@ fn paint_shape(
                 cx,
             );
         }
+    }
+}
+
+/// The run an overlay text of `len` bytes draws with (#1668): `base` (the
+/// overlay's font) with the shape's font family, weight and slant when it
+/// sets them, and a 1 px underline and strikethrough in its colour, as
+/// `plugin_ui::styled` draws a table cell. An explicit off draws plain: an
+/// overlay text inherits nothing.
+#[allow(clippy::too_many_arguments)]
+fn overlay_text_run(
+    base: &Font,
+    len: usize,
+    color: u32,
+    family: Option<&str>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+) -> TextRun {
+    let mut font = base.clone();
+    if let Some(family) = family {
+        font.family = family.to_string().into();
+    }
+    match bold {
+        Some(true) => font.weight = FontWeight::BOLD,
+        Some(false) => font.weight = FontWeight::NORMAL,
+        None => {}
+    }
+    match italic {
+        Some(true) => font.style = FontStyle::Italic,
+        Some(false) => font.style = FontStyle::Normal,
+        None => {}
+    }
+    let line = Hsla::from(rgb(color));
+    TextRun {
+        len,
+        font,
+        color: line,
+        underline: (underline == Some(true)).then_some(UnderlineStyle {
+            thickness: px(1.),
+            color: Some(line),
+            wavy: false,
+        }),
+        strikethrough: (strikethrough == Some(true)).then_some(StrikethroughStyle {
+            thickness: px(1.),
+            color: Some(line),
+        }),
+        ..Default::default()
     }
 }
 

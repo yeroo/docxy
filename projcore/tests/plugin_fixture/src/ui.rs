@@ -51,10 +51,13 @@
 //!   clears it with null).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
-//!   label at the selected task's bar when the request names one (#1565).
+//!   label at the selected task's bar when the request names one (#1565),
+//!   italic and underlined (#1668).
 //!   With the `fixture.names` switch on it also writes each row's Resource
 //!   Names right of its bar, unless a bar style row of the view already has
-//!   a text field of that name (#1696).
+//!   a text field of that name (#1696), in the font, bold, italic,
+//!   underline and strikethrough of the view's `Bar Text - Right` style
+//!   (#1668).
 
 use crate::json::{Json, quote};
 use crate::{OK, UNSUPPORTED_EXTENSION, YppxBuf, bytes, fail, give};
@@ -702,8 +705,10 @@ pub unsafe extern "C" fn yppx_ui_overlay(input: *const u8, len: usize, out: *mut
             .find(|row| row.get("uid").and_then(Json::num) == Some(uid));
         if let Some(bar) = row.and_then(|r| r.get("bar")).filter(|b| !b.is_null()) {
             let f = |k: &str| bar.get(k).and_then(Json::num).unwrap_or(0.0);
+            // Italic and underlined, so the host's text style keys (#1668)
+            // reach the harness end to end.
             shapes.push(format!(
-                r##"{{"kind":"text","x":{},"y":{},"text":"selected {}","color":"#333333","size":10}}"##,
+                r##"{{"kind":"text","x":{},"y":{},"text":"selected {}","color":"#333333","size":10,"italic":true,"underline":true}}"##,
                 f("x") + f("w") + 6.0,
                 f("y"),
                 uid as i64
@@ -729,6 +734,20 @@ pub unsafe extern "C" fn yppx_ui_overlay(input: *const u8, len: usize, out: *mut
                 .iter()
                 .any(|pos| text.get(pos).and_then(Json::str) == Some("Resource Names"))
         });
+    // The names take the font and the effects of the view's `Bar Text -
+    // Right` text style (#1668), only its well-typed values.
+    let right = flags
+        .and_then(|f| f.get("text_styles"))
+        .and_then(|t| t.get("Bar Text - Right"));
+    let mut style = String::new();
+    if let Some(font) = right.and_then(|r| r.get("font")).and_then(Json::str) {
+        style.push_str(&format!(r#","font":{}"#, quote(font)));
+    }
+    for key in ["bold", "italic", "underline", "strikethrough"] {
+        if let Some(on) = right.and_then(|r| r.get(key)).and_then(Json::bool) {
+            style.push_str(&format!(r#","{key}":{on}"#));
+        }
+    }
     if names_on && !row_writes_names {
         for row in req.get("rows").map(Json::list).unwrap_or(&[]) {
             let names = row
@@ -743,7 +762,7 @@ pub unsafe extern "C" fn yppx_ui_overlay(input: *const u8, len: usize, out: *mut
             }
             let f = |k: &str| bar.get(k).and_then(Json::num).unwrap_or(0.0);
             shapes.push(format!(
-                r##"{{"kind":"text","x":{},"y":{},"text":{},"color":"#333333","size":10}}"##,
+                r##"{{"kind":"text","x":{},"y":{},"text":{},"color":"#333333","size":10{style}}}"##,
                 f("x") + f("w") + 6.0,
                 f("y"),
                 quote(&format!("names {names}"))

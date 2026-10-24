@@ -880,6 +880,68 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     )
     .unwrap();
     assert_eq!(texts(&named(other)), ["names Ann"]);
+
+    // The names take the Bar Text - Right style's font and effects (#1668);
+    // a wrongly typed value there is left out, and without the style the
+    // label is plain.
+    let names_shape = |flags: &str| {
+        ui.overlay(&named(Json::parse(flags).unwrap()))
+            .unwrap()
+            .into_iter()
+            .find(|s| matches!(s, Shape::Text { text, .. } if text == "names Ann"))
+            .unwrap()
+    };
+    let styled = names_shape(
+        r##"{"switches":{"fixture.names":true},"text_styles":{"Bar Text - Right":{"font":"Arial \"Narrow\"","bold":true,"italic":false,"underline":true,"strikethrough":"yes","color":"#FF0000"}}}"##,
+    );
+    let Shape::Text {
+        font,
+        bold,
+        italic,
+        underline,
+        strikethrough,
+        ..
+    } = styled
+    else {
+        unreachable!()
+    };
+    assert_eq!(font.as_deref(), Some("Arial \"Narrow\""));
+    assert_eq!(
+        (bold, italic, underline, strikethrough),
+        (Some(true), Some(false), Some(true), None)
+    );
+    let plain = names_shape(r#"{"switches":{"fixture.names":true}}"#);
+    assert!(matches!(
+        plain,
+        Shape::Text {
+            font: None,
+            bold: None,
+            italic: None,
+            underline: None,
+            strikethrough: None,
+            ..
+        }
+    ));
+    // The selected task's label is italic and underlined.
+    let selected = OverlayCtx {
+        selected: vec![3],
+        ..overlay.clone()
+    };
+    let label = ui
+        .overlay(&selected)
+        .unwrap()
+        .into_iter()
+        .find(|s| matches!(s, Shape::Text { text, .. } if text.starts_with("selected ")))
+        .unwrap();
+    assert!(matches!(
+        label,
+        Shape::Text {
+            italic: Some(true),
+            underline: Some(true),
+            bold: None,
+            ..
+        }
+    ));
     let _ = std::fs::remove_dir_all(dir);
 }
 

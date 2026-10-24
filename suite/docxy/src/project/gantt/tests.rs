@@ -1378,3 +1378,59 @@ fn layout_drawn_lists_rects_with_the_row_offset_and_skips_table_rows_for_rollups
     assert_eq!(rects.len(), 4);
     assert!(rolls.is_empty());
 }
+
+#[test]
+fn overlay_text_takes_the_shapes_text_style() {
+    // A base that is neither bold nor italic shows whether a key moved it.
+    let base = Font {
+        family: "Segoe UI".into(),
+        weight: FontWeight::LIGHT,
+        style: FontStyle::Oblique,
+        ..Default::default()
+    };
+    let len = "names Ann".len();
+    let run = |family: Option<&str>, b, i, u, s| {
+        overlay_text_run(&base, len, 0xFF0000, family, b, i, u, s)
+    };
+    let red = Hsla::from(rgb(0xFF0000));
+    // Unset: the overlay's own font, plain, as before #1668.
+    let plain = run(None, None, None, None, None);
+    assert_eq!(plain.len, len);
+    assert_eq!(plain.font, base);
+    assert_eq!(plain.color, red);
+    assert!(plain.underline.is_none() && plain.strikethrough.is_none());
+    // Every key on.
+    let on = run(
+        Some("Arial"),
+        Some(true),
+        Some(true),
+        Some(true),
+        Some(true),
+    );
+    assert_eq!(on.font.family.as_ref(), "Arial");
+    assert_eq!(on.font.weight, FontWeight::BOLD);
+    assert_eq!(on.font.style, FontStyle::Italic);
+    let under = on.underline.unwrap();
+    assert_eq!(
+        (under.thickness, under.color, under.wavy),
+        (px(1.), Some(red), false)
+    );
+    let strike = on.strikethrough.unwrap();
+    assert_eq!((strike.thickness, strike.color), (px(1.), Some(red)));
+    // Each key acts alone: bold and strikethrough leave the slant and the
+    // underline as they were, and the mirror.
+    let bold_strike = run(None, Some(true), None, None, Some(true));
+    assert_eq!(bold_strike.font.weight, FontWeight::BOLD);
+    assert_eq!(bold_strike.font.style, base.style);
+    assert!(bold_strike.underline.is_none() && bold_strike.strikethrough.is_some());
+    let italic_under = run(None, None, Some(true), Some(true), None);
+    assert_eq!(italic_under.font.weight, base.weight);
+    assert_eq!(italic_under.font.style, FontStyle::Italic);
+    assert!(italic_under.underline.is_some() && italic_under.strikethrough.is_none());
+    // An explicit off is plain: nothing is inherited.
+    let off = run(None, Some(false), Some(false), Some(false), Some(false));
+    assert_eq!(off.font.weight, FontWeight::NORMAL);
+    assert_eq!(off.font.style, FontStyle::Normal);
+    assert_eq!(off.font.family, base.family);
+    assert!(off.underline.is_none() && off.strikethrough.is_none());
+}

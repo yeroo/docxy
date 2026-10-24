@@ -603,6 +603,21 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Overlay text style (#1668)
+
+- `projcore::uiplugin::Shape::Text` carries `font`, `bold`, `italic`,
+  `underline` and `strikethrough` (`Option`s) beside `x, y, text, color,
+  size` (`size` stays pixels). `shapes_json` writes each only when set,
+  after the old keys, so an unstyled text is byte-identical to before;
+  `parse_shapes` reads them, a wrongly typed value or a blank font is
+  `None`. The suite's `paint_shape` builds the run with
+  `gantt::overlay_text_run` (the shape's family, weight and slant over the
+  overlay's Segoe UI, a 1 px underline and strikethrough in its colour; an
+  explicit off is plain, nothing is inherited) and `project-overlay`
+  reports the keys when set. The fixture's names label takes the view's
+  `Bar Text - Right` style; its `selected N` label is italic and
+  underlined. No background or pattern on overlay text.
+
 ## Rich-text dialog control (#1557)
 
 - A UI plugin control `"kind":"richtext"` (`ControlKind::Richtext`) is a
