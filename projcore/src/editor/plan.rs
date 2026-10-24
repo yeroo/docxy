@@ -143,6 +143,26 @@ mod tests {
     }
 
     #[test]
+    fn a_status_date_edit_moves_the_late_status_at_once() {
+        // The suite's Late Tasks text style reads this per frame (#1665).
+        let mut ed = editor();
+        let start = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        ed.set_project_start(start).unwrap();
+        let status = |ed: &Editor| {
+            let task = ed.project().task(1).unwrap().clone();
+            crate::editor::FieldReader::new(ed)
+                .read(&task, crate::editor::Field::Status)
+                .text
+        };
+        ed.set_status_date(Some(DateTime::from_ymd_hm(2026, 3, 6, 17, 0)))
+            .unwrap();
+        assert_eq!(status(&ed), "Future Task");
+        ed.set_status_date(Some(DateTime::from_ymd_hm(2026, 3, 16, 17, 0)))
+            .unwrap();
+        assert_eq!(status(&ed), "Late");
+    }
+
+    #[test]
     fn the_default_calendar_must_be_a_base_calendar_of_the_plan() {
         let mut ed = editor();
         let standard = ed.project().default_calendar_uid;
