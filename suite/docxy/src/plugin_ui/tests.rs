@@ -624,6 +624,7 @@ fn late_and_placeholder_come_after_manual_and_before_inactive() {
         inactive: true,
         late: true,
         placeholder: true,
+        ..RowFacts::default()
     };
     assert_eq!(
         row_categories(&task, all),
@@ -667,17 +668,168 @@ fn a_manifest_opts_a_category_in_by_its_exact_name() {
         Optins::of(&[&late]),
         Optins {
             late: true,
-            placeholder: false
+            ..Optins::default()
         }
     );
     assert_eq!(
         Optins::of(&[&near, &both]),
         Optins {
             late: true,
-            placeholder: true
+            placeholder: true,
+            ..Optins::default()
         }
     );
     assert_eq!(Optins::of(&[&near]), Optins::default());
+}
+
+#[test]
+fn a_manifest_opts_the_model_feature_categories_in() {
+    // #1667: Marked, Highlighted, External and Changed Cells, by exact name.
+    let m = Manifest::parse(
+        r#"{"ribbon":[],"menus":[],"dialogs":[],"palettes":[],"text_style_categories":["Marked Tasks","Highlighted Tasks","External Tasks","Changed Cells","changed cells"]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        Optins::of(&[&m]),
+        Optins {
+            marked: true,
+            highlighted: true,
+            external: true,
+            changed_cells: true,
+            ..Optins::default()
+        }
+    );
+}
+
+#[test]
+fn external_marked_and_highlighted_come_after_late_and_before_inactive() {
+    let task = projcore::Task {
+        uid: 3,
+        duration_min: 480,
+        ..projcore::Task::default()
+    };
+    let all = RowFacts {
+        inactive: true,
+        late: true,
+        external: true,
+        marked: true,
+        highlighted: true,
+        ..RowFacts::default()
+    };
+    assert_eq!(
+        row_categories(&task, all),
+        [
+            "All",
+            "Noncritical Tasks",
+            "Late Tasks",
+            "External Tasks",
+            "Marked Tasks",
+            "Highlighted Tasks",
+            "Inactive Tasks"
+        ]
+    );
+}
+
+#[test]
+fn marked_highlighted_and_external_rows_are_computed_only_when_opted_in() {
+    let mut external = leaf(3);
+    external.external_task = Some(true);
+    let mut v = view_of(vec![leaf(1), leaf(2), external]);
+    v.ed.set_marked(1, true).unwrap();
+    v.ed.set_highlight(
+        projcore::editor::Field::Name,
+        Some(["T2".to_string()].into_iter().collect()),
+    );
+    let on = Optins {
+        external: true,
+        marked: true,
+        highlighted: true,
+        ..Optins::default()
+    };
+    let cats = |v: &ProjectView, optins, row: usize| {
+        let task = v.ed.project().tasks[row].clone();
+        task_categories(v, &task, row, optins)
+    };
+    assert!(cats(&v, on, 0).contains(&"Marked Tasks"));
+    assert!(cats(&v, on, 1).contains(&"Highlighted Tasks"));
+    assert!(cats(&v, on, 2).contains(&"External Tasks"));
+    assert!(!cats(&v, on, 0).contains(&"Highlighted Tasks"));
+    for row in 0..3 {
+        let off = cats(&v, Optins::default(), row);
+        for name in [MARKED_TASKS, HIGHLIGHTED_TASKS, EXTERNAL_TASKS] {
+            assert!(!off.contains(&name), "{row}: {off:?}");
+        }
+    }
+}
+
+#[test]
+fn the_changed_cells_are_the_grid_columns_but_id_read_once_per_revision() {
+    let mut first = leaf(1);
+    first.duration_min = 960;
+    let mut second = leaf(2);
+    second
+        .predecessors
+        .push(projcore::model::Predecessor::fs(1));
+    let mut v = view_of(vec![first, second]);
+    assert!(changed_cells(&v).is_empty());
+    v.ed.set_duration(1, "3d").unwrap();
+    let cells = changed_cells(&v);
+    assert_eq!(
+        *cells,
+        [(1, "Duration"), (1, "Finish"), (2, "Start"), (2, "Finish")]
+    );
+    // Cached by revision: the same list until the plan moves.
+    assert!(Rc::ptr_eq(&cells, &changed_cells(&v)));
+    v.ed.edit_formatting(|f| {
+        f.set_category(
+            CHANGED_CELLS,
+            projcore::formatting::TextStyle {
+                bold: Some(true),
+                ..Default::default()
+            },
+        )
+    });
+    // Styling Changed Cells keeps them.
+    assert_eq!(*changed_cells(&v), *cells);
+    v.ed.add_task(Some(1), "New", 480, false).unwrap();
+    assert!(changed_cells(&v).iter().all(|(_, c)| *c != "ID"));
+}
+
+#[test]
+fn a_changed_cell_takes_changed_cells_over_the_row_and_under_its_own() {
+    use projcore::formatting::TextStyle;
+    let row = TextStyle {
+        italic: Some(true),
+        color: Some(0x0000CC),
+        ..Default::default()
+    };
+    let changed = TextStyle {
+        color: Some(0xCC0000),
+        bold: Some(true),
+        ..Default::default()
+    };
+    let own = TextStyle {
+        bold: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        changed_cell_style(Some(&row), Some(&changed), Some(&own)),
+        Some(TextStyle {
+            italic: Some(true),
+            color: Some(0xCC0000),
+            bold: Some(false),
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        changed_cell_style(None, Some(&changed), None),
+        Some(changed.clone())
+    );
+    assert_eq!(
+        changed_cell_style(Some(&row), None, None),
+        Some(row.clone())
+    );
+    assert_eq!(changed_cell_style(None, None, None), None);
 }
 
 /// A view over `tasks`, scheduled from 2026-03-09.
@@ -709,6 +861,7 @@ fn a_task_enters_late_tasks_when_the_status_date_passes_it() {
     let on = Optins {
         late: true,
         placeholder: true,
+        ..Optins::default()
     };
     let cats = |v: &ProjectView, optins| {
         let task = v.ed.project().tasks[0].clone();
@@ -732,8 +885,8 @@ fn a_manual_task_without_a_start_is_a_placeholder_only_when_opted_in() {
     let v = view_of(vec![tbd]);
     let task = v.ed.project().tasks[0].clone();
     let on = Optins {
-        late: false,
         placeholder: true,
+        ..Optins::default()
     };
     assert!(task_categories(&v, &task, 0, on).contains(&"Placeholder Tasks"));
     assert!(!task_categories(&v, &task, 0, Optins::default()).contains(&"Placeholder Tasks"));
