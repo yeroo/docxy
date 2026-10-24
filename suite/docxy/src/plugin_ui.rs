@@ -513,6 +513,9 @@ pub(crate) struct Prefill {
     pub values: Vec<(String, Json)>,
     pub items: Vec<(String, Vec<String>)>,
     pub enabled: Vec<(String, bool)>,
+    /// The editable controls whose values follow this re-ask (#1670): each
+    /// named by the plugin whose value for it won.
+    pub follow: Vec<String>,
 }
 
 impl Prefill {
@@ -533,6 +536,30 @@ impl Prefill {
             .find(|(n, _)| n == name)
             .map(|(_, on)| *on)
     }
+
+    /// Add one plugin's `state`, after the plugins before it: a name already
+    /// given keeps its first value, items and flag, and a name follows only
+    /// when the plugin whose value is taken names it (#1670).
+    fn merge(&mut self, state: ui::State) {
+        for (name, value) in state.values {
+            if self.value(&name).is_none() {
+                if state.follow.contains(&name) {
+                    self.follow.push(name.clone());
+                }
+                self.values.push((name, value));
+            }
+        }
+        for (name, items) in state.items {
+            if self.items(&name).is_none() {
+                self.items.push((name, items));
+            }
+        }
+        for (name, on) in state.enabled {
+            if self.enabled(&name).is_none() {
+                self.enabled.push((name, on));
+            }
+        }
+    }
 }
 
 /// [`prefill`] for an open dialog asked again (#1602): `values` are the
@@ -548,21 +575,7 @@ fn prefill_with(v: &ProjectView, dialog: &str, uid: Option<i32>, values: Option<
     let mut out = Prefill::default();
     for p in plugins() {
         if let Ok(state) = p.state(&ctx) {
-            for (name, value) in state.values {
-                if out.value(&name).is_none() {
-                    out.values.push((name, value));
-                }
-            }
-            for (name, items) in state.items {
-                if out.items(&name).is_none() {
-                    out.items.push((name, items));
-                }
-            }
-            for (name, on) in state.enabled {
-                if out.enabled(&name).is_none() {
-                    out.enabled.push((name, on));
-                }
-            }
+            out.merge(state);
         }
     }
     out
@@ -1149,7 +1162,8 @@ fn open_dialog(v: &ProjectView, spec_id: &str, command: &str) -> Result<Dialog, 
 /// (#1602, modal or not since #1610), and apply the reply: items, enabled
 /// flags, label and sample values and `name.selected_row` always (a chosen
 /// item that is still there stays chosen), every value when the plan or
-/// selection moved (a grid keeps the cell being typed into). Called before a frame is
+/// selection moved (a grid keeps the cell being typed into), and the values
+/// of the editable controls the state names in `follow` (#1670). Called before a frame is
 /// drawn or a reply is written, so a read sees the state the plugin would
 /// show.
 pub(crate) fn refresh_dialog(tab: &mut DocTab) {
@@ -1214,6 +1228,15 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
     }
     let values = values_of(d);
     let p = prefill_with(v, spec_id, uid, Some(values));
+    apply_refresh(d, &p, moved);
+    d.stale = false;
+    d.seen = Some(now);
+}
+
+/// Apply a re-ask's reply `p` to the plugin controls and buttons of `d`:
+/// items, enabled flags, values (all of them when `moved`, else a label's,
+/// a sample's and those `follow` names) and `name.selected_row`.
+pub(crate) fn apply_refresh(d: &mut Dialog, p: &Prefill, moved: bool) {
     for c in d.controls.iter_mut().filter(|c| c.plugin) {
         if let Some(on) = p.enabled(c.name) {
             c.enabled = on;
@@ -1232,13 +1255,15 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
         }
         // The state's values: every control when the plan moved, a label or
         // a sample (display only) on any refresh, so one may follow another
-        // control (#1610, #1609); an editable control keeps what it holds
+        // control (#1610, #1609), and an editable control the state names in
+        // `follow` (#1670); an editable control keeps what it holds
         // otherwise.
         let follows = moved
             || matches!(
                 c.kind,
                 dialog::ControlKind::Label | dialog::ControlKind::Sample
-            );
+            )
+            || p.follow.iter().any(|n| n == c.name);
         if follows && let Some(value) = p.value(c.name) {
             follow_value(c, value);
             if c.kind == dialog::ControlKind::Grid {
@@ -1252,15 +1277,13 @@ pub(crate) fn refresh_dialog(tab: &mut DocTab) {
         // The plugin may keep the selection on the same row of a grid whose
         // rows just moved, or drop it when a row of another grid was picked
         // (`name.selected_row`, #1610).
-        apply_selected_row(c, &p);
+        apply_selected_row(c, p);
     }
     for b in &mut d.buttons {
         if let Some(on) = p.enabled(&b.id) {
             b.enabled = on;
         }
     }
-    d.stale = false;
-    d.seen = Some(now);
 }
 
 /// Add the plugins' Task Information pages for task `uid` to `d`, whose

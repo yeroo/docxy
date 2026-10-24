@@ -1450,3 +1450,82 @@ fn a_multibyte_keytip_never_panics_the_keytip_lookups() {
     assert_eq!(crate::tab_keytip_cmd(&task, "ÉX"), Some(act_of("a.e")));
     assert_eq!(crate::tab_keytip_cmd(&task, "ZÉ"), Some(act_of("a.more")));
 }
+
+#[test]
+fn a_re_ask_refills_only_the_editable_controls_it_names_in_follow() {
+    // Text Styles' case (#1670): a control change re-asks the state, which
+    // refills the fields when `Item to Change` moved. A field it does not
+    // name keeps what it holds unless the plan or the selection moved.
+    let json = r##"{"dialogs":[{"id":"task-information","pages":[{"name":"Fixture","controls":[
+        {"name":"fx.item","label":"&Item:","kind":"list","items":["A","B"],"value":"A"},
+        {"name":"fx.style","label":"&Style:","kind":"list","items":["Regular","Italic","Bold"],"value":"Regular"},
+        {"name":"fx.font","label":"&Font:","kind":"text","value":"Calibri"},
+        {"name":"fx.size","label":"Si&ze:","kind":"text","value":"11"},
+        {"name":"fx.echo","label":"","kind":"label","value":""}]}]}]}"##;
+    let m = Manifest::parse(json).unwrap();
+    let spec = m.dialog("task-information").unwrap();
+    let tab = tab();
+    let Surface::Project(v) = &tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let open = || {
+        let mut d = crate::task_info_dialog(&v.ed, uid, crate::InfoPage::General).unwrap();
+        extend_task_info_with(&mut d, spec, &Prefill::default());
+        d.mark_opened();
+        d
+    };
+    let text = |d: &Dialog, n: &str| d.controls.iter().find(|c| c.name == n).unwrap().text();
+    // The reply: values for every field, `fx.style` and `fx.size` named,
+    // `fx.size` with no value (so nothing to take).
+    let reply = Prefill {
+        values: vec![
+            ("fx.style".to_string(), Json::str("Bold")),
+            ("fx.font".to_string(), Json::str("Arial")),
+            ("fx.echo".to_string(), Json::str("item B")),
+        ],
+        follow: vec!["fx.style".to_string(), "fx.size".to_string()],
+        ..Prefill::default()
+    };
+    let mut d = open();
+    apply_refresh(&mut d, &reply, false);
+    assert_eq!(text(&d, "fx.style"), "Bold", "named: follows");
+    assert_eq!(text(&d, "fx.font"), "Calibri", "not named: kept");
+    assert_eq!(text(&d, "fx.size"), "11", "named without a value: kept");
+    assert_eq!(text(&d, "fx.echo"), "item B", "a label always follows");
+    assert!(
+        d.changed("fx.style"),
+        "a followed value is a change from the opening"
+    );
+    // Without `follow` the field keeps what it holds, as before.
+    let mut d = open();
+    let unnamed = Prefill {
+        follow: Vec::new(),
+        ..reply.clone()
+    };
+    apply_refresh(&mut d, &unnamed, false);
+    assert_eq!(text(&d, "fx.style"), "Regular");
+    assert_eq!(text(&d, "fx.echo"), "item B");
+    // The plan or the selection moved: every value applies.
+    let mut d = open();
+    apply_refresh(&mut d, &unnamed, true);
+    assert_eq!(text(&d, "fx.style"), "Bold");
+    assert_eq!(text(&d, "fx.font"), "Arial");
+    assert_eq!(text(&d, "fx.size"), "11");
+}
+
+#[test]
+fn a_name_follows_only_for_the_plugin_whose_value_is_taken() {
+    // Plugin A gives `x` and `y` and names neither; plugin B names both and
+    // gives `y` and `z`: B's follow cannot make A's values overwrite a field
+    // (#1670), but its own `z` follows.
+    let a = projcore::uiplugin::State::parse(r#"{"values":{"x":"a","y":"a"}}"#).unwrap();
+    let b =
+        projcore::uiplugin::State::parse(r#"{"values":{"y":"b","z":"b"},"follow":["x","y","z"]}"#)
+            .unwrap();
+    let mut p = Prefill::default();
+    p.merge(a);
+    p.merge(b);
+    assert_eq!(p.value("y"), Some(&Json::str("a")));
+    assert_eq!(p.follow, vec!["z".to_string()]);
+}
