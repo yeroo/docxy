@@ -396,7 +396,7 @@ fn an_estimated_milestone_shows_no_estimate_suffix() {
 #[test]
 fn names_list_the_families_and_match_loosely() {
     let names = field_names();
-    assert_eq!(names.len(), 23 + 11 * 5 + 34 + 120);
+    assert_eq!(names.len(), 23 + 11 * 5 + 35 + 120);
     assert_eq!(names[..3], [s("ID"), s("Task Mode"), s("Name")]);
     for name in [
         "Baseline Start",
@@ -1445,7 +1445,7 @@ fn custom_field_names_parse_and_list() {
     .collect();
     let unique_id = names.iter().position(|n| n == "Unique ID").unwrap();
     assert_eq!(names[unique_id + 1..], tail[..]);
-    assert_eq!(names.len(), 23 + 11 * 5 + 34 + 120);
+    assert_eq!(names.len(), 23 + 11 * 5 + 35 + 120);
     assert_eq!(Field::all().len(), names.len());
     for name in &names[unique_id + 1..] {
         assert_eq!(Field::parse(name).unwrap().name(), *name);
