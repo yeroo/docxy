@@ -1995,3 +1995,66 @@ fn a_tier_cell_puts_the_plan_style_over_the_tier_defaults() {
         (Some(7.5), Some(true), Some(0x123456))
     );
 }
+
+/// The `fixture.mark` reply's ops and styles (#1667) on the harness case's
+/// plan (project-clipboard.xml: A and B, 2 days each, unlinked), pinning
+/// what `project-plugin-ui.uit` asserts: A marked, highlighted and 3 days
+/// long, so critical; B left with slack.
+#[test]
+fn the_fixture_mark_command_on_the_harness_plan() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures/project-clipboard.xml");
+    let project = projcore::mspdi::read_mspdi(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut v = ProjectView::new(project, false);
+    let ops = [
+        projcore::uiplugin::Op {
+            verb: "task.set".into(),
+            args: Json::parse(r#"{"uid":1,"marked":true,"duration":"3d"}"#).unwrap(),
+        },
+        projcore::uiplugin::Op {
+            verb: "proj.highlight".into(),
+            args: Json::parse(r#"{"field":"Name","values":["A"]}"#).unwrap(),
+        },
+    ];
+    v.ed.batch(|ed| {
+        projctl::apply_ops_in(ed, &ops)?;
+        ed.edit_formatting(|f| {
+            f.apply_view(
+                &Json::parse(
+                    r##"{"text_styles":{"Marked Tasks":{"bold":true},"Highlighted Tasks":{"background":"#FFFF99"},"Changed Cells":{"color":"#C00000","italic":true}}}"##,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        });
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(v.ed.undo_depth(), 1);
+    let on = Optins {
+        late: true,
+        placeholder: true,
+        external: true,
+        marked: true,
+        highlighted: true,
+        changed_cells: true,
+    };
+    let line = |v: &ProjectView, row: usize| {
+        let task = v.ed.project().tasks[row].clone();
+        format!(
+            "{}:{}",
+            task.uid,
+            task_categories(v, &task, row, on).join("|")
+        )
+    };
+    assert_eq!(
+        line(&v, 0),
+        "1:All|Critical Tasks|Marked Tasks|Highlighted Tasks"
+    );
+    assert_eq!(line(&v, 1), "2:All|Noncritical Tasks");
+    assert_eq!(*changed_cells(&v), [(1, "Duration"), (1, "Finish")]);
+    // Undo reports the same cells back; the highlight stays.
+    assert!(v.ed.undo());
+    assert_eq!(line(&v, 0), "1:All|Critical Tasks|Highlighted Tasks");
+    assert_eq!(*changed_cells(&v), [(1, "Duration"), (1, "Finish")]);
+}
