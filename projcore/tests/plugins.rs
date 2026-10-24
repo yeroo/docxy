@@ -321,7 +321,10 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     );
     assert_eq!(sheet.pages[0].controls[0].columns[0].kind, "check");
     assert_eq!(m.palettes.len(), 2);
-    assert_eq!(m.text_style_categories, ["Fixture Tasks"]);
+    assert_eq!(
+        m.text_style_categories,
+        ["Fixture Tasks", "Late Tasks", "Placeholder Tasks"]
+    );
 
     // State: the toggle off, the row item disabled without a selection,
     // the blue palette checked; a Task Information prefill by uid.
