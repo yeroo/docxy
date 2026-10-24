@@ -1,0 +1,38 @@
+# Cases known to fail on the Windows sweep (scripts/ui-linux-sweep.py on
+# windows-latest, the ui-sweep-windows job). The Linux sweep's list is
+# expected-failures.txt; this one has the same grammar:
+#
+#   <script>.uit | <exact test name> | #<tracking issue> [| error | flaky]
+#
+# A listed case must fail and an unlisted one must pass, so remove the entry in
+# the change that fixes its issue. An entry covers failed expectations: FAIL
+# steps and no step that could not run (ERROR). An entry ending `| error`
+# instead requires an ERROR step (FAIL steps may appear too). An entry ending
+# `| flaky` is for a case that fails only now and then: it may pass, and a
+# failure must be FAIL steps only. Never mark a case that always fails flaky.
+# See docs/ui-test-harness.md, "Expected failures".
+
+# vbottom_inset at 200% is 323, the case expects 241 (as on Linux).
+doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
+
+# Ribbon groups clipped or collapsed differently at the Windows CI widths.
+ribbon-fit.uit | sheet ribbon: no tab is clipped vertically | #1779
+ribbon-fit.uit | widening restores full groups | #1779
+sheet-ribbon.uit | sheet Home ribbon: no group is clipped vertically | #1779
+project-plugin-ui.uit | the Task tab with a contributed group collapses whole groups, never a label | #1779
+
+# Project table and Timeline geometry at the Windows window sizes.
+project-selection.uit | project the default window shows the whole Entry table and a narrowed pane does not | #1780
+project-timeline-box.uit | project dragging the box's right edge out widens the span and narrows the days | #1780
+project-timeline-grip.uit | project the grip stops at half the window and follows the window's height | #1780
+project-timeline-view.uit | project timeline highlights the chart's visible range and follows its scroll | #1780
+
+# Line number positions in print layout.
+page-line-numbers.uit | line numbers draw in print layout, continue across pages and columns, and follow the ribbon toggle | #1781
+
+# `shot gallery` cannot be captured (ERROR step).
+style-gallery.uit | style gallery tiles in dark and light | #1782 | error
+
+# Border colour asserts that fail in some runs only.
+gantt-scroll.uit | gantt panes stay aligned while scrolling | #1783 | flaky
+project-cells.uit | project unchanged edits preserve redo and cell border follows navigation | #1783 | flaky
