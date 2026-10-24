@@ -2074,3 +2074,33 @@ fn the_fixture_mark_command_on_the_harness_plan() {
     assert_eq!(line(&v, 0), "1:All|Critical Tasks|Highlighted Tasks");
     assert_eq!(*changed_cells(&v), [(1, "Duration"), (1, "Finish")]);
 }
+
+#[test]
+fn the_selection_lists_the_cursor_column_first() {
+    // #1756: a range Name..Duration with the cursor on Duration sends
+    // Duration first, as the cursor's task is sent first.
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    let first = v.ed.project().tasks[0].uid;
+    let second = v.ed.project().tasks[1].uid;
+    let name = crate::COLUMNS.iter().position(|c| *c == "Name").unwrap();
+    let duration = crate::COLUMNS
+        .iter()
+        .position(|c| *c == "Duration")
+        .unwrap();
+    v.entry = false;
+    v.col = duration;
+    assert_eq!(selection_of(v).cols, vec!["Duration".to_string()]);
+    v.anchor = Some((first, name));
+    let sel = selection_of(v);
+    assert_eq!(sel.uids, vec![second, first]);
+    assert_eq!(sel.cols, vec!["Duration".to_string(), "Name".to_string()]);
+    v.col = name;
+    v.ed.select(0);
+    v.anchor = Some((second, duration));
+    let sel = selection_of(v);
+    assert_eq!(sel.uids, vec![first, second]);
+    assert_eq!(sel.cols, vec!["Name".to_string(), "Duration".to_string()]);
+}
