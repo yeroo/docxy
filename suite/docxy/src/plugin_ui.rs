@@ -1904,6 +1904,40 @@ pub(crate) fn titles_of(f: &projcore::formatting::Formatting) -> Option<TextStyl
     (!style.is_empty()).then_some(style)
 }
 
+/// Project's timescale tier text style categories (#1666). The header draws
+/// two tiers, Project's middle (the major unit) and bottom (the minor), as
+/// its gridlines do (#1575); `Top Timescale Tier` is stored only.
+pub(crate) const MIDDLE_TIER: &str = "Middle Timescale Tier";
+pub(crate) const BOTTOM_TIER: &str = "Bottom Timescale Tier";
+
+/// The plan's (major, minor) timescale tier styles: `All` under the tier's
+/// own, field by field; `None` for a tier nothing styles. Unlike the
+/// titles style, the tiers take `All` (as the issue asks).
+pub(crate) fn tier_styles(
+    f: &projcore::formatting::Formatting,
+) -> (Option<TextStyle>, Option<TextStyle>) {
+    let of = |tier: &str| {
+        let style = f.style_for(&["All", tier]);
+        (!style.is_empty()).then_some(style)
+    };
+    (of(MIDDLE_TIER), of(BOTTOM_TIER))
+}
+
+/// The style a header tier's cells draw in: the plan's tier style over the
+/// tier's own defaults (7.5 pt, which is the 10 px text; the major tier
+/// bold), so an explicit field, `bold: false` included, wins.
+pub(crate) fn tier_cell_style(style: Option<&TextStyle>, major: bool) -> TextStyle {
+    let base = TextStyle {
+        size: Some(7.5),
+        bold: major.then_some(true),
+        ..TextStyle::default()
+    };
+    match style {
+        Some(s) => base.over(s),
+        None => base,
+    }
+}
+
 /// The ID cell's style: the titles style instead of the row's when one is
 /// set (as Project: a Critical Tasks colour leaves the row header alone),
 /// the cell's own on top either way.

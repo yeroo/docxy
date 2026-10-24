@@ -43,8 +43,10 @@
 //!   and `fixture.format` (#1575: sets the plan's gridlines through
 //!   `view.gridlines`: dotted red Gantt rows with every second one solid
 //!   blue, no sheet rows, solid green sheet columns and a solid red project
-//!   start line; a second press, seeing the view's Gantt Rows dotted, clears
-//!   them all with null).
+//!   start line, and #1666: a normal-weight 9 pt Middle Timescale Tier and
+//!   a red italic light-fill Bottom Timescale Tier through
+//!   `view.text_styles`; a second press, seeing the view's Gantt Rows
+//!   dotted, clears them all with null).
 //!   and `fixture.bars` (#1696: sets two bar style rows through `view.bars`,
 //!   a normal-task row 1 with Resource Names to the right and a not-summary
 //!   row 2 with other marks, one `view.task_bars` override of task 1 and
@@ -424,8 +426,9 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
     };
     let id = req.get("id").and_then(Json::str).unwrap_or_default();
     let reply = match id {
-        // The gridlines (#1575): set them, or, seeing them set in the
-        // view, put every line back to its default.
+        // The gridlines (#1575) and the timescale tiers' text styles
+        // (#1666): set them, or, seeing the gridlines set in the view, put
+        // every line back to its default and clear the two styles.
         "fixture.format" => {
             let set = req
                 .get("view")
@@ -435,13 +438,18 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                 .and_then(Json::str)
                 == Some("dotted");
             if set {
-                r#"{"ops":[],"status":"Fixture: format","view":{"gridlines":null}}"#.to_string()
+                r#"{"ops":[],"status":"Fixture: format","view":{"gridlines":null,
+                    "text_styles":{"Middle Timescale Tier":null,"Bottom Timescale Tier":null}}}"#
+                    .to_string()
             } else {
                 r##"{"ops":[],"status":"Fixture: format","view":{"gridlines":{
                     "Gantt Rows":{"type":"dotted","color":"#CC3333","interval":2,"interval_type":"solid","interval_color":"#3366CC"},
                     "Sheet Rows":{"type":"none"},
                     "Sheet Columns":{"type":"solid","color":"#33AA33"},
-                    "Project Start":{"type":"solid","color":"#CC3333"}}}}"##
+                    "Project Start":{"type":"solid","color":"#CC3333"}},
+                    "text_styles":{
+                    "Middle Timescale Tier":{"bold":false,"size":9},
+                    "Bottom Timescale Tier":{"color":"#C00000","italic":true,"pattern":"light-fill"}}}}"##
                     .to_string()
             }
         }

@@ -113,7 +113,7 @@ fn a_tier_covers_the_view_edge_to_edge_with_labels_that_fit() {
     let scale = scale_at("2026-03-02", 200, 12.);
     let level = &LEVELS[nearest(12.)];
     assert_eq!((level.major, level.minor), (Unit::Month, Unit::Week));
-    let (major, minor) = tiers(scale, level, 0., 500.);
+    let (major, minor) = tiers(scale, level, 0., 500., (CHAR_W, CHAR_W));
     // March 2026 is 31 days, entered from its Monday the 2nd.
     assert_eq!(major[0].label, "Mar 2026");
     assert_eq!(
@@ -147,20 +147,37 @@ fn a_cell_cut_by_the_left_edge_keeps_its_label_in_view() {
     let scale = scale_at("2026-01-01", 800, 3.);
     let level = &LEVELS[nearest(3.)];
     // 20 days in: January began 20 days (60 px) before the view's left edge.
-    let (_, minor) = tiers(scale, level, 60., 400.);
+    let (_, minor) = tiers(scale, level, 60., 400., (CHAR_W, CHAR_W));
     assert_eq!(minor[0].x, 0.);
     assert_eq!(minor[0].at, 60.);
     assert!(!minor[0].label.is_empty());
 }
 
 #[test]
+fn a_wider_tier_text_fits_shorter_labels_in_the_same_cells() {
+    // A tier text style at twice the default size (#1666): the week cells
+    // that hold "Mar 2, 2026" at 6 px a character take a shorter label.
+    let scale = scale_at("2026-03-02", 200, 12.);
+    let level = &LEVELS[nearest(12.)];
+    let (_, plain) = tiers(scale, level, 0., 500., (CHAR_W, CHAR_W));
+    let (_, wide) = tiers(scale, level, 0., 500., (CHAR_W, 2. * CHAR_W));
+    assert_eq!(plain[0].label, "Mar 2, 2026");
+    assert!(wide[0].label.chars().count() < plain[0].label.chars().count());
+    for c in &wide {
+        assert!(
+            c.label.is_empty() || c.label.chars().count() as f32 * 2. * CHAR_W + CELL_PAD <= c.w
+        );
+    }
+}
+
+#[test]
 fn narrow_cells_drop_to_short_labels_then_none() {
     let scale = scale_at("2026-03-02", 60, 22.);
-    let (_, days) = tiers(scale, &LEVELS[6], 0., 300.);
+    let (_, days) = tiers(scale, &LEVELS[6], 0., 300., (CHAR_W, CHAR_W));
     // 22 px holds one character: the weekday's initial.
     assert_eq!(days[0].label, "M");
     let scale = scale_at("2026-01-01", 4000, 0.25);
-    let (_, quarters) = tiers(scale, &LEVELS[0], 0., 1000.);
+    let (_, quarters) = tiers(scale, &LEVELS[0], 0., 1000., (CHAR_W, CHAR_W));
     assert!(
         quarters
             .iter()

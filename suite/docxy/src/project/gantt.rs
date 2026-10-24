@@ -2,6 +2,7 @@
 use super::barstyle::{BarStyled, styled_children};
 use super::rolled::RolledChild;
 use super::*;
+use projcore::formatting::TextStyle as PlanStyle;
 use projcore::formatting::gridlines::{Gridline, Gridlines, Line, LineType};
 
 /// The pixels one day is wide at the default zoom (the Days level); a view's live
@@ -497,7 +498,7 @@ pub(crate) fn tier_lines(
     // Within the viewport, and never past the scale's last day. The cells
     // are consecutive unit starts, so the walk from the origin happens once,
     // for the first, and the rest count up from it.
-    let cells: Vec<zoom::Cell> = zoom::tier(scale, unit, offset, width)
+    let cells: Vec<zoom::Cell> = zoom::tier(scale, unit, offset, width, zoom::CHAR_W)
         .into_iter()
         .filter(|c| c.x < scale.width())
         .collect();
@@ -783,28 +784,51 @@ pub(crate) fn gantt_header(
     width: f32,
     pal: Pal,
     grid: &Gridlines,
+    styles: (Option<PlanStyle>, Option<PlanStyle>),
 ) -> impl IntoElement {
     div()
         .relative()
         .w(px(scale.width()))
         .h(px(ROW_H))
         .child(backdrop(scale, cal, offset, width, pal))
-        .children(header_cells(scale, offset, width, pal, grid))
+        .children(header_cells(scale, offset, width, pal, grid, styles))
+}
+
+/// The px a tier's label character is fitted at, from the drawn cell style
+/// (#1666): [`zoom::CHAR_W`] is the bold 10 px text the header row draws in
+/// (it sets bold, so a tier inherits it), scaled by the drawn size and a
+/// tenth narrower only when the style makes the tier regular weight. A
+/// style that sets neither (colour, italic, pattern) fits as the plain header.
+pub(crate) fn tier_char_w(drawn: &PlanStyle) -> f32 {
+    let size_px = drawn.size.unwrap_or(7.5) * 96. / 72.;
+    let regular = if drawn.bold == Some(false) {
+        1. / 1.1
+    } else {
+        1.
+    };
+    zoom::CHAR_W * size_px / 10. * regular
 }
 
 /// The header's two tiers, 14 px each: the major unit over the minor, each
 /// cell ruled on its left (the Title Vertical gridline) and labelled when
 /// the label fits; the minor tier ruled on its top (Title Horizontal). A
-/// title line draws solid whatever its type, in its colour (#1575).
+/// title line draws solid whatever its type, in its colour (#1575). Each
+/// tier's cells draw in [`plugin_ui::tier_cell_style`] of its plan style
+/// (`styles`: the middle and bottom timescale tiers, #1666); a larger size
+/// is clipped to the tier.
 fn header_cells(
     scale: GanttScale,
     offset: f32,
     width: f32,
     pal: Pal,
     grid: &Gridlines,
+    styles: (Option<PlanStyle>, Option<PlanStyle>),
 ) -> Vec<Div> {
     let level = &zoom::LEVELS[zoom::nearest(scale.day_w)];
-    let (major, minor) = zoom::tiers(scale, level, offset, width);
+    let major_look = crate::plugin_ui::tier_cell_style(styles.0.as_ref(), true);
+    let minor_look = crate::plugin_ui::tier_cell_style(styles.1.as_ref(), false);
+    let char_w = (tier_char_w(&major_look), tier_char_w(&minor_look));
+    let (major, minor) = zoom::tiers(scale, level, offset, width, char_w);
     let half = ROW_H / 2.;
     let rule = Hsla {
         a: pal.border.a * 0.6,
@@ -812,8 +836,8 @@ fn header_cells(
     };
     let vertical = grid.get(Line::TitleVertical);
     let horizontal = grid.get(Line::TitleHorizontal);
-    let cell = |c: zoom::Cell, top: f32, bold: bool| {
-        div()
+    let cell = |c: zoom::Cell, top: f32, look: &PlanStyle| {
+        let d = div()
             .absolute()
             .left(px(c.x))
             .top(px(top))
@@ -825,17 +849,20 @@ fn header_cells(
             })
             .overflow_hidden()
             .whitespace_nowrap()
-            .text_size(px(10.))
-            .line_height(px(half))
-            .when(bold, |d| d.font_weight(FontWeight::BOLD))
+            .line_height(px(half));
+        crate::plugin_ui::styled(d, look)
+            .children(crate::plugin_ui::pattern_layer(look))
             .child(div().absolute().left(px(c.at - c.x + 2.)).child(c.label))
     };
-    let mut cells: Vec<Div> = major.into_iter().map(|c| cell(c, 0., true)).collect();
+    let mut cells: Vec<Div> = major
+        .into_iter()
+        .map(|c| cell(c, 0., &major_look))
+        .collect();
     // The Title Horizontal rule is a child of its own: gpui's border colour
     // is one value for all four sides, so a top border would recolour the
     // cell's Title Vertical left rule.
     cells.extend(minor.into_iter().map(|c| {
-        cell(c, half, false).when(horizontal.line_type != LineType::None, |d| {
+        cell(c, half, &minor_look).when(horizontal.line_type != LineType::None, |d| {
             d.child(
                 div()
                     .absolute()

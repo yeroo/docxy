@@ -272,19 +272,28 @@ pub(crate) struct Cell {
     pub label: String,
 }
 
-/// Pixels a label character is given, and the cell's padding.
-const CHAR_W: f32 = 6.;
+/// Pixels a label character is given in the default 10 px tier text, and
+/// the cell's padding.
+pub(crate) const CHAR_W: f32 = 6.;
 const CELL_PAD: f32 = 6.;
 
-fn fitted(labels: Vec<String>, room: f32) -> String {
+fn fitted(labels: Vec<String>, room: f32, char_w: f32) -> String {
     labels
         .into_iter()
-        .find(|l| l.chars().count() as f32 * CHAR_W + CELL_PAD <= room)
+        .find(|l| l.chars().count() as f32 * char_w + CELL_PAD <= room)
         .unwrap_or_default()
 }
 
-/// The cells of one tier over the chart offsets `[offset, offset + width)`.
-pub(crate) fn tier(scale: GanttScale, unit: Unit, offset: f32, width: f32) -> Vec<Cell> {
+/// The cells of one tier over the chart offsets `[offset, offset + width)`,
+/// each label given `char_w` px a character ([`CHAR_W`] for the default
+/// text; a tier text style scales it, #1666).
+pub(crate) fn tier(
+    scale: GanttScale,
+    unit: Unit,
+    offset: f32,
+    width: f32,
+    char_w: f32,
+) -> Vec<Cell> {
     let dw = scale.day_w;
     let first = scale.origin_day + (offset / dw).floor() as i64;
     let last = scale.origin_day + ((offset + width) / dw).ceil() as i64;
@@ -297,7 +306,7 @@ pub(crate) fn tier(scale: GanttScale, unit: Unit, offset: f32, width: f32) -> Ve
         // A cell cut by the left edge keeps its label in view when it fits there.
         let shown = x.max(offset);
         let room = x + w - shown;
-        let label = fitted(unit.labels(day), room);
+        let label = fitted(unit.labels(day), room, char_w);
         let at = if label.is_empty() || x >= offset {
             x
         } else {
@@ -323,16 +332,18 @@ pub(crate) fn tier_index(scale: GanttScale, unit: Unit, x: f32) -> usize {
     k
 }
 
-/// The major and minor tiers of `level` over the visible offsets.
+/// The major and minor tiers of `level` over the visible offsets, their
+/// labels fitted at `char_w` (major, minor) px a character.
 pub(crate) fn tiers(
     scale: GanttScale,
     level: &Level,
     offset: f32,
     width: f32,
+    char_w: (f32, f32),
 ) -> (Vec<Cell>, Vec<Cell>) {
     (
-        tier(scale, level.major, offset, width),
-        tier(scale, level.minor, offset, width),
+        tier(scale, level.major, offset, width, char_w.0),
+        tier(scale, level.minor, offset, width, char_w.1),
     )
 }
 

@@ -119,7 +119,13 @@ fn slot_one_alone_does_not_show_a_bar_or_extend_the_scale() {
 #[test]
 fn week_cells_start_on_mondays_and_weekend_columns_are_saturday_sunday() {
     let scale = gantt_scale(&editor(vec![]));
-    let weeks = zoom::tier(scale, zoom::Unit::Week, 0., 15. * DEFAULT_DAY_W);
+    let weeks = zoom::tier(
+        scale,
+        zoom::Unit::Week,
+        0.,
+        15. * DEFAULT_DAY_W,
+        zoom::CHAR_W,
+    );
     assert_eq!(
         weeks.iter().map(|c| c.x).collect::<Vec<_>>(),
         [0., 7. * 22., 14. * 22.]
@@ -1433,4 +1439,60 @@ fn overlay_text_takes_the_shapes_text_style() {
     assert_eq!(off.font.style, FontStyle::Normal);
     assert_eq!(off.font.family, base.family);
     assert!(off.underline.is_none() && off.strikethrough.is_none());
+}
+
+#[test]
+fn a_tier_label_fits_at_its_drawn_size_and_weight() {
+    use crate::plugin_ui::tier_cell_style;
+    let close = |w: f32, want: f32| assert!((w - want).abs() < 1e-4, "{w} != {want}");
+    // No plan style: the default 6 px a character on both tiers, which the
+    // header row draws bold (#1666).
+    close(tier_char_w(&tier_cell_style(None, true)), zoom::CHAR_W);
+    close(tier_char_w(&tier_cell_style(None, false)), zoom::CHAR_W);
+    // A style that sets neither size nor weight fits as the plain header.
+    let colour = PlanStyle {
+        color: Some(0xC00000),
+        italic: Some(true),
+        pattern: Some("light-fill".into()),
+        ..PlanStyle::default()
+    };
+    close(
+        tier_char_w(&tier_cell_style(Some(&colour), true)),
+        zoom::CHAR_W,
+    );
+    close(
+        tier_char_w(&tier_cell_style(Some(&colour), false)),
+        zoom::CHAR_W,
+    );
+    // 15 pt is 20 px, twice the default text, on either tier; the minor
+    // tier's inherited bold fits as an explicit bold does.
+    let big = PlanStyle {
+        size: Some(15.),
+        ..PlanStyle::default()
+    };
+    let big_bold = PlanStyle {
+        bold: Some(true),
+        ..big.clone()
+    };
+    close(
+        tier_char_w(&tier_cell_style(Some(&big), true)),
+        2. * zoom::CHAR_W,
+    );
+    close(
+        tier_char_w(&tier_cell_style(Some(&big), false)),
+        2. * zoom::CHAR_W,
+    );
+    close(
+        tier_char_w(&tier_cell_style(Some(&big_bold), false)),
+        2. * zoom::CHAR_W,
+    );
+    // Only an explicit regular weight is a tenth narrower.
+    let thin = PlanStyle {
+        bold: Some(false),
+        ..PlanStyle::default()
+    };
+    close(
+        tier_char_w(&tier_cell_style(Some(&thin), true)),
+        zoom::CHAR_W / 1.1,
+    );
 }

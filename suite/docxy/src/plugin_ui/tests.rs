@@ -1753,3 +1753,92 @@ fn a_name_follows_only_for_the_plugin_whose_value_is_taken() {
     assert_eq!(p.value("y"), Some(&Json::str("a")));
     assert_eq!(p.follow, vec!["z".to_string()]);
 }
+
+#[test]
+fn the_tiers_draw_by_the_middle_and_bottom_timescale_styles() {
+    use projcore::formatting::Formatting;
+    let mut f = Formatting::default();
+    assert_eq!(tier_styles(&f), (None, None));
+    // The top tier is stored only: the header draws no top tier.
+    f.set_category(
+        "Top Timescale Tier",
+        TextStyle {
+            italic: Some(true),
+            ..TextStyle::default()
+        },
+    );
+    assert_eq!(tier_styles(&f), (None, None));
+    let red = TextStyle {
+        color: Some(0xC00000),
+        ..TextStyle::default()
+    };
+    f.set_category(BOTTOM_TIER, red.clone());
+    assert_eq!(tier_styles(&f), (None, Some(red.clone())));
+    // All under the tier's own, field by field.
+    f.set_category(
+        "All",
+        TextStyle {
+            size: Some(9.),
+            bold: Some(true),
+            ..TextStyle::default()
+        },
+    );
+    f.set_category(
+        MIDDLE_TIER,
+        TextStyle {
+            bold: Some(false),
+            ..TextStyle::default()
+        },
+    );
+    let (middle, bottom) = tier_styles(&f);
+    let middle = middle.unwrap();
+    assert_eq!((middle.size, middle.bold), (Some(9.), Some(false)));
+    let bottom = bottom.unwrap();
+    assert_eq!(
+        (bottom.size, bottom.bold, bottom.color),
+        (Some(9.), Some(true), Some(0xC00000))
+    );
+}
+
+#[test]
+fn a_tier_cell_puts_the_plan_style_over_the_tier_defaults() {
+    // No style: the 10 px text, the major tier bold, the minor's weight
+    // inherited as before.
+    assert_eq!(
+        tier_cell_style(None, true),
+        TextStyle {
+            size: Some(7.5),
+            bold: Some(true),
+            ..TextStyle::default()
+        }
+    );
+    assert_eq!(
+        tier_cell_style(None, false),
+        TextStyle {
+            size: Some(7.5),
+            ..TextStyle::default()
+        }
+    );
+    // An explicit off wins over the major tier's bold; a set size wins.
+    let plan = TextStyle {
+        bold: Some(false),
+        size: Some(9.),
+        italic: Some(true),
+        ..TextStyle::default()
+    };
+    let drawn = tier_cell_style(Some(&plan), true);
+    assert_eq!(
+        (drawn.size, drawn.bold, drawn.italic),
+        (Some(9.), Some(false), Some(true))
+    );
+    // A style that sets neither keeps the defaults under it.
+    let colour = TextStyle {
+        color: Some(0x123456),
+        ..TextStyle::default()
+    };
+    let drawn = tier_cell_style(Some(&colour), true);
+    assert_eq!(
+        (drawn.size, drawn.bold, drawn.color),
+        (Some(7.5), Some(true), Some(0x123456))
+    );
+}
