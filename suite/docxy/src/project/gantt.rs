@@ -1260,12 +1260,24 @@ fn paint_shape(
             x,
             y,
             text,
+            color,
             size: text_size,
-            ..
+            font: family,
+            bold,
+            italic,
+            underline,
+            strikethrough,
         } => {
-            let Some(run) = overlay_text_run(shape, font) else {
-                return;
-            };
+            let run = overlay_text_run(
+                font,
+                text.len(),
+                *color,
+                family.as_deref(),
+                *bold,
+                *italic,
+                *underline,
+                *strikethrough,
+            );
             let line = window.text_system().shape_line(
                 SharedString::from(text.clone()),
                 px(*text_size),
@@ -1284,55 +1296,52 @@ fn paint_shape(
     }
 }
 
-/// The run an overlay text draws with (#1668): `base` (the overlay's font)
-/// with the shape's font family, weight and slant when it sets them, and a
-/// 1 px underline and strikethrough in its colour, as `plugin_ui::styled`
-/// draws a table cell. An explicit off draws plain: an overlay text inherits
-/// nothing. `None` for any other shape.
-fn overlay_text_run(shape: &projcore::uiplugin::Shape, base: &Font) -> Option<TextRun> {
-    let projcore::uiplugin::Shape::Text {
-        text,
-        color,
-        font,
-        bold,
-        italic,
-        underline,
-        strikethrough,
-        ..
-    } = shape
-    else {
-        return None;
-    };
-    let mut run_font = base.clone();
-    if let Some(family) = font {
-        run_font.family = family.clone().into();
+/// The run an overlay text of `len` bytes draws with (#1668): `base` (the
+/// overlay's font) with the shape's font family, weight and slant when it
+/// sets them, and a 1 px underline and strikethrough in its colour, as
+/// `plugin_ui::styled` draws a table cell. An explicit off draws plain: an
+/// overlay text inherits nothing.
+#[allow(clippy::too_many_arguments)]
+fn overlay_text_run(
+    base: &Font,
+    len: usize,
+    color: u32,
+    family: Option<&str>,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strikethrough: Option<bool>,
+) -> TextRun {
+    let mut font = base.clone();
+    if let Some(family) = family {
+        font.family = family.to_string().into();
     }
     match bold {
-        Some(true) => run_font.weight = FontWeight::BOLD,
-        Some(false) => run_font.weight = FontWeight::NORMAL,
+        Some(true) => font.weight = FontWeight::BOLD,
+        Some(false) => font.weight = FontWeight::NORMAL,
         None => {}
     }
     match italic {
-        Some(true) => run_font.style = FontStyle::Italic,
-        Some(false) => run_font.style = FontStyle::Normal,
+        Some(true) => font.style = FontStyle::Italic,
+        Some(false) => font.style = FontStyle::Normal,
         None => {}
     }
-    let line = Hsla::from(rgb(*color));
-    Some(TextRun {
-        len: text.len(),
-        font: run_font,
+    let line = Hsla::from(rgb(color));
+    TextRun {
+        len,
+        font,
         color: line,
-        underline: (*underline == Some(true)).then_some(UnderlineStyle {
+        underline: (underline == Some(true)).then_some(UnderlineStyle {
             thickness: px(1.),
             color: Some(line),
             wavy: false,
         }),
-        strikethrough: (*strikethrough == Some(true)).then_some(StrikethroughStyle {
+        strikethrough: (strikethrough == Some(true)).then_some(StrikethroughStyle {
             thickness: px(1.),
             color: Some(line),
         }),
         ..Default::default()
-    })
+    }
 }
 
 fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
