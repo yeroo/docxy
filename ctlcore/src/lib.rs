@@ -142,12 +142,14 @@ impl Drop for Server {
 }
 
 /// Wake the blocking `accept()` so the acceptor thread observes the shutdown
-/// flag, and wait for it to close the connection it woke with: the side that
-/// closes first holds TIME_WAIT, and on Windows a client port in TIME_WAIT is
-/// an ephemeral port gone for minutes (#1544). The server's side holds the
-/// listener's port instead. Not an abortive close: a BSD kernel (macOS) drops a
-/// connection reset while still in the listen queue, so `accept` would never
-/// return. Whether the server closed first, for the tests.
+/// flag, and wait for it to close the connection it woke with. The side that
+/// closes first holds TIME_WAIT, so the nudge's own client port is released at
+/// once and the TIME_WAIT moves to the server's end. Its port came from the
+/// ephemeral range too, so at worst one port per server shutdown is still
+/// held, as before (#1544). The nudge cannot close abortively as the probes
+/// do: a BSD kernel (macOS) drops a connection reset while still in the listen
+/// queue, so `accept` would never return. Whether the server closed first, for
+/// the tests.
 fn nudge_acceptor(port: u16) -> bool {
     let Ok(mut nudge) = TcpStream::connect(("127.0.0.1", port)) else {
         return false;
