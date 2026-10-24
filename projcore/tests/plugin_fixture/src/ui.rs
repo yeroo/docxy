@@ -6,7 +6,11 @@
 //!   `fixture.hello`, a toggle `fixture.flag`, a toggle `fixture.plain` with
 //!   no icon (its label is drawn, #1608; `fixture.flat` on the Gantt Chart
 //!   Format tab is the same) and a gallery `fixture.palette` of two swatches
-//!   (`fixture.blue`, `fixture.red`).
+//!   (`fixture.blue`, `fixture.red`), and a dialog launcher `fixture.font`
+//!   (KeyTip ZN, #1669).
+//!   The Gantt Chart Format tab's "Fixture Format" has the same launcher: it
+//!   is drawn in place at every CI width, where the Task tab's group is
+//!   collapsed.
 //!   On the Gantt Chart Format tab a second group "Fixture Percent" after
 //!   "Fixture Format" declares `priority` 120 and holds five small labelled
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
@@ -49,6 +53,7 @@
 //!   12 pt bars, roll-up on, round bars off, splits and drawings off and the
 //!   date format `1/28`; a second press, seeing a bar height in the view,
 //!   clears it with null).
+//!   and `fixture.font` (#1669: the Fixture group's launcher; a status only).
 //! - Overlay: a polyline with an arrowhead from the first bar's end to the
 //!   second bar's start, a text label at the first bar, and a `selected N`
 //!   label at the selected task's bar when the request names one (#1565),
@@ -67,7 +72,7 @@ use std::sync::Mutex;
 const TARGET: &str = r#"{"suite":"0.1.*","yppxy":"0.1.*","built_against":"fixture"}"#;
 
 const MANIFEST: &str = r##"{
-  "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","controls":[
+  "ribbon":[{"tab":"Task","groups":[{"title":"Fixture","launcher":{"id":"fixture.font","tip":"Font (fixture launcher)","keytip":"ZN"},"controls":[
     {"id":"fixture.hello","kind":"button","label":"Hello","tip":"Say hello from the fixture","keytip":"XH","icon":"comment","large":true},
     {"id":"fixture.flag","kind":"toggle","label":"Flag","tip":"A toggle the fixture keeps","keytip":"XF","icon":"lock"},
     {"id":"fixture.plain","kind":"toggle","label":"Plain","tip":"A toggle with no icon: its label is drawn (#1608)","keytip":"XP","icon":""},
@@ -78,7 +83,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"},
     {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"},
     {"id":"fixture.layout","kind":"button","label":"Layout (fixture)","tip":"Sets or clears the Layout dialog's chart settings (#1695)","keytip":"XL","icon":"table"}]}]},
-    {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","controls":[
+    {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","launcher":{"id":"fixture.font","tip":"Font (fixture launcher)","keytip":"ZN"},"controls":[
     {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
     {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]},
     {"title":"Fixture Percent","after":"Fixture Format","priority":120,"controls":[
@@ -456,6 +461,8 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                     .to_string()
             }
         }
+        // The Fixture group's dialog launcher (#1669).
+        "fixture.font" => r#"{"ops":[],"status":"Fixture: font launcher"}"#.to_string(),
         "fixture.hello" => match (req.get("button").and_then(Json::str), req.get("values")) {
             // Bump (#1610): one op on the first selected task, the dialog
             // kept open.

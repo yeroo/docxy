@@ -256,6 +256,16 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
     assert_eq!(m.ribbon[1].groups[1].controls.len(), 5);
     let group = &m.ribbon[0].groups[0];
     assert_eq!(group.title, "Fixture");
+    // Its dialog launcher (#1669), and Fixture Format's; Fixture Percent
+    // has none.
+    let launcher = Some(projcore::uiplugin::Launcher {
+        id: "fixture.font".into(),
+        tip: "Font (fixture launcher)".into(),
+        keytip: "ZN".into(),
+    });
+    assert_eq!(group.launcher, launcher);
+    assert_eq!(m.ribbon[1].groups[0].launcher, launcher);
+    assert_eq!(m.ribbon[1].groups[1].launcher, None);
     assert_eq!(
         group
             .controls
@@ -721,6 +731,12 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
         Some("fixture.red")
     );
     assert_eq!(ui.command(&cmd("other.thing", vec![], None)).unwrap(), None);
+    let launched = ui
+        .command(&cmd("fixture.font", vec![], None))
+        .unwrap()
+        .unwrap();
+    assert_eq!(launched.status.as_deref(), Some("Fixture: font launcher"));
+    assert!(launched.ops.is_empty() && launched.dialog.is_none());
     let asks = ui
         .command(&cmd("fixture.hello", vec![], None))
         .unwrap()
