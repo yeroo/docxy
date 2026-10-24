@@ -732,6 +732,28 @@
   white. The harness state reports `cell_styles`; the fixture's Bold command
   sets both keys.
 
+## Text style categories the host computes (#1665)
+
+- `plugin_ui::task_categories` (facts from the plan as it is, so a row
+  entering one restyles on the next frame) is the one category list the
+  grid (`row_style`), the toolbar's ticks (`shown_cell_style`) and the
+  harness state's `row_categories` (`<uid>:<cat>|<cat>...` per shown task
+  row, while a UI plugin is loaded) read. `Late Tasks` (Status reads
+  `Late`, so a status date is needed) and `Placeholder Tasks`
+  (`Task::is_placeholder`: a manual leaf with no manual or stored start,
+  Project's TBD task) are computed only when a loaded manifest names them in
+  `text_style_categories` (`Optins`, exact string, read once per process);
+  order: ..., Manually Scheduled, Placeholder, Late, Inactive. Only a
+  missing start is representable: `duration_min` is always a number, so a
+  TBD duration or finish is not.
+- The titles style (`titles_style`) is `Row & Column Titles` over the older
+  key `Column Titles`, field by field. The headings and the task rows' ID
+  cells draw by it: with one set, the ID cell takes it instead of the row's
+  category style (`id_cell_style`, the cell's own on top), so the row box
+  carries no style and every cell is styled whole, its own pattern layer
+  included (a hatch may jog at column rules). Without one the row draws as
+  before. The inactive dim and strike stay on the row.
+
 ## Project leveling as a plan edit (#1594)
 
 - `projcore::schedule::level_with(proj, &LevelScope {movable, order,

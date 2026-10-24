@@ -1134,11 +1134,7 @@ fn effective_style(v: &ProjectView, uid: i32, col: &str) -> projcore::formatting
     else {
         return Default::default();
     };
-    let critical = v.ed.schedule().get(uid).is_some_and(|r| r.critical);
-    let inactive = inactive_row(v.ed.project(), row);
-    let row_style = crate::plugin_ui::row_style(v, task, critical, inactive);
-    let mut style =
-        crate::plugin_ui::cell_style(v, row_style.as_ref(), Some(uid), col).unwrap_or_default();
+    let mut style = crate::plugin_ui::shown_cell_style(v, task, row, col).unwrap_or_default();
     if style.bold.is_none() && task.summary {
         style.bold = Some(true);
     }

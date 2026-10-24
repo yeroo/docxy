@@ -575,14 +575,19 @@ fn a_rows_categories_run_general_to_specific() {
         duration_min: 480,
         ..projcore::Task::default()
     };
+    let facts = |critical, inactive| RowFacts {
+        critical,
+        inactive,
+        ..RowFacts::default()
+    };
     assert_eq!(
-        row_categories(&task, true, false),
+        row_categories(&task, facts(true, false)),
         ["All", "Critical Tasks"]
     );
     task.summary = true;
     task.manual = true;
     assert_eq!(
-        row_categories(&task, false, true),
+        row_categories(&task, facts(false, true)),
         [
             "All",
             "Summary Tasks",
@@ -593,15 +598,234 @@ fn a_rows_categories_run_general_to_specific() {
     task.uid = 0;
     task.manual = false;
     assert_eq!(
-        row_categories(&task, false, false),
+        row_categories(&task, facts(false, false)),
         ["All", "Project Summary Task"]
     );
     let mut milestone = projcore::Task::default();
     milestone.milestone = true;
     assert_eq!(
-        row_categories(&milestone, true, false),
+        row_categories(&milestone, facts(true, false)),
         ["All", "Milestone Tasks"]
     );
+}
+
+#[test]
+fn late_and_placeholder_come_after_manual_and_before_inactive() {
+    // #1665: Placeholder, then Late, then Inactive, so a later one wins
+    // field by field in `style_for`.
+    let task = projcore::Task {
+        uid: 3,
+        duration_min: 480,
+        manual: true,
+        ..projcore::Task::default()
+    };
+    let all = RowFacts {
+        critical: false,
+        inactive: true,
+        late: true,
+        placeholder: true,
+    };
+    assert_eq!(
+        row_categories(&task, all),
+        [
+            "All",
+            "Noncritical Tasks",
+            "Manually Scheduled Tasks",
+            "Placeholder Tasks",
+            "Late Tasks",
+            "Inactive Tasks"
+        ]
+    );
+    let late = RowFacts {
+        late: true,
+        ..RowFacts::default()
+    };
+    assert_eq!(
+        row_categories(&task, late),
+        [
+            "All",
+            "Noncritical Tasks",
+            "Manually Scheduled Tasks",
+            "Late Tasks"
+        ]
+    );
+}
+
+#[test]
+fn a_manifest_opts_a_category_in_by_its_exact_name() {
+    let with = |names: &str| {
+        Manifest::parse(&format!(
+            r#"{{"ribbon":[],"menus":[],"dialogs":[],"palettes":[],"text_style_categories":{names}}}"#
+        ))
+        .unwrap()
+    };
+    assert_eq!(Optins::of(&[]), Optins::default());
+    let late = with(r#"["Late Tasks"]"#);
+    let both = with(r#"["Fixture Tasks","Placeholder Tasks","Late Tasks"]"#);
+    let near = with(r#"["late tasks","Placeholder"]"#);
+    assert_eq!(
+        Optins::of(&[&late]),
+        Optins {
+            late: true,
+            placeholder: false
+        }
+    );
+    assert_eq!(
+        Optins::of(&[&near, &both]),
+        Optins {
+            late: true,
+            placeholder: true
+        }
+    );
+    assert_eq!(Optins::of(&[&near]), Optins::default());
+}
+
+/// A view over `tasks`, scheduled from 2026-03-09.
+fn view_of(tasks: Vec<projcore::Task>) -> ProjectView {
+    let mut project = projcore::Project {
+        start_date: Some(projcore::DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+        ..projcore::Project::default()
+    };
+    project.tasks = tasks;
+    ProjectView::new(project, false)
+}
+
+fn leaf(uid: i32) -> projcore::Task {
+    projcore::Task {
+        uid,
+        id: uid,
+        name: format!("T{uid}"),
+        outline_level: 1,
+        duration_min: 480,
+        ..projcore::Task::default()
+    }
+}
+
+#[test]
+fn a_task_enters_late_tasks_when_the_status_date_passes_it() {
+    // CUS-057/058: computed from the plan as it is, so the next frame
+    // restyles the row; only while a plugin opts the category in.
+    let mut v = view_of(vec![leaf(1)]);
+    let on = Optins {
+        late: true,
+        placeholder: true,
+    };
+    let cats = |v: &ProjectView, optins| {
+        let task = v.ed.project().tasks[0].clone();
+        task_categories(v, &task, 0, optins)
+    };
+    v.ed.set_status_date(Some(projcore::DateTime::from_ymd_hm(2026, 3, 6, 17, 0)))
+        .unwrap();
+    assert!(!cats(&v, on).contains(&"Late Tasks"));
+    v.ed.set_status_date(Some(projcore::DateTime::from_ymd_hm(2026, 3, 16, 17, 0)))
+        .unwrap();
+    assert!(cats(&v, on).contains(&"Late Tasks"));
+    assert!(!cats(&v, Optins::default()).contains(&"Late Tasks"));
+}
+
+#[test]
+fn a_manual_task_without_a_start_is_a_placeholder_only_when_opted_in() {
+    let tbd = projcore::Task {
+        manual: true,
+        ..leaf(1)
+    };
+    let v = view_of(vec![tbd]);
+    let task = v.ed.project().tasks[0].clone();
+    let on = Optins {
+        late: false,
+        placeholder: true,
+    };
+    assert!(task_categories(&v, &task, 0, on).contains(&"Placeholder Tasks"));
+    assert!(!task_categories(&v, &task, 0, Optins::default()).contains(&"Placeholder Tasks"));
+}
+
+#[test]
+fn the_titles_style_reads_row_and_column_titles_over_column_titles() {
+    use projcore::formatting::{Formatting, TextStyle};
+    let mut f = Formatting::default();
+    assert_eq!(titles_of(&f), None);
+    let old = TextStyle {
+        bold: Some(true),
+        color: Some(0x0000CC),
+        ..Default::default()
+    };
+    f.set_category("Column Titles", old.clone());
+    assert_eq!(titles_of(&f), Some(old));
+    f.set_category(
+        "Row & Column Titles",
+        TextStyle {
+            color: Some(0xCC0000),
+            ..Default::default()
+        },
+    );
+    // Project's name wins field by field; the alias's bold stays.
+    assert_eq!(
+        titles_of(&f),
+        Some(TextStyle {
+            bold: Some(true),
+            color: Some(0xCC0000),
+            ..Default::default()
+        })
+    );
+}
+
+#[test]
+fn the_id_cell_takes_the_titles_style_instead_of_the_rows() {
+    use projcore::formatting::TextStyle;
+    let row = TextStyle {
+        italic: Some(true),
+        color: Some(0xCC0000),
+        ..Default::default()
+    };
+    let titles = TextStyle {
+        bold: Some(true),
+        ..Default::default()
+    };
+    let own = TextStyle {
+        underline: Some(true),
+        ..Default::default()
+    };
+    // Nothing of the row's survives under a titles style.
+    assert_eq!(
+        id_cell_style(Some(&row), Some(&titles), Some(&own)),
+        Some(TextStyle {
+            bold: Some(true),
+            underline: Some(true),
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        id_cell_style(Some(&row), Some(&titles), None),
+        Some(titles.clone())
+    );
+    // Without one it is the row's, as before.
+    assert_eq!(id_cell_style(Some(&row), None, None), Some(row.clone()));
+    assert_eq!(
+        id_cell_style(Some(&row), None, Some(&own)),
+        Some(row.clone().over(&own))
+    );
+    assert_eq!(id_cell_style(None, None, None), None);
+}
+
+#[test]
+fn the_grid_and_the_toolbar_read_one_cell_style() {
+    use projcore::formatting::TextStyle;
+    let mut v = view_of(vec![leaf(1)]);
+    let red = TextStyle {
+        color: Some(0xCC0000),
+        ..Default::default()
+    };
+    let bold = TextStyle {
+        bold: Some(true),
+        ..Default::default()
+    };
+    v.ed.edit_formatting(|f| {
+        f.set_category("All", red.clone());
+        f.set_category("Row & Column Titles", bold.clone());
+    });
+    let task = v.ed.project().tasks[0].clone();
+    assert_eq!(shown_cell_style(&v, &task, 0, "ID"), Some(bold));
+    assert_eq!(shown_cell_style(&v, &task, 0, "Name"), Some(red));
 }
 
 #[test]

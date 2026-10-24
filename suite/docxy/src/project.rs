@@ -145,7 +145,7 @@ pub(super) struct ProjectView {
 }
 
 impl ProjectView {
-    fn new(project: Project, dirty: bool) -> Self {
+    pub(crate) fn new(project: Project, dirty: bool) -> Self {
         let ed = ProjectEditor::restored(project, dirty);
         let scale = gantt_scale(&ed);
         // A plan without tasks has only the entry row.
@@ -687,6 +687,31 @@ fn project_region(
 }
 
 /// The plan's cell text styles for the harness state (#1664).
+fn row_categories_json(v: &ProjectView) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    if !crate::plugin_ui::any() {
+        return Json::Arr(Vec::new());
+    }
+    Json::Arr(row_categories_lines(v, crate::plugin_ui::optins()))
+}
+
+fn row_categories_lines(
+    v: &ProjectView,
+    optins: crate::plugin_ui::Optins,
+) -> Vec<ctlcore::json::Json> {
+    use ctlcore::json::Json;
+    let tasks = &v.ed.project().tasks;
+    v.ed.display_rows()
+        .into_iter()
+        .filter_map(|i| Some((i, tasks.get(i)?)))
+        .filter(|(_, t)| !t.is_null)
+        .map(|(i, t)| {
+            let cats = crate::plugin_ui::task_categories(v, t, i, optins);
+            Json::Str(format!("{}:{}", t.uid, cats.join("|")))
+        })
+        .collect()
+}
+
 fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
     let mut text = String::new();
     projcore::json::Json::Arr(
@@ -793,6 +818,9 @@ pub(super) fn project_state(
             "gridlines".into(),
             gridlines_json(&v.ed.project().formatting.gridlines),
         ),
+        // The text style categories of each shown task row (#1665), as
+        // `<uid>:<cat>|<cat>...`, while a UI plugin is loaded.
+        ("row_categories".into(), row_categories_json(v)),
         // The cells' own text styles (#1664), each `{uid, column, ..style}`.
         (
             "cell_styles".into(),
@@ -1291,8 +1319,9 @@ fn heading_cells(
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
-    // The plan's Column Titles text style (#1532), when it sets one.
-    let style = crate::plugin_ui::category_style(v, "Column Titles");
+    // The plan's titles text style (#1532, #1665: Row & Column Titles over
+    // Column Titles), when it sets one.
+    let style = crate::plugin_ui::titles_style(v);
     let row = h_flex().relative().h(px(ROW_H)).items_center();
     let row = match &style {
         Some(style) => crate::plugin_ui::styled(row, style),
@@ -1426,10 +1455,12 @@ fn editable_row_cells(
     let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
     // The plan's text styles (#1532): the row's categories, then each
     // cell's own, when the formatting sets any.
-    let critical = task
-        .and_then(|t| v.ed.schedule().get(t.uid))
-        .is_some_and(|r| r.critical);
-    let row_style = task.and_then(|t| crate::plugin_ui::row_style(v, t, critical, inactive));
+    let row_style = task.and_then(|t| crate::plugin_ui::row_style(v, t, row));
+    // With a titles style the ID cell draws by it instead of the row's
+    // (#1665), so nothing may be inherited from the row: each cell then
+    // carries its whole style itself and the row box carries none.
+    let titles = task.and_then(|_| crate::plugin_ui::titles_style(v));
+    let container_style = row_style.as_ref().filter(|_| titles.is_none());
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
     let cursor_row = v.cursor_row();
     let widths = v.widths();
@@ -1450,15 +1481,20 @@ fn editable_row_cells(
         .h(px(row_h))
         .items_center()
         .when(inactive, |d| d.text_color(pal.dim).line_through());
-    let cells = match &row_style {
+    let cells = match container_style {
         Some(style) => crate::plugin_ui::styled(cells, style),
         None => cells,
     };
     let cells = crate::plugin_ui::keep_inactive_strike(cells, inactive);
     cells
-        .children(row_style.as_ref().and_then(crate::plugin_ui::pattern_layer))
+        .children(container_style.and_then(crate::plugin_ui::pattern_layer))
         .children(values.into_iter().enumerate().map(|(col, value)| {
-            let cell_style = crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col]);
+            let cell_style = if titles.is_some() && col == COL_ID {
+                let own = uid.and_then(|u| v.ed.project().formatting.cell(u, COLUMNS[col]));
+                crate::plugin_ui::id_cell_style(row_style.as_ref(), titles.as_ref(), own)
+            } else {
+                crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col])
+            };
             let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
             let content = if let Some(edit) = edit {
                 let measure = Measurer::new(window);
@@ -1502,7 +1538,7 @@ fn editable_row_cells(
             // above it, else the fill would cover the wash.
             let forced_base = cell_style
                 .as_ref()
-                .and_then(|s| crate::plugin_ui::cell_base(row_style.as_ref(), s));
+                .and_then(|s| crate::plugin_ui::cell_base(container_style, s));
             let covered = forced_base.is_some()
                 || cell_style
                     .as_ref()
@@ -1605,7 +1641,7 @@ fn below_entry_row(down_y: Pixels, up_y: Pixels, entry_bottom: Option<Pixels>) -
     })
 }
 
-fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
+pub(crate) fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
     proj.tasks
         .get(index)
         .is_some_and(|t| !t.is_null && !proj.effectively_active(index))

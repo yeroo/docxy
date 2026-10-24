@@ -1155,3 +1155,50 @@ fn a_plugin_type_is_a_project_only_while_its_plugin_is_loaded() {
     ));
     assert!(save_target(&path).is_err());
 }
+
+#[test]
+fn the_harness_lists_each_shown_rows_categories() {
+    // #1665: `<uid>:<cat>|<cat>...` per shown task row, blank rows left out.
+    let mut project = projcore::Project {
+        start_date: Some(projcore::DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+        ..projcore::Project::default()
+    };
+    let task = |uid: i32| Task {
+        uid,
+        id: uid,
+        name: format!("T{uid}"),
+        outline_level: 1,
+        duration_min: 480,
+        ..Task::default()
+    };
+    project.tasks = vec![
+        task(1),
+        Task {
+            is_null: true,
+            ..task(2)
+        },
+        Task {
+            manual: true,
+            ..task(3)
+        },
+    ];
+    let v = ProjectView::new(project, false);
+    let on = crate::plugin_ui::Optins {
+        late: false,
+        placeholder: true,
+    };
+    let lines: Vec<String> = row_categories_lines(&v, on)
+        .into_iter()
+        .map(|j| match j {
+            ctlcore::json::Json::Str(s) => s,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "1:All|Critical Tasks",
+            "3:All|Critical Tasks|Manually Scheduled Tasks|Placeholder Tasks"
+        ]
+    );
+}
