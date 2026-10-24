@@ -11,12 +11,13 @@
 //! carries everything the model holds and stays interoperable: unzip a `.yppx`,
 //! rename `project.xml`, and MS Project can open it.
 
+use crate::flagpart::TaskFlagPart;
 use crate::formats::Registry;
 use crate::formatting::{self, Formatting};
 use crate::model::{PackageParts, Project};
 use crate::mspdi::{read_mspdi, write_mspdi};
 use crate::tableview::{self, TableView};
-use crate::timeline;
+use crate::{marked, timeline};
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::{ZipArchive, ZipEntry};
 use opccore::zipwrite::write_zip;
@@ -37,7 +38,11 @@ const CONTENT_TYPES_END: &str = "</Types>\n";
 /// a retained extra instead.
 const MAX_TABLE_VIEW_PART: u64 = 1024 * 1024;
 /// One line per flagged task, so a larger bound than the table view's.
-const MAX_TIMELINE_PART: u64 = 8 * 1024 * 1024;
+const MAX_FLAG_PART: u64 = 8 * 1024 * 1024;
+
+/// The per-task flag parts MSPDI has no element for, in the order they are
+/// written: Display on Timeline (#1536), Marked (#1667).
+const FLAG_PARTS: [&TaskFlagPart; 2] = [&timeline::FLAGS, &marked::FLAGS];
 
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
@@ -66,7 +71,7 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
                 &proj.package,
                 !proj.formatting.is_empty(),
                 !proj.table_view.is_empty(),
-                timeline::any(&proj.tasks),
+                &FLAG_PARTS.map(|f| f.any(&proj.tasks)),
             )
             .into_bytes(),
         ),
@@ -87,14 +92,16 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
             proj.table_view.to_xml().into_bytes(),
         ));
     }
-    // The timeline part (#1536): MSPDI has no Display on Timeline, so the
-    // flags live here, only when a task states one.
-    if timeline::any(&proj.tasks) {
-        seen.insert(timeline::PART.to_ascii_lowercase());
-        entries.push((
-            timeline::PART.to_string(),
-            timeline::to_xml(&proj.tasks).into_bytes(),
-        ));
+    // The flag parts (timeline #1536, marked #1667): MSPDI has no element
+    // for them, so the flags live here, each only when a task states one.
+    for flags in FLAG_PARTS {
+        if flags.any(&proj.tasks) {
+            seen.insert(flags.part.to_ascii_lowercase());
+            entries.push((
+                flags.part.to_string(),
+                flags.to_xml(&proj.tasks).into_bytes(),
+            ));
+        }
     }
     // The formatting part (#1532), only when there is formatting to keep.
     if !proj.formatting.is_empty() {
@@ -118,7 +125,7 @@ fn build_content_types(
     package: &PackageParts,
     with_formatting: bool,
     with_table_view: bool,
-    with_timeline: bool,
+    with_flags: &[bool; FLAG_PARTS.len()],
 ) -> String {
     let mut content_types = format!("{CONTENT_TYPES_START}{PROJECT_CONTENT_TYPE}\"/>");
     if with_formatting {
@@ -135,19 +142,22 @@ fn build_content_types(
             tableview::CONTENT_TYPE
         ));
     }
-    if with_timeline {
-        content_types.push_str(&format!(
-            "<Override PartName=\"/{}\" ContentType=\"{}\"/>",
-            timeline::PART,
-            timeline::CONTENT_TYPE
-        ));
+    for (flags, &with) in FLAG_PARTS.iter().zip(with_flags) {
+        if with {
+            content_types.push_str(&format!(
+                "<Override PartName=\"/{}\" ContentType=\"{}\"/>",
+                flags.part, flags.content_type
+            ));
+        }
     }
-    // A timeline part read and no longer written leaves no declaration; one
+    // A flag part read and no longer written leaves no declaration; one
     // this build could not read stays a retained extra and keeps its own.
-    let timeline_kept = package
-        .parts
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case(timeline::PART));
+    let flag_kept = FLAG_PARTS.map(|flags| {
+        package
+            .parts
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(flags.part))
+    });
     for (extension, content_type) in &package.defaults {
         if extension.eq_ignore_ascii_case("xml") {
             continue;
@@ -162,7 +172,9 @@ fn build_content_types(
         let bare = part_name.trim_start_matches('/');
         if bare.eq_ignore_ascii_case(MAIN_PART)
             || (with_table_view && bare.eq_ignore_ascii_case(tableview::PART))
-            || (bare.eq_ignore_ascii_case(timeline::PART) && (with_timeline || !timeline_kept))
+            || FLAG_PARTS.iter().enumerate().any(|(i, flags)| {
+                bare.eq_ignore_ascii_case(flags.part) && (with_flags[i] || !flag_kept[i])
+            })
         {
             continue;
         }
@@ -367,18 +379,18 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
             Some((TableView::from_xml(&text).ok()?, entry.name.as_str()))
         })
         .map_or((None, None), |(view, name)| (Some(view), Some(name)));
-    // The timeline part (#1536), the same way: one this build cannot read
-    // stays a retained extra.
-    let (timeline_flags, timeline_part) = zip
-        .entries()
-        .iter()
-        .find(|entry| entry.name.eq_ignore_ascii_case(timeline::PART))
-        .filter(|entry| entry.uncomp_size <= MAX_TIMELINE_PART)
-        .and_then(|entry| {
-            let text = String::from_utf8(zip.extract(entry)?).ok()?;
-            Some((timeline::from_xml(&text).ok()?, entry.name.as_str()))
-        })
-        .map_or((None, None), |(flags, name)| (Some(flags), Some(name)));
+    // The flag parts (#1536, #1667), the same way: one this build cannot
+    // read stays a retained extra.
+    let flag_reads = FLAG_PARTS.map(|flags| {
+        zip.entries()
+            .iter()
+            .find(|entry| entry.name.eq_ignore_ascii_case(flags.part))
+            .filter(|entry| entry.uncomp_size <= MAX_FLAG_PART)
+            .and_then(|entry| {
+                let text = String::from_utf8(zip.extract(entry)?).ok()?;
+                Some((flags.from_xml(&text).ok()?, entry.name.as_str()))
+            })
+    });
     // A directory entry, even one without a trailing `/`, is no part (#1167).
     let names: Vec<String> = zip
         .entries()
@@ -397,7 +409,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
                 || name.eq_ignore_ascii_case(MAIN_PART)
                 || name.eq_ignore_ascii_case(formatting::PART)
                 || table_part.is_some_and(|part| name == part)
-                || timeline_part.is_some_and(|part| name == part)
+                || flag_reads.iter().flatten().any(|(_, part)| name == part)
                 || !seen.insert(name.to_ascii_lowercase()))
         })
         .map(|(entry, _)| entry)
@@ -432,8 +444,10 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
     if let Some(view) = table_view {
         project.table_view = view;
     }
-    if let Some(flags) = timeline_flags {
-        timeline::apply(&mut project.tasks, &flags);
+    for (flags, read) in FLAG_PARTS.iter().zip(&flag_reads) {
+        if let Some((values, _)) = read {
+            flags.apply(&mut project.tasks, values);
+        }
     }
     for entry in extras {
         if let Some(bytes) = zip.extract(entry) {
@@ -534,6 +548,61 @@ mod tests {
         assert!(zip.read("timeline.xml").is_none());
         let map = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
         assert!(!map.contains("timeline.xml"), "{map}");
+    }
+
+    /// Marked (#1667): MSPDI has none, so it rides in `marked.xml`, written
+    /// only when a task states a value; the MSPDI part is unchanged by it,
+    /// and a plan with no mark saves exactly as before.
+    #[test]
+    fn marked_round_trips_through_its_own_part() {
+        let mut proj = sample();
+        let plain = write_yppx(&proj).unwrap();
+        assert!(!String::from_utf8_lossy(&plain).contains("marked.xml"));
+        proj.tasks[0].marked = Some(true);
+        proj.tasks[0].display_on_timeline = Some(false);
+        assert_eq!(write_mspdi(&proj), {
+            let mut bare = proj.clone();
+            bare.tasks[0].marked = None;
+            write_mspdi(&bare)
+        });
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        let part = String::from_utf8(zip.read("marked.xml").unwrap()).unwrap();
+        assert!(part.contains("<task uid=\"1\" on=\"1\"/>"), "{part}");
+        let map = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
+        assert_eq!(map.matches("/marked.xml").count(), 1, "{map}");
+        assert!(map.contains("application/vnd.yppx.marked+xml"), "{map}");
+        let back = read_yppx(&bytes).unwrap();
+        assert_eq!(back.tasks[0].marked, Some(true));
+        assert_eq!(back.tasks[0].display_on_timeline, Some(false));
+        assert!(back.package.parts.is_empty(), "{:?}", back.package.parts);
+        // Cleared again: the same bytes as the plan that never had a mark.
+        let mut cleared = back;
+        cleared.tasks[0].marked = None;
+        cleared.tasks[0].display_on_timeline = None;
+        assert_eq!(write_yppx(&cleared).unwrap(), plain);
+    }
+
+    /// A `marked.xml` this build cannot read is retained, not dropped, and
+    /// keeps its declaration; a written one replaces it.
+    #[test]
+    fn unreadable_marked_part_is_retained() {
+        let map = "<?xml version=\"1.0\"?><Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/vnd.yppx.project+xml\"/><Override PartName=\"/marked.xml\" ContentType=\"application/vnd.yppx.marked+xml\"/></Types>";
+        let source = with_parts(map, &[("marked.xml", b"<marked><task")]);
+        let mut proj = read_yppx(&source).unwrap();
+        assert!(proj.tasks.iter().all(|t| t.marked.is_none()));
+        assert_eq!(proj.package.parts.len(), 1);
+        let kept = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&kept).unwrap();
+        assert_eq!(zip.read(crate::marked::PART).unwrap(), b"<marked><task");
+        let types = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert_eq!(types.matches("/marked.xml").count(), 1, "{types}");
+        proj.tasks[0].marked = Some(true);
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        let types = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert_eq!(types.matches("/marked.xml").count(), 1, "{types}");
+        assert_eq!(read_yppx(&bytes).unwrap().tasks[0].marked, Some(true));
     }
 
     /// The two parts have their own size bounds: a 2 MiB `timeline.xml`

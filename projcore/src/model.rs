@@ -402,6 +402,9 @@ pub struct Task {
     /// Display on Timeline. MSPDI has no element for it, so it is saved
     /// only in the `.yppx` package's `timeline.xml` ([`crate::timeline`]).
     pub display_on_timeline: Option<bool>,
+    /// Project's Marked flag (#1667). MSPDI has no element for it, so it is
+    /// saved only in the `.yppx` package's `marked.xml` ([`crate::marked`]).
+    pub marked: Option<bool>,
     pub external_task: Option<bool>,
     pub external_task_project: Option<String>,
     pub is_subproject: Option<bool>,
