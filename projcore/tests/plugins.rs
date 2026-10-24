@@ -662,6 +662,14 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             .color,
         Some(0x33AA33)
     );
+    // And the middle and bottom timescale tiers' text styles (#1666).
+    let middle = formatting.category("Middle Timescale Tier").unwrap();
+    assert_eq!((middle.bold, middle.size), (Some(false), Some(9.)));
+    let bottom = formatting.category("Bottom Timescale Tier").unwrap();
+    assert_eq!(
+        (bottom.color, bottom.italic, bottom.pattern.as_deref()),
+        (Some(0xC00000), Some(true), Some("light-fill"))
+    );
     let mut seen = cmd("fixture.format", vec![], None);
     seen.view = Json::obj(vec![("gridlines", formatting.gridlines.to_json())]);
     let cleared = ui.command(&seen).unwrap().unwrap();
@@ -671,6 +679,8 @@ fn the_fixture_is_a_ui_plugin_for_a_matching_host() {
             .unwrap()
     );
     assert!(formatting.gridlines.is_empty());
+    assert!(formatting.category("Middle Timescale Tier").is_none());
+    assert!(formatting.category("Bottom Timescale Tier").is_none());
     // The bars command (#1696) sets two rows and one override through the
     // view; the model takes them losslessly, and a second press, seeing the
     // rows, clears them.
