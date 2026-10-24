@@ -1123,7 +1123,8 @@ fn format_cells(v: &ProjectView) -> Vec<(i32, &'static str)> {
 }
 
 /// The style the grid draws for task `uid`'s cell in column `col`: the
-/// plan's row categories under the cell's own style, and bold on a summary.
+/// plan's row categories (in the ID column the titles style instead, when
+/// one is set, #1665) under the cell's own style, and bold on a summary.
 fn effective_style(v: &ProjectView, uid: i32, col: &str) -> projcore::formatting::TextStyle {
     let Some((row, task)) =
         v.ed.project()

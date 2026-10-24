@@ -686,7 +686,8 @@ fn project_region(
     }
 }
 
-/// The plan's cell text styles for the harness state (#1664).
+/// The text style categories of each shown task row for the harness state
+/// (#1665); `[]` without a UI plugin.
 fn row_categories_json(v: &ProjectView) -> ctlcore::json::Json {
     use ctlcore::json::Json;
     if !crate::plugin_ui::any() {
@@ -712,6 +713,7 @@ fn row_categories_lines(
         .collect()
 }
 
+/// The plan's cell text styles for the harness state (#1664).
 fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
     let mut text = String::new();
     projcore::json::Json::Arr(
@@ -1489,12 +1491,13 @@ fn editable_row_cells(
     cells
         .children(container_style.and_then(crate::plugin_ui::pattern_layer))
         .children(values.into_iter().enumerate().map(|(col, value)| {
-            let cell_style = if titles.is_some() && col == COL_ID {
-                let own = uid.and_then(|u| v.ed.project().formatting.cell(u, COLUMNS[col]));
-                crate::plugin_ui::id_cell_style(row_style.as_ref(), titles.as_ref(), own)
-            } else {
-                crate::plugin_ui::cell_style(v, row_style.as_ref(), uid, COLUMNS[col])
-            };
+            let cell_style = crate::plugin_ui::cell_style_under(
+                v,
+                row_style.as_ref(),
+                titles.as_ref(),
+                uid,
+                COLUMNS[col],
+            );
             let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
             let content = if let Some(edit) = edit {
                 let measure = Measurer::new(window);

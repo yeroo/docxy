@@ -551,8 +551,9 @@
   `overlay_shapes`, cached by revision, scale, flags, the shown rows and the
   selection (#1565); `bar_look` draws the
   bars in the palette the plan's formatting names (`plugin_ui::palette`),
-  and `row_style`/`cell_style`/`category_style` draw the formatting's text
-  styles (`Column Titles` on the headings). The harness reports contributed
+  and `row_style`/`cell_style`/`titles_style` draw the formatting's text
+  styles (`Row & Column Titles` over `Column Titles` on the headings and ID
+  cells, #1665). The harness reports contributed
   items with `"plugin": true` in `ribbon-read`, `menu-read` and
   `dialog-read`, `project-overlay` lists the shapes, and `dialog-set`
   addresses a grid cell as `name[row].column` (checked against the column's

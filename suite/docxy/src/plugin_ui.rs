@@ -1932,12 +1932,29 @@ pub(crate) fn shown_cell_style(
     row: usize,
     column: &str,
 ) -> Option<TextStyle> {
-    let row_style = row_style(v, task, row);
+    cell_style_under(
+        v,
+        row_style(v, task, row).as_ref(),
+        titles_style(v).as_ref(),
+        Some(task.uid),
+        column,
+    )
+}
+
+/// A cell's style from its row's and the titles style, already looked up:
+/// the ID cell takes [`id_cell_style`], every other one [`cell_style`].
+pub(crate) fn cell_style_under(
+    v: &ProjectView,
+    row: Option<&TextStyle>,
+    titles: Option<&TextStyle>,
+    uid: Option<i32>,
+    column: &str,
+) -> Option<TextStyle> {
     if column == crate::COLUMNS[crate::COL_ID] {
-        let own = v.ed.project().formatting.cell(task.uid, column);
-        id_cell_style(row_style.as_ref(), titles_style(v).as_ref(), own)
+        let own = uid.and_then(|uid| v.ed.project().formatting.cell(uid, column));
+        id_cell_style(row, titles, own)
     } else {
-        cell_style(v, row_style.as_ref(), Some(task.uid), column)
+        cell_style(v, row, uid, column)
     }
 }
 
