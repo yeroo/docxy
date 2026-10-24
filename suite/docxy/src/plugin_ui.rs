@@ -32,6 +32,7 @@ use projcore::uiplugin::{
     Palette, Selection, Shape, State, StateCtx,
 };
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -348,9 +349,15 @@ pub(crate) struct PluginCache {
     states: Vec<State>,
     overlay_key: Option<OverlayKey>,
     shapes: Rc<Vec<Shape>>,
-    /// The grid's changed cells (#1667) and the revision they were read at.
+    /// The grid's changed cells (#1667) and the revision they were read at,
+    /// as a list and as a set for the per-cell look-up.
     changed_key: Option<u64>,
     changed: Rc<Vec<(i32, &'static str)>>,
+    changed_set: HashSet<(i32, &'static str)>,
+    /// [`projcore::editor::Editor::highlighted_rows`] (#1667) and the
+    /// revision it was read at.
+    highlight_key: Option<u64>,
+    highlighted: Rc<Vec<bool>>,
 }
 
 /// The view's switches as the plugins see them (`view` in every request),
@@ -1908,7 +1915,7 @@ fn task_facts(v: &ProjectView, task: &projcore::Task, row: usize, optins: Optins
         placeholder: optins.placeholder && task.is_placeholder(),
         external: optins.external && task.external_task == Some(true) && !task.is_null,
         marked: optins.marked && task.marked == Some(true),
-        highlighted: optins.highlighted && v.ed.is_highlighted(row),
+        highlighted: optins.highlighted && highlighted(v, row),
     }
 }
 
@@ -2042,10 +2049,7 @@ pub(crate) fn cell_style(
     let own = uid.and_then(|uid| formatting.cell(uid, column));
     let changed = uid.filter(|_| optins().changed_cells).and_then(|uid| {
         let style = formatting.category(CHANGED_CELLS)?;
-        changed_cells(v)
-            .iter()
-            .any(|&(u, c)| u == uid && c == column)
-            .then_some(style)
+        is_changed_cell(v, uid, column).then_some(style)
     });
     changed_cell_style(row, changed, own)
 }
@@ -2076,20 +2080,48 @@ fn changeable_columns() -> Vec<(&'static str, projcore::editor::Field)> {
 /// The grid cells the last change of the plan changed, `(uid, column)` in
 /// task then column order (#1667), read once per revision.
 pub(crate) fn changed_cells(v: &ProjectView) -> Rc<Vec<(i32, &'static str)>> {
+    let mut cache = v.plugin_cache.borrow_mut();
+    refresh_changed(v, &mut cache);
+    Rc::clone(&cache.changed)
+}
+
+/// Whether the last change of the plan changed task `uid`'s `column` cell.
+fn is_changed_cell(v: &ProjectView, uid: i32, column: &str) -> bool {
+    let Some(&column) = crate::COLUMNS.iter().find(|c| **c == column) else {
+        return false;
+    };
+    let mut cache = v.plugin_cache.borrow_mut();
+    refresh_changed(v, &mut cache);
+    cache.changed_set.contains(&(uid, column))
+}
+
+fn refresh_changed(v: &ProjectView, cache: &mut PluginCache) {
+    let revision = v.ed.revision();
+    if cache.changed_key == Some(revision) {
+        return;
+    }
+    let columns = changeable_columns();
+    let fields: Vec<_> = columns.iter().map(|(_, f)| *f).collect();
+    let cells: Vec<_> =
+        v.ed.changed_cells(&fields)
+            .into_iter()
+            .filter_map(|(uid, f)| Some((uid, columns.iter().find(|(_, g)| *g == f)?.0)))
+            .collect();
+    cache.changed_set = cells.iter().copied().collect();
+    cache.changed = Rc::new(cells);
+    cache.changed_key = Some(revision);
+}
+
+/// Whether task `row` (its index in the plan's tasks) is highlighted
+/// (#1667): the editor's rows, read once per revision.
+fn highlighted(v: &ProjectView, row: usize) -> bool {
     let revision = v.ed.revision();
     let mut cache = v.plugin_cache.borrow_mut();
-    if cache.changed_key != Some(revision) {
-        let columns = changeable_columns();
-        let fields: Vec<_> = columns.iter().map(|(_, f)| *f).collect();
-        let cells =
-            v.ed.changed_cells(&fields)
-                .into_iter()
-                .filter_map(|(uid, f)| Some((uid, columns.iter().find(|(_, g)| *g == f)?.0)))
-                .collect();
-        cache.changed = Rc::new(cells);
-        cache.changed_key = Some(revision);
+    if cache.highlight_key != Some(revision) {
+        cache.highlighted = Rc::new(v.ed.highlighted_rows());
+        cache.highlight_key = Some(revision);
     }
-    Rc::clone(&cache.changed)
+    cache.highlighted.get(row).copied().unwrap_or(false)
 }
 
 /// The pattern colour when the style sets no text colour, and Project's

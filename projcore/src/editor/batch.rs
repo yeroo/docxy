@@ -69,11 +69,10 @@ impl Editor {
                 self.undo = undo;
                 self.pushes = saved.pushes;
                 // Clears redo, caps history and counts one snapshot.
-                self.push_undo(saved.proj);
+                self.record_undo(saved.proj);
                 // Pair the edit's refresh with the state before the batch,
                 // as after any single edit (see `pending`).
                 self.pending = Some(saved.sched);
-                self.change_from = None;
                 self.record_change(Box::new(from), Some(saved.last_change));
                 Ok(value)
             }

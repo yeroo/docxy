@@ -780,6 +780,8 @@ fn the_changed_cells_are_the_grid_columns_but_id_read_once_per_revision() {
     );
     // Cached by revision: the same list until the plan moves.
     assert!(Rc::ptr_eq(&cells, &changed_cells(&v)));
+    assert!(is_changed_cell(&v, 2, "Start") && !is_changed_cell(&v, 2, "Name"));
+    assert!(!is_changed_cell(&v, 1, "ID") && !is_changed_cell(&v, 1, "Nope"));
     v.ed.edit_formatting(|f| {
         f.set_category(
             CHANGED_CELLS,
@@ -793,6 +795,20 @@ fn the_changed_cells_are_the_grid_columns_but_id_read_once_per_revision() {
     assert_eq!(*changed_cells(&v), *cells);
     v.ed.add_task(Some(1), "New", 480, false).unwrap();
     assert!(changed_cells(&v).iter().all(|(_, c)| *c != "ID"));
+}
+
+/// Every grid column but ID is a field a change can mark: a column
+/// `Field::parse` dropped would never show as changed (FIX r1).
+#[test]
+fn every_grid_column_but_id_can_be_a_changed_cell() {
+    let columns: Vec<&str> = changeable_columns().iter().map(|(c, _)| *c).collect();
+    let expected: Vec<&str> = crate::COLUMNS
+        .iter()
+        .copied()
+        .filter(|c| *c != crate::COLUMNS[crate::COL_ID])
+        .collect();
+    assert_eq!(columns, expected);
+    assert_eq!(columns.len(), crate::COLUMNS.len() - 1);
 }
 
 #[test]

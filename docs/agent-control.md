@@ -41,7 +41,8 @@ invalid indices, non-Project targets, and failed-load placeholders are errors.
 Explicit targets do not activate that tab. Task/link arguments use stable
 **UIDs**, as reported by `task.list`, not the table's displayed IDs.
 
-Supported verbs are `proj.path`, `proj.get`, `proj.set`, `task.list`, `task.get`, `task.fields`, `task.set`,
+Supported verbs are `proj.path`, `proj.get`, `proj.set`, `proj.highlight` (#1667: the
+highlight, view state that repaints and is no edit; see `projctl`), `task.list`, `task.get`, `task.fields`, `task.set`,
 `task.add`, `task.del`, `link.add`, `link.del`, `find`, `assign.list`,
 `assign.get`, `assign.fields`, `assign.add`, `assign.set`, `assign.del`,
 `resource.list`, `resource.get`, `resource.add`, `resource.set`, `resource.del`,
@@ -1291,7 +1292,9 @@ resource assignments, by assignment UID), `proj.save {path?}`, `proj.reload`,
 `proj.open {path}`, `proj.view` / `proj.sort {column?, descending?}` /
 `proj.filter {column, values? | clear}` (the grid's sort and AutoFilter, view
 state: `values` are cell texts, `(Blanks)` for an empty cell, or on a date
-column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; #1533), `app-info` (the build; #1023). Edits
+column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; #1533), `proj.highlight
+{field, values}` (`values: null` or `{clear: true}` clears; #1667, view state;
+yppxy draws no text styles), `app-info` (the build; #1023). Edits
 reschedule the plan (CPM) live. MCP: `claude mcp add yppxy -- yppxy --mcp` →
 `yppxy_list`, `yppxy_status`, `yppxy_tasks`, `yppxy_get`, `yppxy_set`,
 `yppxy_fields`, `yppxy_add`, `yppxy_del`, `yppxy_link`, `yppxy_unlink`,

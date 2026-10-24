@@ -53,7 +53,7 @@ const DURATION_EDIT: [(i32, &str); 4] =
 #[test]
 fn a_new_editor_has_no_changed_cells() {
     let ed = plan();
-    assert!(!ed.has_last_change());
+    assert!(ed.last_change.is_none());
     assert!(cells(&ed).is_empty());
 }
 
@@ -127,6 +127,31 @@ fn a_formatting_or_width_change_keeps_the_record() {
     assert_eq!(cells(&ed), [(3, "Name")]);
 }
 
+/// A batch holding only a formatting or a width edit (a plugin's Text
+/// Styles OK styling Changed Cells) keeps the record too (FIX r1).
+#[test]
+fn a_formatting_or_width_only_batch_keeps_the_record() {
+    let mut ed = plan();
+    ed.set_duration(1, "3d").unwrap();
+    let style = crate::formatting::TextStyle {
+        color: Some(0xC00000),
+        ..Default::default()
+    };
+    ed.batch(|ed| {
+        ed.edit_formatting(|f| f.set_category("Changed Cells", style));
+        Ok(())
+    })
+    .unwrap();
+    assert!(ed.project().formatting.category("Changed Cells").is_some());
+    assert_eq!(cells(&ed), DURATION_EDIT);
+    ed.batch(|ed| {
+        ed.edit_table_view(|v| v.set_width("Name", 180.));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(cells(&ed), DURATION_EDIT);
+}
+
 #[test]
 fn a_batch_is_one_change_and_a_rolled_back_one_keeps_the_record() {
     let mut ed = plan();
@@ -173,7 +198,7 @@ fn a_replaced_project_has_none() {
     let mut ed = plan();
     ed.set_duration(1, "3d").unwrap();
     ed.replace_project(plan().project().clone());
-    assert!(!ed.has_last_change());
+    assert!(ed.last_change.is_none());
     assert!(cells(&ed).is_empty());
 }
 

@@ -493,8 +493,17 @@ impl Editor {
     /// Every edit comes through here, so it also opens the edit's refresh
     /// (see `pending`).
     fn push_undo(&mut self, prev: Project) {
+        // A batch records its one change from the state before it, so its
+        // steps keep no copy of their own (#1667).
+        if !self.batching {
+            self.change_from = Some(self.frozen(prev.clone()));
+        }
+        self.record_undo(prev);
+    }
+
+    /// [`Self::push_undo`] without noting where the change started.
+    fn record_undo(&mut self, prev: Project) {
         self.pending = Some(self.sched.clone());
-        self.change_from = Some(self.frozen(prev.clone()));
         self.pushes += 1;
         self.undo.push(prev);
         if self.undo.len() > UNDO_CAP {
@@ -567,7 +576,9 @@ impl Editor {
         };
         self.pending = None;
         self.pre_view = None;
-        self.change_from = Some(self.frozen(self.proj.clone()));
+        if !self.batching {
+            self.change_from = Some(self.frozen(self.proj.clone()));
+        }
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -579,7 +590,9 @@ impl Editor {
         };
         self.pending = None;
         self.pre_view = None;
-        self.change_from = Some(self.frozen(self.proj.clone()));
+        if !self.batching {
+            self.change_from = Some(self.frozen(self.proj.clone()));
+        }
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true

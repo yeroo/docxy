@@ -19,7 +19,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, fields?, the Task Information fields of #1550: percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, and custom? (#1554: `{"Text1": "Civil", ...}`)}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled); see `projctl` for each field's form |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, fields?, the Task Information fields of #1550: percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, marked? (#1667), calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, and custom? (#1554: `{"Text1": "Civil", ...}`)}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled); see `projctl` for each field's form |
 //! | `task.add` | `{after?, name?, duration?, fields?}` | the new task (without `duration`, 1 day, estimated unless the plan's `NewTasksEstimated` is off; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain, A->B becoming A->N->B, while the plan's `Autolink` is on, the default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?, fields?}` | the updated task |
@@ -46,6 +46,7 @@
 //! | `proj.view` | — | the grid's order (#1533): `{sort, sort_descending, filter, filters:[{column, values}], count, rows:[uid…]}`, the rows in the order the table draws them |
 //! | `proj.sort` | `{column?, descending?}` (no `column` clears) | the same as `proj.view`; view state, not an edit |
 //! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts (one may contain `|`), `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |
+//! | `proj.highlight` | `{field, values}` / `{field, values: null}` / `{clear: true}` / `{}` | `{highlight: [{field, values}]}`: the highlight (#1667), view state, not an edit; the terminal draws no text styles, so it shows nowhere here (a UI plugin's command may still set it); see `projctl` |
 //! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |

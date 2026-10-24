@@ -48,11 +48,6 @@ impl Editor {
         }
     }
 
-    /// Whether a change of the plan is remembered.
-    pub fn has_last_change(&self) -> bool {
-        self.last_change.is_some()
-    }
-
     /// The cells the last change of the plan changed: for every task that
     /// is not blank both before it and now (by UID), each of `fields` whose
     /// display text differs, in task then `fields` order. A task the change
