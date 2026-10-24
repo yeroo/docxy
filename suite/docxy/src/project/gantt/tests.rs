@@ -119,7 +119,13 @@ fn slot_one_alone_does_not_show_a_bar_or_extend_the_scale() {
 #[test]
 fn week_cells_start_on_mondays_and_weekend_columns_are_saturday_sunday() {
     let scale = gantt_scale(&editor(vec![]));
-    let weeks = zoom::tier(scale, zoom::Unit::Week, 0., 15. * DEFAULT_DAY_W);
+    let weeks = zoom::tier(
+        scale,
+        zoom::Unit::Week,
+        0.,
+        15. * DEFAULT_DAY_W,
+        zoom::CHAR_W,
+    );
     assert_eq!(
         weeks.iter().map(|c| c.x).collect::<Vec<_>>(),
         [0., 7. * 22., 14. * 22.]
@@ -1433,4 +1439,35 @@ fn overlay_text_takes_the_shapes_text_style() {
     assert_eq!(off.font.style, FontStyle::Normal);
     assert_eq!(off.font.family, base.family);
     assert!(off.underline.is_none() && off.strikethrough.is_none());
+}
+
+#[test]
+fn a_tier_label_fits_at_its_style_size_only_when_the_plan_styles_it() {
+    use crate::plugin_ui::tier_cell_style;
+    // No plan style: the default 6 px a character, the major tier's bold
+    // included, so the default header is unchanged (#1666).
+    assert_eq!(
+        tier_char_w(None, &tier_cell_style(None, true)),
+        zoom::CHAR_W
+    );
+    assert_eq!(
+        tier_char_w(None, &tier_cell_style(None, false)),
+        zoom::CHAR_W
+    );
+    // 15 pt is 20 px, twice the default text.
+    let big = PlanStyle {
+        size: Some(15.),
+        ..PlanStyle::default()
+    };
+    let w = tier_char_w(Some(&big), &tier_cell_style(Some(&big), false));
+    assert!((w - 2. * zoom::CHAR_W).abs() < 1e-4, "{w}");
+    // Bold is a tenth wider; an explicit off is not.
+    let w = tier_char_w(Some(&big), &tier_cell_style(Some(&big), true));
+    assert!((w - 2.2 * zoom::CHAR_W).abs() < 1e-4, "{w}");
+    let thin = PlanStyle {
+        bold: Some(false),
+        ..PlanStyle::default()
+    };
+    let w = tier_char_w(Some(&thin), &tier_cell_style(Some(&thin), true));
+    assert!((w - zoom::CHAR_W).abs() < 1e-4, "{w}");
 }

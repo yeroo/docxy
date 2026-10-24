@@ -738,6 +738,23 @@ fn cell_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json
     ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
 }
 
+/// The plan's timescale tier styles for the harness state (#1666):
+/// `{"middle", "bottom"}`, each the style the tier draws by, `null` when
+/// none.
+fn timescale_styles_json(f: &projcore::formatting::Formatting) -> ctlcore::json::Json {
+    let (middle, bottom) = crate::plugin_ui::tier_styles(f);
+    let style = |s: Option<projcore::formatting::TextStyle>| {
+        s.map_or(projcore::json::Json::Null, |s| s.to_json())
+    };
+    let mut text = String::new();
+    projcore::json::Json::Obj(vec![
+        ("middle".to_string(), style(middle)),
+        ("bottom".to_string(), style(bottom)),
+    ])
+    .write(&mut text);
+    ctlcore::json::Json::parse(&text).unwrap_or(ctlcore::json::Json::Null)
+}
+
 /// The plan's set gridlines for the harness state (#1575).
 fn gridlines_json(grid: &projcore::formatting::Gridlines) -> ctlcore::json::Json {
     let mut text = String::new();
@@ -827,6 +844,12 @@ pub(super) fn project_state(
         (
             "cell_styles".into(),
             cell_styles_json(&v.ed.project().formatting),
+        ),
+        // The middle and bottom timescale tiers' styles (#1666), `null`
+        // for a tier nothing styles.
+        (
+            "timescale_styles".into(),
+            timescale_styles_json(&v.ed.project().formatting),
         ),
         (
             "gridlines_set".into(),
@@ -1821,6 +1844,7 @@ pub(super) fn project_el(
                                 gantt_w,
                                 pal,
                                 &view.ed.project().formatting.gridlines,
+                                crate::plugin_ui::tier_styles(&view.ed.project().formatting),
                             ),
                         ))
                         // Above the vertical scrollbar.
