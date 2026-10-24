@@ -1761,7 +1761,7 @@ fn the_tiers_draw_by_the_middle_and_bottom_timescale_styles() {
     assert_eq!(tier_styles(&f), (None, None));
     // The top tier is stored only: the header draws no top tier.
     f.set_category(
-        TOP_TIER,
+        "Top Timescale Tier",
         TextStyle {
             italic: Some(true),
             ..TextStyle::default()

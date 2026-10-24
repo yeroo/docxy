@@ -1906,8 +1906,7 @@ pub(crate) fn titles_of(f: &projcore::formatting::Formatting) -> Option<TextStyl
 
 /// Project's timescale tier text style categories (#1666). The header draws
 /// two tiers, Project's middle (the major unit) and bottom (the minor), as
-/// its gridlines do (#1575); the top tier's style is stored only.
-pub(crate) const TOP_TIER: &str = "Top Timescale Tier";
+/// its gridlines do (#1575); `Top Timescale Tier` is stored only.
 pub(crate) const MIDDLE_TIER: &str = "Middle Timescale Tier";
 pub(crate) const BOTTOM_TIER: &str = "Bottom Timescale Tier";
 
