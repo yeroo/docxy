@@ -531,6 +531,18 @@ impl Task {
         Some((start, self.manual_finish))
     }
 
+    /// A placeholder task (Project's Placeholder Tasks text style item, #1665):
+    /// a manually scheduled leaf with no start to pin it to, Project's "TBD"
+    /// task. Only the start can be missing here: `duration_min` is always a
+    /// number, so a missing duration or finish is not representable.
+    pub fn is_placeholder(&self) -> bool {
+        !self.is_null
+            && !self.summary
+            && !self.is_external_leaf()
+            && self.manual
+            && self.pinned_dates().is_none()
+    }
+
     /// The start and finish a manually scheduled summary keeps instead of
     /// rolling up: its manual start (else the stored start) and its manual
     /// finish, if any. When the finish is absent the scheduler derives it from
@@ -2014,6 +2026,56 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placeholder_is_a_manual_leaf_without_a_start() {
+        let at = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let manual = Task {
+            manual: true,
+            duration_min: 480,
+            ..Task::default()
+        };
+        assert!(manual.is_placeholder());
+        let stored = Task {
+            stored_start: Some(at),
+            ..manual.clone()
+        };
+        assert!(!stored.is_placeholder());
+        let pinned = Task {
+            manual_start: Some(at),
+            ..manual.clone()
+        };
+        assert!(!pinned.is_placeholder());
+        // A start with no ManualFinish or ManualDuration still shows its
+        // duration: not a placeholder.
+        let bare = Task {
+            stored_start: Some(at),
+            manual_finish: None,
+            manual_duration_min: None,
+            ..manual.clone()
+        };
+        assert!(!bare.is_placeholder());
+        for never in [
+            Task {
+                manual: false,
+                ..manual.clone()
+            },
+            Task {
+                summary: true,
+                ..manual.clone()
+            },
+            Task {
+                is_null: true,
+                ..manual.clone()
+            },
+            Task {
+                external_task: Some(true),
+                ..manual.clone()
+            },
+        ] {
+            assert!(!never.is_placeholder(), "{never:?}");
+        }
+    }
 
     #[test]
     fn format_in_unit_never_prints_a_non_zero_time_as_zero() {

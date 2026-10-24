@@ -1768,15 +1768,59 @@ pub(crate) fn overlay_json(v: &ProjectView) -> CtlJson {
 
 // ---- text styles -------------------------------------------------------------
 
+/// The facts about a task row the text style categories are read from.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct RowFacts {
+    pub critical: bool,
+    pub inactive: bool,
+    /// Its Status reads `Late`, and a plugin opted `Late Tasks` in.
+    pub late: bool,
+    /// [`projcore::Task::is_placeholder`], and a plugin opted
+    /// `Placeholder Tasks` in.
+    pub placeholder: bool,
+}
+
+/// The categories a UI plugin opts in by naming them in its manifest's
+/// `text_style_categories` (#1665): the host computes them only then.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Optins {
+    pub late: bool,
+    pub placeholder: bool,
+}
+
+pub(crate) const LATE_TASKS: &str = "Late Tasks";
+pub(crate) const PLACEHOLDER_TASKS: &str = "Placeholder Tasks";
+
+impl Optins {
+    /// What `manifests` name, by exact string.
+    pub(crate) fn of(manifests: &[&ui::Manifest]) -> Optins {
+        let named = |name: &str| {
+            manifests
+                .iter()
+                .any(|m| m.text_style_categories.iter().any(|c| c == name))
+        };
+        Optins {
+            late: named(LATE_TASKS),
+            placeholder: named(PLACEHOLDER_TASKS),
+        }
+    }
+}
+
+/// The loaded plugins' opt-ins. Plugins load once per process, so it is
+/// read once; a test build reads it afresh, as a test may swap the registry.
+pub(crate) fn optins() -> Optins {
+    if cfg!(test) {
+        return Optins::of(&manifests());
+    }
+    static ONCE: std::sync::OnceLock<Optins> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| Optins::of(&manifests()))
+}
+
 /// The text style categories a task row falls in, the general first.
-pub(crate) fn row_categories(
-    task: &projcore::Task,
-    critical: bool,
-    inactive: bool,
-) -> Vec<&'static str> {
+pub(crate) fn row_categories(task: &projcore::Task, facts: RowFacts) -> Vec<&'static str> {
     let mut out = vec!["All"];
     if !task.summary && !task.is_milestone() {
-        out.push(if critical {
+        out.push(if facts.critical {
             "Critical Tasks"
         } else {
             "Noncritical Tasks"
@@ -1795,26 +1839,123 @@ pub(crate) fn row_categories(
     if task.manual {
         out.push("Manually Scheduled Tasks");
     }
-    if inactive {
+    if facts.placeholder {
+        out.push(PLACEHOLDER_TASKS);
+    }
+    if facts.late {
+        out.push(LATE_TASKS);
+    }
+    if facts.inactive {
         out.push("Inactive Tasks");
     }
     out
 }
 
-/// A task row's style from the plan's formatting; `None` when nothing
-/// applies.
-pub(crate) fn row_style(
+/// The categories of the task at `row` (its index in the plan's tasks),
+/// computed from the plan as it is now, so a row entering one restyles on
+/// the next frame. The one rule the grid, the toolbar and the harness read.
+pub(crate) fn task_categories(
     v: &ProjectView,
     task: &projcore::Task,
-    critical: bool,
-    inactive: bool,
-) -> Option<TextStyle> {
+    row: usize,
+    optins: Optins,
+) -> Vec<&'static str> {
+    row_categories(task, task_facts(v, task, row, optins))
+}
+
+fn task_facts(v: &ProjectView, task: &projcore::Task, row: usize, optins: Optins) -> RowFacts {
+    let late = optins.late
+        && projcore::editor::FieldReader::new(&v.ed)
+            .read(task, projcore::editor::Field::Status)
+            .text
+            == "Late";
+    RowFacts {
+        critical: v.ed.schedule().get(task.uid).is_some_and(|r| r.critical),
+        inactive: crate::inactive_row(v.ed.project(), row),
+        late,
+        placeholder: optins.placeholder && task.is_placeholder(),
+    }
+}
+
+/// A task row's style from the plan's formatting; `None` when nothing
+/// applies.
+pub(crate) fn row_style(v: &ProjectView, task: &projcore::Task, row: usize) -> Option<TextStyle> {
     let formatting = &v.ed.project().formatting;
     if formatting.text_styles.is_empty() {
         return None;
     }
-    let style = formatting.style_for(&row_categories(task, critical, inactive));
+    // No Status read per row when nothing styles Late Tasks.
+    let mut optins = optins();
+    optins.late &= formatting.category(LATE_TASKS).is_some();
+    optins.placeholder &= formatting.category(PLACEHOLDER_TASKS).is_some();
+    let style = formatting.style_for(&task_categories(v, task, row, optins));
     (!style.is_empty()).then_some(style)
+}
+
+/// The row and column titles' style (#1665): Project's `Row & Column
+/// Titles` over the older key `Column Titles`, field by field; `None` when
+/// neither sets anything. The headings and the ID cells draw by it.
+pub(crate) fn titles_style(v: &ProjectView) -> Option<TextStyle> {
+    titles_of(&v.ed.project().formatting)
+}
+
+pub(crate) fn titles_of(f: &projcore::formatting::Formatting) -> Option<TextStyle> {
+    let style = f.style_for(&["Column Titles", "Row & Column Titles"]);
+    (!style.is_empty()).then_some(style)
+}
+
+/// The ID cell's style: the titles style instead of the row's when one is
+/// set (as Project: a Critical Tasks colour leaves the row header alone),
+/// the cell's own on top either way.
+pub(crate) fn id_cell_style(
+    row: Option<&TextStyle>,
+    titles: Option<&TextStyle>,
+    own: Option<&TextStyle>,
+) -> Option<TextStyle> {
+    merged(titles.or(row), own)
+}
+
+fn merged(base: Option<&TextStyle>, own: Option<&TextStyle>) -> Option<TextStyle> {
+    match (base, own) {
+        (None, None) => None,
+        (Some(r), None) => Some(r.clone()),
+        (None, Some(o)) => Some(o.clone()),
+        (Some(r), Some(o)) => Some(r.clone().over(o)),
+    }
+}
+
+/// The style the grid draws task `task`'s cell in `column` with (`row` its
+/// index in the plan's tasks): the toolbar reads the same value.
+pub(crate) fn shown_cell_style(
+    v: &ProjectView,
+    task: &projcore::Task,
+    row: usize,
+    column: &str,
+) -> Option<TextStyle> {
+    cell_style_under(
+        v,
+        row_style(v, task, row).as_ref(),
+        titles_style(v).as_ref(),
+        Some(task.uid),
+        column,
+    )
+}
+
+/// A cell's style from its row's and the titles style, already looked up:
+/// the ID cell takes [`id_cell_style`], every other one [`cell_style`].
+pub(crate) fn cell_style_under(
+    v: &ProjectView,
+    row: Option<&TextStyle>,
+    titles: Option<&TextStyle>,
+    uid: Option<i32>,
+    column: &str,
+) -> Option<TextStyle> {
+    if column == crate::COLUMNS[crate::COL_ID] {
+        let own = uid.and_then(|uid| v.ed.project().formatting.cell(uid, column));
+        id_cell_style(row, titles, own)
+    } else {
+        cell_style(v, row, uid, column)
+    }
 }
 
 /// A cell's style: the row's with the cell's own on top.
@@ -1825,22 +1966,7 @@ pub(crate) fn cell_style(
     column: &str,
 ) -> Option<TextStyle> {
     let own = uid.and_then(|uid| v.ed.project().formatting.cell(uid, column));
-    match (row, own) {
-        (None, None) => None,
-        (Some(r), None) => Some(r.clone()),
-        (None, Some(o)) => Some(o.clone()),
-        (Some(r), Some(o)) => Some(r.clone().over(o)),
-    }
-}
-
-/// The style of one category alone (`Column Titles`, `Middle Timescale
-/// Tier`), when set.
-pub(crate) fn category_style(v: &ProjectView, category: &str) -> Option<TextStyle> {
-    v.ed.project()
-        .formatting
-        .category(category)
-        .filter(|s| !s.is_empty())
-        .cloned()
+    merged(row, own)
 }
 
 /// The pattern colour when the style sets no text colour, and Project's

@@ -120,7 +120,7 @@ const MANIFEST: &str = r##"{
   "palettes":[
     {"id":"fixture.blue","label":"Blue","bars":[{"kind":"on-track","color":"#3366CC","shape":"bar"},{"kind":"critical","color":"#1F3763","shape":"bar"}]},
     {"id":"fixture.red","label":"Red","bars":[{"kind":"on-track","color":"#CC3333","shape":"bar"},{"kind":"critical","color":"#7F0000","shape":"bar"}]}],
-  "text_style_categories":["Fixture Tasks"]
+  "text_style_categories":["Fixture Tasks","Late Tasks","Placeholder Tasks"]
 }"##;
 
 /// The chosen palette, kept across calls.

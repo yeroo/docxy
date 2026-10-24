@@ -551,8 +551,9 @@
   `overlay_shapes`, cached by revision, scale, flags, the shown rows and the
   selection (#1565); `bar_look` draws the
   bars in the palette the plan's formatting names (`plugin_ui::palette`),
-  and `row_style`/`cell_style`/`category_style` draw the formatting's text
-  styles (`Column Titles` on the headings). The harness reports contributed
+  and `row_style`/`cell_style`/`titles_style` draw the formatting's text
+  styles (`Row & Column Titles` over `Column Titles` on the headings and ID
+  cells, #1665). The harness reports contributed
   items with `"plugin": true` in `ribbon-read`, `menu-read` and
   `dialog-read`, `project-overlay` lists the shapes, and `dialog-set`
   addresses a grid cell as `name[row].column` (checked against the column's
@@ -731,6 +732,28 @@
   Without a text colour the pattern is black, without a background it sits on
   white. The harness state reports `cell_styles`; the fixture's Bold command
   sets both keys.
+
+## Text style categories the host computes (#1665)
+
+- `plugin_ui::task_categories` (facts from the plan as it is, so a row
+  entering one restyles on the next frame) is the one category list the
+  grid (`row_style`), the toolbar's ticks (`shown_cell_style`) and the
+  harness state's `row_categories` (`<uid>:<cat>|<cat>...` per shown task
+  row, while a UI plugin is loaded) read. `Late Tasks` (Status reads
+  `Late`, so a status date is needed) and `Placeholder Tasks`
+  (`Task::is_placeholder`: a manual leaf with no manual or stored start,
+  Project's TBD task) are computed only when a loaded manifest names them in
+  `text_style_categories` (`Optins`, exact string, read once per process);
+  order: ..., Manually Scheduled, Placeholder, Late, Inactive. Only a
+  missing start is representable: `duration_min` is always a number, so a
+  TBD duration or finish is not.
+- The titles style (`titles_style`) is `Row & Column Titles` over the older
+  key `Column Titles`, field by field. The headings and the task rows' ID
+  cells draw by it: with one set, the ID cell takes it instead of the row's
+  category style (`id_cell_style`, the cell's own on top), so the row box
+  carries no style and every cell is styled whole, its own pattern layer
+  included (a hatch may jog at column rules). Without one the row draws as
+  before. The inactive dim and strike stay on the row.
 
 ## Project leveling as a plan edit (#1594)
 
