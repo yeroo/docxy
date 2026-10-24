@@ -603,6 +603,27 @@
   `uiharness/cases/project-plugin-ui.uit` drives
   the fixture through all of it; nothing changes without a UI plugin.
 
+## Contributed group launchers (#1669)
+
+- A manifest group may carry `"launcher":{"id","tip","keytip"}`
+  (`uiplugin::Launcher`; an object without `id` fails the manifest naming the
+  group, any other value is none; `Manifest::json` writes it after
+  `priority`). `plugin_ui::extend_tab_with` sets `ribbonspec::Group::launcher`
+  to `act_of(id)` with `launcher_tip`/`launcher_key` (`&'static str`, empty
+  for the built-ins: the tip falls back to "More options"), on the new group
+  or on the group it joins, replacing that one's launcher, even when every
+  control replaced a built-in; a new group with no control is still not
+  made. `render_group` draws the tip, a `ribbon-launch:<title>` probe (flyout
+  prefix in a flyout copy) and, in place only, the KeyTip badge;
+  `tab_keytip_cmd`/`tab_keytip_starts` take `launcher_key` after the commands'
+  tips (a built-in one-letter tip still shadows a two-letter one it starts).
+- The harness's `ribbon-launch:<title>` takes any title and resolves it at
+  measure time against the shown tab's groups, any case
+  (`harness::launch_title`); `ribbon-read` adds `launcher_tip` and
+  `launcher_key_tip`. The fixture's Fixture (Task) and Fixture Format (Gantt
+  Chart Format, drawn in place at CI widths) groups launch `fixture.font`
+  (KeyTip ZN); `project-plugin-ui.uit` clicks one and types the other.
+
 ## Overlay text style (#1668)
 
 - `projcore::uiplugin::Shape::Text` carries `font`, `bold`, `italic`,

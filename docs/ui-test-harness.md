@@ -328,7 +328,9 @@ plugins"): the same `plugin <name>` line installs it, and the suite loads
 its UI when its version target names this host's version. What it adds is
 reported like the built-ins, marked `"plugin": true`: `ribbon-read`'s
 commands and gallery tiles (a contributed control with a built-in's id
-replaces it in place, so the built-in's slot then reads `plugin: true`),
+replaces it in place, so the built-in's slot then reads `plugin: true`; a
+group with a contributed dialog launcher reads `launcher: true` and, when the
+plugin names them, `launcher_tip` and `launcher_key_tip`, #1669),
 `menu-read`'s items (the row, bar, column and chart menus; `menu-open
 {"target":"chart"}` opens the chart's own menu beside the bars: Timescale... and
 Zoom... are live and open their dialogs, the rest of Project's items are drawn greyed), and `dialog-read`'s controls (a dialog a
@@ -1674,10 +1676,11 @@ shown), `ribbon-flyout` a collapsed group's open flyout (#1020), and
 `ribbon-group:<index>` group `index` of the tab shown as it is drawn: in place,
 or its collapsed button (a `pointer-click` there opens or shuts its flyout).
 `ribbon-launch:<group title>` (for example `ribbon-launch:Number`, the title
-matched without regard to case) is the dialog launcher (↘) of the sheet ribbon
-group with that title, while the group is drawn in place on the tab shown
-(#1164). It is an error when the group draws no launcher, and when the group is
-not drawn in place (collapsed into a flyout, or on another tab).
+matched without regard to case) is the dialog launcher of the group with that
+title on the tab shown, while the group is drawn in place (#1164): a sheet
+group's (↘), a document or Project group's (⤢), a UI plugin's group's
+included (#1669). It is an error when the group draws no launcher, and when the
+group is not drawn in place (collapsed into a flyout, or on another tab).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is
