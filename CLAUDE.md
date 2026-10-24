@@ -755,6 +755,27 @@
   included (a hatch may jog at column rules). Without one the row draws as
   before. The inactive dim and strike stay on the row.
 
+## Timescale tier text styles (#1666)
+
+- The Gantt header's two tiers draw by the plan's text styles, as its
+  gridlines do (#1575): the upper (major) tier by `Middle Timescale Tier`,
+  the lower (minor) by `Bottom Timescale Tier`; `Top Timescale Tier` is
+  stored only until a three-tier header exists (the issue had Middle stored
+  only). `plugin_ui::tier_styles` is `style_for(["All", <tier>])`: the tiers
+  take `All`, deliberately (the issue asks it), while the titles style
+  (#1665) does not. `tier_cell_style` puts the plan's style over the
+  defaults (7.5 pt = the old 10 px, the major tier bold), so `bold: false`
+  wins, and `header_cells` draws it through `styled` and `pattern_layer`.
+- A cell's background or pattern covers the header's non-working shading
+  there. A large size is clipped: the tier stays 14 px (Project grows it).
+  Labels fit at `gantt::tier_char_w` px a character: `zoom::CHAR_W` (6)
+  while the plan gives the tier no style, else scaled by the drawn size from
+  10 px, a tenth wider when bold.
+- The harness state reports `timescale_styles` `{middle, bottom}` (`null`
+  for an unstyled tier). The fixture's `fixture.format` sets both with its
+  gridlines and clears them on the next press (`project-plugin-ui.uit`, not
+  run on macOS).
+
 ## Project leveling as a plan edit (#1594)
 
 - `projcore::schedule::level_with(proj, &LevelScope {movable, order,
