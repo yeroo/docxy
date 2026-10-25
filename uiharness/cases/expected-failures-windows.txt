@@ -15,12 +15,6 @@
 # vbottom_inset at 200% is 323, the case expects 241 (as on Linux).
 doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
 
-# Ribbon groups clipped or collapsed differently at the Windows CI widths.
-ribbon-fit.uit | sheet ribbon: no tab is clipped vertically | #1779
-ribbon-fit.uit | widening restores full groups | #1779
-sheet-ribbon.uit | sheet Home ribbon: no group is clipped vertically | #1779
-project-plugin-ui.uit | the Task tab with a contributed group collapses whole groups, never a label | #1779
-
 # Project table and Timeline geometry at the Windows window sizes.
 project-selection.uit | project the default window shows the whole Entry table and a narrowed pane does not | #1780
 project-timeline-box.uit | project dragging the box's right edge out widens the span and narrows the days | #1780

@@ -2112,6 +2112,14 @@ script (Windows runs them two to three times slower), and uploads
 `ui-sweep-windows` whatever the result. Like the Linux job it fails the PR on
 a new failure or an unexpected pass (#1544).
 
+Windows caps a window at the screen plus its frame, so the Windows sweep needs
+a screen at least as large as the widest `window-size` a case asks for
+(1400x800 logical pixels): on the runner's 1024x768 desktop every such window
+came out 1028x780 and the ribbon cases saw narrower ribbons than they asked
+for (#1779). The job sets the display to 1920x1080 before the sweep and fails
+there, naming the mode it got and the modes offered, if the screen is smaller.
+The `window-size` reply echoes the request, not the size the window got.
+
 ### Capture on macOS
 
 Nothing outside the app can photograph a macOS harness window: it is never on

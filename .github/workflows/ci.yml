@@ -268,6 +268,66 @@ jobs:
         run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture
       - name: Sweep runner unit tests
         run: python -m unittest discover -s scripts -p "test_*.py" -v
+      # The runner's desktop is 1024x768, and Windows caps a window at the screen
+      # plus its frame, so every `window-size` wider than that came out 1028x780
+      # and the cases saw a narrower ribbon than they asked for (#1779). Give the
+      # sweep a 1920x1080 screen (the widest case asks for 1400x800 logical px),
+      # and fail here, with the mode got and the modes offered, if it is smaller.
+      # The readback is the display mode, not Screen.Bounds or GetSystemMetrics,
+      # which a DPI-unaware pwsh reports scaled down.
+      - name: Set the display to 1920x1080
+        shell: pwsh
+        run: |
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Display {
+              [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+              public struct DEVMODE {
+                  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+                  public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+                  public int dmFields;
+                  public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+                  public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+                  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+                  public short dmLogPixels;
+                  public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+                  public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType;
+                  public int dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+              }
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern bool EnumDisplaySettings(string device, int mode, ref DEVMODE dm);
+              [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+              public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
+              [DllImport("user32.dll")]
+              public static extern IntPtr SetProcessDpiAwarenessContext(IntPtr context);
+              [DllImport("user32.dll")]
+              public static extern uint GetDpiForSystem();
+              public static DEVMODE Mode(int index) {
+                  var dm = new DEVMODE();
+                  dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+                  if (!EnumDisplaySettings(null, index, ref dm)) dm.dmPelsWidth = -1;
+                  return dm;
+              }
+          }
+          '@
+          $current = -1  # ENUM_CURRENT_SETTINGS
+          $dm = [Display]::Mode($current)
+          "before: $($dm.dmPelsWidth)x$($dm.dmPelsHeight)"
+          $dm.dmPelsWidth = 1920
+          $dm.dmPelsHeight = 1080
+          $dm.dmFields = 0x80000 -bor 0x100000  # DM_PELSWIDTH | DM_PELSHEIGHT
+          $code = [Display]::ChangeDisplaySettings([ref]$dm, 0)  # this session only
+          "ChangeDisplaySettings: $code (0 is DISP_CHANGE_SUCCESSFUL)"
+          $got = [Display]::Mode($current)
+          [void][Display]::SetProcessDpiAwarenessContext([IntPtr]-4)  # per-monitor v2, for a true DPI
+          "after: $($got.dmPelsWidth)x$($got.dmPelsHeight), system DPI $([Display]::GetDpiForSystem())"
+          if ($code -ne 0 -or $got.dmPelsWidth -lt 1920 -or $got.dmPelsHeight -lt 1080) {
+            $modes = for ($i = 0; ($m = [Display]::Mode($i)).dmPelsWidth -ge 0; $i++) { "$($m.dmPelsWidth)x$($m.dmPelsHeight)" }
+            "modes offered: $(($modes | Select-Object -Unique) -join ', ')"
+            Write-Error "the display is $($got.dmPelsWidth)x$($got.dmPelsHeight), the sweep needs 1920x1080 (#1779)"
+            exit 1
+          }
       - name: Sweep
         timeout-minutes: 90
         run: python scripts/ui-linux-sweep.py --timeout 420 --expected uiharness/cases/expected-failures-windows.txt --suite suite/target/release/suite.exe --uiharness target/release/uiharness.exe --run "${{ github.workspace }}/uiharness-runs/sweep"
