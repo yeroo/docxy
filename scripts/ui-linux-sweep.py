@@ -5,8 +5,9 @@ On Linux each script gets its own private Xvfb + Openbox display
 (scripts/ui-linux.py); on Windows no wrapper, and `uiharness --desktop
 sweep-<stem>` starts the suite on a Win32 desktop of its own (no x11/ logs).
 Each has its own `uiharness run`, so no script inherits another's tabs or view
-settings. Results are checked against uiharness/cases/expected-failures.txt:
-the run fails on a failure that is not listed and on a listed case that passes.
+settings. Results are checked against uiharness/cases/expected-failures.txt
+(expected-failures-windows.txt on Windows): the run fails on a failure that is
+not listed and on a listed case that passes.
 
     python3 scripts/ui-linux-sweep.py                      # every script
     python3 scripts/ui-linux-sweep.py uiharness/cases/doc-state.uit
@@ -28,11 +29,17 @@ import time
 REPO = Path(__file__).resolve().parent.parent
 CASES = REPO / 'uiharness' / 'cases'
 EXPECTED = CASES / 'expected-failures.txt'
+EXPECTED_WINDOWS = CASES / 'expected-failures-windows.txt'
 UI_LINUX = REPO / 'scripts' / 'ui-linux.py'
 
 # Statuses, best first. Only PASS and XFAIL leave the exit code at 0.
 PASS, XFAIL, XPASS, FAIL, ERROR = 'PASS', 'XFAIL', 'XPASS', 'FAIL', 'ERROR'
-KINDS = ('fail', 'error')
+KINDS = ('fail', 'error', 'flaky')
+
+
+def default_expected(platform):
+    """The expected-failures list for a platform: Windows has its own (#1544)."""
+    return EXPECTED_WINDOWS if platform == 'win32' else EXPECTED
 
 
 class ListError(Exception):
@@ -118,7 +125,7 @@ class Entry:
 
 
 def parse_expected(text):
-    """Parse `<script>.uit | <case name> | #<issue> [| error]` lines."""
+    """Parse `<script>.uit | <case name> | #<issue> [| error|flaky]` lines."""
     entries = []
     for n, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
@@ -126,7 +133,7 @@ def parse_expected(text):
             continue
         fields = [f.strip() for f in line.split('|')]
         if len(fields) not in (3, 4):
-            raise ListError(f'line {n}: expected "<script>.uit | <case> | #<issue> [| error]", '
+            raise ListError(f'line {n}: expected "<script>.uit | <case> | #<issue> [| error|flaky]", '
                             f'got {raw!r}')
         script, case, issue = fields[:3]
         kind = fields[3] if len(fields) == 4 else 'fail'
@@ -279,13 +286,14 @@ def classify(script, transcript, exit_code, declared, expected, timed_out=False)
         c = t.cases[name]
         entry = expected.get(name)
         if c.ok:
-            if entry:
+            # A flaky case may pass; only a `fail` or `error` entry must fail.
+            if entry and entry.kind != 'flaky':
                 r.unexpected_pass.append(f'{name} ({entry.issue})')
             continue
         r.failed_cases.append(name)
         if entry is None:
             r.new_failures.append(name)
-        elif entry.kind == 'fail' and (c.error_steps or not c.fail_steps):
+        elif entry.kind in ('fail', 'flaky') and (c.error_steps or not c.fail_steps):
             # The entry covers an expectation mismatch; a step that could not
             # run at all is a different, unlisted problem.
             r.new_failures.append(f'{name} (step error)')
@@ -409,7 +417,9 @@ def main(argv=None):
                              '(default: beside --uiharness)')
     parser.add_argument('--run', type=Path,
                         help='run directory (default: uiharness-runs/sweep-<timestamp>)')
-    parser.add_argument('--expected', type=Path, default=EXPECTED)
+    parser.add_argument('--expected', type=Path, default=default_expected(sys.platform),
+                        help='expected-failures list (default: expected-failures.txt, '
+                             'expected-failures-windows.txt on Windows)')
     parser.add_argument('--timeout', type=float, default=600,
                         help='seconds per script (default: 600)')
     args = parser.parse_args(argv)

@@ -155,6 +155,16 @@ class Classify(unittest.TestCase):
         self.assertEqual(classify(STEP_ERROR, 1, [entry('second', 'error')]).status, sweep.XFAIL)
         self.assertEqual(classify(FAILING, 1, [entry('second', 'error')]).status, sweep.FAIL)
 
+    def test_flaky_entry_may_pass(self):
+        r = classify(PASSING, 0, [entry('second', 'flaky')])
+        self.assertEqual((r.status, r.unexpected_pass), (sweep.PASS, []))
+
+    def test_flaky_entry_covers_fail_steps_only(self):
+        r = classify(FAILING, 1, [entry('second', 'flaky', '#1783')])
+        self.assertEqual((r.status, r.expected), (sweep.XFAIL, ['second (#1783)']))
+        r = classify(STEP_ERROR, 1, [entry('second', 'flaky')])
+        self.assertEqual((r.status, r.new_failures), (sweep.FAIL, ['second (step error)']))
+
     def test_no_case_lines_is_an_error_even_when_listed(self):
         r = classify('ui-linux: Xvfb did not start\n', 1, [entry('second')])
         self.assertEqual(r.status, sweep.ERROR)
@@ -193,10 +203,12 @@ class ExpectedList(unittest.TestCase):
         entries = sweep.parse_expected(
             '# header\n\n'
             'doc-rulers.uit | ruler case | #808\n'
-            'word-tables.uit | a case | #976 | error\n')
+            'word-tables.uit | a case | #976 | error\n'
+            'gantt-scroll.uit | b case | #1783 | flaky\n')
         self.assertEqual([(e.script, e.case, e.issue, e.kind, e.line) for e in entries], [
             ('doc-rulers.uit', 'ruler case', '#808', 'fail', 3),
-            ('word-tables.uit', 'a case', '#976', 'error', 4)])
+            ('word-tables.uit', 'a case', '#976', 'error', 4),
+            ('gantt-scroll.uit', 'b case', '#1783', 'flaky', 5)])
 
     def test_rejects_malformed_lines(self):
         for bad in ('doc-rulers.uit | case\n',             # no issue
@@ -225,6 +237,15 @@ class ExpectedList(unittest.TestCase):
     def test_committed_list_is_current(self):
         entries = sweep.parse_expected(sweep.EXPECTED.read_text(encoding='utf-8'))
         sweep.validate_expected(entries, sweep.CASES)
+
+    def test_committed_windows_list_is_current(self):
+        text = sweep.EXPECTED_WINDOWS.read_text(encoding='utf-8')
+        sweep.validate_expected(sweep.parse_expected(text), sweep.CASES)
+
+    def test_windows_reads_its_own_list(self):
+        self.assertEqual(sweep.default_expected('win32'), sweep.EXPECTED_WINDOWS)
+        self.assertEqual(sweep.default_expected('linux'), sweep.EXPECTED)
+        self.assertEqual(sweep.default_expected('darwin'), sweep.EXPECTED)
 
 
 class Table(unittest.TestCase):

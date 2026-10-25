@@ -61,19 +61,23 @@ impl Instance {
             reader,
             writer: stream,
             token: self.token.clone(),
+            probe: false,
         })
     }
 
     /// The liveness probe: a connection when the server accepts one, which a
-    /// caller that goes on to talk to it keeps (a probe it drops costs a
-    /// TIME_WAIT port on Windows).
+    /// caller that goes on to talk to it keeps. One it drops closes abortively
+    /// (see [`Conn`]'s `Drop`).
     fn probe(&self) -> Option<Conn> {
-        self.open(Duration::from_millis(200)).ok()
+        let mut conn = self.open(Duration::from_millis(200)).ok()?;
+        conn.probe = true;
+        Some(conn)
     }
 
     /// A client whose first call uses `conn`, a connection to this instance
     /// from [`probe`](Instance::probe).
-    fn client_with(&self, conn: Conn) -> Client {
+    fn client_with(&self, mut conn: Conn) -> Client {
+        conn.probe = false;
         Client {
             instance: self.clone(),
             conn: Mutex::new(Some(conn)),
@@ -175,6 +179,19 @@ pub struct Conn {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     token: String,
+    /// A liveness probe not handed to a [`Client`]: dropping it closes
+    /// abortively, so it leaves no client port in TIME_WAIT (#1544).
+    probe: bool,
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        if self.probe {
+            // The reader is a clone of the same socket, so the RST goes out
+            // when the second of the two handles closes.
+            crate::close_abortively(&self.writer);
+        }
+    }
 }
 
 impl Conn {
@@ -462,6 +479,79 @@ mod tests {
         std::fs::remove_dir(a).unwrap();
         std::fs::remove_dir(b).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    /// A stand-in server: a listener that is never accepted from (the listen
+    /// queue holds its connections) with a discovery record `name` in `dir`.
+    fn stand_in_record(dir: &Path, name: &str) -> std::net::TcpListener {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            format!(r#"{{"instance":"{name}","port":{port},"token":"t","pid":1}}"#),
+        )
+        .unwrap();
+        listener
+    }
+
+    /// Every probe that is not handed to a client closes abortively, on each
+    /// path that drops one (#1544).
+    #[test]
+    fn probes_that_are_not_kept_close_abortively() {
+        use crate::tests::abortive_closes;
+        let dir = std::env::temp_dir().join(format!("ctlcore_abort_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _left = stand_in_record(&dir, "docxy-left");
+        let _right = stand_in_record(&dir, "docxy-right");
+        let sources = [Source {
+            dir: &dir,
+            app: "docxy",
+        }];
+        let aborts = |f: &dyn Fn()| {
+            let before = abortive_closes();
+            f();
+            abortive_closes() - before
+        };
+        assert_eq!(aborts(&|| assert_eq!(discover_live(&dir).len(), 2)), 2);
+        assert_eq!(
+            aborts(&|| {
+                let list = list_running_in(&sources);
+                assert_eq!(list.get("running").unwrap().as_array().unwrap().len(), 2);
+            }),
+            2
+        );
+        // Ambiguous: both probes are dropped.
+        assert_eq!(
+            aborts(&|| assert!(resolve_target_in(&sources, None).is_err())),
+            2
+        );
+        assert_eq!(
+            aborts(&|| assert!(resolve_target_for_new(&dir, "docxy", None).is_err())),
+            2
+        );
+        // A target keeps one probe as the client's connection and drops the
+        // other; the kept one closes gracefully with its client.
+        assert_eq!(
+            aborts(&|| {
+                let (client, _) = resolve_target_in(&sources, Some("left")).unwrap();
+                assert_eq!(client.instance().instance, "docxy-left");
+            }),
+            1
+        );
+        assert_eq!(
+            aborts(&|| {
+                let client = resolve_target_for_new(&dir, "docxy", Some("right"))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(client.instance().instance, "docxy-right");
+            }),
+            1
+        );
+        // A connection made for calls is not a probe.
+        let instance = discover(&dir).remove(0);
+        assert_eq!(aborts(&|| drop(instance.client().connect().unwrap())), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A resolved client's first call rides the connection the liveness probe

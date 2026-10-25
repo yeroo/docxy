@@ -1,12 +1,15 @@
-# Cases known to fail on the Linux sweep (scripts/ui-linux-sweep.py).
+# Cases known to fail on the Linux sweep (scripts/ui-linux-sweep.py). The
+# Windows sweep has its own list, expected-failures-windows.txt.
 #
-#   <script>.uit | <exact test name> | #<tracking issue> [| error]
+#   <script>.uit | <exact test name> | #<tracking issue> [| error | flaky]
 #
 # A listed case must fail and an unlisted one must pass, so remove the entry in
 # the change that fixes its issue. An entry covers failed expectations: FAIL
 # steps and no step that could not run (ERROR). An entry ending `| error`
 # instead requires an ERROR step (FAIL steps may appear too); if the case then
-# fails on FAIL steps only, that is a new failure: drop the `| error`.
+# fails on FAIL steps only, that is a new failure: drop the `| error`. An entry
+# ending `| flaky` is for a case that fails only now and then: it may pass, and
+# a failure must be FAIL steps only. Never mark a case that always fails flaky.
 # See docs/ui-test-harness.md, "Expected failures".
 
 # vbottom_inset at 200% is 323, the case expects 241.

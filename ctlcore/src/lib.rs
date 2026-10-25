@@ -37,7 +37,7 @@ pub mod json;
 pub mod mcp;
 
 use json::Json;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,10 +136,28 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Nudge the blocking `accept()` so the acceptor thread observes the flag.
-        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        nudge_acceptor(self.port);
         let _ = std::fs::remove_file(&self.discovery);
     }
+}
+
+/// Wake the blocking `accept()` so the acceptor thread observes the shutdown
+/// flag, and wait for it to close the connection it woke with. The side that
+/// closes first holds TIME_WAIT, so the nudge's own client port is released at
+/// once and the TIME_WAIT moves to the server's end. Its port came from the
+/// ephemeral range too, so at worst one port per server shutdown is still
+/// held, as before (#1544). The nudge cannot close abortively as the probes
+/// do: a BSD kernel (macOS) drops a connection reset while still in the listen
+/// queue, so `accept` would never return. Whether the server closed first, for
+/// the tests.
+fn nudge_acceptor(port: u16) -> bool {
+    let Ok(mut nudge) = TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    nudge
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .ok();
+    matches!(nudge.read(&mut [0u8; 1]), Ok(0))
 }
 
 /// Start a control server for `instance` (e.g. `"docxy-<session id>"`), writing
@@ -217,8 +235,13 @@ fn sweep_stale(dir: &Path, own: &Path) {
             continue;
         }
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port as u16));
-        if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_err() {
-            let _ = std::fs::remove_file(&path);
+        match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)) {
+            Ok(probe) => {
+                close_abortively(&probe);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 }
@@ -380,6 +403,130 @@ fn os_random_bytes(n: usize) -> Vec<u8> {
     buf
 }
 
+/// Make the last close of `stream` abortive (SO_LINGER on with a zero
+/// timeout: an RST, not a FIN), so neither side holds TIME_WAIT. For a
+/// connection opened only to see whether a server is there: a probe the client
+/// closes first leaves its port in TIME_WAIT, and on Windows enough of them run
+/// the ephemeral ports out (#1234, #1544). std's `set_linger` is unstable, so
+/// this is a hand-declared `setsockopt`, like `BCryptGenRandom` above. A
+/// failure leaves the close graceful, as before. Returns whether it was set.
+pub(crate) fn close_abortively(stream: &TcpStream) -> bool {
+    let set = set_linger_zero(stream);
+    #[cfg(test)]
+    if set {
+        tests::ABORTIVE_CLOSES.with(|n| n.set(n.get() + 1));
+    }
+    set
+}
+
+#[cfg(windows)]
+fn set_linger_zero(stream: &TcpStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    #[repr(C)]
+    struct Linger {
+        l_onoff: u16,
+        l_linger: u16,
+    }
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+    }
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_LINGER: i32 = 0x0080;
+    let linger = Linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the socket is open for the borrow of `stream`, and `optval`
+    // points at a `struct linger` of exactly `optlen` bytes.
+    unsafe {
+        setsockopt(
+            stream.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_LINGER,
+            (&linger as *const Linger).cast(),
+            std::mem::size_of::<Linger>() as i32,
+        ) == 0
+    }
+}
+
+// Linux's generic socket constants; mips and sparc number them as BSD does.
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    )
+))]
+fn set_linger_zero(stream: &TcpStream) -> bool {
+    use std::ffi::c_int;
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct Linger {
+        l_onoff: c_int,
+        l_linger: c_int,
+    }
+    unsafe extern "C" {
+        fn setsockopt(
+            socket: c_int,
+            level: c_int,
+            name: c_int,
+            value: *const core::ffi::c_void,
+            len: u32,
+        ) -> c_int;
+    }
+    #[cfg(target_os = "macos")]
+    const SOL_SOCKET: c_int = 0xffff;
+    #[cfg(target_os = "macos")]
+    const SO_LINGER: c_int = 0x0080;
+    #[cfg(target_os = "linux")]
+    const SOL_SOCKET: c_int = 1;
+    #[cfg(target_os = "linux")]
+    const SO_LINGER: c_int = 13;
+    let linger = Linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the descriptor is open for the borrow of `stream`, and `value`
+    // points at a `struct linger` of exactly `len` bytes.
+    unsafe {
+        setsockopt(
+            stream.as_raw_fd(),
+            SOL_SOCKET,
+            SO_LINGER,
+            (&linger as *const Linger).cast(),
+            std::mem::size_of::<Linger>() as u32,
+        ) == 0
+    }
+}
+
+/// Any other target closes gracefully.
+#[cfg(not(any(
+    windows,
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        ))
+    )
+)))]
+fn set_linger_zero(_stream: &TcpStream) -> bool {
+    false
+}
+
 /// Constant-time equality for the per-request token check, so a remote caller
 /// can't learn the token a matching character at a time through response
 /// timing. The token's length is fixed and not itself a secret, so a length
@@ -518,6 +665,60 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::time::Duration;
+
+    thread_local! {
+        /// How many abortive closes this thread has set up, so a test can see
+        /// which paths abort their probes. Counted, not watched on the wire: a
+        /// probe reset before the server accepts it vanishes from a BSD listen
+        /// queue, so a stand-in server may never see it.
+        pub(crate) static ABORTIVE_CLOSES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    pub(crate) fn abortive_closes() -> usize {
+        ABORTIVE_CLOSES.with(|n| n.get())
+    }
+
+    #[test]
+    fn an_abortive_close_resets_the_server_side() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Accept first: see `ABORTIVE_CLOSES`.
+        let (mut accepted, _) = listener.accept().unwrap();
+        accepted
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(close_abortively(&client));
+        drop(client);
+        let err = accepted.read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+
+        // A plain close is graceful: the server reads end of stream.
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut accepted, _) = listener.accept().unwrap();
+        drop(client);
+        assert_eq!(accepted.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn the_shutdown_nudge_lets_the_server_close_first() {
+        let dir = tmp_dir("nudge");
+        let (server, _rx) = serve(&dir, "docxy-nudge").unwrap();
+        let port = server.port();
+        server.shutdown.store(true, Ordering::SeqCst);
+        assert!(nudge_acceptor(port), "the acceptor closed its side first");
+        // The acceptor has ended, so its listener is closed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener still accepts after shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn instance_name_is_the_pane_id_inside_agwinterm_else_the_pid() {
@@ -684,8 +885,15 @@ mod tests {
             ),
         )
         .unwrap();
-        // A second server starting up runs the sweep.
+        // A second server starting up runs the sweep, closing its probe of the
+        // live one abortively.
+        let before = abortive_closes();
         let (fresh, _rx2) = serve(&dir, "docxy-fresh").unwrap();
+        assert_eq!(
+            abortive_closes() - before,
+            1,
+            "the live server's probe aborts"
+        );
         assert!(!stale.exists(), "dead discovery file swept");
         assert!(alive.discovery_path().exists(), "live server's file kept");
         assert!(fresh.discovery_path().exists());

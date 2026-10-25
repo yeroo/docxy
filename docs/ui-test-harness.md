@@ -2081,7 +2081,9 @@ disagrees with them.
 #### Expected failures
 
 `uiharness/cases/expected-failures.txt` lists the cases known to fail on the
-sweep, one per line, each with the issue that tracks it:
+Linux sweep, one per line, each with the issue that tracks it;
+`expected-failures-windows.txt` is the Windows sweep's list, in the same
+grammar (the runner picks it on Windows; `--expected` names another):
 
 ```text
 doc-rulers.uit | <exact test name> | #808
@@ -2095,15 +2097,20 @@ expectations failed (`FAIL` steps); a step that could not run at all
 An entry ending in `| error` is the reverse: the case must fail with an
 `ERROR` step (`FAIL` steps may appear too), and one that fails on `FAIL`
 steps only is a new failure, so a partial fix shows up and the entry goes
-back to the default kind. Every entry must name an existing script
+back to the default kind. An entry ending in `| flaky` is for a case that
+fails only in some runs: it may pass (no `XPASS`), and when it fails it is
+covered as the default kind is, so an `ERROR` step is still new. It is never
+for a case that always fails. Every entry must name an existing script
 and `test` line, checked before anything starts, even when only some scripts
 are run.
 
 CI's `ui sweep (linux)` job runs the sweep on `ubuntu-latest` after release
 builds, and uploads the run directory as the `ui-sweep-linux` artifact when
 it fails. The `ui sweep (windows)` job runs the same script on
-`windows-latest` and uploads `ui-sweep-windows`; it is `continue-on-error`
-until a Windows baseline exists (the expected-failures list is the Linux one).
+`windows-latest` against `expected-failures-windows.txt`, with 420 s per
+script (Windows runs them two to three times slower), and uploads
+`ui-sweep-windows` whatever the result. Like the Linux job it fails the PR on
+a new failure or an unexpected pass (#1544).
 
 ### Capture on macOS
 
