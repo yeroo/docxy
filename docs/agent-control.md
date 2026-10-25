@@ -942,9 +942,18 @@ worth knowing:
   sheet) that refers to the removed sheet reads `#REF!`, as Excel turns them,
   a 3-D span whose end sheet went shrinks to the sheets left, and the cells
   that read a rewritten one recalculate; an in-memory chart drops its
-  references to the sheet. The undo gives each of them its text back (unless
-  it changed meanwhile) and recalculates. When the restore shifts other sheets, the undo/redo history is
-  cleared, as `sheet.remove` itself clears it.
+  references to the sheet. The undo gives the names, rule formulas, table
+  formulas and charts their text back one by one, each unless it changed
+  meanwhile. A sheet's cell formulas come back only while none of that
+  sheet's cells has been edited or moved since the removal (the rewrites
+  make many formulas one text, so a moved cell cannot be told from the one
+  stashed); otherwise they all stay as they are, and the
+  `sheet.restore-removed` reply lists that sheet in `cellsKept` (absent when
+  every sheet got its formulas back). A rename or a row or column edit of
+  another sheet that rewrote one of that sheet's formulas counts as an edit
+  there (a known limit). The cells then recalculate. When the restore shifts
+  other sheets, the undo/redo history is cleared, as `sheet.remove` itself
+  clears it.
 - **Agent sheet-removals are undoable in any order.** The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
@@ -1137,7 +1146,7 @@ Where a row below says a protected sheet is refused (`<verb>: the sheet is prote
 | `wb.consolidate` | `{refs,dest?,fn?,top?,left?,links?}` | Terminal xlsxy only for now. `{sheet,range}` — Data › Consolidate (a protected destination sheet is refused): `refs` are source references such as `East!A1:C4` or `'My sheet'!$A$1:$D$9` (a bare range is on the destination's sheet), or a defined name whose definition is one area on a sheet (local to the destination sheet first, then global); other workbooks are not supported; `dest` is the output's top-left cell, `Sheet!B2` or `B2`, or a range `Sheet!B2:D9` whose size, where it is more than one cell tall or wide, limits the categories written that way (default: the cursor on the active sheet); `fn` is a dialog name or file token, case-insensitive (`Sum` by default, `Count`, `Average`, `Max`, `Min`, `Product`, `Count Numbers`/`countNums`, `StdDev`, `StdDevp`, `Var`, `Varp`); `top`/`left` match rows and columns by the labels in each source's top row / left column (case-insensitive, whole label, any order); `links` writes `=Sheet!$B$2` detail formulas in hidden outline rows under a summary formula, and is refused for a source on the destination sheet. A refusal (no or bad references, a source overlapping the output) changes nothing. The settings are kept on the destination sheet (`<dataConsolidate>`), and its local `_xlnm.Consolidate_Area` name is set to the output. MCP: `xlsxy_consolidate`. One undo step |
 | `wb.replace-all` | `{query,text}` | `{replaced}` — spans **all sheets**, one undo group; the match runs on each cell's own input text (never on the `'` a quote prefix adds, which is kept on the result), and the replaced text is re-read with the entry rules of `cell.set`, except that a percent cell's number constant is not divided again; a result over the cell limit leaves that cell as it was; refused, changing nothing, when any sheet is protected |
 | `sheet.add` | `{name?}` | `{sheet,name}` — deduplicates a taken name, never errors |
-| `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default). The cell formulas that name the sheet read `#REF!` (a 3-D span whose end sheet went shrinks) and the cells that read those recalculate, as in Delete Sheet, in terminal xlsxy and in the VS Code tab, whose undo gives them back |
+| `sheet.remove` | `{sheet}` | `{removed:true}` (errors on the last sheet; `sheet` is required, no active-sheet default). The cell formulas that name the sheet read `#REF!` (a 3-D span whose end sheet went shrinks) and the cells that read those recalculate, as in Delete Sheet, in terminal xlsxy and in the VS Code tab, whose undo gives them back on each sheet not edited since (else its `sheet.restore-removed` reply's `cellsKept` names the sheet) |
 | `sheet.rename` | `{sheet,name}` | `{name}` — rewrites formula/defined-name references |
 | `table.list` | — | Terminal xlsxy only for now. `{tables:[{name,sheet,sheet_name,ref,columns,header_rows,totals_rows}]}` |
 | `table.rename` | `{name,new}` | Terminal xlsxy only for now. The renamed table, as `table.list` shows it. Excel's name rules (letter, `_` or `\` first; letters, digits, `_`, `.`; not a cell reference; unique among tables and defined names). Every formula naming it, defined names, rules, PivotTable sources and the data model follow. One undo step; refused when the table's sheet is protected |

@@ -3253,9 +3253,14 @@ impl Session {
     /// elements and every stored sheet index in step. When that shifts other
     /// sheets the undo and redo history, which names sheets by index, is
     /// cleared (as `sheet.remove` does). The global names, Consolidate
-    /// references, and other sheets' cell, table and CF and DV formulas and
-    /// charts the removal rewrote get their text back (unless they changed
-    /// since), and the cells recalculate.
+    /// references, other sheets' CF and DV formulas, tables' calculated
+    /// formulas and charts the removal rewrote get their text back, each
+    /// unless it changed since. A sheet's cell formulas come back only while
+    /// none of that sheet's cells was edited or moved since the removal
+    /// (`RemovedSheetStash::cell_guards`); otherwise they all stay as they
+    /// are, and the reply's `cellsKept` names that sheet. A rename or a row or
+    /// column edit of another sheet that rewrote a formula here counts as an
+    /// edit (a known limit). The cells recalculate.
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
         if self.removed_sheet_stashes.is_empty() {
             return Err("nothing to restore".into());
@@ -3340,7 +3345,7 @@ impl Session {
         }
         let name = self.removed_sheet_stashes[k].name.clone();
         let removed_active = self.removed_sheet_stashes[k].removed_active;
-        let had_pivots = self.restore_top();
+        let (had_pivots, cells_kept) = self.restore_top();
         for (later_name, was_active, serial) in &later {
             let si = self
                 .pkg
@@ -3391,6 +3396,16 @@ impl Session {
         out.push_str(&new_idx.to_string());
         out.push_str(",\"name\":");
         json::push_str(&mut out, &name);
+        if !cells_kept.is_empty() {
+            out.push_str(",\"cellsKept\":[");
+            for (i, sheet) in cells_kept.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json::push_str(&mut out, sheet);
+            }
+            out.push(']');
+        }
         out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
         out.push_str(&new_idx.to_string());
         out.push_str("}},\"undoSteps\":0}");
@@ -3400,9 +3415,10 @@ impl Session {
     /// Pop the top of `Session::removed_sheet_stashes` and put its sheet
     /// back (see [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed)),
     /// leaving the pivot refresh and the engine rebuild to the caller.
-    /// Whether the sheet had pivots. The caller has checked that no live
-    /// sheet has the stashed name.
-    fn restore_top(&mut self) -> bool {
+    /// Whether the sheet had pivots, and the sheets whose cell formulas were
+    /// left as they are (`RemovedSheetStash::cell_guards`). The caller has
+    /// checked that no live sheet has the stashed name.
+    fn restore_top(&mut self) -> (bool, Vec<String>) {
         let stash = self
             .removed_sheet_stashes
             .pop()
@@ -3490,6 +3506,13 @@ impl Session {
             })
             .map(|(name, _)| name.as_str())
             .collect();
+        let cells_kept: Vec<String> = stash
+            .cell_guards
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| !intact.contains(&name.as_str()))
+            .cloned()
+            .collect();
         for r in &stash.rewritten_cells {
             if !intact.contains(&r.sheet.as_str()) {
                 continue;
@@ -3557,7 +3580,7 @@ impl Session {
             self.window.1 = 0;
         }
         self.dirty = true;
-        had_pivots
+        (had_pivots, cells_kept)
     }
 
     /// Reinsert a pivot into `workbook.pivots`, pointed at `dest_sheet`, as
@@ -7060,7 +7083,8 @@ mod tests {
         s.active = 2;
         s.dispatch("set\t5\t0\t=5");
         s.active = 0;
-        restore(&mut s, "C");
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["B"]"#), "{out}");
         assert_eq!(row21(&s, 0), ("C!A1+1".into(), number(4.0)));
         assert_eq!(row21(&s, 1), ("A21*2".into(), number(8.0)));
         let b = |r: u32| {
@@ -7095,7 +7119,8 @@ mod tests {
             s.dispatch(op);
             let moved = column_b(&s, 0..8);
             assert_ne!(moved, rewritten, "{op}");
-            restore(&mut s, "C");
+            let out = restore(&mut s, "C");
+            assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{op}: {out}");
             assert_eq!(column_b(&s, 0..8), moved, "{op}");
         }
         // Rows added below them move nothing: the restore goes ahead.
@@ -7107,8 +7132,23 @@ mod tests {
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
         s.dispatch("insrow\t10\t1");
         s.dispatch("set\t12\t1\t7");
-        restore(&mut s, "C");
+        let out = restore(&mut s, "C");
+        assert!(!out.contains("cellsKept"), "{out}");
         assert_eq!(column_b(&s, 0..8), original);
+    }
+
+    /// #1734 r2: a rename of another sheet that rewrote a formula on the
+    /// sheet counts as an edit there (a known limit), and the reply says so.
+    #[test]
+    fn ctl_sheet_restore_removed_names_a_sheet_a_rename_elsewhere_kept() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=C!A1+B!A1");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"B","name":"Bee"}}"#);
+        assert_eq!(row21(&s, 0).0, "#REF!+Bee!A1");
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
+        assert_eq!(row21(&s, 0).0, "#REF!+Bee!A1");
     }
 
     /// #1734: a table's calculated-column formula and an in-memory chart's
