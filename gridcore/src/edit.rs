@@ -1219,6 +1219,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u
         return Vec::new();
     }
     remove_sheet_refs_in_rules(wb, removed);
+    let order = sheet_order(wb);
     for sheet in &mut wb.sheets {
         for d in &mut sheet.drawings {
             if let crate::sheet::DrawingKind::Chart(cd) = &mut d.kind {
@@ -1235,7 +1236,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u
             if cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a)) {
                 continue; // preserved verbatim
             }
-            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed, &order);
             if let Some(updated) = rewrite_if_changed(src, rewrite) {
                 cell.formula = Some(updated);
                 rewritten.push((s, r, c));
@@ -1247,7 +1248,7 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u
         for slot in t.calculated_formulas.iter_mut() {
             let updated = slot.as_deref().and_then(|src| {
                 rewrite_if_changed(src, |e| {
-                    crate::formula::remove_sheet_refs_in_expr(e, removed)
+                    crate::formula::remove_sheet_refs_in_expr(e, removed, &order)
                 })
             });
             if updated.is_some() {
@@ -1287,6 +1288,12 @@ pub fn remove_sheet_refs(wb: &mut Workbook, removed: &[String]) -> Vec<(usize, u
     rewritten
 }
 
+/// The workbook's sheet names in tab order: what a removed end sheet of a
+/// 3-D span moves inward along ([`crate::formula::remove_sheet_refs_in_expr`]).
+pub fn sheet_order(wb: &Workbook) -> Vec<String> {
+    wb.sheets.iter().map(|s| s.name.clone()).collect()
+}
+
 /// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
 /// formula (a rule's, a threshold's, an Excel 2010 one's) and data-validation
 /// formula on any sheet that names a sheet in `removed` now reads `#REF!`, as
@@ -1295,9 +1302,10 @@ pub fn remove_sheet_refs_in_rules(wb: &mut Workbook, removed: &[String]) {
     if removed.is_empty() {
         return;
     }
+    let order = sheet_order(wb);
     for sheet in &mut wb.sheets {
         for_each_rule_formula(sheet, true, |_, src| {
-            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed);
+            let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed, &order);
             if let Some(updated) = rewrite_if_changed(src, rewrite) {
                 *src = updated;
             }

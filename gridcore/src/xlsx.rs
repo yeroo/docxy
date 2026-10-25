@@ -11069,6 +11069,7 @@ impl SheetPackage {
         // Excel; the removed sheet's own scoped names are dropped below.
         // Cell formulas are left to the caller ([`Self::delete_sheet`] does).
         let gone = [self.workbook.sheets[idx].name.clone()];
+        let order = crate::edit::sheet_order(&self.workbook);
         // So do the conditional-formatting and data-validation formulas that
         // name it.
         crate::edit::remove_sheet_refs_in_rules(&mut self.workbook, &gone);
@@ -11076,8 +11077,9 @@ impl SheetPackage {
             if d.scope == Some(idx) {
                 continue;
             }
-            let rewrite =
-                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            let rewrite = |e: &crate::formula::Expr| {
+                crate::formula::remove_sheet_refs_in_expr(e, &gone, &order)
+            };
             if let Some(text) = crate::formula::rewrite_defined_name(&d.formula, rewrite, None) {
                 d.formula = text;
             }
@@ -11087,8 +11089,9 @@ impl SheetPackage {
         // sheet that stays is `Sheet!#REF!`). `consolidate_loaded` stays as loaded,
         // so the save sees the difference and rewrites the element.
         crate::edit::for_each_consolidate_ref(&mut self.workbook, |text| {
-            let rewrite =
-                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            let rewrite = |e: &crate::formula::Expr| {
+                crate::formula::remove_sheet_refs_in_expr(e, &gone, &order)
+            };
             if let Some(updated) = crate::formula::rewrite_defined_name(text, rewrite, None) {
                 *text = updated;
             }
@@ -25613,6 +25616,69 @@ mod rule_shift_tests {
         assert_eq!(re.workbook.sheets[1].cell(0, 0).unwrap().value, ref_err);
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains("<f>#REF!+1</f>"), "{ws}");
+    }
+
+    /// #1734: Delete Sheet of a 3-D span's end sheet moves that end inward,
+    /// in cells, rule formulas and defined names, and the cells read the
+    /// shrunk span; the file keeps the new text.
+    #[test]
+    fn delete_sheet_shrinks_a_three_d_span_whose_end_went() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>SUM(Jan:Mar!B2)</f><v>7</v></c></row><row r="2"><c r="A2"><f>Jan:Mar!B2</f><v>0</v></c></row></sheetData>"#;
+        let num =
+            |n: u32| format!(r#"<sheetData><row r="2"><c r="B2"><v>{n}</v></c></row></sheetData>"#);
+        let (jan, feb, mar) = (num(1), num(2), num(4));
+        let names = r#"<definedNames><definedName name="Q1">SUM(Jan:Mar!$B$2)</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(
+            names,
+            &[
+                ("S", Some(s)),
+                ("Jan", Some(&jan)),
+                ("Feb", Some(&feb)),
+                ("Mar", Some(&mar)),
+            ],
+        ))
+        .unwrap();
+        pkg.workbook.sheets[0]
+            .ext_rules
+            .push(crate::sheet::ExtRule {
+                kind: crate::sheet::ExtKind::Cf,
+                ranges: vec![(0, 3, 0, 3)],
+                formulas: vec!["SUM(Jan:Mar!$B$2)>1".into()],
+                ix: 0,
+            });
+        assert!(pkg.delete_sheet(3));
+        let cell = |pkg: &SheetPackage, r: u32| pkg.workbook.sheets[0].cell(r, 0).unwrap().clone();
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(Jan:Feb!B2)"));
+        assert_eq!(a.value, CellValue::Number(3.0));
+        assert_eq!(cell(&pkg, 1).formula.as_deref(), Some("Jan:Feb!B2"));
+        assert_eq!(
+            pkg.workbook.sheets[0].ext_rules[0].formulas,
+            vec!["SUM(Jan:Feb!$B$2)>1".to_string()]
+        );
+        assert_eq!(pkg.workbook.defined_names[0].formula, "SUM(Jan:Feb!$B$2)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<f>SUM(Jan:Feb!B2)</f>"), "{ws}");
+        // The first sheet next: one sheet is left, a plain reference, whose
+        // value a lone cell now reads as Excel's does.
+        assert!(pkg.delete_sheet(1));
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(Feb!B2)"));
+        assert_eq!(a.value, CellValue::Number(2.0));
+        let b = cell(&pkg, 1);
+        assert_eq!(b.formula.as_deref(), Some("Feb!B2"));
+        assert_eq!(b.value, CellValue::Number(2.0));
+        assert_eq!(pkg.workbook.defined_names[0].formula, "SUM(Feb!$B$2)");
+        // And the last: `#REF!`.
+        assert!(pkg.delete_sheet(1));
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(#REF!)"));
+        assert_eq!(a.value, CellValue::Error("#REF!".into()));
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("saved file reloads");
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).unwrap().formula.as_deref(),
+            Some("SUM(#REF!)")
+        );
     }
 
     #[test]
