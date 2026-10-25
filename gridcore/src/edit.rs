@@ -1701,12 +1701,14 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
-    // The sheet-level `<sortState>` translates with the grid, and an insert
-    // strictly inside it grows it (Excel does the same; a condition at or
-    // below the insert shifts by the `point` rule, as a cell reference does).
-    // A delete through it, or an insert that pushes it off the sheet, leaves
-    // its conditions naming other cells, so it goes. Each edit that touches
-    // it is logged, for the save to replay on the loaded element.
+    // The sheet-level `<sortState>` translates with the grid, an insert
+    // strictly inside it grows it, and a delete through it shrinks it as a
+    // cell range shrinks (Excel does the same; a condition shifts by the same
+    // rules, as a cell reference does). A delete overlapping its top clamps
+    // it to the edit point, which can take in a deleted header row's place
+    // (unmeasured against Excel). A delete of all of it, or an insert that
+    // pushes it off the sheet, ends it. Each edit that touches it is logged,
+    // for the save to replay on the loaded element.
     if let Some((r1, c1, r2, c2)) = sheet.sort_state {
         let (lo, hi) = if shift.rows { (r1, r2) } else { (c1, c2) };
         let far_off = shift.delta > 0 && point(hi, &shift).is_none();
@@ -1716,7 +1718,8 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         } else if grown {
             point(hi, &shift).map(|nhi| (lo, nhi))
         } else {
-            span(lo, hi, &shift).filter(|&(nlo, nhi)| nhi - nlo == hi - lo)
+            // A delete clamps; an insert at or above it only translates it.
+            span(lo, hi, &shift)
         };
         sheet.sort_state = moved.map(|(nlo, nhi)| {
             if shift.rows {
@@ -2335,7 +2338,7 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
 }
 
 /// A span through the shift (deletes clamp); None = span fully deleted.
-fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
+pub(crate) fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     let at = shift.at;
     // `point` says `None` for two different things. On a DELETE the coordinate
     // is gone, and the span clamps to the edit point. On an INSERT it was pushed

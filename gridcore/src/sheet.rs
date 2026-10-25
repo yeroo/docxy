@@ -699,13 +699,14 @@ pub struct Sheet {
     /// The range (r1, c1, r2, c2, 0-based) of the sheet's own top-level
     /// `<sortState>` (not the one nested in an `<autoFilter>` or a table, nor
     /// a custom view's). Structural edits translate it, and an insert strictly
-    /// inside it grows it (see [`Sheet::sort_state_edits`]); a delete through
-    /// it or an insert pushing it off the sheet makes it `None`. A save
+    /// inside it grows it and a delete through it shrinks it (see
+    /// [`Sheet::sort_state_edits`]); a delete of all of it or an insert
+    /// pushing it off the sheet makes it `None`. A save
     /// replays the log on the element, or translates it when the log is
     /// empty, and drops it once this is `None`; an element whose `ref`
     /// doesn't read as a range is left alone.
     pub sort_state: Option<(u32, u32, u32, u32)>,
-    /// Every row/column insert or delete that moved or grew
+    /// Every row/column insert or delete that moved, grew or shrank
     /// [`Sheet::sort_state`] since the part was loaded, in order (edits
     /// wholly below it change nothing and are not kept). The saved element
     /// still holds the loaded range, so a save replays these on its `ref` and
