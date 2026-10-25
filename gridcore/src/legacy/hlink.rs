@@ -193,8 +193,10 @@ impl Le<'_> {
 /// UTF-16LE `bytes` up to the first null unit, lossy.
 fn utf16_to_null(bytes: &[u8]) -> String {
     let end = bytes
-        .chunks_exact(2)
-        .position(|p| p == [0, 0])
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .position(|p| *p == [0, 0])
         .map_or(bytes.len() & !1, |i| i * 2);
     utf16(&bytes[..end])
 }
