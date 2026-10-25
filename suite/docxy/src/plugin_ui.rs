@@ -367,7 +367,8 @@ pub(crate) struct PluginCache {
 /// gridline as drawn by Project's name (#1575), the plugins' switches, every
 /// text style category, and the selected cells' styles, #1572) in the shape
 /// `Formatting::apply_view` reads; `layout` is the Layout dialog's seven
-/// keys (#1695).
+/// keys (#1695); `rich_notes` the tasks' rich notes by uid (#1801), which
+/// `apply_view` ignores.
 fn view_json(v: &ProjectView) -> Json {
     let formatting = &v.ed.project().formatting;
     let text = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
@@ -405,6 +406,11 @@ fn view_json(v: &ProjectView) -> Json {
         ("layout", formatting.layout_json()),
         ("text_styles", Json::Obj(text_styles)),
         ("cells", Json::Arr(cells)),
+        // Read-only: the tasks' rich notes (#1801), which MSPDI cannot carry.
+        (
+            "rich_notes",
+            projcore::formatting::rich_notes_json(v.ed.project()),
+        ),
     ])
 }
 

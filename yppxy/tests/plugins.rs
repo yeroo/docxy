@@ -253,3 +253,64 @@ fn a_ui_plugin_command_runs_headless() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Rich task notes (#1801), the downstream plugin's loop: a command reads a
+/// task's markup from the request's `view.rich_notes` (MSPDI has the plain
+/// text only) and writes it back through `task.set rich_notes`; a `.yppx`
+/// save keeps it, and the next press reads the stored markup back.
+#[test]
+fn a_ui_plugin_reads_and_writes_rich_notes() {
+    let plugins = fixture_plugin::plugin_dir("yppxy-plugin-rich-notes");
+    let dir = work_dir("yppxy-rich-notes-work");
+    let input = dir.join("plan.xml");
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mspdi/10-summary.xml"),
+        &input,
+    )
+    .unwrap();
+    let press = |from: &Path, to: &Path| {
+        let output = yppxy(
+            Some(&plugins),
+            &[
+                from,
+                Path::new("--command"),
+                Path::new("fixture.richnote"),
+                Path::new("--save"),
+                to,
+            ],
+        );
+        ok(&output);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with("Fixture: rich note on task "),
+            "{stdout}"
+        );
+        let plan = projcore::yppx::read_yppx(&std::fs::read(to).unwrap()).unwrap();
+        let noted: Vec<_> = plan
+            .tasks
+            .iter()
+            .filter(|t| t.rich_notes.is_some())
+            .map(|t| (t.uid, t.notes.clone(), t.rich_notes.clone()))
+            .collect();
+        assert_eq!(noted.len(), 1, "{noted:?}");
+        noted.into_iter().next().unwrap()
+    };
+    // No rich notes yet: the plugin bolds the plain notes it reads from MSPDI.
+    let once = dir.join("once.yppx");
+    let (uid, notes, rich) = press(&input, &once);
+    let plain = notes.clone().unwrap();
+    let bold = plain
+        .split('\n')
+        .map(|l| format!("<p><b>{l}</b></p>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rich.as_deref(), Some(bold.as_str()));
+    // Reopened, the view hands the stored markup back, which the plugin
+    // extends: the bold survives, so it read the markup, not the plain text.
+    let twice = dir.join("twice.yppx");
+    let (uid2, notes, rich) = press(&once, &twice);
+    assert_eq!(uid2, uid);
+    assert_eq!(notes, Some(format!("{plain}\nagain")));
+    assert_eq!(rich, Some(format!("{bold}\n<li><i>again</i></li>")));
+    let _ = std::fs::remove_dir_all(dir);
+}

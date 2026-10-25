@@ -269,6 +269,11 @@ impl Formats {
                 ("bars", ed.project().formatting.bars_json()),
                 ("task_bars", ed.project().formatting.task_bars_json()),
                 ("layout", ed.project().formatting.layout_json()),
+                // Read-only: the tasks' rich notes (#1801).
+                (
+                    "rich_notes",
+                    projcore::formatting::rich_notes_json(ed.project()),
+                ),
             ]),
             values,
             button: None,
