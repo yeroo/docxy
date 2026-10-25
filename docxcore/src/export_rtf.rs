@@ -213,7 +213,7 @@ impl Writer<'_> {
             self.body.push_str("\\intbl");
         }
         let marker = self.markers.get(path).cloned();
-        let listed = p.props.num_id;
+        let listed = p.props.num_id.filter(|&n| n != 0);
         if let Some(num_id) = listed {
             let ilvl = p.props.ilvl.clamp(0, 8) as usize;
             let ls = self.list(num_id, ilvl, marker.as_deref());
@@ -1139,6 +1139,24 @@ pub(crate) mod tests {
             .map(|p| (p.props.num_id, p.props.ilvl))
             .collect();
         assert_eq!(ordered, [(Some(2), 0), (Some(2), 1), (Some(2), 0)]);
+    }
+
+    /// `w:numId="0"` is "no numbering" (#1728): no `\\ls`, no list table.
+    #[test]
+    fn num_id_zero_is_not_a_list() {
+        let doc = Document {
+            body: vec![para(
+                ParProps {
+                    num_id: Some(0),
+                    ..ParProps::default()
+                },
+                vec![plain("plain")],
+            )],
+        };
+        let s = to_rtf(&doc, &ExportContext::default());
+        assert!(!s.contains("\\ls"), "{s}");
+        assert!(!s.contains("\\ilvl"), "{s}");
+        assert!(!s.contains("\\listtable"), "{s}");
     }
 
     /// A numbered list whose number text has no `.` or `)` after it (`%1`,

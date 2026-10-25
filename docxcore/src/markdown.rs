@@ -121,7 +121,7 @@ pub fn to_markdown_with(doc: &Document, markers: &HashMap<Vec<usize>, String>) -
             continue;
         }
         let cur_list = match b {
-            Block::Paragraph(p) if p.props.num_id.is_some() && !is_hrule_para(p) => p.props.num_id,
+            Block::Paragraph(p) if p.props.in_list() && !is_hrule_para(p) => p.props.num_id,
             _ => None,
         };
         // Blank line between blocks, except between adjacent items of one list.
@@ -228,7 +228,7 @@ fn para_to_md(p: &Paragraph, marker: Option<&str>, out: &mut String) {
         return;
     }
     let text = inlines_to_md(&p.content);
-    if p.props.num_id.is_some() {
+    if p.props.in_list() {
         let indent = "  ".repeat(p.props.ilvl.max(0) as usize);
         match marker {
             // A numeric marker ("1.", "2)") makes an ordered item; anything else
@@ -1471,6 +1471,18 @@ mod tests {
             "cont",
             "no leading space before cont"
         );
+    }
+
+    /// `w:numId="0"` is "no numbering" (#1728): the paragraph between two
+    /// items is plain text, set off from them by blank lines.
+    #[test]
+    fn num_id_zero_writes_a_plain_paragraph() {
+        let mut doc = from_markdown("- a\n- b\n- c");
+        if let Block::Paragraph(p) = &mut doc.body[1] {
+            p.props.num_id = Some(0);
+        }
+        let md = to_markdown(&doc);
+        assert_eq!(md, "- a\n\nb\n\n- c\n", "{md:?}");
     }
 
     #[test]

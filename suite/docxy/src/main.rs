@@ -13598,7 +13598,7 @@ fn blank_base(doc: &Document) -> Package {
     let has_list = doc
         .body
         .iter()
-        .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+        .any(|b| matches!(b, Block::Paragraph(p) if p.props.in_list()));
     if has_list {
         docxcore::package::new_markdown_package(doc.clone())
     } else {
@@ -30197,6 +30197,36 @@ mod repeat_tests {
         assert_ne!(ed.doc, tabbed, "the repeat outdented");
     }
 
+    /// `w:numId="0"` is "no numbering" (#1728): no marker, a plain paragraph
+    /// that ends the list, and no list package for a new document.
+    #[test]
+    fn list_markers_skip_num_id_zero() {
+        use docxcore::model::{Block, Document, ParProps, Paragraph};
+        let p = |num_id| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let body = [p(Some(NUM_DECIMAL)), p(Some(NUM_DECIMAL)), p(Some(0)), p(Some(NUM_DECIMAL))];
+        assert_eq!(
+            list_markers(&body),
+            [
+                Some("1. ".to_string()),
+                Some("2. ".to_string()),
+                None,
+                Some("1. ".to_string())
+            ]
+        );
+        let base = blank_base(&Document {
+            body: vec![p(Some(0))],
+        });
+        assert!(base.part("word/numbering.xml").is_none());
+    }
+
     /// An undo step pushed in another editor (another tab, the
     /// header/footer editor) makes the record stale, though this editor's
     /// newest step is still the recorded one.
@@ -33156,7 +33186,7 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut counts: Vec<u32> = Vec::new();
     for b in body {
         let marker = match b {
-            Block::Paragraph(p) if p.props.num_id.is_some() => {
+            Block::Paragraph(p) if p.props.in_list() => {
                 let ilvl = p.props.ilvl as usize;
                 if p.props.num_id == Some(NUM_DECIMAL) {
                     if counts.len() <= ilvl {

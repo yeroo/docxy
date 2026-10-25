@@ -2674,6 +2674,23 @@ mod tests {
         assert_eq!(roundtrip(&d2, &Relationships::default()), d2);
     }
 
+    /// `w:numId="0"` cancels a style's numbering, so it is written and read
+    /// back as such, though it makes no list item (#1728).
+    #[test]
+    fn num_id_zero_is_written() {
+        let pp = ParProps {
+            style_id: Some("ListBullet".to_string()),
+            num_id: Some(0),
+            ..Default::default()
+        };
+        let d = Document {
+            body: vec![para(pp, vec![run("x", RunProps::default())])],
+        };
+        let xml = document_to_xml(&d);
+        assert!(xml.contains("<w:numId w:val=\"0\"/>"), "{xml}");
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
     #[test]
     fn paragraph_properties_roundtrip() {
         let pp = ParProps {

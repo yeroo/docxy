@@ -790,7 +790,7 @@ impl<'o> Compare<'o> {
         }
         if props
             .num_id
-            .is_some_and(|n| !self.nums.contains(&n.to_string()))
+            .is_some_and(|n| n != 0 && !self.nums.contains(&n.to_string()))
         {
             props.num_id = None;
             props.ilvl = 0;
@@ -1679,6 +1679,37 @@ mod tests {
     }
 
     use super::*;
+
+    /// An explicit `w:numId="0"` ("no numbering", overriding the style's) is
+    /// kept, though no numbering part defines a num 0; an undefined list is
+    /// still dropped (#1728).
+    #[test]
+    fn original_props_keep_num_id_zero() {
+        let opts = CompareOptions {
+            author: "a".into(),
+            date: "2026-01-01T00:00:00Z".into(),
+        };
+        let mut cx = Compare {
+            opts: &opts,
+            styles: HashSet::new(),
+            nums: HashSet::new(),
+            next_id: 1,
+            insertions: 0,
+            deletions: 0,
+            skipped: Vec::new(),
+            conflicts: Vec::new(),
+            dropped_conflicting: false,
+        };
+        let with = |num_id, ilvl| ParProps {
+            num_id: Some(num_id),
+            ilvl,
+            ..ParProps::default()
+        };
+        let kept = cx.original_par_props(&with(0, 0));
+        assert_eq!(kept.num_id, Some(0));
+        let dropped = cx.original_par_props(&with(5, 2));
+        assert_eq!((dropped.num_id, dropped.ilvl), (None, 0));
+    }
 
     fn script(a: &str, b: &str) -> String {
         let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
