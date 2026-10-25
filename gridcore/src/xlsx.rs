@@ -3555,10 +3555,29 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 /// `.xlsx` that says it is a template or carries macros. `pkg` itself is
 /// untouched.
 pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
+    save_xlsx_as_with(pkg, kind, SaveCalc::default())
+}
+
+/// The host's clock and RAND seed for the formulas a save evaluates: the
+/// cells that read one a macro-free save turned into `#REF!`. With none, a
+/// clock or RAND formula among them keeps its cached value, as
+/// [`save_xlsx_as`] leaves it. A host passes its engine's
+/// ([`crate::engine::Engine::clock`], [`crate::engine::Engine::seed`]); the
+/// save draws from a copy, so the host's seed does not move.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SaveCalc {
+    /// The current moment as an Excel serial (`NOW()`, `TODAY()`).
+    pub clock: Option<f64>,
+    /// The PRNG state for `RAND`.
+    pub seed: Option<u64>,
+}
+
+/// [`save_xlsx_as`] with the host's clock and RAND seed ([`SaveCalc`]).
+pub fn save_xlsx_as_with(pkg: &SheetPackage, kind: SpreadsheetKind, calc: SaveCalc) -> Vec<u8> {
     let without_excel4_macros;
     let pkg = if !kind.allows_macros() && (pkg.has_macro_sheets() || pkg.has_macro_names()) {
         let mut copy = pkg.clone();
-        copy.remove_excel4_macros();
+        copy.remove_excel4_macros(calc);
         without_excel4_macros = copy;
         &without_excel4_macros
     } else {
@@ -3576,8 +3595,17 @@ pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
 /// [`save_xlsx_as`] with the kind of `path`'s extension; an extension that is
 /// not a spreadsheet type keeps the loaded type, as [`save_xlsx`] does.
 pub fn save_xlsx_for_path(pkg: &SheetPackage, path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    save_xlsx_for_path_with(pkg, path, SaveCalc::default())
+}
+
+/// [`save_xlsx_for_path`] with the host's clock and RAND seed ([`SaveCalc`]).
+pub fn save_xlsx_for_path_with(
+    pkg: &SheetPackage,
+    path: impl AsRef<std::path::Path>,
+    calc: SaveCalc,
+) -> Vec<u8> {
     match SpreadsheetKind::from_path(path) {
-        Some(kind) => save_xlsx_as(pkg, kind),
+        Some(kind) => save_xlsx_as_with(pkg, kind, calc),
         None => save_xlsx(pkg),
     }
 }
@@ -3709,11 +3737,12 @@ impl SheetPackage {
     /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
     /// removed sheet keeps its cell, with that reference as `#REF!`. A
     /// workbook of nothing but macro sheets first gains a blank worksheet, so
-    /// one remains. Returns whether there was anything to drop.
+    /// one remains. The readers of a rewritten cell are evaluated on
+    /// `calc`'s clock and seed. Returns whether there was anything to drop.
     ///
     /// Only that copy: an open workbook keeps its macros, as Excel keeps
     /// them, and its sheet indices stay put.
-    fn remove_excel4_macros(&mut self) -> bool {
+    fn remove_excel4_macros(&mut self, calc: SaveCalc) -> bool {
         let doomed = self.macro_sheet_indices();
         if doomed.is_empty() && !self.has_macro_names() {
             return false;
@@ -3781,6 +3810,8 @@ impl SheetPackage {
         // Before the sheets go, while their indices still hold.
         if !rewritten.is_empty() {
             let mut engine = crate::engine::Engine::new(&self.workbook);
+            engine.clock = calc.clock;
+            engine.seed = calc.seed;
             engine.recalc_dependents_of(&mut self.workbook, &rewritten);
         }
         for &i in doomed.iter().rev() {
@@ -19866,8 +19897,8 @@ mod kind_tests {
 
         // The in-memory drop agrees with the file.
         let mut pkg = mixed_xlm_book();
-        assert!(pkg.remove_excel4_macros());
-        assert!(!pkg.remove_excel4_macros());
+        assert!(pkg.remove_excel4_macros(SaveCalc::default()));
+        assert!(!pkg.remove_excel4_macros(SaveCalc::default()));
         assert!(
             pkg.workbook
                 .defined_names
@@ -20213,10 +20244,10 @@ mod kind_tests {
 
         // The in-memory drop does the same.
         let mut copy = pkg.clone();
-        assert!(copy.remove_excel4_macros());
+        assert!(copy.remove_excel4_macros(SaveCalc::default()));
         assert!(!copy.has_macro_names());
         assert_eq!(copy.workbook.sheets.len(), 2);
-        assert!(!copy.remove_excel4_macros());
+        assert!(!copy.remove_excel4_macros(SaveCalc::default()));
     }
 
     /// #727 r2: a macro sheet named by an absolute or `./` Target is removed
@@ -20314,7 +20345,7 @@ mod kind_tests {
         assert!(rels.contains("dialogsheets"), "{rels}");
 
         let mut copy = relocated_xlm_book();
-        assert!(copy.remove_excel4_macros());
+        assert!(copy.remove_excel4_macros(SaveCalc::default()));
         let wb = part_text(&copy, "wb/book.xml");
         assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
         assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
@@ -20472,15 +20503,58 @@ mod kind_tests {
         assert_eq!(value(3), CellValue::Number(0.0), "IFERROR sees the error");
         assert_eq!(value(4), CellValue::Number(123.0), "NOW() reads none of it");
         assert_eq!(value(5), CellValue::Number(77.0), "reads another sheet");
-        // The engine has no clock or random seed here, so a clock or RAND
-        // formula keeps its cached value even when it reads a rewritten cell;
-        // Excel recalculates it on load (`fullCalcOnLoad`).
+        // `save_xlsx_as` gives the engine no clock or random seed, so a clock
+        // or RAND formula keeps its cached value even when it reads a
+        // rewritten cell (Excel recalculates it on load, `fullCalcOnLoad`);
+        // a host passes its own through `save_xlsx_as_with` (#1723).
         assert_eq!(value(6), CellValue::Number(0.5), "no clock to evaluate it");
         // The open workbook is untouched.
         assert_eq!(
             pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
             CellValue::Number(10.0)
         );
+    }
+
+    /// #1723: with the host's clock and seed, a volatile formula that reads a
+    /// rewritten cell is saved with the value the `#REF!` gives it; one that
+    /// reads none still keeps its cached value.
+    #[test]
+    fn macro_free_save_with_a_clock_evaluates_volatile_readers_of_a_rewritten_cell() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let cached = |src: &str, v: f64| {
+            let mut c = Cell::formula(src);
+            c.value = CellValue::Number(v);
+            c
+        };
+        data.set_cell(0, 0, cached("Macro1!A1+1", 9.0));
+        data.set_cell(0, 1, cached("IF(ISERROR(A1),NOW(),0)", 0.5));
+        data.set_cell(0, 2, cached("NOW()+A1", 0.5));
+        data.set_cell(0, 3, cached("NOW()", 123.0));
+        data.set_cell(0, 4, cached("RAND()+0*IFERROR(A1,0)", 5.0));
+        let calc = SaveCalc {
+            clock: Some(45_306.25),
+            seed: Some(7),
+        };
+        let out = load_xlsx(&save_xlsx_as_with(&pkg, SpreadsheetKind::Workbook, calc)).unwrap();
+        let data = &out.workbook.sheets[0];
+        let value = |c: u32| data.cell(0, c).unwrap().value.clone();
+        assert_eq!(value(1), CellValue::Number(45_306.25), "NOW() on the clock");
+        assert_eq!(value(2), CellValue::Error("#REF!".into()));
+        assert_eq!(value(3), CellValue::Number(123.0), "NOW() reads none of it");
+        match value(4) {
+            CellValue::Number(n) => assert!((0.0..1.0).contains(&n), "RAND gave {n}"),
+            v => panic!("RAND reader is {v:?}"),
+        }
+        // The path form passes it through too.
+        let out = load_xlsx(&save_xlsx_for_path_with(&pkg, "out.xlsx", calc)).unwrap();
+        let v = out.workbook.sheets[0].cell(0, 1).unwrap().value.clone();
+        assert_eq!(v, CellValue::Number(45_306.25));
+        // Without them (the plain form): cached values, RAND included.
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let data = &out.workbook.sheets[0];
+        assert_eq!(data.cell(0, 1).unwrap().value, CellValue::Number(0.5));
+        assert_eq!(data.cell(0, 4).unwrap().value, CellValue::Number(5.0));
     }
 
     /// #827: chart series refs, a validation list and a conditional-format

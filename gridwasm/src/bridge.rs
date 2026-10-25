@@ -10,7 +10,9 @@ use gridcore::sheet::{
     Align, Cell, CellValue, DefinedName, DrawingKind, MAX_COLS, MAX_ROWS, Sheet, Styles, cell_name,
     fmt_general, format_with, parse_cell_name, parse_col, parse_range_name, sheet_to_csv,
 };
-use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, save_xlsx, save_xlsx_as};
+use gridcore::xlsx::{
+    SaveCalc, SheetPackage, SpreadsheetKind, load_xlsx, save_xlsx, save_xlsx_as_with,
+};
 
 use crate::json;
 
@@ -897,10 +899,15 @@ impl Session {
     /// [`Self::save`] as a file of `kind`: the workbook part's content type
     /// follows it, and a macro-free kind leaves the VBA project and Excel 4.0
     /// macro sheets out of the bytes (the open workbook keeps them). `None`
-    /// keeps the loaded type.
+    /// keeps the loaded type. The readers of a cell a macro-free save turns
+    /// into `#REF!` are evaluated on the session's clock and seed.
     pub fn save_as(&mut self, kind: Option<SpreadsheetKind>) -> Vec<u8> {
+        let calc = SaveCalc {
+            clock: self.engine.clock,
+            seed: self.engine.seed,
+        };
         let out = match kind {
-            Some(kind) => save_xlsx_as(&self.pkg, kind),
+            Some(kind) => save_xlsx_as_with(&self.pkg, kind, calc),
             None => save_xlsx(&self.pkg),
         };
         self.dirty = false;
@@ -3775,6 +3782,32 @@ mod tests {
         assert!(v.contains("3.75"), "formula not recalculated: {v}");
         assert!(v.contains("\"dirty\":false"), "{v}");
         assert!(v.contains("\"cur\":{\"ref\":\"A1\""), "{v}");
+    }
+
+    /// #1723: a macro-free save evaluates a clock formula that reads a cell
+    /// it turns into `#REF!` on the session's clock.
+    #[test]
+    fn a_macro_free_save_evaluates_the_ref_readers_on_the_sessions_clock() {
+        use gridcore::sheet::CellValue;
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Macro1");
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml""#,
+                r#"Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("Macro1!A1+1"));
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::formula("IF(ISERROR(A1),NOW(),0)"));
+        let bytes = gridcore::xlsx::save_xlsx_as(&pkg, SpreadsheetKind::MacroWorkbook);
+        let mut s = Session::open(&bytes).expect("open");
+        s.dispatch("clock\t45306.25");
+        let out = load_xlsx(&s.save_as(Some(SpreadsheetKind::Workbook))).unwrap();
+        assert!(!out.has_macro_sheets());
+        assert_eq!(
+            out.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(45_306.25)
+        );
     }
 
     #[test]
