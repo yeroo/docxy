@@ -163,6 +163,70 @@ fn a_plugin_write_and_read_carry_the_formatting() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Rich task notes (#1801) cross the format plugin seam inside the
+/// formatting text: a plan whose only "formatting" is a rich note still hands
+/// the plugin a formatting text, and the markup comes back on read. MSPDI
+/// alone (a `.xml` save, or the plain read) keeps the plain text only.
+#[test]
+fn rich_notes_cross_the_plugin_seam_both_ways() {
+    let dir = fixture_plugin::plugin_dir("projcore-plugin-rich-notes");
+    let mut registry = Registry::new();
+    for format in load_plugins(std::slice::from_ref(&dir)) {
+        registry.register(format);
+    }
+    let path = Path::new("plan.fakeproj");
+    let mut project = corpus_plan();
+    assert!(project.formatting.is_empty());
+    let i = project
+        .tasks
+        .iter()
+        .position(|t| t.uid != 0 && !t.is_null)
+        .unwrap();
+    let uid = project.tasks[i].uid;
+    let markup = "<p><b>Bold</b> &amp; plain</p>\n<li align=\"center\">item</li>";
+    project.tasks[i].notes = Some("Bold & plain\nitem".into());
+    project.tasks[i].rich_notes = Some(markup.into());
+
+    let bytes = registry.write(&project, path, None).unwrap();
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    assert!(text.contains("<!-- fixture-formatting: "), "{text}");
+    let back = registry.read(path, &bytes).unwrap();
+    let task = back.tasks.iter().find(|t| t.uid == uid).unwrap();
+    assert_eq!(task.rich_notes.as_deref(), Some(markup));
+    assert_eq!(task.notes.as_deref(), Some("Bold & plain\nitem"));
+    assert!(back.formatting.is_empty());
+    assert_eq!(
+        back.tasks.iter().filter(|t| t.rich_notes.is_some()).count(),
+        1
+    );
+
+    // MSPDI keeps the plain text only: the plain read of the same bytes, and
+    // a `.xml` save and reopen.
+    let plain = read_mspdi(&text).unwrap();
+    assert!(plain.tasks.iter().all(|t| t.rich_notes.is_none()));
+    let xml = Path::new("plan.xml");
+    let reopened = registry
+        .read(xml, &registry.write(&project, xml, None).unwrap())
+        .unwrap();
+    let task = reopened.tasks.iter().find(|t| t.uid == uid).unwrap();
+    assert_eq!(
+        (task.notes.as_deref(), task.rich_notes.as_deref()),
+        (Some("Bold & plain\nitem"), None)
+    );
+
+    // The plugin's file now holds other text for that task (edited outside):
+    // the stale note is dropped, the new text kept.
+    let edited = text.replace("Bold &amp; plain", "Rewritten");
+    let back = registry.read(path, edited.as_bytes()).unwrap();
+    let task = back.tasks.iter().find(|t| t.uid == uid).unwrap();
+    assert_eq!(
+        (task.notes.as_deref(), task.rich_notes.as_deref()),
+        (Some("Rewritten\nitem"), None)
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn formatting_a_plugin_returns_that_cannot_be_read_fails_the_read() {
     let dir = fixture_plugin::plugin_dir("projcore-plugin-formatting-bad");
