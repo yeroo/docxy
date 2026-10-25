@@ -1778,11 +1778,19 @@
   block as a new `<hyperlink>` over `now` (in `hyperlinks_removed` it strikes
   nothing). HLinkTooltip (0x0800) is named "hyperlink ScreenTips". Checked
   against xlrd only (no Excel oracle).
-- `xlsx::model_target` maps every `file:` spelling of a UNC path
+- The model holds paths natively, UNC and scheme-less alike (`has_scheme`, in
+  `xlsx/hyperlinks.rs`, is the one scheme test; `C:` is a drive): an xlsx
+  `Target` (a URI reference) is decoded on load and `%`-escaped on write.
+  `xlsx::model_target` maps every `file:` spelling of a UNC path
   (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
-  decoded in each) to `\\s\sh`; `localhost`, a drive or port in the server's
-  place (`file://C:/x`, `file://h:80/x`), local paths, `?`/`#`, escaped
-  separators and bad escapes stay raw. `wire_target` writes a UNC path as
-  `file:///\\…` with `%` escaped as `%25`, so it reloads as written. The xlsx
-  save compares and reuses relationships through `model_target`, so a raw
-  spelling held in the model is no change and no new relationship.
+  decoded in each) to `\\s\sh`, and decodes a scheme-less path's escapes
+  (`My%20Book.xlsx`); `localhost`, a drive or port in the server's place
+  (`file://C:/x`, `file://h:80/x`), local `file:` paths, `?`/`#`, URLs,
+  locations, escaped separators and bad escapes stay raw. `wire_target` writes
+  a UNC path as `file:///\\…` and any native path with `%` escaped as `%25`, so
+  it reloads as written. The save compares model values through `canonical`
+  (`model_target(wire_target(m))`, never `model_target(m)`, which would decode
+  a native `%`) and reuses relationships through it, so a raw spelling held in
+  the model is no change and no new relationship. An `.xls` File moniker's path
+  is native and read as it is; URL and string monikers go through
+  `model_target`.

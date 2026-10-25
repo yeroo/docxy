@@ -24,24 +24,59 @@ type Rect = (u32, u32, u32, u32);
 /// How Excel spells a UNC path in a relationship: `file:///\\server\share`.
 const UNC_URI: &str = "file:///";
 
-/// The relationship `Target` for a model target: a UNC path (`\\server\share`)
-/// gets the `file:///` Excel writes, since a bare backslash path is no URI
-/// (#1456), and its `%` is escaped as `%25`, as [`model_target`] decodes the
-/// escapes of that spelling (#1726); every other target is written as it is.
+/// Whether `target` starts with a URI scheme of two or more characters
+/// (`C:` is a drive, not a scheme): the one test the model, the xlsx save and
+/// the `.xls` HLINK writer share.
+pub(crate) fn has_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
+    let scheme = &target[..colon];
+    scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
+/// A path with no scheme that is not a UNC path or a location: relative or
+/// a drive path (`..\a.xlsx`, `C:\x.xlsx`, `sub/x.xlsx`).
+fn is_plain_path(target: &str) -> bool {
+    !has_scheme(target) && !target.starts_with("\\\\") && !target.starts_with('#')
+}
+
+/// The relationship `Target` for a model target. The model holds a path
+/// natively (#1726), and a `Target` is a URI reference, so a path's `%` is
+/// escaped as `%25` ([`model_target`] decodes it back): a UNC path
+/// (`\\server\share`) also gets the `file:///` Excel writes, since a bare
+/// backslash path is no URI (#1456). Every other target is written as it is.
 fn wire_target(model: &str) -> Cow<'_, str> {
     if model.starts_with("\\\\") {
         Cow::Owned(format!("{UNC_URI}{}", model.replace('%', "%25")))
+    } else if is_plain_path(model) && model.contains('%') {
+        Cow::Owned(model.replace('%', "%25"))
     } else {
         Cow::Borrowed(model)
     }
 }
 
-/// The model target for a relationship `Target`: a `file:` URI naming a UNC
-/// path is the plain path (`\\server\share\...`), in each spelling it comes
-/// in (#1726): Excel's `file:///\\server\share`, and `file://server/share`,
+/// A model target as a save would reload it: the identity on the model's own
+/// form, and the model's form for a raw spelling held in it
+/// (`file://srv/share/x`). Model values are compared through this, never
+/// through [`model_target`], which would decode a native path's `%`.
+fn canonical(model: &str) -> String {
+    model_target(&wire_target(model)).into_owned()
+}
+
+/// The model target for a relationship `Target`: the model holds paths
+/// natively (#1726). A `file:` URI naming a UNC path is the plain path
+/// (`\\server\share\...`), in each spelling it comes in: Excel's
+/// `file:///\\server\share`, and `file://server/share`,
 /// `file:////server/share` and `file://///server/share` (any case of the
-/// scheme; percent escapes decoded). Every other target, including one a
-/// #1025 save wrote as a bare UNC path, is as it is.
+/// scheme; percent escapes decoded). A path with no scheme
+/// (`My%20Book.xlsx`, `C:\a%20b.xlsx`) has its escapes decoded. One whose
+/// escapes do not decode (a bad one, `%2F`, `%5C`, not UTF-8), a URL, a
+/// location, and a bare UNC path a #1025 save wrote, are as they are.
 pub(crate) fn model_target(wire: &str) -> Cow<'_, str> {
     match wire.get(..UNC_URI.len()) {
         Some(scheme) if scheme.eq_ignore_ascii_case(UNC_URI) => {
@@ -57,10 +92,15 @@ pub(crate) fn model_target(wire: &str) -> Cow<'_, str> {
         }
         _ => {}
     }
-    match unc_of_file_uri(wire) {
-        Some(unc) => Cow::Owned(unc),
-        None => Cow::Borrowed(wire),
+    if let Some(unc) = unc_of_file_uri(wire) {
+        return Cow::Owned(unc);
     }
+    if is_plain_path(wire) && wire.contains('%') {
+        if let Some(decoded) = percent_decode(wire) {
+            return Cow::Owned(decoded);
+        }
+    }
+    Cow::Borrowed(wire)
 }
 
 /// The UNC path a `file://server/share/...` URI names (two, four or five
@@ -263,7 +303,7 @@ pub(super) fn write_hyperlinks(
     let mut changed: HashSet<(u32, u32)> = sheet
         .hyperlinks
         .iter()
-        .filter(|(cell, t)| loaded.get(cell).copied() != Some(&*model_target(t)))
+        .filter(|(cell, t)| loaded.get(cell).copied() != Some(canonical(t).as_str()))
         .map(|(&cell, _)| cell)
         .collect();
     changed.extend(
@@ -296,7 +336,7 @@ pub(super) fn write_hyperlinks(
     let mut new: BTreeMap<(u32, u32), &str> = sheet
         .hyperlinks
         .iter()
-        .filter(|(cell, t)| kept.get(cell).copied() != Some(&*model_target(t)))
+        .filter(|(cell, t)| kept.get(cell).copied() != Some(canonical(t).as_str()))
         .map(|(&cell, t)| (cell, t.as_str()))
         .collect();
 
@@ -319,7 +359,7 @@ pub(super) fn write_hyperlinks(
             continue;
         };
         let own = link.target.as_str();
-        if !link_cells(now).all(|c| new.get(&c).is_some_and(|t| model_target(t) == own)) {
+        if !link_cells(now).all(|c| new.get(&c).is_some_and(|t| canonical(t) == own)) {
             continue;
         }
         for c in link_cells(now) {
@@ -426,7 +466,7 @@ fn relocate(items: &mut [Item], sheet: &Sheet) -> bool {
             continue;
         };
         if link_cells(now).all(|c| {
-            sheet.hyperlinks.get(&c).map(|t| model_target(t)).as_deref() == Some(target.as_str())
+            sheet.hyperlinks.get(&c).map(|t| canonical(t)).as_deref() == Some(target.as_str())
         }) {
             item.moved_to = Some(now);
             item.link = Some((now, target.clone()));
@@ -503,7 +543,7 @@ impl ExternalRels {
     /// `file:///`, a #1025 bare UNC path), else a new one with the next free
     /// `rIdN`, written as [`wire_target`].
     fn id(&mut self, model: &str) -> Option<String> {
-        if let Some(id) = self.have.get(&*model_target(model)) {
+        if let Some(id) = self.have.get(&canonical(model)) {
             return Some(id.clone());
         }
         let target = wire_target(model);
@@ -520,8 +560,7 @@ impl ExternalRels {
             self.rel_type,
             esc_attr(&target)
         ));
-        self.have
-            .insert(model_target(model).into_owned(), rid.clone());
+        self.have.insert(canonical(model), rid.clone());
         Some(rid)
     }
 

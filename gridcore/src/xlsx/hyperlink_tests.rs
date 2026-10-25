@@ -1125,3 +1125,79 @@ fn a_unc_path_s_percent_is_escaped_in_its_file_uri() {
     assert_eq!(text(&again, RELS), text(&re, RELS));
     assert_eq!(text(&again, SHEET), text(&re, SHEET));
 }
+
+// ---- Scheme-less paths are native in the model (#1726 r5) ----
+
+#[test]
+fn scheme_less_targets_load_native() {
+    for (wire, want) in [
+        ("My%20Book.xlsx", "My Book.xlsx"),
+        ("..\\Q1%20Sales.xlsx", "..\\Q1 Sales.xlsx"),
+        ("C:\\a%20b.xlsx", "C:\\a b.xlsx"),
+        ("sub/x.xlsx", "sub/x.xlsx"),
+        // Escapes that do not decode, a URL and a location stay raw.
+        ("a%2Fb.xlsx", "a%2Fb.xlsx"),
+        ("C:\\100%.xlsx", "C:\\100%.xlsx"),
+        ("https://x/a%20b", "https://x/a%20b"),
+        ("#a%20b", "#a%20b"),
+    ] {
+        assert_eq!(model_target(wire), want, "{wire}");
+    }
+}
+
+#[test]
+fn an_unchanged_escaped_path_link_keeps_bytes() {
+    let pkg = linked_spellings(&["My%20Book.xlsx", "C:\\100%.xlsx"]);
+    let links = &pkg.workbook.sheets[0].hyperlinks;
+    assert_eq!(links[&(0, 0)], "My Book.xlsx");
+    assert_eq!(links[&(1, 0)], "C:\\100%.xlsx");
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+    // A new link to the same file reuses its relationship.
+    let mut pkg = pkg;
+    link(&mut pkg, "B9", "My Book.xlsx");
+    let re = resaved(&pkg);
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"B9\" r:id=\"rId1\"/>"));
+    assert_eq!(targets_of(&re, "/hyperlink").len(), 2);
+}
+
+#[test]
+fn a_native_percent_path_is_escaped_in_its_target() {
+    let mut pkg = plain_book();
+    link(&mut pkg, "A1", "..\\a%41.xlsx");
+    link(&mut pkg, "A2", "C:\\100%.xlsx");
+    let re = resaved(&pkg);
+    let mut got = targets_of(&re, "/hyperlink");
+    got.sort();
+    assert_eq!(got, vec!["..\\a%2541.xlsx", "C:\\100%25.xlsx"]);
+    assert_links_kept(&pkg, &re);
+    let again = resaved(&re);
+    assert_eq!(text(&again, RELS), text(&re, RELS));
+    assert_eq!(text(&again, SHEET), text(&re, SHEET));
+}
+
+#[test]
+fn paths_cross_between_xlsx_and_xls_natively() {
+    // An xlsx Target's escapes are decoded; the .xls File moniker holds the
+    // native path.
+    let pkg = linked_spellings(&["My%20Book.xlsx"]);
+    let out = crate::legacy::write_xls(&pkg);
+    assert!(out.lost.is_empty(), "{:?}", out.lost);
+    let (xls, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+    assert_eq!(xls.workbook.sheets[0].hyperlinks[&(0, 0)], "My Book.xlsx");
+    // A native `%` from an .xls is escaped in the xlsx Target and reloads
+    // as itself.
+    let mut pkg = plain_book();
+    link(&mut pkg, "A1", "..\\a%41.xlsx");
+    let (xls, _) = crate::legacy::open_workbook(&crate::legacy::write_xls(&pkg).bytes).unwrap();
+    assert_eq!(xls.workbook.sheets[0].hyperlinks[&(0, 0)], "..\\a%41.xlsx");
+    let xlsx = resaved(&xls);
+    let rels: Vec<String> = parse_rels_mode(&text(&xlsx, RELS))
+        .into_iter()
+        .filter(|(_, ty, _, _)| ty.ends_with("/hyperlink"))
+        .map(|(_, _, t, _)| t)
+        .collect();
+    assert_eq!(rels, vec!["..\\a%2541.xlsx"]);
+    assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 0)], "..\\a%41.xlsx");
+}

@@ -15,7 +15,7 @@
 
 use super::Le;
 use super::ptg::utf16;
-use crate::xlsx::model_target;
+use crate::xlsx::{has_scheme, model_target};
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
 pub(crate) type Rect = (u32, u32, u32, u32);
@@ -47,20 +47,6 @@ const HAS_LOCATION: u32 = 0x08;
 const HAS_DISPLAY_NAME: u32 = 0x10;
 const HAS_FRAME_NAME: u32 = 0x80;
 const MONIKER_SAVED_AS_STR: u32 = 0x100;
-
-/// Whether `target` starts with a URI scheme of two or more characters
-/// (`C:` is a drive, not a scheme).
-fn has_scheme(target: &str) -> bool {
-    let Some(colon) = target.find(':') else {
-        return false;
-    };
-    let scheme = &target[..colon];
-    scheme.len() >= 2
-        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-        && scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
-}
 
 /// A HyperlinkString: the character count with the null, the UTF-16
 /// characters, the null.
@@ -234,15 +220,18 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
     if flags & HAS_FRAME_NAME != 0 {
         c.hyperlink_string()?;
     }
+    // A URL or string moniker is URI text, mapped as an xlsx Target is
+    // ([`model_target`]); a File moniker's path is native, as the model holds
+    // paths.
     let moniker = if flags & HAS_MONIKER == 0 {
         None
     } else if flags & MONIKER_SAVED_AS_STR != 0 {
-        Some(c.hyperlink_string()?)
+        Some(model_target(&c.hyperlink_string()?).into_owned())
     } else {
         let class = c.take(16)?;
         if class == URL_MONIKER {
             let n = c.u32()? as usize;
-            Some(utf16_to_null(c.take(n)?))
+            Some(model_target(&utf16_to_null(c.take(n)?)).into_owned())
         } else if class == FILE_MONIKER {
             Some(read_file_moniker(&mut c)?)
         } else {
@@ -255,8 +244,8 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
         None
     };
     let target = match (moniker, location) {
-        (Some(m), None) => model_target(&m).into_owned(),
-        (Some(m), Some(l)) => format!("{}#{l}", model_target(&m)),
+        (Some(m), None) => m,
+        (Some(m), Some(l)) => format!("{m}#{l}"),
         (None, Some(l)) => format!("#{l}"),
         (None, None) => return None,
     };
@@ -416,7 +405,8 @@ mod tests {
 
     #[test]
     fn a_file_path_is_native_text() {
-        // A File moniker's path is the filesystem's: a `%` is a `%`.
+        // A File moniker's path is native, as the model holds paths: a `%` is
+        // a `%` (an xlsx Target's escapes are decoded on load, #1726 r5).
         for t in ["C:\\R\\Sales%2024.xlsx", "..\\a%41.xlsx", "My%20Book.xlsx"] {
             assert_eq!(parse(&body((0, 0, 0, 0), t)).unwrap().1, t);
         }

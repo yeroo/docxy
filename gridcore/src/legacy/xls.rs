@@ -2086,6 +2086,35 @@ pub(crate) mod tests {
         assert_eq!(xlsx.workbook.sheets[0].hyperlinks, s.hyperlinks);
     }
 
+    /// The trace of #1726 r5: HLINK C:C -> x, then C1 -> y; deleting row 1
+    /// re-anchors the column on the new C1, which takes the range's own x,
+    /// not the deleted cell's y.
+    #[test]
+    fn a_reanchored_range_keeps_its_own_target() {
+        let hlink = |rect, t| rec(0x01B8, &super::super::hlink::body(rect, t));
+        let stream = workbook(
+            &[],
+            &[
+                hlink((0, 2, 65_535, 2), "https://x/"),
+                hlink((0, 2, 0, 2), "https://y/"),
+            ],
+        );
+        let mut pkg = read(&stream).unwrap().build();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.hyperlinks.len(), 1);
+        assert_eq!(s.hyperlinks[&(0, 2)], "https://x/");
+        assert_eq!(s.hyperlink_refs[&(0, 2)].now, (0, 2, 65_534, 2));
+        assert_eq!(s.hyperlink_refs[&(0, 2)].target, "https://x/");
+        // Intact again: written as the one range.
+        let out = crate::legacy::xls_write::write_xls(&pkg);
+        let (back, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+        assert_eq!(
+            back.workbook.sheets[0].hyperlink_refs[&(0, 2)].now,
+            (0, 2, 65_534, 2)
+        );
+    }
+
     #[test]
     fn hlink_tooltip_is_named() {
         let good = rec(0x01B8, &super::super::hlink::body((0, 0, 0, 0), "#Data!B2"));

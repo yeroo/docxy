@@ -2501,9 +2501,9 @@ fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
                 continue;
             };
             let rect = with_axis(now, lo, hi);
-            if let Some(target) = sheet.hyperlinks.get(&(now.0, now.1)) {
-                reanchored.push((rect, target.clone()));
-            }
+            // The range's own target, not the anchor cell's: a link of the
+            // anchor's own goes with the anchor (#1726 r5).
+            reanchored.push((rect, l.target.clone()));
             rect
         } else {
             let (Some(lo), Some(hi)) = (point(a, shift), point(b, shift)) else {
