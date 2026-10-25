@@ -396,7 +396,7 @@ fn custom_page_setup(p: &crate::print::setup::PageSetup) -> bool {
 /// What each loaded `<cellXfs>` entry of the package's styles part has
 /// beyond the model's xf ([`crate::xlsx::loaded_xf_extras`]).
 fn loaded_extras(pkg: &SheetPackage) -> Vec<crate::xlsx::LoadedXfExtras> {
-    pkg.part("xl/styles.xml")
+    pkg.part(pkg.styles_part_name())
         .map(|b| crate::xlsx::loaded_xf_extras(&String::from_utf8_lossy(b)))
         .unwrap_or_default()
 }

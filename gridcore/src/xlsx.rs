@@ -110,6 +110,10 @@ pub struct SheetPackage {
     /// this exact part instead of assuming the standard path — otherwise an
     /// unconventional original would be left orphaned beside a fresh duplicate.
     shared_part: Option<String>,
+    /// Resolved part name of the workbook's styles part, if it has one (it
+    /// need not be the conventional `xl/styles.xml`). Authored cell styles
+    /// and dxfs go into this exact part, through [`Self::styles_part_name`].
+    styles_part: Option<String>,
     /// The workbook is Strict Open XML: parts and relationships the writer
     /// creates use the Strict namespaces, as its own parts do.
     strict: bool,
@@ -118,6 +122,12 @@ pub struct SheetPackage {
 }
 
 impl SheetPackage {
+    /// The styles part's name: the one the workbook's relationships name,
+    /// else the conventional `xl/styles.xml`.
+    pub(crate) fn styles_part_name(&self) -> &str {
+        self.styles_part.as_deref().unwrap_or("xl/styles.xml")
+    }
+
     /// Names of all parts in the container (for inspection/tests).
     pub fn part_names(&self) -> Vec<&str> {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()
@@ -350,10 +360,13 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         None => Vec::new(),
     };
     let ambiguous = ambiguous_shared(&shared);
-    let styles = rels
+    let styles_part = rels
         .iter()
         .find(|(_, ty, _)| ty.ends_with("/styles"))
-        .and_then(|(_, _, t)| get_str(&resolve(t)))
+        .map(|(_, _, t)| resolve(t));
+    let styles = styles_part
+        .as_deref()
+        .and_then(get_str)
         .map(|xml| parse_styles(&xml))
         .unwrap_or_default();
 
@@ -544,6 +557,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         macro_loaded: Default::default(),
         shared,
         shared_part,
+        styles_part,
         strict,
         workbook: Workbook {
             sheets,
@@ -1947,6 +1961,7 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                     | crate::model::MODEL_PART
             )
             || Some(name) == pkg.shared_part.as_deref()
+            || Some(name) == pkg.styles_part.as_deref()
             || under("xl/sharedStrings")
             || under("xl/theme/")
             // Named through the model or the sheet's own elements.
@@ -1989,7 +2004,7 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
 
     // A cell style of the workbook's own (Excel's built-in ones carry a
     // builtinId): the .xls gets the Normal style alone.
-    if let Some(xml) = text("xl/styles.xml") {
+    if let Some(xml) = text(pkg.styles_part_name()) {
         let own = section_children(&xml, "cellStyles", "cellStyle")
             .into_iter()
             .any(|raw| {
@@ -4181,8 +4196,9 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     };
 
     // --- colour filters' <dxf>s: an equal one the styles part has, or new
+    let styles_name = pkg.styles_part_name();
     let styles_src = pkg
-        .part("xl/styles.xml")
+        .part(styles_name)
         .map(|b| String::from_utf8_lossy(b).into_owned());
     let have_dxfs: Vec<String> = styles_src
         .as_deref()
@@ -4325,18 +4341,18 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     }
 
     // --- authored cell styles: append new xfs to styles.xml ---------------
-    if let Some(orig) = pkg.part("xl/styles.xml") {
+    if let Some(orig) = pkg.part(styles_name) {
         let orig = String::from_utf8_lossy(orig).into_owned();
         let base = parse_styles(&orig).xfs.len();
         if wb.styles.xfs.len() > base {
             let updated = splice_styles(&orig, &wb.styles.xfs[base..]);
-            if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == styles_name) {
                 p.1 = updated.into_bytes();
             }
         }
     }
     if !new_dxfs.is_empty() {
-        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == styles_name) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = append_dxfs(&xml, &new_dxfs).into_bytes();
         }
@@ -9948,8 +9964,10 @@ impl SheetPackage {
         }
         let dxf_id = self.workbook.styles.dxfs.len();
         self.workbook.styles.dxfs.push(dxf);
-        // styles.xml: regenerate <dxfs> from the model (splice_styles preserves it).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+        // The styles part: regenerate <dxfs> from the model (splice_styles
+        // preserves it).
+        let styles_name = self.styles_part_name().to_string();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == styles_name) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = set_dxfs(&xml, &self.workbook.styles.dxfs).into_bytes();
         }
@@ -11454,6 +11472,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
         macro_loaded: Default::default(),
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
+        styles_part: Some("xl/styles.xml".to_string()),
         strict: false,
         workbook: Workbook {
             sheets: names
