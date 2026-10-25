@@ -472,7 +472,9 @@
 - A library may also export `yppx_plugin_read_ex` / `yppx_plugin_write_ex`
   (#1702; independent, optional, ABI still 1) to carry the plan's
   `Formatting`, which MSPDI does not: write_ex gets the `formatting.xml` text
-  beside the MSPDI (NULL/0 when the plan has none) and is called instead of
+  beside the MSPDI (NULL/0 when the plan has neither formatting nor rich
+  notes; its `<note>` children are the rich notes, #1801, which read_ex must
+  return for them to survive) and is called instead of
   `yppx_plugin_write`; read_ex returns it in a second buffer (empty leaves the
   default; non-UTF-8 or unparsable fails the read with the plugin's name).
   `.yppx` keeps it in `formatting.xml` as before. Hosts need nothing: they pass
