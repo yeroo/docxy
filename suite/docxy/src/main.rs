@@ -15271,6 +15271,8 @@ impl Docxy {
                 if self.protected_refused(cx) {
                     return self.refocus(window, cx);
                 }
+                let since = docxcore::editor::undo_serial_counter();
+                let repeats_indent = self.repeat_indents();
                 let changed = match self.edit_target_and_repeat() {
                     (Some(ed), rec) => {
                         let changed = redo_or_repeat(ed, rec);
@@ -15282,6 +15284,9 @@ impl Docxy {
                 if changed {
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         tab.mark_dirty();
+                    }
+                    if repeats_indent {
+                        self.repair_list_indents_since(since);
                     }
                 }
                 self.keep_repeat_current(untouched);
@@ -23286,6 +23291,27 @@ impl Docxy {
         (ed, &mut self.repeat)
     }
 
+    /// After an Increase/Decrease Indent that changed the document (an undo
+    /// step newer than `since`): a list of ours an older build saved with
+    /// indent-less levels gets their indents, as a Bullets press would, or
+    /// the item whose level stepped would not move (#1728). The page draws
+    /// from the package, so after the edit is in time. Not an undo step.
+    fn repair_list_indents_since(&mut self, since: u64) {
+        if docxcore::editor::undo_serial_counter() <= since {
+            return;
+        }
+        if let Some(pkg) = self.tabs.get_mut(self.active).and_then(|t| t.pkg.as_mut()) {
+            pkg.repair_list_indents();
+        }
+    }
+
+    /// Whether Repeat (Ctrl+Y, F4, the Quick Access Toolbar) would indent.
+    fn repeat_indents(&self) -> bool {
+        self.repeat
+            .as_ref()
+            .is_some_and(|r| matches!(r.what, Repeat::Act(Act::IndentInc | Act::IndentDec)))
+    }
+
     /// What the Quick Access Toolbar shows for the active tab (#618, #619,
     /// #1149).
     fn qat_state(&self) -> QatState {
@@ -26585,9 +26611,11 @@ impl Docxy {
         if self.table_tab(true, window, cx) {
             return;
         }
+        let since = docxcore::editor::undo_serial_counter();
         self.with_editor_noted(window, cx, Repeat::Act(Act::IndentDec), |e| {
             apply_doc_act(e, Act::IndentDec)
         });
+        self.repair_list_indents_since(since);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -26865,6 +26893,7 @@ impl Docxy {
         let redo_only = self.redo_only;
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let autocorrect = self.autocorrect.clone();
+        let repeats_indent = history && self.repeat_indents();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
         };
@@ -26954,10 +26983,15 @@ impl Docxy {
                 },
             }
         };
+        let indents = repeats_indent
+            || matches!(noted, Some(Repeat::Act(Act::IndentInc | Act::IndentDec)));
         let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.mark_dirty();
+            }
+            if indents {
+                self.repair_list_indents_since(since);
             }
         }
         self.keep_repeat_current(recorded || (history && untouched));
@@ -35697,6 +35731,11 @@ impl Docxy {
             UndoTo(n) => self.with_editor(window, cx, |e| {
                 e.undo_to(n);
             }),
+            IndentInc | IndentDec => {
+                let since = docxcore::editor::undo_serial_counter();
+                self.with_editor(window, cx, |e| apply_doc_act(e, act));
+                self.repair_list_indents_since(since);
+            }
             _ => self.with_editor(window, cx, |e| apply_doc_act(e, act)),
         }
     }

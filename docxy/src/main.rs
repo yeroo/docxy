@@ -2400,14 +2400,8 @@ impl App {
             Highlight => self.open_picker(PickerKind::Highlight),
             Bullets => self.apply_list(true),
             Numbering => self.apply_list(false),
-            IncreaseIndent => {
-                self.editor.change_indent(720);
-                self.after_edit();
-            }
-            DecreaseIndent => {
-                self.editor.change_indent(-720);
-                self.after_edit();
-            }
+            IncreaseIndent => self.change_indent(720),
+            DecreaseIndent => self.change_indent(-720),
             FirstLineIndent => {
                 self.editor.set_first_line(720);
                 self.after_edit();
@@ -5444,6 +5438,18 @@ impl App {
         self.numbering = Rc::new(n);
     }
 
+    /// Increase/Decrease Indent by `delta` twips. A list of ours saved by a
+    /// build whose levels had no indent is repaired first, as Bullets would:
+    /// the item steps its level, which moves it only by the level's indent
+    /// (#1728).
+    fn change_indent(&mut self, delta: i32) {
+        if self.pkg.repair_list_indents() {
+            self.reparse_numbering();
+        }
+        self.editor.change_indent(delta);
+        self.after_edit();
+    }
+
     /// Toggle a bullet/numbered list on the selected paragraphs.
     fn apply_list(&mut self, bullet: bool) {
         if !self.mutation_allowed(protection::MutationKind::Formatting) {
@@ -7006,10 +7012,7 @@ impl App {
                 self.editor.clear_run_formatting();
                 self.after_edit();
             }
-            KeyCode::Char('m') if ctrl => {
-                self.editor.change_indent(if shift { -720 } else { 720 });
-                self.after_edit();
-            }
+            KeyCode::Char('m') if ctrl => self.change_indent(if shift { -720 } else { 720 }),
             KeyCode::Char('l') if ctrl => {
                 self.editor.set_align(Align::Left);
                 self.after_edit();
@@ -15101,6 +15104,61 @@ mod tests {
             _ => panic!(),
         }
         assert!(app.modified);
+    }
+
+    /// #1728: a bullet list of ours saved by a build whose levels had no
+    /// indent is repaired before Increase/Decrease Indent steps its level,
+    /// from the ribbon and from Ctrl+M alike, so the item moves.
+    #[test]
+    fn indent_repairs_an_old_builds_indent_less_list_levels() {
+        use docxcore::package::BULLET_LIST_NUM_ID;
+        let old_levels: String = (0..9)
+            .map(|l| {
+                format!(
+                    "<w:lvl w:ilvl=\"{l}\"><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"•\"/></w:lvl>"
+                )
+            })
+            .collect();
+        let old = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+             <w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+             <w:abstractNum w:abstractNumId=\"{BULLET_LIST_NUM_ID}\">{old_levels}</w:abstractNum>\
+             <w:num w:numId=\"{BULLET_LIST_NUM_ID}\"><w:abstractNumId w:val=\"{BULLET_LIST_NUM_ID}\"/></w:num>\
+             </w:numbering>"
+        );
+        let numbering = |app: &App| {
+            String::from_utf8_lossy(app.pkg.part("word/numbering.xml").unwrap()).into_owned()
+        };
+        let ctrl_m = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL);
+        let ribbon = |app: &mut App| app.run_act(ribbon::Act::IncreaseIndent);
+        let keys = |app: &mut App| {
+            app.on_key(ctrl_m);
+        };
+        for (how, press) in [("ribbon", &ribbon as &dyn Fn(&mut App)), ("Ctrl+M", &keys)] {
+            let mut item = ParProps::default();
+            item.num_id = Some(BULLET_LIST_NUM_ID);
+            let mut pkg = new_package(Document {
+                body: vec![Block::Paragraph(MPara {
+                    props: item,
+                    content: vec![Inline::Run(Run {
+                        text: "item".to_string(),
+                        props: RunProps::default(),
+                    })],
+                })],
+            });
+            pkg.ensure_list(true);
+            assert!(pkg.set_part("word/numbering.xml", old.clone().into_bytes()));
+            let mut app = App::new(pkg, "test.docx", false);
+            app.os_clip = None;
+            assert!(!numbering(&app).contains("<w:ind "), "{how}: old levels");
+            press(&mut app);
+            assert_eq!(props0(&app).ilvl, 1, "{how}: the level stepped");
+            let t = numbering(&app);
+            assert!(
+                t.contains("<w:ind w:left=\"1440\" w:hanging=\"360\"/>"),
+                "{how}: level indents repaired: {t}"
+            );
+        }
     }
 
     #[test]
