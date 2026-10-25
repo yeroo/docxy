@@ -118,6 +118,10 @@ pub struct SheetPackage {
     /// The workbook is Strict Open XML: parts and relationships the writer
     /// creates use the Strict namespaces, as its own parts do.
     strict: bool,
+    /// Ids of the table parts a sheet removal dropped: the save drops the
+    /// slicer caches over them too, as over a table it drops itself (#1741).
+    /// Kept as ids, since a table added later may take a freed id.
+    removed_table_ids: Vec<u32>,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
 }
@@ -560,6 +564,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         shared_part,
         styles_part,
         strict,
+        removed_table_ids: Vec::new(),
         workbook: Workbook {
             sheets,
             styles,
@@ -4408,7 +4413,13 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     }
 
     // --- tables: geometry, names, columns and conversions reach the parts --
-    let table_drops = sync_table_parts(&mut parts, wb);
+    let mut table_drops = sync_table_parts(&mut parts, wb);
+    // A removed sheet's tables went with it, and their slicer caches go now.
+    for id in &pkg.removed_table_ids {
+        if !table_drops.tables.contains(id) {
+            table_drops.tables.push(*id);
+        }
+    }
 
     // --- pivots: patch a moved location, ask Excel to rebuild what we laid out
     // Refresh may have grown/shrunk the output region; the location ref must
@@ -11118,7 +11129,15 @@ impl SheetPackage {
         }
         // The part, its rels, and what only it named (comments, drawings,
         // tables, printer settings), each with its content-type Override.
+        // The ids of its tables are kept for the save, which drops the
+        // slicer caches over them.
+        let tables = sheet_table_parts(&self.parts, &part_name);
         drop_parts_cascading(&mut self.parts, &part_name);
+        for (part, id) in tables {
+            if self.part(&part).is_none() && !self.removed_table_ids.contains(&id) {
+                self.removed_table_ids.push(id);
+            }
+        }
         self.workbook.tables.retain(|t| t.sheet != idx);
         self.workbook
             .removed_tables
@@ -11278,6 +11297,23 @@ fn remap_local_sheet_ids(xml: &str, f: impl Fn(usize) -> usize) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The table parts sheet part `sheet` names, with their `id`s.
+fn sheet_table_parts(parts: &[(String, Vec<u8>)], sheet: &str) -> Vec<(String, u32)> {
+    let dir = sheet.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let Some(rels) = part_text(parts, &rels_part_name(sheet)) else {
+        return Vec::new();
+    };
+    (parse_rels_mode(&rels).into_iter())
+        .filter(|(_, ty, _, mode)| ty.ends_with("/table") && mode.as_deref() != Some("External"))
+        .filter_map(|(_, _, target, _)| {
+            let part = resolve_relative(dir, &target);
+            let xml = part_text(parts, &part)?;
+            let id = table_id(&xml)?;
+            Some((part, id))
+        })
+        .collect()
 }
 
 /// Remove `part`, its own rels part, and, following those relationships, each
@@ -11493,6 +11529,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
         shared_part: Some("xl/sharedStrings.xml".to_string()),
         styles_part: Some("xl/styles.xml".to_string()),
         strict: false,
+        removed_table_ids: Vec::new(),
         workbook: Workbook {
             sheets: names
                 .iter()
@@ -27004,6 +27041,194 @@ mod table_command_tests {
         assert!(wb.contains("name=\"Keep\""), "{wb}");
         let types = text(&re, "[Content_Types].xml");
         assert!(!types.contains("slicer"), "{types}");
+    }
+
+    /// The slicer fixture with a second sheet, `Other`, after it.
+    fn slicer_package_two_sheets() -> SheetPackage {
+        let mut pkg = slicer_package();
+        pkg.add_sheet("Other");
+        reload(&pkg)
+    }
+
+    /// The cache side of [`slicer_leftovers`]: what a sheet removal leaves
+    /// of `Slicer_<name>` outside the removed sheet's own parts.
+    fn cache_leftovers(pkg: &SheetPackage, name: &str) -> Vec<String> {
+        (slicer_leftovers(pkg, name).into_iter())
+            .filter(|l| l != "slicer" && l != "drawing anchor")
+            .collect()
+    }
+
+    #[test]
+    fn save_drops_slicer_caches_of_removed_sheets_tables() {
+        let mut pkg = slicer_package_two_sheets();
+        assert!(pkg.remove_sheet(0));
+        let re = reload(&pkg);
+        assert_eq!(re.workbook.sheets.len(), 1);
+        assert_eq!(re.workbook.sheets[0].name, "Other");
+        assert!(re.workbook.tables.is_empty());
+        for name in ["Item", "Qty"] {
+            assert_eq!(cache_leftovers(&re, name), Vec::<String>::new(), "{name}");
+        }
+        let wb = text(&re, "xl/workbook.xml");
+        assert!(
+            !wb.contains("slicerCache") && !wb.contains("extLst"),
+            "{wb}"
+        );
+        assert!(wb.contains("name=\"Keep\""), "{wb}");
+        let types = text(&re, "[Content_Types].xml");
+        assert!(!types.contains("slicer"), "{types}");
+        assert!(re.part_names().iter().all(|n| !n.contains("slicer")));
+        // Saved again, nothing more changes.
+        let again = reload(&re);
+        for part in [
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "[Content_Types].xml",
+        ] {
+            assert_eq!(text(&again, part), text(&re, part), "{part}");
+        }
+    }
+
+    #[test]
+    fn save_drops_slicer_on_another_sheet_over_removed_sheets_table() {
+        // The slicers and their drawing hang off `Other`, slicing Sheet1's
+        // table.
+        let mut pkg = slicer_package_two_sheets();
+        let other = pkg.sheet_parts[1].clone();
+        let other_rels = rels_part_name(&other);
+        let s1 = "xl/worksheets/sheet1.xml";
+        let s1_rels = "xl/worksheets/_rels/sheet1.xml.rels";
+        let rels = text(&pkg, s1_rels);
+        let moved: Vec<String> = ["rId2", "rId3"]
+            .iter()
+            .map(|id| {
+                let el = find_element_by_attr(&rels, "Relationship", "Id", |v| v == *id).unwrap();
+                rels[el.start..el.end].to_string()
+            })
+            .collect();
+        let mut kept = rels.clone();
+        for m in &moved {
+            kept = kept.replace(m.as_str(), "");
+        }
+        let set = |pkg: &mut SheetPackage, name: &str, xml: String| match pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == name)
+        {
+            Some(p) => p.1 = xml.into_bytes(),
+            None => pkg.parts.push((name.to_string(), xml.into_bytes())),
+        };
+        set(&mut pkg, s1_rels, kept);
+        let theirs = match pkg.part(&other_rels) {
+            Some(b) => String::from_utf8_lossy(b).replace(
+                "</Relationships>",
+                &format!("{}</Relationships>", moved.concat()),
+            ),
+            None => format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}</Relationships>"#,
+                moved.concat()
+            ),
+        };
+        set(&mut pkg, &other_rels, theirs);
+        let sheet1 = text(&pkg, s1);
+        let ext_at = sheet1.find("<extLst>").unwrap();
+        let ext_end = sheet1.find("</extLst>").unwrap() + "</extLst>".len();
+        let ext = sheet1[ext_at..ext_end].to_string();
+        let sheet1 = sheet1
+            .replace(&ext, "")
+            .replace(r#"<drawing r:id="rId3"/>"#, "");
+        set(&mut pkg, s1, sheet1);
+        let sheet2 = text(&pkg, &other);
+        assert!(
+            !sheet2.contains("<drawing") && !sheet2.contains("extLst"),
+            "{sheet2}"
+        );
+        let sheet2 = sheet2.replace(
+            "</worksheet>",
+            &format!(r#"<drawing r:id="rId3"/>{ext}</worksheet>"#),
+        );
+        set(&mut pkg, &other, sheet2);
+        let pkg = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&pkg, name).len(), 7, "fixture {name}");
+        }
+        assert!(text(&pkg, &other).contains("slicerList"), "fixture");
+
+        let mut pkg = pkg;
+        assert!(pkg.remove_sheet(0));
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&re, name), Vec::<String>::new(), "{name}");
+        }
+        // No slicer is left: the part, `Other`'s relationship and entry go;
+        // the drawing stays, without the anchors.
+        assert!(re.part("xl/slicers/slicer1.xml").is_none());
+        let other = re.sheet_parts[0].clone();
+        let rels = text(&re, &rels_part_name(&other));
+        assert!(
+            !rels.contains("slicer") && rels.contains("drawing1.xml"),
+            "{rels}"
+        );
+        let ws = text(&re, &other);
+        assert!(!ws.contains("slicer") && !ws.contains("extLst"), "{ws}");
+        let drawing = text(&re, "xl/drawings/drawing1.xml");
+        assert!(!drawing.contains("AlternateContent"), "{drawing}");
+        assert!(re.part_names().iter().all(|n| !n.contains("slicer")));
+        // Saved again, nothing more changes.
+        let again = reload(&re);
+        for part in [
+            "xl/workbook.xml",
+            "xl/drawings/drawing1.xml",
+            other.as_str(),
+            "[Content_Types].xml",
+        ] {
+            assert_eq!(text(&again, part), text(&re, part), "{part}");
+        }
+    }
+
+    #[test]
+    fn new_table_after_sheet_removal_does_not_take_stale_slicers() {
+        let mut pkg = slicer_package_two_sheets();
+        assert!(pkg.remove_sheet(0));
+        let s = &mut pkg.workbook.sheets[0];
+        s.set_cell(0, 0, Cell::text("Name"));
+        s.set_cell(0, 1, Cell::text("Qty"));
+        s.set_cell(1, 0, Cell::text("Pen"));
+        s.set_cell(1, 1, Cell::number(3.0));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleMedium2")
+            .unwrap();
+        // It takes the removed table's part and id, which the stale caches
+        // name.
+        assert_eq!(pkg.workbook.tables[0].part, "xl/tables/table1.xml");
+        assert!(text(&pkg, "xl/tables/table1.xml").contains(" id=\"1\""));
+        assert!(pkg.part("xl/slicerCaches/slicerCache1.xml").is_some());
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(cache_leftovers(&re, name), Vec::<String>::new(), "{name}");
+        }
+        assert!(re.part_names().iter().all(|n| !n.contains("slicer")));
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert_eq!(re.workbook.tables[0].columns, ["Name", "Qty"]);
+        assert_eq!(re.workbook.tables[0].range, (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn removing_a_sheet_without_tables_keeps_the_slicers() {
+        let pkg = slicer_package_two_sheets();
+        let caches: Vec<String> = (1..=2)
+            .map(|n| text(&pkg, &format!("xl/slicerCaches/slicerCache{n}.xml")))
+            .collect();
+        let mut pkg = pkg;
+        assert!(pkg.remove_sheet(1));
+        let re = reload(&pkg);
+        for name in ["Item", "Qty"] {
+            assert_eq!(slicer_leftovers(&re, name).len(), 7, "{name}");
+        }
+        for (n, cache) in (1..=2).zip(&caches) {
+            let part = format!("xl/slicerCaches/slicerCache{n}.xml");
+            assert_eq!(&text(&re, &part), cache, "{part}");
+        }
+        assert!(text(&re, "xl/worksheets/sheet1.xml").contains("slicerList"));
     }
 
     #[test]

@@ -1759,7 +1759,10 @@
   the slicers on them (their element in the slicer part, the part with its
   sheet rel and `x14:slicer` entry when none is left, their drawing anchor).
   Other slicers keep their bytes. Dropping rather than keeping is unverified
-  against Excel's repair.
+  against Excel's repair. A sheet removal records the ids of the table parts
+  it drops (`SheetPackage::removed_table_ids`), and the save drops their
+  slicer caches too (#1741); ids, not a "names no part" test, as a table
+  added later takes the first free part and its id.
 - `App::restore` (xlsxy) folds the renames between the current and the restored
   table state over the data model's measures and relationships
   (`model_edits_for`), so ones added after a table step follow its Undo/Redo;
