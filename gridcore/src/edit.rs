@@ -2300,7 +2300,7 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
             // inside that block cuts the layout as one in the body does.
             let in_page_area = shift.rows && !piv.page.is_empty() && {
                 let rows = piv.page_rows.unwrap_or(piv.page.len() as u32);
-                let top = r1.saturating_sub(1 + rows);
+                let top = r1.saturating_sub(rows.saturating_add(1));
                 if shift.delta > 0 {
                     top < shift.at && shift.at <= r1
                 } else {
@@ -5595,6 +5595,13 @@ mod table_tests {
             assert!(wb.pivots[0].unsupported, "{ins} {at}");
             assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
         }
+        // A huge `rowPageCount` from the file must not overflow the height.
+        let mut wb = sales();
+        page(&mut wb);
+        wb.pivots[0].page_rows = Some(u32::MAX);
+        insert_rows(&mut wb, 1, 6, 1);
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
     }
 
     #[test]
