@@ -519,6 +519,7 @@ fn calculate_now_in_protected_view_keeps_pivots_and_the_tab_clean() {
             field_items: Vec::new(),
             hidden: Vec::new(),
             page: Vec::new(),
+            page_rows: None,
             items_order: Vec::new(),
             calc_formulas: Vec::new(),
             grand_rows: true,

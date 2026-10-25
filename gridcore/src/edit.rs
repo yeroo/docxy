@@ -2295,11 +2295,12 @@ fn shift_pivots(wb: &mut Workbook, idx: usize, target_name: &str, shift: &EditSh
     for piv in &mut wb.pivots {
         if piv.sheet == idx {
             let (r1, c1, r2, c2) = piv.location;
-            // Report filters sit above the body, one per row (`page.len()`
-            // stands in for `rowPageCount`) with a blank row between: a row
-            // edit inside that block cuts the layout as one in the body does.
+            // Report filters sit above the body in `rowPageCount` rows (one
+            // per filter when absent) with a blank row between: a row edit
+            // inside that block cuts the layout as one in the body does.
             let in_page_area = shift.rows && !piv.page.is_empty() && {
-                let top = r1.saturating_sub(1 + piv.page.len() as u32);
+                let rows = piv.page_rows.unwrap_or(piv.page.len() as u32);
+                let top = r1.saturating_sub(rows.saturating_add(1));
                 if shift.delta > 0 {
                     top < shift.at && shift.at <= r1
                 } else {
@@ -5305,6 +5306,7 @@ mod table_tests {
             field_items: Vec::new(),
             hidden: Vec::new(),
             page: Vec::new(),
+            page_rows: None,
             items_order: Vec::new(),
             calc_formulas: Vec::new(),
             grand_rows: true,
@@ -5554,6 +5556,52 @@ mod table_tests {
         delete_rows(&mut wb, 1, 0, 2);
         assert!(!wb.pivots[0].unsupported);
         assert_eq!(wb.pivots[0].location, (5, 0, 7, 1));
+    }
+
+    #[test]
+    fn a_row_edit_above_side_by_side_page_filters_translates_the_pivot() {
+        // Three report filters side by side: `rowPageCount="1"`, so the block
+        // is the filter row 4 and the blank row 5, not three rows from 2.
+        let page = |wb: &mut Workbook| {
+            let mut p = range_pivot(1, (6, 0, 8, 1), "Sheet1", (0, 0, 3, 2));
+            p.page = vec![(0, None), (1, None), (2, None)];
+            p.page_rows = Some(1);
+            wb.pivots.push(p);
+        };
+        for (ins, at, moved) in [
+            (true, 3, (7, 0, 9, 1)),
+            (true, 4, (7, 0, 9, 1)),
+            (false, 2, (5, 0, 7, 1)),
+            (false, 3, (5, 0, 7, 1)),
+        ] {
+            let mut wb = sales();
+            page(&mut wb);
+            if ins {
+                insert_rows(&mut wb, 1, at, 1);
+            } else {
+                delete_rows(&mut wb, 1, at, 1);
+            }
+            assert!(!wb.pivots[0].unsupported, "{ins} {at}");
+            assert_eq!(wb.pivots[0].location, moved, "{ins} {at}");
+        }
+        for (ins, at) in [(true, 5), (true, 6), (false, 4), (false, 5)] {
+            let mut wb = sales();
+            page(&mut wb);
+            if ins {
+                insert_rows(&mut wb, 1, at, 1);
+            } else {
+                delete_rows(&mut wb, 1, at, 1);
+            }
+            assert!(wb.pivots[0].unsupported, "{ins} {at}");
+            assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
+        }
+        // A huge `rowPageCount` from the file must not overflow the height.
+        let mut wb = sales();
+        page(&mut wb);
+        wb.pivots[0].page_rows = Some(u32::MAX);
+        insert_rows(&mut wb, 1, 6, 1);
+        assert!(wb.pivots[0].unsupported);
+        assert_eq!(wb.pivots[0].location, (6, 0, 8, 1));
     }
 
     #[test]

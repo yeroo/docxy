@@ -65,6 +65,10 @@ pub struct Pivot {
     /// Report (page) filters: per `<pageField>`, the selected shared-item index,
     /// or `None` for "(All)". A selected item keeps only matching records.
     pub page: Vec<(usize, Option<usize>)>,
+    /// Rows the report-filter block takes (`<location rowPageCount>`): fewer
+    /// than `page` when filters sit side by side (`pageOverThenDown`,
+    /// `pageWrap`). `None` = one row per filter.
+    pub page_rows: Option<u32>,
     /// Per pivot field, the shared index (`x`) of each `<item>` in order — maps a
     /// page field's `item` position to a shared index. Empty = identity.
     pub items_order: Vec<Vec<i64>>,
@@ -111,6 +115,7 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
         field_items: Vec::new(),
         hidden: Vec::new(),
         page: Vec::new(),
+        page_rows: None,
         items_order: Vec::new(),
         calc_formulas: Vec::new(),
         grand_rows: true,
@@ -155,6 +160,11 @@ pub(crate) fn parse_pivot_table_xml(xml: &str, sheet: usize, part: &str) -> Opti
                     }
                 }
                 "location" => {
+                    piv.page_rows = p
+                        .attr("rowPageCount")
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|&n| n > 0);
                     if let Some(rect) = parse_range_name(p.attr("ref")) {
                         piv.location = rect;
                         got_location = true;
@@ -768,6 +778,21 @@ mod tests {
     }
 
     #[test]
+    fn row_page_count_is_parsed() {
+        let with = |loc: &str| {
+            let xml = format!(
+                r#"<pivotTableDefinition name="P" cacheId="1"><location ref="A3:B6"{loc}/><pageFields count="2"><pageField fld="0"/><pageField fld="1"/></pageFields><rowFields><field x="0"/></rowFields><dataFields><dataField fld="1"/></dataFields></pivotTableDefinition>"#
+            );
+            parse_pivot_table_xml(&xml, 0, "p").unwrap().0.page_rows
+        };
+        assert_eq!(with(r#" rowPageCount="1" colPageCount="2""#), Some(1));
+        assert_eq!(with(r#" rowPageCount="2""#), Some(2));
+        assert_eq!(with(""), None);
+        assert_eq!(with(r#" rowPageCount="0""#), None);
+        assert_eq!(with(r#" rowPageCount="x""#), None);
+    }
+
+    #[test]
     fn rewrite_regenerates_field_layout() {
         let xml = r#"<?xml version="1.0"?><pivotTableDefinition name="P" cacheId="1"><location ref="A3:B6" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="3"><pivotField axis="axisRow"><items count="2"><item x="0"/><item t="default"/></items></pivotField><pivotField/><pivotField dataField="1"/></pivotFields><rowFields count="1"><field x="0"/></rowFields><rowItems count="2"><i><x/></i><i t="grand"><x/></i></rowItems><dataFields count="1"><dataField name="Sum of Sales" fld="2"/></dataFields><pivotTableStyleInfo name="PivotStyleLight16"/></pivotTableDefinition>"#;
         let (mut piv, _) = parse_pivot_table_xml(xml, 0, "p").unwrap();
@@ -909,6 +934,7 @@ mod tests {
                 ],
                 hidden,
                 page,
+                page_rows: None,
                 items_order: vec![],
                 calc_formulas: vec![],
                 grand_rows: true,
@@ -1101,6 +1127,7 @@ mod tests {
             field_items: Vec::new(),
             hidden: Vec::new(),
             page: Vec::new(),
+            page_rows: None,
             items_order: Vec::new(),
             calc_formulas: Vec::new(),
             grand_rows: true,
