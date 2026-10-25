@@ -1108,6 +1108,12 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Push an undo step for a structural edit the caller then makes to
+    /// `doc` itself (`agent`'s block-range edits).
+    pub(crate) fn checkpoint_structural(&mut self) {
+        self.checkpoint(EditKind::Structural);
+    }
+
     /// Push an undo step for an edit of `kind`, unless it continues the
     /// newest step: only typing coalesces. Each Backspace or Delete is a step
     /// of its own, as in Word (#853).
