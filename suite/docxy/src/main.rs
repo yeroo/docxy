@@ -6081,7 +6081,13 @@ struct EffIndent {
 }
 
 fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
-    let list_step = p.ilvl.max(0).saturating_mul(300);
+    // An explicit numId 0 is no list (#1728). No numId at all may still be
+    // a level of the style's numbering, so it keeps its step.
+    let list_step = if p.num_id == Some(0) {
+        0
+    } else {
+        p.ilvl.max(0).saturating_mul(300)
+    };
     let left = p.indent.max(0).saturating_add(list_step);
     EffIndent {
         left,
@@ -7120,6 +7126,24 @@ mod ruler_geom_tests {
         );
         assert!(!super::marker_visible(&clipped, clipped.first_x, 5.0));
         assert_eq!(hruler_hit(&clipped, viewport.x + 1.0, 2.0), None);
+    }
+
+    /// #1728: `w:numId="0"` is no list, so its `w:ilvl` adds no step.
+    #[test]
+    fn num_id_zero_takes_no_list_step() {
+        let p = ParProps {
+            indent: 720,
+            num_id: Some(0),
+            ilvl: 2,
+            ..ParProps::default()
+        };
+        let eff = eff_indent(&p);
+        assert_eq!((eff.list_step, eff.left), (0, 720));
+        let listed = eff_indent(&ParProps {
+            num_id: Some(1),
+            ..p
+        });
+        assert_eq!((listed.list_step, listed.left), (600, 1320));
     }
 
     #[test]
@@ -13598,7 +13622,7 @@ fn blank_base(doc: &Document) -> Package {
     let has_list = doc
         .body
         .iter()
-        .any(|b| matches!(b, Block::Paragraph(p) if p.props.num_id.is_some()));
+        .any(|b| matches!(b, Block::Paragraph(p) if p.props.in_list()));
     if has_list {
         docxcore::package::new_markdown_package(doc.clone())
     } else {
@@ -15271,6 +15295,8 @@ impl Docxy {
                 if self.protected_refused(cx) {
                     return self.refocus(window, cx);
                 }
+                let since = docxcore::editor::undo_serial_counter();
+                let repeats_indent = self.repeat_indents();
                 let changed = match self.edit_target_and_repeat() {
                     (Some(ed), rec) => {
                         let changed = redo_or_repeat(ed, rec);
@@ -15282,6 +15308,9 @@ impl Docxy {
                 if changed {
                     if let Some(tab) = self.tabs.get_mut(self.active) {
                         tab.mark_dirty();
+                    }
+                    if repeats_indent {
+                        self.repair_list_indents_since(since);
                     }
                 }
                 self.keep_repeat_current(untouched);
@@ -23286,6 +23315,30 @@ impl Docxy {
         (ed, &mut self.repeat)
     }
 
+    /// After an Increase/Decrease Indent that changed the document (an undo
+    /// step newer than `since`): a list of ours an older build saved with
+    /// indent-less levels gets their indents, as a Bullets press would, or
+    /// the saved item whose level stepped would not move in Word, Pages and
+    /// the other hosts, which indent it by its level (#1728). The suite draws
+    /// the level from `ilvl` alone (`eff_indent`), so this is for the file;
+    /// a refused edit, which makes no step, leaves the package alone. Not an
+    /// undo step.
+    fn repair_list_indents_since(&mut self, since: u64) {
+        if docxcore::editor::undo_serial_counter() <= since {
+            return;
+        }
+        if let Some(pkg) = self.tabs.get_mut(self.active).and_then(|t| t.pkg.as_mut()) {
+            pkg.repair_list_indents();
+        }
+    }
+
+    /// Whether Repeat (Ctrl+Y, F4, the Quick Access Toolbar) would indent.
+    fn repeat_indents(&self) -> bool {
+        self.repeat
+            .as_ref()
+            .is_some_and(|r| matches!(r.what, Repeat::Act(Act::IndentInc | Act::IndentDec)))
+    }
+
     /// What the Quick Access Toolbar shows for the active tab (#618, #619,
     /// #1149).
     fn qat_state(&self) -> QatState {
@@ -26585,9 +26638,11 @@ impl Docxy {
         if self.table_tab(true, window, cx) {
             return;
         }
+        let since = docxcore::editor::undo_serial_counter();
         self.with_editor_noted(window, cx, Repeat::Act(Act::IndentDec), |e| {
             apply_doc_act(e, Act::IndentDec)
         });
+        self.repair_list_indents_since(since);
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -26865,6 +26920,7 @@ impl Docxy {
         let redo_only = self.redo_only;
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let autocorrect = self.autocorrect.clone();
+        let repeats_indent = history && self.repeat_indents();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
         };
@@ -26954,10 +27010,15 @@ impl Docxy {
                 },
             }
         };
+        let indents =
+            repeats_indent || matches!(noted, Some(Repeat::Act(Act::IndentInc | Act::IndentDec)));
         let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
                 t.mark_dirty();
+            }
+            if indents {
+                self.repair_list_indents_since(since);
             }
         }
         self.keep_repeat_current(recorded || (history && untouched));
@@ -30197,6 +30258,41 @@ mod repeat_tests {
         assert_ne!(ed.doc, tabbed, "the repeat outdented");
     }
 
+    /// `w:numId="0"` is "no numbering" (#1728): no marker, a plain paragraph
+    /// that ends the list, and no list package for a new document.
+    #[test]
+    fn list_markers_skip_num_id_zero() {
+        use docxcore::model::{Block, Document, ParProps, Paragraph};
+        let p = |num_id| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let body = [
+            p(Some(NUM_DECIMAL)),
+            p(Some(NUM_DECIMAL)),
+            p(Some(0)),
+            p(Some(NUM_DECIMAL)),
+        ];
+        assert_eq!(
+            list_markers(&body),
+            [
+                Some("1. ".to_string()),
+                Some("2. ".to_string()),
+                None,
+                Some("1. ".to_string())
+            ]
+        );
+        let base = blank_base(&Document {
+            body: vec![p(Some(0))],
+        });
+        assert!(base.part("word/numbering.xml").is_none());
+    }
+
     /// An undo step pushed in another editor (another tab, the
     /// header/footer editor) makes the record stale, though this editor's
     /// newest step is still the recorded one.
@@ -33156,7 +33252,7 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     let mut counts: Vec<u32> = Vec::new();
     for b in body {
         let marker = match b {
-            Block::Paragraph(p) if p.props.num_id.is_some() => {
+            Block::Paragraph(p) if p.props.in_list() => {
                 let ilvl = p.props.ilvl as usize;
                 if p.props.num_id == Some(NUM_DECIMAL) {
                     if counts.len() <= ilvl {
@@ -35667,6 +35763,11 @@ impl Docxy {
             UndoTo(n) => self.with_editor(window, cx, |e| {
                 e.undo_to(n);
             }),
+            IndentInc | IndentDec => {
+                let since = docxcore::editor::undo_serial_counter();
+                self.with_editor(window, cx, |e| apply_doc_act(e, act));
+                self.repair_list_indents_since(since);
+            }
             _ => self.with_editor(window, cx, |e| apply_doc_act(e, act)),
         }
     }

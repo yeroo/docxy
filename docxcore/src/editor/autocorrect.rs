@@ -42,7 +42,7 @@ impl Editor {
         };
         let text: Vec<char> = editor_text(&p.content).chars().collect();
         let caret = self.caret.offset;
-        if let Some(kind) = auto_list(&text, caret, ch, p.props.num_id.is_some(), opts) {
+        if let Some(kind) = auto_list(&text, caret, ch, p.props.in_list(), opts) {
             if !plain_text(&p.content, 0, text.len(), false) {
                 return 0;
             }
@@ -282,6 +282,18 @@ mod tests {
         assert_eq!(para(&ed).props.num_id, None);
 
         let mut ed = empty();
+        type_keys(&mut ed, "* ");
+        assert_eq!((text(&ed).as_str(), para(&ed).props.num_id), ("", Some(1)));
+    }
+
+    /// `w:numId="0"` is "no numbering" (#1728): `* ` there starts a list as
+    /// on a plain paragraph.
+    #[test]
+    fn num_id_zero_starts_an_automatic_list() {
+        let mut ed = empty();
+        if let Block::Paragraph(p) = &mut ed.doc.body[0] {
+            p.props.num_id = Some(0);
+        }
         type_keys(&mut ed, "* ");
         assert_eq!((text(&ed).as_str(), para(&ed).props.num_id), ("", Some(1)));
     }

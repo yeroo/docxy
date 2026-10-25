@@ -3332,9 +3332,7 @@ impl Package {
             if xml.contains(&marker) {
                 // Defined, perhaps by a build whose levels carried no indent:
                 // repair those levels in place, touching nothing else.
-                if let Some(fixed) = repair_level_indents(&xml, num_id) {
-                    self.set_part(name, fixed.into_bytes());
-                }
+                self.repair_list(num_id);
                 return num_id;
             }
             if let Some(spliced) = splice_numbering(&xml, &abstract_xml, &num_xml) {
@@ -3376,6 +3374,35 @@ impl Package {
             }
         }
         num_id
+    }
+
+    /// Repair the levels of docxy's own lists ([`BULLET_LIST_NUM_ID`],
+    /// [`NUMBER_LIST_NUM_ID`]) that a build before the level indents saved
+    /// without a `w:ind`, as [`Package::ensure_list`] does when it finds one.
+    /// Hosts call it with Increase/Decrease Indent, which steps such an
+    /// item's level, moving it in Word and Pages only by that level's indent
+    /// (#1728): terminal `docxy` and `docxwasm` before the edit, the suite
+    /// after one that made an undo step. Only
+    /// those levels change; no numbering part is created. Not an undo step:
+    /// it is idempotent and what a later Bullets or Numbering press writes
+    /// anyway. True when the part changed.
+    pub fn repair_list_indents(&mut self) -> bool {
+        let bullet = self.repair_list(BULLET_LIST_NUM_ID);
+        self.repair_list(NUMBER_LIST_NUM_ID) || bullet
+    }
+
+    /// [`repair_level_indents`] for `num_id` on the numbering part, written
+    /// only when something needed repair.
+    fn repair_list(&mut self, num_id: i32) -> bool {
+        let name = "word/numbering.xml";
+        let Some(b) = self.part(name) else {
+            return false;
+        };
+        let Some(fixed) = repair_level_indents(&String::from_utf8_lossy(b), num_id) else {
+            return false;
+        };
+        self.set_part(name, fixed.into_bytes());
+        true
     }
 
     /// Ensure `styles.xml` defines each style id in `ids` that Markdown-sourced
@@ -6767,6 +6794,58 @@ mod tests {
             assert_eq!(numbering_text(&pkg), fixed);
             assert_eq!(pkg.parts_stamp(), stamp);
         }
+    }
+
+    /// #1728: the hosts' repair before Increase/Decrease Indent fixes both
+    /// reserved lists' indent-less levels as `ensure_list` would, leaves a
+    /// list that needs none byte-identical, and creates no part.
+    #[test]
+    fn repair_list_indents_fixes_old_reserved_lists_only() {
+        let abs = |id: i32, levels: &str| {
+            format!("<w:abstractNum w:abstractNumId=\"{id}\">{levels}</w:abstractNum>")
+        };
+        let num =
+            |id: i32| format!("<w:num w:numId=\"{id}\"><w:abstractNumId w:val=\"{id}\"/></w:num>");
+        let (b, n) = (BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID);
+        let old = format!(
+            "<w:numbering>{}{}{}{}</w:numbering>",
+            abs(b, &old_levels(true)),
+            abs(n, &old_levels(false)),
+            num(b),
+            num(n)
+        );
+        let mut pkg = pkg_with_numbering(&old);
+        assert!(pkg.repair_list_indents());
+        let mut by_ensure = pkg_with_numbering(&old);
+        by_ensure.ensure_list(true);
+        by_ensure.ensure_list(false);
+        assert_eq!(numbering_text(&pkg), numbering_text(&by_ensure));
+        assert!(numbering_text(&pkg).contains(&markdown_list_levels(true)));
+        assert!(numbering_text(&pkg).contains(&markdown_list_levels(false)));
+        // Repaired: nothing more to do, the part untouched.
+        let stamp = pkg.parts_stamp();
+        assert!(!pkg.repair_list_indents());
+        assert_eq!(pkg.parts_stamp(), stamp);
+
+        // Only the bullet list is old: the decimal one stays byte-identical.
+        let fresh_decimal = abs(n, &markdown_list_levels(false));
+        let mixed = format!(
+            "<w:numbering>{}{fresh_decimal}{}{}</w:numbering>",
+            abs(b, &old_levels(true)),
+            num(b),
+            num(n)
+        );
+        let mut pkg = pkg_with_numbering(&mixed);
+        assert!(pkg.repair_list_indents());
+        let t = numbering_text(&pkg);
+        assert!(t.contains(&fresh_decimal), "{t}");
+        assert!(t.contains(&abs(b, &markdown_list_levels(true))), "{t}");
+
+        // No numbering part: none is made.
+        let mut pkg = new_package(Document::default());
+        assert!(pkg.part("word/numbering.xml").is_none());
+        assert!(!pkg.repair_list_indents());
+        assert!(pkg.part("word/numbering.xml").is_none());
     }
 
     #[test]

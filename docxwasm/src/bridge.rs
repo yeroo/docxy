@@ -370,7 +370,13 @@ impl Session {
                 "justify" => Align::Justify,
                 _ => Align::Left,
             }),
-            "indent" => self.editor.change_indent(rest.trim().parse().unwrap_or(0)),
+            "indent" => {
+                // An old build's indent-less levels of our lists first (#1728).
+                if self.pkg.repair_list_indents() {
+                    self.reparse_numbering();
+                }
+                self.editor.change_indent(rest.trim().parse().unwrap_or(0))
+            }
             // Ruler drags: absolute indent values in twips (the page's drag
             // math snaps and clamps them; see DocxyEngine.ruler).
             "setind" => {

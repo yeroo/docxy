@@ -94,6 +94,26 @@
   through `macos_menu::end_process` (a unit test scans for a bare
   `cx.quit()`), or `resume_quit`'s apply phase, so its terminate goes ahead.
 
+## Lists: numId 0, indent at the margin, old levels (#1653, #1728)
+
+- `ParProps::in_list()` (a nonzero `numId`) is the list test everywhere:
+  `w:numId="0"` is "no numbering" (render, PDF, Markdown, RTF, AutoFormat,
+  the suite's markers and new-document base). The serializer still writes
+  the 0 (it cancels a style's numbering) and compare's merge keeps it.
+- `Editor::change_indent`: a list item with a direct left indent that
+  reaches 0 writes `w:left="0"` (`ParProps::pin_left_indent_zero`,
+  idempotent, attribute order kept), so the level's indent does not come
+  back and it stays on the direct path in session as after a reload. A
+  step that changes no paragraph (`step_indent` on a clone) records no undo.
+- `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
+  indents an older build left out, as `ensure_list` does. Every host's
+  Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
+  the edit, re-parsing the numbering; the suite after an indent that made
+  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
+  draws the level from `ilvl`, so there it is for the saved file). Not an
+  undo step; nothing repairs at load. The suite's `eff_indent` gives an
+  explicit numId 0 no level step.
+
 ## Mac text navigation (#1073)
 
 - `suite/docxy/src/mac_nav.rs` maps ⌘←/→/↑/↓ (line start/end, document start/end),

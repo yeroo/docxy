@@ -273,7 +273,8 @@ pub struct LineMap {
     /// Word does). `None` for non-table or borderless lines.
     pub table_edge: Option<Rc<(String, String)>>,
     /// True for every visual line of a list-item paragraph (`w:numPr`/
-    /// `para.props.num_id.is_some()`), including wrapped continuation lines.
+    /// `para.props.in_list()`: a `w:numId` of 0 is none), including wrapped
+    /// continuation lines.
     /// Consumed by the webview to scope Markdown-mode's checkbox glyph
     /// (`[ ] `/`[x] ` → ☐/☑) to actual list items instead of any line whose
     /// text happens to start with that literal prefix.
@@ -2322,7 +2323,7 @@ fn render_paragraph(
     next_sect: Option<&str>,
 ) -> Vec<(Line, LineMap)> {
     let heading = para.props.heading_level;
-    let is_list = para.props.num_id.is_some();
+    let is_list = para.props.in_list();
     // Left indent (`w:ind`) drawn as leading spaces: ~6 cells per half-inch.
     let indent = " ".repeat((para.props.indent.max(0) / 120) as usize);
     let (first_prefix, cont_prefix) = if is_list {
@@ -4356,6 +4357,19 @@ mod tests {
         let d = doc(vec![Block::Paragraph(p)]);
         let lines = render(&d, &opts(20));
         assert!(lines[0].plain().starts_with("• "));
+    }
+
+    /// `w:numId="0"` is "no numbering" (#1728): no bullet, not a list line.
+    #[test]
+    fn num_id_zero_is_not_a_list_item() {
+        let mut p = Paragraph {
+            props: ParProps::default(),
+            content: vec![run("item", RunProps::default())],
+        };
+        p.props.num_id = Some(0);
+        let d = doc(vec![Block::Paragraph(p)]);
+        let lines = render(&d, &opts(20));
+        assert_eq!(lines[0].plain().trim_end(), "item");
     }
 
     #[test]

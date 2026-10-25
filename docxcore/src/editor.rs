@@ -2962,13 +2962,17 @@ impl Editor {
     /// strand it at the margin. An item that already carries a direct left
     /// indent attribute (`w:left`, `w:start`, their character units; loaded
     /// from a document, whatever its value) keeps moving that, which is
-    /// visible. A selection of level-stepping items all at the limit
-    /// changes nothing and records no undo step.
+    /// visible; at 0 it is written `w:left="0"`, so the level's indent does
+    /// not come back (#1728). A selection that this would leave as it is
+    /// (level-stepping items at the limit, indents already at 0) changes
+    /// nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
         let step = delta.signum();
         let paths = self.selected_para_paths();
         let moves = |p: &ParProps| -> bool {
-            !steps_level(p) || (p.ilvl.clamp(0, 8) + step).clamp(0, 8) != p.ilvl
+            let mut stepped = p.clone();
+            step_indent(&mut stepped, step, delta);
+            stepped != *p
         };
         let any = paths
             .iter()
@@ -2976,18 +2980,7 @@ impl Editor {
         if !any {
             return;
         }
-        self.for_each_para(|pr| {
-            if steps_level(pr) {
-                pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
-                return;
-            }
-            pr.indent = (pr.indent + delta).max(0);
-            // The loaded left indent goes, character units included: a
-            // decrease clamped to zero twips must still clear `w:leftChars`.
-            if delta != 0 {
-                pr.forget_loaded_indent(&[IndentSide::Left]);
-            }
-        });
+        self.for_each_para(|pr| step_indent(pr, step, delta));
     }
 
     /// Set the left indent and first-line delta (twips) of the selected
@@ -4099,6 +4092,26 @@ fn hrule_kind(text: &str) -> Option<BorderKind> {
         _ => return None,
     };
     (t.chars().count() >= 3 && t.chars().all(|c| c == first)).then_some(kind)
+}
+
+/// One paragraph's Increase/Decrease Indent (see [`Editor::change_indent`]).
+fn step_indent(pr: &mut ParProps, step: i32, delta: i32) {
+    if steps_level(pr) {
+        pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
+        return;
+    }
+    pr.indent = (pr.indent + delta).max(0);
+    if delta == 0 {
+        return;
+    }
+    if pr.in_list() && pr.indent == 0 {
+        // No `w:left` would hand the item back to its level's indent.
+        pr.pin_left_indent_zero();
+    } else {
+        // The loaded left indent goes, character units included: a
+        // decrease clamped to zero twips must still clear `w:leftChars`.
+        pr.forget_loaded_indent(&[IndentSide::Left]);
+    }
 }
 
 /// Whether Increase/Decrease Indent moves this paragraph's list level rather
@@ -7115,6 +7128,112 @@ mod tests {
             panic!()
         };
         assert_eq!((p.props.ilvl, p.props.indent), (0, 720));
+    }
+
+    /// A loaded list item `<w:p>` at `ilvl` with the pPr child `ind`.
+    fn loaded_list_item(ilvl: i32, ind: &str) -> Editor {
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val=\"{ilvl}\"/>\
+             <w:numId w:val=\"9990\"/></w:numPr>{ind}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>\
+             </w:body></w:document>"
+        );
+        let mut ed = Editor::new(crate::load::parse_document_xml(
+            &xml,
+            &crate::load::Relationships::default(),
+        ));
+        ed.select_all();
+        ed
+    }
+
+    /// The first paragraph's saved `w:ind`, or "" without one.
+    fn saved_ind(ed: &Editor) -> String {
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        xml.find("<w:ind ")
+            .map(|at| xml[at..at + xml[at..].find("/>").unwrap() + 2].to_string())
+            .unwrap_or_default()
+    }
+
+    fn first_props(ed: &Editor) -> &ParProps {
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        &p.props
+    }
+
+    /// #1728: a list item with a direct left indent reaches the margin and
+    /// stays there; at 0 the indent is written, as `w:left="0"`, so the
+    /// level's indent (1440 at ilvl 1) does not come back.
+    #[test]
+    fn decrease_indent_takes_a_list_items_own_indent_to_the_margin() {
+        let mut ed = loaded_list_item(1, "<w:ind w:left=\"1080\" w:hanging=\"360\"/>");
+        ed.change_indent(-720);
+        assert_eq!(first_props(&ed).indent, 360);
+        ed.change_indent(-720);
+        assert_eq!((first_props(&ed).indent, first_props(&ed).ilvl), (0, 1));
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\" w:hanging=\"360\"/>");
+        let steps = ed.undo_names().len();
+        let at_margin = ed.doc.clone();
+        ed.change_indent(-720);
+        assert_eq!(ed.doc, at_margin, "a third Decrease changes nothing");
+        assert_eq!(ed.undo_names().len(), steps, "and records no step");
+        // Saved and opened again, it is the same paragraph.
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body>{}</w:body></w:document>",
+            crate::serialize::blocks_to_xml(&ed.doc.body)
+        );
+        let back = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        let Block::Paragraph(p) = &back.body[0] else {
+            panic!()
+        };
+        assert_eq!((p.props.indent, p.props.ilvl), (0, 1));
+        assert!(p.props.has_loaded_left_indent());
+
+        let mut ed = loaded_list_item(0, "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(first_props(&ed).indent, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1728: at the margin the item keeps its own indent in session, as it
+    /// does once saved: Increase moves that indent, not the level.
+    #[test]
+    fn increase_indent_after_the_margin_moves_the_items_own_indent() {
+        let mut ed = loaded_list_item(1, "<w:ind w:left=\"360\"/>");
+        ed.change_indent(-720);
+        assert!(first_props(&ed).has_loaded_left_indent());
+        ed.change_indent(720);
+        assert_eq!((first_props(&ed).indent, first_props(&ed).ilvl), (720, 1));
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        // An item given its indent in session (no loaded one) is pinned too.
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.set_list(Some(42));
+        ed.select_all();
+        ed.set_indent(720, 0);
+        ed.change_indent(-720);
+        assert_eq!(first_props(&ed).indent, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1728: an item already at an explicit zero is left as loaded, its
+    /// attribute order included, and no step is recorded.
+    #[test]
+    fn decrease_indent_at_an_explicit_zero_changes_nothing() {
+        for ind in [
+            "<w:ind w:left=\"0\" w:hanging=\"360\"/>",
+            "<w:ind w:hanging=\"360\" w:left=\"0\"/>",
+            "<w:ind w:start=\"0\"/>",
+        ] {
+            let mut ed = loaded_list_item(0, ind);
+            let before = saved_ind(&ed);
+            assert_eq!(before, ind);
+            ed.change_indent(-720);
+            assert_eq!(saved_ind(&ed), before, "{ind}");
+            assert!(ed.undo_names().is_empty(), "{ind}");
+        }
+        // A character-unit zero becomes twips, as any edit of it does.
+        let mut ed = loaded_list_item(0, "<w:ind w:leftChars=\"0\" w:left=\"0\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
     }
 
     #[test]

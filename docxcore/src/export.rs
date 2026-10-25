@@ -1125,7 +1125,7 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
     flow.chapter_heading(p);
     let size = heading_size(p, opts.base_font_size);
     let mut segs = flatten_segments(p, p.props.heading_level.is_some(), &opts.styles);
-    if p.props.num_id.is_some() {
+    if p.props.in_list() {
         let ind = (p.props.ilvl.max(0) as usize) * 2;
         let mut bullet: Vec<PCell> = Vec::new();
         for _ in 0..ind {
@@ -3367,6 +3367,24 @@ mod tests {
         let pdf = to_pdf(&d, &PdfOptions::default());
         // 0x95 is the WinAnsi bullet byte; must appear in a content stream.
         assert!(pdf.windows(1).any(|w| w == [0x95]));
+    }
+
+    /// `w:numId="0"` is "no numbering" (#1728): no bullet prefix.
+    #[test]
+    fn num_id_zero_prints_no_bullet() {
+        let mut p = Paragraph {
+            props: ParProps::default(),
+            content: vec![run("item", RunProps::default())],
+        };
+        p.props.num_id = Some(0);
+        let d = doc(vec![Block::Paragraph(p)]);
+        let pdf = to_pdf(&d, &PdfOptions::default());
+        assert!(!pdf.contains(&0x95));
+        let texts: String = pages_of(&d, &PdfOptions::default())
+            .iter()
+            .flat_map(|p| p.texts.iter().map(|t| t.2.clone()))
+            .collect();
+        assert!(texts.starts_with("item"), "{texts:?}");
     }
 
     /// A non-breaking hyphen prints as a hyphen (WinAnsi has no U+2011), a
