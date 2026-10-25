@@ -20398,12 +20398,14 @@ mod kind_tests {
             (2, "SUM(macro1!A1:B2)*2", "SUM(#REF!)*2"),
             (3, "SUM(Macro1!A:A)", "SUM(#REF!)"),
             (4, "SUM(Report!A1,Dialog1!$B$2)", "SUM(Report!A1,#REF!)"),
-            // A 3-D span with a removed end sheet.
-            (5, "SUM(Data:Macro1!A1)", "SUM(#REF!)"),
         ];
         for (r, src, _) in gone {
             data.set_cell(r, 0, Cell::formula(src));
         }
+        // A 3-D span with a removed end sheet shrinks to the sheet left
+        // (#1734), and reads it.
+        data.set_cell(0, 0, Cell::number(5.0));
+        data.set_cell(5, 0, Cell::formula("SUM(Data:Macro1!A1)"));
         let kept = [
             (1, "Report!A1*2"),
             // Macro1 lies between Data and Report: it just leaves the span.
@@ -20463,6 +20465,9 @@ mod kind_tests {
                 assert_eq!(cell.formula.as_deref(), Some(want), "row {r}");
                 assert_eq!(cell.value, CellValue::Error("#REF!".into()), "row {r}");
             }
+            let shrunk = data.cell(5, 0).unwrap();
+            assert_eq!(shrunk.formula.as_deref(), Some("SUM(Data!A1)"));
+            assert_eq!(shrunk.value, CellValue::Number(5.0));
             for (r, src) in kept {
                 assert_eq!(data.cell(r, 1).unwrap().formula.as_deref(), Some(src));
             }
