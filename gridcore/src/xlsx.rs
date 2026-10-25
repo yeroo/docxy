@@ -25784,6 +25784,20 @@ mod rule_shift_tests {
         assert!(ws.contains(&keep), "{ws}");
     }
 
+    /// #1734: the Data Validation dialog's OK on "Any value" over a cell an
+    /// x14 validation covers keeps the element in the saved file.
+    #[test]
+    fn any_value_ok_keeps_an_x14_validation_through_a_save() {
+        let dv = x14_dv("C1:C5", "Z1", None);
+        let mut pkg = one("S", &format!("{MARGINS}{dv}"));
+        let any = crate::sheet::DataValidation::default();
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 2, 4, 2), &any, false);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<x14:dataValidations count=\"1\">"), "{ws}");
+        assert!(ws.contains("<xm:sqref>C1:C5</xm:sqref>"), "{ws}");
+        assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
+    }
+
     #[test]
     fn clear_conditional_formats_removes_x14_cf_but_keeps_x14_dv() {
         let cf = x14_cf("A1:A5", "B1&gt;1");

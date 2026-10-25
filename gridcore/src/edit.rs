@@ -48,6 +48,7 @@ pub use dataform::{
 mod consolidate;
 mod paste_special;
 mod sort;
+pub(crate) use paste_special::clear_classic_validation;
 pub use paste_special::{
     ClipBlock, ClipNote, ClipRule, MULTI_SELECTION, PasteExtras, PasteOp, PasteSpec, PasteWhat,
     clear_validation, multi_area_shape, paste_link_changes, paste_special_changes,
