@@ -899,8 +899,10 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     let mut parts: Vec<(u32, String)> = Vec::new();
 
     // A direct `w:jc` in `raw_props` (an explicit left) supersedes the
-    // loaded one, which may say `thaiDistribute` or `start` (#1752).
-    let raw_jc = props.raw_props.iter().any(|raw| local_name(raw) == "jc");
+    // loaded one, which may say `thaiDistribute` or `start` (#1752), while
+    // it is written: under another alignment it is superseded itself.
+    let raw_jc =
+        props.align == Align::Left && props.raw_props.iter().any(|raw| local_name(raw) == "jc");
     for raw in shadow.elements() {
         let name = local_name(raw);
         if name == "jc" && raw_jc {

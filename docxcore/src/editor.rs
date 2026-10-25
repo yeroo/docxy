@@ -8908,6 +8908,20 @@ mod tests {
         assert_eq!(saved_jcs(&ed), [LEFT_JC]);
     }
 
+    /// #1752 r1: a writer that sets `align` directly (wordcomshim) after an
+    /// Align Left leaves the raw left jc behind; the save still writes the
+    /// loaded centre, once, not nothing.
+    #[test]
+    fn a_superseded_raw_jc_keeps_the_loaded_one() {
+        let mut ed = loaded_para("<w:jc w:val=\"center\"/>");
+        ed.set_align(Align::Left);
+        let Block::Paragraph(p) = &mut ed.doc.body[0] else {
+            panic!()
+        };
+        p.props.align = Align::Center;
+        assert_eq!(saved_jcs(&ed), ["<w:jc w:val=\"center\"/>"]);
+    }
+
     #[test]
     fn align_left_undo_drops_explicit_jc() {
         let mut ed = Editor::new(doc(&["a"]));

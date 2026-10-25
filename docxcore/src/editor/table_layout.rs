@@ -676,7 +676,7 @@ impl Editor {
                 });
                 for b in &mut cell.blocks {
                     if let Block::Paragraph(p) = b {
-                        p.props.align = h;
+                        p.props.set_align_direct(h);
                     }
                 }
             }
@@ -2191,6 +2191,26 @@ mod tests {
         ed.anchor = None;
         ed.caret = at(0, 0);
         assert_eq!(ed.cell_alignment(), Some((VAlign::Center, Align::Right)));
+    }
+
+    /// #1752 r1: a cell's Left alignment is explicit, as Align Left is, so it
+    /// beats a centred Normal and saves one `w:jc` left.
+    #[test]
+    fn cell_alignment_left_beats_a_centred_normal() {
+        let sheet = crate::styles::parse_styles_xml(
+            "<w:styles><w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">\
+             <w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style></w:styles>",
+        );
+        let mut ed = Editor::new(grid_doc(1, 1));
+        select(&mut ed, (0, 0), (0, 0));
+        ed.set_cell_alignment(VAlign::Top, Align::Left).unwrap();
+        let Block::Paragraph(p) = &t(&ed).rows[0].cells[0].blocks[0] else {
+            panic!()
+        };
+        assert_eq!(sheet.effective_align(None, &p.props), Align::Left);
+        let xml = document_to_xml(&ed.doc);
+        assert_eq!(xml.matches("<w:jc ").count(), 1, "{xml}");
+        assert!(xml.contains("<w:jc w:val=\"left\"/>"), "{xml}");
     }
 
     #[test]
