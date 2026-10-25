@@ -193,7 +193,7 @@ struct RemovedSheetStash {
     /// The other sheets' tables whose calculated-column formulas it rewrote,
     /// by table name, before and after; put back on a table still reading
     /// `after`.
-    rewritten_tables: Vec<(String, Vec<Option<String>>, Vec<Option<String>>)>,
+    rewritten_tables: Vec<RewrittenTable>,
     /// The other sheets' charts it dropped references from (one with no part
     /// yet, or edited): the sheet's NAME, the drawing's index and the chart
     /// before and after; put back on a chart still as it was `after`.
@@ -223,6 +223,17 @@ struct RewrittenCell {
     before: String,
     after: String,
 }
+
+/// One table whose calculated-column formulas `delete_sheet` rewrote (see
+/// [`RemovedSheetStash::rewritten_tables`]).
+struct RewrittenTable {
+    name: String,
+    before: Vec<Option<String>>,
+    after: Vec<Option<String>>,
+}
+
+/// A sheet's NAME and its cells' formulas, by cell.
+type SheetFormulas = (String, Vec<((u32, u32), String)>);
 
 /// One chart `delete_sheet` dropped references from (see
 /// [`RemovedSheetStash::rewritten_charts`]).
@@ -2881,7 +2892,7 @@ impl Session {
             .collect();
         // The other sheets' cell formulas, tables' calculated formulas and
         // charts, to find which of them the removal rewrites.
-        let cells_before: Vec<(String, Vec<((u32, u32), String)>)> = self
+        let cells_before: Vec<SheetFormulas> = self
             .pkg
             .workbook
             .sheets
@@ -2939,15 +2950,17 @@ impl Session {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let rewritten_tables: Vec<(String, Vec<Option<String>>, Vec<Option<String>>)> =
-            tables_before
-                .into_iter()
-                .filter_map(|(name, before)| {
-                    let t = wb.tables.iter().find(|t| t.name == name)?;
-                    (t.calculated_formulas != before)
-                        .then(|| (name, before, t.calculated_formulas.clone()))
+        let rewritten_tables: Vec<RewrittenTable> = tables_before
+            .into_iter()
+            .filter_map(|(name, before)| {
+                let t = wb.tables.iter().find(|t| t.name == name)?;
+                (t.calculated_formulas != before).then(|| RewrittenTable {
+                    name,
+                    before,
+                    after: t.calculated_formulas.clone(),
                 })
-                .collect();
+            })
+            .collect();
         let rewritten_charts: Vec<RewrittenChart> = charts_before
             .into_iter()
             .flat_map(|(sheet, charts)| {
@@ -3391,11 +3404,11 @@ impl Session {
                 cell.formula = Some(r.before.clone());
             }
         }
-        for (name, before, after) in &stash.rewritten_tables {
+        for r in &stash.rewritten_tables {
             let tables = &mut self.pkg.workbook.tables;
-            if let Some(t) = tables.iter_mut().find(|t| t.name == *name) {
-                if t.calculated_formulas == *after {
-                    t.calculated_formulas = before.clone();
+            if let Some(t) = tables.iter_mut().find(|t| t.name == r.name) {
+                if t.calculated_formulas == r.after {
+                    t.calculated_formulas = r.before.clone();
                 }
             }
         }
