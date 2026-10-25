@@ -11310,29 +11310,10 @@ fn sheet_table_parts(parts: &[(String, Vec<u8>)], sheet: &str) -> Vec<(String, u
         .filter_map(|(_, _, target, _)| {
             let part = resolve_relative(dir, &target);
             let xml = part_text(parts, &part)?;
-            let id = table_root_id(&xml)?;
+            let id = table_id(&xml)?;
             Some((part, id))
         })
         .collect()
-}
-
-/// The `id` of `xml`'s root when it is a `table`.
-fn table_root_id(xml: &str) -> Option<u32> {
-    let mut p = XmlParser::new(xml);
-    loop {
-        match p.next() {
-            Event::Start => {
-                if local(p.name()) != "table" {
-                    return None;
-                }
-                return (p.attrs().iter())
-                    .find(|a| local(a.name) == "id")
-                    .and_then(|a| decode(a.value).parse().ok());
-            }
-            Event::Eof => return None,
-            _ => {}
-        }
-    }
 }
 
 /// Remove `part`, its own rels part, and, following those relationships, each
