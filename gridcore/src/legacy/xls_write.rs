@@ -5,15 +5,15 @@
 //! The whole file is written from the model, so it reflects every edit:
 //! sheets, cells, formulas, number formats, defined names, the date system,
 //! the formatting the model holds (fonts, fills, alignment, wrap, a thin
-//! box border, quote prefix), merged cells, column widths, row heights,
-//! hidden rows, columns and sheets, and frozen panes. The record layouts and
+//! box border, quote prefix), merged cells, hyperlinks, column widths, row
+//! heights, hidden rows, columns and sheets, and frozen panes. The record layouts and
 //! their order follow what Excel writes (corpus/legacy's `.xls` files).
 //!
 //! What BIFF8 or this writer can't hold is left out and named in
 //! [`XlsOut::lost`]: cells past the 65,536 × 256 grid, formulas that can't
 //! be compiled ([`super::ptg_write::Why`]; the cell keeps its value), and
 //! the model features this writer has no records for (tables, conditional
-//! formatting, data validation, hyperlinks, drawings, comments, ...).
+//! formatting, data validation, drawings, comments, ...).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -133,6 +133,8 @@ enum Loss {
     LongText,
     Xfs,
     Fonts,
+    HyperlinksPastGrid,
+    HyperlinksTooLong,
 }
 
 pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
@@ -181,6 +183,14 @@ impl Loss {
             Loss::Fonts => format!(
                 "{} past Excel 97-2003's limit of 512 (merged into the default)",
                 plural(n, "font", "fonts")
+            ),
+            Loss::HyperlinksPastGrid => format!(
+                "{} beyond row 65,536 or column IV",
+                plural(n, "hyperlink", "hyperlinks")
+            ),
+            Loss::HyperlinksTooLong => format!(
+                "{} Excel 97-2003 cannot hold",
+                plural(n, "hyperlink", "hyperlinks")
             ),
         }
     }
@@ -256,9 +266,6 @@ fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtra
     }
     if any(&|s| !s.validations.is_empty()) {
         out.push("data validation");
-    }
-    if any(&|s| !s.hyperlinks.is_empty()) {
-        out.push("hyperlinks");
     }
     if any(&|s| !s.drawings.is_empty()) {
         out.push("pictures, shapes and charts");
@@ -1491,8 +1498,69 @@ fn sheet_records(
         }
         rec(&mut out, 0x00E5, &b);
     }
+    hyperlink_records(&mut out, s, lost);
     rec(&mut out, EOF, &[]);
     SheetOut { bytes: out }
+}
+
+/// The sheet's HLINK records (#1726). A loaded range whose cells all still
+/// carry its own target ([`LinkRef::target`]; the anchor alone for a range
+/// too big to spread) is one record over the range, clipped to the grid;
+/// every other link cell is a record of its own, after the ranges, so one
+/// inside a range reads back with its own target (a later record wins). A
+/// range or cell past the grid, and a link whose record would be over
+/// [`MAX_BODY`] (HLINK has no CONTINUE), is counted in `lost`.
+///
+/// Known limit: ranges go in anchor order, not the order the file had them,
+/// so where two overlap, which one a cell outside the model's spread takes in
+/// Excel after an `.xls` round trip can change; an anchor-only range does not
+/// hold its other cells, so this cannot be exact.
+///
+/// [`LinkRef::target`]: crate::sheet::LinkRef::target
+fn hyperlink_records(out: &mut Vec<u8>, s: &Sheet, lost: &mut BTreeMap<Loss, usize>) {
+    use crate::sheet::hyperlink_cells;
+    if s.hyperlinks.is_empty() {
+        return;
+    }
+    let mut write = |rect: Rect, target: &str, lost: &mut BTreeMap<Loss, usize>| {
+        let b = super::hlink::body(rect, target);
+        if b.len() <= MAX_BODY {
+            rec(out, super::hlink::HLINK, &b);
+        } else {
+            *lost.entry(Loss::HyperlinksTooLong).or_default() += 1;
+        }
+    };
+    let mut covered = std::collections::HashSet::new();
+    for link in s.hyperlink_refs.values() {
+        let (now, target) = (link.now, &link.target);
+        if !hyperlink_cells(now).all(|c| s.hyperlinks.get(&c) == Some(target)) {
+            continue;
+        }
+        if !on_grid(now.0, now.1) {
+            covered.extend(hyperlink_cells(now));
+            *lost.entry(Loss::HyperlinksPastGrid).or_default() += 1;
+            continue;
+        }
+        // Its cells past the grid are counted by the cell loop below.
+        covered.extend(hyperlink_cells(now).filter(|&(r, c)| on_grid(r, c)));
+        let max_row = ptg_write::MAX_ROW as u32;
+        let max_col = ptg_write::MAX_COL as u32;
+        write(
+            (now.0, now.1, now.2.min(max_row), now.3.min(max_col)),
+            target,
+            lost,
+        );
+    }
+    for (&(r, c), target) in &s.hyperlinks {
+        if covered.contains(&(r, c)) {
+            continue;
+        }
+        if on_grid(r, c) {
+            write((r, c, r, c), target, lost);
+        } else {
+            *lost.entry(Loss::HyperlinksPastGrid).or_default() += 1;
+        }
+    }
 }
 
 /// A FORMULA record (and a STRING after it for a text result): `head` is
@@ -1939,6 +2007,301 @@ mod tests {
         assert_eq!(cells.len(), 3);
     }
 
+    /// A loaded `<hyperlink>` over `rect`, as the xlsx loader leaves it.
+    fn loaded_link(s: &mut Sheet, rect: Rect, target: &str) {
+        for cell in crate::sheet::hyperlink_cells(rect) {
+            s.hyperlinks.insert(cell, target.into());
+        }
+        s.hyperlink_refs.insert(
+            (rect.0, rect.1),
+            crate::sheet::LinkRef {
+                loaded: rect,
+                now: rect,
+                target: target.into(),
+            },
+        );
+    }
+
+    /// The HLINK records' ranges in a written file, in order.
+    fn hlink_ranges(file: &[u8]) -> Vec<Rect> {
+        let cfb = opccore::cfb::Cfb::open(file).unwrap();
+        let s = cfb.read_stream("Workbook").unwrap();
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + 4 <= s.len() {
+            let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+            let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+            if ty == 0x01B8 {
+                let (rect, _) = super::super::hlink::parse(&s[at + 4..at + 4 + len]).unwrap();
+                out.push(rect);
+            }
+            at += 4 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn hyperlinks_round_trip_through_xls() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        let targets = [
+            "https://example.com/a?b=1&c=2",
+            "mailto:a@b.example",
+            "#Data!B3",
+            "#'My Sheet'!A1",
+            "\\\\server\\share\\a.xlsx",
+            "C:\\x\\y.xlsx",
+            "..\\up\\a.xlsx",
+            "C:\\dé\\ü.xlsx",
+            "file:///C:/x",
+            // A cell in another workbook: the path, then the location.
+            "..\\a.xls#Sheet1!A1",
+            "C:\\b.xlsx#S!A1",
+            "\\\\s\\sh\\a.xls#S!A1",
+            "https://x/#frag",
+        ];
+        let s = &mut pkg.workbook.sheets[0];
+        for (i, t) in targets.iter().enumerate() {
+            s.hyperlinks.insert((i as u32, 2), t.to_string());
+        }
+        pkg.workbook.sheets[1]
+            .hyperlinks
+            .insert((65_535, 255), "https://corner/".into());
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty(), "{lost:?}");
+        assert_eq!(
+            back.workbook.sheets[0].hyperlinks,
+            pkg.workbook.sheets[0].hyperlinks
+        );
+        assert_eq!(
+            back.workbook.sheets[1].hyperlinks,
+            pkg.workbook.sheets[1].hyperlinks
+        );
+        // Single cells make no ranges.
+        assert!(back.workbook.sheets[0].hyperlink_refs.is_empty());
+        // Saved on as xlsx, the links stay.
+        let again = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&back)).unwrap();
+        assert_eq!(
+            again.workbook.sheets[0].hyperlinks,
+            pkg.workbook.sheets[0].hyperlinks
+        );
+    }
+
+    #[test]
+    fn loaded_ranges_write_one_hlink() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        let s = &mut pkg.workbook.sheets[0];
+        loaded_link(s, (0, 0, 1, 1), "https://a/");
+        // A whole column and a whole row: anchor-only in the model.
+        loaded_link(s, (0, 2, crate::sheet::MAX_ROWS - 1, 2), "https://c/");
+        loaded_link(s, (4, 0, 4, crate::sheet::MAX_COLS - 1), "https://row/");
+        let out = write_xls(&pkg);
+        assert!(out.lost.is_empty(), "{:?}", out.lost);
+        assert_eq!(
+            hlink_ranges(&out.bytes),
+            [(0, 0, 1, 1), (0, 2, 65_535, 2), (4, 0, 4, 255)]
+        );
+        let (back, _) = round(&pkg);
+        // The import keeps each range as one, clipped.
+        let refs: Vec<Rect> = back.workbook.sheets[0]
+            .hyperlink_refs
+            .values()
+            .map(|l| l.now)
+            .collect();
+        assert_eq!(refs, [(0, 0, 1, 1), (0, 2, 65_535, 2), (4, 0, 4, 255)]);
+        let links = &back.workbook.sheets[0].hyperlinks;
+        for cell in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+            assert_eq!(links[&cell], "https://a/");
+        }
+        // The column, clipped, is still over 4,096 cells: anchor only.
+        assert_eq!(links[&(0, 2)], "https://c/");
+        assert!(!links.contains_key(&(1, 2)));
+        // The row, clipped to 256 cells, now spreads over them (the one
+        // stated exception to an equal map).
+        assert_eq!(
+            links.iter().filter(|(_, t)| *t == "https://row/").count(),
+            256
+        );
+    }
+
+    /// The worksheet part of an imported book's first sheet.
+    fn sheet_xml(pkg: &SheetPackage) -> String {
+        let name = pkg
+            .part_names()
+            .into_iter()
+            .filter(|n| n.starts_with("xl/worksheets/sheet") && n.ends_with(".xml"))
+            .min()
+            .unwrap()
+            .to_string();
+        String::from_utf8_lossy(pkg.part(&name).unwrap()).into_owned()
+    }
+
+    /// A big range is held by its anchor: relinking the anchor breaks the
+    /// range, and only the anchor's own link is written, never the column
+    /// under the anchor's new target (#1726 r4).
+    #[test]
+    fn a_relinked_anchor_writes_only_its_own_link() {
+        let col = (0, 2, crate::sheet::MAX_ROWS - 1, 2);
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(&mut pkg.workbook.sheets[0], col, "https://a/");
+        // An .xls import, and an .xlsx load, of the column.
+        let (imported, _) = round(&pkg);
+        let loaded = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            loaded.workbook.sheets[0].hyperlink_refs[&(0, 2)].target,
+            "https://a/"
+        );
+        for mut p in [imported, loaded] {
+            p.workbook.sheets[0]
+                .hyperlinks
+                .insert((0, 2), "https://b/".into());
+            let out = write_xls(&p);
+            assert_eq!(hlink_ranges(&out.bytes), [(0, 2, 0, 2)]);
+            let (back, _) = open_workbook(&out.bytes).unwrap();
+            assert!(back.workbook.sheets[0].hyperlink_refs.is_empty());
+            assert_eq!(back.workbook.sheets[0].hyperlinks.len(), 1);
+            assert_eq!(back.workbook.sheets[0].hyperlinks[&(0, 2)], "https://b/");
+            let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&p)).unwrap();
+            let ws = sheet_xml(&xlsx);
+            assert_eq!(ws.matches("<hyperlink ").count(), 1, "{ws}");
+            assert!(ws.contains("<hyperlink ref=\"C1\" "), "{ws}");
+            assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 2)], "https://b/");
+        }
+    }
+
+    /// An `.xls` range over more than 4,096 cells (the model holds its
+    /// anchor) stays one range through `.xls` and `.xlsx` saves.
+    #[test]
+    fn an_imported_whole_column_link_stays_a_range() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(
+            &mut pkg.workbook.sheets[0],
+            (0, 2, crate::sheet::MAX_ROWS - 1, 2),
+            "https://c/",
+        );
+        let (imported, _) = round(&pkg);
+        let col = (0, 2, 65_535, 2);
+        let refs = |p: &SheetPackage| -> Vec<Rect> {
+            p.workbook.sheets[0]
+                .hyperlink_refs
+                .values()
+                .map(|l| l.now)
+                .collect()
+        };
+        assert_eq!(refs(&imported), [col]);
+        // Saved as .xls again: one record.
+        assert_eq!(hlink_ranges(&write_xls(&imported).bytes), [col]);
+        // Saved as .xlsx: one element; reloaded, the same range.
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&imported)).unwrap();
+        let ws = sheet_xml(&xlsx);
+        assert_eq!(ws.matches("<hyperlink ").count(), 1, "{ws}");
+        assert!(ws.contains("<hyperlink ref=\"C1:C65536\" r:id="), "{ws}");
+        assert_eq!(refs(&xlsx), [col]);
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 2)], "https://c/");
+        // A row moves the range with its cells before the save.
+        let mut moved = imported.clone();
+        crate::edit::insert_rows(&mut moved.workbook, 0, 0, 1);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&moved)).unwrap();
+        assert_eq!(refs(&xlsx), [(1, 2, 65_536, 2)]);
+    }
+
+    /// An imported range's `loaded` names no element of the package:
+    /// removing the link (from every cell, #671) or cutting the range writes
+    /// no stray element, and the cells a cut leaves are written each.
+    #[test]
+    fn an_edited_imported_range_writes_what_is_left() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(&mut pkg.workbook.sheets[0], (0, 0, 2, 1), "#Data!A1");
+        let (imported, _) = round(&pkg);
+        // Removed from one cell: gone from all of them.
+        let mut cleared = imported.clone();
+        let s = &mut cleared.workbook.sheets[0];
+        let plan = crate::edit::clear_plan(
+            s,
+            &[(0, 0, 0, 0)],
+            crate::edit::ClearWhat::RemoveHyperlinks,
+            &[],
+        )
+        .unwrap();
+        crate::edit::apply_clear_sheet(s, &plan);
+        assert!(s.hyperlinks.is_empty());
+        assert_eq!(s.hyperlinks_removed, [(0, 0, 2, 1)]);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&cleared)).unwrap();
+        assert!(!sheet_xml(&xlsx).contains("<hyperlink"));
+        assert!(xlsx.workbook.sheets[0].hyperlinks.is_empty());
+        // A row deleted through the range cuts it: the four cells left are
+        // links of their own.
+        let mut cut = imported.clone();
+        crate::edit::delete_rows(&mut cut.workbook, 0, 1, 1);
+        let s = &cut.workbook.sheets[0];
+        assert!(s.hyperlink_refs.is_empty());
+        assert_eq!(s.hyperlinks.len(), 4);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&cut)).unwrap();
+        let ws = sheet_xml(&xlsx);
+        assert_eq!(ws.matches("<hyperlink ").count(), 4, "{ws}");
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks, s.hyperlinks);
+    }
+
+    #[test]
+    fn a_range_whose_cells_changed_is_written_cell_by_cell() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        let s = &mut pkg.workbook.sheets[0];
+        loaded_link(s, (0, 0, 0, 2), "https://a/");
+        s.hyperlinks.insert((0, 1), "https://b/".into());
+        let out = write_xls(&pkg);
+        assert_eq!(
+            hlink_ranges(&out.bytes),
+            [(0, 0, 0, 0), (0, 1, 0, 1), (0, 2, 0, 2)]
+        );
+        let (back, _) = round(&pkg);
+        assert_eq!(
+            back.workbook.sheets[0].hyperlinks,
+            pkg.workbook.sheets[0].hyperlinks
+        );
+    }
+
+    #[test]
+    fn cell_link_inside_a_range_wins() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        let s = &mut pkg.workbook.sheets[0];
+        loaded_link(s, (0, 2, crate::sheet::MAX_ROWS - 1, 2), "https://c/");
+        s.hyperlinks.insert((9, 2), "https://own/".into());
+        let out = write_xls(&pkg);
+        assert_eq!(hlink_ranges(&out.bytes), [(0, 2, 65_535, 2), (9, 2, 9, 2)]);
+        let (back, _) = round(&pkg);
+        let links = &back.workbook.sheets[0].hyperlinks;
+        assert_eq!(links[&(0, 2)], "https://c/");
+        assert_eq!(links[&(9, 2)], "https://own/");
+    }
+
+    #[test]
+    fn hyperlinks_past_the_grid_are_counted() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        let s = &mut pkg.workbook.sheets[0];
+        s.hyperlinks.insert((65_536, 0), "https://a/".into());
+        s.hyperlinks.insert((0, 256), "https://b/".into());
+        // A range anchored past the grid counts once.
+        loaded_link(s, (70_000, 0, 70_001, 1), "https://r/");
+        // A range across the grid's edge: its cells past it count each.
+        loaded_link(s, (65_534, 3, 65_537, 3), "https://edge/");
+        // A target too long for one record.
+        s.hyperlinks
+            .insert((1, 0), format!("https://x/{}", "a".repeat(5_000)));
+        s.hyperlinks.insert((2, 0), "https://kept/".into());
+        let (back, lost) = round(&pkg);
+        assert_eq!(
+            lost,
+            [
+                "5 hyperlinks beyond row 65,536 or column IV",
+                "1 hyperlink Excel 97-2003 cannot hold"
+            ]
+        );
+        let links = &back.workbook.sheets[0].hyperlinks;
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[&(2, 0)], "https://kept/");
+        assert_eq!(links[&(65_534, 3)], "https://edge/");
+        assert_eq!(links[&(65_535, 3)], "https://edge/");
+    }
+
     #[test]
     fn model_features_without_records_are_named() {
         let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
@@ -1947,9 +2310,10 @@ mod tests {
             .hyperlinks
             .insert((0, 0), "https://example.com".into());
         pkg.workbook.sheets[0].set_row_outline(1, 1);
+        // Hyperlinks have records (#1726): only the outline is named.
         assert_eq!(
             write_xls(&pkg).lost,
-            ["hyperlinks", "outlines (grouped rows and columns)"]
+            ["outlines (grouped rows and columns)"]
         );
         // Excel's own page setup isn't a loss (an .xlsx's says portrait and
         // A4), a landscape one is.

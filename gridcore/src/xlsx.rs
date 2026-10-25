@@ -30,6 +30,7 @@ mod filter_tests;
 #[cfg(test)]
 mod hyperlink_tests;
 mod hyperlinks;
+pub(crate) use hyperlinks::{has_scheme, model_target};
 mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
@@ -2846,6 +2847,7 @@ fn parse_worksheet_with(
                             crate::sheet::LinkRef {
                                 loaded: rect,
                                 now: rect,
+                                target: t.clone(),
                             },
                         );
                         // A whole-column hyperlink applies only to its anchor.

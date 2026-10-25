@@ -542,7 +542,7 @@ const SHEET_KNOWN: &[u16] = &[
     0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B, 0x0041, 0x0055, 0x005D, 0x007D, 0x0081, 0x0083,
     0x0084, 0x0099, 0x009D, 0x00A0, 0x00A1, 0x00AE, 0x00B0, 0x00BD, 0x00BE, 0x00E5, 0x00E9, 0x00EC,
     0x00FD, 0x01AA, 0x01AD, 0x01B0, 0x01B1, 0x01B2, 0x01B8, 0x01BE, 0x0201, 0x0204, 0x0205, 0x0207,
-    0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
+    0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0800, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
     0x088B, 0x005F, 0x0866, 0x089C,
     // CONTINUE, and USERSVIEWEND (its view's BEGIN is named).
     0x003C, 0x01AB,
@@ -1036,6 +1036,22 @@ fn read_sheet(
             _ if depth > 0 => continue,
             _ => {}
         }
+        // HLINK (#1726): one the reader can't read is left out and named. A
+        // range spreads its target over its cells: charged as repeats, so a
+        // small file can't expand without bound.
+        if r.ty == super::hlink::HLINK {
+            match super::hlink::parse(&r.data) {
+                Some(link) => {
+                    let copies = crate::sheet::hyperlink_cells(link.0).count() - 1;
+                    book.charge_repeats(copies, copies.saturating_mul(link.1.len()))?;
+                    sheet.hyperlinks.push(link);
+                }
+                None => {
+                    book.dropped.insert("hyperlinks");
+                }
+            }
+            continue;
+        }
         let mut c = Cur::new(r);
         let _ = (|| -> Option<()> {
             match r.ty {
@@ -1369,8 +1385,8 @@ fn read_sheet(
                 0x01B2 | 0x01BE => {
                     book.dropped.insert("data validation");
                 }
-                0x01B8 => {
-                    book.dropped.insert("hyperlinks");
+                super::hlink::HLINK_TOOLTIP => {
+                    book.dropped.insert("hyperlink ScreenTips");
                 }
                 0x009D => {
                     book.dropped.insert("AutoFilter");
@@ -1982,6 +1998,135 @@ pub(crate) mod tests {
                 "vertical alignment"
             ]
         );
+    }
+
+    /// HLINK records are read; one the reader can't read is named, and so
+    /// is a ScreenTip (#1726).
+    #[test]
+    fn unreadable_hlink_is_dropped_by_name() {
+        let good = rec(
+            0x01B8,
+            &super::super::hlink::body((0, 0, 1, 1), "https://x/"),
+        );
+        let book = read(&workbook(&[], &[number(0, 0, 1.0), good.clone()])).unwrap();
+        assert_eq!(
+            book.sheets[0].hyperlinks,
+            [((0, 0, 1, 1), "https://x/".to_string())]
+        );
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+        let mut reversed = super::super::hlink::body((0, 0, 1, 1), "https://y/");
+        reversed[0] = 5;
+        for bad in [vec![0u8; 3], vec![0u8; 40], reversed] {
+            let book = read(&workbook(&[], &[good.clone(), rec(0x01B8, &bad)])).unwrap();
+            assert_eq!(book.sheets[0].hyperlinks.len(), 1);
+            assert_eq!(
+                book.dropped.iter().copied().collect::<Vec<_>>(),
+                ["hyperlinks"]
+            );
+            assert!(book.unknown_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn hlink_spread_is_charged_as_repeats() {
+        // Two 64x64 ranges: 2 x 4,095 copies of the target past the first
+        // cell each.
+        let link = |r: u32| {
+            rec(
+                0x01B8,
+                &super::super::hlink::body((r, 0, r + 63, 63), "https://x/"),
+            )
+        };
+        let stream = workbook(&[], &[link(0), link(100)]);
+        let tight = Limits {
+            repeat_cells: 8_000,
+            ..Limits::default()
+        };
+        let err = read_with(&stream, tight).err().unwrap();
+        assert!(err.to_string().contains("too many repeated cells"), "{err}");
+        let tight_bytes = Limits {
+            repeat_bytes: 50_000,
+            ..Limits::default()
+        };
+        assert!(read_with(&stream, tight_bytes).is_err());
+        let book = read(&stream).unwrap();
+        assert_eq!(book.sheets[0].hyperlinks.len(), 2);
+    }
+
+    /// A column link and a later link on its anchor: the model holds the
+    /// anchor's own, and a save writes that alone (the column, which the
+    /// model holds only by its anchor, is not written under it).
+    #[test]
+    fn a_later_link_on_a_range_anchor_breaks_the_range() {
+        let hlink = |rect, t| rec(0x01B8, &super::super::hlink::body(rect, t));
+        let stream = workbook(
+            &[],
+            &[
+                hlink((0, 2, 65_535, 2), "https://x/"),
+                hlink((0, 2, 0, 2), "https://y/"),
+            ],
+        );
+        let pkg = read(&stream).unwrap().build();
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.hyperlinks.len(), 1);
+        assert_eq!(s.hyperlinks[&(0, 2)], "https://y/");
+        assert_eq!(s.hyperlink_refs[&(0, 2)].target, "https://x/");
+        let out = crate::legacy::xls_write::write_xls(&pkg);
+        let (back, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+        let b = &back.workbook.sheets[0];
+        assert!(b.hyperlink_refs.is_empty());
+        assert_eq!(b.hyperlinks, s.hyperlinks);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert!(
+            xlsx.workbook.sheets[0]
+                .hyperlink_refs
+                .values()
+                .all(|l| l.now == (0, 2, 0, 2))
+        );
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks, s.hyperlinks);
+    }
+
+    /// The trace of #1726 r5: HLINK C:C -> x, then C1 -> y; deleting row 1
+    /// re-anchors the column on the new C1, which takes the range's own x,
+    /// not the deleted cell's y.
+    #[test]
+    fn a_reanchored_range_keeps_its_own_target() {
+        let hlink = |rect, t| rec(0x01B8, &super::super::hlink::body(rect, t));
+        let stream = workbook(
+            &[],
+            &[
+                hlink((0, 2, 65_535, 2), "https://x/"),
+                hlink((0, 2, 0, 2), "https://y/"),
+            ],
+        );
+        let mut pkg = read(&stream).unwrap().build();
+        crate::edit::delete_rows(&mut pkg.workbook, 0, 0, 1);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.hyperlinks.len(), 1);
+        assert_eq!(s.hyperlinks[&(0, 2)], "https://x/");
+        assert_eq!(s.hyperlink_refs[&(0, 2)].now, (0, 2, 65_534, 2));
+        assert_eq!(s.hyperlink_refs[&(0, 2)].target, "https://x/");
+        // Intact again: written as the one range.
+        let out = crate::legacy::xls_write::write_xls(&pkg);
+        let (back, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+        assert_eq!(
+            back.workbook.sheets[0].hyperlink_refs[&(0, 2)].now,
+            (0, 2, 65_534, 2)
+        );
+    }
+
+    #[test]
+    fn hlink_tooltip_is_named() {
+        let good = rec(0x01B8, &super::super::hlink::body((0, 0, 0, 0), "#Data!B2"));
+        let mut tip = vec![0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        tip.extend("tip\0".encode_utf16().flat_map(u16::to_le_bytes));
+        let book = read(&workbook(&[], &[good, rec(0x0800, &tip)])).unwrap();
+        assert_eq!(book.sheets[0].hyperlinks[0].1, "#Data!B2");
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["hyperlink ScreenTips"]
+        );
+        assert!(book.unknown_records.is_empty());
     }
 
     /// A thin box is the model's border in any colour, but a colour other

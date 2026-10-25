@@ -15571,16 +15571,14 @@ mod tests {
 
         // A loss the writer finds: asked once, then not again for the same
         // list, and again when the list grows.
-        app.pkg.workbook.sheets[app.sheet]
-            .hyperlinks
-            .insert((0, 0), "https://example.com".into());
+        app.pkg.workbook.sheets[app.sheet].protection = Some("sheet=\"1\"".into());
         app.save();
         assert!(
             app.confirm
                 .as_ref()
                 .unwrap()
                 .prompt()
-                .contains("lost: hyperlinks.")
+                .contains("lost: sheet protection.")
         );
         yes(&mut app);
         app.save();
@@ -15592,7 +15590,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .prompt()
-                .contains("hyperlinks; outlines")
+                .contains("sheet protection; outlines")
         );
         yes(&mut app);
         // Fewer losses than were accepted don't ask again.
@@ -15625,25 +15623,21 @@ mod tests {
     fn a_new_workbook_forgets_accepted_losses() {
         let dir = tmp("compat-new");
         let (mut app, _) = open_clean_xls(&dir, "a.xls");
-        app.pkg.workbook.sheets[app.sheet]
-            .hyperlinks
-            .insert((0, 0), "https://example.com".into());
+        app.pkg.workbook.sheets[app.sheet].protection = Some("sheet=\"1\"".into());
         app.save();
         yes(&mut app);
         assert!(!app.compat_accepted.is_empty());
         app.new_workbook();
         assert!(app.compat_accepted.is_empty() && app.dropped.is_empty());
         assert!(app.last_lost.is_empty());
-        app.pkg.workbook.sheets[app.sheet]
-            .hyperlinks
-            .insert((0, 0), "https://example.com".into());
+        app.pkg.workbook.sheets[app.sheet].protection = Some("sheet=\"1\"".into());
         app.request_save_as(dir.join("b.xls").to_string_lossy().into_owned());
         assert!(
             app.confirm
                 .as_ref()
                 .unwrap()
                 .prompt()
-                .contains("hyperlinks")
+                .contains("sheet protection")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15709,9 +15703,7 @@ mod tests {
             SourceFormat::Xls
         );
         // A loss asks before Save As writes, and No writes nothing.
-        app.pkg.workbook.sheets[app.sheet]
-            .hyperlinks
-            .insert((0, 0), "https://example.com".into());
+        app.pkg.workbook.sheets[app.sheet].protection = Some("sheet=\"1\"".into());
         let other = dir.join("other.xls");
         app.request_save_as(other.to_string_lossy().into_owned());
         no(&mut app);

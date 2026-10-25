@@ -18,6 +18,11 @@ fn book(links: &[(u32, u32)], refs: &[Area]) -> Workbook {
             crate::sheet::LinkRef {
                 loaded: rect,
                 now: rect,
+                target: s
+                    .hyperlinks
+                    .get(&(rect.0, rect.1))
+                    .cloned()
+                    .unwrap_or_default(),
             },
         );
     }
@@ -80,7 +85,7 @@ fn an_unchanged_range_link_is_translated() {
     let mut wb = book(&[(0, 0), (1, 0), (2, 0)], &[(0, 0, 2, 0)]);
     insert_rows(&mut wb, 0, 0, 2);
     assert_eq!(keys(&wb), vec![(2, 0), (3, 0), (4, 0)]);
-    let l = wb.sheets[0].hyperlink_refs[&(2, 0)];
+    let l = wb.sheets[0].hyperlink_refs[&(2, 0)].clone();
     assert_eq!((l.loaded, l.now), ((0, 0, 2, 0), (2, 0, 4, 0)));
     assert_eq!(wb.sheets[0].hyperlink_refs.len(), 1);
     let mut wb = book(&[(0, 1), (0, 2)], &[(0, 1, 0, 2)]);

@@ -24,31 +24,151 @@ type Rect = (u32, u32, u32, u32);
 /// How Excel spells a UNC path in a relationship: `file:///\\server\share`.
 const UNC_URI: &str = "file:///";
 
-/// The relationship `Target` for a model target: a UNC path (`\\server\share`)
-/// gets the `file:///` Excel writes, since a bare backslash path is no URI
-/// (#1456); every other target is written as it is.
+/// Whether `target` starts with a URI scheme of two or more characters
+/// (`C:` is a drive, not a scheme): the one test the model, the xlsx save and
+/// the `.xls` HLINK writer share.
+pub(crate) fn has_scheme(target: &str) -> bool {
+    let Some(colon) = target.find(':') else {
+        return false;
+    };
+    let scheme = &target[..colon];
+    scheme.len() >= 2
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
+/// A path with no scheme that is not a UNC path or a location: relative or
+/// a drive path (`..\a.xlsx`, `C:\x.xlsx`, `sub/x.xlsx`).
+fn is_plain_path(target: &str) -> bool {
+    !has_scheme(target) && !target.starts_with("\\\\") && !target.starts_with('#')
+}
+
+/// The relationship `Target` for a model target. The model holds a path
+/// natively (#1726), and a `Target` is a URI reference, so a path's `%` is
+/// escaped as `%25` ([`model_target`] decodes it back): a UNC path
+/// (`\\server\share`) also gets the `file:///` Excel writes, since a bare
+/// backslash path is no URI (#1456). Every other target is written as it is.
 fn wire_target(model: &str) -> Cow<'_, str> {
     if model.starts_with("\\\\") {
-        Cow::Owned(format!("{UNC_URI}{model}"))
+        Cow::Owned(format!("{UNC_URI}{}", model.replace('%', "%25")))
+    } else if is_plain_path(model) && model.contains('%') {
+        Cow::Owned(model.replace('%', "%25"))
     } else {
         Cow::Borrowed(model)
     }
 }
 
-/// The model target for a relationship `Target`: `file:///\\server\share`
-/// (any case of the scheme) is the plain UNC path; every other target,
-/// including one a #1025 save wrote as a bare UNC path, is as it is.
-fn model_target(wire: &str) -> Cow<'_, str> {
+/// A model target as a save would reload it: the identity on the model's own
+/// form, and the model's form for a raw spelling held in it
+/// (`file://srv/share/x`). Model values are compared through this, never
+/// through [`model_target`], which would decode a native path's `%`.
+fn canonical(model: &str) -> String {
+    model_target(&wire_target(model)).into_owned()
+}
+
+/// The model target for a relationship `Target`: the model holds paths
+/// natively (#1726). A `file:` URI naming a UNC path is the plain path
+/// (`\\server\share\...`), in each spelling it comes in: Excel's
+/// `file:///\\server\share`, and `file://server/share`,
+/// `file:////server/share` and `file://///server/share` (any case of the
+/// scheme; percent escapes decoded). A path with no scheme
+/// (`My%20Book.xlsx`, `C:\a%20b.xlsx`) has its escapes decoded. One whose
+/// escapes do not decode (a bad one, `%2F`, `%5C`, not UTF-8), a URL, a
+/// location, and a bare UNC path a #1025 save wrote, are as they are.
+pub(crate) fn model_target(wire: &str) -> Cow<'_, str> {
     match wire.get(..UNC_URI.len()) {
         Some(scheme) if scheme.eq_ignore_ascii_case(UNC_URI) => {
             let rest = &wire[UNC_URI.len()..];
             if rest.starts_with("\\\\") {
-                return Cow::Borrowed(rest);
+                // Escapes decoded as in the other spellings; a remainder that
+                // does not decode stays as it is.
+                return match percent_decode(rest) {
+                    Some(decoded) => Cow::Owned(decoded),
+                    None => Cow::Borrowed(rest),
+                };
             }
-            Cow::Borrowed(wire)
         }
-        _ => Cow::Borrowed(wire),
+        _ => {}
     }
+    if let Some(unc) = unc_of_file_uri(wire) {
+        return Cow::Owned(unc);
+    }
+    if is_plain_path(wire) && wire.contains('%') {
+        if let Some(decoded) = percent_decode(wire) {
+            return Cow::Owned(decoded);
+        }
+    }
+    Cow::Borrowed(wire)
+}
+
+/// The UNC path a `file://server/share/...` URI names (two, four or five
+/// slashes), or `None`: a local path (`file:///C:/x`, `file:///srv/share`),
+/// `localhost`, no server or no share, a query or fragment, a backslash, an
+/// escape that is a separator (`%2F`, `%5C`) or that does not decode to
+/// UTF-8, a drive or a port where the server goes.
+fn unc_of_file_uri(wire: &str) -> Option<String> {
+    const FILE: &str = "file://";
+    let scheme = wire.get(..FILE.len())?;
+    if !scheme.eq_ignore_ascii_case(FILE) {
+        return None;
+    }
+    let rest = &wire[FILE.len()..];
+    let path = if let Some(p) = rest.strip_prefix("///") {
+        p
+    } else if let Some(p) = rest.strip_prefix("//") {
+        p
+    } else {
+        let host = rest.split('/').next().unwrap_or("");
+        if host.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        rest
+    };
+    if path.contains(['?', '#', '\\']) {
+        return None;
+    }
+    let mut segments = path.split('/');
+    let server = segments.next().unwrap_or("");
+    let share = segments.next().unwrap_or("");
+    // A drive (`C:`, `c|`) or a `host:port` is no server.
+    if server.is_empty() || share.is_empty() || server.contains([':', '|']) {
+        return None;
+    }
+    let decoded = percent_decode(path)?;
+    Some(format!("\\\\{}", decoded.replace('/', "\\")))
+}
+
+/// `%XX` escapes decoded as UTF-8 bytes; `None` for a malformed escape, an
+/// escaped `/`, `\`, `#` or `?`, or bytes that are not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    if !s.contains('%') {
+        return Some(s.to_string());
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = s.get(i + 1..i + 3)?;
+            if !hex.bytes().all(|h| h.is_ascii_hexdigit()) {
+                return None;
+            }
+            let v = u8::from_str_radix(hex, 16).ok()?;
+            // An escaped separator, fragment or query would change what
+            // the path names once decoded (a `#` reads as a location).
+            if matches!(v, b'/' | b'\\' | b'#' | b'?') {
+                return None;
+            }
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// External hyperlink targets keyed by relationship id, from a worksheet's
@@ -173,6 +293,11 @@ pub(super) fn write_hyperlinks(
         None => (0, ""),
     };
     let mut items = items(block, &targets);
+    // The ranges the block's elements have as loaded, before [`relocate`].
+    let element_rects: HashSet<Rect> = items
+        .iter()
+        .filter_map(|i| i.link.as_ref().map(|(rect, _)| *rect))
+        .collect();
     let relocated = relocate(&mut items, sheet);
 
     // The cells whose link the model changed since the load.
@@ -180,7 +305,7 @@ pub(super) fn write_hyperlinks(
     let mut changed: HashSet<(u32, u32)> = sheet
         .hyperlinks
         .iter()
-        .filter(|(cell, t)| loaded.get(cell) != Some(&t.as_str()))
+        .filter(|(cell, t)| loaded.get(cell).copied() != Some(canonical(t).as_str()))
         .map(|(&cell, _)| cell)
         .collect();
     changed.extend(
@@ -210,10 +335,10 @@ pub(super) fn write_hyperlinks(
             .filter(|(_, s)| !**s)
             .map(|(i, _)| i),
     );
-    let new: BTreeMap<(u32, u32), &str> = sheet
+    let mut new: BTreeMap<(u32, u32), &str> = sheet
         .hyperlinks
         .iter()
-        .filter(|(cell, t)| kept.get(cell) != Some(&t.as_str()))
+        .filter(|(cell, t)| kept.get(cell).copied() != Some(canonical(t).as_str()))
         .map(|(&cell, t)| (cell, t.as_str()))
         .collect();
 
@@ -221,11 +346,37 @@ pub(super) fn write_hyperlinks(
     if span.is_none() && !worksheet_takes(&xml, "hyperlinks", false) {
         return xml;
     }
+    // A range no element of the block has (one an `.xls` import read, #1726)
+    // whose cells all still carry its target is one element over it, ahead
+    // of the single cells, so a cell's own link inside it wins on load.
+    let mut ranges: Vec<(Rect, &str)> = Vec::new();
+    for link in sheet.hyperlink_refs.values() {
+        let now = link.now;
+        if element_rects.contains(&link.loaded) || (now.0, now.1) == (now.2, now.3) {
+            continue;
+        }
+        // Every cell it spreads over (the anchor alone for a big range) still
+        // carries the range's own target, else its cells go one by one.
+        let Some(&target) = new.get(&(now.0, now.1)) else {
+            continue;
+        };
+        let own = link.target.as_str();
+        if !link_cells(now).all(|c| new.get(&c).is_some_and(|t| canonical(t) == own)) {
+            continue;
+        }
+        for c in link_cells(now) {
+            new.remove(&c);
+        }
+        ranges.push((now, target));
+    }
     let mut rels = ExternalRels::new(parts, rels_part, ns.rel("hyperlink"), &xml);
     let mut added = Vec::new();
     let mut uses_r = false;
-    for (&(r, c), target) in &new {
-        let at = cell_name(r, c);
+    let singles = new.iter().map(|(&(r, c), &t)| (cell_name(r, c), t));
+    let spans = ranges
+        .iter()
+        .map(|&(rect, t)| (crate::print::area::rect_name(rect), t));
+    for (at, target) in spans.chain(singles) {
         let item = match target.strip_prefix('#') {
             Some(location) => format!(
                 "<hyperlink ref=\"{at}\" location=\"{}\"/>",
@@ -316,7 +467,9 @@ fn relocate(items: &mut [Item], sheet: &Sheet) -> bool {
         let Some(&now) = moved.get(rect) else {
             continue;
         };
-        if link_cells(now).all(|c| sheet.hyperlinks.get(&c).map(String::as_str) == Some(target)) {
+        if link_cells(now).all(|c| {
+            sheet.hyperlinks.get(&c).map(|t| canonical(t)).as_deref() == Some(target.as_str())
+        }) {
             item.moved_to = Some(now);
             item.link = Some((now, target.clone()));
             any = true;
@@ -392,7 +545,7 @@ impl ExternalRels {
     /// `file:///`, a #1025 bare UNC path), else a new one with the next free
     /// `rIdN`, written as [`wire_target`].
     fn id(&mut self, model: &str) -> Option<String> {
-        if let Some(id) = self.have.get(model) {
+        if let Some(id) = self.have.get(&canonical(model)) {
             return Some(id.clone());
         }
         let target = wire_target(model);
@@ -409,7 +562,7 @@ impl ExternalRels {
             self.rel_type,
             esc_attr(&target)
         ));
-        self.have.insert(model.to_string(), rid.clone());
+        self.have.insert(canonical(model), rid.clone());
         Some(rid)
     }
 

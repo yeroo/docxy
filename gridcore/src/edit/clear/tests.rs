@@ -23,6 +23,7 @@ fn book() -> Workbook {
         crate::sheet::LinkRef {
             loaded: (0, 0, 0, 0),
             now: (0, 0, 0, 0),
+            target: "https://example.com".into(),
         },
     );
     wb.sheets.push(s);

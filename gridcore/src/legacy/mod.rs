@@ -27,6 +27,7 @@
 //! truncating.
 
 mod ftab;
+mod hlink;
 mod ods;
 mod ptg;
 mod ptg_write;
@@ -321,6 +322,9 @@ pub(crate) struct SheetIn {
     pub default_row_height: Option<f64>,
     pub base_col_width: Option<u32>,
     pub default_col_width: Option<f64>,
+    /// Cell hyperlinks in file order: (range, model target). A later one wins
+    /// over a cell an earlier one covers.
+    pub hyperlinks: Vec<(hlink::Rect, String)>,
 }
 
 /// Another workbook or add-in whose names formulas call, as `[k]!NAME`
@@ -519,6 +523,23 @@ impl BookIn {
                 s.cells.insert(key, cell);
             }
             s.merges = sheet.merges;
+            for (rect, target) in sheet.hyperlinks {
+                for cell in crate::sheet::hyperlink_cells(rect) {
+                    s.hyperlinks.insert(cell, target.clone());
+                }
+                // A range is kept as one, as an xlsx `<hyperlink>` is: saves
+                // write it whole and edits move it.
+                if (rect.0, rect.1) != (rect.2, rect.3) {
+                    s.hyperlink_refs.insert(
+                        (rect.0, rect.1),
+                        crate::sheet::LinkRef {
+                            loaded: rect,
+                            now: rect,
+                            target: target.clone(),
+                        },
+                    );
+                }
+            }
             for (first, last, width, hidden, plain) in sheet.cols {
                 s.col_defs.push(crate::sheet::ColDef {
                     min: first,

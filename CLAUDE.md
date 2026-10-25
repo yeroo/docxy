@@ -1744,3 +1744,55 @@
   table state over the data model's measures and relationships
   (`model_edits_for`), so ones added after a table step follow its Undo/Redo;
   the step's recorded `model_edits` still restore its `#REF!` cases.
+
+## Sheet hyperlinks in .xls, and file URI forms (#1726)
+
+- `gridcore/src/legacy/hlink.rs` is the HLINK record both ways: `body` for
+  `xls_write` (after MERGEDCELLS), `parse` for the `.xls` reader. A model target
+  is written as Excel writes it: `#loc` a location string (never split), a UNC
+  path a string moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme
+  (2+ letters, so `C:` is a drive) a URL moniker, any other path a File moniker
+  holding the path as the model has it (native text: `%` is literal; relative:
+  leading `..\` in `cAnti`, at most 255, no `hlstmfIsAbsolute`; a non-ASCII
+  path adds the Unicode extension). A path's `#loc` (a cell of another
+  workbook: the first `#` whose tail is a reference with `!` or a defined name,
+  no `\` or `/`) is that moniker plus a location, as the reader reads it
+  (`a#b.xlsx` is still split: the model holds one string). No display name,
+  frame or ScreenTip (#1454).
+- `LinkRef::target` is a range's own target. A `hyperlink_refs` range is
+  written whole, by both writers, only while every cell it spreads over (the
+  anchor alone for a range over 4,096 cells) carries that target; otherwise its
+  cells go one by one, so relinking a whole column's anchor writes only the
+  anchor. The `.xls` writer clips a range to the grid (a whole row then reads
+  back spread over its 256 cells) and writes the other link cells after the
+  ranges, so a cell's own link in a range wins on read. Overlapping ranges go
+  in anchor order, not the file's, so which one an overlapped cell takes in
+  Excel after an `.xls` round trip can change (a known limit: an anchor-only
+  range does not hold its other cells). Past the grid or over `MAX_BODY` is
+  counted in `lost`.
+- The reader skips a record it can't read (named "hyperlinks"; `cAnti` over
+  255 is one), takes a moniker plus location as `url#loc`, spreads ranges
+  through `hyperlink_cells` (charged as repeats, `charge_repeats`) and keeps
+  each multi-cell one in `hyperlink_refs` (`loaded == now`), so edits move it
+  and `write_hyperlinks` writes a ref whose `loaded` names no element of the
+  block as a new `<hyperlink>` over `now` (in `hyperlinks_removed` it strikes
+  nothing). HLinkTooltip (0x0800) is named "hyperlink ScreenTips". Checked
+  against xlrd only (no Excel oracle).
+- The model holds paths natively, UNC and scheme-less alike (`has_scheme`, in
+  `xlsx/hyperlinks.rs`, is the one scheme test; `C:` is a drive): an xlsx
+  `Target` (a URI reference) is decoded on load and `%`-escaped on write.
+  `xlsx::model_target` maps every `file:` spelling of a UNC path
+  (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
+  decoded in each) to `\\s\sh`, and decodes a scheme-less path's escapes
+  (`My%20Book.xlsx`); `localhost`, a drive or port in the server's place
+  (`file://C:/x`, `file://h:80/x`), local `file:` paths, a `file:` URI with
+  `?`/`#`, URLs, locations, bad escapes, and an escaped separator, `#` or `?`
+  (`%2F`, `%5C`, `%23`, `%3F`, which would change what the path names) stay
+  raw (Excel's `file:///\\…` spelling then keeps its UNC path, undecoded). `wire_target` writes
+  a UNC path as `file:///\\…` and any native path with `%` escaped as `%25`, so
+  it reloads as written. The save compares model values through `canonical`
+  (`model_target(wire_target(m))`, never `model_target(m)`, which would decode
+  a native `%`) and reuses relationships through it, so a raw spelling held in
+  the model is no change and no new relationship. An `.xls` File moniker's path
+  is native and read as it is; URL and string monikers go through
+  `model_target`.
