@@ -2053,6 +2053,39 @@ pub(crate) mod tests {
         assert_eq!(book.sheets[0].hyperlinks.len(), 2);
     }
 
+    /// A column link and a later link on its anchor: the model holds the
+    /// anchor's own, and a save writes that alone (the column, which the
+    /// model holds only by its anchor, is not written under it).
+    #[test]
+    fn a_later_link_on_a_range_anchor_breaks_the_range() {
+        let hlink = |rect, t| rec(0x01B8, &super::super::hlink::body(rect, t));
+        let stream = workbook(
+            &[],
+            &[
+                hlink((0, 2, 65_535, 2), "https://x/"),
+                hlink((0, 2, 0, 2), "https://y/"),
+            ],
+        );
+        let pkg = read(&stream).unwrap().build();
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.hyperlinks.len(), 1);
+        assert_eq!(s.hyperlinks[&(0, 2)], "https://y/");
+        assert_eq!(s.hyperlink_refs[&(0, 2)].target, "https://x/");
+        let out = crate::legacy::xls_write::write_xls(&pkg);
+        let (back, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+        let b = &back.workbook.sheets[0];
+        assert!(b.hyperlink_refs.is_empty());
+        assert_eq!(b.hyperlinks, s.hyperlinks);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert!(
+            xlsx.workbook.sheets[0]
+                .hyperlink_refs
+                .values()
+                .all(|l| l.now == (0, 2, 0, 2))
+        );
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks, s.hyperlinks);
+    }
+
     #[test]
     fn hlink_tooltip_is_named() {
         let good = rec(0x01B8, &super::super::hlink::body((0, 0, 0, 0), "#Data!B2"));

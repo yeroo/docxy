@@ -26,10 +26,11 @@ const UNC_URI: &str = "file:///";
 
 /// The relationship `Target` for a model target: a UNC path (`\\server\share`)
 /// gets the `file:///` Excel writes, since a bare backslash path is no URI
-/// (#1456); every other target is written as it is.
+/// (#1456), and its `%` is escaped as `%25`, as [`model_target`] decodes the
+/// escapes of that spelling (#1726); every other target is written as it is.
 fn wire_target(model: &str) -> Cow<'_, str> {
     if model.starts_with("\\\\") {
-        Cow::Owned(format!("{UNC_URI}{model}"))
+        Cow::Owned(format!("{UNC_URI}{}", model.replace('%', "%25")))
     } else {
         Cow::Borrowed(model)
     }
@@ -101,7 +102,7 @@ fn unc_of_file_uri(wire: &str) -> Option<String> {
 
 /// `%XX` escapes decoded as UTF-8 bytes; `None` for a malformed escape, an
 /// escaped `/` or `\`, or bytes that are not UTF-8.
-pub(crate) fn percent_decode(s: &str) -> Option<String> {
+fn percent_decode(s: &str) -> Option<String> {
     if !s.contains('%') {
         return Some(s.to_string());
     }
@@ -312,10 +313,13 @@ pub(super) fn write_hyperlinks(
         if element_rects.contains(&link.loaded) || (now.0, now.1) == (now.2, now.3) {
             continue;
         }
+        // Every cell it spreads over (the anchor alone for a big range) still
+        // carries the range's own target, else its cells go one by one.
         let Some(&target) = new.get(&(now.0, now.1)) else {
             continue;
         };
-        if !link_cells(now).all(|c| new.get(&c) == Some(&target)) {
+        let own = link.target.as_str();
+        if !link_cells(now).all(|c| new.get(&c).is_some_and(|t| model_target(t) == own)) {
             continue;
         }
         for c in link_cells(now) {

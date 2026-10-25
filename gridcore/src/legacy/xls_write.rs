@@ -1504,11 +1504,19 @@ fn sheet_records(
 }
 
 /// The sheet's HLINK records (#1726). A loaded range whose cells all still
-/// carry its target is one record over the range, clipped to the grid; every
-/// other link cell is a record of its own, after the ranges, so one inside a
-/// range reads back with its own target (a later record wins). A range or
-/// cell past the grid, and a link whose record would be over [`MAX_BODY`]
-/// (HLINK has no CONTINUE), is counted in `lost`.
+/// carry its own target ([`LinkRef::target`]; the anchor alone for a range
+/// too big to spread) is one record over the range, clipped to the grid;
+/// every other link cell is a record of its own, after the ranges, so one
+/// inside a range reads back with its own target (a later record wins). A
+/// range or cell past the grid, and a link whose record would be over
+/// [`MAX_BODY`] (HLINK has no CONTINUE), is counted in `lost`.
+///
+/// Known limit: ranges go in anchor order, not the order the file had them,
+/// so where two overlap, which one a cell outside the model's spread takes in
+/// Excel after an `.xls` round trip can change; an anchor-only range does not
+/// hold its other cells, so this cannot be exact.
+///
+/// [`LinkRef::target`]: crate::sheet::LinkRef::target
 fn hyperlink_records(out: &mut Vec<u8>, s: &Sheet, lost: &mut BTreeMap<Loss, usize>) {
     use crate::sheet::hyperlink_cells;
     if s.hyperlinks.is_empty() {
@@ -1524,10 +1532,7 @@ fn hyperlink_records(out: &mut Vec<u8>, s: &Sheet, lost: &mut BTreeMap<Loss, usi
     };
     let mut covered = std::collections::HashSet::new();
     for link in s.hyperlink_refs.values() {
-        let now = link.now;
-        let Some(target) = s.hyperlinks.get(&(now.0, now.1)) else {
-            continue;
-        };
+        let (now, target) = (link.now, &link.target);
         if !hyperlink_cells(now).all(|c| s.hyperlinks.get(&c) == Some(target)) {
             continue;
         }
@@ -2012,6 +2017,7 @@ mod tests {
             crate::sheet::LinkRef {
                 loaded: rect,
                 now: rect,
+                target: target.into(),
             },
         );
     }
@@ -2127,6 +2133,39 @@ mod tests {
             .unwrap()
             .to_string();
         String::from_utf8_lossy(pkg.part(&name).unwrap()).into_owned()
+    }
+
+    /// A big range is held by its anchor: relinking the anchor breaks the
+    /// range, and only the anchor's own link is written, never the column
+    /// under the anchor's new target (#1726 r4).
+    #[test]
+    fn a_relinked_anchor_writes_only_its_own_link() {
+        let col = (0, 2, crate::sheet::MAX_ROWS - 1, 2);
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(&mut pkg.workbook.sheets[0], col, "https://a/");
+        // An .xls import, and an .xlsx load, of the column.
+        let (imported, _) = round(&pkg);
+        let loaded = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        assert_eq!(
+            loaded.workbook.sheets[0].hyperlink_refs[&(0, 2)].target,
+            "https://a/"
+        );
+        for mut p in [imported, loaded] {
+            p.workbook.sheets[0]
+                .hyperlinks
+                .insert((0, 2), "https://b/".into());
+            let out = write_xls(&p);
+            assert_eq!(hlink_ranges(&out.bytes), [(0, 2, 0, 2)]);
+            let (back, _) = open_workbook(&out.bytes).unwrap();
+            assert!(back.workbook.sheets[0].hyperlink_refs.is_empty());
+            assert_eq!(back.workbook.sheets[0].hyperlinks.len(), 1);
+            assert_eq!(back.workbook.sheets[0].hyperlinks[&(0, 2)], "https://b/");
+            let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&p)).unwrap();
+            let ws = sheet_xml(&xlsx);
+            assert_eq!(ws.matches("<hyperlink ").count(), 1, "{ws}");
+            assert!(ws.contains("<hyperlink ref=\"C1\" "), "{ws}");
+            assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 2)], "https://b/");
+        }
     }
 
     /// An `.xls` range over more than 4,096 cells (the model holds its

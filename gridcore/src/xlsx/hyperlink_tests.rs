@@ -1103,3 +1103,25 @@ fn raw_spelling_in_model_reuses_rel() {
     assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
     assert_eq!(text(&re, RELS), text(&pkg, RELS));
 }
+
+#[test]
+fn a_unc_path_s_percent_is_escaped_in_its_file_uri() {
+    let mut pkg = plain_book();
+    link(&mut pkg, "A1", "\\\\s\\sh\\a%20b.xls");
+    link(&mut pkg, "A2", "\\\\s\\sh\\a b.xls");
+    let re = resaved(&pkg);
+    let mut got = targets_of(&re, "/hyperlink");
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "file:///\\\\s\\sh\\a b.xls",
+            "file:///\\\\s\\sh\\a%2520b.xls"
+        ]
+    );
+    assert_links_kept(&pkg, &re);
+    // Saved again unchanged, nothing is rewritten.
+    let again = resaved(&re);
+    assert_eq!(text(&again, RELS), text(&re, RELS));
+    assert_eq!(text(&again, SHEET), text(&re, SHEET));
+}

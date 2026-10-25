@@ -2468,8 +2468,11 @@ fn shift_grid(sheet: &mut Sheet, shift: &EditShift) {
 /// `hyperlinks`. A range too big to spread is held by its anchor alone, so it
 /// stretches and re-anchors with the edit instead. The loaded `ref` of every
 /// range forgotten goes to `hyperlinks_removed`, so the save strikes its
-/// element; the list itself names elements of the loaded file and is never
-/// shifted.
+/// element (one from an `.xls` import names none, and strikes nothing); the
+/// list itself names elements of the loaded file and is never shifted. A
+/// range keeps its own [`LinkRef::target`].
+///
+/// [`LinkRef::target`]: crate::sheet::LinkRef::target
 fn shift_hyperlinks(sheet: &mut Sheet, shift: &EditShift) {
     let axis = |r: u32, c: u32| if shift.rows { r } else { c };
     let with_axis = |rect: Area, lo: u32, hi: u32| {

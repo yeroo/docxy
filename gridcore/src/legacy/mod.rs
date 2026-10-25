@@ -535,6 +535,7 @@ impl BookIn {
                         crate::sheet::LinkRef {
                             loaded: rect,
                             now: rect,
+                            target: target.clone(),
                         },
                     );
                 }

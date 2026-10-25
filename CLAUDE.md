@@ -1749,32 +1749,40 @@
 
 - `gridcore/src/legacy/hlink.rs` is the HLINK record both ways: `body` for
   `xls_write` (after MERGEDCELLS), `parse` for the `.xls` reader. A model target
-  is written as Excel writes it: `#loc` a location string, a UNC path a string
-  moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme (2+ letters, so
-  `C:` is a drive) a URL moniker, any other path a File moniker (relative:
-  leading `..\` in `cAnti`, no `hlstmfIsAbsolute`; a non-ASCII path adds the
-  Unicode extension); a path's `#loc` (a cell of another workbook: the first
-  `#` whose tail is a reference with `!` or a defined name, no `\` or `/`) is
-  that moniker plus a location, as the reader reads it (`a#b.xlsx` is still
-  split: the model holds one string). A File moniker's path is
-  percent-decoded when it decodes; an internal `#loc` is never split. No display name, frame or
-  ScreenTip (#1454).
-- A `hyperlink_refs` range whose cells all still carry its target is one
-  record, clipped to the grid (a whole row then reads back spread over its 256
-  cells); the other link cells follow one record each, so a cell's own link in
-  a range wins on read. Past the grid or over `MAX_BODY` is counted in `lost`.
-  The reader skips a record it can't read (named "hyperlinks"), takes a moniker
-  plus location as `url#loc`, spreads ranges through `hyperlink_cells` and
-  keeps each multi-cell one in `hyperlink_refs` (`loaded == now`), so an `.xls`
-  save writes it back as one record, edits move it, and `write_hyperlinks`
-  writes a ref whose `loaded` names no element of the block as one
-  `<hyperlink>` over `now` while its cells all carry its target; a range's spread is charged as repeats
-  (`charge_repeats`) and a `cAnti` over 255 is unreadable; HLinkTooltip (0x0800) is named "hyperlink
-  ScreenTips". Checked against xlrd only (no Excel oracle).
+  is written as Excel writes it: `#loc` a location string (never split), a UNC
+  path a string moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme
+  (2+ letters, so `C:` is a drive) a URL moniker, any other path a File moniker
+  holding the path as the model has it (native text: `%` is literal; relative:
+  leading `..\` in `cAnti`, at most 255, no `hlstmfIsAbsolute`; a non-ASCII
+  path adds the Unicode extension). A path's `#loc` (a cell of another
+  workbook: the first `#` whose tail is a reference with `!` or a defined name,
+  no `\` or `/`) is that moniker plus a location, as the reader reads it
+  (`a#b.xlsx` is still split: the model holds one string). No display name,
+  frame or ScreenTip (#1454).
+- `LinkRef::target` is a range's own target. A `hyperlink_refs` range is
+  written whole, by both writers, only while every cell it spreads over (the
+  anchor alone for a range over 4,096 cells) carries that target; otherwise its
+  cells go one by one, so relinking a whole column's anchor writes only the
+  anchor. The `.xls` writer clips a range to the grid (a whole row then reads
+  back spread over its 256 cells) and writes the other link cells after the
+  ranges, so a cell's own link in a range wins on read. Overlapping ranges go
+  in anchor order, not the file's, so which one an overlapped cell takes in
+  Excel after an `.xls` round trip can change (a known limit: an anchor-only
+  range does not hold its other cells). Past the grid or over `MAX_BODY` is
+  counted in `lost`.
+- The reader skips a record it can't read (named "hyperlinks"; `cAnti` over
+  255 is one), takes a moniker plus location as `url#loc`, spreads ranges
+  through `hyperlink_cells` (charged as repeats, `charge_repeats`) and keeps
+  each multi-cell one in `hyperlink_refs` (`loaded == now`), so edits move it
+  and `write_hyperlinks` writes a ref whose `loaded` names no element of the
+  block as a new `<hyperlink>` over `now` (in `hyperlinks_removed` it strikes
+  nothing). HLinkTooltip (0x0800) is named "hyperlink ScreenTips". Checked
+  against xlrd only (no Excel oracle).
 - `xlsx::model_target` maps every `file:` spelling of a UNC path
   (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
-  decoded in each) to `\\s\sh`; `localhost`, a drive or port in the server's place
-  (`file://C:/x`, `file://h:80/x`), local paths, `?`/`#`, escaped separators
-  and bad escapes stay raw. The xlsx save compares and reuses relationships
-  through it, so a raw spelling held in the model is no change and no new
-  relationship.
+  decoded in each) to `\\s\sh`; `localhost`, a drive or port in the server's
+  place (`file://C:/x`, `file://h:80/x`), local paths, `?`/`#`, escaped
+  separators and bad escapes stay raw. `wire_target` writes a UNC path as
+  `file:///\\…` with `%` escaped as `%25`, so it reloads as written. The xlsx
+  save compares and reuses relationships through `model_target`, so a raw
+  spelling held in the model is no change and no new relationship.
