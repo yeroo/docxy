@@ -210,11 +210,13 @@
   takes the paragraph's `ParProps`, so a direct `w:jc="left"` (kept in
   `raw_props`) still beats a centred style. An editor-chosen Align Left is
   explicit too (#1752): `ParProps::set_align_direct` (`Editor::set_align`,
-  `agent::set_style_range`, `Editor::set_cell_alignment`) keeps a raw `w:jc` saying `left`/`start`, else
+  `agent::set_style_range`, `Editor::set_cell_alignment`, wordcomshim's
+  Alignment put) keeps a raw `w:jc` saying `left`/`start`, else
   puts `<w:jc w:val="left"/>` in place of any other; other alignments drop
   it. A raw `w:jc` supersedes the loaded (shadow) one on save while the
   paragraph is left, so a loaded `thaiDistribute` or `start` is never written
-  beside it (wordcomshim, which sets `align` directly, stays safe). `shown_run` (the suite) still
+  beside it, and a raw `w:jc` left behind by a direct `align` write is
+  superseded itself. `shown_run` (the suite) still
   skips Normal.
 - Page borders: `BorderStyle::{Wave, ThreeD, Motif}`. `border_rules` draws
   `wave`/`doubleWave` as a sine polyline (amplitude one width, wavelength four),

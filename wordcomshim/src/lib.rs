@@ -1013,7 +1013,7 @@ mod win {
                 if all {
                     for b in &mut d.pkg.document.body {
                         if let Block::Paragraph(p) = b {
-                            p.props.align = a;
+                            p.props.set_align_direct(a);
                         }
                     }
                 }
@@ -1817,7 +1817,7 @@ mod win {
                                     if all {
                                         for b in &mut d.pkg.document.body {
                                             if let Block::Paragraph(p) = b {
-                                                p.props.align = a;
+                                                p.props.set_align_direct(a);
                                             }
                                         }
                                     }

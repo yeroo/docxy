@@ -806,9 +806,10 @@ fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
 /// stop, whether it started bold, plain, or mixed within the range; it is
 /// **not** the toggle `Editor::toggle_bold` implements, so applying the same
 /// patch twice is idempotent. Non-paragraph blocks in the range (tables) are
-/// left untouched but still counted — see [`checkpoint_for_block_range`]'s
-/// doc comment for why this deliberately never recurses into a table's
-/// cells.
+/// left untouched but still counted: the granularity is the body's blocks,
+/// so this deliberately never recurses into a table's cells (a selection
+/// over the range would, as `Editor::selection_spans` flattens every nested
+/// cell paragraph).
 ///
 /// Returns the number of blocks in `[start..=end]` (== `end - start + 1`,
 /// matching `doc.format`'s `{formatted:N}` reply). ONE undo checkpoint
