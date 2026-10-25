@@ -461,13 +461,7 @@ pub(crate) const COLOR_VALUE: &[&str] = &["w:val", "w:themeColor", "w:themeShade
 /// attributes stay), so it reads as edited to `val`.
 pub(crate) fn set_shadow_val(shadow: &mut [String], local: &str, val: &str) {
     for raw in shadow.iter_mut().filter(|raw| local_name(raw) == local) {
-        let name = raw
-            .trim_start()
-            .trim_start_matches('<')
-            .split([' ', '/', '>', '\t', '\n', '\r'])
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let name = crate::table_props::element_name(raw);
         let mut attrs = element_attrs_of(raw);
         match attrs.iter_mut().find(|(n, _)| n == "w:val") {
             Some((_, v)) => *v = val.to_string(),
@@ -482,13 +476,7 @@ pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: 
         if local_name(raw) != local {
             return true;
         }
-        let name = raw
-            .trim_start()
-            .trim_start_matches('<')
-            .split([' ', '/', '>', '\t', '\n', '\r'])
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let name = crate::table_props::element_name(raw);
         let mut kept = element_attrs_of(raw);
         kept.retain(|(n, _)| !attrs.contains(&n.as_str()));
         if kept.is_empty() {
@@ -525,13 +513,7 @@ pub(crate) fn pin_shadow_left_zero(shadow: &mut Vec<String>) {
         .unwrap_or(0);
     attrs.retain(|(n, _)| !IND_LEFT.contains(&n.as_str()));
     attrs.insert(at.min(attrs.len()), ("w:left".to_string(), "0".to_string()));
-    let name = raw
-        .trim_start()
-        .trim_start_matches('<')
-        .split([' ', '/', '>', '\t', '\n', '\r'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let name = crate::table_props::element_name(raw);
     *raw = empty_element(&name, &attrs);
 }
 

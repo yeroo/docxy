@@ -3379,8 +3379,10 @@ impl Package {
     /// Repair the levels of docxy's own lists ([`BULLET_LIST_NUM_ID`],
     /// [`NUMBER_LIST_NUM_ID`]) that a build before the level indents saved
     /// without a `w:ind`, as [`Package::ensure_list`] does when it finds one.
-    /// Hosts call it before Increase/Decrease Indent, which steps such an
-    /// item's level and moves it only by that level's indent (#1728). Only
+    /// Hosts call it with Increase/Decrease Indent, which steps such an
+    /// item's level, moving it in Word and Pages only by that level's indent
+    /// (#1728): terminal `docxy` and `docxwasm` before the edit, the suite
+    /// after one that made an undo step. Only
     /// those levels change; no numbering part is created. Not an undo step:
     /// it is idempotent and what a later Bullets or Numbering press writes
     /// anyway. True when the part changed.

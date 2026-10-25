@@ -6081,7 +6081,13 @@ struct EffIndent {
 }
 
 fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
-    let list_step = p.ilvl.max(0).saturating_mul(300);
+    // An explicit numId 0 is no list (#1728). No numId at all may still be
+    // a level of the style's numbering, so it keeps its step.
+    let list_step = if p.num_id == Some(0) {
+        0
+    } else {
+        p.ilvl.max(0).saturating_mul(300)
+    };
     let left = p.indent.max(0).saturating_add(list_step);
     EffIndent {
         left,
@@ -7120,6 +7126,24 @@ mod ruler_geom_tests {
         );
         assert!(!super::marker_visible(&clipped, clipped.first_x, 5.0));
         assert_eq!(hruler_hit(&clipped, viewport.x + 1.0, 2.0), None);
+    }
+
+    /// #1728: `w:numId="0"` is no list, so its `w:ilvl` adds no step.
+    #[test]
+    fn num_id_zero_takes_no_list_step() {
+        let p = ParProps {
+            indent: 720,
+            num_id: Some(0),
+            ilvl: 2,
+            ..ParProps::default()
+        };
+        let eff = eff_indent(&p);
+        assert_eq!((eff.list_step, eff.left), (0, 720));
+        let listed = eff_indent(&ParProps {
+            num_id: Some(1),
+            ..p
+        });
+        assert_eq!((listed.list_step, listed.left), (600, 1320));
     }
 
     #[test]
@@ -23294,8 +23318,11 @@ impl Docxy {
     /// After an Increase/Decrease Indent that changed the document (an undo
     /// step newer than `since`): a list of ours an older build saved with
     /// indent-less levels gets their indents, as a Bullets press would, or
-    /// the item whose level stepped would not move (#1728). The page draws
-    /// from the package, so after the edit is in time. Not an undo step.
+    /// the saved item whose level stepped would not move in Word, Pages and
+    /// the other hosts, which indent it by its level (#1728). The suite draws
+    /// the level from `ilvl` alone (`eff_indent`), so this is for the file;
+    /// a refused edit, which makes no step, leaves the package alone. Not an
+    /// undo step.
     fn repair_list_indents_since(&mut self, since: u64) {
         if docxcore::editor::undo_serial_counter() <= since {
             return;

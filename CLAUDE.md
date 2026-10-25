@@ -109,8 +109,10 @@
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
   the edit, re-parsing the numbering; the suite after an indent that made
-  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat). Not an undo
-  step; nothing repairs at load.
+  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
+  draws the level from `ilvl`, so there it is for the saved file). Not an
+  undo step; nothing repairs at load. The suite's `eff_indent` gives an
+  explicit numId 0 no level step.
 
 ## Mac text navigation (#1073)
 
