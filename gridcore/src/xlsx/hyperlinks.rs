@@ -141,7 +141,7 @@ fn unc_of_file_uri(wire: &str) -> Option<String> {
 }
 
 /// `%XX` escapes decoded as UTF-8 bytes; `None` for a malformed escape, an
-/// escaped `/` or `\`, or bytes that are not UTF-8.
+/// escaped `/`, `\`, `#` or `?`, or bytes that are not UTF-8.
 fn percent_decode(s: &str) -> Option<String> {
     if !s.contains('%') {
         return Some(s.to_string());
@@ -156,7 +156,9 @@ fn percent_decode(s: &str) -> Option<String> {
                 return None;
             }
             let v = u8::from_str_radix(hex, 16).ok()?;
-            if v == b'/' || v == b'\\' {
+            // An escaped separator, fragment or query would change what
+            // the path names once decoded (a `#` reads as a location).
+            if matches!(v, b'/' | b'\\' | b'#' | b'?') {
                 return None;
             }
             out.push(v);

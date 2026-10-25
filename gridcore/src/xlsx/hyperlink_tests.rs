@@ -1201,3 +1201,36 @@ fn paths_cross_between_xlsx_and_xls_natively() {
     assert_eq!(rels, vec!["..\\a%2541.xlsx"]);
     assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 0)], "..\\a%41.xlsx");
 }
+
+#[test]
+fn an_escaped_hash_or_query_keeps_a_target_raw() {
+    for wire in [
+        "Plan%23Final.xlsx",
+        "a%3Fb.xlsx",
+        "a%3fb.xlsx",
+        "file://srv/sh/Plan%23Final.xlsx",
+    ] {
+        assert_eq!(model_target(wire), wire, "{wire}");
+    }
+    // Excel's spelling keeps its UNC path with the escape undecoded, as for
+    // `%2F`: no `#` appears.
+    assert_eq!(
+        model_target("file:///\\\\srv\\sh\\Plan%23Final.xlsx"),
+        "\\\\srv\\sh\\Plan%23Final.xlsx"
+    );
+    let pkg = linked_spellings(&["Plan%23Final.xlsx"]);
+    assert_eq!(
+        pkg.workbook.sheets[0].hyperlinks[&(0, 0)],
+        "Plan%23Final.xlsx"
+    );
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+    // Save As .xls: one File moniker, no location.
+    let out = crate::legacy::write_xls(&pkg);
+    let (xls, _) = crate::legacy::open_workbook(&out.bytes).unwrap();
+    assert_eq!(
+        xls.workbook.sheets[0].hyperlinks[&(0, 0)],
+        "Plan%23Final.xlsx"
+    );
+}

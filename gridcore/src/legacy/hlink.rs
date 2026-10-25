@@ -404,6 +404,15 @@ mod tests {
     }
 
     #[test]
+    fn an_escaped_hash_path_is_one_file_moniker() {
+        let b = body((0, 0, 0, 0), "Plan%23Final.xlsx");
+        let flags = u32::from_le_bytes(b[28..32].try_into().unwrap());
+        assert_eq!(flags, HAS_MONIKER);
+        assert_eq!(&b[32..48], &FILE_MONIKER);
+        assert_eq!(parse(&b).unwrap().1, "Plan%23Final.xlsx");
+    }
+
+    #[test]
     fn a_file_path_is_native_text() {
         // A File moniker's path is native, as the model holds paths: a `%` is
         // a `%` (an xlsx Target's escapes are decoded on load, #1726 r5).

@@ -1785,8 +1785,10 @@
   (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
   decoded in each) to `\\s\sh`, and decodes a scheme-less path's escapes
   (`My%20Book.xlsx`); `localhost`, a drive or port in the server's place
-  (`file://C:/x`, `file://h:80/x`), local `file:` paths, `?`/`#`, URLs,
-  locations, escaped separators and bad escapes stay raw. `wire_target` writes
+  (`file://C:/x`, `file://h:80/x`), local `file:` paths, a `file:` URI with
+  `?`/`#`, URLs, locations, bad escapes, and an escaped separator, `#` or `?`
+  (`%2F`, `%5C`, `%23`, `%3F`, which would change what the path names) stay
+  raw (Excel's `file:///\\…` spelling then keeps its UNC path, undecoded). `wire_target` writes
   a UNC path as `file:///\\…` and any native path with `%` escaped as `%25`, so
   it reloads as written. The save compares model values through `canonical`
   (`model_target(wire_target(m))`, never `model_target(m)`, which would decode
