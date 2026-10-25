@@ -542,7 +542,7 @@ const SHEET_KNOWN: &[u16] = &[
     0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B, 0x0041, 0x0055, 0x005D, 0x007D, 0x0081, 0x0083,
     0x0084, 0x0099, 0x009D, 0x00A0, 0x00A1, 0x00AE, 0x00B0, 0x00BD, 0x00BE, 0x00E5, 0x00E9, 0x00EC,
     0x00FD, 0x01AA, 0x01AD, 0x01B0, 0x01B1, 0x01B2, 0x01B8, 0x01BE, 0x0201, 0x0204, 0x0205, 0x0207,
-    0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
+    0x0208, 0x0221, 0x0225, 0x0236, 0x023E, 0x027E, 0x04BC, 0x0800, 0x0862, 0x0868, 0x0872, 0x0879, 0x087A,
     0x088B, 0x005F, 0x0866, 0x089C,
     // CONTINUE, and USERSVIEWEND (its view's BEGIN is named).
     0x003C, 0x01AB,
@@ -1369,8 +1369,16 @@ fn read_sheet(
                 0x01B2 | 0x01BE => {
                     book.dropped.insert("data validation");
                 }
-                0x01B8 => {
-                    book.dropped.insert("hyperlinks");
+                // HLINK (#1726): one the reader can't read is left out and
+                // named.
+                super::hlink::HLINK => match super::hlink::parse(&r.data) {
+                    Some(link) => sheet.hyperlinks.push(link),
+                    None => {
+                        book.dropped.insert("hyperlinks");
+                    }
+                },
+                super::hlink::HLINK_TOOLTIP => {
+                    book.dropped.insert("hyperlink ScreenTips");
                 }
                 0x009D => {
                     book.dropped.insert("AutoFilter");
@@ -1982,6 +1990,47 @@ pub(crate) mod tests {
                 "vertical alignment"
             ]
         );
+    }
+
+    /// HLINK records are read; one the reader can't read is named, and so
+    /// is a ScreenTip (#1726).
+    #[test]
+    fn unreadable_hlink_is_dropped_by_name() {
+        let good = rec(
+            0x01B8,
+            &super::super::hlink::body((0, 0, 1, 1), "https://x/"),
+        );
+        let book = read(&workbook(&[], &[number(0, 0, 1.0), good.clone()])).unwrap();
+        assert_eq!(
+            book.sheets[0].hyperlinks,
+            [((0, 0, 1, 1), "https://x/".to_string())]
+        );
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+        let mut reversed = super::super::hlink::body((0, 0, 1, 1), "https://y/");
+        reversed[0] = 5;
+        for bad in [vec![0u8; 3], vec![0u8; 40], reversed] {
+            let book = read(&workbook(&[], &[good.clone(), rec(0x01B8, &bad)])).unwrap();
+            assert_eq!(book.sheets[0].hyperlinks.len(), 1);
+            assert_eq!(
+                book.dropped.iter().copied().collect::<Vec<_>>(),
+                ["hyperlinks"]
+            );
+            assert!(book.unknown_records.is_empty());
+        }
+    }
+
+    #[test]
+    fn hlink_tooltip_is_named() {
+        let good = rec(0x01B8, &super::super::hlink::body((0, 0, 0, 0), "#Data!B2"));
+        let mut tip = vec![0x00, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        tip.extend("tip\0".encode_utf16().flat_map(u16::to_le_bytes));
+        let book = read(&workbook(&[], &[good, rec(0x0800, &tip)])).unwrap();
+        assert_eq!(book.sheets[0].hyperlinks[0].1, "#Data!B2");
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["hyperlink ScreenTips"]
+        );
+        assert!(book.unknown_records.is_empty());
     }
 
     /// A thin box is the model's border in any colour, but a colour other
