@@ -4373,7 +4373,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             if piv.edited {
                 xml = crate::pivot::rewrite_pivot_definition(&xml, piv);
             }
-            p.1 = patch_pivot_location(&xml, piv.location).into_bytes();
+            p.1 = patch_rect_ref(&xml, "<location", piv.location).into_bytes();
         }
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == &piv.cache_part) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
@@ -4386,7 +4386,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
             match &piv.source {
                 crate::pivot::PivotSource::Range { sheet, rect } => {
                     xml = patch_worksheet_source_sheet(&xml, sheet);
-                    xml = patch_worksheet_source_ref(&xml, *rect);
+                    xml = patch_rect_ref(&xml, "<worksheetSource", *rect);
                 }
                 // A renamed source table: the cache names it. The empty name
                 // is the placeholder of a source we did not parse (external
@@ -9019,26 +9019,12 @@ fn drop_query_table_fields(parts: &mut [(String, Vec<u8>)], part: &str, dropped:
     }
 }
 
-/// Point a pivot definition's `<location ref>` at `rect`; a no-op when it
-/// already names that rect, so a single-cell `ref="A3"` keeps its spelling.
-fn patch_pivot_location(xml: &str, rect: (u32, u32, u32, u32)) -> String {
-    let current = xml
-        .find("<location")
-        .and_then(|el| attr_at(xml, el, "ref"))
-        .and_then(crate::sheet::parse_range_name);
-    if current == Some(rect) {
-        return xml.to_string();
-    }
-    let (r1, c1, r2, c2) = rect;
-    let full = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-    patch_ref_attr(xml, "<location", &full)
-}
-
-/// Point a pivot cache's `<worksheetSource ref>` at `rect` (a row/column edit
-/// moved the source range); a no-op when it already names that rect, so
-/// `$A$1:$C$5` keeps its spelling, or when the element has no `ref`.
-fn patch_worksheet_source_ref(xml: &str, rect: (u32, u32, u32, u32)) -> String {
-    let Some(el) = xml.find("<worksheetSource") else {
+/// Point the first `prefix` element's `ref` at `rect`: a pivot definition's
+/// `<location>` or a pivot cache's `<worksheetSource>` after a row/column edit
+/// moved it. A no-op when it already names that rect, so `A3` or `$A$1:$C$5`
+/// keeps its spelling, or when there is no such element or it has no `ref`.
+fn patch_rect_ref(xml: &str, prefix: &str, rect: (u32, u32, u32, u32)) -> String {
+    let Some(el) = xml.find(prefix) else {
         return xml.to_string();
     };
     let Some(current) = attr_at(xml, el, "ref").map(crate::sheet::parse_range_name) else {
@@ -11453,6 +11439,30 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn patch_rect_ref_leaves_an_element_without_ref_alone() {
+        // No `ref` on `<location>`: the next element's `ref` is not its.
+        let xml = r#"<pivotTableDefinition><location firstHeaderRow="1"/><x ref="A1:B2"/></pivotTableDefinition>"#;
+        assert_eq!(super::patch_rect_ref(xml, "<location", (5, 0, 7, 1)), xml);
+        let none = r#"<pivotCacheDefinition><cacheSource/></pivotCacheDefinition>"#;
+        assert_eq!(
+            super::patch_rect_ref(none, "<worksheetSource", (0, 0, 1, 1)),
+            none
+        );
+        // Same rect: the spelling stays; another rect: plain A1:B2.
+        let loc = r#"<location ref="A3" rowPageCount="1"/>"#;
+        assert_eq!(super::patch_rect_ref(loc, "<location", (2, 0, 2, 0)), loc);
+        assert_eq!(
+            super::patch_rect_ref(loc, "<location", (3, 0, 5, 1)),
+            r#"<location ref="A4:B6" rowPageCount="1"/>"#
+        );
+        let src = r#"<worksheetSource ref="$A$1:$C$5" sheet="Data"/>"#;
+        assert_eq!(
+            super::patch_rect_ref(src, "<worksheetSource", (0, 0, 4, 2)),
+            src
+        );
+    }
 
     /// A line series' colour lives on its stroke, not its fill. Writing it as a
     /// fill leaves the line in Excel's default palette and tints the shape
