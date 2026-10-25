@@ -340,6 +340,7 @@ fn headless_recalc_updates_what_reads_a_refreshed_pivot_in_manual_mode() {
         field_items: Vec::new(),
         hidden: Vec::new(),
         page: Vec::new(),
+        page_rows: None,
         items_order: Vec::new(),
         calc_formulas: Vec::new(),
         grand_rows: true,

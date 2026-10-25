@@ -10777,6 +10777,7 @@ impl SheetPackage {
             field_items: Vec::new(),
             hidden: Vec::new(),
             page: Vec::new(),
+            page_rows: None,
             items_order: Vec::new(),
             calc_formulas: Vec::new(),
             grand_rows: true,
