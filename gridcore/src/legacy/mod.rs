@@ -527,6 +527,17 @@ impl BookIn {
                 for cell in crate::sheet::hyperlink_cells(rect) {
                     s.hyperlinks.insert(cell, target.clone());
                 }
+                // A range is kept as one, as an xlsx `<hyperlink>` is: saves
+                // write it whole and edits move it.
+                if (rect.0, rect.1) != (rect.2, rect.3) {
+                    s.hyperlink_refs.insert(
+                        (rect.0, rect.1),
+                        crate::sheet::LinkRef {
+                            loaded: rect,
+                            now: rect,
+                        },
+                    );
+                }
             }
             for (first, last, width, hidden, plain) in sheet.cols {
                 s.col_defs.push(crate::sheet::ColDef {

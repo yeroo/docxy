@@ -30,7 +30,7 @@ mod filter_tests;
 #[cfg(test)]
 mod hyperlink_tests;
 mod hyperlinks;
-pub(crate) use hyperlinks::model_target;
+pub(crate) use hyperlinks::{model_target, percent_decode};
 mod page;
 mod repair;
 pub use repair::{Repairs, load_xlsx_repair};

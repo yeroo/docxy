@@ -101,7 +101,7 @@ fn unc_of_file_uri(wire: &str) -> Option<String> {
 
 /// `%XX` escapes decoded as UTF-8 bytes; `None` for a malformed escape, an
 /// escaped `/` or `\`, or bytes that are not UTF-8.
-fn percent_decode(s: &str) -> Option<String> {
+pub(crate) fn percent_decode(s: &str) -> Option<String> {
     if !s.contains('%') {
         return Some(s.to_string());
     }
@@ -250,6 +250,11 @@ pub(super) fn write_hyperlinks(
         None => (0, ""),
     };
     let mut items = items(block, &targets);
+    // The ranges the block's elements have as loaded, before [`relocate`].
+    let element_rects: HashSet<Rect> = items
+        .iter()
+        .filter_map(|i| i.link.as_ref().map(|(rect, _)| *rect))
+        .collect();
     let relocated = relocate(&mut items, sheet);
 
     // The cells whose link the model changed since the load.
@@ -287,7 +292,7 @@ pub(super) fn write_hyperlinks(
             .filter(|(_, s)| !**s)
             .map(|(i, _)| i),
     );
-    let new: BTreeMap<(u32, u32), &str> = sheet
+    let mut new: BTreeMap<(u32, u32), &str> = sheet
         .hyperlinks
         .iter()
         .filter(|(cell, t)| kept.get(cell).copied() != Some(&*model_target(t)))
@@ -298,11 +303,34 @@ pub(super) fn write_hyperlinks(
     if span.is_none() && !worksheet_takes(&xml, "hyperlinks", false) {
         return xml;
     }
+    // A range no element of the block has (one an `.xls` import read, #1726)
+    // whose cells all still carry its target is one element over it, ahead
+    // of the single cells, so a cell's own link inside it wins on load.
+    let mut ranges: Vec<(Rect, &str)> = Vec::new();
+    for link in sheet.hyperlink_refs.values() {
+        let now = link.now;
+        if element_rects.contains(&link.loaded) || (now.0, now.1) == (now.2, now.3) {
+            continue;
+        }
+        let Some(&target) = new.get(&(now.0, now.1)) else {
+            continue;
+        };
+        if !link_cells(now).all(|c| new.get(&c) == Some(&target)) {
+            continue;
+        }
+        for c in link_cells(now) {
+            new.remove(&c);
+        }
+        ranges.push((now, target));
+    }
     let mut rels = ExternalRels::new(parts, rels_part, ns.rel("hyperlink"), &xml);
     let mut added = Vec::new();
     let mut uses_r = false;
-    for (&(r, c), target) in &new {
-        let at = cell_name(r, c);
+    let singles = new.iter().map(|(&(r, c), &t)| (cell_name(r, c), t));
+    let spans = ranges
+        .iter()
+        .map(|&(rect, t)| (crate::print::area::rect_name(rect), t));
+    for (at, target) in spans.chain(singles) {
         let item = match target.strip_prefix('#') {
             Some(location) => format!(
                 "<hyperlink ref=\"{at}\" location=\"{}\"/>",

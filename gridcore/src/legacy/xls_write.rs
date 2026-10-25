@@ -2070,7 +2070,7 @@ mod tests {
             back.workbook.sheets[1].hyperlinks,
             pkg.workbook.sheets[1].hyperlinks
         );
-        // An import has no `<hyperlink>` elements to keep.
+        // Single cells make no ranges.
         assert!(back.workbook.sheets[0].hyperlink_refs.is_empty());
         // Saved on as xlsx, the links stay.
         let again = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&back)).unwrap();
@@ -2095,6 +2095,13 @@ mod tests {
             [(0, 0, 1, 1), (0, 2, 65_535, 2), (4, 0, 4, 255)]
         );
         let (back, _) = round(&pkg);
+        // The import keeps each range as one, clipped.
+        let refs: Vec<Rect> = back.workbook.sheets[0]
+            .hyperlink_refs
+            .values()
+            .map(|l| l.now)
+            .collect();
+        assert_eq!(refs, [(0, 0, 1, 1), (0, 2, 65_535, 2), (4, 0, 4, 255)]);
         let links = &back.workbook.sheets[0].hyperlinks;
         for cell in [(0, 0), (0, 1), (1, 0), (1, 1)] {
             assert_eq!(links[&cell], "https://a/");
@@ -2108,6 +2115,91 @@ mod tests {
             links.iter().filter(|(_, t)| *t == "https://row/").count(),
             256
         );
+    }
+
+    /// The worksheet part of an imported book's first sheet.
+    fn sheet_xml(pkg: &SheetPackage) -> String {
+        let name = pkg
+            .part_names()
+            .into_iter()
+            .filter(|n| n.starts_with("xl/worksheets/sheet") && n.ends_with(".xml"))
+            .min()
+            .unwrap()
+            .to_string();
+        String::from_utf8_lossy(pkg.part(&name).unwrap()).into_owned()
+    }
+
+    /// An `.xls` range over more than 4,096 cells (the model holds its
+    /// anchor) stays one range through `.xls` and `.xlsx` saves.
+    #[test]
+    fn an_imported_whole_column_link_stays_a_range() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(
+            &mut pkg.workbook.sheets[0],
+            (0, 2, crate::sheet::MAX_ROWS - 1, 2),
+            "https://c/",
+        );
+        let (imported, _) = round(&pkg);
+        let col = (0, 2, 65_535, 2);
+        let refs = |p: &SheetPackage| -> Vec<Rect> {
+            p.workbook.sheets[0]
+                .hyperlink_refs
+                .values()
+                .map(|l| l.now)
+                .collect()
+        };
+        assert_eq!(refs(&imported), [col]);
+        // Saved as .xls again: one record.
+        assert_eq!(hlink_ranges(&write_xls(&imported).bytes), [col]);
+        // Saved as .xlsx: one element; reloaded, the same range.
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&imported)).unwrap();
+        let ws = sheet_xml(&xlsx);
+        assert_eq!(ws.matches("<hyperlink ").count(), 1, "{ws}");
+        assert!(ws.contains("<hyperlink ref=\"C1:C65536\" r:id="), "{ws}");
+        assert_eq!(refs(&xlsx), [col]);
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks[&(0, 2)], "https://c/");
+        // A row moves the range with its cells before the save.
+        let mut moved = imported.clone();
+        crate::edit::insert_rows(&mut moved.workbook, 0, 0, 1);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&moved)).unwrap();
+        assert_eq!(refs(&xlsx), [(1, 2, 65_536, 2)]);
+    }
+
+    /// An imported range's `loaded` names no element of the package:
+    /// removing the link (from every cell, #671) or cutting the range writes
+    /// no stray element, and the cells a cut leaves are written each.
+    #[test]
+    fn an_edited_imported_range_writes_what_is_left() {
+        let mut pkg = book(&[(0, 0, Cell::text("a"))]);
+        loaded_link(&mut pkg.workbook.sheets[0], (0, 0, 2, 1), "#Data!A1");
+        let (imported, _) = round(&pkg);
+        // Removed from one cell: gone from all of them.
+        let mut cleared = imported.clone();
+        let s = &mut cleared.workbook.sheets[0];
+        let plan = crate::edit::clear_plan(
+            s,
+            &[(0, 0, 0, 0)],
+            crate::edit::ClearWhat::RemoveHyperlinks,
+            &[],
+        )
+        .unwrap();
+        crate::edit::apply_clear_sheet(s, &plan);
+        assert!(s.hyperlinks.is_empty());
+        assert_eq!(s.hyperlinks_removed, [(0, 0, 2, 1)]);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&cleared)).unwrap();
+        assert!(!sheet_xml(&xlsx).contains("<hyperlink"));
+        assert!(xlsx.workbook.sheets[0].hyperlinks.is_empty());
+        // A row deleted through the range cuts it: the four cells left are
+        // links of their own.
+        let mut cut = imported.clone();
+        crate::edit::delete_rows(&mut cut.workbook, 0, 1, 1);
+        let s = &cut.workbook.sheets[0];
+        assert!(s.hyperlink_refs.is_empty());
+        assert_eq!(s.hyperlinks.len(), 4);
+        let xlsx = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&cut)).unwrap();
+        let ws = sheet_xml(&xlsx);
+        assert_eq!(ws.matches("<hyperlink ").count(), 4, "{ws}");
+        assert_eq!(xlsx.workbook.sheets[0].hyperlinks, s.hyperlinks);
     }
 
     #[test]

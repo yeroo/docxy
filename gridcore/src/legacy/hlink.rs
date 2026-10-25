@@ -15,7 +15,7 @@
 
 use super::Le;
 use super::ptg::utf16;
-use crate::xlsx::model_target;
+use crate::xlsx::{model_target, percent_decode};
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
 pub(crate) type Rect = (u32, u32, u32, u32);
@@ -84,7 +84,7 @@ pub(crate) fn body(rect: Rect, target: &str) -> Vec<u8> {
     b.extend_from_slice(&STD_LINK);
     b.extend_from_slice(&2u32.to_le_bytes());
     let mut rest = Vec::new();
-    let (path, location) = if has_scheme(target) {
+    let (path, location) = if has_scheme(target) || target.starts_with('#') {
         (target, None)
     } else {
         split_location(target)
@@ -144,6 +144,11 @@ fn split_location(target: &str) -> (&str, Option<&str>) {
 
 /// A File moniker for a path with no scheme; the flags it takes.
 fn file_moniker(out: &mut Vec<u8>, path: &str) -> u32 {
+    // The model holds a relationship's text, a URI reference, so a path's
+    // escapes (`My%20Book.xlsx`) are decoded; one that does not decode is
+    // written as it is.
+    let decoded = percent_decode(path);
+    let path = decoded.as_deref().unwrap_or(path);
     let bytes = path.as_bytes();
     let absolute = path.starts_with('\\')
         || path.starts_with('/')
@@ -380,6 +385,8 @@ mod tests {
             "\\\\s\\sh\\a.xls#S!A1",
             "https://x/#frag",
             "C:\\b.xlsx#MyName",
+            "#'Q#1'!A1",
+            "#a#b",
             "C:\\Dev\\C#\\a.xlsx",
             "\\\\s\\sh\\a#1.xlsx",
         ] {
@@ -398,6 +405,31 @@ mod tests {
             parse(&body((0, 0, 0, 0), "file:///\\\\srv\\share\\x")).map(|l| l.1),
             Some("\\\\srv\\share\\x".into())
         );
+    }
+
+    #[test]
+    fn an_internal_location_with_a_hash_is_one_string() {
+        for loc in ["'Q#1'!A1", "a#b"] {
+            let mut want = head();
+            want.extend_from_slice(&HAS_LOCATION.to_le_bytes());
+            want.extend_from_slice(&(loc.encode_utf16().count() as u32 + 1).to_le_bytes());
+            want.extend_from_slice(&utf16z(loc));
+            assert_eq!(body((1, 3, 2, 4), &format!("#{loc}")), want, "{loc}");
+        }
+    }
+
+    #[test]
+    fn a_file_path_s_escapes_are_decoded() {
+        let (_, t) = parse(&body((0, 0, 0, 0), "My%20Book.xlsx")).unwrap();
+        assert_eq!(t, "My Book.xlsx");
+        assert_eq!(
+            parse(&body((0, 0, 0, 0), "..\\a%C3%A9.xlsx")).unwrap().1,
+            "..\\aé.xlsx"
+        );
+        // An escape that does not decode, or decodes to a separator, stays.
+        for t in ["C:\\100%.xlsx", "a%2Fb.xlsx"] {
+            assert_eq!(parse(&body((0, 0, 0, 0), t)).unwrap().1, t);
+        }
     }
 
     #[test]
