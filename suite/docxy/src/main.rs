@@ -27010,8 +27010,8 @@ impl Docxy {
                 },
             }
         };
-        let indents = repeats_indent
-            || matches!(noted, Some(Repeat::Act(Act::IndentInc | Act::IndentDec)));
+        let indents =
+            repeats_indent || matches!(noted, Some(Repeat::Act(Act::IndentInc | Act::IndentDec)));
         let recorded = noted.is_some_and(|what| note_edit(ed, repeat, since, what));
         if changed {
             if let Some(t) = self.tabs.get_mut(self.active) {
@@ -30272,7 +30272,12 @@ mod repeat_tests {
                 content: Vec::new(),
             })
         };
-        let body = [p(Some(NUM_DECIMAL)), p(Some(NUM_DECIMAL)), p(Some(0)), p(Some(NUM_DECIMAL))];
+        let body = [
+            p(Some(NUM_DECIMAL)),
+            p(Some(NUM_DECIMAL)),
+            p(Some(0)),
+            p(Some(NUM_DECIMAL)),
+        ];
         assert_eq!(
             list_markers(&body),
             [
