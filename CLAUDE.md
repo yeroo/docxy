@@ -1744,3 +1744,27 @@
   table state over the data model's measures and relationships
   (`model_edits_for`), so ones added after a table step follow its Undo/Redo;
   the step's recorded `model_edits` still restore its `#REF!` cases.
+
+## Sheet hyperlinks in .xls, and file URI forms (#1726)
+
+- `gridcore/src/legacy/hlink.rs` is the HLINK record both ways: `body` for
+  `xls_write` (after MERGEDCELLS), `parse` for the `.xls` reader. A model target
+  is written as Excel writes it: `#loc` a location string, a UNC path a string
+  moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme (2+ letters, so
+  `C:` is a drive) a URL moniker, any other path a File moniker (relative:
+  leading `..\` in `cAnti`, no `hlstmfIsAbsolute`; a non-ASCII path adds the
+  Unicode extension). No display name, frame or ScreenTip (#1454).
+- A `hyperlink_refs` range whose cells all still carry its target is one
+  record, clipped to the grid (a whole row then reads back spread over its 256
+  cells); the other link cells follow one record each, so a cell's own link in
+  a range wins on read. Past the grid or over `MAX_BODY` is counted in `lost`.
+  The reader skips a record it can't read (named "hyperlinks"), takes a moniker
+  plus location as `url#loc`, spreads ranges through `hyperlink_cells` and
+  leaves `hyperlink_refs` empty; HLinkTooltip (0x0800) is named "hyperlink
+  ScreenTips". Checked against xlrd only (no Excel oracle).
+- `xlsx::model_target` maps every `file:` spelling of a UNC path
+  (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
+  decoded) to `\\s\sh`; `localhost`, local paths, `?`/`#`, escaped separators
+  and bad escapes stay raw. The xlsx save compares and reuses relationships
+  through it, so a raw spelling held in the model is no change and no new
+  relationship.
