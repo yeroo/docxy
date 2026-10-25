@@ -110,6 +110,10 @@ pub struct SheetPackage {
     /// this exact part instead of assuming the standard path — otherwise an
     /// unconventional original would be left orphaned beside a fresh duplicate.
     shared_part: Option<String>,
+    /// Resolved part name of the workbook's styles part, if it has one (it
+    /// need not be the conventional `xl/styles.xml`). Authored cell styles
+    /// and dxfs go into this exact part, through [`Self::styles_part_name`].
+    styles_part: Option<String>,
     /// The workbook is Strict Open XML: parts and relationships the writer
     /// creates use the Strict namespaces, as its own parts do.
     strict: bool,
@@ -118,6 +122,12 @@ pub struct SheetPackage {
 }
 
 impl SheetPackage {
+    /// The styles part's name: the one the workbook's relationships name,
+    /// else the conventional `xl/styles.xml`.
+    pub(crate) fn styles_part_name(&self) -> &str {
+        self.styles_part.as_deref().unwrap_or("xl/styles.xml")
+    }
+
     /// Names of all parts in the container (for inspection/tests).
     pub fn part_names(&self) -> Vec<&str> {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()
@@ -350,10 +360,13 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         None => Vec::new(),
     };
     let ambiguous = ambiguous_shared(&shared);
-    let styles = rels
+    let styles_part = rels
         .iter()
         .find(|(_, ty, _)| ty.ends_with("/styles"))
-        .and_then(|(_, _, t)| get_str(&resolve(t)))
+        .map(|(_, _, t)| resolve(t));
+    let styles = styles_part
+        .as_deref()
+        .and_then(get_str)
         .map(|xml| parse_styles(&xml))
         .unwrap_or_default();
 
@@ -544,6 +557,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         macro_loaded: Default::default(),
         shared,
         shared_part,
+        styles_part,
         strict,
         workbook: Workbook {
             sheets,
@@ -1947,6 +1961,7 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
                     | crate::model::MODEL_PART
             )
             || Some(name) == pkg.shared_part.as_deref()
+            || Some(name) == pkg.styles_part.as_deref()
             || under("xl/sharedStrings")
             || under("xl/theme/")
             // Named through the model or the sheet's own elements.
@@ -1989,7 +2004,7 @@ pub(crate) fn settings_xls_lacks(pkg: &SheetPackage) -> Vec<String> {
 
     // A cell style of the workbook's own (Excel's built-in ones carry a
     // builtinId): the .xls gets the Normal style alone.
-    if let Some(xml) = text("xl/styles.xml") {
+    if let Some(xml) = text(pkg.styles_part_name()) {
         let own = section_children(&xml, "cellStyles", "cellStyle")
             .into_iter()
             .any(|raw| {
@@ -3555,10 +3570,29 @@ pub fn save_xlsx(pkg: &SheetPackage) -> Vec<u8> {
 /// `.xlsx` that says it is a template or carries macros. `pkg` itself is
 /// untouched.
 pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
+    save_xlsx_as_with(pkg, kind, SaveCalc::default())
+}
+
+/// The host's clock and RAND seed for the formulas a save evaluates: the
+/// cells that read one a macro-free save turned into `#REF!`. With none, a
+/// clock or RAND formula among them keeps its cached value, as
+/// [`save_xlsx_as`] leaves it. A host passes its engine's
+/// ([`crate::engine::Engine::clock`], [`crate::engine::Engine::seed`]); the
+/// save draws from a copy, so the host's seed does not move.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SaveCalc {
+    /// The current moment as an Excel serial (`NOW()`, `TODAY()`).
+    pub clock: Option<f64>,
+    /// The PRNG state for `RAND`.
+    pub seed: Option<u64>,
+}
+
+/// [`save_xlsx_as`] with the host's clock and RAND seed ([`SaveCalc`]).
+pub fn save_xlsx_as_with(pkg: &SheetPackage, kind: SpreadsheetKind, calc: SaveCalc) -> Vec<u8> {
     let without_excel4_macros;
     let pkg = if !kind.allows_macros() && (pkg.has_macro_sheets() || pkg.has_macro_names()) {
         let mut copy = pkg.clone();
-        copy.remove_excel4_macros();
+        copy.remove_excel4_macros(calc);
         without_excel4_macros = copy;
         &without_excel4_macros
     } else {
@@ -3576,8 +3610,17 @@ pub fn save_xlsx_as(pkg: &SheetPackage, kind: SpreadsheetKind) -> Vec<u8> {
 /// [`save_xlsx_as`] with the kind of `path`'s extension; an extension that is
 /// not a spreadsheet type keeps the loaded type, as [`save_xlsx`] does.
 pub fn save_xlsx_for_path(pkg: &SheetPackage, path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    save_xlsx_for_path_with(pkg, path, SaveCalc::default())
+}
+
+/// [`save_xlsx_for_path`] with the host's clock and RAND seed ([`SaveCalc`]).
+pub fn save_xlsx_for_path_with(
+    pkg: &SheetPackage,
+    path: impl AsRef<std::path::Path>,
+    calc: SaveCalc,
+) -> Vec<u8> {
     match SpreadsheetKind::from_path(path) {
-        Some(kind) => save_xlsx_as(pkg, kind),
+        Some(kind) => save_xlsx_as_with(pkg, kind, calc),
         None => save_xlsx(pkg),
     }
 }
@@ -3709,11 +3752,12 @@ impl SheetPackage {
     /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
     /// removed sheet keeps its cell, with that reference as `#REF!`. A
     /// workbook of nothing but macro sheets first gains a blank worksheet, so
-    /// one remains. Returns whether there was anything to drop.
+    /// one remains. The readers of a rewritten cell are evaluated on
+    /// `calc`'s clock and seed. Returns whether there was anything to drop.
     ///
     /// Only that copy: an open workbook keeps its macros, as Excel keeps
     /// them, and its sheet indices stay put.
-    fn remove_excel4_macros(&mut self) -> bool {
+    fn remove_excel4_macros(&mut self, calc: SaveCalc) -> bool {
         let doomed = self.macro_sheet_indices();
         if doomed.is_empty() && !self.has_macro_names() {
             return false;
@@ -3781,6 +3825,8 @@ impl SheetPackage {
         // Before the sheets go, while their indices still hold.
         if !rewritten.is_empty() {
             let mut engine = crate::engine::Engine::new(&self.workbook);
+            engine.clock = calc.clock;
+            engine.seed = calc.seed;
             engine.recalc_dependents_of(&mut self.workbook, &rewritten);
         }
         for &i in doomed.iter().rev() {
@@ -4150,8 +4196,9 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     };
 
     // --- colour filters' <dxf>s: an equal one the styles part has, or new
+    let styles_name = pkg.styles_part_name();
     let styles_src = pkg
-        .part("xl/styles.xml")
+        .part(styles_name)
         .map(|b| String::from_utf8_lossy(b).into_owned());
     let have_dxfs: Vec<String> = styles_src
         .as_deref()
@@ -4294,18 +4341,18 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     }
 
     // --- authored cell styles: append new xfs to styles.xml ---------------
-    if let Some(orig) = pkg.part("xl/styles.xml") {
+    if let Some(orig) = pkg.part(styles_name) {
         let orig = String::from_utf8_lossy(orig).into_owned();
         let base = parse_styles(&orig).xfs.len();
         if wb.styles.xfs.len() > base {
             let updated = splice_styles(&orig, &wb.styles.xfs[base..]);
-            if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+            if let Some(p) = parts.iter_mut().find(|(n, _)| n == styles_name) {
                 p.1 = updated.into_bytes();
             }
         }
     }
     if !new_dxfs.is_empty() {
-        if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+        if let Some(p) = parts.iter_mut().find(|(n, _)| n == styles_name) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = append_dxfs(&xml, &new_dxfs).into_bytes();
         }
@@ -9917,8 +9964,10 @@ impl SheetPackage {
         }
         let dxf_id = self.workbook.styles.dxfs.len();
         self.workbook.styles.dxfs.push(dxf);
-        // styles.xml: regenerate <dxfs> from the model (splice_styles preserves it).
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| n == "xl/styles.xml") {
+        // The styles part: regenerate <dxfs> from the model (splice_styles
+        // preserves it).
+        let styles_name = self.styles_part_name().to_string();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == styles_name) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             p.1 = set_dxfs(&xml, &self.workbook.styles.dxfs).into_bytes();
         }
@@ -11423,6 +11472,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
         macro_loaded: Default::default(),
         shared: Vec::new(),
         shared_part: Some("xl/sharedStrings.xml".to_string()),
+        styles_part: Some("xl/styles.xml".to_string()),
         strict: false,
         workbook: Workbook {
             sheets: names
@@ -19866,8 +19916,8 @@ mod kind_tests {
 
         // The in-memory drop agrees with the file.
         let mut pkg = mixed_xlm_book();
-        assert!(pkg.remove_excel4_macros());
-        assert!(!pkg.remove_excel4_macros());
+        assert!(pkg.remove_excel4_macros(SaveCalc::default()));
+        assert!(!pkg.remove_excel4_macros(SaveCalc::default()));
         assert!(
             pkg.workbook
                 .defined_names
@@ -20213,10 +20263,10 @@ mod kind_tests {
 
         // The in-memory drop does the same.
         let mut copy = pkg.clone();
-        assert!(copy.remove_excel4_macros());
+        assert!(copy.remove_excel4_macros(SaveCalc::default()));
         assert!(!copy.has_macro_names());
         assert_eq!(copy.workbook.sheets.len(), 2);
-        assert!(!copy.remove_excel4_macros());
+        assert!(!copy.remove_excel4_macros(SaveCalc::default()));
     }
 
     /// #727 r2: a macro sheet named by an absolute or `./` Target is removed
@@ -20314,7 +20364,7 @@ mod kind_tests {
         assert!(rels.contains("dialogsheets"), "{rels}");
 
         let mut copy = relocated_xlm_book();
-        assert!(copy.remove_excel4_macros());
+        assert!(copy.remove_excel4_macros(SaveCalc::default()));
         let wb = part_text(&copy, "wb/book.xml");
         assert_eq!(wb.matches("<sheet ").count(), 2, "{wb}");
         assert!(!wb.contains("Macro1") && !wb.contains("Dialog1"), "{wb}");
@@ -20472,15 +20522,58 @@ mod kind_tests {
         assert_eq!(value(3), CellValue::Number(0.0), "IFERROR sees the error");
         assert_eq!(value(4), CellValue::Number(123.0), "NOW() reads none of it");
         assert_eq!(value(5), CellValue::Number(77.0), "reads another sheet");
-        // The engine has no clock or random seed here, so a clock or RAND
-        // formula keeps its cached value even when it reads a rewritten cell;
-        // Excel recalculates it on load (`fullCalcOnLoad`).
+        // `save_xlsx_as` gives the engine no clock or random seed, so a clock
+        // or RAND formula keeps its cached value even when it reads a
+        // rewritten cell (Excel recalculates it on load, `fullCalcOnLoad`);
+        // a host passes its own through `save_xlsx_as_with` (#1723).
         assert_eq!(value(6), CellValue::Number(0.5), "no clock to evaluate it");
         // The open workbook is untouched.
         assert_eq!(
             pkg.workbook.sheets[0].cell(0, 1).unwrap().value,
             CellValue::Number(10.0)
         );
+    }
+
+    /// #1723: with the host's clock and seed, a volatile formula that reads a
+    /// rewritten cell is saved with the value the `#REF!` gives it; one that
+    /// reads none still keeps its cached value.
+    #[test]
+    fn macro_free_save_with_a_clock_evaluates_volatile_readers_of_a_rewritten_cell() {
+        let mut pkg = mixed_xlm_book();
+        let data = &mut pkg.workbook.sheets[0];
+        let cached = |src: &str, v: f64| {
+            let mut c = Cell::formula(src);
+            c.value = CellValue::Number(v);
+            c
+        };
+        data.set_cell(0, 0, cached("Macro1!A1+1", 9.0));
+        data.set_cell(0, 1, cached("IF(ISERROR(A1),NOW(),0)", 0.5));
+        data.set_cell(0, 2, cached("NOW()+A1", 0.5));
+        data.set_cell(0, 3, cached("NOW()", 123.0));
+        data.set_cell(0, 4, cached("RAND()+0*IFERROR(A1,0)", 5.0));
+        let calc = SaveCalc {
+            clock: Some(45_306.25),
+            seed: Some(7),
+        };
+        let out = load_xlsx(&save_xlsx_as_with(&pkg, SpreadsheetKind::Workbook, calc)).unwrap();
+        let data = &out.workbook.sheets[0];
+        let value = |c: u32| data.cell(0, c).unwrap().value.clone();
+        assert_eq!(value(1), CellValue::Number(45_306.25), "NOW() on the clock");
+        assert_eq!(value(2), CellValue::Error("#REF!".into()));
+        assert_eq!(value(3), CellValue::Number(123.0), "NOW() reads none of it");
+        match value(4) {
+            CellValue::Number(n) => assert!((0.0..1.0).contains(&n), "RAND gave {n}"),
+            v => panic!("RAND reader is {v:?}"),
+        }
+        // The path form passes it through too.
+        let out = load_xlsx(&save_xlsx_for_path_with(&pkg, "out.xlsx", calc)).unwrap();
+        let v = out.workbook.sheets[0].cell(0, 1).unwrap().value.clone();
+        assert_eq!(v, CellValue::Number(45_306.25));
+        // Without them (the plain form): cached values, RAND included.
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let data = &out.workbook.sheets[0];
+        assert_eq!(data.cell(0, 1).unwrap().value, CellValue::Number(0.5));
+        assert_eq!(data.cell(0, 4).unwrap().value, CellValue::Number(5.0));
     }
 
     /// #827: chart series refs, a validation list and a conditional-format

@@ -61,7 +61,7 @@ use gridcore::sheet::{
     date_unrepresentable, format_with, sheet_to_csv,
 };
 use gridcore::textio::{AutoConvert, Origin, TextParse};
-use gridcore::xlsx::{SheetPackage, SpreadsheetKind, new_xlsx, save_xlsx_for_path};
+use gridcore::xlsx::{SaveCalc, SheetPackage, SpreadsheetKind, new_xlsx, save_xlsx_for_path_with};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -469,11 +469,19 @@ fn type_for_path(path: &str) -> Option<usize> {
 
 /// The headless `--recalc`: Calculate Now on a freshly loaded workbook, so a
 /// manual workbook and what reads its pivot output are up to date in the file.
-fn recalc_package(pkg: &mut SheetPackage) -> gridcore::pivot::RefreshOutcome {
+/// Also returns the engine's clock and seed after it, for the save to go on
+/// with (a macro-free one evaluates its `#REF!` readers), so its RAND draws
+/// continue the recalculation's instead of repeating them.
+fn recalc_package(pkg: &mut SheetPackage) -> (gridcore::pivot::RefreshOutcome, SaveCalc) {
     let mut engine = Engine::new(&pkg.workbook);
     engine.clock = now_serial();
     engine.seed = entropy_seed();
-    gridcore::calc::calculate_now(&mut pkg.workbook, &mut engine, true)
+    let pivots = gridcore::calc::calculate_now(&mut pkg.workbook, &mut engine, true);
+    let calc = SaveCalc {
+        clock: engine.clock,
+        seed: engine.seed,
+    };
+    (pivots, calc)
 }
 
 /// `path`'s save type when a workbook package can't be written under it:
@@ -753,7 +761,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         let mut pkg = pkg;
-        let pivots = recalc_package(&mut pkg);
+        let (pivots, calc) = recalc_package(&mut pkg);
         if pivots.refreshed + pivots.skipped > 0 {
             println!(
                 "pivots: {} refreshed, {} kept on cached values",
@@ -772,7 +780,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        let bytes = save_xlsx_for_path(&pkg, &out);
+        let bytes = save_xlsx_for_path_with(&pkg, &out, calc);
         // Recalculation is an in-place save for .xlsx, but a conversion for
         // CSV/TSV input. Never replace the imported text file with an XLSX,
         // nor the .csv/.txt a text open is bound to.
@@ -5663,8 +5671,13 @@ impl App {
         // author and creation time are kept, or, on a workbook's first save
         // (no core properties yet), set to this user and this time.
         self.pkg.stamp_save(&iso_now(), &comment_author());
-        // The file's type follows the path it is written to.
-        save_xlsx_for_path(&self.pkg, &self.path)
+        // The file's type follows the path it is written to; a macro-free
+        // one evaluates the readers of its `#REF!` cells on the app's clock.
+        let calc = SaveCalc {
+            clock: self.engine.clock,
+            seed: self.engine.seed,
+        };
+        save_xlsx_for_path_with(&self.pkg, &self.path, calc)
     }
 
     /// Ctrl+S, `:w` and the backstage's Save. On a file opened read-only it
@@ -16037,6 +16050,28 @@ mod tests {
         app.commit_save_as(dir.clone(), "again.xlsx".into());
         assert!(app.confirm.is_some(), "a later Save As asks again");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #1723: a macro-free save evaluates a clock formula that reads a cell
+    /// it turns into `#REF!` on the app's clock.
+    #[test]
+    fn a_macro_free_save_evaluates_the_ref_readers_on_the_apps_clock() {
+        let mut pkg = xlm_pkg();
+        let cached = |src: &str, v: f64| {
+            let mut c = Cell::formula(src);
+            c.value = CellValue::Number(v);
+            c
+        };
+        pkg.workbook.sheets[0].set_cell(0, 0, cached("Macro1!A1+1", 9.0));
+        pkg.workbook.sheets[0].set_cell(0, 1, cached("IF(ISERROR(A1),NOW(),0)", 0.5));
+        let mut app = App::new(pkg, "out.xlsx");
+        app.engine.clock = Some(45_306.25);
+        let out = load_xlsx(&app.package_bytes()).unwrap();
+        assert!(!out.has_macro_sheets());
+        assert_eq!(
+            out.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(45_306.25)
+        );
     }
 
     /// #727 r1: an Excel 4.0 name alone, with no macro sheet, is asked about

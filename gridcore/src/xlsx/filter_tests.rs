@@ -488,3 +488,138 @@ fn a_fill_comes_from_the_highest_rule_that_sets_one() {
     assert_eq!(painted.fill, Some((0, 0xB0, 0x50)));
     assert_eq!(painted.color, Some((255, 0, 0)));
 }
+
+/// `pkg` with its workbook part at `xl/book/wb.xml` and its styles part at
+/// `xl/book/styles.xml` (rel target `styles.xml`), nothing at `xl/styles.xml`.
+fn styles_elsewhere(pkg: &SheetPackage) -> SheetPackage {
+    let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, bytes) in &pkg.parts {
+        let text = || String::from_utf8_lossy(bytes).into_owned();
+        match name.as_str() {
+            "xl/workbook.xml" => parts.push(("xl/book/wb.xml".into(), bytes.clone())),
+            "xl/styles.xml" => parts.push(("xl/book/styles.xml".into(), bytes.clone())),
+            "xl/_rels/workbook.xml.rels" => {
+                let rels = text()
+                    .replace("Target=\"", "Target=\"../")
+                    .replace("Target=\"../styles.xml\"", "Target=\"styles.xml\"");
+                parts.push(("xl/book/_rels/wb.xml.rels".into(), rels.into_bytes()));
+            }
+            "_rels/.rels" => parts.push((
+                name.clone(),
+                text()
+                    .replace("xl/workbook.xml", "xl/book/wb.xml")
+                    .into_bytes(),
+            )),
+            "[Content_Types].xml" => parts.push((
+                name.clone(),
+                text()
+                    .replace("/xl/workbook.xml", "/xl/book/wb.xml")
+                    .replace("/xl/styles.xml", "/xl/book/styles.xml")
+                    .into_bytes(),
+            )),
+            _ => parts.push((name.clone(), bytes.clone())),
+        }
+    }
+    load_xlsx(&write_zip(&parts)).expect("the relocated fixture loads")
+}
+
+/// #1723: the styles part is the one the workbook's relationships name.
+#[test]
+fn the_loader_records_where_the_styles_part_is() {
+    let pkg = list("", "");
+    assert_eq!(pkg.styles_part_name(), "xl/styles.xml");
+    let moved = styles_elsewhere(&pkg);
+    assert_eq!(moved.styles_part_name(), "xl/book/styles.xml");
+    assert!(moved.part("xl/styles.xml").is_none());
+    assert!(moved.part("xl/book/styles.xml").is_some());
+}
+
+/// #1723: in a workbook whose styles part is not `xl/styles.xml`, a new cell
+/// style, a conditional format's dxf and a colour filter's dxf go into that
+/// part, and no `xl/styles.xml` appears.
+#[test]
+fn a_styles_part_elsewhere_takes_new_cell_styles_and_dxfs() {
+    let cf_dxf = r#"<dxf><font><b/><color theme="5"/></font></dxf>"#;
+    let own_style = r#"<cellStyles count="2"><cellStyle name="Normal" xfId="0" builtinId="0"/><cellStyle name="Mine" xfId="0"/></cellStyles>"#;
+    let mut pkg = list("", &format!(r#"<dxfs count="1">{cf_dxf}</dxfs>"#));
+    for (p, xml) in pkg.parts.iter_mut() {
+        if p == "xl/styles.xml" {
+            let s = String::from_utf8_lossy(xml);
+            let s = match s.find("<cellStyles") {
+                Some(at) => {
+                    let end = s[at..].find("</cellStyles>").unwrap() + at + "</cellStyles>".len();
+                    format!("{}{own_style}{}", &s[..at], &s[end..])
+                }
+                None => s.replacen("<dxfs", &format!("{own_style}<dxfs"), 1),
+            };
+            *xml = s.into_bytes();
+        }
+    }
+    let mut pkg = styles_elsewhere(&load_xlsx(&write_zip(&pkg.parts)).unwrap());
+    let cells = &mut pkg.workbook.sheets[0];
+    cells.set_cell(1, 0, Cell::text("Ann"));
+    cells.set_cell(2, 0, Cell::text("Bo"));
+    cells.set_cell(0, 0, Cell::text("Rep"));
+    cells.set_cell(0, 1, Cell::text("Units"));
+    cells.set_cell(1, 1, Cell::number(5.0));
+    cells.set_cell(2, 1, Cell::number(9.0));
+
+    // The `.xls` export's loss list reads the moved part as the styles
+    // part: its own cell style is named, the part itself is not a loss.
+    let lacks = settings_xls_lacks(&pkg);
+    assert!(lacks.iter().any(|l| l == "cell styles"), "{lacks:?}");
+    assert!(!lacks.iter().any(|l| l.contains("xl/book")), "{lacks:?}");
+
+    // A new cell style, past the loaded `cellXfs`.
+    let base = pkg.workbook.styles.xfs.len();
+    pkg.workbook.styles.xfs.push(crate::sheet::Xf {
+        bold: true,
+        ..Default::default()
+    });
+    pkg.workbook.sheets[0]
+        .cells
+        .get_mut(&(1, 1))
+        .expect("B2 is set")
+        .style = base as u32;
+    // A conditional format's dxf (model id 1), then a colour filter's (2).
+    let dxf = crate::sheet::Dxf {
+        fill: Some((0xFF, 0, 0)),
+        ..Default::default()
+    };
+    assert!(pkg.add_conditional_format(0, (1, 1, 2, 1), "greaterThan", "6", None, dxf));
+    let moved = text(&pkg, "xl/book/styles.xml");
+    assert!(moved.contains(r#"<dxfs count="2">"#), "{moved}");
+    pkg.workbook.sheets[0].auto_filter = Some(SheetAutoFilter {
+        range: (0, 0, 2, 1),
+        criteria: vec![(
+            0,
+            ColumnFilter::Color {
+                cell: true,
+                rgb: Some((0, 0xB0, 0x50)),
+                dxf_id: None,
+            },
+        )],
+        ..SheetAutoFilter::default()
+    });
+
+    let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+    assert!(re.part("xl/styles.xml").is_none(), "no second styles part");
+    assert!(ws.contains(r#"<colorFilter dxfId="2"/>"#), "{ws}");
+    let styles = text(&re, "xl/book/styles.xml");
+    assert!(styles.contains(r#"<dxfs count="3">"#), "{styles}");
+    assert!(
+        styles.contains(&crate::filter::color_dxf_xml(true, Some((0, 0xB0, 0x50)))),
+        "{styles}"
+    );
+    assert!(
+        styles.contains(&format!(r#"<cellXfs count="{}">"#, base + 1)),
+        "{styles}"
+    );
+    let b2 = re.workbook.sheets[0].cell(1, 1).unwrap().style as usize;
+    assert_eq!(b2, base);
+    assert!(
+        re.workbook.styles.xf(b2 as u32).bold,
+        "the new style reloads"
+    );
+    assert_eq!(re.workbook.styles.dxfs.len(), 3);
+}

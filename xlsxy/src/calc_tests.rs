@@ -353,7 +353,7 @@ fn headless_recalc_updates_what_reads_a_refreshed_pivot_in_manual_mode() {
         part: String::new(),
         cache_part: String::new(),
     });
-    let out = recalc_package(&mut pkg);
+    let (out, _) = recalc_package(&mut pkg);
     assert_eq!(out.refreshed, 1);
     let g1 = pkg.workbook.sheets[0].cell(0, 6).unwrap().value.clone();
     assert_eq!(g1, CellValue::Number(80.0), "G1 reads the refreshed E2");

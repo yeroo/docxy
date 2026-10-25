@@ -9531,8 +9531,14 @@ fn sample_doc() -> Loaded {
 /// `None` and keeps the loaded type. Also returns how many UI charts
 /// `add_chart` refused, so the save can say they are not in the file.
 fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usize) {
+    // A macro-free save evaluates the readers of the cells it turns into
+    // `#REF!` on the view's clock and seed.
+    let calc = gridcore::xlsx::SaveCalc {
+        clock: v.engine.clock,
+        seed: v.engine.seed,
+    };
     let write = |pkg: &gridcore::xlsx::SheetPackage| match target {
-        Some(target) => gridcore::xlsx::save_xlsx_for_path(pkg, target),
+        Some(target) => gridcore::xlsx::save_xlsx_for_path_with(pkg, target, calc),
         None => gridcore::xlsx::save_xlsx(pkg),
     };
     if v.charts.is_empty() {
@@ -28730,6 +28736,35 @@ mod sheet_save_tests {
         );
         assert!(tab.status.starts_with("saved "), "{}", tab.status);
         assert!(!tab.status.contains("without"), "{}", tab.status);
+    }
+
+    /// #1723: a macro-free save evaluates a clock formula that reads a cell
+    /// it turns into `#REF!` on the view's clock.
+    #[test]
+    fn a_macro_free_save_evaluates_the_ref_readers_on_the_views_clock() {
+        use gridcore::sheet::{Cell, CellValue};
+        let dir = Scratch::new();
+        let mut pkg = xlm_book(gridcore::xlsx::SpreadsheetKind::MacroWorkbook);
+        let cached = |src: &str, v: f64| {
+            let mut c = Cell::formula(src);
+            c.value = CellValue::Number(v);
+            c
+        };
+        pkg.workbook.sheets[0].set_cell(0, 0, cached("Macro1!A1+1", 9.0));
+        pkg.workbook.sheets[0].set_cell(0, 1, cached("IF(ISERROR(A1),NOW(),0)", 0.5));
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &mut tab.surface else {
+            unreachable!()
+        };
+        v.pkg = pkg;
+        v.engine.clock = Some(45_306.25);
+        let (bytes, _) = sheet_bytes(v, Some(&dir.path("out.xlsx")));
+        let saved = gridcore::xlsx::load_xlsx(&bytes).unwrap();
+        assert!(!saved.has_macro_sheets());
+        assert_eq!(
+            saved.workbook.sheets[0].cell(0, 1).unwrap().value,
+            CellValue::Number(45_306.25)
+        );
     }
 
     /// #727: a template opens as a new, never-saved workbook from it, as
