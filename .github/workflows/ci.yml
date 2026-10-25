@@ -272,9 +272,10 @@ jobs:
       # plus its frame, so every `window-size` wider than that came out 1028x780
       # and the cases saw a narrower ribbon than they asked for (#1779). Give the
       # sweep a 1920x1080 screen (the widest case asks for 1400x800 logical px),
-      # and fail here, with the mode got and the modes offered, if it is smaller.
-      # The readback is the display mode, not Screen.Bounds or GetSystemMetrics,
-      # which a DPI-unaware pwsh reports scaled down.
+      # and fail here, with the mode got and the modes offered, if the mode is
+      # below 1920x1080 or the screen at the runner's scale is below 1400x800 plus
+      # the frame. The readback is the display mode, not Screen.Bounds or
+      # GetSystemMetrics, which a DPI-unaware pwsh reports scaled down.
       - name: Set the display to 1920x1080
         shell: pwsh
         run: |
@@ -300,7 +301,7 @@ jobs:
               [DllImport("user32.dll", CharSet = CharSet.Unicode)]
               public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
               [DllImport("user32.dll")]
-              public static extern IntPtr SetProcessDpiAwarenessContext(IntPtr context);
+              public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
               [DllImport("user32.dll")]
               public static extern uint GetDpiForSystem();
               public static DEVMODE Mode(int index) {
@@ -320,12 +321,15 @@ jobs:
           $code = [Display]::ChangeDisplaySettings([ref]$dm, 0)  # this session only
           "ChangeDisplaySettings: $code (0 is DISP_CHANGE_SUCCESSFUL)"
           $got = [Display]::Mode($current)
-          [void][Display]::SetProcessDpiAwarenessContext([IntPtr]-4)  # per-monitor v2, for a true DPI
-          "after: $($got.dmPelsWidth)x$($got.dmPelsHeight), system DPI $([Display]::GetDpiForSystem())"
-          if ($code -ne 0 -or $got.dmPelsWidth -lt 1920 -or $got.dmPelsHeight -lt 1080) {
+          $aware = [Display]::SetProcessDpiAwarenessContext([IntPtr]-4)  # per-monitor v2, for a true DPI
+          $dpi = [Display]::GetDpiForSystem()
+          $logW = [math]::Floor($got.dmPelsWidth * 96 / $dpi)
+          $logH = [math]::Floor($got.dmPelsHeight * 96 / $dpi)
+          "after: $($got.dmPelsWidth)x$($got.dmPelsHeight), DPI awareness set: $aware, system DPI $dpi, logical ${logW}x${logH}"
+          if ($code -ne 0 -or $got.dmPelsWidth -lt 1920 -or $got.dmPelsHeight -lt 1080 -or $logW -lt 1410 -or $logH -lt 815) {
             $modes = for ($i = 0; ($m = [Display]::Mode($i)).dmPelsWidth -ge 0; $i++) { "$($m.dmPelsWidth)x$($m.dmPelsHeight)" }
             "modes offered: $(($modes | Select-Object -Unique) -join ', ')"
-            Write-Error "the display is $($got.dmPelsWidth)x$($got.dmPelsHeight), the sweep needs 1920x1080 (#1779)"
+            Write-Error "the display is $($got.dmPelsWidth)x$($got.dmPelsHeight) (logical ${logW}x${logH} at $dpi DPI), the sweep needs 1920x1080 and 1410x815 logical (#1779)"
             exit 1
           }
       - name: Sweep

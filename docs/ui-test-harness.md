@@ -2117,7 +2117,9 @@ a screen at least as large as the widest `window-size` a case asks for
 (1400x800 logical pixels): on the runner's 1024x768 desktop every such window
 came out 1028x780 and the ribbon cases saw narrower ribbons than they asked
 for (#1779). The job sets the display to 1920x1080 before the sweep and fails
-there, naming the mode it got and the modes offered, if the screen is smaller.
+there, naming the mode it got and the modes offered, if the mode is smaller
+or the screen at the runner's scale (its size in logical pixels) is below
+1410x815, the widest window plus its frame.
 The `window-size` reply echoes the request, not the size the window got.
 
 ### Capture on macOS
