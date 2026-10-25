@@ -499,6 +499,42 @@ pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: 
     });
 }
 
+/// Make the loaded `w:ind` in `shadow` set the left indent as an explicit
+/// zero: its left attributes ([`IND_LEFT`]) become one `w:left="0"`, in the
+/// place of the first of them (else first); a shadow without a `w:ind` gets
+/// `<w:ind w:left="0"/>`. Already a lone zero `w:left` or `w:start` (no
+/// character units), it is left as it is, so pinning again changes nothing.
+pub(crate) fn pin_shadow_left_zero(shadow: &mut Vec<String>) {
+    let Some(raw) = shadow.iter_mut().find(|raw| local_name(raw) == "ind") else {
+        shadow.push("<w:ind w:left=\"0\"/>".to_string());
+        return;
+    };
+    let mut attrs = element_attrs_of(raw);
+    let left: Vec<&(String, String)> = attrs
+        .iter()
+        .filter(|(n, _)| IND_LEFT.contains(&n.as_str()))
+        .collect();
+    if let [(n, v)] = left.as_slice() {
+        if (n == "w:left" || n == "w:start") && v.trim().parse::<i64>() == Ok(0) {
+            return;
+        }
+    }
+    let at = attrs
+        .iter()
+        .position(|(n, _)| IND_LEFT.contains(&n.as_str()))
+        .unwrap_or(0);
+    attrs.retain(|(n, _)| !IND_LEFT.contains(&n.as_str()));
+    attrs.insert(at.min(attrs.len()), ("w:left".to_string(), "0".to_string()));
+    let name = raw
+        .trim_start()
+        .trim_start_matches('<')
+        .split([' ', '/', '>', '\t', '\n', '\r'])
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    *raw = empty_element(&name, &attrs);
+}
+
 /// Whether a shadow element `local` still carries any of `attrs`.
 pub(crate) fn shadow_has_attr(shadow: &[String], local: &str, attrs: &[&str]) -> bool {
     shadow.iter().any(|raw| {

@@ -705,6 +705,15 @@ impl ParProps {
         self.num_id.is_some_and(|n| n != 0)
     }
 
+    /// Pin the left indent at an explicit `w:left="0"`, as the loaded `w:ind`
+    /// (see `serialize::pin_shadow_left_zero`): a list item decreased to the
+    /// margin keeps it there, where no `w:left` would bring its numbering
+    /// level's indent back (#1728). The paragraph then has a loaded left
+    /// indent, as it does when the file is opened again.
+    pub fn pin_left_indent_zero(&mut self) {
+        crate::serialize::pin_shadow_left_zero(&mut self.shadow);
+    }
+
     /// Call after setting indents explicitly. The loaded `w:ind` loses every
     /// attribute that sets one of `sides`, in twips or in character units
     /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents
