@@ -1171,6 +1171,20 @@ fn on_grid(r: u32, c: u32) -> bool {
     r as i64 <= ptg_write::MAX_ROW && c as i64 <= ptg_write::MAX_COL
 }
 
+/// The COLINFO width of a hidden column with no width of its own: the
+/// sheet's STANDARDWIDTH, else DEFCOLWIDTH's characters plus 8.43's
+/// padding (2158 for 8), which the reader takes for the default and loads
+/// as no width (#1731).
+fn widthless_hidden_coldx(base: u16, standard: Option<u16>) -> u16 {
+    let coldx = standard.unwrap_or(base * 256 + 110);
+    debug_assert!(super::xls::is_default_coldx(
+        Some(u32::from(base)),
+        standard.map(|w| f64::from(w) / 256.0),
+        coldx,
+    ));
+    coldx
+}
+
 /// One worksheet substream.
 fn sheet_records(
     wb: &Workbook,
@@ -1314,8 +1328,10 @@ fn sheet_records(
         if d.width.is_none() && !hidden {
             continue;
         }
-        let width = d.width.unwrap_or(crate::sheet::DEFAULT_COL_WIDTH);
-        let coldx = (width * 256.0).round().clamp(0.0, 65535.0) as u16;
+        let coldx = match d.width {
+            Some(width) => (width * 256.0).round().clamp(0.0, 65535.0) as u16,
+            None => widthless_hidden_coldx(base, standard),
+        };
         // fUserSet is xlsx's customWidth: a plain width leaves it clear,
         // unless the reader would take that width for the sheet's default
         // and drop it.
@@ -2949,6 +2965,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(1, Some(10.0), false), (3, Some(12.0), true)]
         );
+    }
+
+    /// A hidden column with no width of its own is written at the sheet's
+    /// default, so it loads back without one (#1731).
+    #[test]
+    fn a_hidden_widthless_column_keeps_the_sheet_default() {
+        for (base, standard, coldx) in [(8, None, 2158u16), (8, Some(12.0), 3072), (10, None, 2670)]
+        {
+            let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+            let s = &mut pkg.workbook.sheets[0];
+            s.format.base_col_width = base;
+            s.format.default_col_width = standard;
+            s.col_defs = vec![crate::sheet::ColDef {
+                min: 2,
+                max: 2,
+                width: None,
+                attrs: " hidden=\"1\"".into(),
+                default_width: true,
+                plain_width: false,
+            }];
+            let out = write_xls(&pkg);
+            let coldxs: Vec<u16> = out
+                .bytes
+                .windows(4)
+                .enumerate()
+                .filter(|(_, w)| w[..2] == [0x7D, 0x00] && w[2] == 12)
+                .map(|(i, _)| u16::from_le_bytes([out.bytes[i + 4 + 4], out.bytes[i + 4 + 5]]))
+                .collect();
+            assert_eq!(coldxs, [coldx], "{base} {standard:?}");
+            let (back, _) = round(&pkg);
+            let s = &back.workbook.sheets[0];
+            let d = &s.col_defs[0];
+            assert_eq!(
+                (d.min, d.width, d.default_width),
+                (2, None, true),
+                "{base} {standard:?}"
+            );
+            assert!(s.col_hidden(2), "{base} {standard:?}");
+        }
     }
 
     /// A loaded thin box in red is written as the box, its colour named
