@@ -1753,8 +1753,10 @@
   moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme (2+ letters, so
   `C:` is a drive) a URL moniker, any other path a File moniker (relative:
   leading `..\` in `cAnti`, no `hlstmfIsAbsolute`; a non-ASCII path adds the
-  Unicode extension); a path's `#loc` (a cell of another workbook) is that
-  moniker plus a location, as the reader reads it. No display name, frame or
+  Unicode extension); a path's `#loc` (a cell of another workbook: the first
+  `#` whose tail is a reference with `!` or a defined name, no `\` or `/`) is
+  that moniker plus a location, as the reader reads it (`a#b.xlsx` is still
+  split: the model holds one string). No display name, frame or
   ScreenTip (#1454).
 - A `hyperlink_refs` range whose cells all still carry its target is one
   record, clipped to the grid (a whole row then reads back spread over its 256
@@ -1762,11 +1764,12 @@
   a range wins on read. Past the grid or over `MAX_BODY` is counted in `lost`.
   The reader skips a record it can't read (named "hyperlinks"), takes a moniker
   plus location as `url#loc`, spreads ranges through `hyperlink_cells` and
-  leaves `hyperlink_refs` empty; HLinkTooltip (0x0800) is named "hyperlink
+  leaves `hyperlink_refs` empty; a range's spread is charged as repeats
+  (`charge_repeats`) and a `cAnti` over 255 is unreadable; HLinkTooltip (0x0800) is named "hyperlink
   ScreenTips". Checked against xlrd only (no Excel oracle).
 - `xlsx::model_target` maps every `file:` spelling of a UNC path
   (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
-  decoded) to `\\s\sh`; `localhost`, a drive or port in the server's place
+  decoded in each) to `\\s\sh`; `localhost`, a drive or port in the server's place
   (`file://C:/x`, `file://h:80/x`), local paths, `?`/`#`, escaped separators
   and bad escapes stay raw. The xlsx save compares and reuses relationships
   through it, so a raw spelling held in the model is no change and no new

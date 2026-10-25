@@ -978,6 +978,11 @@ fn file_uri_unc_forms_load_as_unc() {
             "\\\\srv\\my share\\aé.xlsx",
         ),
         ("file:///\\\\srv\\share\\x.xlsx", "\\\\srv\\share\\x.xlsx"),
+        // Escapes decode in Excel's spelling too, so both are one model form.
+        ("file:///\\\\srv\\my%20share\\x", "\\\\srv\\my share\\x"),
+        ("file://srv/my%20share/x", "\\\\srv\\my share\\x"),
+        // One that does not decode stays as it is.
+        ("file:///\\\\srv\\a%2Fb", "\\\\srv\\a%2Fb"),
     ] {
         assert_eq!(model_target(wire), want, "{wire}");
     }
@@ -1045,11 +1050,13 @@ fn unchanged_host_form_link_keeps_bytes() {
         "file://srv/share/a",
         "file:////srv/share/b",
         "FILE://///srv/share/c",
+        "file:///\\\\srv\\my%20share\\d",
     ]);
     let links = &pkg.workbook.sheets[0].hyperlinks;
     assert_eq!(links[&(0, 0)], "\\\\srv\\share\\a");
     assert_eq!(links[&(1, 0)], "\\\\srv\\share\\b");
     assert_eq!(links[&(2, 0)], "\\\\srv\\share\\c");
+    assert_eq!(links[&(3, 0)], "\\\\srv\\my share\\d");
     let re = resaved(&pkg);
     assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
     assert_eq!(text(&re, RELS), text(&pkg, RELS));

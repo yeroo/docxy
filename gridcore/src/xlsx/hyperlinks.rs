@@ -46,7 +46,12 @@ pub(crate) fn model_target(wire: &str) -> Cow<'_, str> {
         Some(scheme) if scheme.eq_ignore_ascii_case(UNC_URI) => {
             let rest = &wire[UNC_URI.len()..];
             if rest.starts_with("\\\\") {
-                return Cow::Borrowed(rest);
+                // Escapes decoded as in the other spellings; a remainder that
+                // does not decode stays as it is.
+                return match percent_decode(rest) {
+                    Some(decoded) => Cow::Owned(decoded),
+                    None => Cow::Borrowed(rest),
+                };
             }
         }
         _ => {}

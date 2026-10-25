@@ -1036,6 +1036,22 @@ fn read_sheet(
             _ if depth > 0 => continue,
             _ => {}
         }
+        // HLINK (#1726): one the reader can't read is left out and named. A
+        // range spreads its target over its cells: charged as repeats, so a
+        // small file can't expand without bound.
+        if r.ty == super::hlink::HLINK {
+            match super::hlink::parse(&r.data) {
+                Some(link) => {
+                    let copies = crate::sheet::hyperlink_cells(link.0).count() - 1;
+                    book.charge_repeats(copies, copies.saturating_mul(link.1.len()))?;
+                    sheet.hyperlinks.push(link);
+                }
+                None => {
+                    book.dropped.insert("hyperlinks");
+                }
+            }
+            continue;
+        }
         let mut c = Cur::new(r);
         let _ = (|| -> Option<()> {
             match r.ty {
@@ -1369,14 +1385,6 @@ fn read_sheet(
                 0x01B2 | 0x01BE => {
                     book.dropped.insert("data validation");
                 }
-                // HLINK (#1726): one the reader can't read is left out and
-                // named.
-                super::hlink::HLINK => match super::hlink::parse(&r.data) {
-                    Some(link) => sheet.hyperlinks.push(link),
-                    None => {
-                        book.dropped.insert("hyperlinks");
-                    }
-                },
                 super::hlink::HLINK_TOOLTIP => {
                     book.dropped.insert("hyperlink ScreenTips");
                 }
@@ -2017,6 +2025,32 @@ pub(crate) mod tests {
             );
             assert!(book.unknown_records.is_empty());
         }
+    }
+
+    #[test]
+    fn hlink_spread_is_charged_as_repeats() {
+        // Two 64x64 ranges: 2 x 4,095 copies of the target past the first
+        // cell each.
+        let link = |r: u32| {
+            rec(
+                0x01B8,
+                &super::super::hlink::body((r, 0, r + 63, 63), "https://x/"),
+            )
+        };
+        let stream = workbook(&[], &[link(0), link(100)]);
+        let tight = Limits {
+            repeat_cells: 8_000,
+            ..Limits::default()
+        };
+        let err = read_with(&stream, tight).err().unwrap();
+        assert!(err.to_string().contains("too many repeated cells"), "{err}");
+        let tight_bytes = Limits {
+            repeat_bytes: 50_000,
+            ..Limits::default()
+        };
+        assert!(read_with(&stream, tight_bytes).is_err());
+        let book = read(&stream).unwrap();
+        assert_eq!(book.sheets[0].hyperlinks.len(), 2);
     }
 
     #[test]

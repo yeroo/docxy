@@ -14,6 +14,7 @@
 //! No display name, frame or ScreenTip: the model holds none.
 
 use super::Le;
+use super::ptg::utf16;
 use crate::xlsx::model_target;
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
@@ -36,6 +37,9 @@ const URL_MONIKER: [u8; 16] = [
 const FILE_MONIKER: [u8; 16] = [
     0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
 ];
+
+/// The most `..\\` steps a File moniker's `cAnti` may name.
+const MAX_ANTI: u16 = 255;
 
 const HAS_MONIKER: u32 = 0x01;
 const IS_ABSOLUTE: u32 = 0x02;
@@ -80,11 +84,10 @@ pub(crate) fn body(rect: Rect, target: &str) -> Vec<u8> {
     b.extend_from_slice(&STD_LINK);
     b.extend_from_slice(&2u32.to_le_bytes());
     let mut rest = Vec::new();
-    // A path's `#` starts a location in the file it names (a link to a cell
-    // of another workbook), written after the moniker as Excel does.
-    let (path, location) = match target.split_once('#') {
-        Some((p, l)) if !p.is_empty() && !has_scheme(target) => (p, Some(l)),
-        _ => (target, None),
+    let (path, location) = if has_scheme(target) {
+        (target, None)
+    } else {
+        split_location(target)
     };
     let flags = if let Some(location) = target.strip_prefix('#') {
         put_string(&mut rest, location);
@@ -114,6 +117,29 @@ pub(crate) fn body(rect: Rect, target: &str) -> Vec<u8> {
     b.extend_from_slice(&flags.to_le_bytes());
     b.extend_from_slice(&rest);
     b
+}
+
+/// A path's location in the file it names (a link to a cell of another
+/// workbook), written after the moniker as Excel does: the tail after the
+/// first `#` that reads as one, a reference (`Sheet1!A1`) or a defined name
+/// (`MyName`), with no `\` or `/`. The model holds `path#loc` as one string,
+/// so a file whose own name has such a `#` (`a#b.xlsx`) is still split;
+/// `C:\Dev\C#\a.xlsx` and `a#1.xlsx` are not.
+fn split_location(target: &str) -> (&str, Option<&str>) {
+    for (at, _) in target.match_indices('#') {
+        let (path, tail) = (&target[..at], &target[at + 1..]);
+        if path.is_empty() || tail.is_empty() || tail.contains(['\\', '/']) {
+            continue;
+        }
+        let name = tail.starts_with(|c: char| c.is_alphabetic() || c == '_')
+            && tail
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+        if tail.contains('!') || name {
+            return (path, Some(tail));
+        }
+    }
+    (target, None)
 }
 
 /// A File moniker for a path with no scheme; the flags it takes.
@@ -177,14 +203,13 @@ impl Le<'_> {
     }
 }
 
-/// UTF-16LE `bytes` up to the first null, lossy.
+/// UTF-16LE `bytes` up to the first null unit, lossy.
 fn utf16_to_null(bytes: &[u8]) -> String {
-    let units: Vec<u16> = bytes
+    let end = bytes
         .chunks_exact(2)
-        .map(|p| u16::from_le_bytes([p[0], p[1]]))
-        .take_while(|&u| u != 0)
-        .collect();
-    String::from_utf16_lossy(&units)
+        .position(|p| p == [0, 0])
+        .map_or(bytes.len() & !1, |i| i * 2);
+    utf16(&bytes[..end])
 }
 
 /// An HLINK body's rectangle and model target, or `None` for one this
@@ -244,6 +269,10 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
 /// when there is one, else the ANSI path (its bytes read as Latin-1).
 fn read_file_moniker(c: &mut Le) -> Option<String> {
     let anti = c.u16()?;
+    // Excel climbs a few folders; more is a hostile record, not a path.
+    if anti > MAX_ANTI {
+        return None;
+    }
     let n = c.u32()? as usize;
     let ansi = c.take(n)?;
     let ansi: String = ansi
@@ -261,12 +290,7 @@ fn read_file_moniker(c: &mut Le) -> Option<String> {
         if bytes.checked_add(6)? != size as usize || c.u16()? != 3 || !bytes.is_multiple_of(2) {
             return None;
         }
-        let units: Vec<u16> = c
-            .take(bytes)?
-            .chunks_exact(2)
-            .map(|p| u16::from_le_bytes([p[0], p[1]]))
-            .collect();
-        String::from_utf16_lossy(&units)
+        utf16(c.take(bytes)?)
     };
     Some(format!("{}{path}", "..\\".repeat(anti as usize)))
 }
@@ -355,6 +379,9 @@ mod tests {
             "C:\\b.xlsx#S!A1",
             "\\\\s\\sh\\a.xls#S!A1",
             "https://x/#frag",
+            "C:\\b.xlsx#MyName",
+            "C:\\Dev\\C#\\a.xlsx",
+            "\\\\s\\sh\\a#1.xlsx",
         ] {
             assert_eq!(
                 parse(&body((5, 1, 9, 2), t)),
@@ -370,6 +397,30 @@ mod tests {
         assert_eq!(
             parse(&body((0, 0, 0, 0), "file:///\\\\srv\\share\\x")).map(|l| l.1),
             Some("\\\\srv\\share\\x".into())
+        );
+    }
+
+    #[test]
+    fn only_a_location_shaped_tail_is_split() {
+        let flags = |t: &str| u32::from_le_bytes(body((0, 0, 0, 0), t)[28..32].try_into().unwrap());
+        for t in [
+            "C:\\Dev\\C#\\a.xlsx",
+            "\\\\s\\sh\\a#1.xlsx",
+            "a#",
+            "C:\\x#y\\z!A1",
+        ] {
+            assert_eq!(flags(t) & HAS_LOCATION, 0, "{t}");
+        }
+        for t in [
+            "..\\a.xls#Sheet1!A1",
+            "C:\\b.xlsx#MyName",
+            "\\\\s\\sh\\a.xls#'S 1'!A1",
+        ] {
+            assert_ne!(flags(t) & HAS_LOCATION, 0, "{t}");
+        }
+        assert_eq!(
+            split_location("C:\\b.xlsx#S!A1"),
+            ("C:\\b.xlsx", Some("S!A1"))
         );
     }
 
@@ -422,6 +473,13 @@ mod tests {
         );
         // And it is what the writer writes for that target.
         assert_eq!(body((1, 3, 2, 4), "Book2.xls#Sheet1!A1"), b);
+        // A cAnti past 255 is no path.
+        let mut b = body((1, 3, 2, 4), "..\\a");
+        assert_eq!(parse(&b).map(|l| l.1), Some("..\\a".into()));
+        b[48..50].copy_from_slice(&256u16.to_le_bytes());
+        assert_eq!(parse(&b), None);
+        b[48..50].copy_from_slice(&255u16.to_le_bytes());
+        assert!(parse(&b).is_some());
         // Without the extension the ANSI path is read as Latin-1.
         let mut b = head();
         b.extend_from_slice(&HAS_MONIKER.to_le_bytes());
