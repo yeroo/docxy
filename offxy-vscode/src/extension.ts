@@ -859,9 +859,9 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
               }
               const res = await this.applyInverseRequest(document, undoReq);
               if (!res.ok) {
-                // A failed inverse (e.g. the sheet-restore stash stack
-                // already consumed by earlier undos, or an undo out of order —
-                // the disclosed double-remove/double-undo failure mode) must be SURFACED, not
+                // A failed inverse (e.g. the sheet-restore stash already
+                // consumed by earlier undos, or forgotten beyond the latest
+                // 16 removals) must be SURFACED, not
                 // swallowed, and must NOT throw: VS Code's undo pointer advances
                 // regardless, so a silent failure would lose data invisibly.
                 void vscode.window.showWarningMessage(

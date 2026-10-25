@@ -942,13 +942,15 @@ worth knowing:
   the undo gives those names their text back (unless they changed
   meanwhile). When the restore shifts other sheets, the undo/redo history is
   cleared, as `sheet.remove` itself clears it.
-- **Agent sheet-removals are undoable in reverse order.** The restore is
+- **Agent sheet-removals are undoable in any order.** The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
-  first. A removal older than the 16th is forgotten, and its undo shows a
-  warning (`"Offxy: couldn't undo … — nothing left to reverse"` or "… nothing
-  to restore"), as does an undo out of order (`restore mismatch: …`), instead
-  of silently failing or reviving the wrong sheet.
+  first. An undo out of order (a removal with later ones still stashed, as
+  after undoing a remove and then an import) restores the sheet it names and
+  leaves the later ones stashed, each sheet back where it stood. A removal
+  older than the 16th is forgotten, and its undo shows a warning (`"Offxy:
+  couldn't undo … — nothing left to reverse"` or `restore mismatch: …`),
+  instead of silently failing or reviving the wrong sheet.
 - **An agent `sheet.remove`/`sheet.import-csv` invalidates earlier grid
   edits' undo entries.** These verbs clear the workbook's own undo history
   (mirroring the terminal apps, whose package-parts churn can't be represented
