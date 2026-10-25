@@ -714,6 +714,14 @@ impl ParProps {
         crate::serialize::pin_shadow_left_zero(&mut self.shadow);
     }
 
+    /// Set the paragraph's direct alignment, as an edit does: a left is
+    /// explicit (a raw `w:jc`), so it beats a centred or right style; any
+    /// other alignment drops that element (#1752).
+    pub fn set_align_direct(&mut self, align: Align) {
+        self.align = align;
+        crate::serialize::set_raw_jc(&mut self.raw_props, align == Align::Left);
+    }
+
     /// Call after setting indents explicitly. The loaded `w:ind` loses every
     /// attribute that sets one of `sides`, in twips or in character units
     /// (`w:leftChars`, `w:firstLineChars`, …), and keeps the other indents

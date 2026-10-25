@@ -1108,6 +1108,12 @@ impl Editor {
             .unwrap_or(0)
     }
 
+    /// Push an undo step for a structural edit the caller then makes to
+    /// `doc` itself (`agent`'s block-range edits).
+    pub(crate) fn checkpoint_structural(&mut self) {
+        self.checkpoint(EditKind::Structural);
+    }
+
     /// Push an undo step for an edit of `kind`, unless it continues the
     /// newest step: only typing coalesces. Each Backspace or Delete is a step
     /// of its own, as in Word (#853).
@@ -3683,7 +3689,7 @@ impl Editor {
         self.checkpoint(EditKind::Structural);
         for path in paths {
             if let Some(p) = para_mut(&mut self.doc.body, &path) {
-                p.props.align = align;
+                p.props.set_align_direct(align);
             }
         }
     }
@@ -8794,6 +8800,141 @@ mod tests {
                 assert_eq!(p.props.align, Align::Center);
             }
         }
+    }
+
+    /// #1752: a centred default paragraph style, as Normal carries it.
+    fn centred_normal() -> crate::styles::StyleSheet {
+        crate::styles::parse_styles_xml(
+            "<w:styles><w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">\
+             <w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style></w:styles>",
+        )
+    }
+
+    /// One loaded paragraph whose `w:pPr` is `ppr`, all of it selected.
+    fn loaded_para(ppr: &str) -> Editor {
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body><w:p><w:pPr>{ppr}</w:pPr>\
+             <w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let mut ed = Editor::new(crate::load::parse_document_xml(
+            &xml,
+            &crate::load::Relationships::default(),
+        ));
+        ed.select_all();
+        ed
+    }
+
+    /// Every `w:jc` the first paragraph saves with.
+    fn saved_jcs(ed: &Editor) -> Vec<String> {
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        xml.match_indices("<w:jc ")
+            .map(|(at, _)| xml[at..at + xml[at..].find("/>").unwrap() + 2].to_string())
+            .collect()
+    }
+
+    fn reloaded(ed: &Editor) -> Document {
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body>{}</w:body></w:document>",
+            crate::serialize::blocks_to_xml(&ed.doc.body)
+        );
+        crate::load::parse_document_xml(&xml, &crate::load::Relationships::default())
+    }
+
+    const LEFT_JC: &str = "<w:jc w:val=\"left\"/>";
+
+    /// #1752: Align Left on an unstyled paragraph beats a centred Normal, in
+    /// the model and in the saved file.
+    #[test]
+    fn align_left_overrides_centred_normal() {
+        let sheet = centred_normal();
+        let mut ed = Editor::new(doc(&["a"]));
+        assert_eq!(sheet.effective_align(None, first_props(&ed)), Align::Center);
+        ed.set_align(Align::Left);
+        assert_eq!(sheet.effective_align(None, first_props(&ed)), Align::Left);
+        assert_eq!(saved_jcs(&ed), [LEFT_JC]);
+    }
+
+    #[test]
+    fn align_left_saves_explicit_jc_and_reloads() {
+        let sheet = centred_normal();
+        let mut ed = loaded_para("<w:jc w:val=\"center\"/>");
+        ed.set_align(Align::Left);
+        assert_eq!(saved_jcs(&ed), [LEFT_JC]);
+        let back = reloaded(&ed);
+        let Block::Paragraph(p) = &back.body[0] else {
+            panic!()
+        };
+        assert_eq!(sheet.effective_align(None, &p.props), Align::Left);
+    }
+
+    #[test]
+    fn align_toggles_keep_one_jc() {
+        let mut ed = loaded_para("<w:jc w:val=\"left\"/>");
+        for (align, jc) in [
+            (Align::Center, "<w:jc w:val=\"center\"/>"),
+            (Align::Left, LEFT_JC),
+            (Align::Right, "<w:jc w:val=\"right\"/>"),
+            (Align::Left, LEFT_JC),
+            (Align::Left, LEFT_JC),
+            (Align::Justify, "<w:jc w:val=\"both\"/>"),
+        ] {
+            ed.set_align(align);
+            assert_eq!(saved_jcs(&ed), [jc], "after {align:?}");
+        }
+        assert!(
+            !crate::styles::has_raw_child(&first_props(&ed).raw_props, "jc"),
+            "a non-left alignment drops the raw jc"
+        );
+    }
+
+    #[test]
+    fn align_left_keeps_loaded_start_jc() {
+        for jc in ["<w:jc w:val=\"start\"/>", LEFT_JC] {
+            let mut ed = loaded_para(jc);
+            let before = first_props(&ed).clone();
+            ed.set_align(Align::Left);
+            assert_eq!(first_props(&ed), &before, "{jc}");
+            assert_eq!(saved_jcs(&ed), [jc]);
+        }
+    }
+
+    #[test]
+    fn align_left_replaces_thai_distribute_once() {
+        let mut ed = loaded_para("<w:jc w:val=\"thaiDistribute\"/>");
+        ed.set_align(Align::Left);
+        assert_eq!(saved_jcs(&ed), [LEFT_JC]);
+    }
+
+    #[test]
+    fn align_toggle_from_loaded_start_writes_one_jc() {
+        let mut ed = loaded_para("<w:jc w:val=\"start\"/>");
+        ed.set_align(Align::Center);
+        assert_eq!(saved_jcs(&ed), ["<w:jc w:val=\"center\"/>"]);
+        ed.set_align(Align::Left);
+        assert_eq!(saved_jcs(&ed), [LEFT_JC]);
+    }
+
+    /// #1752 r1: a writer that sets `align` directly (wordcomshim) after an
+    /// Align Left leaves the raw left jc behind; the save still writes the
+    /// loaded centre, once, not nothing.
+    #[test]
+    fn a_superseded_raw_jc_keeps_the_loaded_one() {
+        let mut ed = loaded_para("<w:jc w:val=\"center\"/>");
+        ed.set_align(Align::Left);
+        let Block::Paragraph(p) = &mut ed.doc.body[0] else {
+            panic!()
+        };
+        p.props.align = Align::Center;
+        assert_eq!(saved_jcs(&ed), ["<w:jc w:val=\"center\"/>"]);
+    }
+
+    #[test]
+    fn align_left_undo_drops_explicit_jc() {
+        let mut ed = Editor::new(doc(&["a"]));
+        ed.set_align(Align::Left);
+        ed.undo();
+        assert!(first_props(&ed).raw_props.is_empty());
+        assert!(saved_jcs(&ed).is_empty());
     }
 
     #[test]

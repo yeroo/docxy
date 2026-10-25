@@ -255,8 +255,8 @@ impl StyleSheet {
     /// Effective alignment: direct wins, an explicit direct `w:jc="left"`
     /// (kept in `raw_props`) included; otherwise inherit from the style chain
     /// (the default paragraph style's when the paragraph names none). An
-    /// explicit left beats a style only when it was loaded from a file: an
-    /// editor-chosen Align Left is not kept as a `w:jc` yet.
+    /// editor-chosen Align Left is explicit too (`ParProps::set_align_direct`,
+    /// #1752).
     pub fn effective_align(&self, para_style: Option<&str>, direct: &ParProps) -> Align {
         if direct.align != Align::Left {
             return direct.align;

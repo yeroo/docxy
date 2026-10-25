@@ -730,32 +730,17 @@ fn parse_size(value: &str) -> Result<u32, String> {
 /// ([`format_range`] / [`set_style_range`]), then leave the editor ready for
 /// the caller's own direct mutation of `ed.doc.body[start..=end]`.
 ///
-/// Neither `Editor::checkpoint` nor the private `map_props`/`for_each_para`
-/// helpers behind its setters are `pub`, and this module doesn't touch
-/// `editor.rs` — so the only way to land exactly one entry on the Editor's
-/// own undo stack is through a real `pub` mutating call. [`Editor::set_align`]
-/// is the right shape: unlike the run-level setters (`set_color`/`set_font`/…,
-/// built on the private `map_props`, which checkpoints only when there's an
-/// active selection), `set_align` checkpoints unconditionally, even with none
-/// — falling back to just the caret's own paragraph. So clearing `ed.anchor`
-/// first and pointing the caret at `start` makes it touch exactly ONE
-/// paragraph (`start` itself, already confirmed to be one by the caller's
-/// `require_para` check), never any nested table-cell content a genuine
-/// multi-paragraph selection over `[start..=end]` could reach if a table sat
-/// inside the range — `Editor::selection_spans` flattens ALL paragraphs,
-/// including nested ones, between the anchor's and caret's positions in
-/// document order (see `all_paragraph_paths`), which is out of bounds for
-/// this wave's block-range-only granularity (tables mid-range are left
-/// untouched — see [`format_range`]'s doc comment). Passing back `start`'s
-/// own current align is an exact no-op value-wise, so the caller is free to
-/// immediately overwrite `ed.doc.body[start..=end]` (including `start`'s own
-/// align, if that's part of the patch) without colliding with this call's
-/// effect.
+/// The step is a plain structural checkpoint (`Editor::checkpoint_structural`),
+/// so it changes nothing in the document: it used to go through
+/// `Editor::set_align` with the paragraph's own value, which is no longer a
+/// no-op, as an Align Left writes an explicit `w:jc` (#1752). The selection is
+/// cleared and the caret put at `start` (already confirmed to be a paragraph
+/// by the caller's `require_para` check) first, as before, so undo and redo
+/// land the caret where they did.
 fn checkpoint_for_block_range(ed: &mut Editor, start: usize) {
     ed.anchor = None;
     ed.caret = Caret::top(start, 0);
-    let align = ed.caret_para_props().align;
-    ed.set_align(align);
+    ed.checkpoint_structural();
 }
 
 /// Apply `patch`'s SET-to-value fields to every run in `content` — bare
@@ -821,9 +806,10 @@ fn apply_run_patch_props(props: &mut RunProps, patch: &RunPatch) {
 /// stop, whether it started bold, plain, or mixed within the range; it is
 /// **not** the toggle `Editor::toggle_bold` implements, so applying the same
 /// patch twice is idempotent. Non-paragraph blocks in the range (tables) are
-/// left untouched but still counted — see [`checkpoint_for_block_range`]'s
-/// doc comment for why this deliberately never recurses into a table's
-/// cells.
+/// left untouched but still counted: the granularity is the body's blocks,
+/// so this deliberately never recurses into a table's cells (a selection
+/// over the range would, as `Editor::selection_spans` flattens every nested
+/// cell paragraph).
 ///
 /// Returns the number of blocks in `[start..=end]` (== `end - start + 1`,
 /// matching `doc.format`'s `{formatted:N}` reply). ONE undo checkpoint
@@ -929,7 +915,7 @@ pub fn set_style_range(
                 apply_style_to_para(&mut p.props, s);
             }
             if let Some(a) = align {
-                p.props.align = a;
+                p.props.set_align_direct(a);
             }
         }
     }
@@ -2002,6 +1988,75 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.doc, before);
         assert!(!ed.undo());
+    }
+
+    /// #1752: an agent's Align Left is explicit, as the editor's is, so it
+    /// beats a centred Normal and saves one `w:jc` left.
+    #[test]
+    fn set_style_range_align_left_over_centred_normal() {
+        let sheet = centred_normal();
+        let mut ed = Editor::new(doc_with(&["A"]));
+        set_style_range(&mut ed, 0, 0, None, Some(Align::Left)).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(sheet.effective_align(None, &p.props), Align::Left);
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        assert_eq!(xml.matches("<w:jc ").count(), 1, "{xml}");
+        assert!(xml.contains("<w:jc w:val=\"left\"/>"), "{xml}");
+    }
+
+    /// #1752 r2: a centred default paragraph style.
+    fn centred_normal() -> crate::styles::StyleSheet {
+        crate::styles::parse_styles_xml(
+            "<w:styles><w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">\
+             <w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style></w:styles>",
+        )
+    }
+
+    fn first_props(ed: &Editor) -> ParProps {
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        p.props.clone()
+    }
+
+    /// #1752 r2: a block-range edit asking for no alignment leaves the first
+    /// paragraph's alignment alone (its undo step is no Align Left).
+    #[test]
+    fn format_range_without_align_adds_no_jc() {
+        let mut ed = Editor::new(doc_with(&["A", "B"]));
+        format_range(&mut ed, 0, 1, &run_patch(&[("bold", "true")])).unwrap();
+        assert!(first_props(&ed).raw_props.is_empty());
+        assert_eq!(
+            centred_normal().effective_align(None, &first_props(&ed)),
+            Align::Center
+        );
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        assert!(!xml.contains("<w:jc"), "{xml}");
+    }
+
+    #[test]
+    fn set_style_range_without_align_adds_no_jc() {
+        let mut ed = Editor::new(doc_with(&["A"]));
+        set_style_range(&mut ed, 0, 0, Some("Heading1"), None).unwrap();
+        assert!(first_props(&ed).raw_props.is_empty());
+    }
+
+    #[test]
+    fn format_range_keeps_a_loaded_thai_distribute_jc() {
+        let jc = "<w:jc w:val=\"thaiDistribute\"/>";
+        let mut ed = Editor::new(crate::load::parse_document_xml(
+            &format!(
+                "<w:document xmlns:w=\"w\"><w:body><w:p><w:pPr>{jc}</w:pPr>\
+                 <w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>"
+            ),
+            &crate::load::Relationships::default(),
+        ));
+        format_range(&mut ed, 0, 0, &run_patch(&[("bold", "true")])).unwrap();
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        assert_eq!(xml.matches("<w:jc ").count(), 1, "{xml}");
+        assert!(xml.contains(jc), "{xml}");
     }
 
     #[test]
