@@ -15,18 +15,6 @@
 # vbottom_inset at 200% is 323, the case expects 241 (as on Linux).
 doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
 
-# Project table and Timeline geometry at the Windows window sizes.
-project-selection.uit | project the default window shows the whole Entry table and a narrowed pane does not | #1780
-project-timeline-box.uit | project dragging the box's right edge out widens the span and narrows the days | #1780
-project-timeline-grip.uit | project the grip stops at half the window and follows the window's height | #1780
-project-timeline-view.uit | project timeline highlights the chart's visible range and follows its scroll | #1780
-
-# Line number positions in print layout.
-page-line-numbers.uit | line numbers draw in print layout, continue across pages and columns, and follow the ribbon toggle | #1781
-
-# `shot gallery` cannot be captured (ERROR step).
-style-gallery.uit | style gallery tiles in dark and light | #1782 | error
-
 # Border colour asserts that fail in some runs only.
 gantt-scroll.uit | gantt panes stay aligned while scrolling | #1783 | flaky
 project-cells.uit | project unchanged edits preserve redo and cell border follows navigation | #1783 | flaky
