@@ -1531,11 +1531,13 @@ fn hyperlink_records(out: &mut Vec<u8>, s: &Sheet, lost: &mut BTreeMap<Loss, usi
         if !hyperlink_cells(now).all(|c| s.hyperlinks.get(&c) == Some(target)) {
             continue;
         }
-        covered.extend(hyperlink_cells(now));
         if !on_grid(now.0, now.1) {
+            covered.extend(hyperlink_cells(now));
             *lost.entry(Loss::HyperlinksPastGrid).or_default() += 1;
             continue;
         }
+        // Its cells past the grid are counted by the cell loop below.
+        covered.extend(hyperlink_cells(now).filter(|&(r, c)| on_grid(r, c)));
         let max_row = ptg_write::MAX_ROW as u32;
         let max_col = ptg_write::MAX_COL as u32;
         write(
@@ -2045,6 +2047,11 @@ mod tests {
             "..\\up\\a.xlsx",
             "C:\\dé\\ü.xlsx",
             "file:///C:/x",
+            // A cell in another workbook: the path, then the location.
+            "..\\a.xls#Sheet1!A1",
+            "C:\\b.xlsx#S!A1",
+            "\\\\s\\sh\\a.xls#S!A1",
+            "https://x/#frag",
         ];
         let s = &mut pkg.workbook.sheets[0];
         for (i, t) in targets.iter().enumerate() {
@@ -2143,6 +2150,8 @@ mod tests {
         s.hyperlinks.insert((0, 256), "https://b/".into());
         // A range anchored past the grid counts once.
         loaded_link(s, (70_000, 0, 70_001, 1), "https://r/");
+        // A range across the grid's edge: its cells past it count each.
+        loaded_link(s, (65_534, 3, 65_537, 3), "https://edge/");
         // A target too long for one record.
         s.hyperlinks
             .insert((1, 0), format!("https://x/{}", "a".repeat(5_000)));
@@ -2151,13 +2160,15 @@ mod tests {
         assert_eq!(
             lost,
             [
-                "3 hyperlinks beyond row 65,536 or column IV",
+                "5 hyperlinks beyond row 65,536 or column IV",
                 "1 hyperlink Excel 97-2003 cannot hold"
             ]
         );
         let links = &back.workbook.sheets[0].hyperlinks;
-        assert_eq!(links.len(), 1);
+        assert_eq!(links.len(), 3);
         assert_eq!(links[&(2, 0)], "https://kept/");
+        assert_eq!(links[&(65_534, 3)], "https://edge/");
+        assert_eq!(links[&(65_535, 3)], "https://edge/");
     }
 
     #[test]

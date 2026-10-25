@@ -27,7 +27,7 @@ const UNC_URI: &str = "file:///";
 /// The relationship `Target` for a model target: a UNC path (`\\server\share`)
 /// gets the `file:///` Excel writes, since a bare backslash path is no URI
 /// (#1456); every other target is written as it is.
-pub(crate) fn wire_target(model: &str) -> Cow<'_, str> {
+fn wire_target(model: &str) -> Cow<'_, str> {
     if model.starts_with("\\\\") {
         Cow::Owned(format!("{UNC_URI}{model}"))
     } else {
@@ -61,7 +61,7 @@ pub(crate) fn model_target(wire: &str) -> Cow<'_, str> {
 /// slashes), or `None`: a local path (`file:///C:/x`, `file:///srv/share`),
 /// `localhost`, no server or no share, a query or fragment, a backslash, an
 /// escape that is a separator (`%2F`, `%5C`) or that does not decode to
-/// UTF-8.
+/// UTF-8, a drive or a port where the server goes.
 fn unc_of_file_uri(wire: &str) -> Option<String> {
     const FILE: &str = "file://";
     let scheme = wire.get(..FILE.len())?;
@@ -86,7 +86,8 @@ fn unc_of_file_uri(wire: &str) -> Option<String> {
     let mut segments = path.split('/');
     let server = segments.next().unwrap_or("");
     let share = segments.next().unwrap_or("");
-    if server.is_empty() || share.is_empty() {
+    // A drive (`C:`, `c|`) or a `host:port` is no server.
+    if server.is_empty() || share.is_empty() || server.contains([':', '|']) {
         return None;
     }
     let decoded = percent_decode(path)?;
@@ -105,6 +106,9 @@ fn percent_decode(s: &str) -> Option<String> {
     while i < b.len() {
         if b[i] == b'%' {
             let hex = s.get(i + 1..i + 3)?;
+            if !hex.bytes().all(|h| h.is_ascii_hexdigit()) {
+                return None;
+            }
             let v = u8::from_str_radix(hex, 16).ok()?;
             if v == b'/' || v == b'\\' {
                 return None;

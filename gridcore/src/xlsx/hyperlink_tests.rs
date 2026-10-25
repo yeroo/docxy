@@ -1004,6 +1004,12 @@ fn file_uri_forms_left_raw() {
         "file://srv/share/%FF",
         "file://srv/share/%4",
         "file://srv/share\\x",
+        "file://srv/share/%+5",
+        // A drive or a port is not a server.
+        "file://C:/dir/a.xlsx",
+        "file:////C:/x",
+        "file://c|/x/y",
+        "file://host:8080/x",
         "https://srv/share/x",
     ] {
         assert_eq!(model_target(wire), wire, "{wire}");

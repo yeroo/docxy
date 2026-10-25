@@ -13,6 +13,7 @@
 //!
 //! No display name, frame or ScreenTip: the model holds none.
 
+use super::Le;
 use crate::xlsx::model_target;
 
 /// A cell rectangle: (r1, c1, r2, c2), 0-based and inclusive.
@@ -79,11 +80,17 @@ pub(crate) fn body(rect: Rect, target: &str) -> Vec<u8> {
     b.extend_from_slice(&STD_LINK);
     b.extend_from_slice(&2u32.to_le_bytes());
     let mut rest = Vec::new();
+    // A path's `#` starts a location in the file it names (a link to a cell
+    // of another workbook), written after the moniker as Excel does.
+    let (path, location) = match target.split_once('#') {
+        Some((p, l)) if !p.is_empty() && !has_scheme(target) => (p, Some(l)),
+        _ => (target, None),
+    };
     let flags = if let Some(location) = target.strip_prefix('#') {
         put_string(&mut rest, location);
         HAS_LOCATION
-    } else if target.starts_with("\\\\") {
-        put_string(&mut rest, target);
+    } else if path.starts_with("\\\\") {
+        put_string(&mut rest, path);
         HAS_MONIKER | IS_ABSOLUTE | MONIKER_SAVED_AS_STR
     } else if has_scheme(target) {
         rest.extend_from_slice(&URL_MONIKER);
@@ -95,7 +102,14 @@ pub(crate) fn body(rect: Rect, target: &str) -> Vec<u8> {
         rest.extend_from_slice(&[0, 0]);
         HAS_MONIKER | IS_ABSOLUTE
     } else {
-        file_moniker(&mut rest, target)
+        file_moniker(&mut rest, path)
+    };
+    let flags = match location {
+        Some(l) => {
+            put_string(&mut rest, l);
+            flags | HAS_LOCATION
+        }
+        None => flags,
     };
     b.extend_from_slice(&flags.to_le_bytes());
     b.extend_from_slice(&rest);
@@ -153,27 +167,10 @@ fn file_moniker(out: &mut Vec<u8>, path: &str) -> u32 {
     }
 }
 
-/// A cursor over a record body; every read is checked.
-struct Cur<'a> {
-    b: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let s = self.b.get(self.at..self.at.checked_add(n)?)?;
-        self.at += n;
-        Some(s)
-    }
-    fn u16(&mut self) -> Option<u16> {
-        self.take(2).map(|v| u16::from_le_bytes([v[0], v[1]]))
-    }
-    fn u32(&mut self) -> Option<u32> {
-        self.take(4)
-            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
-    }
+/// The Hyperlink Object's own fields.
+impl Le<'_> {
     /// A HyperlinkString, up to its first null.
-    fn string(&mut self) -> Option<String> {
+    fn hyperlink_string(&mut self) -> Option<String> {
         let n = self.u32()? as usize;
         let units = self.take(n.checked_mul(2)?)?;
         Some(utf16_to_null(units))
@@ -196,7 +193,7 @@ fn utf16_to_null(bytes: &[u8]) -> String {
 /// location make the location the URL's fragment (`url#loc`); the `.xlsx`
 /// loader, which has them as separate attributes, keeps only the URL.
 pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
-    let mut c = Cur { b: body, at: 0 };
+    let mut c = Le::new(body);
     let (r1, r2, c1, c2) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
     if r1 > r2 || c1 > c2 || c2 > 255 {
         return None;
@@ -206,15 +203,15 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
     }
     let flags = c.u32()?;
     if flags & HAS_DISPLAY_NAME != 0 {
-        c.string()?;
+        c.hyperlink_string()?;
     }
     if flags & HAS_FRAME_NAME != 0 {
-        c.string()?;
+        c.hyperlink_string()?;
     }
     let moniker = if flags & HAS_MONIKER == 0 {
         None
     } else if flags & MONIKER_SAVED_AS_STR != 0 {
-        Some(c.string()?)
+        Some(c.hyperlink_string()?)
     } else {
         let class = c.take(16)?;
         if class == URL_MONIKER {
@@ -227,7 +224,7 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
         }
     };
     let location = if flags & HAS_LOCATION != 0 {
-        Some(c.string()?)
+        Some(c.hyperlink_string()?)
     } else {
         None
     };
@@ -245,7 +242,7 @@ pub(crate) fn parse(body: &[u8]) -> Option<(Rect, String)> {
 
 /// A File moniker's path: `cAnti` `..\` segments, then the Unicode path
 /// when there is one, else the ANSI path (its bytes read as Latin-1).
-fn read_file_moniker(c: &mut Cur) -> Option<String> {
+fn read_file_moniker(c: &mut Le) -> Option<String> {
     let anti = c.u16()?;
     let n = c.u32()? as usize;
     let ansi = c.take(n)?;
@@ -354,6 +351,10 @@ mod tests {
             "C:\\é\\ü.xlsx",
             "..\\é.xlsx",
             "file:///C:/x",
+            "..\\a.xls#Sheet1!A1",
+            "C:\\b.xlsx#S!A1",
+            "\\\\s\\sh\\a.xls#S!A1",
+            "https://x/#frag",
         ] {
             assert_eq!(
                 parse(&body((5, 1, 9, 2), t)),
@@ -404,6 +405,23 @@ mod tests {
         b.extend_from_slice(&[10, 0, 0, 0, 4, 0, 0, 0, 3, 0]);
         b.extend_from_slice(&[0xE9, 0, b'x', 0]);
         assert_eq!(parse(&b), Some(((1, 3, 2, 4), "..\\..\\éx".into())));
+        // A File moniker and a location: a cell in another workbook.
+        let mut b = head();
+        b.extend_from_slice(&(HAS_MONIKER | HAS_LOCATION).to_le_bytes());
+        b.extend_from_slice(&FILE_MONIKER);
+        b.extend_from_slice(&[0, 0, 10, 0, 0, 0]);
+        b.extend_from_slice(b"Book2.xls\0");
+        b.extend_from_slice(&[0xFF, 0xFF, 0xAD, 0xDE]);
+        b.extend_from_slice(&[0; 20]);
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        b.extend_from_slice(&[10, 0, 0, 0]);
+        b.extend_from_slice(&utf16z("Sheet1!A1"));
+        assert_eq!(
+            parse(&b),
+            Some(((1, 3, 2, 4), "Book2.xls#Sheet1!A1".into()))
+        );
+        // And it is what the writer writes for that target.
+        assert_eq!(body((1, 3, 2, 4), "Book2.xls#Sheet1!A1"), b);
         // Without the extension the ANSI path is read as Latin-1.
         let mut b = head();
         b.extend_from_slice(&HAS_MONIKER.to_le_bytes());

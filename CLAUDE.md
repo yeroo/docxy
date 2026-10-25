@@ -1753,7 +1753,9 @@
   moniker (`hlstmfMonikerSavedAsStr`), a target with a scheme (2+ letters, so
   `C:` is a drive) a URL moniker, any other path a File moniker (relative:
   leading `..\` in `cAnti`, no `hlstmfIsAbsolute`; a non-ASCII path adds the
-  Unicode extension). No display name, frame or ScreenTip (#1454).
+  Unicode extension); a path's `#loc` (a cell of another workbook) is that
+  moniker plus a location, as the reader reads it. No display name, frame or
+  ScreenTip (#1454).
 - A `hyperlink_refs` range whose cells all still carry its target is one
   record, clipped to the grid (a whole row then reads back spread over its 256
   cells); the other link cells follow one record each, so a cell's own link in
@@ -1764,7 +1766,8 @@
   ScreenTips". Checked against xlrd only (no Excel oracle).
 - `xlsx::model_target` maps every `file:` spelling of a UNC path
   (`file:///\\s\sh`, `file://s/sh`, `file:////s/sh`, `file://///s/sh`, escapes
-  decoded) to `\\s\sh`; `localhost`, local paths, `?`/`#`, escaped separators
+  decoded) to `\\s\sh`; `localhost`, a drive or port in the server's place
+  (`file://C:/x`, `file://h:80/x`), local paths, `?`/`#`, escaped separators
   and bad escapes stay raw. The xlsx save compares and reuses relationships
   through it, so a raw spelling held in the model is no change and no new
   relationship.
