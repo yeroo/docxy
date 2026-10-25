@@ -208,8 +208,12 @@
   the paragraph direction from them: `emit_paragraph` reads alignment from
   `p.props.align`, not through the styles (unchanged here). `effective_align`
   takes the paragraph's `ParProps`, so a direct `w:jc="left"` (kept in
-  `raw_props`) still beats a centred style, but only when it was loaded from a
-  file: an editor-chosen Align Left writes no `w:jc` yet. `shown_run` (the suite) still
+  `raw_props`) still beats a centred style. An editor-chosen Align Left is
+  explicit too (#1752): `ParProps::set_align_direct` (`Editor::set_align`,
+  `agent::set_style_range`) keeps a raw `w:jc` saying `left`/`start`, else
+  puts `<w:jc w:val="left"/>` in place of any other; other alignments drop
+  it. A raw `w:jc` supersedes the loaded (shadow) one on save, so a loaded
+  `thaiDistribute` or `start` is never written beside it. `shown_run` (the suite) still
   skips Normal.
 - Page borders: `BorderStyle::{Wave, ThreeD, Motif}`. `border_rules` draws
   `wave`/`doubleWave` as a sine polyline (amplitude one width, wavelength four),

@@ -517,6 +517,26 @@ pub(crate) fn pin_shadow_left_zero(shadow: &mut Vec<String>) {
     *raw = empty_element(&name, &attrs);
 }
 
+/// The direct `w:jc`s of an editor-chosen alignment (#1752): a left keeps
+/// one already saying `left` or `start`, else takes `<w:jc w:val="left"/>`
+/// in place of any other (`thaiDistribute` loads as left too), so it beats a
+/// centred style; any other alignment drops them, as the model writes it.
+pub(crate) fn set_raw_jc(raw_props: &mut Vec<String>, left: bool) {
+    let says_left = |raw: &String| {
+        element_attrs_of(raw)
+            .iter()
+            .any(|(n, v)| n.rsplit(':').next() == Some("val") && (v == "left" || v == "start"))
+    };
+    let jcs = || raw_props.iter().filter(|raw| local_name(raw) == "jc");
+    if left && jcs().count() == 1 && jcs().all(says_left) {
+        return;
+    }
+    raw_props.retain(|raw| local_name(raw) != "jc");
+    if left {
+        raw_props.push("<w:jc w:val=\"left\"/>".to_string());
+    }
+}
+
 /// Whether a shadow element `local` still carries any of `attrs`.
 pub(crate) fn shadow_has_attr(shadow: &[String], local: &str, attrs: &[&str]) -> bool {
     shadow.iter().any(|raw| {
@@ -878,8 +898,14 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     // `w:ind`/`w:jc`, and a paragraph-mark `w:rPr` stays just before `sectPr`).
     let mut parts: Vec<(u32, String)> = Vec::new();
 
+    // A direct `w:jc` in `raw_props` (an explicit left) supersedes the
+    // loaded one, which may say `thaiDistribute` or `start` (#1752).
+    let raw_jc = props.raw_props.iter().any(|raw| local_name(raw) == "jc");
     for raw in shadow.elements() {
         let name = local_name(raw);
+        if name == "jc" && raw_jc {
+            continue;
+        }
         if PprGroup::of(name).is_some_and(kept) {
             parts.push((ppr_rank(name), raw.to_string()));
         }

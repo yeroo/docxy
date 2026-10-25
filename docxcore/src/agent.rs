@@ -929,7 +929,7 @@ pub fn set_style_range(
                 apply_style_to_para(&mut p.props, s);
             }
             if let Some(a) = align {
-                p.props.align = a;
+                p.props.set_align_direct(a);
             }
         }
     }
@@ -2002,6 +2002,25 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(ed.doc, before);
         assert!(!ed.undo());
+    }
+
+    /// #1752: an agent's Align Left is explicit, as the editor's is, so it
+    /// beats a centred Normal and saves one `w:jc` left.
+    #[test]
+    fn set_style_range_align_left_over_centred_normal() {
+        let sheet = crate::styles::parse_styles_xml(
+            "<w:styles><w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\">\
+             <w:pPr><w:jc w:val=\"center\"/></w:pPr></w:style></w:styles>",
+        );
+        let mut ed = Editor::new(doc_with(&["A"]));
+        set_style_range(&mut ed, 0, 0, None, Some(Align::Left)).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        assert_eq!(sheet.effective_align(None, &p.props), Align::Left);
+        let xml = crate::serialize::blocks_to_xml(&ed.doc.body);
+        assert_eq!(xml.matches("<w:jc ").count(), 1, "{xml}");
+        assert!(xml.contains("<w:jc w:val=\"left\"/>"), "{xml}");
     }
 
     #[test]
