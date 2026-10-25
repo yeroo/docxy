@@ -266,3 +266,29 @@ fn clear_over_x14_only_coverage_plans_an_uncond_area() {
     let dv = clear_plan(&wb.sheets[0], &[(2, 5, 2, 5)], ClearWhat::Formats, &[]).unwrap();
     assert!(dv.uncond.is_empty());
 }
+
+/// #1734: an Excel 2010 rule a clear takes whole is named struck once, also
+/// when `ext_removed` already names it (a load never gives that state, so it
+/// is seeded): Clear Formats for conditional formatting, the validation clear
+/// Paste Special and the dialog share for validations.
+#[test]
+fn an_x14_rule_already_named_struck_is_named_once() {
+    use crate::sheet::{ExtKind, ExtRule};
+    let mut wb = book();
+    let s = &mut wb.sheets[0];
+    for kind in [ExtKind::Cf, ExtKind::Dv] {
+        s.ext_rules.push(ExtRule {
+            kind,
+            ranges: vec![(0, 0, 4, 0)],
+            formulas: vec!["A1>0".into()],
+            ix: 3,
+        });
+    }
+    s.ext_removed = vec![(ExtKind::Cf, 3), (ExtKind::Dv, 3)];
+    clear_cond_formats(s, &[(0, 0, 9, 0)]);
+    assert_eq!(s.ext_rules.len(), 1, "the validation stays");
+    assert_eq!(s.ext_removed, vec![(ExtKind::Cf, 3), (ExtKind::Dv, 3)]);
+    crate::edit::clear_validation(s, (0, 0, 9, 0));
+    assert!(s.ext_rules.is_empty());
+    assert_eq!(s.ext_removed, vec![(ExtKind::Cf, 3), (ExtKind::Dv, 3)]);
+}
