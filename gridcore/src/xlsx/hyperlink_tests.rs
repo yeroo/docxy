@@ -2,6 +2,7 @@
 //! the worksheet and its rels part; a sheet whose links are as loaded keeps
 //! both parts byte for byte.
 
+use super::hyperlinks::model_target;
 use super::*;
 
 const SML: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
@@ -737,6 +738,8 @@ fn non_unc_targets_are_written_as_before() {
         "file:///C:/x",
         // Not a UNC path: written as typed, and read back as the plain path.
         "file:///\\\\srv\\x",
+        // Another spelling of a UNC path (#1726): the same.
+        "file://srv/share/x",
     ];
     for (i, t) in all.iter().enumerate() {
         link(&mut pkg, &format!("A{}", i + 1), t);
@@ -752,6 +755,7 @@ fn non_unc_targets_are_written_as_before() {
         assert_eq!(links[&(i as u32, 0)], *t);
     }
     assert_eq!(links[&(4, 0)], "\\\\srv\\x");
+    assert_eq!(links[&(5, 0)], "\\\\srv\\share\\x");
 }
 
 #[test]
@@ -957,4 +961,132 @@ fn dropping_many_relationships_saves_in_linear_time() {
     let re = load_xlsx(&bytes).unwrap();
     assert!(re.workbook.sheets[0].hyperlinks.is_empty());
     assert!(targets_of(&re, "/hyperlink").is_empty());
+}
+
+// ---- Other file URI spellings of a UNC path (#1726) ----
+
+#[test]
+fn file_uri_unc_forms_load_as_unc() {
+    for (wire, want) in [
+        ("file://srv/share/x.xlsx", "\\\\srv\\share\\x.xlsx"),
+        ("file:////srv/share/x.xlsx", "\\\\srv\\share\\x.xlsx"),
+        ("file://///srv/share/x.xlsx", "\\\\srv\\share\\x.xlsx"),
+        ("FILE://srv/share/x.xlsx", "\\\\srv\\share\\x.xlsx"),
+        ("File:////srv/share", "\\\\srv\\share"),
+        (
+            "file://srv/my%20share/a%C3%A9.xlsx",
+            "\\\\srv\\my share\\aé.xlsx",
+        ),
+        ("file:///\\\\srv\\share\\x.xlsx", "\\\\srv\\share\\x.xlsx"),
+    ] {
+        assert_eq!(model_target(wire), want, "{wire}");
+    }
+}
+
+#[test]
+fn file_uri_forms_left_raw() {
+    for wire in [
+        "file:///C:/x",
+        // A local POSIX path, not a server.
+        "file:///srv/share/x",
+        "file://localhost/share/x",
+        "file://LOCALHOST/share/x",
+        "file:///",
+        "file://",
+        // No share.
+        "file://srv",
+        "file://srv/",
+        "file:////srv",
+        "file://srv/share/x?a=1",
+        "file://srv/share/x#top",
+        "file://srv/share%2Fx",
+        "file://srv/share%5cx",
+        "file://srv/share/%FF",
+        "file://srv/share/%4",
+        "file://srv/share\\x",
+        "https://srv/share/x",
+    ] {
+        assert_eq!(model_target(wire), wire, "{wire}");
+    }
+}
+
+/// A sheet whose A1..A3 link through rId1..rId3 to `targets`.
+fn linked_spellings(targets: &[&str]) -> SheetPackage {
+    let ws = format!(
+        "<worksheet xmlns=\"{SML}\" xmlns:r=\"{RNS}\">{UNC_WS}<hyperlinks>{}</hyperlinks></worksheet>",
+        (1..=targets.len())
+            .map(|i| format!("<hyperlink ref=\"A{i}\" r:id=\"rId{i}\"/>"))
+            .collect::<String>()
+    );
+    let rels = rels_part(
+        &targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                format!(
+                    "<Relationship Id=\"rId{}\" Type=\"{RNS}/hyperlink\" Target=\"{t}\" TargetMode=\"External\"/>",
+                    i + 1
+                )
+            })
+            .collect::<String>(),
+    );
+    book(&ws, Some(&rels))
+}
+
+#[test]
+fn unchanged_host_form_link_keeps_bytes() {
+    let pkg = linked_spellings(&[
+        "file://srv/share/a",
+        "file:////srv/share/b",
+        "FILE://///srv/share/c",
+    ]);
+    let links = &pkg.workbook.sheets[0].hyperlinks;
+    assert_eq!(links[&(0, 0)], "\\\\srv\\share\\a");
+    assert_eq!(links[&(1, 0)], "\\\\srv\\share\\b");
+    assert_eq!(links[&(2, 0)], "\\\\srv\\share\\c");
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+}
+
+#[test]
+fn retyped_link_reuses_host_form_rel() {
+    let mut pkg = linked_spellings(&["file://srv/share/a", "https://example.com/"]);
+    // A new link to the same UNC path, and A2 retyped to it.
+    link(&mut pkg, "B5", "\\\\srv\\share\\a");
+    link(&mut pkg, "A2", "\\\\srv\\share\\a");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
+    let sheet = text(&re, SHEET);
+    assert!(
+        sheet.contains("<hyperlink ref=\"B5\" r:id=\"rId1\"/>"),
+        "{sheet}"
+    );
+    assert!(
+        sheet.contains("<hyperlink ref=\"A2\" r:id=\"rId1\"/>"),
+        "{sheet}"
+    );
+    assert_eq!(targets_of(&re, "/hyperlink"), vec!["file://srv/share/a"]);
+}
+
+#[test]
+fn raw_spelling_in_model_reuses_rel() {
+    let mut pkg = linked_spellings(&["file:///\\\\srv\\share\\a"]);
+    // Held raw, as nothing but the loader maps it.
+    link(&mut pkg, "A1", "file://srv/share/a");
+    link(&mut pkg, "B2", "file:////srv/share/a");
+    let re = resaved(&pkg);
+    // A1 is not changed: its element and the rels part keep their bytes.
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"A1\" r:id=\"rId1\"/>"));
+    assert!(text(&re, SHEET).contains("<hyperlink ref=\"B2\" r:id=\"rId1\"/>"));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
+    let links = &re.workbook.sheets[0].hyperlinks;
+    assert_eq!(links[&(0, 0)], "\\\\srv\\share\\a");
+    assert_eq!(links[&(1, 1)], "\\\\srv\\share\\a");
+    // The model holding only the raw A1 is no change at all.
+    let mut pkg = linked_spellings(&["file:///\\\\srv\\share\\a"]);
+    link(&mut pkg, "A1", "file://srv/share/a");
+    let re = resaved(&pkg);
+    assert_eq!(text(&re, SHEET), text(&pkg, SHEET));
+    assert_eq!(text(&re, RELS), text(&pkg, RELS));
 }
