@@ -2119,9 +2119,10 @@ came out 1028x780 and the ribbon cases saw narrower ribbons than they asked
 for (#1779); the same clamp broke the Project table and Timeline, page line
 number and style gallery cases (#1780, #1781, #1782). The job sets the
 display to 1920x1080 before the sweep and fails there, naming the mode it got
-and the modes offered, if the mode is smaller or the screen at the runner's scale (its size in logical pixels) is below
-1410x815, the widest window plus its frame.
-The `window-size` reply echoes the request, not the size the window got.
+and the modes offered, if the mode is smaller or the screen at the runner's
+scale (its size in logical pixels) is below 1410x815, the widest window plus
+its frame. The `window-size` reply echoes the request, not the size the window
+got.
 
 ### Capture on macOS
 
