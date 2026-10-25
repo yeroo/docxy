@@ -3752,7 +3752,8 @@ impl SheetPackage {
     /// there is no macro sheet: every defined name marked `xlm`, `function`
     /// or `vbProcedure`, and every name whose formula refers to a removed
     /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
-    /// removed sheet keeps its cell, with that reference as `#REF!`. A
+    /// removed sheet keeps its cell, with that reference as `#REF!` (a 3-D
+    /// span whose end sheet goes shrinks to the sheets left instead). A
     /// workbook of nothing but macro sheets first gains a blank worksheet, so
     /// one remains. The readers of a rewritten cell are evaluated on
     /// `calc`'s clock and seed. Returns whether there was anything to drop.
@@ -11012,13 +11013,29 @@ impl SheetPackage {
     }
 
     /// Delete sheet `idx` the way a person does: the cell formulas that name
-    /// it read `#REF!` (as Excel turns them), [`Self::remove_sheet`] runs, then
-    /// the cells that read a rewritten cell or a name it turned to `#REF!`
-    /// recalculate, so the file is right before Excel recalculates. A refusal
-    /// (the last sheet, no such sheet) changes nothing.
+    /// it read `#REF!` (as Excel turns them; a 3-D span whose end sheet goes
+    /// shrinks to the sheets left), [`Self::remove_sheet`] runs, then the
+    /// cells that read a rewritten cell or a name it rewrote recalculate, so
+    /// the file is right before Excel recalculates. A refusal (the last
+    /// sheet, no such sheet) changes nothing.
     pub fn delete_sheet(&mut self, idx: usize) -> bool {
+        match self.delete_sheet_uncalculated(idx) {
+            Some(true) => {
+                let mut engine = crate::engine::Engine::new(&self.workbook);
+                engine.recalc_all(&mut self.workbook);
+                true
+            }
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    /// [`Self::delete_sheet`] without the recalculation, for a host that runs
+    /// its own on its engine's clock: `Some(true)` when cells need it (a cell
+    /// or a name was rewritten), `None` on a refusal.
+    pub fn delete_sheet_uncalculated(&mut self, idx: usize) -> Option<bool> {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
-            return false;
+            return None;
         }
         let gone = [self.workbook.sheets[idx].name.clone()];
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &gone);
@@ -11038,11 +11055,7 @@ impl SheetPackage {
             .iter()
             .map(|d| &d.formula)
             .ne(names.iter());
-        if removed && (!rewritten.is_empty() || renamed) {
-            let mut engine = crate::engine::Engine::new(&self.workbook);
-            engine.recalc_all(&mut self.workbook);
-        }
-        removed
+        removed.then_some(!rewritten.is_empty() || renamed)
     }
 
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
@@ -11066,9 +11079,11 @@ impl SheetPackage {
             }
         }
         // A name that refers to the sheet reads `#REF!` from now on, as in
-        // Excel; the removed sheet's own scoped names are dropped below.
+        // Excel (a 3-D span whose end sheet goes shrinks to the sheets left);
+        // the removed sheet's own scoped names are dropped below.
         // Cell formulas are left to the caller ([`Self::delete_sheet`] does).
         let gone = [self.workbook.sheets[idx].name.clone()];
+        let order = crate::edit::sheet_order(&self.workbook);
         // So do the conditional-formatting and data-validation formulas that
         // name it.
         crate::edit::remove_sheet_refs_in_rules(&mut self.workbook, &gone);
@@ -11076,8 +11091,9 @@ impl SheetPackage {
             if d.scope == Some(idx) {
                 continue;
             }
-            let rewrite =
-                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            let rewrite = |e: &crate::formula::Expr| {
+                crate::formula::remove_sheet_refs_in_expr(e, &gone, &order)
+            };
             if let Some(text) = crate::formula::rewrite_defined_name(&d.formula, rewrite, None) {
                 d.formula = text;
             }
@@ -11087,8 +11103,9 @@ impl SheetPackage {
         // sheet that stays is `Sheet!#REF!`). `consolidate_loaded` stays as loaded,
         // so the save sees the difference and rewrites the element.
         crate::edit::for_each_consolidate_ref(&mut self.workbook, |text| {
-            let rewrite =
-                |e: &crate::formula::Expr| crate::formula::remove_sheet_refs_in_expr(e, &gone);
+            let rewrite = |e: &crate::formula::Expr| {
+                crate::formula::remove_sheet_refs_in_expr(e, &gone, &order)
+            };
             if let Some(updated) = crate::formula::rewrite_defined_name(text, rewrite, None) {
                 *text = updated;
             }
@@ -20395,12 +20412,14 @@ mod kind_tests {
             (2, "SUM(macro1!A1:B2)*2", "SUM(#REF!)*2"),
             (3, "SUM(Macro1!A:A)", "SUM(#REF!)"),
             (4, "SUM(Report!A1,Dialog1!$B$2)", "SUM(Report!A1,#REF!)"),
-            // A 3-D span with a removed end sheet.
-            (5, "SUM(Data:Macro1!A1)", "SUM(#REF!)"),
         ];
         for (r, src, _) in gone {
             data.set_cell(r, 0, Cell::formula(src));
         }
+        // A 3-D span with a removed end sheet shrinks to the sheet left
+        // (#1734), and reads it.
+        data.set_cell(0, 0, Cell::number(5.0));
+        data.set_cell(5, 0, Cell::formula("SUM(Data:Macro1!A1)"));
         let kept = [
             (1, "Report!A1*2"),
             // Macro1 lies between Data and Report: it just leaves the span.
@@ -20460,6 +20479,9 @@ mod kind_tests {
                 assert_eq!(cell.formula.as_deref(), Some(want), "row {r}");
                 assert_eq!(cell.value, CellValue::Error("#REF!".into()), "row {r}");
             }
+            let shrunk = data.cell(5, 0).unwrap();
+            assert_eq!(shrunk.formula.as_deref(), Some("SUM(Data!A1)"));
+            assert_eq!(shrunk.value, CellValue::Number(5.0));
             for (r, src) in kept {
                 assert_eq!(data.cell(r, 1).unwrap().formula.as_deref(), Some(src));
             }
@@ -25615,6 +25637,69 @@ mod rule_shift_tests {
         assert!(ws.contains("<f>#REF!+1</f>"), "{ws}");
     }
 
+    /// #1734: Delete Sheet of a 3-D span's end sheet moves that end inward,
+    /// in cells, rule formulas and defined names, and the cells read the
+    /// shrunk span; the file keeps the new text.
+    #[test]
+    fn delete_sheet_shrinks_a_three_d_span_whose_end_went() {
+        let s = r#"<sheetData><row r="1"><c r="A1"><f>SUM(Jan:Mar!B2)</f><v>7</v></c></row><row r="2"><c r="A2"><f>Jan:Mar!B2</f><v>0</v></c></row></sheetData>"#;
+        let num =
+            |n: u32| format!(r#"<sheetData><row r="2"><c r="B2"><v>{n}</v></c></row></sheetData>"#);
+        let (jan, feb, mar) = (num(1), num(2), num(4));
+        let names = r#"<definedNames><definedName name="Q1">SUM(Jan:Mar!$B$2)</definedName></definedNames>"#;
+        let mut pkg = load_xlsx(&book(
+            names,
+            &[
+                ("S", Some(s)),
+                ("Jan", Some(&jan)),
+                ("Feb", Some(&feb)),
+                ("Mar", Some(&mar)),
+            ],
+        ))
+        .unwrap();
+        pkg.workbook.sheets[0]
+            .ext_rules
+            .push(crate::sheet::ExtRule {
+                kind: crate::sheet::ExtKind::Cf,
+                ranges: vec![(0, 3, 0, 3)],
+                formulas: vec!["SUM(Jan:Mar!$B$2)>1".into()],
+                ix: 0,
+            });
+        assert!(pkg.delete_sheet(3));
+        let cell = |pkg: &SheetPackage, r: u32| pkg.workbook.sheets[0].cell(r, 0).unwrap().clone();
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(Jan:Feb!B2)"));
+        assert_eq!(a.value, CellValue::Number(3.0));
+        assert_eq!(cell(&pkg, 1).formula.as_deref(), Some("Jan:Feb!B2"));
+        assert_eq!(
+            pkg.workbook.sheets[0].ext_rules[0].formulas,
+            vec!["SUM(Jan:Feb!$B$2)>1".to_string()]
+        );
+        assert_eq!(pkg.workbook.defined_names[0].formula, "SUM(Jan:Feb!$B$2)");
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<f>SUM(Jan:Feb!B2)</f>"), "{ws}");
+        // The first sheet next: one sheet is left, a plain reference, whose
+        // value a lone cell now reads as Excel's does.
+        assert!(pkg.delete_sheet(1));
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(Feb!B2)"));
+        assert_eq!(a.value, CellValue::Number(2.0));
+        let b = cell(&pkg, 1);
+        assert_eq!(b.formula.as_deref(), Some("Feb!B2"));
+        assert_eq!(b.value, CellValue::Number(2.0));
+        assert_eq!(pkg.workbook.defined_names[0].formula, "SUM(Feb!$B$2)");
+        // And the last: `#REF!`.
+        assert!(pkg.delete_sheet(1));
+        let a = cell(&pkg, 0);
+        assert_eq!(a.formula.as_deref(), Some("SUM(#REF!)"));
+        assert_eq!(a.value, CellValue::Error("#REF!".into()));
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("saved file reloads");
+        assert_eq!(
+            re.workbook.sheets[0].cell(0, 0).unwrap().formula.as_deref(),
+            Some("SUM(#REF!)")
+        );
+    }
+
     #[test]
     fn delete_sheet_recalcs_with_the_defined_names_the_sheet_took_along() {
         // `Total` pointed at the deleted sheet: it reads #REF! now, so the
@@ -25716,6 +25801,20 @@ mod rule_shift_tests {
         clear_areas(&mut pkg, &[(0, 0, 9, 2)], false);
         let (_, ws) = saved(&pkg, SHEET1);
         assert!(ws.contains(&keep), "{ws}");
+    }
+
+    /// #1734: the Data Validation dialog's OK on "Any value" over a cell an
+    /// x14 validation covers keeps the element in the saved file.
+    #[test]
+    fn any_value_ok_keeps_an_x14_validation_through_a_save() {
+        let dv = x14_dv("C1:C5", "Z1", None);
+        let mut pkg = one("S", &format!("{MARGINS}{dv}"));
+        let any = crate::sheet::DataValidation::default();
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 2, 4, 2), &any, false);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains("<x14:dataValidations count=\"1\">"), "{ws}");
+        assert!(ws.contains("<xm:sqref>C1:C5</xm:sqref>"), "{ws}");
+        assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
     }
 
     #[test]

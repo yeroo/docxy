@@ -798,6 +798,19 @@ pub fn paste_special_extras(clip: &ClipBlock, at: (u32, u32), spec: &PasteSpec) 
 /// the save).
 pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
     let cut = super::areas::RectIndex::new(&[rect]);
+    cut_classic_validation(sheet, rect, &cut);
+    // The Excel 2010 (`extLst`) validations the same way.
+    super::cut_ext_rules(sheet, crate::sheet::ExtKind::Dv, &cut);
+}
+
+/// [`clear_validation`] without the Excel 2010 (`extLst`) validations: only
+/// the rules the Data Validation dialog shows.
+pub(crate) fn clear_classic_validation(sheet: &mut Sheet, rect: Area) {
+    let cut = super::areas::RectIndex::new(&[rect]);
+    cut_classic_validation(sheet, rect, &cut);
+}
+
+fn cut_classic_validation(sheet: &mut Sheet, rect: Area, cut: &super::areas::RectIndex) {
     let removed = &mut sheet.dv_removed;
     sheet.validations.retain_mut(|dv| {
         if !dv.ranges.iter().any(|&r| overlaps(r, rect)) {
@@ -805,7 +818,7 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
         }
         // The formulas follow a moved anchor, so every cell left still
         // reads the cells it read (#707 r9 M1).
-        let Some(by) = super::cut_rule_ranges(&mut dv.ranges, &cut) else {
+        let Some(by) = super::cut_rule_ranges(&mut dv.ranges, cut) else {
             removed.extend(dv.ix);
             return false;
         };
@@ -813,8 +826,6 @@ pub fn clear_validation(sheet: &mut Sheet, rect: Area) {
         super::reanchor(&mut dv.formula2, by);
         true
     });
-    // The Excel 2010 (`extLst`) validations the same way.
-    super::cut_ext_rules(sheet, crate::sheet::ExtKind::Dv, &cut);
 }
 
 /// `a` without `b`: up to four rectangles (above, below, left, right).

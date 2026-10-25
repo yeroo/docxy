@@ -168,23 +168,48 @@ struct RemovedSheetStash {
     /// the end.
     index: usize,
     /// The defined names (global, or scoped to another sheet) whose text
-    /// `SheetPackage::remove_sheet` rewrote to `#REF!`: their position among
+    /// `SheetPackage::remove_sheet` rewrote (to `#REF!`, or a 3-D span
+    /// shrunk): their position among
     /// the names that survive the removal, the scope's sheet NAME (an index
     /// moves), and the text before and after. A restore puts `before` back
     /// on a name still at that position, with that scope, still reading
     /// `after`.
     rewritten_names: Vec<RewrittenName>,
     /// The other sheets' Consolidate references `SheetPackage::remove_sheet`
-    /// rewrote to `#REF!`: the sheet's NAME, the reference's position, and its
+    /// rewrote (to `#REF!`, or a 3-D span shrunk): the sheet's NAME, the
+    /// reference's position, and its
     /// text before and after. A restore puts `before` back on a reference
     /// still at that position reading `after`.
     rewritten_consolidate: Vec<RewrittenConsolidate>,
     /// The other sheets' conditional-formatting and data-validation formulas
-    /// `SheetPackage::remove_sheet` rewrote to `#REF!`: the sheet's NAME, the
+    /// `SheetPackage::remove_sheet` rewrote (to `#REF!`, or a 3-D span
+    /// shrunk): the sheet's NAME, the
     /// formula's place in `gridcore::edit::for_each_rule_formula_text`'s walk,
     /// and its text before and after. A restore puts `before` back on a
     /// formula still at that place reading `after`.
     rewritten_rules: Vec<RewrittenConsolidate>,
+    /// The other sheets' cell formulas `SheetPackage::delete_sheet` rewrote
+    /// (to `#REF!`, or a 3-D span shrunk): the sheet's NAME, the cell and
+    /// the text before. A restore puts them back on a sheet only
+    /// when [`Self::cell_guards`] finds it as the removal left it.
+    rewritten_cells: Vec<RewrittenCell>,
+    /// For each sheet in [`Self::rewritten_cells`], what its cells held once
+    /// the removal was done ([`held_cells`]). The rewrites make many
+    /// formulas one text (`=A!B1*2`, `=A!B2*2`, ... all read `#REF!*2`), so a
+    /// cell still reading its rewritten text may be another one moved there by a row
+    /// insert, a sort or a move: a restore gives the sheet its formulas back
+    /// only while every one of these cells still holds the same, and skips
+    /// the whole sheet otherwise (an edit of any of them included). Cells
+    /// added since elsewhere do not count.
+    cell_guards: Vec<CellGuard>,
+    /// The other sheets' tables whose calculated-column formulas it rewrote,
+    /// by table name, before and after; put back on a table still reading
+    /// `after`.
+    rewritten_tables: Vec<RewrittenTable>,
+    /// The other sheets' charts it dropped references from (one with no part
+    /// yet, or edited): the sheet's NAME, the drawing's index and the chart
+    /// before and after; put back on a chart still as it was `after`.
+    rewritten_charts: Vec<RewrittenChart>,
     /// This removal's number in the session (`Session::next_stash_serial`,
     /// never reused), carried by `sheet.remove`'s inverse, so the restore
     /// finds this stash even when a later removal stashed a sheet of the same
@@ -200,6 +225,105 @@ struct RewrittenConsolidate {
     position: usize,
     before: String,
     after: String,
+}
+
+/// One cell formula `delete_sheet` rewrote (see
+/// [`RemovedSheetStash::rewritten_cells`]).
+struct RewrittenCell {
+    sheet: String,
+    at: (u32, u32),
+    before: String,
+}
+
+/// A sheet's NAME and what its cells held (see
+/// [`RemovedSheetStash::cell_guards`]).
+type CellGuard = (String, Vec<((u32, u32), Held)>);
+
+/// What a cell holds for [`RemovedSheetStash::cell_guards`]: its formula's
+/// text, else its value.
+#[derive(PartialEq)]
+enum Held {
+    Formula(String),
+    Value(gridcore::sheet::CellValue),
+}
+
+/// Every cell of `sheet` with what it holds, but the cells of an array its
+/// anchor fills (their values follow a recalculation, not an edit).
+fn held_cells(sheet: &Sheet) -> Vec<((u32, u32), Held)> {
+    let mut filled = std::collections::HashSet::new();
+    for (&(r, c), cell) in &sheet.cells {
+        if let Some((rows, cols)) = cell.spill.filter(|_| cell.formula.is_some()) {
+            for dr in 0..rows {
+                for dc in 0..cols {
+                    if (dr, dc) != (0, 0) {
+                        filled.insert((r.saturating_add(dr), c.saturating_add(dc)));
+                    }
+                }
+            }
+        }
+    }
+    sheet
+        .cells
+        .iter()
+        .filter(|(at, _)| !filled.contains(*at))
+        .map(|(&at, cell)| {
+            let held = match &cell.formula {
+                Some(f) => Held::Formula(f.clone()),
+                None => Held::Value(cell.value.clone()),
+            };
+            (at, held)
+        })
+        .collect()
+}
+
+/// Whether `sheet` still holds every cell of `guard` as it was.
+fn still_holds(sheet: &Sheet, guard: &[((u32, u32), Held)]) -> bool {
+    guard.iter().all(|(at, held)| {
+        let cell = sheet.cells.get(at);
+        match held {
+            Held::Formula(f) => cell.and_then(|c| c.formula.as_deref()) == Some(f.as_str()),
+            Held::Value(v) => match cell {
+                Some(c) => c.formula.is_none() && c.value == *v,
+                None => v.is_empty(),
+            },
+        }
+    })
+}
+
+/// One table whose calculated-column formulas `delete_sheet` rewrote (see
+/// [`RemovedSheetStash::rewritten_tables`]).
+struct RewrittenTable {
+    name: String,
+    before: Vec<Option<String>>,
+    after: Vec<Option<String>>,
+}
+
+/// A sheet's NAME and its cells' formulas, by cell.
+type SheetFormulas = (String, Vec<((u32, u32), String)>);
+
+/// One chart `delete_sheet` dropped references from (see
+/// [`RemovedSheetStash::rewritten_charts`]).
+struct RewrittenChart {
+    sheet: String,
+    drawing: usize,
+    before: gridcore::sheet::ChartData,
+    after: gridcore::sheet::ChartData,
+}
+
+/// A sheet's charts that a sheet delete may rewrite (no part yet, or
+/// edited: `gridcore::edit::remove_sheet_refs_in_chart`), by drawing index.
+fn rewritable_charts(sheet: &Sheet) -> Vec<(usize, gridcore::sheet::ChartData)> {
+    sheet
+        .drawings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| match &d.kind {
+            gridcore::sheet::DrawingKind::Chart(cd) if cd.part.is_none() || cd.edited => {
+                Some((i, cd.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The most removed sheets a session keeps to restore; the oldest goes first.
@@ -2737,7 +2861,10 @@ impl Session {
     /// required (no default to active) — a destructive op shouldn't
     /// silently default to "whichever one is active". Only resets
     /// `cur`/`anchor`/the viewport when the ACTIVE sheet itself is the one
-    /// removed (Task 5's xlsxy fix, mirrored here).
+    /// removed (Task 5's xlsxy fix, mirrored here). The removal is
+    /// `SheetPackage::delete_sheet`, as Delete Sheet is in the suite and xlsxy:
+    /// the other sheets' formulas that name the sheet read `#REF!` (#1734),
+    /// each rewrite stashed for the restore.
     fn ctl_sheet_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
         self.remove_sheet_at(si)
@@ -2794,7 +2921,7 @@ impl Session {
             .cloned()
             .collect();
         // The names that survive the removal, to find which of them it
-        // rewrites to `#REF!`.
+        // rewrites (to `#REF!`, or a 3-D span shrunk).
         let surviving: Vec<DefinedName> = self
             .pkg
             .workbook
@@ -2808,7 +2935,7 @@ impl Session {
             .map(|d| d.scope.map(|s| self.pkg.workbook.sheets[s].name.clone()))
             .collect();
         // The other sheets' CF and DV formulas, to find which of them the
-        // removal rewrites to `#REF!`.
+        // removal rewrites (to `#REF!`, or a 3-D span shrunk).
         let rules_before: Vec<(String, Vec<String>)> = self
             .pkg
             .workbook
@@ -2819,7 +2946,7 @@ impl Session {
             .map(|(_, sh)| (sh.name.clone(), rule_texts(sh)))
             .collect();
         // The other sheets' Consolidate references, to find which of them the
-        // removal rewrites to `#REF!`.
+        // removal rewrites (to `#REF!`, or a 3-D span shrunk).
         let consolidate_before: Vec<(String, Vec<String>)> = self
             .pkg
             .workbook
@@ -2829,9 +2956,100 @@ impl Session {
             .filter(|&(i, _)| i != si)
             .filter_map(|(_, sh)| Some((sh.name.clone(), sh.consolidate.as_ref()?.refs.clone())))
             .collect();
-        if !self.pkg.remove_sheet(si) {
+        // The other sheets' cell formulas, tables' calculated formulas and
+        // charts, to find which of them the removal rewrites.
+        let cells_before: Vec<SheetFormulas> = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != si)
+            .map(|(_, sh)| {
+                let formulas = sh
+                    .cells
+                    .iter()
+                    .filter_map(|(&at, c)| Some((at, c.formula.clone()?)))
+                    .collect();
+                (sh.name.clone(), formulas)
+            })
+            .collect();
+        let tables_before: Vec<(String, Vec<Option<String>>)> = self
+            .pkg
+            .workbook
+            .tables
+            .iter()
+            .filter(|t| t.sheet != si)
+            .map(|t| (t.name.clone(), t.calculated_formulas.clone()))
+            .collect();
+        let charts_before: Vec<(String, Vec<(usize, gridcore::sheet::ChartData)>)> = self
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != si)
+            .map(|(_, sh)| (sh.name.clone(), rewritable_charts(sh)))
+            .filter(|(_, charts)| !charts.is_empty())
+            .collect();
+        // Delete Sheet, as the suite and xlsxy do: the cell formulas that name
+        // the sheet read `#REF!` too, and their readers recalculate.
+        // The engine rebuild below is its one recalculation.
+        if self.pkg.delete_sheet_uncalculated(si).is_none() {
             return Err("cannot remove the last sheet".into());
         }
+        let wb = &self.pkg.workbook;
+        let rewritten_cells: Vec<RewrittenCell> = cells_before
+            .into_iter()
+            .flat_map(|(sheet, formulas)| {
+                let now = wb.sheets.iter().find(|sh| sh.name == sheet);
+                formulas
+                    .into_iter()
+                    .filter_map(|(at, before)| {
+                        let after = now?.cells.get(&at)?.formula.as_deref()?;
+                        (after != before).then(|| RewrittenCell {
+                            sheet: sheet.clone(),
+                            at,
+                            before,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let rewritten_tables: Vec<RewrittenTable> = tables_before
+            .into_iter()
+            .filter_map(|(name, before)| {
+                let t = wb.tables.iter().find(|t| t.name == name)?;
+                (t.calculated_formulas != before).then(|| RewrittenTable {
+                    name,
+                    before,
+                    after: t.calculated_formulas.clone(),
+                })
+            })
+            .collect();
+        let rewritten_charts: Vec<RewrittenChart> = charts_before
+            .into_iter()
+            .flat_map(|(sheet, charts)| {
+                let now = wb
+                    .sheets
+                    .iter()
+                    .find(|sh| sh.name == sheet)
+                    .map(rewritable_charts)
+                    .unwrap_or_default();
+                charts
+                    .into_iter()
+                    .filter_map(|(drawing, before)| {
+                        let (_, after) = now.iter().find(|(i, _)| *i == drawing)?;
+                        (*after != before).then(|| RewrittenChart {
+                            sheet: sheet.clone(),
+                            drawing,
+                            before,
+                            after: after.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let rewritten_consolidate: Vec<RewrittenConsolidate> = consolidate_before
             .into_iter()
             .flat_map(|(sheet, before)| {
@@ -2919,6 +3137,22 @@ impl Session {
         self.redo.clear();
         self.rebuild_engine();
         self.dirty = true;
+        // Taken recalculated, as a restore of a later removal leaves them.
+        let mut cell_guards: Vec<CellGuard> = Vec::new();
+        for r in &rewritten_cells {
+            if cell_guards.iter().any(|(name, _)| *name == r.sheet) {
+                continue;
+            }
+            if let Some(sh) = self
+                .pkg
+                .workbook
+                .sheets
+                .iter()
+                .find(|sh| sh.name == r.sheet)
+            {
+                cell_guards.push((r.sheet.clone(), held_cells(sh)));
+            }
+        }
         // A stack: the latest removal is restored first, and the oldest is
         // forgotten once the stack is full (see `RemovedSheetStash`).
         if self.removed_sheet_stashes.len() >= MAX_REMOVED_SHEET_STASHES {
@@ -2935,6 +3169,10 @@ impl Session {
             rewritten_names,
             rewritten_consolidate,
             rewritten_rules,
+            rewritten_cells,
+            cell_guards,
+            rewritten_tables,
+            rewritten_charts,
             serial: self.next_stash_serial,
         });
         let mut out = String::from(
@@ -3015,8 +3253,14 @@ impl Session {
     /// elements and every stored sheet index in step. When that shifts other
     /// sheets the undo and redo history, which names sheets by index, is
     /// cleared (as `sheet.remove` does). The global names, Consolidate
-    /// references and other sheets' CF and DV formulas the removal turned
-    /// into `#REF!` get their text back (unless they changed since).
+    /// references, other sheets' CF and DV formulas, tables' calculated
+    /// formulas and charts the removal rewrote get their text back, each
+    /// unless it changed since. A sheet's cell formulas come back only while
+    /// none of that sheet's cells was edited or moved since the removal
+    /// (`RemovedSheetStash::cell_guards`); otherwise they all stay as they
+    /// are, and the reply's `cellsKept` names that sheet. A rename or a row or
+    /// column edit of another sheet that rewrote a formula here counts as an
+    /// edit (a known limit). The cells recalculate.
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
         if self.removed_sheet_stashes.is_empty() {
             return Err("nothing to restore".into());
@@ -3101,7 +3345,7 @@ impl Session {
         }
         let name = self.removed_sheet_stashes[k].name.clone();
         let removed_active = self.removed_sheet_stashes[k].removed_active;
-        let had_pivots = self.restore_top();
+        let (had_pivots, cells_kept) = self.restore_top();
         for (later_name, was_active, serial) in &later {
             let si = self
                 .pkg
@@ -3152,6 +3396,16 @@ impl Session {
         out.push_str(&new_idx.to_string());
         out.push_str(",\"name\":");
         json::push_str(&mut out, &name);
+        if !cells_kept.is_empty() {
+            out.push_str(",\"cellsKept\":[");
+            for (i, sheet) in cells_kept.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json::push_str(&mut out, sheet);
+            }
+            out.push(']');
+        }
         out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
         out.push_str(&new_idx.to_string());
         out.push_str("}},\"undoSteps\":0}");
@@ -3161,9 +3415,10 @@ impl Session {
     /// Pop the top of `Session::removed_sheet_stashes` and put its sheet
     /// back (see [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed)),
     /// leaving the pivot refresh and the engine rebuild to the caller.
-    /// Whether the sheet had pivots. The caller has checked that no live
-    /// sheet has the stashed name.
-    fn restore_top(&mut self) -> bool {
+    /// Whether the sheet had pivots, and the sheets whose cell formulas were
+    /// left as they are (`RemovedSheetStash::cell_guards`). The caller has
+    /// checked that no live sheet has the stashed name.
+    fn restore_top(&mut self) -> (bool, Vec<String>) {
         let stash = self
             .removed_sheet_stashes
             .pop()
@@ -3195,7 +3450,7 @@ impl Session {
                     .set_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text);
             }
         }
-        // The names the removal rewrote to `#REF!` read as they did, unless
+        // The names the removal rewrote read as they did, unless
         // they changed since.
         for r in &stash.rewritten_names {
             let wb = &mut self.pkg.workbook;
@@ -3207,7 +3462,7 @@ impl Session {
                 wb.defined_names[r.position].formula = r.before.clone();
             }
         }
-        // The Consolidate references the removal rewrote to `#REF!` read as
+        // The Consolidate references the removal rewrote read as
         // they did, unless they changed since.
         for r in &stash.rewritten_consolidate {
             let text = self
@@ -3235,6 +3490,63 @@ impl Session {
                 }
                 at += 1;
             });
+        }
+        // So do the cell formulas, on each sheet still as the removal left
+        // it (see `RemovedSheetStash::cell_guards`); the caller's engine
+        // rebuild recalculates them.
+        let intact: Vec<&str> = stash
+            .cell_guards
+            .iter()
+            .filter(|(name, guard)| {
+                let sheets = &self.pkg.workbook.sheets;
+                sheets
+                    .iter()
+                    .find(|sh| sh.name == *name)
+                    .is_some_and(|sh| still_holds(sh, guard))
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let cells_kept: Vec<String> = stash
+            .cell_guards
+            .iter()
+            .map(|(name, _)| name)
+            .filter(|name| !intact.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        for r in &stash.rewritten_cells {
+            if !intact.contains(&r.sheet.as_str()) {
+                continue;
+            }
+            let sheets = &mut self.pkg.workbook.sheets;
+            let cell = sheets
+                .iter_mut()
+                .find(|sh| sh.name == r.sheet)
+                .and_then(|sh| sh.cells.get_mut(&r.at));
+            if let Some(cell) = cell {
+                cell.formula = Some(r.before.clone());
+            }
+        }
+        // And the tables' calculated formulas and the charts.
+        for r in &stash.rewritten_tables {
+            let tables = &mut self.pkg.workbook.tables;
+            if let Some(t) = tables.iter_mut().find(|t| t.name == r.name) {
+                if t.calculated_formulas == r.after {
+                    t.calculated_formulas = r.before.clone();
+                }
+            }
+        }
+        for r in &stash.rewritten_charts {
+            let sheets = &mut self.pkg.workbook.sheets;
+            let kind = sheets
+                .iter_mut()
+                .find(|sh| sh.name == r.sheet)
+                .and_then(|sh| sh.drawings.get_mut(r.drawing))
+                .map(|d| &mut d.kind);
+            if let Some(gridcore::sheet::DrawingKind::Chart(cd)) = kind {
+                if *cd == r.after {
+                    *cd = r.before.clone();
+                }
+            }
         }
         // Re-point each name's scope at the NEW index — the old one may no
         // longer even exist (sheets above it shifted down on removal).
@@ -3268,7 +3580,7 @@ impl Session {
             self.window.1 = 0;
         }
         self.dirty = true;
-        had_pivots
+        (had_pivots, cells_kept)
     }
 
     /// Reinsert a pivot into `workbook.pivots`, pointed at `dest_sheet`, as
@@ -6735,6 +7047,184 @@ mod tests {
             }],
             ix: None,
         });
+    }
+
+    /// Sheet1's cell at row 21, column `c`: its formula and value.
+    fn row21(s: &Session, c: u32) -> (String, gridcore::sheet::CellValue) {
+        let cell = s.pkg.workbook.sheets[0].cell(20, c).expect("cell");
+        (cell.formula.clone().unwrap_or_default(), cell.value.clone())
+    }
+
+    fn ref_err() -> gridcore::sheet::CellValue {
+        gridcore::sheet::CellValue::Error("#REF!".into())
+    }
+
+    fn number(n: f64) -> gridcore::sheet::CellValue {
+        gridcore::sheet::CellValue::Number(n)
+    }
+
+    /// #1734: `sheet.remove` is Delete Sheet: the other sheets' cell
+    /// formulas that name it read `#REF!` and their readers recalculate; the
+    /// restore gives them their text and values back, except on a sheet
+    /// edited since, which keeps what it holds.
+    #[test]
+    fn ctl_sheet_remove_rewrites_cell_formulas_and_its_restore_gives_them_back() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=C!A1+1");
+        s.dispatch("set\t20\t1\t=A21*2");
+        s.active = 2; // B
+        s.dispatch("set\t5\t0\t=C!A1");
+        s.dispatch("set\t6\t0\t=C!A1*3");
+        s.active = 0;
+        assert_eq!(row21(&s, 0), ("C!A1+1".into(), number(4.0)));
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(row21(&s, 0), ("#REF!+1".into(), ref_err()));
+        assert_eq!(row21(&s, 1), ("A21*2".into(), ref_err()));
+        s.active = 2;
+        s.dispatch("set\t5\t0\t=5");
+        s.active = 0;
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["B"]"#), "{out}");
+        assert_eq!(row21(&s, 0), ("C!A1+1".into(), number(4.0)));
+        assert_eq!(row21(&s, 1), ("A21*2".into(), number(8.0)));
+        let b = |r: u32| {
+            let sh = &s.pkg.workbook.sheets[2];
+            sh.cell(r, 0).and_then(|c| c.formula.clone())
+        };
+        assert_eq!(b(5).as_deref(), Some("5"));
+        assert_eq!(b(6).as_deref(), Some("#REF!*3"), "B was edited: kept whole");
+    }
+
+    /// Sheet1's formulas in rows `rows` of column B.
+    fn column_b(s: &Session, rows: std::ops::Range<u32>) -> Vec<Option<String>> {
+        let sh = &s.pkg.workbook.sheets[0];
+        rows.map(|r| sh.cell(r, 1).and_then(|c| c.formula.clone()))
+            .collect()
+    }
+
+    /// #1734 r1: the rewrites make a filled column one text, so a row
+    /// inserted or deleted above it between the removal and the restore
+    /// would move another cell's `#REF!*2` under a stashed cell: the restore
+    /// leaves such a sheet as it is rather than give a cell another's
+    /// formula.
+    #[test]
+    fn ctl_sheet_restore_removed_never_puts_a_formula_in_a_cell_that_moved() {
+        for op in ["insrow\t0\t1", "delrow\t0\t1"] {
+            let mut s = abc_session();
+            for r in 1..6 {
+                s.dispatch(&format!("set\t{r}\t1\t=C!B{}*2", r + 1));
+            }
+            s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+            let rewritten = column_b(&s, 0..8);
+            s.dispatch(op);
+            let moved = column_b(&s, 0..8);
+            assert_ne!(moved, rewritten, "{op}");
+            let out = restore(&mut s, "C");
+            assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{op}: {out}");
+            assert_eq!(column_b(&s, 0..8), moved, "{op}");
+        }
+        // Rows added below them move nothing: the restore goes ahead.
+        let mut s = abc_session();
+        for r in 1..6 {
+            s.dispatch(&format!("set\t{r}\t1\t=C!B{}*2", r + 1));
+        }
+        let original = column_b(&s, 0..8);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.dispatch("insrow\t10\t1");
+        s.dispatch("set\t12\t1\t7");
+        let out = restore(&mut s, "C");
+        assert!(!out.contains("cellsKept"), "{out}");
+        assert_eq!(column_b(&s, 0..8), original);
+    }
+
+    /// #1734 r2: a rename of another sheet that rewrote a formula on the
+    /// sheet counts as an edit there (a known limit), and the reply says so.
+    #[test]
+    fn ctl_sheet_restore_removed_names_a_sheet_a_rename_elsewhere_kept() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=C!A1+B!A1");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"B","name":"Bee"}}"#);
+        assert_eq!(row21(&s, 0).0, "#REF!+Bee!A1");
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
+        assert_eq!(row21(&s, 0).0, "#REF!+Bee!A1");
+    }
+
+    /// #1734: a table's calculated-column formula and an in-memory chart's
+    /// source that the removal rewrote come back with the restore.
+    #[test]
+    fn ctl_sheet_restore_removed_gives_back_table_formulas_and_chart_sources() {
+        use gridcore::sheet::{ChartData, ChartSource, Drawing, DrawingKind, Table};
+        let mut s = abc_session();
+        s.pkg.workbook.tables.push(Table {
+            name: "T1".into(),
+            sheet: 0,
+            range: (30, 0, 32, 0),
+            header_rows: 1,
+            columns: vec!["X".into()],
+            calculated_formulas: vec![Some("C!A1*2".into())],
+            ..Default::default()
+        });
+        let chart = ChartData {
+            source: Some(ChartSource {
+                sheet: "C".into(),
+                range: (0, 0, 4, 1),
+                cat_col: 0,
+            }),
+            ..Default::default()
+        };
+        s.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 5),
+            to: (10, 10),
+            kind: DrawingKind::Chart(chart.clone()),
+        });
+        let chart_now = |s: &Session| match &s.pkg.workbook.sheets[0].drawings[0].kind {
+            DrawingKind::Chart(cd) => cd.clone(),
+            other => panic!("{other:?}"),
+        };
+        let calc = |s: &Session| s.pkg.workbook.tables[0].calculated_formulas.clone();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(calc(&s), vec![Some("#REF!*2".to_string())]);
+        assert_eq!(chart_now(&s).source, None);
+        restore(&mut s, "C");
+        assert_eq!(calc(&s), vec![Some("C!A1*2".to_string())]);
+        assert_eq!(chart_now(&s), chart);
+    }
+
+    /// #1734: an older removal's restore unwinds the later ones, gives each
+    /// cell back the text of its own frame and replays them.
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_gives_cell_formulas_back_in_each_frame() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=A!A1+C!A1");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(row21(&s, 0), ("#REF!+#REF!".into(), ref_err()));
+        restore(&mut s, "A");
+        assert_eq!(row21(&s, 0), ("A!A1+#REF!".into(), ref_err()));
+        restore(&mut s, "C");
+        assert_eq!(row21(&s, 0), ("A!A1+C!A1".into(), number(4.0)));
+    }
+
+    /// #1734: a 3-D span shrinks as its end sheets go, and the restores,
+    /// in any order, give the span back.
+    #[test]
+    fn ctl_sheet_remove_shrinks_a_three_d_span_and_the_restores_give_it_back() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=SUM(A:C!A1)");
+        assert_eq!(row21(&s, 0), ("SUM(A:C!A1)".into(), number(6.0)));
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(row21(&s, 0), ("SUM(A:B!A1)".into(), number(3.0)));
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        assert_eq!(row21(&s, 0), ("SUM(A!A1)".into(), number(1.0)));
+        // C first: B is unwound, C put back, B removed again from between.
+        restore(&mut s, "C");
+        assert_eq!(sheet_order(&s), ["Sheet1", "A", "C"]);
+        assert_eq!(row21(&s, 0), ("SUM(A:C!A1)".into(), number(4.0)));
+        restore(&mut s, "B");
+        assert_eq!(row21(&s, 0), ("SUM(A:C!A1)".into(), number(6.0)));
     }
 
     #[test]

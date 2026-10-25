@@ -3608,20 +3608,25 @@ pub fn qualify_sheet_in_formula(src: &str, sheet: &str) -> Option<String> {
 /// formula. Excel writes `#REF!A1` after a sheet delete, keeping the cell
 /// part; the parser has no such form, and the reference is gone either way.
 ///
-/// A 3-D span loses its reference only when an end sheet is removed (Excel
-/// moves that end inward instead). A sheet between the ends just drops out
-/// of the span, which is left alone.
-pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String]) -> Expr {
+/// A 3-D span whose end sheet is removed shrinks, as in Excel: that end
+/// moves inward to the nearest sheet of the span that stays, by `order` (the
+/// workbook's sheet names in tab order, the removed ones still among them).
+/// A span left with one sheet is a plain reference to it (`Nov!B2`), one
+/// left with none, or whose ends `order` does not hold, is `#REF!`. A sheet
+/// between the ends just drops out of the span, which is left alone.
+pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String], order: &[String]) -> Expr {
     let gone = |s: &str| removed.iter().any(|r| r.eq_ignore_ascii_case(s));
     let on_gone = |s: &Option<String>| s.as_deref().is_some_and(gone);
-    let walk = |x: &Expr| remove_sheet_refs_in_expr(x, removed);
+    let walk = |x: &Expr| remove_sheet_refs_in_expr(x, removed, order);
     match e {
+        Expr::Ref3D { first, last, a, b } if gone(first) || gone(last) => {
+            shrink_span(first, last, a, b, &gone, order)
+        }
         Expr::Ref(r) | Expr::SpillRef(r) if on_gone(&r.sheet) => Expr::Err(ExcelError::Ref),
         Expr::Range(a, b) if on_gone(&a.sheet) || on_gone(&b.sheet) => Expr::Err(ExcelError::Ref),
         Expr::ColRange { sheet, .. } | Expr::RowRange { sheet, .. } if on_gone(sheet) => {
             Expr::Err(ExcelError::Ref)
         }
-        Expr::Ref3D { first, last, .. } if gone(first) || gone(last) => Expr::Err(ExcelError::Ref),
         Expr::Name(n) if scoped_name(n).is_some_and(|(s, _)| gone(&s)) => {
             Expr::Err(ExcelError::Ref)
         }
@@ -3637,6 +3642,49 @@ pub fn remove_sheet_refs_in_expr(e: &Expr, removed: &[String]) -> Expr {
         Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x))),
         Expr::Bin(op, l, r) => Expr::Bin(*op, Box::new(walk(l)), Box::new(walk(r))),
         other => other.clone(),
+    }
+}
+
+/// [`remove_sheet_refs_in_expr`]'s 3-D span with an end sheet removed: the
+/// span between the sheets of `order[first..=last]` that stay, or `#REF!`.
+fn shrink_span(
+    first: &str,
+    last: &str,
+    a: &CellRef,
+    b: &CellRef,
+    gone: &dyn Fn(&str) -> bool,
+    order: &[String],
+) -> Expr {
+    let at = |n: &str| order.iter().position(|s| s.eq_ignore_ascii_case(n));
+    let (Some(i), Some(j)) = (at(first), at(last)) else {
+        return Expr::Err(ExcelError::Ref);
+    };
+    // Walked from `first` towards `last`, so a reversed span stays reversed.
+    let span: Vec<&String> = if i <= j {
+        order[i..=j].iter().collect()
+    } else {
+        order[j..=i].iter().rev().collect()
+    };
+    let kept: Vec<&String> = span.into_iter().filter(|s| !gone(s)).collect();
+    match kept.as_slice() {
+        [] => Expr::Err(ExcelError::Ref),
+        [only] => {
+            let one = CellRef {
+                sheet: Some((*only).clone()),
+                ..a.clone()
+            };
+            if a == b {
+                Expr::Ref(one)
+            } else {
+                Expr::Range(one, b.clone())
+            }
+        }
+        [head, .., tail] => Expr::Ref3D {
+            first: (*head).clone(),
+            last: (*tail).clone(),
+            a: a.clone(),
+            b: b.clone(),
+        },
     }
 }
 
@@ -15439,6 +15487,49 @@ mod tests {
         );
     }
 
+    /// #1734: a removed end sheet moves a 3-D span's end inward, as Excel
+    /// does; `#REF!` only when no sheet of the span is left.
+    #[test]
+    fn a_removed_end_sheet_shrinks_a_three_d_span() {
+        let order: Vec<String> = ["Jan", "Feb", "Mar", "Apr", "My Q"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let gone = |src: &str, removed: &[&str]| {
+            let removed: Vec<String> = removed.iter().map(|s| s.to_string()).collect();
+            to_string(&remove_sheet_refs_in_expr(
+                &parse(src).unwrap(),
+                &removed,
+                &order,
+            ))
+        };
+        assert_eq!(gone("SUM(Jan:Apr!B2)", &["Apr"]), "SUM(Jan:Mar!B2)");
+        assert_eq!(gone("SUM(Jan:Apr!B2)", &["jan"]), "SUM(Feb:Apr!B2)");
+        assert_eq!(
+            gone("SUM(Jan:Apr!B2:C3)", &["Apr", "Mar"]),
+            "SUM(Jan:Feb!B2:C3)"
+        );
+        // A sheet between the ends just drops out.
+        assert_eq!(gone("SUM(Jan:Apr!B2)", &["Feb"]), "SUM(Jan:Apr!B2)");
+        // Reversed, it stays reversed.
+        assert_eq!(gone("SUM(Apr:Jan!B2)", &["Apr"]), "SUM(Mar:Jan!B2)");
+        // One sheet left: a plain reference, quoted as its name needs.
+        assert_eq!(gone("SUM(Mar:Apr!$B$2)", &["Apr"]), "SUM(Mar!$B$2)");
+        assert_eq!(gone("SUM(Jan:Feb!B2:C3)", &["Jan"]), "SUM(Feb!B2:C3)");
+        assert_eq!(gone("SUM(Apr:'My Q'!B2)", &["Apr"]), "SUM('My Q'!B2)");
+        // None left, or an end the workbook does not hold.
+        assert_eq!(gone("SUM(Jan:Feb!B2)", &["Jan", "Feb"]), "SUM(#REF!)");
+        assert_eq!(gone("SUM(Jan:Nope!B2)", &["Jan"]), "SUM(#REF!)");
+        // Deleted one at a time, a span ends as a plain reference, then `#REF!`.
+        let mut src = "SUM(Jan:Mar!B2)".to_string();
+        let mut seen = Vec::new();
+        for sheet in ["Mar", "Jan", "Feb"] {
+            src = gone(&src, &[sheet]);
+            seen.push(src.clone());
+        }
+        assert_eq!(seen, ["SUM(Jan:Feb!B2)", "SUM(Feb!B2)", "SUM(#REF!)"]);
+    }
+
     #[test]
     fn sheet_scoped_names_follow_a_sheet_rename_and_delete() {
         // #1632: `Sheet1!Rate` parses as a name carrying its qualifier.
@@ -15456,7 +15547,11 @@ mod tests {
         );
         let gone = |src: &str, removed: &[&str]| {
             let removed: Vec<String> = removed.iter().map(|s| s.to_string()).collect();
-            to_string(&remove_sheet_refs_in_expr(&parse(src).unwrap(), &removed))
+            to_string(&remove_sheet_refs_in_expr(
+                &parse(src).unwrap(),
+                &removed,
+                &removed,
+            ))
         };
         assert_eq!(gone("Sheet1!Rate+1", &["Sheet1"]), "#REF!+1");
         assert_eq!(gone("'My Sheet'!Rate", &["my sheet"]), "#REF!");

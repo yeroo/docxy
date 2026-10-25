@@ -1081,7 +1081,8 @@ pub fn add_ranges(sheet: &mut Sheet, rule: &DataValidation, ranges: &[Rect]) {
 /// [`as_seen_from`]). With `apply_to_all`, every cell range whose rule has the
 /// same settings as the one that cell holds now takes them too. "Any value"
 /// without messages ([`DataValidation::is_meaningful`]) leaves the cells
-/// with no rule.
+/// with no rule the dialog shows: an Excel 2010 (`extLst`) one, which it
+/// cannot show, stays.
 pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, apply_to_all: bool) {
     let base_at = sheet
         .validations
@@ -1112,8 +1113,15 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
         .filter(|b| b.ranges.iter().all(|r| ranges.iter().any(|o| inside(r, o))))
         .and(base_at);
     let held = keep.map(|i| sheet.validations.remove(i));
+    // The dialog shows no Excel 2010 (`extLst`) rule, so "Any value" on OK
+    // is no decision about one: only a rule that imposes something replaces
+    // it (#1734). Clear All still takes it off.
     for &r in &ranges {
-        clear_validation(sheet, r);
+        if rule.is_meaningful() {
+            clear_validation(sheet, r);
+        } else {
+            crate::edit::clear_classic_validation(sheet, r);
+        }
     }
     if !rule.is_meaningful() {
         if let Some(h) = held {
@@ -2042,6 +2050,38 @@ mod tests {
         set_validation(&mut s, (1, 1, 2, 1), &msg, false);
         assert_eq!(s.validations[0].kind, "");
         assert!(s.validations[0].is_meaningful());
+    }
+
+    /// #1734: the dialog shows no Excel 2010 (`extLst`) rule, so OK on "Any
+    /// value" leaves one standing; a rule that imposes something replaces
+    /// it, and Clear All takes it off.
+    #[test]
+    fn any_value_leaves_an_x14_validation_a_real_rule_replaces_it() {
+        use crate::sheet::{ExtKind, ExtRule};
+        let x14 = || ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![(1, 1, 9, 1)],
+            formulas: vec!["$Z$1:$Z$3".into()],
+            ix: 0,
+        };
+        let mut s = Sheet::default();
+        s.ext_rules.push(x14());
+        s.validations.push(rule("whole", "between", "10", "90"));
+        set_validation(&mut s, (1, 1, 9, 1), &DataValidation::default(), false);
+        assert!(s.validations.is_empty(), "the classic rule goes");
+        assert_eq!(s.ext_rules, vec![x14()]);
+        assert!(s.ext_removed.is_empty());
+        let mut list = rule("list", "", "\"a,b\"", "");
+        list.ranges.clear();
+        set_validation(&mut s, (1, 1, 9, 1), &list, false);
+        assert!(s.ext_rules.is_empty());
+        assert_eq!(s.ext_removed, vec![(ExtKind::Dv, 0)]);
+        assert_eq!(s.validations[0].kind, "list");
+        let mut s = Sheet::default();
+        s.ext_rules.push(x14());
+        clear_all_validation(&mut s, (1, 1, 9, 1), false);
+        assert!(s.ext_rules.is_empty());
+        assert_eq!(s.ext_removed, vec![(ExtKind::Dv, 0)]);
     }
 
     #[test]
