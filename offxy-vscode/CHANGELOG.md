@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **An agent sheet removal undoes out of order (#1720).** Undoing a
+  `sheet.remove` while later removals are still stashed (e.g. undo an import,
+  then the removal before it) restores the sheet it removed, at its old
+  place, and keeps the later ones for their own redo, instead of warning
+  `restore mismatch`.
 - **New: text import, Text to Columns and options over MCP (#761).**
   `xlsxy_import_text` imports delimited or fixed-width text into a new sheet
   as the Text Import Wizard reads it (any File origin, including the new

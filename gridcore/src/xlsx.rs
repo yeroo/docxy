@@ -6015,11 +6015,13 @@ fn sheet_sort_state_span(xml: &str) -> Option<(usize, usize)> {
 /// when the model's range is the same size elsewhere (a structural edit
 /// translated it: its `ref` and each `<sortCondition ref>` shift by the same
 /// rows and columns), and dropped otherwise, as the model drops it when a
-/// delete through it or an insert off the sheet ended it. With `edits` (the model's log of the structural
+/// delete of all of it or an insert off the sheet ended it. With `edits` (the model's log of the structural
 /// edits since load, see [`crate::sheet::Sheet::sort_state_edits`]) the loaded
 /// range and every condition are carried through them in order, so an insert
-/// inside the range widens it and the conditions it spans; the result must be
-/// the model's range, else the element goes.
+/// inside the range widens it and the conditions it spans, and a delete
+/// through it shrinks them; the result must be the model's range, and no
+/// condition may be deleted whole (a deleted sort key: unmeasured against
+/// Excel), else the element goes.
 fn set_sort_state(
     mut xml: String,
     model: Option<(u32, u32, u32, u32)>,
@@ -6039,8 +6041,13 @@ fn set_sort_state(
             } else {
                 (&mut c1, &mut c2)
             };
-            *a = crate::edit::point(*a, e)?;
-            *b = crate::edit::point(*b, e)?;
+            // A delete clamps the span as the model's does; an insert moves
+            // each end by the `point` rule (one strictly inside grows it).
+            (*a, *b) = if e.delta < 0 {
+                crate::edit::span(*a, *b, e)?
+            } else {
+                (crate::edit::point(*a, e)?, crate::edit::point(*b, e)?)
+            };
         }
         Some((r1, c1, r2, c2))
     };
@@ -6060,7 +6067,7 @@ fn set_sort_state(
     // Each condition moves with the range and must stay inside it (and on
     // the sheet); one that doesn't, or doesn't read as a range, can't be kept
     // honest, so the whole element goes. Also for a range that didn't move.
-    let mut edits_out: Vec<(usize, String)> = Vec::new();
+    let mut edits_out: Vec<(usize, String, bool)> = Vec::new();
     for (name, s, _) in element_children(&element) {
         if name != "sortCondition" {
             continue;
@@ -6086,18 +6093,23 @@ fn set_sort_state(
             .filter(|&(a, b, c, d)| a >= r1 && b >= c1 && c <= r2 && d <= c2);
         match moved {
             Some((a, b, c, d)) => {
+                let r = format!("{}:{}", cell_name(a, b), cell_name(c, d));
                 if (dr, dc) != (0, 0) || !edits.is_empty() {
-                    edits_out.push((s, format!("{}:{}", cell_name(a, b), cell_name(c, d))));
+                    let same = attr_at(&element, s, "ref") == Some(r.as_str());
+                    edits_out.push((s, r, same));
                 }
             }
             None => return remove_worksheet_child(&xml, "sortState"),
         }
     }
-    if model == Some(held) {
+    // A range back where it was keeps its bytes only while every condition
+    // is too: a delete then an insert can restore the range's size but move
+    // a condition inside it.
+    if model == Some(held) && edits_out.iter().all(|&(_, _, same)| same) {
         return xml;
     }
     let mut block = element;
-    for (s, r) in edits_out.into_iter().rev() {
+    for (s, r, _) in edits_out.into_iter().rev() {
         block = set_tag_attr(&block, s, "ref", Some(&r));
     }
     let r = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
@@ -21399,19 +21411,92 @@ mod print_setup_tests {
     }
 
     #[test]
-    fn sheet_sort_state_is_dropped_when_an_edit_changes_its_size() {
+    fn sheet_sort_state_is_dropped_when_an_edit_ends_it() {
         type Edit = fn(&mut Workbook);
-        let cases: [(&str, Edit); 5] = [
-            ("delete inside", |w| delete_rows(w, 0, 4, 1)),
+        let cases: [(&str, Edit); 3] = [
             ("delete all", |w| delete_rows(w, 0, 0, 20)),
-            ("column delete inside", |w| delete_cols(w, 0, 1, 1)),
-            ("overlapping top", |w| delete_rows(w, 0, 0, 3)),
+            ("the condition's column deleted", |w| {
+                delete_cols(w, 0, 1, 1)
+            }),
             ("off the sheet", |w| insert_rows(w, 0, 0, 1_048_576 - 8)),
         ];
         for (what, edit) in cases {
             let (ws, _) = edited("", SORT, edit);
             assert!(!ws.contains("sortState"), "{what}: {ws}");
         }
+    }
+
+    #[test]
+    fn sort_state_shrinks_on_row_delete_inside_range() {
+        let mut pkg = report("", SORT);
+        delete_rows(&mut pkg.workbook, 0, 4, 1);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, Some((1, 0, 7, 2)));
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A2:C8"><sortCondition ref="B2:B8"/></sortState>"#),
+            "{ws}"
+        );
+        assert_eq!(re.workbook.sheets[0].sort_state, Some((1, 0, 7, 2)));
+    }
+
+    #[test]
+    fn sort_state_shrinks_on_delete_overlapping_its_top() {
+        let mut pkg = report("", SORT);
+        delete_rows(&mut pkg.workbook, 0, 0, 3);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, Some((0, 0, 5, 2)));
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C6"><sortCondition ref="B1:B6"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_shrinks_on_column_delete_beside_its_condition() {
+        let (ws, _) = edited("", SORT, |w| delete_cols(w, 0, 2, 1));
+        assert!(
+            ws.contains(r#"<sortState ref="A2:B9"><sortCondition ref="B2:B9"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_grow_then_shrink_replays_both() {
+        let (ws, _) = edited("", GROW, |w| {
+            insert_rows(w, 0, 4, 2);
+            delete_rows(w, 0, 5, 3);
+        });
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C8"><sortCondition ref="B2:B8"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_delete_shrinks_a_spanning_condition_and_spares_one_above() {
+        // The delete is rows 4-5 (index 3): B2:B3 ends above it and stays,
+        // A2:A9 spans it and shrinks.
+        let two = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A9"/></sortState>"#;
+        let (ws, _) = edited("", two, |w| delete_rows(w, 0, 3, 2));
+        assert!(
+            ws.contains(r#"<sortState ref="A1:C7"><sortCondition ref="B2:B3"/><sortCondition ref="A2:A7"/></sortState>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn sort_state_shrink_then_grow_back_rewrites_a_moved_condition() {
+        // The range comes back to its loaded size, but the condition moved.
+        let narrow = r#"<sortState ref="A2:C9"><sortCondition ref="B2:B3"/></sortState>"#;
+        let mut pkg = report("", narrow);
+        delete_rows(&mut pkg.workbook, 0, 4, 1);
+        insert_rows(&mut pkg.workbook, 0, 2, 1);
+        assert_eq!(pkg.workbook.sheets[0].sort_state, Some((1, 0, 8, 2)));
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<sortState ref="A2:C9"><sortCondition ref="B2:B4"/></sortState>"#),
+            "{ws}"
+        );
     }
 
     const GROW: &str = r#"<sortState ref="A1:C9"><sortCondition ref="B2:B9"/></sortState>"#;
@@ -21506,6 +21591,10 @@ mod print_setup_tests {
         insert_rows(&mut pkg.workbook, 0, 4, 1);
         assert_eq!(pkg.workbook.sheets[0].sort_state_edits.len(), 1);
         delete_rows(&mut pkg.workbook, 0, 4, 1);
+        assert_eq!(pkg.workbook.sheets[0].sort_state_edits.len(), 2);
+        delete_rows(&mut pkg.workbook, 0, 20, 2);
+        assert_eq!(pkg.workbook.sheets[0].sort_state_edits.len(), 2);
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
         assert_eq!(pkg.workbook.sheets[0].sort_state, None);
         assert!(pkg.workbook.sheets[0].sort_state_edits.is_empty());
     }

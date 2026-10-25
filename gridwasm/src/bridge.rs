@@ -128,7 +128,9 @@ enum UndoAction {
 /// `sheet.restore-removed` verb) a genuine, lossless reversal instead of the
 /// earlier "recreate an empty sheet by the same name" placeholder. The
 /// stashes are a stack (`Session::removed_sheet_stashes`): a `sheet.remove`
-/// pushes one, and a successful restore pops the top.
+/// pushes one, and a successful restore takes the one it names out (the top
+/// directly; an older one by unwinding the stack to it and removing the
+/// later sheets again, see `ctl_sheet_restore_removed`).
 struct RemovedSheetStash {
     name: String,
     sheet: Sheet,
@@ -175,10 +177,22 @@ struct RemovedSheetStash {
     /// text before and after. A restore puts `before` back on a reference
     /// still at that position reading `after`.
     rewritten_consolidate: Vec<RewrittenConsolidate>,
+    /// The other sheets' conditional-formatting and data-validation formulas
+    /// `SheetPackage::remove_sheet` rewrote to `#REF!`: the sheet's NAME, the
+    /// formula's place in `gridcore::edit::for_each_rule_formula_text`'s walk,
+    /// and its text before and after. A restore puts `before` back on a
+    /// formula still at that place reading `after`.
+    rewritten_rules: Vec<RewrittenConsolidate>,
+    /// This removal's number in the session (`Session::next_stash_serial`,
+    /// never reused), carried by `sheet.remove`'s inverse, so the restore
+    /// finds this stash even when a later removal stashed a sheet of the same
+    /// name. A non-top restore that removes this sheet again keeps it.
+    serial: usize,
 }
 
-/// One Consolidate reference `remove_sheet` rewrote (see
-/// [`RemovedSheetStash::rewritten_consolidate`]).
+/// One Consolidate reference, or CF/DV formula, `remove_sheet` rewrote (see
+/// [`RemovedSheetStash::rewritten_consolidate`] and
+/// [`RemovedSheetStash::rewritten_rules`]).
 struct RewrittenConsolidate {
     sheet: String,
     position: usize,
@@ -197,6 +211,13 @@ struct RewrittenName {
     scope_sheet: Option<String>,
     before: String,
     after: String,
+}
+
+/// A sheet's CF and DV formula texts, in `for_each_rule_formula_text` order.
+fn rule_texts(sheet: &mut Sheet) -> Vec<String> {
+    let mut out = Vec::new();
+    gridcore::edit::for_each_rule_formula_text(sheet, |t| out.push(t.clone()));
+    out
 }
 
 /// A live editing session over one `.xlsx`.
@@ -218,10 +239,13 @@ pub struct Session {
     undo: Vec<UndoAction>,
     redo: Vec<UndoAction>,
     /// The `sheet.remove`d sheets, the latest last (at most
-    /// [`MAX_REMOVED_SHEET_STASHES`]) — see [`RemovedSheetStash`]. Only the
-    /// top can be restored: each entry's index and rewritten-name positions
-    /// hold only right after its own removal.
+    /// [`MAX_REMOVED_SHEET_STASHES`]) — see [`RemovedSheetStash`]. Each
+    /// entry's index and rewritten-name positions hold only right after its
+    /// own removal, so an older entry is restored by unwinding the ones above
+    /// it first.
     removed_sheet_stashes: Vec<RemovedSheetStash>,
+    /// The next [`RemovedSheetStash::serial`].
+    next_stash_serial: usize,
     /// Incremented every time a REAL undo group lands on `undo` (i.e. a
     /// genuine mutation was committed) — never touched by `do_undo`/
     /// `do_redo`. The webview reads this from `view_json` and compares it
@@ -277,6 +301,7 @@ impl Session {
             undo: Vec::new(),
             redo: Vec::new(),
             removed_sheet_stashes: Vec::new(),
+            next_stash_serial: 0,
             edits: 0,
             clip: None,
         })
@@ -2687,13 +2712,13 @@ impl Session {
 
     /// `{sheet}` -> `{removed:true,undoSteps:0}` — plus the internal
     /// `inverse`, `{"verb":"sheet.restore-removed","args":{"name":"<removed
-    /// sheet name>"}}` (see the bucket-table doc comment above and
+    /// sheet name>","stash":<serial>}}` (see the bucket-table doc comment above and
     /// [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed) for
-    /// what that verb does). The `name` gives the inverse an IDENTITY: the
-    /// stashes are a stack: an intervening `sheet.remove` (e.g. a user
-    /// undo of an agent import) goes on top of it; a named restore can then
-    /// detect the mismatch and refuse rather than silently resurrecting the
-    /// wrong sheet. Before removing, snapshots the sheet's full
+    /// what that verb does). The `stash` serial gives the inverse an
+    /// IDENTITY: the stashes are a stack, and an intervening `sheet.remove`
+    /// (e.g. a user undo of an agent import, perhaps of a sheet with the same
+    /// name) goes on top of it; the restore still brings back the sheet this
+    /// removal stashed, never the top one in its place. Before removing, snapshots the sheet's full
     /// `Sheet` value, its comments, its sheet-scoped defined names, AND
     /// every pivot whose output lived on it (Task 4 fix — `remove_sheet`'s
     /// pivot cascade, added for `pivot.create`'s inverse, would otherwise
@@ -2708,6 +2733,13 @@ impl Session {
     /// removed (Task 5's xlsxy fix, mirrored here).
     fn ctl_sheet_remove(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
+        self.remove_sheet_at(si)
+    }
+
+    /// `sheet.remove` of sheet `si` (see
+    /// [`ctl_sheet_remove`](Self::ctl_sheet_remove)), also what a non-top
+    /// `sheet.restore-removed` replays to remove again the sheets it unwound.
+    fn remove_sheet_at(&mut self, si: usize) -> Result<String, String> {
         // A workbook must keep at least one sheet — `SheetPackage::remove_sheet`
         // enforces this too (and is still checked below as a safety net),
         // but checking it here FIRST avoids cloning a whole `Sheet` (plus
@@ -2768,6 +2800,17 @@ impl Session {
             .iter()
             .map(|d| d.scope.map(|s| self.pkg.workbook.sheets[s].name.clone()))
             .collect();
+        // The other sheets' CF and DV formulas, to find which of them the
+        // removal rewrites to `#REF!`.
+        let rules_before: Vec<(String, Vec<String>)> = self
+            .pkg
+            .workbook
+            .sheets
+            .iter_mut()
+            .enumerate()
+            .filter(|&(i, _)| i != si)
+            .map(|(_, sh)| (sh.name.clone(), rule_texts(sh)))
+            .collect();
         // The other sheets' Consolidate references, to find which of them the
         // removal rewrites to `#REF!`.
         let consolidate_before: Vec<(String, Vec<String>)> = self
@@ -2793,6 +2836,31 @@ impl Session {
                     .find(|sh| sh.name == sheet)
                     .and_then(|sh| sh.consolidate.as_ref())
                     .map(|k| k.refs.clone())
+                    .unwrap_or_default();
+                before
+                    .into_iter()
+                    .zip(after)
+                    .enumerate()
+                    .filter(|(_, (b, a))| b != a)
+                    .map(|(position, (before, after))| RewrittenConsolidate {
+                        sheet: sheet.clone(),
+                        position,
+                        before,
+                        after,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let rewritten_rules: Vec<RewrittenConsolidate> = rules_before
+            .into_iter()
+            .flat_map(|(sheet, before)| {
+                let after = self
+                    .pkg
+                    .workbook
+                    .sheets
+                    .iter_mut()
+                    .find(|sh| sh.name == sheet)
+                    .map(rule_texts)
                     .unwrap_or_default();
                 before
                     .into_iter()
@@ -2859,33 +2927,44 @@ impl Session {
             index: si,
             rewritten_names,
             rewritten_consolidate,
+            rewritten_rules,
+            serial: self.next_stash_serial,
         });
         let mut out = String::from(
             "{\"removed\":true,\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":",
         );
         json::push_str(&mut out, &name);
+        out.push_str(",\"stash\":");
+        out.push_str(&self.next_stash_serial.to_string());
+        self.next_stash_serial += 1;
         out.push_str("}},\"undoSteps\":0}");
         Ok(out)
     }
 
     /// `{name?}` -> `{sheet,name,undoSteps:0}` — plus the internal `inverse`
     /// (`sheet.remove` on the just-restored sheet's NEW index, so a
-    /// follow-up `sheet.remove` redoes the removal). The optional `name` is
-    /// the IDENTITY guard: `sheet.remove`'s inverse always supplies the name
-    /// of the sheet it removed, and this errors (`restore mismatch: …`) when
-    /// that name doesn't match the top of the stash stack — the failure mode where
-    /// an intervening `sheet.remove` put another stash on top, so a blind restore
-    /// would resurrect the wrong sheet. It also errors (`cannot restore …`)
-    /// when a sheet with the stashed name already exists (an intervening
-    /// same-name `sheet.add`), rather than minting a duplicate name. Both
-    /// checks run BEFORE the stash is consumed, so a rejected restore leaves
-    /// it intact for a correct later attempt. **INTERNAL-ONLY**: this
+    /// follow-up `sheet.remove`, by index, redoes the removal). The optional
+    /// `stash` and `name` are the IDENTITY guard: `sheet.remove`'s inverse
+    /// always supplies both, the serial of the stash it pushed and the name
+    /// of the sheet it removed, and that stash is restored even when an
+    /// intervening `sheet.remove` put another stash on top (one of the same
+    /// name too), so a blind restore of the top never resurrects the wrong
+    /// sheet. A `stash` no entry has, or one holding another name, errors
+    /// (`restore mismatch: …`) and never falls back to the name. Without
+    /// `stash` the topmost stash of `name` is restored (a name no stash has
+    /// is a mismatch), and with neither the top. It also errors (`cannot
+    /// restore …`) when a sheet with the stashed name, or with the name of a
+    /// stash above it, already exists (an intervening same-name `sheet.add`),
+    /// or a stash above it has its name or shares one with another above it,
+    /// rather than minting a duplicate name. These checks run BEFORE any stash is
+    /// consumed, so a rejected restore leaves the stack intact for a correct
+    /// later attempt. **INTERNAL-ONLY**: this
     /// verb exists solely so the host can invoke `sheet.remove`'s declared
     /// `inverse` through the normal ctl channel — Task 7 must NOT list it in
     /// `wasmVerbs`, so an external agent calling it through `CtlServer`
     /// still gets `"unknown verb 'sheet.restore-removed'"`.
     ///
-    /// Restores the most-recently-removed sheet from the top of
+    /// Restores the named (else the most recently removed) sheet from
     /// `Session::removed_sheet_stashes`: the full `Sheet` value (cells,
     /// formulas, drawings — everything `Sheet` itself carries), every
     /// comment (threaded and legacy), and every defined name that was
@@ -2897,16 +2976,23 @@ impl Session {
     /// theirs to `remove_sheet`). The restored sheet's autoFilter is written
     /// into its fresh part on save, with a hidden `_xlnm._FilterDatabase`
     /// (#690: a save writes a filter the model holds). The stashes are a
-    /// stack — each `sheet.remove` pushes one, and a successful restore pops
-    /// the top — so only the latest removal can be restored (a `name` that is
-    /// not the top's is a mismatch), and calling this with nothing stashed
-    /// errors (`"nothing to restore"`).
+    /// stack — each `sheet.remove` pushes one — and calling this with
+    /// nothing stashed errors (`"nothing to restore"`). An older stash is
+    /// restored by unwinding: the stashes above it are restored (latest
+    /// first), then it, then the sheets above it are removed again, oldest
+    /// first, each stashing afresh with its old `removed_active`. Every
+    /// sheet then stands where it would had the restored sheet never been
+    /// removed, and each still-stashed sheet's own `#REF!` names and index
+    /// are recorded in that frame. The history is cleared (as each removal
+    /// clears it), and the active sheet, cursor and viewport are put back
+    /// by the active sheet's name.
     ///
     /// Also reconstitutes every pivot that lived on the removed sheet (Task
     /// 4 fix — see [`RemovedSheetStash::pivots`] and
     /// [`ctl_reregister_pivot`](Self::ctl_reregister_pivot)) and refreshes
     /// them immediately, so `pivot.list` shows the pivot again and its
-    /// output is live without waiting for a follow-up `wb.recalc`.
+    /// output is live without waiting for a follow-up `wb.recalc` (the
+    /// sheets only unwound for a moment trigger no refresh).
     ///
     /// Active-sheet/viewport handling mirrors `sheet.remove`'s own rule in
     /// reverse: if the removed sheet WAS the active one, the restored sheet
@@ -2921,41 +3007,160 @@ impl Session {
     /// `SheetPackage::move_sheet`, which keeps the part list, the `<sheet>`
     /// elements and every stored sheet index in step. When that shifts other
     /// sheets the undo and redo history, which names sheets by index, is
-    /// cleared (as `sheet.remove` does). The global names the removal turned
-    /// into `#REF!` get their text back.
+    /// cleared (as `sheet.remove` does). The global names, Consolidate
+    /// references and other sheets' CF and DV formulas the removal turned
+    /// into `#REF!` get their text back (unless they changed since).
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
-        // Peek at the stash name WITHOUT consuming it, so a mismatch (or a
-        // name collision) leaves the stash intact for a correct later restore.
-        let stashed_name = self
-            .removed_sheet_stashes
-            .last()
-            .map(|s| s.name.clone())
-            .ok_or("nothing to restore")?;
+        if self.removed_sheet_stashes.is_empty() {
+            return Err("nothing to restore".into());
+        }
         // Identity guard: the inverse of `sheet.remove` names the sheet it
-        // removed. If an intervening `sheet.remove` (e.g. a user undo of an
-        // agent import) has put another stash on top, the requested
-        // name won't match — error rather than silently restoring the wrong
-        // (most-recently-removed) sheet. `name` is optional for legacy/direct
-        // callers, but `sheet.remove`'s inverse always carries it.
-        if let Some(req) = args.get_str("name") {
-            if req != stashed_name {
+        // removed, and that sheet is the one restored, however many removals
+        // went on top of it since (e.g. a user undo of an agent import): never
+        // the most-recently-removed one in its place. `name` is optional for
+        // legacy/direct callers (the top), but `sheet.remove`'s inverse always
+        // carries it.
+        // The inverse's `stash` serial names the very removal, which a name
+        // cannot once a later removal stashed a sheet of the same name (an
+        // imported sheet named like a removed one).
+        let k = match (args.get_usize("stash"), args.get_str("name")) {
+            (Some(serial), req) => self
+                .removed_sheet_stashes
+                .iter()
+                .position(|st| st.serial == serial && req.is_none_or(|n| n == st.name))
+                .ok_or_else(|| {
+                    let name = req.map(|n| format!(" \"{n}\"")).unwrap_or_default();
+                    format!("restore mismatch: removed sheet{name} (stash {serial}) is not stashed")
+                })?,
+            (None, None) => self.removed_sheet_stashes.len() - 1,
+            (None, Some(req)) => self
+                .removed_sheet_stashes
+                .iter()
+                .rposition(|st| st.name == req)
+                .ok_or_else(|| format!("restore mismatch: no stashed sheet named \"{req}\""))?,
+        };
+        // Every entry from `k` up comes back for a moment, so each must be
+        // free to: a sheet with its name may have been re-created after
+        // removal (an intervening same-name `sheet.add`; `add_sheet` doesn't
+        // dedupe, so restoring would mint a duplicate sheet name), or two of
+        // them may share one. Refuse before anything changes, so a rejected
+        // restore leaves the stack intact for a correct later attempt.
+        let names: Vec<&str> = self.removed_sheet_stashes[k..]
+            .iter()
+            .map(|st| st.name.as_str())
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            if self.pkg.workbook.sheet_index(name).is_some() {
+                return Err(if i == 0 {
+                    format!("cannot restore \"{name}\": a sheet with that name already exists")
+                } else {
+                    format!(
+                        "cannot restore \"{}\": a sheet named \"{name}\", which was removed after it, exists again",
+                        names[0]
+                    )
+                });
+            }
+            if i > 0 && names[0].eq_ignore_ascii_case(name) {
                 return Err(format!(
-                    "restore mismatch: stashed sheet is \"{stashed_name}\", not \"{req}\""
+                    "cannot restore \"{}\": a sheet named \"{name}\" was removed after it",
+                    names[0]
+                ));
+            }
+            if names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                return Err(format!(
+                    "cannot restore \"{}\": two sheets removed after it are named \"{name}\"",
+                    names[0]
                 ));
             }
         }
-        // A sheet with the stashed name may have been re-created after removal
-        // (an intervening same-name `sheet.add`). `add_sheet` doesn't dedupe,
-        // so restoring would mint a duplicate sheet name — refuse instead.
-        if self.pkg.workbook.sheet_index(&stashed_name).is_some() {
-            return Err(format!(
-                "cannot restore \"{stashed_name}\": a sheet with that name already exists"
-            ));
+        // The sheets removed after `k`, oldest first, to remove again once
+        // `k` is back: each entry's positions hold only in its own frame, so
+        // the stack is unwound to `k` and the later removals replayed, each
+        // stashing afresh.
+        let later: Vec<(String, bool, usize)> = self.removed_sheet_stashes[k + 1..]
+            .iter()
+            .map(|st| (st.name.clone(), st.removed_active, st.serial))
+            .collect();
+        let view = (
+            self.pkg.workbook.sheets[self.active].name.clone(),
+            self.cur,
+            self.anchor,
+            self.window,
+        );
+        // A later sheet's pivots are re-registered and removed again with it;
+        // only `k`'s own call for a refresh.
+        for _ in &later {
+            self.restore_top();
         }
+        let name = self.removed_sheet_stashes[k].name.clone();
+        let removed_active = self.removed_sheet_stashes[k].removed_active;
+        let had_pivots = self.restore_top();
+        for (later_name, was_active, serial) in &later {
+            let si = self
+                .pkg
+                .workbook
+                .sheet_index(later_name)
+                .expect("an unwound sheet is back under its name");
+            self.remove_sheet_at(si)
+                .expect("a sheet just restored can be removed again");
+            let stash = self.removed_sheet_stashes.last_mut().expect("just pushed");
+            stash.removed_active = *was_active;
+            // Its inverse, already handed out, names this serial.
+            stash.serial = *serial;
+        }
+        let new_idx = self
+            .pkg
+            .workbook
+            .sheet_index(&name)
+            .expect("the restored sheet is live");
+        if !later.is_empty() {
+            // The unwinding moved the active sheet and cursor about: put them
+            // back as they were, or on the restored sheet when it was the
+            // active one at its removal (as a top restore does).
+            if removed_active {
+                self.active = new_idx;
+                self.cur = (0, 0);
+                self.anchor = None;
+                self.window.0 = 0;
+                self.window.1 = 0;
+            } else {
+                let (active, cur, anchor, window) = view;
+                self.active = self.pkg.workbook.sheet_index(&active).unwrap_or(0);
+                self.cur = cur;
+                self.anchor = anchor;
+                self.window = window;
+            }
+        }
+        if had_pivots {
+            // Makes the restored output live again immediately (matching
+            // `create_pivot`'s own "refresh right away" behavior), not just
+            // eventually-consistent on the next `wb.recalc`. Once, after the
+            // later removals are replayed, so no pivot reads a sheet only
+            // unwound for a moment.
+            gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
+        }
+        self.rebuild_engine();
+        self.dirty = true;
+        let mut out = String::from("{\"sheet\":");
+        out.push_str(&new_idx.to_string());
+        out.push_str(",\"name\":");
+        json::push_str(&mut out, &name);
+        out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
+        out.push_str(&new_idx.to_string());
+        out.push_str("}},\"undoSteps\":0}");
+        Ok(out)
+    }
+
+    /// Pop the top of `Session::removed_sheet_stashes` and put its sheet
+    /// back (see [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed)),
+    /// leaving the pivot refresh and the engine rebuild to the caller.
+    /// Whether the sheet had pivots. The caller has checked that no live
+    /// sheet has the stashed name.
+    fn restore_top(&mut self) -> bool {
         let stash = self
             .removed_sheet_stashes
             .pop()
-            .expect("stash presence verified above");
+            .expect("stash presence verified by the caller");
         let appended = self.pkg.add_sheet(&stash.name);
         // Back to its old place in the tab order. `move_sheet` carries the
         // part, the `<sheet>` element and every stored sheet index (names,
@@ -3010,6 +3215,20 @@ impl Session {
                 *text = r.before.clone();
             }
         }
+        // So do the CF and DV formulas it rewrote.
+        for r in &stash.rewritten_rules {
+            let sheets = &mut self.pkg.workbook.sheets;
+            let Some(sh) = sheets.iter_mut().find(|sh| sh.name == r.sheet) else {
+                continue;
+            };
+            let mut at = 0;
+            gridcore::edit::for_each_rule_formula_text(sh, |text| {
+                if at == r.position && *text == r.after {
+                    *text = r.before.clone();
+                }
+                at += 1;
+            });
+        }
         // Re-point each name's scope at the NEW index — the old one may no
         // longer even exist (sheets above it shifted down on removal).
         // Ascending, each at its old index (or the end, if the list shrank).
@@ -3034,12 +3253,6 @@ impl Session {
         for piv in stash.pivots {
             self.ctl_reregister_pivot(piv, new_idx);
         }
-        if had_pivots {
-            // Makes the restored output live again immediately (matching
-            // `create_pivot`'s own "refresh right away" behavior), not just
-            // eventually-consistent on the next `wb.recalc`.
-            gridcore::pivot::refresh_pivots(&mut self.pkg.workbook);
-        }
         if stash.removed_active {
             self.active = new_idx;
             self.cur = (0, 0);
@@ -3047,16 +3260,8 @@ impl Session {
             self.window.0 = 0;
             self.window.1 = 0;
         }
-        self.rebuild_engine();
         self.dirty = true;
-        let mut out = String::from("{\"sheet\":");
-        out.push_str(&new_idx.to_string());
-        out.push_str(",\"name\":");
-        json::push_str(&mut out, &stash.name);
-        out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
-        out.push_str(&new_idx.to_string());
-        out.push_str("}},\"undoSteps\":0}");
-        Ok(out)
+        had_pivots
     }
 
     /// Reinsert a pivot into `workbook.pivots`, pointed at `dest_sheet`, as
@@ -5933,7 +6138,7 @@ mod tests {
         assert!(out.contains("\"removed\":true"), "{out}");
         assert!(
             out.contains(
-                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\"}}"
+                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\",\"stash\":0}}"
             ),
             "{out}"
         );
@@ -6150,20 +6355,388 @@ mod tests {
         assert!(out.contains("nothing to restore"), "{out}");
     }
 
-    #[test]
-    fn ctl_sheet_restore_removed_out_of_order_name_is_a_mismatch_and_keeps_the_stack() {
+    /// The sheet names, in tab order.
+    fn sheet_order(s: &Session) -> Vec<String> {
+        s.pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|x| x.name.clone())
+            .collect()
+    }
+
+    /// The stashed sheet names, oldest first.
+    fn stash_order(s: &Session) -> Vec<String> {
+        s.removed_sheet_stashes
+            .iter()
+            .map(|st| st.name.clone())
+            .collect()
+    }
+
+    /// A session over [Sheet1, A, B, C], each sheet's A1 its own number.
+    fn abc_session() -> Session {
         let mut s = Session::open(&sample_xlsx()).expect("open");
-        s.ctl(r#"{"verb":"sheet.add","args":{"name":"A"}}"#);
-        s.ctl(r#"{"verb":"sheet.add","args":{"name":"B"}}"#);
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.add","args":{{"name":"{name}"}}}}"#
+            ));
+        }
+        for i in 1..4 {
+            s.active = i;
+            s.dispatch(&format!("set\t0\t0\t{i}"));
+        }
+        s.active = 0;
+        s
+    }
+
+    fn restore(s: &mut Session, name: &str) -> String {
+        s.ctl(&format!(
+            r#"{{"verb":"sheet.restore-removed","args":{{"name":"{name}"}}}}"#
+        ))
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_restores_a_non_top_entry_and_keeps_the_rest_stacked() {
+        let mut s = abc_session();
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let out = restore(&mut s, "A");
+        assert!(out.contains("\"sheet\":1,\"name\":\"A\""), "{out}");
+        assert!(
+            out.contains("\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":1}}"),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), ["Sheet1", "A"]);
+        assert_eq!(stash_order(&s), ["B", "C"]);
+        let a1 = s.pkg.workbook.sheets[1].cell(0, 0).map(|c| c.value.clone());
+        assert_eq!(a1, Some(gridcore::sheet::CellValue::Number(1.0)));
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_puts_every_sheet_back_at_its_index_through_a_save()
+    {
+        let mut s = abc_session();
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let steps: [(&str, &[&str]); 3] = [
+            ("A", &["Sheet1", "A"]),
+            ("C", &["Sheet1", "A", "C"]),
+            ("B", &["Sheet1", "A", "B", "C"]),
+        ];
+        for (name, want) in steps {
+            let out = restore(&mut s, name);
+            assert!(out.contains("\"ok\":true"), "{name}: {out}");
+            assert_eq!(sheet_order(&s), want, "{name}");
+            let re = Session::open(&s.save()).expect("reopen");
+            assert_eq!(sheet_order(&re), want, "{name} after a save");
+            for (i, sheet) in re.pkg.workbook.sheets.iter().enumerate().skip(1) {
+                let v = sheet.cell(0, 0).map(|c| c.value.clone());
+                let n = ["A", "B", "C"]
+                    .iter()
+                    .position(|x| *x == sheet.name)
+                    .unwrap()
+                    + 1;
+                assert_eq!(
+                    v,
+                    Some(gridcore::sheet::CellValue::Number(n as f64)),
+                    "{name}: sheet {i}"
+                );
+            }
+        }
+        assert!(s.removed_sheet_stashes.is_empty());
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_restores_a_name_scoped_to_a_later_removed_sheet() {
+        let mut s = abc_session();
+        // Scoped to C and reading A: A's removal turns it into `#REF!` while
+        // it sits in the name list, then C's removal stashes it so.
+        let names = [("n", Some(3), "A!$A$1"), ("g", None, "A!$A$1+B!$A$1")];
+        for (name, scope, formula) in names {
+            s.pkg.workbook.defined_names.push(DefinedName {
+                name: name.into(),
+                scope,
+                formula: formula.into(),
+            });
+        }
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let formula = |s: &Session, n: &str| {
+            let d = s.pkg.workbook.defined_names.iter().find(|d| d.name == n);
+            d.map(|d| (d.formula.clone(), d.scope))
+        };
+        assert_eq!(formula(&s, "n"), None);
+        restore(&mut s, "A");
+        restore(&mut s, "C");
+        assert_eq!(formula(&s, "n"), Some(("A!$A$1".into(), Some(2))));
+        restore(&mut s, "B");
+        assert_eq!(formula(&s, "n"), Some(("A!$A$1".into(), Some(3))));
+        assert_eq!(formula(&s, "g"), Some(("A!$A$1+B!$A$1".into(), None)));
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_keeps_active_by_name() {
+        let mut s = abc_session();
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"D"}}"#);
+        s.active = 4;
+        s.cur = (3, 3);
+        s.anchor = Some((5, 5));
+        s.window = (2, 1, 20, 10);
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
-        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{"name":"A"}}"#);
-        assert!(out.contains("restore mismatch: stashed sheet is"), "{out}");
-        assert_eq!(s.removed_sheet_stashes.len(), 2);
-        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{"name":"B"}}"#);
-        assert!(out.contains("\"name\":\"B\""), "{out}");
-        let out = s.ctl(r#"{"verb":"sheet.restore-removed","args":{"name":"A"}}"#);
+        assert_eq!(s.active, 2);
+        let out = restore(&mut s, "A");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "A", "C", "D"]);
+        assert_eq!(s.active, 3, "still D");
+        assert_eq!(
+            (s.cur, s.anchor, s.window),
+            ((3, 3), Some((5, 5)), (2, 1, 20, 10))
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_of_the_removed_active_sheet() {
+        let mut s = abc_session();
+        s.active = 1; // A
+        s.cur = (2, 2);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        assert_eq!(s.pkg.workbook.sheets[s.active].name, "B");
+        s.cur = (4, 4);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        s.cur = (6, 6);
+        let active = s.pkg.workbook.sheets[s.active].name.clone();
+        assert_eq!(active, "C");
+        restore(&mut s, "A");
+        assert_eq!(sheet_order(&s), ["Sheet1", "A", "C"]);
+        assert_eq!((s.active, s.cur, s.anchor), (1, (0, 0), None), "A, afresh");
+        // B was the active one at its own removal, and still is on record.
+        assert!(s.removed_sheet_stashes[0].removed_active);
+        s.cur = (6, 6);
+        restore(&mut s, "B");
+        assert_eq!(sheet_order(&s), ["Sheet1", "A", "B", "C"]);
+        assert_eq!((s.active, s.cur), (2, (0, 0)));
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_unknown_name_is_a_mismatch_and_changes_nothing() {
+        let mut s = abc_session();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        let out = restore(&mut s, "Z");
+        assert!(
+            out.contains("\"ok\":false") && out.contains("restore mismatch"),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), ["Sheet1", "C"]);
+        assert_eq!(stash_order(&s), ["A", "B"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_collision_above_refuses_before_any_change() {
+        let mut s = abc_session();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"b"}}"#);
+        let out = restore(&mut s, "A");
+        assert!(
+            out.contains(r#"cannot restore \"A\": a sheet named \"B\", which was removed after it, exists again"#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), ["Sheet1", "C", "b"]);
+        assert_eq!(stash_order(&s), ["A", "B"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_refuses_duplicate_names_above() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        for verb in [
+            r#"{"verb":"sheet.add","args":{"name":"A"}}"#,
+            r#"{"verb":"sheet.add","args":{"name":"B"}}"#,
+            r#"{"verb":"sheet.add","args":{"name":"X"}}"#,
+            r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#,
+            r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#,
+            r#"{"verb":"sheet.add","args":{"name":"A"}}"#,
+            r#"{"verb":"sheet.remove","args":{"sheet":"X"}}"#,
+            r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#,
+        ] {
+            let out = s.ctl(verb);
+            assert!(out.contains("\"ok\":true"), "{verb}: {out}");
+        }
+        assert_eq!(stash_order(&s), ["B", "A", "X", "A"]);
+        let out = restore(&mut s, "B");
+        assert!(
+            out.contains("\"ok\":false") && out.contains(r#"are named \"A\""#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), ["Sheet1"]);
+        assert_eq!(stash_order(&s), ["B", "A", "X", "A"]);
+        // The top A is still the one a name restores.
+        let out = restore(&mut s, "A");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(stash_order(&s), ["B", "A", "X"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_by_stash_never_takes_a_later_sheet_of_the_same_name() {
+        // Remove A, import a CSV named A, undo the import: the stack is
+        // [A, A(imported)]. A's inverse names its own stash, so it never
+        // restores the imported A, which a name alone would (the top A); and
+        // as the imported A cannot come back beside it, it is refused.
+        let mut s = abc_session();
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        let imported =
+            s.ctl(r#"{"verb":"sheet.import-csv","args":{"name":"A","text":"x,y\n1,2"}}"#);
+        assert!(imported.contains("\"name\":\"A\""), "{imported}");
+        s.ctl(&extract_inverse(&imported));
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        assert_eq!(stash_order(&s), ["A", "A", "B"]);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(
+            out.contains(r#"cannot restore \"A\": a sheet named \"A\" was removed after it"#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), ["Sheet1", "C"]);
+        assert_eq!(stash_order(&s), ["A", "A", "B"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_unknown_or_misnamed_stash_is_a_mismatch() {
+        let mut s = abc_session();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        for args in [
+            r#"{"name":"B","stash":7}"#,
+            r#"{"name":"A","stash":1}"#,
+            r#"{"stash":9}"#,
+        ] {
+            let out = s.ctl(&format!(
+                r#"{{"verb":"sheet.restore-removed","args":{args}}}"#
+            ));
+            assert!(
+                out.contains("\"ok\":false") && out.contains("restore mismatch"),
+                "{args}: {out}"
+            );
+        }
+        assert_eq!(sheet_order(&s), ["Sheet1", "C"]);
+        assert_eq!(stash_order(&s), ["A", "B"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_stash_serial_survives_a_non_top_restore() {
+        let mut s = abc_session();
+        let inverses: Vec<String> = ["A", "B", "C"]
+            .iter()
+            .map(|n| {
+                let r = s.ctl(&format!(
+                    r#"{{"verb":"sheet.remove","args":{{"sheet":"{n}"}}}}"#
+                ));
+                extract_inverse(&r)
+            })
+            .collect();
+        assert!(inverses[2].contains("\"stash\":2"), "{}", inverses[2]);
+        // A comes back under B and C, which are stashed again on the way.
+        let out = s.ctl(&inverses[0]);
         assert!(out.contains("\"name\":\"A\""), "{out}");
+        // Their own inverses, handed out before, still find them.
+        let out = s.ctl(&inverses[1]);
+        assert!(out.contains("\"name\":\"B\""), "{out}");
+        let out = s.ctl(&inverses[2]);
+        assert!(out.contains("\"name\":\"C\""), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "A", "B", "C"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_refuses_when_a_later_removal_has_its_name() {
+        // Remove A, add a, remove a: restoring A would need a back beside it.
+        let mut s = abc_session();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"a"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"a"}}"#);
+        let out = restore(&mut s, "A");
+        assert!(
+            out.contains(r#"cannot restore \"A\": a sheet named \"a\" was removed after it"#),
+            "{out}"
+        );
+        assert_eq!(stash_order(&s), ["A", "a"]);
+    }
+
+    /// Sheet `on`'s DV `formula1` and first CF rule's formula.
+    fn rule_formulas(s: &Session, on: &str) -> (String, String) {
+        let i = s.pkg.workbook.sheet_index(on).unwrap();
+        let sh = &s.pkg.workbook.sheets[i];
+        let cf = match &sh.cond_formats[0].rules[0].kind {
+            gridcore::sheet::CfKind::Expression { formula } => formula.clone(),
+            other => panic!("{other:?}"),
+        };
+        (sh.validations[0].formula1.clone(), cf)
+    }
+
+    /// Give sheet `on` a list DV and an expression CF rule reading C.
+    fn add_rules_reading_c(s: &mut Session, on: &str) {
+        let i = s.pkg.workbook.sheet_index(on).unwrap();
+        let sh = &mut s.pkg.workbook.sheets[i];
+        sh.validations.push(gridcore::sheet::DataValidation {
+            ranges: vec![(0, 1, 4, 1)],
+            kind: "list".into(),
+            formula1: "C!$A$1:$A$5".into(),
+            ..Default::default()
+        });
+        sh.cond_formats.push(gridcore::sheet::CondFormat {
+            ranges: vec![(0, 2, 4, 2)],
+            rules: vec![gridcore::sheet::CfRule {
+                kind: gridcore::sheet::CfKind::Expression {
+                    formula: "C!$A$1>0".into(),
+                },
+                dxf_id: None,
+                priority: 1,
+            }],
+            ix: None,
+        });
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_puts_back_the_cf_and_dv_formulas_a_replay_rewrote() {
+        let mut s = abc_session();
+        add_rules_reading_c(&mut s, "A");
+        let original = rule_formulas(&s, "A");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        restore(&mut s, "A");
+        // C is still gone, so A's rules read `#REF!` for now ...
+        let (dv, cf) = rule_formulas(&s, "A");
+        assert!(dv.contains("#REF!") && cf.contains("#REF!"), "{dv} {cf}");
+        // ... and C's restore gives them their text back.
+        restore(&mut s, "C");
+        assert_eq!(rule_formulas(&s, "A"), original);
+        // A save writes the DV back as it reads now (the CF block, built in
+        // memory, is not written by a save).
+        let re = Session::open(&s.save()).expect("reopen");
+        let i = re.pkg.workbook.sheet_index("A").unwrap();
+        assert_eq!(
+            re.pkg.workbook.sheets[i].validations[0].formula1,
+            original.0
+        );
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_puts_back_the_cf_and_dv_formulas_its_removal_rewrote() {
+        let mut s = abc_session();
+        add_rules_reading_c(&mut s, "Sheet1");
+        let original = rule_formulas(&s, "Sheet1");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_ne!(rule_formulas(&s, "Sheet1"), original);
+        restore(&mut s, "C");
+        assert_eq!(rule_formulas(&s, "Sheet1"), original);
     }
 
     #[test]
@@ -6438,17 +7011,17 @@ mod tests {
     // -- Fix 1: identity-guarded sheet restore ---------------------------
 
     #[test]
-    fn ctl_sheet_restore_identity_guard_rejects_a_stash_clobber_interleave() {
-        // The exact CRITICAL interleave. Agent removes A (stash=A); agent
-        // imports a CSV (a new sheet); then the import's OWN inverse
-        // (sheet.remove of that imported sheet) goes on top of the
-        // stash stack. Applying A's restore inverse must now ERROR on the name
-        // mismatch, never silently resurrect the imported sheet in A's place.
+    fn ctl_sheet_restore_identity_guard_restores_the_named_sheet_under_a_stash_interleave() {
+        // The CRITICAL interleave. Agent removes A (stash=A); agent imports a
+        // CSV (a new sheet); then the import's OWN inverse (sheet.remove of
+        // that imported sheet) goes on top of the stash stack. Applying A's
+        // restore inverse must bring back A, never the imported sheet in A's
+        // place, and leave the import's stash for its own redo.
         let mut s = two_sheet_session(); // [Sheet1, Sheet2] — Sheet2 is our "A"
         let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Sheet2"}}"#);
         assert!(
             removed.contains(
-                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\"}}"
+                "\"inverse\":{\"verb\":\"sheet.restore-removed\",\"args\":{\"name\":\"Sheet2\",\"stash\":0}}"
             ),
             "sheet.remove's inverse must name the removed sheet: {removed}"
         );
@@ -6457,21 +7030,24 @@ mod tests {
             s.ctl(r#"{"verb":"sheet.import-csv","args":{"name":"Imp","text":"x,y\n1,2"}}"#);
         assert!(imported.contains("\"name\":\"Imp\""), "{imported}");
         // Apply the IMPORT's inverse (sheet.remove of the imported sheet) —
-        // this clobbers the stash, replacing Sheet2 with Imp.
+        // this puts Imp's stash on top of Sheet2's.
         let clobber = s.ctl(&extract_inverse(&imported));
         assert!(clobber.contains("\"removed\":true"), "{clobber}");
-        // Now apply A's (Sheet2's) restore inverse: the names no longer match.
+        let redo_import = extract_inverse(&clobber);
+        // Now apply A's (Sheet2's) restore inverse: Sheet2 comes back.
         let restore = s.ctl(&extract_inverse(&removed));
         assert!(
-            restore.contains("\"ok\":false") && restore.contains("restore mismatch"),
-            "the clobbered stash must be detected, not mis-restored: {restore}"
+            restore.contains("\"ok\":true") && restore.contains("\"name\":\"Sheet2\""),
+            "the named sheet is restored, not the top: {restore}"
         );
-        // And nothing was restored — only Sheet1 remains.
-        let v = s.view_json(None);
-        assert!(
-            v.contains("\"sheets\":[\"Sheet1\"]"),
-            "a rejected restore must not resurrect the wrong sheet: {v}"
-        );
+        assert_eq!(sheet_order(&s), ["Sheet1", "Sheet2"]);
+        assert_eq!(stash_order(&s), ["Imp"]);
+        // And the import's redo still brings back Imp, with its data.
+        let redo = s.ctl(&redo_import);
+        assert!(redo.contains("\"name\":\"Imp\""), "{redo}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "Sheet2", "Imp"]);
+        let x = s.pkg.workbook.sheets[2].cell(0, 0).map(|c| c.value.clone());
+        assert_eq!(x, Some(gridcore::sheet::CellValue::Text("x".into())));
     }
 
     #[test]
