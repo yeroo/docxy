@@ -49,7 +49,7 @@ mod win {
         Align, Cell, CellValue, Styles, Xf, cell_name, parse_cell_name, parse_range_name,
     };
     use gridcore::xlsx::{
-        SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as,
+        SaveCalc, SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as_with,
     };
 
     use windows::Win32::Foundation::{
@@ -397,8 +397,14 @@ mod win {
             // the format last used.
             let kind = kind.or(self.kind);
             self.recalc_if_dirty();
+            // A macro-free kind evaluates the readers of the cells it turns
+            // into `#REF!` on the book's clock.
+            let calc = SaveCalc {
+                clock: self.engine.clock,
+                seed: self.engine.seed,
+            };
             let bytes = match kind {
-                Some(kind) => save_xlsx_as(&self.pkg, kind),
+                Some(kind) => save_xlsx_as_with(&self.pkg, kind, calc),
                 None => save_xlsx(&self.pkg),
             };
             std::fs::write(path, bytes)?;
@@ -2519,6 +2525,7 @@ mod win {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use gridcore::xlsx::save_xlsx_as;
 
         /// A Book whose cell (0, r, c) has the xf `xf`.
         fn formatted(r: u32, c: u32, xf: Xf) -> Book {
@@ -2743,6 +2750,37 @@ mod win {
             assert!(book.pkg.has_macro_sheets());
             assert_eq!(book.pkg.workbook.sheets.len(), 2, "the live sheet count");
             assert_eq!(book.sheet_name(1), "Macro1");
+        }
+
+        /// #1723: `SaveAs "x.xlsx", 51` evaluates a clock formula that reads
+        /// a cell it turns into `#REF!` on the book's clock.
+        #[test]
+        fn save_as_xlsx_evaluates_the_ref_readers_on_the_books_clock() {
+            let mut pkg = new_xlsx();
+            pkg.add_sheet("Macro1");
+            let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+                .replace(
+                    r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml""#,
+                    r#"Type="http://schemas.microsoft.com/office/2006/relationships/xlMacrosheet" Target="worksheets/sheet2.xml""#,
+                );
+            pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+            pkg.workbook.sheets[0].set_cell(0, 0, Cell::formula("Macro1!A1+1"));
+            pkg.workbook.sheets[0].set_cell(0, 1, Cell::formula("IF(ISERROR(A1),NOW(),0)"));
+            let mut book = Book::new();
+            book.pkg = load_xlsx(&save_xlsx_as(&pkg, SpreadsheetKind::MacroWorkbook)).unwrap();
+            book.engine = Engine::new(&book.pkg.workbook);
+            book.engine.clock = Some(45_306.25);
+            let path =
+                std::env::temp_dir().join(format!("xlcomshim-1723-{}.xlsx", std::process::id()));
+            let path = path.to_str().unwrap();
+            book.save_as(path, kind_for(Some(51), path)).unwrap();
+            let saved = load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!saved.has_macro_sheets());
+            assert_eq!(
+                saved.workbook.sheets[0].cell(0, 1).unwrap().value,
+                CellValue::Number(45_306.25)
+            );
         }
 
         /// Save keeps the type the last SaveAs chose: `SaveAs "out", 51` then
