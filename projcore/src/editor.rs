@@ -1573,7 +1573,37 @@ impl Editor {
             return Ok(false);
         }
         self.snapshot();
-        self.proj.tasks[i].notes = notes;
+        let task = &mut self.proj.tasks[i];
+        task.notes = notes;
+        // New plain text: the old formatting does not describe it (#1801).
+        task.rich_notes = None;
+        self.changed();
+        Ok(true)
+    }
+
+    /// Set a task's notes from a [`crate::richtext`] value as ONE undo step
+    /// (#1801): `notes` becomes its plain text (newline-normalised, empty
+    /// removes the notes) and `rich_notes` its canonical markup, kept only
+    /// when it formats something (`richtext::split_notes`). A value that is
+    /// not markup is plain text. Equal plain text with other formatting is a
+    /// change; the value a task already has changes nothing (`Ok(false)`). A
+    /// blank row cannot take notes.
+    pub fn set_rich_notes(&mut self, uid: i32, value: &str) -> Result<bool, String> {
+        let i = self.index(uid)?;
+        if self.proj.tasks[i].is_null {
+            return Err("A blank row cannot take notes".into());
+        }
+        let (notes, rich) = crate::richtext::split_notes(value);
+        let task = &self.proj.tasks[i];
+        if task.notes.as_deref().unwrap_or("") == notes.as_deref().unwrap_or("")
+            && task.rich_notes == rich
+        {
+            return Ok(false);
+        }
+        self.snapshot();
+        let task = &mut self.proj.tasks[i];
+        task.notes = notes;
+        task.rich_notes = rich;
         self.changed();
         Ok(true)
     }
