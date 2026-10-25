@@ -1200,7 +1200,8 @@ fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {
 }
 
 /// Before the sheets named in `removed` leave the workbook, turn every cell
-/// formula's reference to one of them into `#REF!`
+/// formula's reference to one of them into `#REF!`, except a 3-D span whose
+/// end sheet goes, which shrinks to the sheets left
 /// ([`crate::formula::remove_sheet_refs_in_expr`]). The formulas
 /// [`rename_sheet`] rewrites are the ones covered (shared groups were
 /// expanded at load); a formula that names none of them keeps its text
@@ -1210,7 +1211,8 @@ fn rename_sheet_in_rule(src: &mut String, old: &str, new_name: &str) {
 /// ([`crate::engine::eval_formula_at`]), so `IFERROR(#REF!,0)` caches 0
 /// rather than `#REF!`. An array formula's whole block (its `spill`) takes
 /// the anchor's value, which is right once the removed range has collapsed
-/// to the scalar `#REF!`. Only the rewritten cells are evaluated here: a cell
+/// to the scalar `#REF!` (a shrunk span's block is recalculated with the
+/// rest by the caller). Only the rewritten cells are evaluated here: a cell
 /// that reads one keeps its cached value, and a volatile formula keeps its
 /// own. The rewritten cells' keys come back, for
 /// [`crate::engine::Engine::recalc_dependents_of`] to bring their readers up
@@ -1298,7 +1300,8 @@ pub fn sheet_order(wb: &Workbook) -> Vec<String> {
 /// The rules' part of [`remove_sheet_refs`]: every conditional-formatting
 /// formula (a rule's, a threshold's, an Excel 2010 one's) and data-validation
 /// formula on any sheet that names a sheet in `removed` now reads `#REF!`, as
-/// a cell's does. Text that names none stays as loaded. Idempotent.
+/// a cell's does, a 3-D span whose end sheet goes shrinking to the sheets
+/// left instead. Text that names none stays as loaded. Idempotent.
 pub fn remove_sheet_refs_in_rules(wb: &mut Workbook, removed: &[String]) {
     if removed.is_empty() {
         return;

@@ -3752,7 +3752,8 @@ impl SheetPackage {
     /// there is no macro sheet: every defined name marked `xlm`, `function`
     /// or `vbProcedure`, and every name whose formula refers to a removed
     /// sheet (`Auto_Open=Macro1!$A$1`). A cell formula that refers to a
-    /// removed sheet keeps its cell, with that reference as `#REF!`. A
+    /// removed sheet keeps its cell, with that reference as `#REF!` (a 3-D
+    /// span whose end sheet goes shrinks to the sheets left instead). A
     /// workbook of nothing but macro sheets first gains a blank worksheet, so
     /// one remains. The readers of a rewritten cell are evaluated on
     /// `calc`'s clock and seed. Returns whether there was anything to drop.
@@ -11012,13 +11013,29 @@ impl SheetPackage {
     }
 
     /// Delete sheet `idx` the way a person does: the cell formulas that name
-    /// it read `#REF!` (as Excel turns them), [`Self::remove_sheet`] runs, then
-    /// the cells that read a rewritten cell or a name it turned to `#REF!`
-    /// recalculate, so the file is right before Excel recalculates. A refusal
-    /// (the last sheet, no such sheet) changes nothing.
+    /// it read `#REF!` (as Excel turns them; a 3-D span whose end sheet goes
+    /// shrinks to the sheets left), [`Self::remove_sheet`] runs, then the
+    /// cells that read a rewritten cell or a name it rewrote recalculate, so
+    /// the file is right before Excel recalculates. A refusal (the last
+    /// sheet, no such sheet) changes nothing.
     pub fn delete_sheet(&mut self, idx: usize) -> bool {
+        match self.delete_sheet_uncalculated(idx) {
+            Some(true) => {
+                let mut engine = crate::engine::Engine::new(&self.workbook);
+                engine.recalc_all(&mut self.workbook);
+                true
+            }
+            Some(false) => true,
+            None => false,
+        }
+    }
+
+    /// [`Self::delete_sheet`] without the recalculation, for a host that runs
+    /// its own on its engine's clock: `Some(true)` when cells need it (a cell
+    /// or a name was rewritten), `None` on a refusal.
+    pub fn delete_sheet_uncalculated(&mut self, idx: usize) -> Option<bool> {
         if self.workbook.sheets.len() <= 1 || idx >= self.workbook.sheets.len() {
-            return false;
+            return None;
         }
         let gone = [self.workbook.sheets[idx].name.clone()];
         let rewritten = crate::edit::remove_sheet_refs(&mut self.workbook, &gone);
@@ -11038,11 +11055,7 @@ impl SheetPackage {
             .iter()
             .map(|d| &d.formula)
             .ne(names.iter());
-        if removed && (!rewritten.is_empty() || renamed) {
-            let mut engine = crate::engine::Engine::new(&self.workbook);
-            engine.recalc_all(&mut self.workbook);
-        }
-        removed
+        removed.then_some(!rewritten.is_empty() || renamed)
     }
 
     pub fn remove_sheet(&mut self, idx: usize) -> bool {
@@ -11066,7 +11079,8 @@ impl SheetPackage {
             }
         }
         // A name that refers to the sheet reads `#REF!` from now on, as in
-        // Excel; the removed sheet's own scoped names are dropped below.
+        // Excel (a 3-D span whose end sheet goes shrinks to the sheets left);
+        // the removed sheet's own scoped names are dropped below.
         // Cell formulas are left to the caller ([`Self::delete_sheet`] does).
         let gone = [self.workbook.sheets[idx].name.clone()];
         let order = crate::edit::sheet_order(&self.workbook);
