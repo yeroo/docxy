@@ -946,8 +946,11 @@ worth knowing:
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
   first. An undo out of order (a removal with later ones still stashed, as
-  after undoing a remove and then an import) restores the sheet it names and
-  leaves the later ones stashed, each sheet back where it stood. A removal
+  after undoing a remove and then an import) restores the sheet that removal
+  stashed and leaves the later ones stashed, each sheet back where it stood,
+  with the conditional-formatting and validation formulas the removals turned
+  into `#REF!` read as before. It never restores a later sheet of the same
+  name: while one is stashed above it, the undo warns (`cannot restore …`). A removal
   older than the 16th is forgotten, and its undo shows a warning (`"Offxy:
   couldn't undo … — nothing left to reverse"` or `restore mismatch: …`),
   instead of silently failing or reviving the wrong sheet.

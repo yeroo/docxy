@@ -1984,6 +1984,14 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
     }
 }
 
+/// Every conditional-formatting and data-validation formula text on `sheet`,
+/// always in the same order, which is what [`remove_sheet_refs_in_rules`]
+/// rewrites: a host that records the texts by their place in this walk can
+/// put them back.
+pub fn for_each_rule_formula_text(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
+    for_each_rule_formula(sheet, true, |_, src| f(src));
+}
+
 /// Every conditional-formatting formula on `sheet` (a rule's `<formula>`s, the
 /// `val`s of its `formula` thresholds, and the Excel 2010 `extLst` ones), and
 /// with `validations` every data-validation formula too.
