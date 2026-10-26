@@ -105,7 +105,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
     {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]},
-    {"tab":"View","groups":[{"title":"Fixture Styles","controls":[
+    {"tab":"View","groups":[{"title":"Fixture Styles","priority":0,"controls":[
     {"id":"fixture.styles","kind":"gallery","label":"Styles","tip":"Two sections of palette tiles (#1761)","swatches":[
       {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
       {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},

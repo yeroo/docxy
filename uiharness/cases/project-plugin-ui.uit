@@ -346,7 +346,9 @@ test a swatch gallery draws palette tiles under section headers
   assert reply.settled is true
   assert reply.estimates_ok is true
   assert reply.any_clipped is false
-  # Narrow, the group collapses; its flyout draws the two sections under
+  assert reply.groups.-1.title is Fixture Styles
+  assert reply.groups.-1.state is full
+  # Narrow, the group (priority 0, the first to go) collapses; its flyout draws the two sections under
   # their headers.
   call window-size {"w":640,"h":800}
   call ribbon-layout {"tab":"View"}
