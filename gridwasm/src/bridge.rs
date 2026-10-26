@@ -7842,7 +7842,7 @@ mod tests {
         let out = restore(&mut s, "B");
         assert!(out.contains("\"ok\":false"), "{out}");
         assert!(
-            out.contains("restore \"C\" first, it holds a table"),
+            out.contains(r#"restore \"C\" first, it holds a table"#),
             "{out}"
         );
         assert_eq!(sheet_order(&s), order);
