@@ -1028,9 +1028,11 @@
   narrow width is full again at a wide one (`plugin_ui` tests pin both).
 - `fit_with` ends with a back-fill (#1763): once the collapse passes fit, groups
   they took too early (a wider group's collapse can free more than the small
-  ones before it) go back to Full (a collapsed one to IconOnly under
-  `LabelsFirst` when Full does not fit), highest priority first; it does not
-  run when the chevron is needed. The result is not monotone in the width (the
+  ones before it) come back, highest priority first, in two rounds under
+  `LabelsFirst` (labels were dropped first, so they return last): collapsed
+  groups to IconOnly (Full when icon-only saves nothing; Full only under
+  `WholeGroups`), then IconOnly groups to Full. It does not run when the
+  chevron is needed. The result is not monotone in the width (the
   collapse is greedy); the tests that pin the collapse order read
   `fit_passes(.., false)`, the passes without it.
 

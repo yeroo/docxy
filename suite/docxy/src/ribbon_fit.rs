@@ -151,16 +151,17 @@ fn fit(specs: &[Spec], width: f32) -> Fit {
 /// overflow, the lowest-priority ones move to the chevron, but one group
 /// always stays drawn. When the tab fits, a last pass gives back what the
 /// first two took too early (a wider group's collapse can free more than the
-/// small ones taken before it): groups that are icon-only or collapsed return
-/// to full (collapsed ones to icon-only under `LabelsFirst`, if full does not
-/// fit), highest priority first, as far as the room allows.
+/// small ones taken before it): groups come back, highest priority first, as
+/// far as the room allows. Under `LabelsFirst` in two rounds, as labels went
+/// first and return last: collapsed groups to icon-only (full where that
+/// saves nothing), then icon-only groups to full.
 pub(crate) fn fit_with(specs: &[Spec], width: f32, policy: Policy) -> Fit {
     fit_passes(specs, width, policy, true)
 }
 
 /// [`fit_with`], the back-fill pass optional: the tests that pin the order the
 /// first passes take groups in read it without.
-fn fit_passes(specs: &[Spec], width: f32, policy: Policy, back_fill: bool) -> Fit {
+pub(crate) fn fit_passes(specs: &[Spec], width: f32, policy: Policy, back_fill: bool) -> Fit {
     let avail = width - GUTTER;
     let mut states = vec![State::Full; specs.len()];
     let mut order: Vec<usize> = (0..specs.len()).collect();
@@ -187,22 +188,31 @@ fn fit_passes(specs: &[Spec], width: f32, policy: Policy, back_fill: bool) -> Fi
     // first, so a later, wider collapse can leave room for a group dropped
     // earlier. Walk them highest priority first (the reverse of the order
     // they went) and give each back what still fits. Not when the chevron
-    // is needed: nothing fits then.
+    // is needed: nothing fits then. Labels go before any collapse (#1020),
+    // so they come back last: first the collapsed groups return (labels-first:
+    // icon-only where that saves width, else full), then icon-only groups
+    // get their labels.
     if back_fill && total(&states) <= avail {
-        for &i in order.iter().rev() {
-            let tries: &[State] = match (states[i], policy) {
-                (State::Full, _) => &[],
-                (State::IconOnly, _) => &[State::Full],
-                (State::Collapsed, Policy::LabelsFirst) => &[State::Full, State::IconOnly],
-                (State::Collapsed, Policy::WholeGroups) => &[State::Full],
-            };
-            for &to in tries {
-                let from = states[i];
-                states[i] = to;
-                if total(&states) <= avail {
-                    break;
-                }
+        let try_to = |states: &mut Vec<State>, i: usize, to: State| {
+            let from = states[i];
+            states[i] = to;
+            if total(states) > avail {
                 states[i] = from;
+            }
+        };
+        for &i in order.iter().rev() {
+            if states[i] == State::Collapsed {
+                let back = if policy == Policy::LabelsFirst && specs[i].icon < specs[i].full {
+                    State::IconOnly
+                } else {
+                    State::Full
+                };
+                try_to(&mut states, i, back);
+            }
+        }
+        for &i in order.iter().rev() {
+            if states[i] == State::IconOnly {
+                try_to(&mut states, i, State::Full);
             }
         }
     }
@@ -1063,14 +1073,70 @@ mod tests {
         assert!(f.laid_out(&specs) <= 250.0);
     }
 
+    /// #1763 r1: labels come back last. With room for every group icon-only
+    /// but not for the highest one in full beside the lowest collapsed, the
+    /// groups return icon-only first, then the highest that fits gets its
+    /// labels.
+    #[test]
+    fn back_fill_returns_groups_before_labels() {
+        let sp = |p, full, icon, collapsed| Spec {
+            priority: p,
+            full,
+            icon,
+            collapsed,
+        };
+        let specs = [
+            sp(10, 100., 50., 40.),
+            sp(20, 200., 100., 50.),
+            sp(30, 400., 400., 60.),
+        ];
+        let f = fit(&specs, 300.0 + GUTTER);
+        assert_eq!(
+            f.states,
+            vec![State::Full, State::IconOnly, State::Collapsed]
+        );
+        assert!(f.laid_out(&specs) <= 300.0);
+        let specs = [
+            sp(20, 300., 200., 50.),
+            sp(10, 300., 200., 50.),
+            sp(15, 400., 400., 50.),
+        ];
+        let f = fit(&specs, 500.0 + GUTTER);
+        assert!(f.laid_out(&specs) <= 500.0);
+        let someone_collapsed_could_be_icon_only =
+            (0..3).any(|i| f.states[i] == State::Collapsed && specs[i].icon < specs[i].full);
+        assert!(
+            !(someone_collapsed_could_be_icon_only && f.states.contains(&State::Full)),
+            "{:?}",
+            f.states
+        );
+    }
+
     /// #1763: whenever the groups fit without the chevron, they fit the
     /// room and no collapsed group could be drawn in full instead. Not
     /// monotone in the width, as the collapse is greedy: with 100, 100 and
-    /// 400 wide groups, 510 px collapses the two small ones (the first
-    /// pass stops at the first fit) where 500 px collapsed only the wide.
+    /// 400 wide groups, window width 512 (500 px of room) collapses the
+    /// two small ones (the first pass stops at the first fit) where 511 collapses only the wide.
     #[test]
     fn fit_fills_its_room_and_leaves_nothing_restorable() {
+        let labelled = |priority, full: f32, icon: f32, collapsed| Spec {
+            priority,
+            full,
+            icon,
+            collapsed,
+        };
         let sets = [
+            vec![
+                labelled(10, 100., 50., 40.),
+                labelled(20, 200., 100., 50.),
+                labelled(30, 400., 400., 60.),
+            ],
+            vec![
+                labelled(20, 300., 200., 50.),
+                labelled(10, 300., 200., 50.),
+                labelled(15, 400., 400., 50.),
+                labelled(40, 120., 70., 45.),
+            ],
             vec![spec(10, 100.), spec(20, 100.), spec(30, 400.)],
             vec![spec(50, 90.), spec(50, 300.), spec(40, 120.), spec(60, 60.)],
             vec![
@@ -1095,10 +1161,20 @@ mod tests {
                         continue;
                     }
                     assert!(sum(&f.states) <= avail, "{policy:?} {w}: over");
-                    for i in (0..specs.len()).filter(|&i| f.states[i] == State::Collapsed) {
-                        let mut g = f.states.clone();
-                        g[i] = State::Full;
-                        assert!(sum(&g) > avail, "{policy:?} {w}: {i} restorable");
+                    for i in 0..specs.len() {
+                        let better: &[State] = match (f.states[i], policy) {
+                            (State::Collapsed, Policy::LabelsFirst) => {
+                                &[State::IconOnly, State::Full]
+                            }
+                            (State::Collapsed, Policy::WholeGroups) => &[State::Full],
+                            (State::IconOnly, _) => &[State::Full],
+                            (State::Full, _) => &[],
+                        };
+                        for &to in better {
+                            let mut g = f.states.clone();
+                            g[i] = to;
+                            assert!(sum(&g) > avail, "{policy:?} {w}: {i} -> {to:?} fits");
+                        }
                     }
                 }
             }

@@ -1332,6 +1332,15 @@ fn a_declared_priority_moves_the_group_in_the_collapse_order() {
         ribbon_fit::Policy::WholeGroups,
     );
     assert_eq!(fit.states[early], ribbon_fit::State::Full);
+    // The declared priority still reaches the collapse order: the passes
+    // alone take Early first.
+    let passes = ribbon_fit::fit_passes(
+        &specs,
+        full + ribbon_fit::GUTTER - 1.0,
+        ribbon_fit::Policy::WholeGroups,
+        false,
+    );
+    assert_eq!(passes.states[early], ribbon_fit::State::Collapsed);
     let editing = task
         .groups
         .iter()
