@@ -364,6 +364,30 @@ pub struct Swatch {
     pub color: Option<u32>,
     /// A palette id ([`Palette`]) the tile previews, or any text.
     pub preview: String,
+    /// A header the tile sits under (#1761): consecutive swatches with the
+    /// same section share one header row. Empty = none.
+    pub section: String,
+}
+
+/// A swatch as the manifest writes it; `section` only when set, so a manifest
+/// without sections serialises as before.
+fn swatch_json(sw: &Swatch) -> Json {
+    let mut obj = Json::obj(vec![
+        ("id", Json::str(sw.id.clone())),
+        ("label", Json::str(sw.label.clone())),
+        (
+            "color",
+            sw.color
+                .map_or(Json::Null, |c| Json::str(format!("#{c:06X}"))),
+        ),
+        ("preview", Json::str(sw.preview.clone())),
+    ]);
+    if let Json::Obj(pairs) = &mut obj {
+        if !sw.section.is_empty() {
+            pairs.push(("section".into(), Json::str(sw.section.clone())));
+        }
+    }
+    obj
 }
 
 /// Items for one context menu.
@@ -692,6 +716,7 @@ impl Manifest {
                                 label: s.text("label"),
                                 color: parse_color(s.get("color")),
                                 preview: s.text("preview"),
+                                section: s.text("section"),
                             })
                             .collect(),
                     });
@@ -825,7 +850,6 @@ impl Manifest {
     /// The manifest JSON, as [`Manifest::parse`] reads it: what a plugin
     /// written in Rust returns from `yppx_ui_manifest`.
     pub fn json(&self) -> String {
-        let color = |c: Option<u32>| c.map_or(Json::Null, |c| Json::str(format!("#{c:06X}")));
         let items = |items: &[Item]| {
             Json::Arr(
                 items
@@ -875,38 +899,7 @@ impl Manifest {
                                                                 Json::Arr(
                                                                     c.swatches
                                                                         .iter()
-                                                                        .map(|sw| {
-                                                                            Json::obj(vec![
-                                                                                (
-                                                                                    "id",
-                                                                                    Json::str(
-                                                                                        sw.id
-                                                                                            .clone(
-                                                                                            ),
-                                                                                    ),
-                                                                                ),
-                                                                                (
-                                                                                    "label",
-                                                                                    Json::str(
-                                                                                        sw.label
-                                                                                            .clone(
-                                                                                            ),
-                                                                                    ),
-                                                                                ),
-                                                                                (
-                                                                                    "color",
-                                                                                    color(sw.color),
-                                                                                ),
-                                                                                (
-                                                                                    "preview",
-                                                                                    Json::str(
-                                                                                        sw.preview
-                                                                                            .clone(
-                                                                                            ),
-                                                                                    ),
-                                                                                ),
-                                                                            ])
-                                                                        })
+                                                                        .map(swatch_json)
                                                                         .collect(),
                                                                 ),
                                                             ),
@@ -2231,6 +2224,23 @@ mod tests {
     }
 
     #[test]
+    fn a_swatch_section_parses_and_round_trips() {
+        let text = r##"{"ribbon":[{"tab":"Task","groups":[{"title":"G","controls":[
+            {"id":"g","kind":"gallery","label":"G","swatches":[
+              {"id":"a","label":"A","section":"Scheduling Styles","preview":"p"},
+              {"id":"b","label":"B","section":7},
+              {"id":"c","label":"C"}]}]}]}]}"##;
+        let m = Manifest::parse(text).unwrap();
+        let sw = &m.ribbon[0].groups[0].controls[0].swatches;
+        assert_eq!(sw[0].section, "Scheduling Styles");
+        assert_eq!(sw[1].section, "", "a non-string section is none");
+        assert_eq!(sw[2].section, "");
+        let json = m.json();
+        assert_eq!(json.matches("\"section\"").count(), 1, "{json}");
+        assert_eq!(Manifest::parse(&json).unwrap(), m);
+    }
+
+    #[test]
     fn a_group_priority_parses_clamped_and_round_trips() {
         let parse = |p: &str| {
             let text = format!(
@@ -2572,6 +2582,7 @@ mod tests {
         assert_eq!(gallery.swatches[0].color, Some(0x3366CC));
         assert_eq!(gallery.swatches[1].color, Some(0xCC3333));
         assert_eq!(gallery.swatches[0].preview, "fx.blue");
+        assert_eq!(gallery.swatches[0].section, "");
         assert_eq!(m.menus[0].menu, "row");
         assert_eq!(m.menus[0].items[0].after, "Notes...");
         let ti = m.dialog("task-information").unwrap();

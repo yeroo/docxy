@@ -1653,6 +1653,34 @@
   ` manual` before ` inactive`. yppxy draws no palette, so it has nothing to
   change.
 
+## Swatch gallery palette tiles and sections (#1761)
+
+- `uiplugin::Swatch::section` (manifest `section`, a non-string is none, written
+  by `Manifest::json` only when set) and `ribbonspec::GalleryItem::section`
+  (`""` for every built-in gallery). `plugin_ui::swatch_item` keeps a swatch's
+  `preview` when it names a palette of a loaded manifest (the tile is that
+  palette's miniature), else puts `color` as `#RRGGBB`, else the text; the
+  renderer asks `tile_palette(preview)` first, then `swatch_color`.
+- `plugin_ui/tile.rs` is the pure part: `palette_tile_marks` (summary bracket,
+  manual bar, on-track bar, link, milestone diamond in the tile body
+  `tile_body()`; colours through `project::tile_color`, which takes the chart's
+  `palette_entry`, `manual` falling back to `on-track`, then the built-in
+  colours; proportions are by estimate, no capture of Project's tile is in
+  this repository), `gallery_layout` (a header row per run of equal non-empty
+  sections, every section on a new row) and `span_of`/`gallery_span` (in a
+  flyout the longest section run, in place every tile: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
+  both wrap by, so the estimate is the width drawn). Height is
+  `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
+  A palette tile shows no label, its label is the tooltip. Sections show in
+  the flyout (expanded) copy only: in place (`max_w` None) a group is one
+  fixed-height strip, so `gallery_span`/`gallery_rows` give every tile on one
+  row with no headers, exactly as before sections; a header is clipped to the
+  gallery's width.
+- `ribbon-read` adds `section` and, on a palette tile, `palette` and `marks`.
+  The fixture's `fixture.styles` gallery (group "Fixture Styles", last on the
+  View tab) has two sections; `project-plugin-ui.uit` reads it and shoots it
+  (a `shot` is evidence, not a comparison with the plugin repo's capture).
+
 ## Project timescale and Timeline pane (#1535)
 
 - `GanttScale` carries `day_w` (px per day); `DEFAULT_DAY_W` (22, the Days

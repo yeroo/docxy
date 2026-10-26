@@ -152,6 +152,8 @@ pub struct Gallery<A> {
 pub struct GalleryItem<A> {
     pub label: &'static str,
     pub preview: &'static str,
+    /// The header a run of equal sections shares; empty = none (#1761).
+    pub section: &'static str,
     pub act: A,
 }
 

@@ -2130,3 +2130,166 @@ fn the_selection_lists_the_cursor_column_first() {
     assert_eq!(sel.uids, vec![first, second]);
     assert_eq!(sel.cols, vec!["Name".to_string(), "Duration".to_string()]);
 }
+
+// ---- swatch gallery palette tiles and sections (#1761) ----
+
+const TILES: &str = r##"{
+  "ribbon":[{"tab":"Task","groups":[{"title":"Styles","controls":[
+    {"id":"t.gallery","kind":"gallery","label":"Style","swatches":[
+      {"id":"t.a","label":"A","section":"Scheduling Styles","preview":"t.blue","color":"#111111"},
+      {"id":"t.b","label":"B","section":"Scheduling Styles","preview":"t.nope","color":"#222222"},
+      {"id":"t.c","label":"C","section":"Scheduling Styles","color":"#333333"},
+      {"id":"t.d","label":"D","section":"Presentation Styles","preview":"t.blue"},
+      {"id":"t.e","label":"E","section":"Presentation Styles","preview":"just text"}]}]}]}],
+  "palettes":[{"id":"t.blue","label":"Blue","bars":[
+    {"kind":"summary","color":"#101010"},{"kind":"on-track","color":"#3366CC"},
+    {"kind":"manual","color":"#22AA55"},{"kind":"milestone","color":"#CC3333"}]}]
+}"##;
+
+fn tile_gallery() -> rs::Gallery<Act> {
+    let mut task = extended(TILES);
+    let Control::Gallery(gal) = task.groups.pop().unwrap().items.remove(0) else {
+        panic!("a gallery");
+    };
+    gal
+}
+
+#[test]
+fn a_swatch_previews_its_palette_before_its_colour() {
+    let gal = tile_gallery();
+    let previews: Vec<&str> = gal.items.iter().map(|it| it.preview).collect();
+    assert_eq!(
+        previews,
+        ["t.blue", "#222222", "#333333", "t.blue", "just text"],
+        "a known palette wins over a colour, an unknown id falls back to it"
+    );
+    let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
+    assert_eq!(sections[0], "Scheduling Styles");
+    assert_eq!(sections[4], "Presentation Styles");
+}
+
+fn blue() -> projcore::uiplugin::Palette {
+    Manifest::parse(TILES).unwrap().palettes.remove(0)
+}
+
+#[test]
+fn a_palette_tile_draws_the_palettes_colours_inside_its_box() {
+    let (w, h) = (54., 54.);
+    let marks = palette_tile_marks(&blue(), w, h);
+    for m in &marks {
+        assert!(m.x >= 0. && m.y >= 0., "{m:?}");
+        assert!(m.x + m.w <= w && m.y + m.h <= h, "{m:?} outside {w}x{h}");
+    }
+    let colors: Vec<u32> = marks.iter().map(|m| m.color).collect();
+    for c in [0x101010, 0x22AA55, 0x3366CC, 0xCC3333] {
+        assert!(colors.contains(&c), "{c:06X} in {colors:?}");
+    }
+    let diamonds = marks.iter().filter(|m| m.shape == MarkShape::Diamond);
+    assert_eq!(diamonds.map(|m| m.color).collect::<Vec<_>>(), [0xCC3333]);
+}
+
+#[test]
+fn a_palette_tile_falls_back_as_the_chart_does() {
+    let mut pal = blue();
+    pal.bars.retain(|b| b.kind == "on-track");
+    let marks = palette_tile_marks(&pal, 54., 54.);
+    let colors: Vec<u32> = marks.iter().map(|m| m.color).collect();
+    // `manual` takes the on-track colour, the rest the built-in ones.
+    assert_eq!(colors.iter().filter(|c| **c == 0x3366CC).count(), 2);
+    assert!(colors.contains(&crate::project::tile_color(&Palette::default(), "summary")));
+    assert!(colors.contains(&crate::project::tile_color(
+        &Palette::default(),
+        "milestone"
+    )));
+}
+
+#[test]
+fn a_gallery_lays_out_a_header_per_section_and_wraps_inside_it() {
+    let none = ["", "", "", "", ""];
+    assert_eq!(
+        gallery_layout(&none, 2),
+        [Row::Tiles(0, 2), Row::Tiles(2, 4), Row::Tiles(4, 5)],
+        "no sections is the plain wrap"
+    );
+    let mut two = vec!["Scheduling Styles"; 12];
+    two.extend(vec!["Presentation Styles"; 12]);
+    let rows = gallery_layout(&two, 6);
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0], Row::Header("Scheduling Styles".into()));
+    assert_eq!(rows[1], Row::Tiles(0, 6));
+    assert_eq!(rows[3], Row::Header("Presentation Styles".into()));
+    assert_eq!(rows[5], Row::Tiles(18, 24));
+    // A section starts on a new row even when the last row has room.
+    let rows = gallery_layout(&["a", "b"], 6);
+    assert_eq!(
+        rows,
+        [
+            Row::Header("a".into()),
+            Row::Tiles(0, 1),
+            Row::Header("b".into()),
+            Row::Tiles(1, 2)
+        ]
+    );
+    assert_eq!(gallery_layout(&[], 6), [Row::Tiles(0, 0)]);
+}
+
+#[test]
+fn a_gallery_in_place_is_one_strip_and_its_flyout_shows_the_sections() {
+    let gal = tile_gallery();
+    let t = crate::style_gallery::TILE;
+    let tw = ribbon_fit::approx_tw;
+    let n = gal.items.len();
+    // In place: every tile on one row, no headers, 62 px high.
+    assert_eq!(gallery_span(&gal, None), n);
+    let rows = gallery_rows(&gal, None, n);
+    assert_eq!(rows, [Row::Tiles(0, n)]);
+    assert_eq!(layout_height(&rows, t.h, t.gap), t.h);
+    let control = Control::Gallery(gal);
+    let drawn = n as f32 * t.w + (n as f32 - 1.) * t.gap;
+    assert_eq!(
+        ribbon_fit::model_control_w(&control, false, None, &tw),
+        drawn
+    );
+    let Control::Gallery(gal) = &control else {
+        unreachable!()
+    };
+    // In a flyout: the longest section run wraps and the headers are drawn.
+    assert_eq!(gallery_span(gal, Some(400.)), 3);
+    let flyout = ribbon_fit::model_control_w(&control, false, Some(400.), &tw);
+    assert_eq!(flyout, 3. * t.w + 2. * t.gap);
+    let (k, w) = ribbon_fit::gallery_row(
+        ribbon_fit::gallery_geom(gal),
+        gallery_span(gal, Some(140.)),
+        Some(140.),
+    );
+    assert_eq!((k, w), (2, 2. * t.w + t.gap));
+    let rows = gallery_rows(gal, Some(140.), k);
+    // 2 headers, 2 tile rows of Scheduling (3 -> 2 + 1), 1 of Presentation.
+    assert_eq!(rows.len(), 2 + 2 + 1);
+    let expect = 3. * t.h + 2. * HEADER_H + 4. * t.gap;
+    assert_eq!(layout_height(&rows, t.h, t.gap), expect);
+}
+
+#[test]
+fn a_palette_tiles_link_leaves_the_on_track_bar_under_the_diamond() {
+    let (w, h) = tile_body();
+    let marks = palette_tile_marks(&blue(), w, h);
+    let bar = marks.iter().find(|m| m.color == 0x3366CC).unwrap();
+    let link = marks.iter().find(|m| m.color == tile::LINK_COLOR).unwrap();
+    let dia = marks
+        .iter()
+        .find(|m| m.shape == MarkShape::Diamond)
+        .unwrap();
+    assert!(
+        link.x >= bar.x + bar.w - 1. && link.x <= bar.x + bar.w,
+        "the link touches the bar's right end: {link:?} vs {bar:?}"
+    );
+    assert!(
+        (dia.x + dia.w / 2. - link.x).abs() <= 1.,
+        "{dia:?} {link:?}"
+    );
+    assert!(link.y >= bar.y + bar.h && link.y + link.h <= dia.y + 1.);
+    for m in &marks {
+        assert!(m.x >= 0. && m.x + m.w <= w && m.y + m.h <= h, "{m:?}");
+    }
+}

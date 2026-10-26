@@ -31223,36 +31223,43 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             rs::GalleryItem {
                                 label: "Normal",
                                 preview: "normal",
+                                section: "",
                                 act: Normal,
                             },
                             rs::GalleryItem {
                                 label: "No Spacing",
                                 preview: "normal",
+                                section: "",
                                 act: NoSpacing,
                             },
                             rs::GalleryItem {
                                 label: "Heading 1",
                                 preview: "h1",
+                                section: "",
                                 act: H1,
                             },
                             rs::GalleryItem {
                                 label: "Heading 2",
                                 preview: "h2",
+                                section: "",
                                 act: H2,
                             },
                             rs::GalleryItem {
                                 label: "Heading 3",
                                 preview: "h3",
+                                section: "",
                                 act: H3,
                             },
                             rs::GalleryItem {
                                 label: "Title",
                                 preview: "title",
+                                section: "",
                                 act: Title,
                             },
                             rs::GalleryItem {
                                 label: "Subtitle",
                                 preview: "subtitle",
+                                section: "",
                                 act: Subtitle,
                             },
                         ],
@@ -37754,8 +37761,10 @@ impl Docxy {
     }
 
     /// A UI plugin's gallery (#1532): a tile per swatch, filled with the
-    /// swatch's colour (its preview, `#RRGGBB`) over its label, the checked
-    /// one framed in the accent.
+    /// swatch's colour (its preview, `#RRGGBB`) over its label, or, when the
+    /// preview names a palette, that palette's miniature chart with the label
+    /// as its tooltip (#1761). Swatches of one section sit under a header
+    /// row; the checked tile is framed in the accent.
     fn swatch_gallery(
         &self,
         gal: &rs::Gallery<Act>,
@@ -37765,63 +37774,113 @@ impl Docxy {
     ) -> AnyElement {
         let g = style_gallery::TILE;
         let geom = ribbon_fit::gallery_geom(gal);
-        let (per_row, _) = ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
-        let rows = gal.items.len().div_ceil(per_row).max(1) as f32;
-        let tiles: Vec<AnyElement> = gal
-            .items
-            .iter()
-            .map(|it| {
-                let act = it.act;
-                let selected = self.gallery_item_selected(act);
-                let color = plugin_ui::swatch_color(it.preview).map(hsla_u);
-                v_flex()
-                    .id(it.label)
+        let (per_row, _) =
+            ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal, max_w), max_w);
+        let layout = plugin_ui::gallery_rows(gal, max_w, per_row);
+        let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
+            let act = it.act;
+            let selected = self.gallery_item_selected(act);
+            let palette = plugin_ui::tile_palette(it.preview);
+            let color = plugin_ui::swatch_color(it.preview).map(hsla_u);
+            let (bw, bh) = plugin_ui::tile_body();
+            let body: AnyElement = match &palette {
+                Some(p) => div()
+                    .relative()
                     .flex_none()
-                    .justify_between()
-                    .items_start()
-                    .w(px(g.w))
-                    .h(px(g.h))
-                    .p(px(g.pad))
-                    .rounded(px(g.radius))
-                    .border(px(g.border))
-                    .overflow_hidden()
-                    .border_color(if selected {
-                        hsla_u(accent::brand())
-                    } else {
-                        pal.border
-                    })
-                    .bg(if selected { pal.sel } else { pal.panel })
-                    .cursor_pointer()
-                    .when(!selected, |d| d.hover(move |d| d.bg(pal.hover)))
-                    .child(
-                        div()
-                            .w_full()
-                            .h(px(g.h - g.name_size - 3. * g.pad))
-                            .rounded(px(2.))
-                            .when_some(color, |d, c| d.bg(c))
-                            .when(color.is_none(), |d| d.border_1().border_color(pal.dim)),
+                    .w(px(bw))
+                    .h(px(bh))
+                    .children(
+                        plugin_ui::palette_tile_marks(p, bw, bh)
+                            .into_iter()
+                            .map(|m| {
+                                let at = div()
+                                    .absolute()
+                                    .left(px(m.x))
+                                    .top(px(m.y))
+                                    .w(px(m.w))
+                                    .h(px(m.h));
+                                match m.shape {
+                                    plugin_ui::MarkShape::Rect => at.bg(hsla_u(m.color)),
+                                    plugin_ui::MarkShape::Diamond => {
+                                        at.child(project::milestone_diamond(m.color, false))
+                                    }
+                                }
+                            }),
                     )
-                    .child(
+                    .into_any_element(),
+                None => div()
+                    .w_full()
+                    .h(px(g.h - g.name_size - 3. * g.pad))
+                    .rounded(px(2.))
+                    .when_some(color, |d, c| d.bg(c))
+                    .when(color.is_none(), |d| d.border_1().border_color(pal.dim))
+                    .into_any_element(),
+            };
+            let label = it.label;
+            v_flex()
+                .id(it.label)
+                .flex_none()
+                .justify_between()
+                .items_start()
+                .w(px(g.w))
+                .h(px(g.h))
+                .p(px(g.pad))
+                .rounded(px(g.radius))
+                .border(px(g.border))
+                .overflow_hidden()
+                .border_color(if selected {
+                    hsla_u(accent::brand())
+                } else {
+                    pal.border
+                })
+                .bg(if selected { pal.sel } else { pal.panel })
+                .cursor_pointer()
+                .when(!selected, |d| d.hover(move |d| d.bg(pal.hover)))
+                .child(body)
+                .when(palette.is_none(), |d| {
+                    d.child(
                         div()
                             .text_size(px(g.name_size))
                             .text_color(pal.fg)
                             .whitespace_nowrap()
-                            .child(it.label),
+                            .child(label),
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.dispatch(act, window, cx);
-                    }))
-                    .into_any_element()
+                })
+                .when(palette.is_some(), |d| {
+                    d.tooltip(move |w, cx| Tooltip::new(label).build(w, cx))
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.dispatch(act, window, cx);
+                }))
+                .into_any_element()
+        };
+        let rows: Vec<AnyElement> = layout
+            .iter()
+            .map(|row| match row {
+                plugin_ui::Row::Header(text) => div()
+                    .h(px(plugin_ui::HEADER_H))
+                    .w_full()
+                    .overflow_hidden()
+                    .text_size(px(g.name_size))
+                    .text_color(pal.dim)
+                    .whitespace_nowrap()
+                    .child(SharedString::from(text.clone()))
+                    .into_any_element(),
+                plugin_ui::Row::Tiles(a, b) => {
+                    let tiles: Vec<AnyElement> =
+                        gal.items[*a..*b].iter().map(|it| tile(it, cx)).collect();
+                    h_flex().gap(px(g.gap)).children(tiles).into_any_element()
+                }
             })
             .collect();
         div()
             .id(gal.id)
             .flex()
-            .flex_wrap()
+            .flex_col()
             .gap(px(g.gap))
             .w(px(per_row as f32 * g.w + (per_row as f32 - 1.) * g.gap))
-            .h(px(rows * g.h + (rows - 1.) * g.gap))
-            .children(tiles)
+            .h(px(plugin_ui::layout_height(&layout, g.h, g.gap)))
+            .children(rows)
             .into_any_element()
     }
 

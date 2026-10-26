@@ -104,7 +104,15 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct25","kind":"button","label":"25%"},
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
-    {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]}],
+    {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]},
+    {"tab":"View","groups":[{"title":"Fixture Styles","priority":0,"controls":[
+    {"id":"fixture.styles","kind":"gallery","label":"Styles","tip":"Two sections of palette tiles (#1761)","swatches":[
+      {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
+      {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},
+      {"id":"fixture.styles.2","label":"Blue two","section":"Scheduling Styles","preview":"fixture.blue"},
+      {"id":"fixture.styles.3","label":"Red two","section":"Presentation Styles","preview":"fixture.red"},
+      {"id":"fixture.styles.4","label":"Colour only","section":"Presentation Styles","color":"#44AA66"},
+      {"id":"fixture.styles.5","label":"Blue three","section":"Presentation Styles","preview":"fixture.blue"}]}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."},{"id":"fixture.mark","label":"Mark (fixture)","icon":"comment","after":"Rename (fixture)"}]}],
   "dialogs":[
     {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
@@ -319,7 +327,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{}}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{},"fixture.styles":"fixture.styles.1"}}"#,
         flag(&req),
         switch_on(&req, "fixture.plain"),
         switch_on(&req, "fixture.flat"),

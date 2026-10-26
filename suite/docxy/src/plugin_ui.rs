@@ -89,6 +89,11 @@ pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
         })
 }
 
+mod tile;
+pub(crate) use tile::{
+    HEADER_H, MarkShape, Row, gallery_layout, layout_height, palette_tile_marks, tile_body,
+};
+
 // ---- the ribbon --------------------------------------------------------------
 
 fn cmd_of(id: &str, label: &str, icon: &str, tip: &str, keytip: &str) -> rs::Cmd<Act> {
@@ -102,18 +107,63 @@ fn item_cmd(item: &ui::Item) -> rs::Cmd<Act> {
     cmd_of(&item.id, &item.label, &item.icon, &item.tip, "")
 }
 
-/// A swatch's tile: its colour rides in the preview as `#RRGGBB`, which the
-/// swatch gallery renderer reads ([`swatch_color`]).
-fn swatch_item(s: &ui::Swatch) -> rs::GalleryItem<Act> {
-    let preview = match s.color {
-        Some(c) => format!("#{c:06X}"),
-        None => s.preview.clone(),
+/// A swatch's tile: its preview when that names a palette of a loaded
+/// manifest (the tile is that palette's miniature), else its colour as
+/// `#RRGGBB`, which the swatch gallery renderer reads ([`swatch_color`]),
+/// else the preview text (#1761).
+fn swatch_item(s: &ui::Swatch, manifests: &[&ui::Manifest]) -> rs::GalleryItem<Act> {
+    let preview = if palette_with(&s.preview, manifests).is_some() {
+        s.preview.clone()
+    } else {
+        match s.color {
+            Some(c) => format!("#{c:06X}"),
+            None => s.preview.clone(),
+        }
     };
     rs::GalleryItem {
         label: intern(&s.label),
         preview: intern(&preview),
+        section: intern(&s.section),
         act: act_of(&s.id),
     }
+}
+
+/// The palette a gallery tile's `preview` names, if a loaded manifest
+/// declares it.
+pub(crate) fn tile_palette(preview: &str) -> Option<Palette> {
+    if preview.is_empty() {
+        return None;
+    }
+    palette_with(preview, &manifests())
+}
+
+/// How many tiles one row of the swatch gallery `gal` must have room for.
+/// Drawn in place (`max_w` None) a group is a single strip: one row of every
+/// tile, no section headers, as before sections existed. In a flyout (`max_w`
+/// given) the sections show, so a row needs the longest run of equal
+/// sections. `ribbon_fit` and `Docxy::swatch_gallery` both ask it, so the
+/// estimate is the width drawn (#1761).
+pub(crate) fn gallery_span<A>(gal: &rs::Gallery<A>, max_w: Option<f32>) -> usize {
+    if max_w.is_none() {
+        return gal.items.len();
+    }
+    let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
+    tile::span_of(&sections)
+}
+
+/// The rows `gal` is laid out in at `per_row` tiles a row: sections with their
+/// headers in a flyout, one plain wrap in place (`max_w` None).
+pub(crate) fn gallery_rows<A>(
+    gal: &rs::Gallery<A>,
+    max_w: Option<f32>,
+    per_row: usize,
+) -> Vec<Row> {
+    let sections: Vec<&str> = gal
+        .items
+        .iter()
+        .map(|it| if max_w.is_some() { it.section } else { "" })
+        .collect();
+    gallery_layout(&sections, per_row)
 }
 
 /// The colour a swatch tile's preview carries, when it is one.
@@ -126,7 +176,7 @@ pub(crate) fn swatch_color(preview: &str) -> Option<u32> {
 
 /// A contributed control as the ribbon model holds it. A plain small button
 /// comes back as a one-button column; [`controls_of`] stacks neighbours.
-fn control_of(c: &ui::Control) -> Control<Act> {
+fn control_of(c: &ui::Control, manifests: &[&ui::Manifest]) -> Control<Act> {
     let cmd = cmd_of(&c.id, &c.label, &c.icon, &c.tip, &c.keytip);
     match c.kind {
         PluginControlKind::Button if c.large => Control::Large(cmd),
@@ -148,7 +198,11 @@ fn control_of(c: &ui::Control) -> Control<Act> {
                 body: "",
                 shortcut: "",
             },
-            items: c.swatches.iter().map(swatch_item).collect(),
+            items: c
+                .swatches
+                .iter()
+                .map(|s| swatch_item(s, manifests))
+                .collect(),
         }),
     }
 }
@@ -184,7 +238,7 @@ fn small_cmd(c: &ui::Control) -> rs::Cmd<Act> {
 
 /// A group's contributed controls, small buttons that follow one another
 /// stacked in columns of up to `rs::MAX_COLUMN_ROWS`, as the built-ins are.
-fn controls_of(controls: &[ui::Control]) -> Vec<Control<Act>> {
+fn controls_of(controls: &[ui::Control], manifests: &[&ui::Manifest]) -> Vec<Control<Act>> {
     let mut out: Vec<Control<Act>> = Vec::new();
     for c in controls {
         if c.kind == PluginControlKind::Button && !c.large {
@@ -195,7 +249,7 @@ fn controls_of(controls: &[ui::Control]) -> Vec<Control<Act>> {
             }
             continue;
         }
-        out.push(control_of(c));
+        out.push(control_of(c, manifests));
     }
     out
 }
@@ -268,7 +322,7 @@ pub(crate) fn extend_tab_with(tab: &mut rs::Tab<Act>, manifests: &[&ui::Manifest
                     }
                 };
                 let controls: Vec<ui::Control> = added.into_iter().cloned().collect();
-                let controls = controls_of(&controls);
+                let controls = controls_of(&controls, manifests);
                 match tab
                     .groups
                     .iter_mut()

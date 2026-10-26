@@ -520,7 +520,8 @@ without one nothing changes.
 - **Manifest** (`yppx_ui_manifest`, static): `ribbon` (per project tab:
   groups to append, or controls for an existing group by title; a control is
   `{id, kind: button|toggle|split|dropdown|gallery|combo, label, tip, keytip,
-  icon, large, items, swatches}`), `menus` (items per `row`, `bar`, `column`,
+  icon, large, items, swatches}`; a swatch is
+  `{id, label, color, preview, section}`), `menus` (items per `row`, `bar`, `column`,
   `chart`, `heading-filter` menu with an `after` label hint), `dialogs`
   (specs by id: pages of controls with kinds `text`, `number`, `date`,
   `duration`, `checkbox`, `radio`, `dropdown`, `list`, `grid` with per-column
@@ -613,7 +614,8 @@ without one nothing changes.
 - **The desktop suite** (`suite/docxy/src/plugin_ui.rs`) draws the
   contributions: ribbon groups and controls after each project tab's own
   (a control with a built-in command's id replaces it in place; a gallery's
-  swatches as colour tiles; KeyTips as declared), items in the row, bar,
+  swatches as palette miniatures when `preview` names a declared palette, else
+  colour tiles, under `section` header rows in the flyout; KeyTips as declared), items in the row, bar,
   column and chart menus (after the `after` label, else at the end), the
   `task-information` spec's pages in the Task Information dialog, a
   command's dialog with `multiline` and `grid` controls, the overlay's
