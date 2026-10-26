@@ -38,6 +38,7 @@ Built bottom-up, each a pure module:
 | `datetime` | a civil wall-clock instant (minutes since 1970), proleptic-Gregorian conversion, MSPDI ISO parse/format |
 | `model` | the pure domain: `Task`, `Predecessor`, `Resource`, `Assignment`, `Calendar`, `Project`; `LinkType`/`ConstraintType` with MSPDI's integer codes pinned once |
 | `mspdi` | read **and** write MS Project's MSPDI XML — the interop bridge |
+| `mpx` | read MPX, Project's older comma-separated interchange text (`.mpx`, or any unclaimed file starting `MPX,`); never written (#309) |
 | `schedule` | the CPM engine + resource leveling |
 | `assign` | assignment dates and costs from the schedule and rate tables, and the refresh of stored totals an edit made stale |
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
@@ -251,6 +252,10 @@ carry no oracle.
 computed dates, slack and critical flags match — and also runs each file
 through **MSPDI → `.yppx` → back** to prove the writer and OPC container are
 lossless. Regenerate with `python3 corpus/tools/gen_mspdi_corpus.py`.
+`corpus/mpx/` holds MPXJ's MPX of each of those files, in the three date
+orders; `projcore/tests/mpx_corpus.rs` reads each and asserts it schedules as
+its MSPDI twin, but where the MPX file cannot carry what the twin does
+(`corpus/mpx/README.md`).
 
 ## Resource leveling
 

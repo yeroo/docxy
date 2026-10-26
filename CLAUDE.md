@@ -1857,3 +1857,29 @@
   the model is no change and no new relationship. An `.xls` File moniker's path
   is native and read as it is; URL and string monikers go through
   `model_target`.
+
+## MPX import (#309)
+
+- `projcore::mpx::read_mpx` reads MPX (dependency-free; UTF-8, else
+  Windows-1252; the delimiter is the character after `MPX` in the header,
+  record 10 is only the number format). `formats::Mpx` (`.mpx`, label "MPX")
+  is a built-in of `Registry::new`, read-only, so every host lists it in
+  Open and treats an opened `.mpx` as an import (Save goes to Save As) by
+  the existing rule, with no host code naming it. `Registry::read` reads a
+  file whose extension nothing claims as MPX when it starts `MPX,` or `MPX;`
+  (`mpx::is_mpx`, after an optional BOM), else as MSPDI as before; the
+  suite's `Formats::read` refuses such an extension before that, so only
+  yppxy and projctl sniff.
+- Rows are read by the field ids of the 41/61 record before them; tasks are
+  ordered by ID (a row with no ID keeps its place), a row with no name and
+  no outline level is blank, links name task IDs. Dates are whole days: a
+  constraint, actual, stop or stored date lands on `editor::day_start` /
+  `day_end` of the task calendar by its kind. Start/Finish are only the
+  stored dates, never constraints. Enumerations are Project's English words
+  (Priority as MPXJ maps them, Medium = 500); units are fractions (`1` =
+  100%), as MPXJ writes and reads them.
+- MPX has no task calendar, Manual, Active or Honor Constraints field, and
+  constraint dates have no time: `projcore/tests/mpx_corpus.rs` compares
+  `corpus/mpx` (MPXJ 16.8.0's MPX of `corpus/mspdi`, three date orders)
+  with the twins and lists those exclusions; `every_exclusion_is_needed`
+  drops a stale one.
