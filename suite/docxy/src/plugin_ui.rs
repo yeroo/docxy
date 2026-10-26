@@ -91,8 +91,7 @@ pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
 
 mod tile;
 pub(crate) use tile::{
-    HEADER_H, LINK_COLOR, MarkShape, Row, gallery_layout, layout_height, palette_tile_marks,
-    tile_body,
+    HEADER_H, MarkShape, Row, gallery_layout, layout_height, palette_tile_marks, tile_body,
 };
 
 // ---- the ribbon --------------------------------------------------------------

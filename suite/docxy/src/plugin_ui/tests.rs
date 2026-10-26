@@ -2275,7 +2275,7 @@ fn a_palette_tiles_link_leaves_the_on_track_bar_under_the_diamond() {
     let (w, h) = tile_body();
     let marks = palette_tile_marks(&blue(), w, h);
     let bar = marks.iter().find(|m| m.color == 0x3366CC).unwrap();
-    let link = marks.iter().find(|m| m.color == LINK_COLOR).unwrap();
+    let link = marks.iter().find(|m| m.color == tile::LINK_COLOR).unwrap();
     let dia = marks
         .iter()
         .find(|m| m.shape == MarkShape::Diamond)
