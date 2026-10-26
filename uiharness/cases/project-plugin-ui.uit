@@ -319,6 +319,26 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
   call ribbon-read {}
   assert reply.tabs.1.groups.-1.commands.-4.checked is false
 
+test a swatch gallery draws palette tiles under section headers
+  # #1761: the "Fixture Styles" group (before Schedule) has six swatches in two
+  # sections; a swatch whose preview names a palette is a palette tile (marks
+  # counted), one with only a colour is the flat tile.
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.title is Fixture Styles
+  assert reply.tabs.1.groups.1.galleries.0.id is fixture.styles
+  assert reply.tabs.1.groups.1.commands.0.id is fixture.styles:Blue one
+  assert reply.tabs.1.groups.1.commands.0.section is Scheduling Styles
+  assert reply.tabs.1.groups.1.commands.0.palette is fixture.blue
+  assert reply.tabs.1.groups.1.commands.0.marks is 7
+  assert reply.tabs.1.groups.1.commands.1.palette is fixture.red
+  assert reply.tabs.1.groups.1.commands.3.section is Presentation Styles
+  assert reply.tabs.1.groups.1.commands.4.id is fixture.styles:Colour only
+  assert reply.tabs.1.groups.1.commands.4.section is Presentation Styles
+  assert reply.tabs.1.groups.1.commands.4.checked is false
+  assert reply.tabs.1.groups.1.commands.1.checked is true
+  shot window
+
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml
   assert dirty is false

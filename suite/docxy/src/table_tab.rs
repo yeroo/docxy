@@ -547,6 +547,7 @@ pub(crate) fn table_design_tab() -> rs::Tab<Act> {
                             .map(|(i, s)| rs::GalleryItem {
                                 label: s.name,
                                 preview: s.id,
+                                section: "",
                                 act: t(T::Style(i)),
                             })
                             .collect(),

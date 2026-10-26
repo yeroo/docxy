@@ -2738,6 +2738,10 @@ struct RibbonCommand {
     menu: Option<String>,
     /// Contributed by a UI plugin (#1532): `ribbon-read` says `"plugin": true`.
     plugin: bool,
+    /// A gallery tile's section header and, for a palette tile, the palette's
+    /// id and its marks (#1761).
+    section: String,
+    palette: Option<(String, usize)>,
 }
 
 impl RibbonCommand {
@@ -2752,6 +2756,8 @@ impl RibbonCommand {
             gallery: false,
             menu: None,
             plugin: crate::plugin_ui::is_plugin(cmd.act),
+            section: String::new(),
+            palette: None,
         }
     }
     fn in_menu(cmd: &crate::rs::Cmd<crate::Act>, owner: &crate::rs::Cmd<crate::Act>) -> Self {
@@ -2786,6 +2792,13 @@ impl RibbonCommand {
         if self.plugin {
             fields.push(("plugin", Json::Bool(true)));
         }
+        if !self.section.is_empty() {
+            fields.push(("section", Json::Str(self.section.clone())));
+        }
+        if let Some((id, marks)) = &self.palette {
+            fields.push(("palette", Json::Str(id.clone())));
+            fields.push(("marks", Json::Num(*marks as f64)));
+        }
         Json::obj(fields)
     }
 }
@@ -2814,6 +2827,14 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
             gallery: true,
             menu: None,
             plugin: crate::plugin_ui::is_plugin(item.act),
+            section: item.section.into(),
+            palette: crate::plugin_ui::tile_palette(item.preview).map(|p| {
+                let (w, h) = crate::plugin_ui::tile_body();
+                (
+                    p.id.clone(),
+                    crate::plugin_ui::palette_tile_marks(&p, w, h).len(),
+                )
+            }),
         })),
         Control::Rows(rows) => {
             for cell in rows.iter().flatten() {
@@ -7853,6 +7874,8 @@ mod tests {
             gallery: false,
             menu: None,
             plugin: false,
+            section: String::new(),
+            palette: None,
         };
         let commands = vec![
             cmd("one", "Move", "Move Task", Act::Bold),
@@ -8244,6 +8267,8 @@ mod tests {
                 gallery: false,
                 menu: None,
                 plugin: false,
+                section: String::new(),
+                palette: None,
             },
             RibbonCommand {
                 id: "two".into(),
@@ -8255,6 +8280,8 @@ mod tests {
                 gallery: false,
                 menu: None,
                 plugin: false,
+                section: String::new(),
+                palette: None,
             },
         ];
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();

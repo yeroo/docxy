@@ -170,7 +170,7 @@ pub(crate) fn bar_look(
 
 /// The palette's entry for `kind` (its colour and shape, `fallback` for an
 /// unknown shape name), if it has one.
-fn palette_entry(
+pub(crate) fn palette_entry(
     palette: Option<&projcore::uiplugin::Palette>,
     kind: &str,
     fallback: BarShape,
@@ -1408,7 +1408,7 @@ fn overlay_text_run(
     }
 }
 
-fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
+pub(crate) fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |b, _, window, _| {
@@ -1431,6 +1431,23 @@ fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
         },
     )
     .size_full()
+}
+
+/// The colour a gallery tile draws `kind` in (#1761): the palette's entry, as
+/// the chart takes it, `manual` falling back to `on-track` and a kind the
+/// palette lacks to the built-in colour.
+pub(crate) fn tile_color(palette: &projcore::uiplugin::Palette, kind: &str) -> u32 {
+    let (name, builtin) = match kind {
+        "summary" => ("summary", BarKind::Summary),
+        "milestone" => ("milestone", BarKind::Milestone),
+        _ => ("on-track", BarKind::OnTrack),
+    };
+    let find = |k: &str| palette_entry(Some(palette), k, BarShape::Bar).map(|e| e.0);
+    (kind == "manual")
+        .then(|| find("manual"))
+        .flatten()
+        .or_else(|| find(name))
+        .unwrap_or_else(|| bar_kind_color(builtin))
 }
 
 fn bar_kind_color(kind: BarKind) -> u32 {

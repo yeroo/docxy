@@ -850,7 +850,6 @@ impl Manifest {
     /// The manifest JSON, as [`Manifest::parse`] reads it: what a plugin
     /// written in Rust returns from `yppx_ui_manifest`.
     pub fn json(&self) -> String {
-        let color = |c: Option<u32>| c.map_or(Json::Null, |c| Json::str(format!("#{c:06X}")));
         let items = |items: &[Item]| {
             Json::Arr(
                 items
@@ -900,7 +899,7 @@ impl Manifest {
                                                                 Json::Arr(
                                                                     c.swatches
                                                                         .iter()
-                                                                        .map(|sw| swatch_json(sw))
+                                                                        .map(swatch_json)
                                                                         .collect(),
                                                                 ),
                                                             ),
