@@ -144,6 +144,8 @@ pub enum Cell<A> {
 pub struct Gallery<A> {
     pub id: &'static str,
     pub tip: ScreenTip,
+    /// The KeyTip that opens the gallery's flyout; empty = none (#1762).
+    pub key_tip: &'static str,
     pub items: Vec<GalleryItem<A>>,
 }
 

@@ -541,6 +541,7 @@ pub(crate) fn table_design_tab() -> rs::Tab<Act> {
                             body: "Give the table a style",
                             shortcut: "",
                         },
+                        key_tip: "",
                         items: BUILTIN
                             .iter()
                             .enumerate()
