@@ -124,6 +124,11 @@ pub struct SheetPackage {
     /// slicer caches over them too, as over a table it drops itself (#1741).
     /// Kept as ids, since a table added later may take a freed id.
     removed_table_ids: Vec<u32>,
+    /// `(sheetId, name)` of the pivots a removal took out: the save drops the
+    /// pivot slicer and timeline caches over them (#1797). A pivot added or
+    /// re-registered later under the same pair has a cache of its own, which
+    /// the old caches never filtered, so the pair stays noted.
+    removed_pivots: Vec<(String, String)>,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
 }
@@ -567,6 +572,7 @@ fn load_parts(parts: Vec<(String, Vec<u8>)>) -> Result<SheetPackage, XlsxError> 
         styles_part,
         strict,
         removed_table_ids: Vec::new(),
+        removed_pivots: Vec::new(),
         workbook: Workbook {
             sheets,
             styles,
@@ -4491,6 +4497,7 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     // --- slicers over table columns or tables the tables step dropped ------
     // After the defined names: their `Slicer_<name>` entry is in the model.
     drop_table_slicers(&mut parts, &table_drops, &wb_part);
+    drop_pivot_slicers(&mut parts, &pkg.removed_pivots, &wb_part);
 
     // --- calcPr: the calculation settings the user can change ------------------
     if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_part) {
@@ -8562,6 +8569,15 @@ fn remove_rel(parts: &mut [(String, Vec<u8>)], rels: &str, id: &str) {
 /// surviving column or an untouched table keeps its bytes. Excel likely
 /// repaired such a file by dropping the slicer (not verified in Excel);
 /// dropping it here is the same loss without the repair prompt.
+///
+/// The `Slicer_<name>` defined name stays in the in-memory
+/// `Workbook::defined_names` (#1797): `save_xlsx` reads the package
+/// immutably, so the save cannot forget it, and forgetting it at the edit
+/// would have to move gridwasm's `RemovedSheetStash::rewritten_names`
+/// positions. The file is right on every save (`patch_defined_names` writes
+/// the name, this strikes it again) and a reload drops it from the model; the
+/// one host list of names, the suite's Go To, leaves `Slicer_` and
+/// `NativeTimeline_` names out.
 fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb_part: &str) {
     if drops.tables.is_empty() && drops.columns.is_empty() {
         return;
@@ -8600,6 +8616,58 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
             caches.push((name.clone(), cache));
         }
     }
+    drop_slicer_caches(parts, &caches, wb_part, &SLICERS);
+}
+
+/// What names a slicer or a timeline in the parts around its cache: the two
+/// kinds share one drop (`drop_slicer_caches`), as their wiring is the same.
+struct SlicerKind {
+    /// The folder of the parts holding the slicers (`xl/slicers/`).
+    dir: &'static str,
+    /// The slicer's element in that part.
+    element: &'static str,
+    /// The sheet's `extLst` wrapper and leaf naming the part by relationship.
+    sheet_wrapper: &'static str,
+    sheet_leaf: &'static str,
+    /// The workbook's `extLst` wrapper and leaf naming a cache.
+    wb_wrapper: &'static str,
+    wb_leaf: &'static str,
+    /// The drawing anchor's element, holding the slicer's `name`.
+    anchor: &'static str,
+}
+
+/// `x14:slicer` / `x14:slicerCache` (MS-XLSX 2.3.4, 2.3.1).
+const SLICERS: SlicerKind = SlicerKind {
+    dir: "xl/slicers/",
+    element: "slicer",
+    sheet_wrapper: "slicerList",
+    sheet_leaf: "slicer",
+    wb_wrapper: "slicerCaches",
+    wb_leaf: "slicerCache",
+    anchor: "slicer",
+};
+
+/// `x15:timelineRef` / `x15:timelineCacheRef` (MS-XLSX 2.3.9, 2.3.8), the
+/// timeline's `tle:timeslicer` anchor.
+const TIMELINES: SlicerKind = SlicerKind {
+    dir: "xl/timelines/",
+    element: "timeline",
+    sheet_wrapper: "timelineRefs",
+    sheet_leaf: "timelineRef",
+    wb_wrapper: "timelineCacheRefs",
+    wb_leaf: "timelineCacheRef",
+    anchor: "timeslicer",
+};
+
+/// Drop `caches` ((cache part, cache name) of one kind) with what hangs off
+/// them: the slicers or timelines on them, their anchors, the workbook's
+/// relationship, entry and defined name.
+fn drop_slicer_caches(
+    parts: &mut Vec<(String, Vec<u8>)>,
+    caches: &[(String, String)],
+    wb_part: &str,
+    kind: &SlicerKind,
+) {
     if caches.is_empty() {
         return;
     }
@@ -8610,7 +8678,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
     let mut slicer_names: Vec<String> = Vec::new();
     let slicer_parts: Vec<String> = (parts.iter())
         .map(|(n, _)| n.clone())
-        .filter(|n| n.starts_with("xl/slicers/") && n.ends_with(".xml") && !n.contains("_rels/"))
+        .filter(|n| n.starts_with(kind.dir) && n.ends_with(".xml") && !n.contains("_rels/"))
         .collect();
     for part in slicer_parts {
         let Some(xml) = part_text(parts, &part) else {
@@ -8618,7 +8686,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
         };
         let kids = element_children(&xml);
         let hit = |k: &(String, usize, usize)| {
-            k.0 == "slicer"
+            k.0 == kind.element
                 && start_attr_local(&xml[k.1..k.2], "cache")
                     .is_some_and(|c| cache_names.contains(&c.as_str()))
         };
@@ -8643,7 +8711,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
             remove_rel(parts, &rels, &id);
             if let Some(p) = parts.iter_mut().find(|(n, _)| *n == owner) {
                 let sheet = String::from_utf8_lossy(&p.1).into_owned();
-                let out = strike_ext_leaves(&sheet, "slicerList", "slicer", &|f| {
+                let out = strike_ext_leaves(&sheet, kind.sheet_wrapper, kind.sheet_leaf, &|f| {
                     start_attr_local(f, "id").as_deref() == Some(id.as_str())
                 });
                 p.1 = out.into_bytes();
@@ -8666,7 +8734,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
             };
             let edits: Vec<_> = element_children(&xml)
                 .into_iter()
-                .filter(|(_, s, e)| names_a_slicer(&xml[*s..*e], &slicer_names))
+                .filter(|(_, s, e)| names_a_slicer(&xml[*s..*e], &slicer_names, kind.anchor))
                 .map(|(_, s, e)| (s, e, String::new()))
                 .collect();
             if edits.is_empty() {
@@ -8680,7 +8748,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
 
     // The caches themselves: the workbook's relationship and entry first, so
     // the cascade finds nothing naming the part.
-    for (part, cache) in &caches {
+    for (part, cache) in caches {
         let rids: Vec<String> = (rels_naming(parts, part).into_iter())
             .filter(|(_, rels, _)| *rels == wb_rels)
             .map(|(_, _, id)| id)
@@ -8690,7 +8758,7 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
         }
         if let Some(p) = parts.iter_mut().find(|(n, _)| n == wb_part) {
             let mut xml = String::from_utf8_lossy(&p.1).into_owned();
-            xml = strike_ext_leaves(&xml, "slicerCaches", "slicerCache", &|f| {
+            xml = strike_ext_leaves(&xml, kind.wb_wrapper, kind.wb_leaf, &|f| {
                 start_attr_local(f, "id").is_some_and(|v| rids.contains(&v))
             });
             if let Some(el) = find_element_by_attr(&xml, "definedName", "name", |v| v == cache) {
@@ -8702,13 +8770,102 @@ fn drop_table_slicers(parts: &mut Vec<(String, Vec<u8>)>, drops: &TableDrops, wb
     }
 }
 
-/// Whether `anchor` (a drawing's child) holds an `sle:slicer` named one of
-/// `names`.
-fn names_a_slicer(anchor: &str, names: &[String]) -> bool {
+/// The cache's own `name`: the root element's attribute.
+fn cache_root_name(xml: &str) -> Option<String> {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                return Some(
+                    (p.attrs().iter())
+                        .find(|a| local(a.name) == "name")
+                        .map(|a| decode(a.value))
+                        .unwrap_or_default(),
+                );
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Pivot slicer caches (`x14:slicerCacheDefinition`) and timeline caches
+/// (`x15:timelineCacheDefinition`) over pivots a removal took out (#1797):
+/// each lists the pivots it filters in `<pivotTables><pivotTable tabId name/>`
+/// (`tabId` is the pivot's sheet's `sheetId`, MS-XLSX 2.3.1 and 2.3.8).
+/// `removed` holds those `(sheetId, name)` pairs. A cache whose every pivot
+/// went is dropped like a table's (`drop_slicer_caches`); one that also
+/// filters a pivot that stays only loses the removed `pivotTable` entries,
+/// every other byte kept. Not verified in Excel (no oracle here: the fixtures
+/// are synthetic, as for table slicers).
+fn drop_pivot_slicers(
+    parts: &mut Vec<(String, Vec<u8>)>,
+    removed: &[(String, String)],
+    wb_part: &str,
+) {
+    if removed.is_empty() {
+        return;
+    }
+    for (folder, kind) in [
+        ("xl/slicerCaches/", &SLICERS),
+        ("xl/timelineCaches/", &TIMELINES),
+    ] {
+        let mut caches: Vec<(String, String)> = Vec::new();
+        let names: Vec<String> = (parts.iter())
+            .map(|(n, _)| n.clone())
+            .filter(|n| n.starts_with(folder) && n.ends_with(".xml") && !n.contains("_rels/"))
+            .collect();
+        for part in names {
+            let Some(xml) = part_text(parts, &part) else {
+                continue;
+            };
+            let refs: Vec<(usize, usize)> = (element_children(&xml).into_iter())
+                .filter(|(n, _, _)| n == "pivotTables")
+                .flat_map(|(_, ls, le)| {
+                    let list = &xml[ls..le];
+                    (element_children(list).into_iter())
+                        .filter(|(n, _, _)| n == "pivotTable")
+                        .map(move |(_, s, e)| (ls + s, ls + e))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let doomed: Vec<&(usize, usize)> = (refs.iter())
+                .filter(|(s, e)| {
+                    let el = &xml[*s..*e];
+                    match (start_attr_local(el, "tabId"), start_attr_local(el, "name")) {
+                        (Some(t), Some(n)) => removed.iter().any(|(rt, rn)| *rt == t && *rn == n),
+                        _ => false,
+                    }
+                })
+                .collect();
+            if doomed.is_empty() {
+                continue;
+            }
+            if doomed.len() == refs.len() {
+                if let Some(cache) = cache_root_name(&xml) {
+                    caches.push((part, cache));
+                }
+                continue;
+            }
+            let edits = doomed
+                .iter()
+                .map(|(s, e)| (*s, *e, String::new()))
+                .collect();
+            if let Some(p) = parts.iter_mut().find(|(n, _)| *n == part) {
+                p.1 = apply_edits(xml, edits).into_bytes();
+            }
+        }
+        drop_slicer_caches(parts, &caches, wb_part, kind);
+    }
+}
+
+/// Whether `anchor` (a drawing's child) holds an `sle:slicer` (or, for
+/// `element` `timeslicer`, a `tle:timeslicer`) named one of `names`.
+fn names_a_slicer(anchor: &str, names: &[String], element: &str) -> bool {
     let mut p = XmlParser::new(anchor);
     loop {
         match p.next() {
-            Event::Start if local(p.name()) == "slicer" => {
+            Event::Start if local(p.name()) == element => {
                 let named = (p.attrs().iter())
                     .find(|a| local(a.name) == "name")
                     .map(|a| decode(a.value));
@@ -11015,10 +11172,12 @@ impl SheetPackage {
         Some(idx)
     }
 
-    /// Remove pivot `idx` from `workbook.pivots`: drops its table/cache
-    /// parts, their content-type overrides, the workbook-rels relationship +
-    /// `<pivotCache>` registration for the cache, and the destination
-    /// sheet's relationship to the table part. The exact inverse of
+    /// Remove pivot `idx` from `workbook.pivots`: drops its table part and
+    /// the destination sheet's relationship to it, and the cache part, its
+    /// content-type override, the workbook-rels relationship and the
+    /// `<pivotCache>` registration, those only when no other pivot shares
+    /// the `cache_part` (#1797); the pivot is also noted for the save to drop
+    /// the slicer and timeline caches over it. The exact inverse of
     /// `add_pivot`/`create_pivot` — nothing else in the codebase unregisters
     /// a pivot, so this is the "remove both or neither" half of the
     /// pivot-creation inverse (pair with `remove_sheet` when the pivot's
@@ -11029,8 +11188,18 @@ impl SheetPackage {
             return false;
         }
         let piv = self.workbook.pivots.remove(idx);
+        // The caches over it go at the save; they name it by its sheet's
+        // `sheetId` and its name, read while both are still in the parts.
+        if let Some(key) = self.pivot_key(piv.sheet, &piv.part) {
+            if !self.removed_pivots.contains(&key) {
+                self.removed_pivots.push(key);
+            }
+        }
+        // Another pivot may share the cache (one `cacheId`): it keeps the
+        // cache part, its override, the workbook's relationship and entry.
+        let shared = (self.workbook.pivots.iter()).any(|q| q.cache_part == piv.cache_part);
         self.parts
-            .retain(|(n, _)| *n != piv.part && *n != piv.cache_part);
+            .retain(|(n, _)| *n != piv.part && (shared || *n != piv.cache_part));
         if let Some(p) = self
             .parts
             .iter_mut()
@@ -11038,7 +11207,11 @@ impl SheetPackage {
         {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.part));
-            let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.cache_part));
+            let xml = if shared {
+                xml
+            } else {
+                remove_element_containing(&xml, "<Override", &format!("/{}", piv.cache_part))
+            };
             p.1 = xml.into_bytes();
         }
         // workbook.xml.rels: drop the cache relationship, remembering its rId.
@@ -11046,7 +11219,10 @@ impl SheetPackage {
         let wb_rels = rels_part_name(&wb_part);
         let wb_dir = workbook_dir(&self.parts);
         let mut cache_rid = String::new();
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
+        if let Some(p) = (self.parts.iter_mut())
+            .filter(|_| !shared)
+            .find(|(n, _)| *n == wb_rels)
+        {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // The rel whose Target resolves to the cache part, however the
             // file spells it (`../pivotCache/…`, `/xl/pivotCache/…`).
@@ -11089,6 +11265,30 @@ impl SheetPackage {
             }
         }
         true
+    }
+
+    /// The `sheetId` of sheet `sheet`'s `<sheet>` in the workbook part, as
+    /// the caches' `pivotTable tabId` writes it.
+    fn sheet_id_of(&self, sheet: usize) -> Option<String> {
+        let sheet_part = self.sheet_parts.get(sheet)?;
+        let wb_part = workbook_part_name(&self.parts);
+        let wb_dir = workbook_dir(&self.parts);
+        let rels = String::from_utf8_lossy(self.part(&rels_part_name(&wb_part))?).into_owned();
+        let (rid, _, _) = parse_rels(&rels)
+            .into_iter()
+            .find(|(_, _, t)| resolve_relative(&wb_dir, t) == *sheet_part)?;
+        let xml = String::from_utf8_lossy(self.part(&wb_part)?).into_owned();
+        let el = find_element_by_attr(&xml, "sheet", "id", |v| v == rid)?;
+        start_attr_local(&xml[el.start..el.end], "sheetId")
+    }
+
+    /// What a slicer or timeline cache calls the pivot whose table part is
+    /// `part` on sheet `sheet`: `(sheetId, name)`. `None` when either is not
+    /// in the package (the caches are then left as they are).
+    fn pivot_key(&self, sheet: usize, part: &str) -> Option<(String, String)> {
+        let xml = String::from_utf8_lossy(self.part(part)?).into_owned();
+        let name = cache_root_name(&xml).filter(|n| !n.is_empty())?;
+        Some((self.sheet_id_of(sheet)?, name))
     }
 
     /// Remove the sheet at `idx`. Returns false (and does nothing) when it
@@ -11636,6 +11836,7 @@ pub(crate) fn new_xlsx_sheets(names: &[String]) -> SheetPackage {
         styles_part: Some("xl/styles.xml".to_string()),
         strict: false,
         removed_table_ids: Vec::new(),
+        removed_pivots: Vec::new(),
         workbook: Workbook {
             sheets: names
                 .iter()
@@ -19707,6 +19908,439 @@ b",
             pkg.workbook.sheets[0].cell(0, 0).unwrap().value,
             crate::sheet::CellValue::Number(1234567890123456789.0)
         );
+    }
+
+    // --- pivot slicer and timeline caches over a removed pivot (#1797) -----
+    // Synthetic fixtures (no Excel oracle), laid out as MS-XLSX describes.
+
+    const MS14: &str = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main";
+    const MS15: &str = "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main";
+    const REL07: &str = "http://schemas.microsoft.com/office/2007/relationships";
+    const REL11: &str = "http://schemas.microsoft.com/office/2011/relationships";
+
+    fn ptext(pkg: &SheetPackage, part: &str) -> String {
+        String::from_utf8(pkg.part(part).unwrap_or_default().to_vec()).unwrap()
+    }
+
+    fn preload(pkg: &SheetPackage) -> SheetPackage {
+        load_xlsx(&save_xlsx(pkg)).unwrap()
+    }
+
+    /// `pivot_fixture()` (Data = sheetId 1, Report = sheetId 2 holding
+    /// `PivotTable1`) with a pivot slicer `Slicer_Region` and a timeline
+    /// `NativeTimeline_Sales`, both filtering `pivots` (`tabId`/`name` pairs),
+    /// their slicer and timeline parts, drawing anchors and workbook entries
+    /// on Data.
+    fn pivot_slicer_package(pivots: &[(&str, &str)]) -> SheetPackage {
+        let mut pkg = load_xlsx(&pivot_fixture()).unwrap();
+        let list: String = pivots
+            .iter()
+            .map(|(t, n)| format!(r#"<pivotTable tabId="{t}" name="{n}"/>"#))
+            .collect();
+        let put = |pkg: &mut SheetPackage, name: &str, xml: String| match pkg
+            .parts
+            .iter_mut()
+            .find(|(n, _)| n == name)
+        {
+            Some(p) => p.1 = xml.into_bytes(),
+            None => pkg.parts.push((name.to_string(), xml.into_bytes())),
+        };
+        let edit = |pkg: &mut SheetPackage, name: &str, f: &dyn Fn(String) -> String| {
+            let p = pkg.parts.iter_mut().find(|(n, _)| n == name).unwrap();
+            p.1 = f(String::from_utf8(p.1.clone()).unwrap()).into_bytes();
+        };
+        put(
+            &mut pkg,
+            "xl/slicerCaches/slicerCache1.xml",
+            format!(
+                r#"<slicerCacheDefinition xmlns="{MS14}" name="Slicer_Region" sourceName="Region"><pivotTables>{list}</pivotTables><data><tabular pivotCacheId="1"/></data></slicerCacheDefinition>"#
+            ),
+        );
+        put(
+            &mut pkg,
+            "xl/timelineCaches/timelineCache1.xml",
+            format!(
+                r#"<timelineCacheDefinition xmlns="{MS15}" name="NativeTimeline_Sales" sourceName="Sales"><pivotTables>{list}</pivotTables><state/></timelineCacheDefinition>"#
+            ),
+        );
+        put(
+            &mut pkg,
+            "xl/slicers/slicer1.xml",
+            format!(
+                r#"<slicers xmlns="{MS14}"><slicer name="Region" cache="Slicer_Region" caption="Region"/></slicers>"#
+            ),
+        );
+        put(
+            &mut pkg,
+            "xl/timelines/timeline1.xml",
+            format!(
+                r#"<timelines xmlns="{MS15}"><timeline name="Sales" cache="NativeTimeline_Sales" caption="Sales"/></timelines>"#
+            ),
+        );
+        let anchor = |id: u32, name: &str, el: &str| {
+            format!(
+                r#"<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><mc:Choice Requires="x"><xdr:twoCellAnchor><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="{id}" name="{name}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><a:graphic><a:graphicData uri="x"><x:{el} xmlns:x="urn:x" name="{name}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></mc:Choice><mc:Fallback><xdr:sp macro="" textlink=""/></mc:Fallback></mc:AlternateContent>"#
+            )
+        };
+        put(
+            &mut pkg,
+            "xl/drawings/drawing1.xml",
+            format!(
+                r#"<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">{}{}</xdr:wsDr>"#,
+                anchor(2, "Region", "slicer"),
+                anchor(3, "Sales", "timeslicer")
+            ),
+        );
+        let rel = |id: &str, ty: &str, target: &str| {
+            format!(r#"<Relationship Id="{id}" Type="{ty}" Target="{target}"/>"#)
+        };
+        edit(&mut pkg, "xl/_rels/workbook.xml.rels", &|x| {
+            x.replace(
+                "</Relationships>",
+                &format!(
+                    "{}{}</Relationships>",
+                    rel(
+                        "rId10",
+                        &format!("{REL07}/slicerCache"),
+                        "slicerCaches/slicerCache1.xml"
+                    ),
+                    rel(
+                        "rId11",
+                        &format!("{REL11}/timelineCache"),
+                        "timelineCaches/timelineCache1.xml"
+                    )
+                ),
+            )
+        });
+        put(
+            &mut pkg,
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            format!(
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{}{}{}</Relationships>"#,
+                rel("rId2", &format!("{REL07}/slicer"), "../slicers/slicer1.xml"),
+                rel(
+                    "rId3",
+                    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing",
+                    "../drawings/drawing1.xml"
+                ),
+                rel(
+                    "rId4",
+                    &format!("{REL11}/timeline"),
+                    "../timelines/timeline1.xml"
+                )
+            ),
+        );
+        edit(&mut pkg, "xl/worksheets/sheet1.xml", &|x| {
+            x.replace(
+                "<worksheet ",
+                r#"<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" "#,
+            )
+            .replace(
+                "</worksheet>",
+                &format!(
+                    r#"<drawing r:id="rId3"/><extLst><ext uri="{{A8765BA9-456A-4dab-B4F3-ACF838C121DE}}" xmlns:x14="{MS14}"><x14:slicerList><x14:slicer r:id="rId2"/></x14:slicerList></ext><ext uri="{{7E03D99C-DC04-49d9-9315-930204A7B6E9}}" xmlns:x15="{MS15}"><x15:timelineRefs><x15:timelineRef r:id="rId4"/></x15:timelineRefs></ext></extLst></worksheet>"#
+                ),
+            )
+        });
+        edit(&mut pkg, "xl/workbook.xml", &|x| {
+            x.replace(
+                "</sheets>",
+                r#"</sheets><definedNames><definedName name="Slicer_Region">#N/A</definedName><definedName name="NativeTimeline_Sales">#N/A</definedName><definedName name="Keep">Data!$A$1</definedName></definedNames>"#,
+            )
+            .replace(
+                "</workbook>",
+                &format!(
+                    r#"<extLst><ext uri="{{BBE1A952-AA13-448e-AADC-164F8A28A991}}" xmlns:x14="{MS14}"><x14:slicerCaches><x14:slicerCache r:id="rId10"/></x14:slicerCaches></ext><ext uri="{{D0A3BD9C-5ACF-43ac-A0E0-F2B8A8A7F8D0}}" xmlns:x15="{MS15}"><x15:timelineCacheRefs><x15:timelineCacheRef r:id="rId11"/></x15:timelineCacheRefs></ext></extLst></workbook>"#
+                ),
+            )
+        });
+        edit(&mut pkg, "[Content_Types].xml", &|x| {
+            let ov = |part: &str, ty: &str| {
+                format!(
+                    r#"<Override PartName="/{part}" ContentType="application/vnd.ms-excel.{ty}+xml"/>"#
+                )
+            };
+            x.replace(
+                "</Types>",
+                &format!(
+                    "{}{}{}{}{}</Types>",
+                    ov("xl/slicerCaches/slicerCache1.xml", "slicerCache"),
+                    ov("xl/timelineCaches/timelineCache1.xml", "timelineCache"),
+                    ov("xl/slicers/slicer1.xml", "slicer"),
+                    ov("xl/timelines/timeline1.xml", "timeline"),
+                    r#"<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>"#
+                ),
+            )
+        });
+        preload(&pkg)
+    }
+
+    /// The package with a second pivot, also named `PivotTable1`, on Data
+    /// (sheetId 1), sharing the first one's cache (`cacheId` 1).
+    fn with_pivot_on_data(mut pkg: SheetPackage) -> SheetPackage {
+        let table = ptext(&pkg, "xl/pivotTables/pivotTable1.xml").replace("A3:B5", "E3:F5");
+        pkg.parts
+            .push(("xl/pivotTables/pivotTable2.xml".into(), table.into_bytes()));
+        let rels = ptext(&pkg, "xl/worksheets/_rels/sheet1.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable2.xml"/></Relationships>"#,
+        );
+        let at = pkg
+            .parts
+            .iter()
+            .position(|(n, _)| n == "xl/worksheets/_rels/sheet1.xml.rels")
+            .unwrap();
+        pkg.parts[at].1 = rels.into_bytes();
+        let types = ptext(&pkg, "[Content_Types].xml").replace(
+            "</Types>",
+            r#"<Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/><Override PartName="/xl/pivotTables/pivotTable2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/></Types>"#,
+        );
+        let at = (pkg.parts.iter())
+            .position(|(n, _)| n == "[Content_Types].xml")
+            .unwrap();
+        pkg.parts[at].1 = types.into_bytes();
+        let pkg = preload(&pkg);
+        assert_eq!(pkg.workbook.pivots.len(), 2, "both pivots load");
+        assert_eq!(
+            pkg.workbook.pivots[0].cache_part,
+            pkg.workbook.pivots[1].cache_part
+        );
+        pkg
+    }
+
+    /// Everything of the pivot slicer fixture that still exists.
+    fn pivot_slicer_leftovers(pkg: &SheetPackage) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let wb = ptext(pkg, "xl/workbook.xml");
+        let rels = ptext(pkg, "xl/_rels/workbook.xml.rels");
+        let types = ptext(pkg, "[Content_Types].xml");
+        let sheet = ptext(pkg, "xl/worksheets/sheet1.xml");
+        let drawing = ptext(pkg, "xl/drawings/drawing1.xml");
+        let checks: [(&str, bool); 14] = [
+            (
+                "slicer cache",
+                pkg.part("xl/slicerCaches/slicerCache1.xml").is_some(),
+            ),
+            (
+                "timeline cache",
+                pkg.part("xl/timelineCaches/timelineCache1.xml").is_some(),
+            ),
+            ("slicer part", pkg.part("xl/slicers/slicer1.xml").is_some()),
+            (
+                "timeline part",
+                pkg.part("xl/timelines/timeline1.xml").is_some(),
+            ),
+            ("slicer name", wb.contains("\"Slicer_Region\"")),
+            ("timeline name", wb.contains("\"NativeTimeline_Sales\"")),
+            ("slicer workbook entry", wb.contains("slicerCache ")),
+            ("timeline workbook entry", wb.contains("timelineCacheRef ")),
+            (
+                "workbook rels",
+                rels.contains("slicerCache") || rels.contains("timelineCache"),
+            ),
+            (
+                "types",
+                types.contains("slicer") || types.contains("timeline"),
+            ),
+            ("sheet slicer entry", sheet.contains("x14:slicer ")),
+            ("sheet timeline entry", sheet.contains("timelineRef ")),
+            ("slicer anchor", drawing.contains("name=\"Region\"")),
+            ("timeline anchor", drawing.contains("name=\"Sales\"")),
+        ];
+        for (what, present) in checks {
+            if present {
+                out.push(what);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_pivot_slicer_fixture_loads_and_saves_untouched() {
+        let pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
+        assert_eq!(pkg.workbook.pivots.len(), 1, "the pivot loads");
+        assert_eq!(pivot_slicer_leftovers(&pkg).len(), 14, "fixture");
+        let re = preload(&pkg);
+        assert_eq!(pivot_slicer_leftovers(&re).len(), 14);
+        for part in [
+            "xl/slicerCaches/slicerCache1.xml",
+            "xl/timelineCaches/timelineCache1.xml",
+            "xl/slicers/slicer1.xml",
+            "xl/timelines/timeline1.xml",
+            "xl/drawings/drawing1.xml",
+        ] {
+            assert_eq!(ptext(&re, part), ptext(&pkg, part), "{part}");
+        }
+    }
+
+    #[test]
+    fn removing_a_pivots_sheet_drops_its_slicer_and_timeline_caches() {
+        let mut pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
+        assert!(pkg.remove_sheet(1));
+        let re = preload(&pkg);
+        assert!(re.workbook.pivots.is_empty());
+        assert_eq!(pivot_slicer_leftovers(&re), Vec::<&str>::new());
+        let wb = ptext(&re, "xl/workbook.xml");
+        assert!(
+            wb.contains("name=\"Keep\"") && !wb.contains("extLst"),
+            "{wb}"
+        );
+        let ws = ptext(&re, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("extLst") && !ws.contains("slicer"), "{ws}");
+        assert!(re.part_names().iter().all(|n| {
+            !n.contains("slicer") && !n.contains("timeline") || n.contains("drawing")
+        }));
+        let again = preload(&re);
+        for part in [
+            "xl/workbook.xml",
+            "xl/_rels/workbook.xml.rels",
+            "[Content_Types].xml",
+        ] {
+            assert_eq!(ptext(&again, part), ptext(&re, part), "{part}");
+        }
+    }
+
+    #[test]
+    fn removing_the_pivot_alone_drops_its_slicer_and_timeline_caches() {
+        let mut pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
+        assert!(pkg.remove_pivot(0));
+        let re = preload(&pkg);
+        assert_eq!(re.workbook.sheets.len(), 2, "the sheet stays");
+        assert_eq!(pivot_slicer_leftovers(&re), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_cache_over_a_pivot_that_stays_loses_only_the_removed_entry() {
+        // The caches also filter Data's `PivotTable1`, a real pivot sharing
+        // the cache that stays: the same name on another sheet is another
+        // pivot.
+        let mut pkg = with_pivot_on_data(pivot_slicer_package(&[
+            ("2", "PivotTable1"),
+            ("1", "PivotTable1"),
+        ]));
+        assert!(pkg.remove_sheet(1));
+        let re = preload(&pkg);
+        assert_eq!(re.workbook.pivots.len(), 1);
+        let slicer = ptext(&re, "xl/slicerCaches/slicerCache1.xml");
+        let timeline = ptext(&re, "xl/timelineCaches/timelineCache1.xml");
+        for xml in [&slicer, &timeline] {
+            assert!(
+                xml.contains(r#"<pivotTable tabId="1" name="PivotTable1"/>"#),
+                "{xml}"
+            );
+            assert!(!xml.contains(r#"tabId="2""#), "{xml}");
+        }
+        assert!(slicer.contains(r#"<data><tabular pivotCacheId="1"/></data>"#));
+        assert_eq!(
+            pivot_slicer_leftovers(&re).len(),
+            14,
+            "{:?}",
+            pivot_slicer_leftovers(&re)
+        );
+    }
+
+    #[test]
+    fn removing_a_pivot_keeps_a_cache_another_pivot_shares() {
+        let mut pkg = with_pivot_on_data(pivot_slicer_package(&[("1", "PivotTable1")]));
+        let report = pkg
+            .workbook
+            .pivots
+            .iter()
+            .position(|p| p.sheet == 1)
+            .unwrap();
+        let cache = pkg.workbook.pivots[report].cache_part.clone();
+        assert!(pkg.remove_pivot(report));
+        let over = format!("PartName=\"/{cache}\"");
+        assert!(pkg.part(&cache).is_some(), "the shared cache part stays");
+        assert!(ptext(&pkg, "[Content_Types].xml").contains(&over));
+        let types = ptext(&pkg, "[Content_Types].xml");
+        assert!(!types.contains("pivotTable1.xml") && types.contains("pivotTable2.xml"));
+        let rels = ptext(&pkg, "xl/_rels/workbook.xml.rels");
+        assert!(rels.contains("pivotCacheDefinition1.xml"), "{rels}");
+        assert!(ptext(&pkg, "xl/workbook.xml").contains("<pivotCache "));
+        let re = preload(&pkg);
+        assert_eq!(re.workbook.pivots.len(), 1, "the other pivot still loads");
+        assert!(re.part(&cache).is_some());
+        // The last one out takes the cache with it.
+        let mut re = re;
+        assert!(re.remove_pivot(0));
+        assert!(re.part(&cache).is_none());
+        assert!(!ptext(&re, "xl/_rels/workbook.xml.rels").contains("pivotCacheDefinition1"));
+        assert!(!ptext(&re, "[Content_Types].xml").contains(&over));
+    }
+
+    #[test]
+    fn caches_over_a_surviving_pivot_keep_their_bytes() {
+        let mut pkg = pivot_slicer_package(&[("1", "PivotTable1")]);
+        let before: Vec<String> = [
+            "xl/slicerCaches/slicerCache1.xml",
+            "xl/timelineCaches/timelineCache1.xml",
+            "xl/workbook.xml",
+            "xl/drawings/drawing1.xml",
+        ]
+        .iter()
+        .map(|p| ptext(&pkg, p))
+        .collect();
+        assert!(pkg.remove_sheet(1));
+        let re = preload(&pkg);
+        assert_eq!(pivot_slicer_leftovers(&re).len(), 14);
+        for (i, part) in [
+            "xl/slicerCaches/slicerCache1.xml",
+            "xl/timelineCaches/timelineCache1.xml",
+            "xl/workbook.xml",
+            "xl/drawings/drawing1.xml",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // The workbook loses the removed sheet's own `<sheet>` only.
+            if i != 2 {
+                assert_eq!(ptext(&re, part), before[i], "{part}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pivot_added_over_a_removed_ones_name_does_not_save_the_old_caches() {
+        let mut pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
+        assert!(pkg.remove_pivot(0));
+        assert_eq!(
+            pkg.removed_pivots,
+            [("2".to_string(), "PivotTable1".to_string())]
+        );
+        // A new pivot on Report takes the freed part, so the same name.
+        let idx = pkg
+            .add_pivot(
+                crate::pivot::PivotSource::Range {
+                    sheet: "Data".into(),
+                    rect: (0, 0, 4, 2),
+                },
+                vec!["Region".into(), "Product".into(), "Sales".into()],
+                crate::pivot::DataField {
+                    name: "Sum of Sales".into(),
+                    field: 2,
+                    agg: crate::frame::Agg::Sum,
+                },
+                1,
+                (2, 0),
+            )
+            .expect("add_pivot");
+        assert_eq!(pkg.workbook.pivots[idx].name, "PivotTable1");
+        // The new pivot has a cache of its own: the old caches stay noted.
+        assert_eq!(pkg.removed_pivots.len(), 1);
+        let re = preload(&pkg);
+        assert_eq!(pivot_slicer_leftovers(&re), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn a_pivot_whose_sheet_or_name_is_unknown_is_not_noted() {
+        let mut pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
+        let part = pkg.workbook.pivots[0].part.clone();
+        pkg.parts.retain(|(n, _)| *n != part);
+        assert!(pkg.remove_pivot(0));
+        assert!(pkg.removed_pivots.is_empty());
+        let re = preload(&pkg);
+        assert!(re.part("xl/slicerCaches/slicerCache1.xml").is_some());
     }
 }
 

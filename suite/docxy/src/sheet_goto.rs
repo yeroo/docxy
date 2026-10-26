@@ -100,6 +100,16 @@ fn default_ok(mut d: Dialog) -> Dialog {
     d
 }
 
+/// A name Go To does not list: Excel's built-ins and the `Slicer_` /
+/// `NativeTimeline_` names of slicers and timelines (#1797), which are not
+/// places to go to, and which a dropped table slicer leaves in the model
+/// until the file is reloaded. Those are the names Excel writes as `#N/A`; a
+/// name of the user's own that starts alike and points at a range stays.
+fn hidden_name(d: &gridcore::sheet::DefinedName) -> bool {
+    let cache = d.name.starts_with("Slicer_") || d.name.starts_with("NativeTimeline_");
+    d.name.starts_with("_xlnm") || (cache && d.formula.trim() == "#N/A")
+}
+
 /// Go To: the defined names, a Reference box and Special….
 pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let v = sheet_view(tab)?;
@@ -121,7 +131,7 @@ pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .workbook
         .defined_names
         .iter()
-        .filter(|n| n.scope.is_none_or(|s| s == v.active) && !n.name.starts_with("_xlnm"))
+        .filter(|n| n.scope.is_none_or(|s| s == v.active) && !hidden_name(n))
         .map(|n| n.name.clone())
         .collect();
     d.controls = vec![
@@ -462,6 +472,35 @@ mod tests {
         set(&mut t, "names", Value::Choice(Some(0)));
         assert_eq!(click(&mut t, "OK"), Some(Ok(())));
         assert_eq!(view(&mut t).sel, at("D9"));
+    }
+
+    #[test]
+    fn go_to_leaves_slicer_and_timeline_names_out() {
+        let mut t = tab();
+        for (name, formula) in [
+            ("Slicer_Item", "#N/A"),
+            ("NativeTimeline_Date", "#N/A"),
+            ("Slicer_Total", "Sheet1!$D$9"),
+            ("Rate", "Sheet1!$D$9"),
+            ("_xlnm.Print_Area", "Sheet1!$D$9"),
+        ] {
+            view(&mut t)
+                .pkg
+                .workbook
+                .defined_names
+                .push(gridcore::sheet::DefinedName {
+                    name: name.into(),
+                    scope: None,
+                    formula: formula.into(),
+                });
+        }
+        t.dialogs.push(goto_dialog(&t).unwrap());
+        let names = &t.dialogs.top().unwrap().controls[0];
+        // A user's own `Slicer_Total` over a range stays listed.
+        assert_eq!(
+            names.items,
+            vec!["Slicer_Total".to_string(), "Rate".to_string()]
+        );
     }
 
     /// #707 r6 m2: Enter and Escape on Go To and Go To Special press
