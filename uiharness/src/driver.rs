@@ -2,7 +2,9 @@
 //! its picture.
 
 use crate::capture::{Capture, capture_pid};
+use crate::expect::{BorderCheck, BorderExpect, check_border_clipped};
 use crate::image::{Clip, Image, RectPx, clipped};
+use crate::probe::ProbeOpts;
 use ctlcore::client::{Client, Instance, discover_live};
 use ctlcore::json::Json;
 use std::path::{Path, PathBuf};
@@ -79,6 +81,144 @@ where
          (before: {:?}, frame {}; after: {:?}, frame {}); keep the window still and retry",
         before.rect, before.frame, after.rect, after.frame
     ))
+}
+
+/// How many captures [`steady_shot`] takes, at most, looking for two in a row
+/// that agree. A region with a blinking caret in it may never agree; it is then
+/// judged on its last capture, as before the wait existed.
+const STEADY_ATTEMPTS: usize = 4;
+
+/// How long [`judge_until`] keeps re-polling a border that reads wrong.
+const BORDER_DEADLINE: Duration = Duration::from_secs(2);
+
+/// And how many steady shots it takes at most, whatever the clock says, so a
+/// slow capture cannot keep it looping.
+const BORDER_POLLS: usize = 8;
+
+/// Two shots of a region that agree pixel for pixel, and on which edges the
+/// region ran off the capture.
+fn same_pixels(a: &Shot, b: &Shot) -> bool {
+    a.image == b.image && a.clipped == b.clipped
+}
+
+/// A region's shot once the capture has caught up with the app.
+///
+/// ⚠️ [`Driver::settle`] counts the frames the app *drew*, which is not the
+/// frame Windows *presents*: `PrintWindow` can return the one before, with the
+/// geometry from the new one (#1783). So shots are taken until two in a row
+/// agree, each settled twice over, with frames drawn in between. That reduces
+/// the chance of judging a stale picture but does not prove the picture fresh:
+/// two stale captures in a row would agree too, and [`judge_until`] stops on
+/// the first verdict that passes, so such a pair that satisfies the
+/// expectation passes.
+///
+/// Returns the shot, whether two agreed, and how many captures it took.
+fn steady_shot<F>(mut shoot: F) -> Result<(Shot, bool, usize), String>
+where
+    F: FnMut() -> Result<Shot, String>,
+{
+    let mut prev = shoot()?;
+    let mut captures = 1;
+    while captures < STEADY_ATTEMPTS {
+        let next = shoot()?;
+        captures += 1;
+        if same_pixels(&prev, &next) {
+            return Ok((next, true, captures));
+        }
+        prev = next;
+    }
+    Ok((prev, false, captures))
+}
+
+/// A border check and the shot it was made on.
+pub struct Judged<C> {
+    pub shot: Shot,
+    pub check: C,
+    /// Steady shots judged, the reported one included.
+    pub attempts: usize,
+    /// Captures taken over all of them.
+    pub captures: usize,
+    /// Whether the reported shot's region agreed across two captures.
+    pub steady: bool,
+}
+
+impl<C> Judged<C> {
+    /// What to add after the capture's own description on a failure: empty
+    /// when the first two captures agreed and were judged.
+    pub fn polling(&self) -> String {
+        let mut s = String::new();
+        if self.attempts > 1 || self.captures > 2 || !self.steady {
+            s.push_str(&format!(
+                "; {} attempt{}, {} captures",
+                self.attempts,
+                if self.attempts == 1 { "" } else { "s" },
+                self.captures
+            ));
+        }
+        if !self.steady {
+            s.push_str("; region not steady");
+        }
+        s
+    }
+}
+
+/// Judge a region on a steady shot ([`steady_shot`]), and while the verdict
+/// is a failure, take another until it passes or `deadline` has passed since
+/// the first (at most [`BORDER_POLLS`]). The verdict reported is the last.
+///
+/// A verdict that `done` calls final (it passed, or a side could not be read
+/// at all, which a new picture cannot change) is returned at once, and so is
+/// a shot that fails outright (a moved window, a hung app).
+fn judge_until<C, F, J, D, N>(
+    mut shoot: F,
+    mut judge: J,
+    done: D,
+    deadline: Duration,
+    mut now: N,
+) -> Result<Judged<C>, String>
+where
+    F: FnMut() -> Result<Shot, String>,
+    J: FnMut(&Shot) -> C,
+    D: Fn(&C) -> bool,
+    N: FnMut() -> Instant,
+{
+    let start = now();
+    let mut captures = 0;
+    let mut attempts = 0;
+    loop {
+        let (shot, steady, n) = steady_shot(&mut shoot)?;
+        captures += n;
+        attempts += 1;
+        let check = judge(&shot);
+        if done(&check) || attempts >= BORDER_POLLS || now().duration_since(start) >= deadline {
+            return Ok(Judged {
+                shot,
+                check,
+                attempts,
+                captures,
+                steady,
+            });
+        }
+    }
+}
+
+/// `judge_until` for a border expectation: the check both the runner's
+/// `assert border` and the CLI's `assert` make.
+pub fn judge_border<F>(
+    exp: &BorderExpect,
+    opts: ProbeOpts,
+    shoot: F,
+) -> Result<Judged<BorderCheck>, String>
+where
+    F: FnMut() -> Result<Shot, String>,
+{
+    judge_until(
+        shoot,
+        |s| check_border_clipped(exp, &s.image, opts, s.clipped),
+        |c: &BorderCheck| c.passed() || !c.errors.is_empty(),
+        BORDER_DEADLINE,
+        Instant::now,
+    )
 }
 
 /// A connection to one harness instance.
@@ -273,6 +413,7 @@ pub struct Shot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expect::parse_border;
 
     #[test]
     fn the_control_directory_is_derived_from_the_sandbox_root() {
@@ -369,6 +510,222 @@ mod tests {
         .expect("geometry that never stabilizes must be refused");
         assert_eq!(captures, CAPTURE_ATTEMPTS);
         assert!(err.contains("moved or rescaled"), "{err}");
+    }
+
+    // ---- judging on a steady shot (#1783) ---------------------------------
+
+    const TEAL: [u8; 4] = [0x2a, 0xa7, 0x9b, 0xff];
+    const WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+    /// A 30x20 white crop, with a 2 px box of `edge` round it when given.
+    fn crop(edge: Option<[u8; 4]>) -> Image {
+        let (w, h) = (30, 20);
+        let mut img = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let on_edge = x < 2 || y < 2 || x >= w - 2 || y >= h - 2;
+                let c = match edge {
+                    Some(c) if on_edge => c,
+                    _ => WHITE,
+                };
+                img.set_pixel(x, y, c);
+            }
+        }
+        img
+    }
+
+    fn shot_of(image: Image) -> Shot {
+        Shot {
+            image,
+            capture: capture(),
+            clipped: Clip::default(),
+        }
+    }
+
+    /// Shots handed out in order, counted.
+    fn shots(images: Vec<Image>) -> impl FnMut() -> Result<Shot, String> {
+        let mut it = images.into_iter();
+        move || {
+            Ok(shot_of(
+                it.next().expect("asked for more shots than the test has"),
+            ))
+        }
+    }
+
+    /// A clock that moves `step` every time it is read.
+    fn clock(step: Duration) -> impl FnMut() -> Instant {
+        let start = Instant::now();
+        let mut reads = 0u32;
+        move || {
+            let t = start + step * reads;
+            reads += 1;
+            t
+        }
+    }
+
+    fn final_verdict(c: &BorderCheck) -> bool {
+        c.passed() || !c.errors.is_empty()
+    }
+
+    fn judge(
+        exp: &BorderExpect,
+        shoot: impl FnMut() -> Result<Shot, String>,
+        now: impl FnMut() -> Instant,
+    ) -> Judged<BorderCheck> {
+        let mut judged = 0;
+        let j = judge_until(
+            shoot,
+            |s| {
+                judged += 1;
+                check_border_clipped(exp, &s.image, ProbeOpts::default(), s.clipped)
+            },
+            final_verdict,
+            BORDER_DEADLINE,
+            now,
+        )
+        .expect("the fake shots never fail");
+        assert_eq!(judged, j.attempts, "each attempt is judged once");
+        j
+    }
+
+    #[test]
+    fn a_border_is_judged_only_once_two_captures_agree() {
+        // The stale frame of #1783: no bar yet. Judged alone it would fail.
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let j = judge(
+            &exp,
+            shots(vec![crop(None), crop(Some(TEAL)), crop(Some(TEAL))]),
+            clock(Duration::ZERO),
+        );
+        assert!(j.check.passed(), "{}", j.check.report(None));
+        assert_eq!((j.attempts, j.captures, j.steady), (1, 3, true));
+        assert_eq!(
+            j.shot.image,
+            crop(Some(TEAL)),
+            "the evidence is the judged shot"
+        );
+    }
+
+    #[test]
+    fn a_steady_passing_border_costs_one_extra_capture() {
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let j = judge(
+            &exp,
+            shots(vec![crop(Some(TEAL)), crop(Some(TEAL))]),
+            clock(Duration::ZERO),
+        );
+        assert!(j.check.passed());
+        assert_eq!((j.attempts, j.captures), (1, 2));
+        assert_eq!(j.polling(), "", "nothing to say about a first steady shot");
+    }
+
+    #[test]
+    fn a_region_that_never_steadies_is_judged_on_its_last_capture() {
+        // A blinking caret, say: no two captures in a row agree.
+        let blue = [0, 0, 0xff, 0xff];
+        let images = vec![
+            crop(Some(TEAL)),
+            crop(None),
+            crop(Some(blue)),
+            crop(Some(TEAL)),
+        ];
+        assert_eq!(images.len(), STEADY_ATTEMPTS);
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let j = judge(&exp, shots(images), clock(Duration::ZERO));
+        assert!(j.check.passed(), "judged on the last capture, the teal one");
+        assert_eq!(
+            (j.attempts, j.captures, j.steady),
+            (1, STEADY_ATTEMPTS, false)
+        );
+        assert!(j.polling().contains("region not steady"), "{}", j.polling());
+    }
+
+    #[test]
+    fn a_failing_border_is_polled_until_the_deadline_and_reports_the_last_attempt() {
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        // Steady and wrong every time: grey, then white. One second passes
+        // per read of the clock, so the 2 s deadline ends it after the second.
+        let grey = [0x80, 0x80, 0x80, 0xff];
+        let j = judge(
+            &exp,
+            shots(vec![
+                crop(Some(grey)),
+                crop(Some(grey)),
+                crop(None),
+                crop(None),
+            ]),
+            clock(Duration::from_secs(1)),
+        );
+        assert!(!j.check.passed());
+        assert!(j.check.errors.is_empty(), "a reading, not a geometry error");
+        assert_eq!((j.attempts, j.captures, j.steady), (2, 4, true));
+        assert_eq!(
+            j.shot.image,
+            crop(None),
+            "the last attempt is the one reported"
+        );
+        assert_eq!(j.polling(), "; 2 attempts, 4 captures");
+    }
+
+    #[test]
+    fn a_failing_border_stops_polling_at_the_cap_even_with_time_left() {
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let j = judge(
+            &exp,
+            shots(vec![crop(None); 2 * BORDER_POLLS]),
+            clock(Duration::ZERO),
+        );
+        assert!(!j.check.passed());
+        assert_eq!((j.attempts, j.captures), (BORDER_POLLS, 2 * BORDER_POLLS));
+    }
+
+    #[test]
+    fn a_single_stale_capture_cannot_pass_a_no_border_assertion() {
+        // The stale capture lacks the border, so judged alone it would pass a
+        // `no border`; the fresh frames that follow disagree with it, so it is
+        // never judged, and the steady fresh frame fails as it should.
+        let exp = parse_border("no border bar:1").unwrap();
+        let j = judge(
+            &exp,
+            shots(vec![crop(None), crop(Some(TEAL)), crop(Some(TEAL))]),
+            clock(Duration::from_secs(3)),
+        );
+        assert!(!j.check.passed(), "{}", j.check.report(None));
+        assert_eq!(j.shot.image, crop(Some(TEAL)));
+        assert_eq!(j.attempts, 1, "the deadline had passed after one attempt");
+    }
+
+    #[test]
+    fn a_side_that_cannot_be_read_is_not_polled() {
+        // A clipped side is geometry: another picture cannot change it.
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let mut taken = 0;
+        let j = judge_border(&exp, ProbeOpts::default(), || {
+            taken += 1;
+            let mut s = shot_of(crop(Some(TEAL)));
+            s.clipped.right = true;
+            Ok(s)
+        })
+        .unwrap();
+        assert!(!j.check.errors.is_empty());
+        assert_eq!((j.attempts, taken), (1, 2));
+    }
+
+    #[test]
+    fn a_shot_that_fails_ends_the_judging_with_its_error() {
+        let exp = parse_border("border bar:1 solid teal").unwrap();
+        let mut n = 0;
+        let e = judge_border(&exp, ProbeOpts::default(), || {
+            n += 1;
+            if n == 1 {
+                Ok(shot_of(crop(None)))
+            } else {
+                Err("region 'bar:1' moved".to_string())
+            }
+        })
+        .err()
+        .expect("the shot's error is the step's");
+        assert!(e.contains("moved"), "{e}");
     }
 
     /// A connect against a directory with nothing in it must fail with a

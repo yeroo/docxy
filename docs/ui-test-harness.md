@@ -2266,6 +2266,25 @@ so `settle` could be satisfied by a frame that was never put on screen and
 `PrintWindow` would photograph the one before it. A capture that quietly reads
 stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
+⚠️ **Even a drawn and presented frame can reach `PrintWindow` late on Windows**
+(#1783): the counter says the frame with the change was drawn, the probe rect is
+from it, and the capture is still the frame before. So a border assertion
+(`assert border`, `no border`, the CLI's `assert`) is judged on a *steady* shot:
+shots are taken until two in a row agree pixel for pixel (at most 4; a region
+that never agrees, such as one holding a blinking caret, is judged on its last
+and a failure says `region not steady`). A verdict that reads wrong is polled
+again, a new steady shot each time, for up to 2 s (at most 8 attempts); a side
+that cannot be read at all is geometry and is not polled. The reported verdict
+and the filed PNG are the last attempt's; when judging took more than the
+first two captures, a failure's `capture:` line says how many attempts and
+captures it did. A passing assertion costs one extra capture; a genuinely
+failing one now takes about 2 s. Steadiness reduces the chance of judging a
+stale frame but does not rule it out: two stale captures in a row agree too.
+The re-poll corrects a stale pair that fails the expectation, not one that
+satisfies it: that one passes, whatever the assertion (a `border` judged
+before the border was wrongly removed, a `no border` before it appeared). `shot` steps are evidence only
+and are taken once, as before.
+
 ## Not covered
 
 - **A recent-files list.** Backstage's Open lists the open tabs, not a

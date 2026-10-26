@@ -14,7 +14,3 @@
 
 # vbottom_inset at 200% is 323, the case expects 241 (as on Linux).
 doc-rulers.uit | ruler positions follow the document geometry at 100 and 200 percent | #808
-
-# Border colour asserts that fail in some runs only.
-gantt-scroll.uit | gantt panes stay aligned while scrolling | #1783 | flaky
-project-cells.uit | project unchanged edits preserve redo and cell border follows navigation | #1783 | flaky

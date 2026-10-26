@@ -29,8 +29,9 @@
 //! comparisons a case turns on are unit tests rather than something only a
 //! window can exercise.
 
+use crate::driver::judge_border;
 use crate::driver::{Driver, Shot};
-use crate::expect::{BorderExpect, check_border_clipped};
+use crate::expect::BorderExpect;
 use crate::image::Image;
 use crate::probe::ProbeOpts;
 use crate::run::Run;
@@ -539,15 +540,18 @@ impl<'a> Runner<'a> {
     }
 
     fn assert_border(&mut self, case: &str, out: StepOutcome, exp: &BorderExpect) -> StepOutcome {
-        let shot = match self.driver.shot(&exp.region) {
+        // Judged on a steady shot and re-polled while it reads wrong (#1783):
+        // the evidence filed is the shot the reported verdict was made on.
+        let driver = &mut *self.driver;
+        let judged = match judge_border(exp, self.opts, || driver.shot(&exp.region)) {
             Ok(v) => v,
             Err(e) => return err(out, e),
         };
+        let (shot, check) = (&judged.shot, &judged.check);
         let path = match self.save(case, out.line, &exp.region, &shot.image) {
             Ok(p) => p,
             Err(e) => return err(out, e),
         };
-        let check = check_border_clipped(exp, &shot.image, self.opts, shot.clipped);
         let how = format!("{}x{} via {}", shot.image.w, shot.image.h, shot.capture.how);
         let mut out = out;
         out.evidence = Some(path);
@@ -575,7 +579,7 @@ impl<'a> Runner<'a> {
             // all: a screen-copy fallback can have another window over the
             // region, and "the border is absent" then has an explanation that
             // the reader would otherwise go hunting in the PNG for.
-            out.detail = format!("{body}\n  capture:  {how}");
+            out.detail = format!("{body}\n  capture:  {how}{}", judged.polling());
             out
         }
     }

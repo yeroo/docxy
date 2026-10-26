@@ -60,7 +60,7 @@ pub mod term;
 pub mod termkeys;
 pub mod window;
 
-pub use driver::{Driver, RegionRect, Shot, control_dir};
+pub use driver::{Driver, Judged, RegionRect, Shot, control_dir, judge_border};
 pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border_clipped, parse_border};
 pub use image::{Clip, Image, RectPx};
 pub use probe::{LineKind, LineProbe, ProbeOpts, Side, probe_edge};
