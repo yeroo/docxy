@@ -8910,6 +8910,21 @@ impl TableDrops {
     }
 }
 
+/// A table part's text with its root `id` set to `id`, or `None` when the
+/// root has no `id` attribute to replace.
+fn set_table_id(xml: &str, id: u32) -> Option<String> {
+    let (start, _) = table_root_attr(xml, "id")?;
+    let end = start + xml[start..].find('>')?;
+    let tag = &xml[start..end];
+    let at = tag.find(" id=\"").or_else(|| tag.find(" id='"))? + 5;
+    let close = at + tag[at..].find(['"', '\''])?;
+    Some(format!(
+        "{}{id}{}",
+        &xml[..start + at],
+        &xml[start + close..]
+    ))
+}
+
 /// A table part's `id`.
 fn table_id(xml: &str) -> Option<u32> {
     table_root_attr(xml, "id")?.1.parse().ok()
@@ -10293,6 +10308,111 @@ impl SheetPackage {
             columns: names,
             part,
         });
+        Ok(self.workbook.tables.len() - 1)
+    }
+
+    /// Put back a table [`remove_sheet`](Self::remove_sheet) dropped with its
+    /// sheet: the model `table` (its `sheet` and `part` set here) and its
+    /// `xml` part as it was, wired as [`add_table`](Self::add_table) wires a
+    /// new one, so its style, totals row and filter survive a save. The part
+    /// keeps its name when that is free, else takes the first free
+    /// `xl/tables/tableN.xml`. Returns the table's index, or why it can't be
+    /// put back, with the package as it was: a name another table or a
+    /// defined name has taken (they compare case-insensitively), or a range
+    /// another table, a PivotTable or an array formula holds
+    /// ([`crate::edit::table_range_conflict`]).
+    ///
+    /// The part's `id` is kept when no other table part has it, and then the
+    /// removal's note of it (`removed_table_ids`, which makes a save drop the
+    /// slicer caches over it) is cleared: the caches name that id. An id
+    /// another table took since is replaced by a free one, and the note stays,
+    /// as the slicer caches no longer name this table.
+    pub fn restore_table(
+        &mut self,
+        sheet: usize,
+        mut table: crate::sheet::Table,
+        xml: &[u8],
+    ) -> Result<usize, String> {
+        if sheet >= self.workbook.sheets.len() {
+            return Err("There is no such sheet".into());
+        }
+        let wb = &self.workbook;
+        let taken = wb.tables.iter().map(|t| &t.name);
+        let taken = taken.chain(wb.defined_names.iter().map(|d| &d.name));
+        if taken.into_iter().any(|n| name_eq(n, &table.name)) {
+            return Err(format!("the name \"{}\" is taken", table.name));
+        }
+        if let Some(why) = crate::edit::table_range_conflict(wb, sheet, table.range, None) {
+            return Err(why);
+        }
+        if !self.sheet_takes(sheet, "tableParts", true) {
+            return Err("This sheet's file can't take a table".into());
+        }
+        let part = if self.part(&table.part).is_none() && table.part.starts_with("xl/tables/") {
+            table.part.clone()
+        } else {
+            let mut tn = 1;
+            while self.part(&format!("xl/tables/table{tn}.xml")).is_some() {
+                tn += 1;
+            }
+            format!("xl/tables/table{tn}.xml")
+        };
+        let text = String::from_utf8_lossy(xml).into_owned();
+        let id = table_id(&text);
+        let mut used = Vec::new();
+        for (name, bytes) in &self.parts {
+            if name.starts_with("xl/tables/") && name.ends_with(".xml") {
+                used.extend(table_id(&String::from_utf8_lossy(bytes)));
+            }
+        }
+        let mut bytes = xml.to_vec();
+        match id {
+            Some(id) if !used.contains(&id) => self.removed_table_ids.retain(|r| *r != id),
+            _ => {
+                let mut fresh = 1;
+                while used.contains(&fresh) || self.removed_table_ids.contains(&fresh) {
+                    fresh += 1;
+                }
+                if let Some(patched) = set_table_id(&text, fresh) {
+                    bytes = patched.into_bytes();
+                }
+            }
+        }
+        self.parts.push((part.clone(), bytes));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        );
+        let ns = self.ns();
+        let sheet_part = self.sheet_parts[sheet].clone();
+        let (ws_dir, ws_file) = sheet_part
+            .rsplit_once('/')
+            .unwrap_or(("", sheet_part.as_str()));
+        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+        let file = part.rsplit_once('/').map_or(part.as_str(), |(_, f)| f);
+        let rid = add_rel(
+            &mut self.parts,
+            &rels_part,
+            &ns.rel("table"),
+            &format!("../tables/{file}"),
+        );
+        if !rid.is_empty() {
+            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+                let xml = String::from_utf8_lossy(&p.1).into_owned();
+                let entry = format!("<tablePart r:id=\"{rid}\"/>");
+                let rels = Some(ns.rels);
+                let xml = append_to_worksheet_child(&xml, "tableParts", &entry, rels)
+                    .unwrap_or_else(|| {
+                        let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
+                        put_worksheet_child(&xml, "tableParts", &block, rels, false)
+                    });
+                p.1 = xml.into_bytes();
+            }
+        }
+        table.sheet = sheet;
+        table.part = part;
+        self.workbook.tables.push(table);
         Ok(self.workbook.tables.len() - 1)
     }
 
@@ -11971,6 +12091,96 @@ mod tests {
         let ws =
             String::from_utf8(re2.part(&re2.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
         assert!(!ws.contains("<mergeCells"));
+    }
+
+    /// A package with a second sheet holding a styled table over A1:B3, and
+    /// the table with its part bytes as they were before the sheet goes.
+    fn sheet_with_table() -> (SheetPackage, crate::sheet::Table, Vec<u8>) {
+        use crate::sheet::Cell;
+        let mut pkg = new_xlsx();
+        let sheet = pkg.add_sheet("Data");
+        pkg.workbook.sheets[sheet].set_cell(0, 0, Cell::text("Item"));
+        pkg.workbook.sheets[sheet].set_cell(0, 1, Cell::text("Qty"));
+        pkg.workbook.sheets[sheet].set_cell(1, 0, Cell::text("Pen"));
+        pkg.workbook.sheets[sheet].set_cell(1, 1, Cell::number(3.0));
+        let t = pkg
+            .add_table(sheet, (0, 0, 2, 1), true, "TableStyleDark3")
+            .unwrap();
+        let table = pkg.workbook.tables[t].clone();
+        let bytes = pkg.part(&table.part).unwrap().to_vec();
+        (pkg, table, bytes)
+    }
+
+    #[test]
+    fn restore_table_gives_back_the_part_and_clears_the_slicer_note_1795() {
+        let (mut pkg, table, bytes) = sheet_with_table();
+        assert!(pkg.remove_sheet(1));
+        assert!(pkg.workbook.tables.is_empty());
+        assert_eq!(pkg.removed_table_ids, vec![1]);
+        let sheet = pkg.add_sheet("Data");
+        let t = pkg.restore_table(sheet, table, &bytes).unwrap();
+        assert_eq!(pkg.workbook.tables[t].sheet, sheet);
+        assert_eq!(pkg.workbook.tables[t].part, "xl/tables/table1.xml");
+        assert!(pkg.removed_table_ids.is_empty());
+        assert_eq!(pkg.part("xl/tables/table1.xml").unwrap(), &bytes[..]);
+        let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert_eq!(re.workbook.tables.len(), 1);
+        assert_eq!(re.workbook.tables[0].name, "Table1");
+        assert_eq!(re.workbook.tables[0].range, (0, 0, 2, 1));
+        assert_eq!(re.workbook.tables[0].sheet, 1);
+        let xml =
+            String::from_utf8_lossy(re.part(&re.workbook.tables[0].part).unwrap()).into_owned();
+        assert!(xml.contains("TableStyleDark3"), "{xml}");
+        let ws = String::from_utf8_lossy(re.part(&re.sheet_parts[1]).unwrap()).into_owned();
+        assert!(ws.contains("<tableParts"), "{ws}");
+    }
+
+    #[test]
+    fn restore_table_takes_a_free_part_and_id_when_they_were_taken_1795() {
+        let (mut pkg, table, bytes) = sheet_with_table();
+        assert!(pkg.remove_sheet(1));
+        let sheet = pkg.add_sheet("Data");
+        // Another table took the part name and the id (and a name the
+        // restored one does not have).
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("X"));
+        pkg.workbook.sheets[0].set_cell(0, 1, crate::sheet::Cell::text("Y"));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleLight1")
+            .unwrap();
+        pkg.workbook.tables[0].name = "Other".into();
+        let t = pkg.restore_table(sheet, table, &bytes).unwrap();
+        let part = pkg.workbook.tables[t].part.clone();
+        assert_eq!(part, "xl/tables/table2.xml");
+        let xml = String::from_utf8_lossy(pkg.part(&part).unwrap()).into_owned();
+        assert!(xml.contains(" id=\"2\""), "{xml}");
+        assert!(xml.contains("TableStyleDark3"), "{xml}");
+        // The caches over the old id stay dropped: they named the other id's
+        // table, not this one.
+        assert_eq!(pkg.removed_table_ids, vec![1]);
+    }
+
+    #[test]
+    fn restore_table_refuses_a_taken_name_or_range_and_changes_nothing_1795() {
+        let (mut pkg, table, bytes) = sheet_with_table();
+        assert!(pkg.remove_sheet(1));
+        let sheet = pkg.add_sheet("Data");
+        pkg.workbook.defined_names.push(DefinedName {
+            name: "TABLE1".into(),
+            scope: None,
+            formula: "Sheet1!$A$1".into(),
+        });
+        let before = pkg.parts.clone();
+        let err = pkg.restore_table(sheet, table.clone(), &bytes).unwrap_err();
+        assert!(err.contains("Table1"), "{err}");
+        assert_eq!(pkg.parts, before);
+        assert!(pkg.workbook.tables.is_empty());
+        assert_eq!(pkg.removed_table_ids, vec![1]);
+        // A range an earlier restore already holds.
+        pkg.workbook.defined_names.clear();
+        pkg.restore_table(sheet, table.clone(), &bytes).unwrap();
+        let mut again = table;
+        again.name = "Table2".into();
+        assert!(pkg.restore_table(sheet, again, &bytes).is_err());
+        assert_eq!(pkg.workbook.tables.len(), 1);
     }
 
     #[test]
