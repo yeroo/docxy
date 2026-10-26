@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::names::name_eq;
+
 // ---------------------------------------------------------------------------
 // A1 reference math
 // ---------------------------------------------------------------------------
@@ -2041,7 +2043,7 @@ impl Table {
     pub fn column_index(&self, name: &str) -> Option<u32> {
         self.columns
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(name))
+            .position(|c| name_eq(c, name))
             .map(|i| self.range.1 + i as u32)
     }
 
@@ -2256,9 +2258,7 @@ impl Workbook {
 
     /// A table by displayName, case-insensitive.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables
-            .iter()
-            .find(|t| t.name.eq_ignore_ascii_case(name))
+        self.tables.iter().find(|t| name_eq(&t.name, name))
     }
 
     /// The table containing a cell, if any (for bare `[@Col]` references).

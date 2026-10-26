@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::formula::{self, Eval, ExcelError, TableInfo, Value};
 use crate::frame::{Frame, PivotOut, key_of, keys_lt};
+use crate::names::name_eq;
 
 /// A many-to-one relationship: each `from` row matches at most one `to` row.
 #[derive(Clone, Debug, PartialEq)]
@@ -65,14 +66,12 @@ impl DataModel {
     pub fn table(&self, name: &str) -> Option<&Frame> {
         self.tables
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .find(|(n, _)| name_eq(n, name))
             .map(|(_, f)| f)
     }
 
     fn table_index(&self, name: &str) -> Option<usize> {
-        self.tables
-            .iter()
-            .position(|(n, _)| n.eq_ignore_ascii_case(name))
+        self.tables.iter().position(|(n, _)| name_eq(n, name))
     }
 
     /// Add a many-to-one relationship. Errors when a table/column is
@@ -139,7 +138,7 @@ impl DataModel {
             return;
         }
         for rel in &self.relationships {
-            if !rel.from.0.eq_ignore_ascii_case(table) {
+            if !name_eq(&rel.from.0, table) {
                 continue;
             }
             let Some(dim) = self.table(&rel.to.0) else {

@@ -22,6 +22,8 @@ use opccore::xml::{Event, XmlParser};
 use opccore::zip::{ZipArchive, ZipEntry};
 use opccore::zipwrite::write_zip;
 
+use crate::names::name_eq;
+
 mod consolidate;
 #[cfg(test)]
 mod container_tests;
@@ -8310,8 +8312,7 @@ fn sync_table_columns(xml: &str, columns: &[String], ids: &[u32]) -> (String, Ve
                 (0..elements.len())
                     .find(|&i| !used[i] && elements[i].0 == *name)
                     .or_else(|| {
-                        (0..elements.len())
-                            .find(|&i| !used[i] && elements[i].0.eq_ignore_ascii_case(name))
+                        (0..elements.len()).find(|&i| !used[i] && name_eq(&elements[i].0, name))
                     })
             };
             if let Some(i) = i {
@@ -8790,10 +8791,7 @@ fn sync_table_parts(parts: &mut Vec<(String, Vec<u8>)>, wb: &Workbook) -> TableD
             let deleted: Vec<bool> = (0..loaded.columns.len())
                 .map(|k| match loaded.column_ids.get(k) {
                     Some(id) if !t.column_ids.is_empty() => !t.column_ids.contains(id),
-                    _ => !t
-                        .columns
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(&loaded.columns[k])),
+                    _ => !t.columns.iter().any(|n| name_eq(n, &loaded.columns[k])),
                 })
                 .collect();
             deleted.contains(&true).then(|| ColumnDeletes {
@@ -10229,7 +10227,7 @@ impl SheetPackage {
             let cand = format!("Table{k}");
             let used = wb.tables.iter().map(|t| &t.name);
             let used = used.chain(wb.defined_names.iter().map(|d| &d.name));
-            if !used.into_iter().any(|n| n.eq_ignore_ascii_case(&cand)) {
+            if !used.into_iter().any(|n| name_eq(n, &cand)) {
                 break cand;
             }
             k += 1;
@@ -26417,6 +26415,37 @@ mod table_command_tests {
             saved.contains("<totalsRowFormula>COUNTA(#REF!)+SUM(Table1[Qty])</totalsRowFormula>"),
             "{saved}"
         );
+    }
+
+    /// #1750: with no column ids, the save pairs the part's columns with the
+    /// model's by name, over Unicode case as every table name site does: a
+    /// header `Кол` retyped `КОЛ` is the same column, not a delete (its
+    /// totals formula would read `#REF!` and its element would be dropped).
+    #[test]
+    fn a_case_only_cyrillic_column_rename_without_ids_is_no_delete() {
+        let mut pkg = one_table();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("Кол"));
+        pkg.workbook.tables[0].columns[1] = "Кол".into();
+        let part = pkg.workbook.tables[0].part.clone();
+        let mut pkg = reload(&pkg);
+        let xml = text(&pkg, &part);
+        let col = "name=\"Кол\" id=\"2\"/>";
+        let at = xml.find(col).unwrap_or_else(|| panic!("{xml}"));
+        let end = at + col.len();
+        let el = "name=\"Кол\" id=\"2\" totalsRowFunction=\"custom\"><totalsRowFormula>SUM(Table1[Кол])</totalsRowFormula></tableColumn>";
+        let xml = format!("{}{el}{}", &xml[..at], &xml[end..]);
+        pkg.parts.iter_mut().find(|(n, _)| *n == part).unwrap().1 = xml.into_bytes();
+        let t = &mut pkg.workbook.tables[0];
+        t.column_ids.clear();
+        t.columns[1] = "КОЛ".into();
+        pkg.workbook.sheets[0].set_cell(0, 1, Cell::text("КОЛ"));
+        let saved = text(&reload(&pkg), &part);
+        assert!(!saved.contains("#REF!"), "{saved}");
+        assert!(
+            saved.contains("<totalsRowFormula>SUM(Table1[Кол])</totalsRowFormula>"),
+            "{saved}"
+        );
+        assert!(saved.contains("name=\"КОЛ\" id=\"2\""), "{saved}");
     }
 
     /// #991 p7: a shared group over a structured reference is expanded into

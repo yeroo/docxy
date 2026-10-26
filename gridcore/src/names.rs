@@ -65,9 +65,37 @@ fn looks_like_r1c1(name: &str) -> bool {
     (r || c) && i == b.len()
 }
 
+/// Whether two table or table column names are the same name: Excel
+/// compares them case-insensitively over all of Unicode (`Продажи` is
+/// `продажи`). Simple per-character lowercase, not full case folding, so
+/// `ß` is not `SS`. Every lookup, uniqueness check and rewrite of a table or
+/// column name goes through it, so they all agree (#1750). A loaded file
+/// holding two tables whose names differ only in non-ASCII case (Excel never
+/// writes one) resolves to the first.
+pub fn name_eq(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        return a.eq_ignore_ascii_case(b);
+    }
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .eq(b.chars().flat_map(char::to_lowercase))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check_name;
+    use super::{check_name, name_eq};
+
+    #[test]
+    fn name_eq_folds_unicode_case() {
+        assert!(name_eq("Sales", "sALES"));
+        assert!(!name_eq("Sales", "Sale"));
+        assert!(name_eq("Продажи", "продажи"));
+        assert!(name_eq("Кол", "КОЛ"));
+        assert!(name_eq("Ölpreis", "ölPREIS"));
+        assert!(!name_eq("Кол", "Кон"));
+        assert!(!name_eq("Straße", "STRASSE"));
+        assert!(!name_eq("Кол", "Kол"));
+    }
 
     #[test]
     fn excel_name_rules() {

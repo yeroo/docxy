@@ -75,6 +75,7 @@ use crate::formula::{
     EditShift, ExcelError, Expr, adjust_for_edit, adjust_formula_for_edit, parse,
     rename_sheet_in_expr, rename_sheet_in_formula, to_string, translate, translate_formula,
 };
+use crate::names::name_eq;
 use crate::sheet::{
     Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, cell_name, f_ref, is_array_f,
     own_array_ref, ref_starts_at, with_ref,
@@ -1802,7 +1803,7 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
                     // against Excel's Insert Table Column.
                     let name = (1..)
                         .map(|n| format!("Column{n}"))
-                        .find(|c| !t.columns.iter().any(|x| x.eq_ignore_ascii_case(c)))
+                        .find(|c| !t.columns.iter().any(|x| name_eq(x, c)))
                         .unwrap_or_default();
                     if t.header_rows > 0 {
                         new_headers.push((idx, r1, shift.at + k as u32, name.clone()));
@@ -1909,8 +1910,7 @@ fn delete_table(wb: &mut Workbook, i: usize) {
     // A PivotTable on the table keeps its cache and its cells, as in Excel,
     // but has no source to refresh from.
     for p in &mut wb.pivots {
-        if matches!(&p.source, crate::pivot::PivotSource::Table(n) if n.eq_ignore_ascii_case(&t.name))
-        {
+        if matches!(&p.source, crate::pivot::PivotSource::Table(n) if name_eq(n, &t.name)) {
             p.unsupported = true;
         }
     }
@@ -2576,7 +2576,7 @@ pub fn table_column_name(header: Option<&CellValue>, n: u32, taken: &[String]) -
         _ => format!("Column{n}"),
     };
     let (mut name, mut k) = (base.clone(), 1);
-    while taken.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+    while taken.iter().any(|x| name_eq(x, &name)) {
         k += 1;
         name = format!("{base}{k}");
     }
@@ -2711,7 +2711,7 @@ impl FormulaSite<'_> {
     /// lacks).
     fn inside(&self, t: &crate::sheet::Table) -> bool {
         match (self.table, self.sheet, self.cell) {
-            (Some(owner), ..) => owner.eq_ignore_ascii_case(&t.name),
+            (Some(owner), ..) => name_eq(owner, &t.name),
             (None, Some(s), Some((r, c))) => t.contains(s, r, c),
             _ => false,
         }
@@ -2796,7 +2796,7 @@ fn rewrite_workbook_formulas(
 fn table_index(wb: &Workbook, name: &str) -> Result<usize, String> {
     wb.tables
         .iter()
-        .position(|t| t.name.eq_ignore_ascii_case(name))
+        .position(|t| name_eq(&t.name, name))
         .ok_or_else(|| format!("There is no table named {name}"))
 }
 
@@ -2813,15 +2813,11 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
         .tables
         .iter()
         .enumerate()
-        .any(|(i, t)| i != idx && t.name.eq_ignore_ascii_case(new));
+        .any(|(i, t)| i != idx && name_eq(&t.name, new));
     if clash {
         return Err(format!("A table named {new} already exists"));
     }
-    if wb
-        .defined_names
-        .iter()
-        .any(|d| d.name.eq_ignore_ascii_case(new))
-    {
+    if wb.defined_names.iter().any(|d| name_eq(&d.name, new)) {
         return Err(format!("{new} is already a defined name"));
     }
     let cur = wb.tables[idx].name.clone();
@@ -2837,7 +2833,7 @@ pub fn rename_table(wb: &mut Workbook, old: &str, new: &str) -> Result<(), Strin
     );
     for piv in &mut wb.pivots {
         if let crate::pivot::PivotSource::Table(n) = &mut piv.source {
-            if n.eq_ignore_ascii_case(&cur) {
+            if name_eq(n, &cur) {
                 *n = new.to_string();
             }
         }
@@ -2934,11 +2930,7 @@ fn resize_table_at(
         let header = header_cell.map(|cl| cl.value.clone());
         let n = if auto {
             (1..)
-                .find(|n| {
-                    !taken
-                        .iter()
-                        .any(|x| x.eq_ignore_ascii_case(&format!("Column{n}")))
-                })
+                .find(|n| !taken.iter().any(|x| name_eq(x, &format!("Column{n}"))))
                 .unwrap_or(1)
         } else {
             c - c1 + 1
@@ -3166,9 +3158,10 @@ pub fn fill_calculated_column(wb: &mut Workbook, sheet: usize, (r, c): (u32, u32
 pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), String> {
     let idx = table_index(wb, name)?;
     let t = wb.tables[idx].clone();
-    let pivot = wb.pivots.iter().find(|p| {
-        matches!(&p.source, crate::pivot::PivotSource::Table(n) if n.eq_ignore_ascii_case(&t.name))
-    });
+    let pivot = wb
+        .pivots
+        .iter()
+        .find(|p| matches!(&p.source, crate::pivot::PivotSource::Table(n) if name_eq(n, &t.name)));
     if let Some(p) = pivot {
         return Err(format!("PivotTable {} uses this table", p.name));
     }
@@ -3177,7 +3170,7 @@ pub fn convert_table_to_range(wb: &mut Workbook, name: &str) -> Result<(), Strin
         parse(src).is_ok_and(|ast| {
             let mut iterated = Vec::new();
             crate::formula::collect_iterated_tables(&ast, &mut iterated);
-            iterated.iter().any(|n| n.eq_ignore_ascii_case(&t.name))
+            iterated.iter().any(|n| name_eq(n, &t.name))
         })
     };
     for sh in &wb.sheets {
@@ -5958,6 +5951,69 @@ mod table_tests {
     fn text_at(wb: &Workbook, at: &str) -> CellValue {
         let (r, c) = parse_cell_name(at).unwrap();
         wb.sheets[0].cell(r, c).unwrap().value.clone()
+    }
+
+    /// [`sales4`] with Cyrillic names: table `Продажи`, columns `Кол` (B)
+    /// and `Цена` (C).
+    fn sales4_cyrillic() -> Workbook {
+        let mut wb = sales4();
+        wb.sheets[0].set_cell(0, 1, Cell::text("Кол"));
+        wb.sheets[0].set_cell(0, 2, Cell::text("Цена"));
+        let t = &mut wb.tables[0];
+        t.name = "Продажи".into();
+        t.columns[1] = "Кол".into();
+        t.columns[2] = "Цена".into();
+        wb
+    }
+
+    #[test]
+    fn table_names_and_columns_fold_unicode_case() {
+        // #1750: every table and column name site compares over Unicode case.
+        // Uniqueness: a column name, a table name and the defined-name clash.
+        let taken = ["Item".to_string(), "Кол".to_string()];
+        let text = CellValue::Text("кол".into());
+        assert_eq!(table_column_name(Some(&text), 2, &taken), "кол2");
+        let mut wb = sales4_cyrillic();
+        wb.tables.push(other_table("Другая", 1, (0, 0, 1, 0)));
+        wb.defined_names.push(DefinedName {
+            name: "Ставка".into(),
+            scope: None,
+            formula: "0.2".into(),
+        });
+        for bad in ["продажи", "ставка"] {
+            assert!(rename_table(&mut wb, "другая", bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            rename_table(&mut wb, "Другая", "ПРОДАЖИ").unwrap_err(),
+            "A table named ПРОДАЖИ already exists"
+        );
+        // Renaming a table rewrites its references in any case.
+        put(&mut wb, 0, "F2", "SUM(продажи[кол])");
+        put(&mut wb, 0, "G2", "ROWS(ПРОДАЖИ)");
+        let qty = value(&mut wb, 0, "F2");
+        assert_eq!(qty, CellValue::Number(10.0));
+        rename_table(&mut wb, "продажи", "Выручка").unwrap();
+        assert_eq!(wb.tables[0].name, "Выручка");
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(Выручка[кол])");
+        assert_eq!(formula(&wb, 0, "G2"), "ROWS(Выручка)");
+        // Another case of its own name is a rename.
+        rename_table(&mut wb, "Выручка", "ВЫРУЧКА").unwrap();
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(ВЫРУЧКА[кол])");
+        // Renaming a column (a header edit) rewrites `[кол]`.
+        assert!(set_header(&mut wb, "B1", Cell::text("Штуки")));
+        assert_eq!(formula(&wb, 0, "F2"), "SUM(ВЫРУЧКА[Штуки])");
+        assert_eq!(value(&mut wb, 0, "F2"), qty);
+        // Deleting a column turns a reference in another case to #REF!.
+        put(&mut wb, 0, "H2", "SUM(выручка[ЦЕНА])");
+        delete_cols(&mut wb, 0, 2, 1);
+        assert_eq!(wb.tables[0].columns, ["Item", "Штуки", "Region"]);
+        assert_eq!(formula(&wb, 0, "G2"), "SUM(#REF!)");
+        // Convert to Range reaches a reference in another case.
+        put(&mut wb, 0, "H2", "SUM(выручка[ШТУКИ])");
+        convert_table_to_range(&mut wb, "выручка").unwrap();
+        assert_eq!(wb.tables.len(), 1, "only Другая is left");
+        assert_eq!(formula(&wb, 0, "E2"), "SUM($B$2:$B$5)");
+        assert_eq!(formula(&wb, 0, "H2"), "SUM($B$2:$B$5)");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 
+use crate::names::name_eq;
 use crate::sheet::{col_name, fmt_general, parse_col, parts_to_serial, serial_to_parts};
 
 // ---------------------------------------------------------------------------
@@ -3340,7 +3341,7 @@ pub fn map_expr(e: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
 pub fn rename_tables_in_expr(e: &Expr, map: &[(String, String)]) -> Expr {
     let new_of = |n: &str| {
         map.iter()
-            .find(|(old, _)| old.eq_ignore_ascii_case(n))
+            .find(|(old, _)| name_eq(old, n))
             .map(|(_, new)| new.clone())
     };
     map_expr(e, &|x| match x {
@@ -3365,7 +3366,7 @@ pub fn rename_tables_in_expr(e: &Expr, map: &[(String, String)]) -> Expr {
 /// `inside` the table.
 fn names_table(table: &Option<String>, name: &str, inside: bool) -> bool {
     match table {
-        Some(t) => t.eq_ignore_ascii_case(name),
+        Some(t) => name_eq(t, name),
         None => inside,
     }
 }
@@ -3383,7 +3384,7 @@ pub fn rename_table_columns_in_expr(
     let new_of = |c: &Option<String>| {
         c.as_ref().and_then(|c| {
             map.iter()
-                .find(|(old, _)| old.eq_ignore_ascii_case(c))
+                .find(|(old, _)| name_eq(old, c))
                 .map(|(_, new)| new.clone())
         })
     };
@@ -3420,7 +3421,7 @@ pub fn delete_table_columns_in_expr(
     columns: &[String],
     deleted: &[bool],
 ) -> Expr {
-    let index = |c: &str| columns.iter().position(|x| x.eq_ignore_ascii_case(c));
+    let index = |c: &str| columns.iter().position(|x| name_eq(x, c));
     let gone = |i: usize| deleted.get(i).copied().unwrap_or(false);
     map_expr(e, &|x| {
         let Expr::Structured {
@@ -3474,7 +3475,7 @@ pub fn delete_table_in_expr(e: &Expr, table: &str, inside: bool) -> Expr {
         Expr::Structured { table: t, .. } if names_table(t, table, inside) => {
             Some(Expr::Err(ExcelError::Ref))
         }
-        Expr::Name(n) if n.eq_ignore_ascii_case(table) => Some(Expr::Err(ExcelError::Ref)),
+        Expr::Name(n) if name_eq(n, table) => Some(Expr::Err(ExcelError::Ref)),
         _ => None,
     })
 }
@@ -3538,7 +3539,7 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
             col2,
         } => {
             let ours = match table {
-                Some(n) => n.eq_ignore_ascii_case(t.name),
+                Some(n) => name_eq(n, t.name),
                 None => host.inside,
             };
             if !ours {
@@ -3554,7 +3555,7 @@ pub fn table_refs_to_cells_in_expr(e: &Expr, t: &TableToRange, host: FormulaHost
                 None => Expr::Err(ExcelError::Ref),
             })
         }
-        Expr::Name(n) if n.eq_ignore_ascii_case(t.name) => {
+        Expr::Name(n) if name_eq(n, t.name) => {
             Some(match t.info.resolve(TableItem::Data, &None, &None, 0) {
                 Some(r) => rect(r, true),
                 None => Expr::Err(ExcelError::Ref),
@@ -4448,7 +4449,7 @@ impl TableInfo {
         let col_of = |name: &str| -> Result<u32, ExcelError> {
             self.columns
                 .iter()
-                .position(|c| c.eq_ignore_ascii_case(name))
+                .position(|c| name_eq(c, name))
                 .map(|i| c1 + i as u32)
                 .ok_or(ref_err)
         };
