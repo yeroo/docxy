@@ -8910,19 +8910,22 @@ impl TableDrops {
     }
 }
 
-/// A table part's text with its root `id` set to `id`, or `None` when the
-/// root has no `id` attribute to replace.
+/// A table part's text with its root `id` set to `id` (the value only, found
+/// through the parser, so any XML spacing and quote style do), or `None` when
+/// the root has no `id` attribute to replace.
 fn set_table_id(xml: &str, id: u32) -> Option<String> {
-    let (start, _) = table_root_attr(xml, "id")?;
-    let end = start + xml[start..].find('>')?;
-    let tag = &xml[start..end];
-    let at = tag.find(" id=\"").or_else(|| tag.find(" id='"))? + 5;
-    let close = at + tag[at..].find(['"', '\''])?;
-    Some(format!(
-        "{}{id}{}",
-        &xml[..start + at],
-        &xml[start + close..]
-    ))
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let value = p.attrs().iter().find(|a| a.name == "id")?.value;
+                let at = value.as_ptr() as usize - xml.as_ptr() as usize;
+                return Some(format!("{}{id}{}", &xml[..at], &xml[at + value.len()..]));
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 /// A table part's `id`.
@@ -10240,9 +10243,7 @@ impl SheetPackage {
         let mut k = wb.tables.len() + 1;
         let name = loop {
             let cand = format!("Table{k}");
-            let used = wb.tables.iter().map(|t| &t.name);
-            let used = used.chain(wb.defined_names.iter().map(|d| &d.name));
-            if !used.into_iter().any(|n| name_eq(n, &cand)) {
+            if !crate::edit::table_name_taken(wb, &cand) {
                 break cand;
             }
             k += 1;
@@ -10265,38 +10266,7 @@ impl SheetPackage {
             names.len()
         );
         let part = format!("xl/tables/table{tn}.xml");
-        self.parts.push((part.clone(), table_xml.into_bytes()));
-        add_content_type_override(
-            &mut self.parts,
-            &format!("/{part}"),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
-        );
-
-        // Worksheet rel → table + a <tableParts> entry (Excel needs both).
-        let sheet_part = self.sheet_parts[sheet].clone();
-        let (ws_dir, ws_file) = sheet_part
-            .rsplit_once('/')
-            .unwrap_or(("", sheet_part.as_str()));
-        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
-        let rid = add_rel(
-            &mut self.parts,
-            &rels_part,
-            &ns.rel("table"),
-            &format!("../tables/table{tn}.xml"),
-        );
-        if !rid.is_empty() {
-            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-                let xml = String::from_utf8_lossy(&p.1).into_owned();
-                let entry = format!("<tablePart r:id=\"{rid}\"/>");
-                let rels = Some(ns.rels);
-                let xml = append_to_worksheet_child(&xml, "tableParts", &entry, rels)
-                    .unwrap_or_else(|| {
-                        let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
-                        put_worksheet_child(&xml, "tableParts", &block, rels, false)
-                    });
-                p.1 = xml.into_bytes();
-            }
-        }
+        self.wire_table_part(sheet, &part, table_xml.into_bytes());
         self.workbook.tables.push(crate::sheet::Table {
             name,
             sheet,
@@ -10309,6 +10279,45 @@ impl SheetPackage {
             part,
         });
         Ok(self.workbook.tables.len() - 1)
+    }
+
+    /// The OPC wiring of a table part: the part itself, its content-type
+    /// override, and the worksheet's `/table` rel with a `<tableParts>` entry
+    /// (Excel needs both). The caller has checked [`Self::sheet_takes`].
+    fn wire_table_part(&mut self, sheet: usize, part: &str, bytes: Vec<u8>) {
+        self.parts.push((part.to_string(), bytes));
+        add_content_type_override(
+            &mut self.parts,
+            &format!("/{part}"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
+        );
+        let ns = self.ns();
+        let sheet_part = self.sheet_parts[sheet].clone();
+        let (ws_dir, ws_file) = sheet_part
+            .rsplit_once('/')
+            .unwrap_or(("", sheet_part.as_str()));
+        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
+        let file = part.rsplit_once('/').map_or(part, |(_, f)| f);
+        let rid = add_rel(
+            &mut self.parts,
+            &rels_part,
+            &ns.rel("table"),
+            &format!("../tables/{file}"),
+        );
+        if rid.is_empty() {
+            return;
+        }
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
+            let xml = String::from_utf8_lossy(&p.1).into_owned();
+            let entry = format!("<tablePart r:id=\"{rid}\"/>");
+            let rels = Some(ns.rels);
+            let xml =
+                append_to_worksheet_child(&xml, "tableParts", &entry, rels).unwrap_or_else(|| {
+                    let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
+                    put_worksheet_child(&xml, "tableParts", &block, rels, false)
+                });
+            p.1 = xml.into_bytes();
+        }
     }
 
     /// Put back a table [`remove_sheet`](Self::remove_sheet) dropped with its
@@ -10337,9 +10346,7 @@ impl SheetPackage {
             return Err("There is no such sheet".into());
         }
         let wb = &self.workbook;
-        let taken = wb.tables.iter().map(|t| &t.name);
-        let taken = taken.chain(wb.defined_names.iter().map(|d| &d.name));
-        if taken.into_iter().any(|n| name_eq(n, &table.name)) {
+        if crate::edit::table_name_taken(wb, &table.name) {
             return Err(format!("the name \"{}\" is taken", table.name));
         }
         if let Some(why) = crate::edit::table_range_conflict(wb, sheet, table.range, None) {
@@ -10348,7 +10355,10 @@ impl SheetPackage {
         if !self.sheet_takes(sheet, "tableParts", true) {
             return Err("This sheet's file can't take a table".into());
         }
-        let part = if self.part(&table.part).is_none() && table.part.starts_with("xl/tables/") {
+        // The old name only as a direct child of `xl/tables/`, as the writer
+        // and `sync_table_parts` place them.
+        let flat = (table.part.strip_prefix("xl/tables/")).is_some_and(|f| !f.contains('/'));
+        let part = if flat && self.part(&table.part).is_none() {
             table.part.clone()
         } else {
             let mut tn = 1;
@@ -10366,50 +10376,25 @@ impl SheetPackage {
             }
         }
         let mut bytes = xml.to_vec();
+        let mut kept_id = None;
         match id {
-            Some(id) if !used.contains(&id) => self.removed_table_ids.retain(|r| *r != id),
+            Some(id) if !used.contains(&id) => kept_id = Some(id),
             _ => {
                 let mut fresh = 1;
                 while used.contains(&fresh) || self.removed_table_ids.contains(&fresh) {
                     fresh += 1;
                 }
-                if let Some(patched) = set_table_id(&text, fresh) {
-                    bytes = patched.into_bytes();
-                }
+                // Two tables with one id corrupt the file: refuse rather
+                // than keep it.
+                let patched = set_table_id(&text, fresh)
+                    .ok_or_else(|| format!("the id of \"{}\" is taken", table.name))?;
+                bytes = patched.into_bytes();
             }
         }
-        self.parts.push((part.clone(), bytes));
-        add_content_type_override(
-            &mut self.parts,
-            &format!("/{part}"),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml",
-        );
-        let ns = self.ns();
-        let sheet_part = self.sheet_parts[sheet].clone();
-        let (ws_dir, ws_file) = sheet_part
-            .rsplit_once('/')
-            .unwrap_or(("", sheet_part.as_str()));
-        let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
-        let file = part.rsplit_once('/').map_or(part.as_str(), |(_, f)| f);
-        let rid = add_rel(
-            &mut self.parts,
-            &rels_part,
-            &ns.rel("table"),
-            &format!("../tables/{file}"),
-        );
-        if !rid.is_empty() {
-            if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-                let xml = String::from_utf8_lossy(&p.1).into_owned();
-                let entry = format!("<tablePart r:id=\"{rid}\"/>");
-                let rels = Some(ns.rels);
-                let xml = append_to_worksheet_child(&xml, "tableParts", &entry, rels)
-                    .unwrap_or_else(|| {
-                        let block = format!("<tableParts count=\"1\">{entry}</tableParts>");
-                        put_worksheet_child(&xml, "tableParts", &block, rels, false)
-                    });
-                p.1 = xml.into_bytes();
-            }
+        if let Some(id) = kept_id {
+            self.removed_table_ids.retain(|r| *r != id);
         }
+        self.wire_table_part(sheet, &part, bytes);
         table.sheet = sheet;
         table.part = part;
         self.workbook.tables.push(table);
@@ -12156,6 +12141,51 @@ mod tests {
         // The caches over the old id stay dropped: they named the other id's
         // table, not this one.
         assert_eq!(pkg.removed_table_ids, vec![1]);
+    }
+
+    #[test]
+    fn restore_table_rewrites_a_taken_id_whatever_the_spacing_and_refuses_when_it_cannot_1795() {
+        let (mut pkg, table, bytes) = sheet_with_table();
+        assert!(pkg.remove_sheet(1));
+        let sheet = pkg.add_sheet("Data");
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("X"));
+        pkg.workbook.sheets[0].set_cell(0, 1, crate::sheet::Cell::text("Y"));
+        pkg.add_table(0, (0, 0, 1, 1), true, "TableStyleLight1")
+            .unwrap();
+        pkg.workbook.tables[0].name = "Other".into();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains(" id=\"1\""), "{text}");
+        // Spaces around `=` and single quotes are still the id attribute.
+        let spaced = text.replacen(" id=\"1\"", " id = '1'", 1);
+        let t = pkg
+            .restore_table(sheet, table.clone(), spaced.as_bytes())
+            .unwrap();
+        let xml =
+            String::from_utf8_lossy(pkg.part(&pkg.workbook.tables[t].part).unwrap()).into_owned();
+        assert_eq!(table_id(&xml), Some(2), "{xml}");
+        assert!(xml.contains("id = '2'"), "{xml}");
+        // No `id` to replace: refused, not left as a duplicate.
+        let mut again = table;
+        again.name = "Table9".into();
+        again.range = (10, 0, 12, 1);
+        let before = pkg.parts.clone();
+        let none = text.replacen(" id=\"1\"", "", 1);
+        let err = pkg
+            .restore_table(sheet, again, none.as_bytes())
+            .unwrap_err();
+        assert!(err.contains("Table9"), "{err}");
+        assert_eq!(pkg.parts, before);
+    }
+
+    #[test]
+    fn restore_table_takes_a_flat_part_name_only_1795() {
+        let (mut pkg, mut table, bytes) = sheet_with_table();
+        assert!(pkg.remove_sheet(1));
+        let sheet = pkg.add_sheet("Data");
+        table.part = "xl/tables/sub/table1.xml".into();
+        let t = pkg.restore_table(sheet, table, &bytes).unwrap();
+        assert_eq!(pkg.workbook.tables[t].part, "xl/tables/table1.xml");
+        assert!(pkg.part("xl/tables/sub/table1.xml").is_none());
     }
 
     #[test]
