@@ -149,8 +149,18 @@ fn fit(specs: &[Spec], width: f32) -> Fit {
 /// skipped: nothing loses a label, groups collapse whole. Among equal
 /// priorities the rightmost goes first. If the collapsed buttons still
 /// overflow, the lowest-priority ones move to the chevron, but one group
-/// always stays drawn.
+/// always stays drawn. When the tab fits, a last pass gives back what the
+/// first two took too early (a wider group's collapse can free more than the
+/// small ones taken before it): groups that are icon-only or collapsed return
+/// to full (collapsed ones to icon-only under `LabelsFirst`, if full does not
+/// fit), highest priority first, as far as the room allows.
 pub(crate) fn fit_with(specs: &[Spec], width: f32, policy: Policy) -> Fit {
+    fit_passes(specs, width, policy, true)
+}
+
+/// [`fit_with`], the back-fill pass optional: the tests that pin the order the
+/// first passes take groups in read it without.
+fn fit_passes(specs: &[Spec], width: f32, policy: Policy, back_fill: bool) -> Fit {
     let avail = width - GUTTER;
     let mut states = vec![State::Full; specs.len()];
     let mut order: Vec<usize> = (0..specs.len()).collect();
@@ -172,6 +182,29 @@ pub(crate) fn fit_with(specs: &[Spec], width: f32, policy: Policy) -> Fit {
             break;
         }
         states[i] = State::Collapsed;
+    }
+    // Back-fill: the passes above stop at the first fit, lowest priority
+    // first, so a later, wider collapse can leave room for a group dropped
+    // earlier. Walk them highest priority first (the reverse of the order
+    // they went) and give each back what still fits. Not when the chevron
+    // is needed: nothing fits then.
+    if back_fill && total(&states) <= avail {
+        for &i in order.iter().rev() {
+            let tries: &[State] = match (states[i], policy) {
+                (State::Full, _) => &[],
+                (State::IconOnly, _) => &[State::Full],
+                (State::Collapsed, Policy::LabelsFirst) => &[State::Full, State::IconOnly],
+                (State::Collapsed, Policy::WholeGroups) => &[State::Full],
+            };
+            for &to in tries {
+                let from = states[i];
+                states[i] = to;
+                if total(&states) <= avail {
+                    break;
+                }
+                states[i] = from;
+            }
+        }
     }
     let mut overflow = Vec::new();
     if total(&states) > avail {
@@ -727,7 +760,9 @@ mod tests {
         }
     }
 
-    /// The order groups collapse in under `policy`, narrowing one px at a
+    /// The order the collapse passes take groups in under `policy` (without
+    /// the back-fill of #1763, which restores groups out of that order),
+    /// narrowing one px at a
     /// time down to where all are collapsed. At every width the collapsed
     /// groups are the first of the priority order (lowest first, the
     /// rightmost of a tie), and a group once collapsed stays so.
@@ -736,7 +771,7 @@ mod tests {
         order.sort_by_key(|&i| (specs[i].priority, std::cmp::Reverse(i)));
         let mut was = 0;
         for width in (100..=3000).rev() {
-            let fit = fit_with(specs, width as f32, policy);
+            let fit = fit_passes(specs, width as f32, policy, false);
             let n = (0..specs.len()).filter(|&i| fit.in_flyout(i)).count();
             assert!(n >= was, "{name}: a group came back at {width}");
             assert!(
@@ -867,7 +902,7 @@ mod tests {
                 continue;
             }
             for width in widths() {
-                let fit = fit(&specs, width);
+                let fit = fit_passes(&specs, width, Policy::LabelsFirst, false);
                 if fit.states.contains(&State::Collapsed) {
                     for (i, s) in specs.iter().enumerate() {
                         assert!(
@@ -901,7 +936,7 @@ mod tests {
             }
             let mut collapsed_before: Vec<usize> = Vec::new();
             for width in widths().collect::<Vec<_>>().into_iter().rev() {
-                let fit = fit_with(&specs, width, policy);
+                let fit = fit_passes(&specs, width, policy, false);
                 assert!(
                     !fit.states.contains(&State::IconOnly),
                     "{name} at {width}: a group lost its labels"
@@ -986,6 +1021,88 @@ mod tests {
         assert!(tight.laid_out(&specs) <= 130.0);
         let tiny = fit(&specs, 10.0);
         assert_eq!(tiny.overflow, vec![1, 2], "the highest stays drawn");
+    }
+
+    /// #1763: a wide high-priority group's collapse can free more than the
+    /// small groups collapsed before it; they are given back.
+    #[test]
+    fn back_fill_restores_groups_a_later_collapse_made_unneeded() {
+        for policy in [Policy::LabelsFirst, Policy::WholeGroups] {
+            // Collapsing the two small groups (550 -> 500) is not enough,
+            // the wide one (-> 150) is; then both small ones fit again.
+            let specs = [spec(10, 100.), spec(20, 100.), spec(30, 400.)];
+            let f = fit_with(&specs, 300.0 + GUTTER, policy);
+            assert_eq!(
+                f.states,
+                vec![State::Full, State::Full, State::Collapsed],
+                "{policy:?}"
+            );
+            assert!(f.overflow.is_empty());
+            assert!(f.laid_out(&specs) <= 300.0);
+        }
+    }
+
+    /// #1763: under LabelsFirst a collapsed group that cannot return in full
+    /// returns icon-only, and an icon-only one returns to full.
+    #[test]
+    fn back_fill_prefers_full_then_icon_only() {
+        let wide = |p, full, icon| Spec {
+            priority: p,
+            full,
+            icon,
+            collapsed: 50.0,
+        };
+        // Both collapse (100); with 200 px, low returns at 100 icon-only
+        // (150 with the other's 50), not at 200 full (250), and with 250 px
+        // in full.
+        let specs = [wide(10, 200., 100.), wide(20, 300., 300.)];
+        let f = fit(&specs, 200.0 + GUTTER);
+        assert_eq!(f.states, vec![State::IconOnly, State::Collapsed]);
+        let f = fit(&specs, 250.0 + GUTTER);
+        assert_eq!(f.states, vec![State::Full, State::Collapsed]);
+        assert!(f.laid_out(&specs) <= 250.0);
+    }
+
+    /// #1763: whenever the groups fit without the chevron, they fit the
+    /// room and no collapsed group could be drawn in full instead. Not
+    /// monotone in the width, as the collapse is greedy: with 100, 100 and
+    /// 400 wide groups, 510 px collapses the two small ones (the first
+    /// pass stops at the first fit) where 500 px collapsed only the wide.
+    #[test]
+    fn fit_fills_its_room_and_leaves_nothing_restorable() {
+        let sets = [
+            vec![spec(10, 100.), spec(20, 100.), spec(30, 400.)],
+            vec![spec(50, 90.), spec(50, 300.), spec(40, 120.), spec(60, 60.)],
+            vec![
+                spec(5, 200.),
+                spec(200, 80.),
+                spec(5, 150.),
+                spec(100, 220.),
+            ],
+        ];
+        for policy in [Policy::LabelsFirst, Policy::WholeGroups] {
+            for specs in &sets {
+                for w in (0..120).map(|k| k as f32 * 10.0) {
+                    let avail = w - GUTTER;
+                    let f = fit_with(specs, w, policy);
+                    if !f.overflow.is_empty() {
+                        continue;
+                    }
+                    let sum = |states: &[State]| -> f32 {
+                        specs.iter().zip(states).map(|(s, st)| s.width(*st)).sum()
+                    };
+                    if sum(&vec![State::Collapsed; specs.len()]) > avail {
+                        continue;
+                    }
+                    assert!(sum(&f.states) <= avail, "{policy:?} {w}: over");
+                    for i in (0..specs.len()).filter(|&i| f.states[i] == State::Collapsed) {
+                        let mut g = f.states.clone();
+                        g[i] = State::Full;
+                        assert!(sum(&g) > avail, "{policy:?} {w}: {i} restorable");
+                    }
+                }
+            }
+        }
     }
 
     /// A tab with no groups has nothing to fit.

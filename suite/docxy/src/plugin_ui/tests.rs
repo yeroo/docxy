@@ -1322,14 +1322,22 @@ fn a_declared_priority_moves_the_group_in_the_collapse_order() {
     assert_eq!((early, late), (0, task.groups.len() - 1));
     // Squeezed just below the full width, the lowest priority goes first
     // (the leftmost group), though the appended one would, at the default 50
-    // and last place, and the highest stays full.
+    // and last place, and the highest stays full. Early's collapsed button
+    // (53 px) is wider than the group (42), so that collapse frees nothing and
+    // the back-fill (#1763) gives it back; Editing, the next, is what goes.
     let full: f32 = specs.iter().map(|s| s.full).sum();
     let fit = ribbon_fit::fit_with(
         &specs,
         full + ribbon_fit::GUTTER - 1.0,
         ribbon_fit::Policy::WholeGroups,
     );
-    assert_eq!(fit.states[early], ribbon_fit::State::Collapsed);
+    assert_eq!(fit.states[early], ribbon_fit::State::Full);
+    let editing = task
+        .groups
+        .iter()
+        .position(|g| g.title == "Editing")
+        .unwrap();
+    assert_eq!(fit.states[editing], ribbon_fit::State::Collapsed);
     assert_eq!(fit.states[late], ribbon_fit::State::Full);
     // Wide again: every group is full, nothing stays collapsed (#1685).
     let fit = ribbon_fit::fit_with(
