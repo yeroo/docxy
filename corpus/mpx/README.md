@@ -26,6 +26,18 @@ leaves that field out of the pair and says why (`EXCLUDED`):
   read to the same plan;
 - 28's durations: MPXJ writes them in days to two decimals.
 
+## Variants
+
+`variants/` holds MPX shapes the MSPDI corpus does not produce, each MPXJ's
+MPX of one corpus file with one change, written by
+`corpus/tools/gen_mpx_variants.py`; `projcore/src/mpx/tests.rs` reads them:
+
+- `month-units.mpx`: 06-lag with B lasting 1 month and lagged 1 elapsed
+  month (MPXJ writes `1mon`, `1FS+1emon`);
+- `weekday-dates.mpx`: 06-lag in date format 9 (`Mon 03/02/26`);
+- `multiline-note.mpx`: 02-link-fs with a two-line note (MPXJ writes the
+  line break as U+007F).
+
 ## Regenerating
 
 ```sh
@@ -33,6 +45,7 @@ pip install mpxj==16.8.0 JPype1    # needs a Java runtime (JAVA_HOME)
 python corpus/tools/gen_mpx_corpus.py        # MDY, into corpus/mpx/
 python corpus/tools/gen_mpx_corpus.py DMY    # into corpus/mpx/dmy/
 python corpus/tools/gen_mpx_corpus.py YMD    # into corpus/mpx/ymd/
+python corpus/tools/gen_mpx_variants.py      # into corpus/mpx/variants/
 ```
 
 Each run writes the generation day into record 30's current date; the reader
