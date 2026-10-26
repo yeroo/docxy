@@ -11172,10 +11172,12 @@ impl SheetPackage {
         Some(idx)
     }
 
-    /// Remove pivot `idx` from `workbook.pivots`: drops its table/cache
-    /// parts, their content-type overrides, the workbook-rels relationship +
-    /// `<pivotCache>` registration for the cache, and the destination
-    /// sheet's relationship to the table part. The exact inverse of
+    /// Remove pivot `idx` from `workbook.pivots`: drops its table part and
+    /// the destination sheet's relationship to it, and the cache part, its
+    /// content-type override, the workbook-rels relationship and the
+    /// `<pivotCache>` registration, those only when no other pivot shares
+    /// the `cache_part` (#1797); the pivot is also noted for the save to drop
+    /// the slicer and timeline caches over it. The exact inverse of
     /// `add_pivot`/`create_pivot` — nothing else in the codebase unregisters
     /// a pivot, so this is the "remove both or neither" half of the
     /// pivot-creation inverse (pair with `remove_sheet` when the pivot's
@@ -20089,6 +20091,14 @@ b",
             .position(|(n, _)| n == "xl/worksheets/_rels/sheet1.xml.rels")
             .unwrap();
         pkg.parts[at].1 = rels.into_bytes();
+        let types = ptext(&pkg, "[Content_Types].xml").replace(
+            "</Types>",
+            r#"<Override PartName="/xl/pivotCache/pivotCacheDefinition1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml"/><Override PartName="/xl/pivotTables/pivotTable1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/><Override PartName="/xl/pivotTables/pivotTable2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/></Types>"#,
+        );
+        let at = (pkg.parts.iter())
+            .position(|(n, _)| n == "[Content_Types].xml")
+            .unwrap();
+        pkg.parts[at].1 = types.into_bytes();
         let pkg = preload(&pkg);
         assert_eq!(pkg.workbook.pivots.len(), 2, "both pivots load");
         assert_eq!(
@@ -20240,7 +20250,11 @@ b",
             .unwrap();
         let cache = pkg.workbook.pivots[report].cache_part.clone();
         assert!(pkg.remove_pivot(report));
+        let over = format!("PartName=\"/{cache}\"");
         assert!(pkg.part(&cache).is_some(), "the shared cache part stays");
+        assert!(ptext(&pkg, "[Content_Types].xml").contains(&over));
+        let types = ptext(&pkg, "[Content_Types].xml");
+        assert!(!types.contains("pivotTable1.xml") && types.contains("pivotTable2.xml"));
         let rels = ptext(&pkg, "xl/_rels/workbook.xml.rels");
         assert!(rels.contains("pivotCacheDefinition1.xml"), "{rels}");
         assert!(ptext(&pkg, "xl/workbook.xml").contains("<pivotCache "));
@@ -20252,6 +20266,7 @@ b",
         assert!(re.remove_pivot(0));
         assert!(re.part(&cache).is_none());
         assert!(!ptext(&re, "xl/_rels/workbook.xml.rels").contains("pivotCacheDefinition1"));
+        assert!(!ptext(&re, "[Content_Types].xml").contains(&over));
     }
 
     #[test]
