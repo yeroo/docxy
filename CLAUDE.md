@@ -472,7 +472,9 @@
 - A library may also export `yppx_plugin_read_ex` / `yppx_plugin_write_ex`
   (#1702; independent, optional, ABI still 1) to carry the plan's
   `Formatting`, which MSPDI does not: write_ex gets the `formatting.xml` text
-  beside the MSPDI (NULL/0 when the plan has none) and is called instead of
+  beside the MSPDI (NULL/0 when the plan has neither formatting nor rich
+  notes; its `<note>` children are the rich notes, #1801, which read_ex must
+  return for them to survive) and is called instead of
   `yppx_plugin_write`; read_ex returns it in a second buffer (empty leaves the
   default; non-UTF-8 or unparsable fails the read with the plugin's name).
   `.yppx` keeps it in `formatting.xml` as before. Hosts need nothing: they pass
@@ -852,6 +854,35 @@
   for an unstyled tier). The fixture's `fixture.format` sets both with its
   gridlines and clears them on the next press (`project-plugin-ui.uit`, not
   run on macOS).
+
+## Rich task notes (#1801)
+
+- `Task::rich_notes` is the notes' `projcore::richtext` markup beside the
+  plain `notes` every reader uses (MSPDI `<Notes>`, the grid, search, the
+  suite's built-in Notes field): `Some` only when it formats something
+  (bold, italic, a non-left alignment, a bullet), and then its plain text is
+  `notes` (`richtext::split_notes` is the one rule). `Editor::set_rich_notes`
+  sets both as one undo step (a style-only change is a step, the value held
+  none); `set_notes` with new text drops the markup, with the same text
+  keeps it, so a host rewriting unchanged notes loses nothing.
+- It travels where the formatting does: `<note uid markup/>` children of
+  `formatting.xml` after the formatting's own (`formatting::part_xml`, the
+  one writer and "is there a part" test: newlines `&#10;`, tabs `&#9;`), so
+  a `.yppx` save keeps it and a format plugin's `_ex` symbols carry it both
+  ways with no new ABI symbol. A plan without rich notes writes the part
+  byte-identically (or none). On read (`formatting::apply_notes`) a note
+  lands only on a non-blank task whose plain notes it still describes; an
+  older build's `Formatting::from_xml` ignores `<note>`.
+- projctl `task.set {rich_notes}` takes the markup verbatim (never the
+  one-line `notes` form), not with `notes` in one call; every task reply
+  with notes carries `rich_notes` (the stored markup, else the plain notes'
+  own markup, so plain text is never mistaken for markup). UI plugins read
+  it from the read-only `view.rich_notes` (`{uid: markup}`, tasks with
+  formatting only; `formatting::rich_notes_json`) in the suite's
+  `view_json` and yppxy's `run_command`. The fixture's `fixture.richnote`
+  (a command with no control) is the loop, `yppxy/tests/plugins.rs`.
+- Out of scope: resource and assignment notes, rich editing in the
+  built-in Notes field, RTF (the plugin converts).
 
 ## Project leveling as a plan edit (#1594)
 

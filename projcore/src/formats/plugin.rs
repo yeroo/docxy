@@ -629,6 +629,9 @@ impl ProjectFormat for PluginFormat {
                 .map_err(|_| format!("{}: the formatting it returned is not UTF-8", plugin.name))?;
             project.formatting = Formatting::from_xml(&text)
                 .map_err(|e| format!("{}: the formatting it returned: {e}", plugin.name))?;
+            // The tasks' rich notes travel in the same text (#1801).
+            crate::formatting::apply_notes(&mut project, &text)
+                .map_err(|e| format!("{}: the formatting it returned: {e}", plugin.name))?;
         }
         Ok(project)
     }
@@ -641,7 +644,9 @@ impl ProjectFormat for PluginFormat {
             ));
         }
         let xml = write_mspdi(project);
-        let formatting = (!project.formatting.is_empty()).then(|| project.formatting.to_xml());
+        // The formatting and the tasks' rich notes (#1801), NULL without
+        // either.
+        let formatting = crate::formatting::part_xml(project);
         self.plugin
             .write_file(&self.ext_c, &xml, formatting.as_deref(), source)
     }

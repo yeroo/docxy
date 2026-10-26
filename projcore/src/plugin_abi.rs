@@ -96,10 +96,16 @@
 //! ABI version stays 1. When `yppx_plugin_write_ex` exists the host calls it
 //! instead of `yppx_plugin_write`, with the `formatting.xml` text (UTF-8, the
 //! part a `.yppx` keeps) in `formatting_xml`, or NULL with `formatting_len` 0
-//! when the plan has no formatting; the rest is as for `yppx_plugin_write`.
+//! when the plan has neither formatting nor rich task notes; the rest is as
+//! for `yppx_plugin_write`. The text may hold `<note uid markup/>` children,
+//! the tasks' rich notes (#1801, shape in `formatting::notes`), so a plan with
+//! only rich notes still passes it.
 //! When `yppx_plugin_read_ex` exists the host calls it instead of
 //! `yppx_plugin_read`; a non-empty `formatting_out` (UTF-8 `formatting.xml`)
-//! becomes the plan's formatting, and an empty one leaves it default. A
+//! becomes the plan's formatting, and an empty one leaves it default. Its
+//! `<note>`s give the tasks their rich notes, each only where the MSPDI
+//! `<Notes>` is the note's plain text, so a plugin that keeps the formatting
+//! in native fields must return the `<note>`s too or the notes lose it. A
 //! `formatting_out` that is not UTF-8 or does not parse fails the read. Both
 //! buffers are freed whatever the return code. Without the symbols nothing
 //! changes: the formatting is not passed and a read returns none.

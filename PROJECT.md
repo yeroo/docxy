@@ -436,8 +436,11 @@ refusal is what it was before plugins existed.
   over what the model does not hold. Two more symbols are optional and
   independent (#1702; the ABI stays 1): `yppx_plugin_read_ex` also returns the
   plan's `formatting.xml` in a second buffer, and `yppx_plugin_write_ex` also
-  takes it (NULL and 0 when the plan has none); each is called instead of its
-  plain twin when present, since MSPDI holds no formatting.
+  takes it (NULL and 0 when the plan has neither formatting nor rich task
+  notes); each is called instead of its plain twin when present, since MSPDI
+  holds no formatting. The text also carries the tasks' rich notes as
+  `<note uid markup/>` children (#1801), which read_ex must return (with the
+  MSPDI `<Notes>` equal to their plain text) for them to survive.
 - **`projcore::formats::plugin`**, behind the cargo feature `plugins` (it
   adds `libloading`; hosts enable it, so the default build and the wasm
   builds stay dependency-free), loads the libraries, checks the ABI version

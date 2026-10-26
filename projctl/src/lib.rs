@@ -18,7 +18,7 @@
 //! | `task.list` | `{fields?}` | `{count, tasks:[{uid, id, outline_number, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid, fields?}` | one task |
 //! | `task.fields` | — | `{count, fields:[name…]}`: the field names `fields` can read |
-//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, milestone?, marked?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven`, `milestone` and `marked` (Project's Marked flag, #1667, saved in `.yppx` only) booleans, `notes` text (`\n` line breaks), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?, start?, finish?, percent_complete?, actual_start?, actual_finish?, actual_duration?, remaining_duration?, priority?, deadline?, constraint?, task_type?, effort_driven?, notes?, rich_notes?, milestone?, marked?, calendar?, ignore_resource_calendar?, wbs?, earned_value_method?, custom?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled). The Task Information fields (#1550): `start` and `finish` (#1570) are set as typed in the Start and Finish cells: `YYYY-MM-DD` (the task calendar's first working time for a start, its last for a finish) or `YYYY-MM-DDTHH:MM`; an auto task gains a Start or Finish No Earlier Than constraint, a manual one is pinned (keeping its duration for a start, the duration following a finish), after `manual`, `duration`, `milestone` and the calendar are applied, and before the actuals and a given `constraint`; only these see the call's calendar, as a bare `actual_*`, `deadline` or `constraint.date` day resolves on the task's calendar before a `calendar` in the same call; both on an auto task, or either on an auto summary, are refused, and `null` is not accepted. `percent_complete` 0–100, the Update Tasks fields (#1568) `actual_start` / `actual_finish` (a date as for `deadline`, an actual start taking the day's first working time and a finish its last, or `null` to clear) and `actual_duration` / `remaining_duration` (durations: setting one adjusts % Complete, the remaining duration also the task's duration; an actual finish completes the task; a `percent_complete` given with an actual finish date, `actual_duration` or `remaining_duration` must equal the % they make or is refused, and with only `actual_start` or a cleared finish it applies after them, a started task getting that share as its actual duration; a `duration` given with `remaining_duration` must equal the actual plus the remaining), `priority` 0–1000, `deadline` a date (`YYYY-MM-DD`, the day's last working time, or `YYYY-MM-DDTHH:MM`) or `null`, `constraint` `{type, date?}` with the type `ASAP`/`ALAP`/`MSO`/`MFO`/`SNET`/`SNLT`/`FNET`/`FNLT`, `task_type` `fixed-units`/`fixed-duration`/`fixed-work`, `effort_driven`, `milestone` and `marked` (Project's Marked flag, #1667, saved in `.yppx` only) booleans, `notes` text (`\n` line breaks), `rich_notes` (#1801) `projcore::richtext` markup taken verbatim (real line breaks between blocks), setting the notes to its plain text and keeping the markup only when it formats something, a style-only change being a change; not with `notes` in one call; a task reply carries `rich_notes` whenever the task has notes (the stored markup, else the plain notes' canonical markup), `calendar` a base calendar's name or uid or `null`, `ignore_resource_calendar` a boolean, `wbs` text, `earned_value_method` `percent-complete`/`physical-percent-complete`. `custom` (#1554) is an object of Project custom field names to values as typed in the cell (`{"Text1": "Civil", "Flag3": true, "Date1": "2026-03-09", "Duration1": "3d", "Cost1": "$1,400", "Number1": null}`; `null` or `""` clears): the field needs a definition in the plan, a formula field is refused, a lookup-table field takes one of its values. Every argument is checked and all apply in one undo step, or none does |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
@@ -670,6 +670,15 @@ fn task_json(
     if let Some(d) = t.leveling_delay.filter(|d| *d != 0) {
         fields.push(("leveling_delay_min", Json::Num(d as f64 / 10.)));
     }
+    // The notes as markup (#1801): the stored formatting, else the plain
+    // notes' own markup, so a reader never mistakes plain text for markup.
+    if let Some(notes) = t.notes.as_deref().filter(|n| !n.is_empty()) {
+        let markup = t
+            .rich_notes
+            .clone()
+            .unwrap_or_else(|| projcore::richtext::Rich::plain(notes).to_markup());
+        fields.push(("rich_notes", Json::Str(markup)));
+    }
     if let Some(r) = ed.schedule().get(t.uid) {
         fields.push(("critical", Json::Bool(r.critical)));
         fields.push((
@@ -792,6 +801,8 @@ struct TaskInfoArgs {
     task_type: Option<TaskType>,
     effort_driven: Option<bool>,
     notes: Option<String>,
+    /// Rich notes as `projcore::richtext` markup (#1801), taken verbatim.
+    rich_notes: Option<String>,
     milestone: Option<bool>,
     /// Project's Marked flag (#1667).
     marked: Option<bool>,
@@ -839,6 +850,7 @@ impl TaskInfoArgs {
             || self.task_type.is_some()
             || self.effort_driven.is_some()
             || self.notes.is_some()
+            || self.rich_notes.is_some()
             || self.milestone.is_some()
             || self.marked.is_some()
             || self.calendar.is_some()
@@ -1041,6 +1053,9 @@ impl TaskInfoArgs {
                 }
             }),
         };
+        if args.get("notes").is_some() && args.get("rich_notes").is_some() {
+            return Err("give notes or rich_notes, not both".into());
+        }
         Ok(TaskInfoArgs {
             start,
             finish,
@@ -1055,6 +1070,7 @@ impl TaskInfoArgs {
             task_type,
             effort_driven: flag("effort_driven")?,
             notes: text("notes")?,
+            rich_notes: text("rich_notes")?,
             milestone: flag("milestone")?,
             marked: flag("marked")?,
             calendar,
@@ -1190,6 +1206,11 @@ impl TaskInfoArgs {
         }
         if let Some(notes) = &self.notes {
             ed.set_notes(uid, &projcore::text::notes_from_line(notes))?;
+        }
+        // Markup has real line breaks, so it is never read as the one-line
+        // form `notes` takes.
+        if let Some(markup) = &self.rich_notes {
+            ed.set_rich_notes(uid, markup)?;
         }
         if let Some(on) = self.marked {
             ed.set_marked(uid, on)?;
@@ -4007,6 +4028,156 @@ mod tests {
         )
         .unwrap();
         assert!(bad.is_err());
+    }
+
+    /// Rich notes (#1801): `task.set {rich_notes}` sets the plain notes and
+    /// the markup in one step, a style-only change is a step, the reply
+    /// reports the markup.
+    #[test]
+    fn task_set_rich_notes_sets_plain_and_markup() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let markup = "<p><b>Check</b></p>\n<li>it</li>";
+        let depth = a.undo_depth();
+        let r = call(
+            &mut a,
+            "task.set",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("rich_notes", Json::Str(markup.into())),
+                ("name", Json::Str("Design 2".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 1, "one step with the name");
+        assert_eq!(r.get_str("rich_notes"), Some(markup));
+        let t = a.project().task(uid as i32).unwrap();
+        assert_eq!(t.notes.as_deref(), Some("Check\nit"));
+        assert_eq!(t.rich_notes.as_deref(), Some(markup));
+        // Same plain text, bold dropped: a step of its own.
+        call(
+            &mut a,
+            "task.set",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("rich_notes", Json::Str("<p>Check</p>\n<li>it</li>".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.undo_depth(), depth + 2);
+        assert_eq!(
+            a.project().task(uid as i32).unwrap().rich_notes.as_deref(),
+            Some("<p>Check</p>\n<li>it</li>")
+        );
+    }
+
+    #[test]
+    fn task_set_rich_notes_is_verbatim() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        // `notes` reads `\n` (backslash, n) as a line break; markup does not.
+        call(
+            &mut a,
+            "task.set",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("rich_notes", Json::Str("<p><b>C:\\new</b></p>".into())),
+            ],
+        )
+        .unwrap();
+        let t = a.project().task(uid as i32).unwrap();
+        assert_eq!(t.notes.as_deref(), Some("C:\\new"));
+        assert_eq!(t.rich_notes.as_deref(), Some("<p><b>C:\\new</b></p>"));
+    }
+
+    #[test]
+    fn task_set_rich_notes_with_notes_is_refused() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let before = a.project().clone();
+        let depth = a.undo_depth();
+        let err = call(
+            &mut a,
+            "task.set",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("notes", Json::Str("x".into())),
+                ("rich_notes", Json::Str("<li>x</li>".into())),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err, "give notes or rich_notes, not both");
+        for bad in [Json::Null, Json::Num(1.0)] {
+            let err = call(
+                &mut a,
+                "task.set",
+                vec![("uid", Json::Num(uid as f64)), ("rich_notes", bad)],
+            )
+            .unwrap_err();
+            assert_eq!(err, "'rich_notes' must be text");
+        }
+        assert_eq!(a.project(), &before);
+        assert_eq!(a.undo_depth(), depth);
+    }
+
+    #[test]
+    fn task_get_reports_rich_notes() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let get =
+            |a: &mut Editor| call(a, "task.get", vec![("uid", Json::Num(uid as f64))]).unwrap();
+        // No notes: no key.
+        assert_eq!(get(&mut a).get("rich_notes"), None);
+        // Plain notes: their own markup, escaped, so `<p>` stays text.
+        call(
+            &mut a,
+            "task.set",
+            vec![
+                ("uid", Json::Num(uid as f64)),
+                ("notes", Json::Str("<p>a\\nb".into())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            get(&mut a).get_str("rich_notes"),
+            Some("<p>&lt;p&gt;a</p>\n<p>b</p>")
+        );
+        // Stored markup, also in task.list.
+        a.set_rich_notes(uid as i32, "<li>x</li>").unwrap();
+        assert_eq!(get(&mut a).get_str("rich_notes"), Some("<li>x</li>"));
+        let list = call(&mut a, "task.list", vec![]).unwrap();
+        let entry = list
+            .get("tasks")
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .find(|t| t.get("uid").and_then(Json::as_f64) == Some(uid as f64))
+            .unwrap()
+            .clone();
+        assert_eq!(entry.get_str("rich_notes"), Some("<li>x</li>"));
+    }
+
+    #[test]
+    fn task_set_notes_clears_rich_notes() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        a.set_rich_notes(uid as i32, "<li>x</li>").unwrap();
+        let set = |a: &mut Editor, text: &str| {
+            call(
+                a,
+                "task.set",
+                vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("notes", Json::Str(text.into())),
+                ],
+            )
+            .unwrap()
+        };
+        // The same plain text keeps the formatting …
+        assert_eq!(set(&mut a, "x").get_str("rich_notes"), Some("<li>x</li>"));
+        // … new text drops it.
+        assert_eq!(set(&mut a, "y").get_str("rich_notes"), Some("<p>y</p>"));
+        assert_eq!(a.project().task(uid as i32).unwrap().rich_notes, None);
     }
 
     /// The Task Information fields (#1550): every argument applies in the

@@ -1155,6 +1155,11 @@ impl Selection {
 pub struct StateCtx {
     pub plan: String,
     pub selection: Selection,
+    /// The view's switches and the plan's formatting, and (read-only, #1801)
+    /// `rich_notes`: `{"<uid>": markup}` for every task whose notes carry
+    /// [`crate::richtext`] formatting, which the plan's MSPDI cannot; a task
+    /// not listed has its plain `<Notes>` only. Its writer is the
+    /// `task.set {rich_notes}` op; a `view` reply never sets it.
     pub view: Json,
     /// `(dialog id, task uid)` when the host is about to open a dialog and
     /// wants its values prefilled, or asks again for an open one (#1602).
@@ -1391,6 +1396,7 @@ pub struct Command {
     pub id: String,
     pub plan: String,
     pub selection: Selection,
+    /// As [`StateCtx::view`], `rich_notes` included.
     pub view: Json,
     pub values: Option<Json>,
     pub button: Option<String>,

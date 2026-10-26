@@ -395,6 +395,11 @@ pub struct Task {
     pub hyperlink_sub_address: Option<String>,
     pub ignore_resource_calendar: Option<bool>,
     pub notes: Option<String>,
+    /// The notes' formatting as canonical [`crate::richtext`] markup (#1801):
+    /// `Some` only when it carries what `notes` cannot (bold, italic, a
+    /// non-left alignment or a bullet), and then its plain text is `notes`.
+    /// Saved in `formatting.xml` (`<note uid markup>`), never in MSPDI.
+    pub rich_notes: Option<String>,
     pub earned_value_method: Option<i32>,
     pub recurring: Option<bool>,
     pub hide_bar: Option<bool>,

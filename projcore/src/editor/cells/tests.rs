@@ -246,6 +246,132 @@ fn set_notes_survive_mspdi_save() {
     assert!(!xml.contains("<Notes>"));
 }
 
+/// Criterion 1 of #1801: markup is kept only when it formats, and its
+/// plain text is then the notes.
+fn rich_notes_consistent(task: &crate::Task) -> bool {
+    match &task.rich_notes {
+        None => true,
+        Some(m) => crate::richtext::split_notes(m) == (task.notes.clone(), Some(m.clone())),
+    }
+}
+
+const BOLD_NOTE: &str = "<p><b>Line 1</b></p>\n<li>Line 2</li>";
+
+#[test]
+fn rich_notes_set_plain_and_markup_as_one_step() {
+    let mut ed = editor();
+    let before = ed.project().clone();
+    assert!(ed.set_rich_notes(10, BOLD_NOTE).unwrap());
+    assert_eq!(ed.undo_depth(), 1);
+    assert!(ed.dirty());
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("Line 1\nLine 2"));
+    assert_eq!(task.rich_notes.as_deref(), Some(BOLD_NOTE));
+    assert!(rich_notes_consistent(task));
+    let after = ed.project().clone();
+    assert!(ed.undo());
+    assert_eq!(ed.project(), &before);
+    assert!(ed.redo());
+    assert_eq!(ed.project(), &after);
+}
+
+#[test]
+fn rich_notes_style_only_change_is_a_step() {
+    let mut ed = editor();
+    assert!(ed.set_notes(10, "Line 1\nLine 2").unwrap());
+    ed.mark_saved();
+    let depth = ed.undo_depth();
+    // Same plain text, bold and a bullet added: a change of its own.
+    assert!(ed.set_rich_notes(10, BOLD_NOTE).unwrap());
+    assert_eq!(ed.undo_depth(), depth + 1);
+    assert!(ed.dirty());
+    assert!(ed.undo());
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("Line 1\nLine 2"));
+    assert_eq!(task.rich_notes, None);
+}
+
+#[test]
+fn rich_notes_identical_is_no_step() {
+    let mut ed = editor();
+    assert!(ed.set_rich_notes(10, BOLD_NOTE).unwrap());
+    ed.mark_saved();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(!ed.set_rich_notes(10, BOLD_NOTE).unwrap());
+    // A non-canonical spelling of the same value is the same value.
+    assert!(
+        !ed.set_rich_notes(10, "<p><b>Line </b><b>1</b></p>\n<li>Line 2</li>")
+            .unwrap()
+    );
+    assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
+    // Plain markup of the plain notes a task has is no change either.
+    assert!(ed.set_notes(10, "x").unwrap());
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(!ed.set_rich_notes(10, "<p>x</p>").unwrap());
+    assert!(!ed.set_rich_notes(10, "x").unwrap());
+    assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
+}
+
+#[test]
+fn rich_notes_without_formatting_store_none() {
+    let mut ed = editor();
+    assert!(ed.set_rich_notes(10, "<p>a &amp; b</p>\n<p></p>").unwrap());
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("a & b\n"));
+    assert_eq!(task.rich_notes, None);
+    // Not markup: plain text, newline-normalised.
+    assert!(ed.set_rich_notes(10, "if a<b>c\r\nd").unwrap());
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("if a<b>c\nd"));
+    assert_eq!(task.rich_notes, None);
+    // Empty removes the notes, formatting and all.
+    assert!(ed.set_rich_notes(10, BOLD_NOTE).unwrap());
+    assert!(ed.set_rich_notes(10, "<li></li>").unwrap());
+    let task = ed.project().task(10).unwrap();
+    assert_eq!((task.notes.clone(), task.rich_notes.clone()), (None, None));
+    // A blank row refuses, as for plain notes.
+    let i = ed.insert_blank_row(Some(10)).unwrap();
+    let blank = ed.project().tasks[i].uid;
+    assert_eq!(
+        ed.set_rich_notes(blank, BOLD_NOTE).unwrap_err(),
+        "A blank row cannot take notes"
+    );
+}
+
+#[test]
+fn set_notes_new_text_clears_rich_notes() {
+    let mut ed = editor();
+    ed.set_rich_notes(10, BOLD_NOTE).unwrap();
+    let depth = ed.undo_depth();
+    assert!(ed.set_notes(10, "Line 1\nLine 2!").unwrap());
+    assert_eq!(ed.undo_depth(), depth + 1);
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.rich_notes, None);
+    assert!(rich_notes_consistent(task));
+    // Undo brings both back as they were.
+    assert!(ed.undo());
+    assert_eq!(
+        ed.project().task(10).unwrap().rich_notes.as_deref(),
+        Some(BOLD_NOTE)
+    );
+    // Removing the notes drops the formatting too.
+    assert!(ed.set_notes(10, "").unwrap());
+    assert_eq!(ed.project().task(10).unwrap().rich_notes, None);
+}
+
+#[test]
+fn set_notes_same_text_keeps_rich_notes() {
+    let mut ed = editor();
+    ed.set_rich_notes(10, BOLD_NOTE).unwrap();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    // A host rewriting the unchanged plain text loses nothing.
+    assert!(!ed.set_notes(10, "Line 1\r\nLine 2").unwrap());
+    assert_eq!((ed.undo_depth(), ed.redo_depth(), ed.dirty()), history);
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.rich_notes.as_deref(), Some(BOLD_NOTE));
+    assert!(rich_notes_consistent(task));
+}
+
 #[test]
 fn resources_preserve_allocations_and_undo_creation_together() {
     let mut ed = editor();

@@ -125,6 +125,25 @@ impl Rich {
     }
 }
 
+/// A task's notes from a rich value (#1801): the plain text (`None` when
+/// empty) and the canonical markup, `None` unless it carries formatting the
+/// plain text cannot (bold, italic, a non-left alignment or a bullet). A
+/// value that is not markup is plain text, newline-normalised; empty plain
+/// text keeps no markup (an empty bullet is no note).
+pub fn split_notes(value: &str) -> (Option<String>, Option<String>) {
+    if !is_markup(value) {
+        let plain = crate::text::normalize_newlines(value);
+        return ((!plain.is_empty()).then_some(plain), None);
+    }
+    let rich = parse_markup(value);
+    if rich.text.is_empty() {
+        return (None, None);
+    }
+    let markup = rich.to_markup();
+    let formatted = markup != Rich::plain(&rich.text).to_markup();
+    (Some(rich.text), formatted.then_some(markup))
+}
+
 /// The canonical markup of `text` with its attributes. Short or missing
 /// attributes are read as plain / left, so a desynced state still writes.
 pub fn to_markup(text: &str, chars: &[u8], paras: &[Para]) -> String {
@@ -503,5 +522,39 @@ mod tests {
         for s in ["<p", "<p>", "<li>&", "<p><", "<p>&amp", "<p a='>x</p>"] {
             invariant(&Rich::parse(s));
         }
+    }
+
+    #[test]
+    fn split_notes_keeps_markup_only_when_it_formats() {
+        // Plain text, newline-normalised, no markup.
+        assert_eq!(split_notes("a\r\nb"), (Some("a\nb".into()), None));
+        assert_eq!(split_notes(""), (None, None));
+        // Markup without formatting is its plain text.
+        assert_eq!(
+            split_notes("<p> a\tb </p>\n<p></p>\n<p>c</p>"),
+            (Some(" a\tb \n\nc".into()), None)
+        );
+        // A plain note that looks like a tag is escaped, so it formats nothing.
+        let looks = Rich::plain("<p>hi").to_markup();
+        assert_eq!(looks, "<p>&lt;p&gt;hi</p>");
+        assert_eq!(split_notes(&looks), (Some("<p>hi".into()), None));
+        // Bold, a bullet or an alignment keep the canonical markup.
+        for m in [
+            "<p><b>x</b> y</p>",
+            "<li>x</li>",
+            "<p align=\"center\">x</p>",
+            "<p><i>a &amp; &lt;b&gt;</i></p>\n<li align=\"right\">c</li>",
+        ] {
+            let (plain, rich) = split_notes(m);
+            assert_eq!(rich.as_deref(), Some(m), "{m}");
+            assert_eq!(plain, Some(Rich::parse(m).to_plain()));
+        }
+        // Not canonical in, canonical out.
+        assert_eq!(
+            split_notes("<p><b>x</b><b>y</b></p>").1.as_deref(),
+            Some("<p><b>xy</b></p>")
+        );
+        // An empty formatted line is no note.
+        assert_eq!(split_notes("<li></li>"), (None, None));
     }
 }

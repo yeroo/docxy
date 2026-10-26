@@ -58,6 +58,10 @@
 //!   date format `1/28`; a second press, seeing a bar height in the view,
 //!   clears it with null).
 //!   and `fixture.font` (#1669: the Fixture group's launcher; a status only).
+//!   and `fixture.richnote` (#1801, no control: a host runs it by id): the
+//!   first selected task's notes back through `task.set rich_notes`, bold
+//!   from the plan's plain notes, or with an italic bullet added to the
+//!   markup `view.rich_notes` holds for it.
 //!   and `fixture.mark` (#1667, a row-menu item after Rename: one
 //!   `task.set` marking the first selected task and making it 3 days long,
 //!   one `proj.highlight` of its name, and `view.text_styles` styling Marked
@@ -522,6 +526,43 @@ pub unsafe extern "C" fn yppx_ui_command(input: *const u8, len: usize, out: *mut
                     "Changed Cells":{{"color":"#C00000","italic":true}}}}}}}}"##,
                     quote(&name),
                     quote(&format!("Fixture: marked task {uid}"))
+                )
+            }
+            None => r#"{"ops":[],"status":"Fixture: select a task first"}"#.to_string(),
+        },
+        // Rich task notes (#1801), the downstream's loop: read the first
+        // selected task's markup from `view.rich_notes`, else its plain
+        // notes from the plan (MSPDI, already escaped as markup needs),
+        // and write it back through `task.set rich_notes`: plain notes come
+        // back bold, line by line; stored markup gains an italic bullet.
+        "fixture.richnote" => match first_uid(&req) {
+            Some(uid) => {
+                let stored = req
+                    .get("view")
+                    .and_then(|v| v.get("rich_notes"))
+                    .and_then(|n| n.get(&uid.to_string()))
+                    .and_then(Json::str);
+                let markup = match stored {
+                    Some(m) => format!("{m}\n<li><i>again</i></li>"),
+                    None => {
+                        let uids = task_field(&req, "UID");
+                        let plain = uids
+                            .iter()
+                            .position(|u| u.trim() == uid.to_string())
+                            .and_then(|at| task_field(&req, "Notes").get(at).cloned())
+                            .filter(|n| !n.is_empty())
+                            .unwrap_or_else(|| "note".to_string());
+                        plain
+                            .split('\n')
+                            .map(|line| format!("<p><b>{line}</b></p>"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                };
+                format!(
+                    r#"{{"ops":[{{"verb":"task.set","args":{{"uid":{uid},"rich_notes":{}}}}}],"status":{}}}"#,
+                    quote(&markup),
+                    quote(&format!("Fixture: rich note on task {uid}"))
                 )
             }
             None => r#"{"ops":[],"status":"Fixture: select a task first"}"#.to_string(),

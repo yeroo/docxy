@@ -104,6 +104,32 @@ fn the_view_json_carries_the_text_styles_and_the_selected_cells_styles() {
     assert!(view_json(v).list("cells").is_empty());
 }
 
+/// Rich task notes (#1801): MSPDI carries the plain notes only, so the view
+/// lists the tasks whose notes are formatted, read-only.
+#[test]
+fn the_view_json_carries_the_rich_notes() {
+    let mut tab = tab();
+    let Surface::Project(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    let uid = v.ed.project().tasks[0].uid;
+    let other = v.ed.project().tasks[1].uid;
+    assert_eq!(view_json(v).get("rich_notes"), Some(&Json::Obj(Vec::new())));
+    v.ed.set_rich_notes(uid, "<p><b>Bold</b></p>").unwrap();
+    v.ed.set_notes(other, "plain").unwrap();
+    let view = view_json(v);
+    let notes = view.get("rich_notes").unwrap();
+    assert_eq!(notes.get_str(&uid.to_string()), Some("<p><b>Bold</b></p>"));
+    assert_eq!(
+        notes.get(&other.to_string()),
+        None,
+        "plain notes are not listed"
+    );
+    // A reply echoing the view writes nothing.
+    let mut f = v.ed.project().formatting.clone();
+    assert!(!f.apply_view(&view).unwrap());
+}
+
 #[test]
 fn the_view_json_carries_strikethrough_and_pattern() {
     let mut tab = tab();

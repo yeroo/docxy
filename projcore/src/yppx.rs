@@ -64,12 +64,15 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
             proj.package.unreadable.join(", ")
         ));
     }
+    // The formatting part (#1532) with the tasks' rich notes (#1801), only
+    // when there is either to keep.
+    let formatting_xml = formatting::part_xml(proj);
     let mut entries = vec![
         (
             CONTENT_TYPES_PART.to_string(),
             build_content_types(
                 &proj.package,
-                !proj.formatting.is_empty(),
+                formatting_xml.is_some(),
                 !proj.table_view.is_empty(),
                 &FLAG_PARTS.map(|f| f.any(&proj.tasks)),
             )
@@ -103,12 +106,8 @@ pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
             ));
         }
     }
-    // The formatting part (#1532), only when there is formatting to keep.
-    if !proj.formatting.is_empty() {
-        entries.push((
-            formatting::PART.to_string(),
-            proj.formatting.to_xml().into_bytes(),
-        ));
+    if let Some(xml) = formatting_xml {
+        entries.push((formatting::PART.to_string(), xml.into_bytes()));
     }
     for (name, bytes) in &proj.package.parts {
         if !name.ends_with('/') && seen.insert(name.to_ascii_lowercase()) {
@@ -440,6 +439,7 @@ fn read_yppx_within(bytes: &[u8], budget: u64) -> Result<Project, String> {
         let text = String::from_utf8(bytes)
             .map_err(|_| format!("{} is not valid UTF-8", formatting::PART))?;
         project.formatting = Formatting::from_xml(&text)?;
+        formatting::apply_notes(&mut project, &text)?;
     }
     if let Some(view) = table_view {
         project.table_view = view;
@@ -754,6 +754,45 @@ mod tests {
             tasks: vec![a, b],
             ..Project::default()
         }
+    }
+
+    /// Rich task notes (#1801) ride in the formatting part: a note alone
+    /// writes it (and declares it), a save and reopen keeps the markup, and
+    /// MSPDI keeps the plain text only.
+    #[test]
+    fn rich_notes_survive_yppx_round_trip() {
+        let mut proj = sample();
+        let markup = "<p><b>Bold</b> &amp; more</p>\n<li align=\"right\">item</li>";
+        proj.tasks[0].notes = Some("Bold & more\nitem".into());
+        proj.tasks[0].rich_notes = Some(markup.into());
+        proj.tasks[1].notes = Some("plain".into());
+        assert!(proj.formatting.is_empty());
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        let part = String::from_utf8(zip.read(crate::formatting::PART).unwrap()).unwrap();
+        assert!(part.contains("<note uid=\"1\""), "{part}");
+        let map = String::from_utf8(zip.read(CONTENT_TYPES_PART).unwrap()).unwrap();
+        assert!(map.contains("/formatting.xml"), "{map}");
+        let main = String::from_utf8(zip.read(MAIN_PART).unwrap()).unwrap();
+        assert!(main.contains("<Notes>Bold &amp; more\nitem</Notes>"));
+        assert!(!main.contains("<b>") && !main.contains("&lt;b&gt;"));
+        let back = read_yppx(&bytes).unwrap();
+        assert_eq!(back.tasks[0].rich_notes.as_deref(), Some(markup));
+        assert_eq!(back.tasks[1].rich_notes, None);
+        assert!(back.formatting.is_empty());
+        assert!(back.package.parts.is_empty(), "the part is the model's");
+        // Saved again, byte for byte.
+        assert_eq!(write_yppx(&back).unwrap(), bytes);
+    }
+
+    #[test]
+    fn plan_without_rich_notes_writes_no_formatting_part() {
+        let mut proj = sample();
+        proj.tasks[0].notes = Some("plain".into());
+        let bytes = write_yppx(&proj).unwrap();
+        let zip = ZipArchive::open(&bytes).unwrap();
+        assert!(zip.read(crate::formatting::PART).is_none());
+        assert_eq!(zip.entries().len(), 2);
     }
 
     #[test]
