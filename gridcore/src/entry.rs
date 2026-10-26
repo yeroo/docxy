@@ -187,7 +187,7 @@ pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryEr
         return Ok(entry(Cell::number(n), Some(format)));
     }
     if let Some(src) = formula_prefix(t) {
-        return Ok(entry(Cell::formula(&src), None));
+        return Ok(entry(Cell::formula(src), None));
     }
     Ok(entry(Cell::text(text), None))
 }
@@ -401,8 +401,10 @@ pub fn reenter_cell(
 
 /// The formula body `text` would commit into (sheet, row, col) — for hosts
 /// that validate a formula before committing. `None` when it is not a
-/// `=` formula there: a Text-formatted cell stores `=…` as text, so there is
-/// nothing to refuse.
+/// formula there: a Text-formatted cell stores `=…` as text, so there is
+/// nothing to refuse. A `+ - @` prefix makes a formula only where
+/// [`parse_entry`] does (`+A1`, `@SUM(1,2)`, not `-5` or `+1+`), and the body
+/// is the source it stores (#1750).
 pub fn typed_formula<'a>(
     wb: &Workbook,
     sheet: usize,
@@ -420,8 +422,22 @@ pub fn typed_formula<'a>(
 
 /// [`typed_formula`] for a cell of style `style` ([`entry_cell_styled`]).
 pub fn typed_formula_styled<'a>(wb: &Workbook, style: u32, text: &'a str) -> Option<&'a str> {
-    let body = text.strip_prefix('=').filter(|b| !b.is_empty())?;
-    (!is_text(&wb.styles.xf(style))).then_some(body)
+    let xf = wb.styles.xf(style);
+    if is_text(&xf) {
+        return None;
+    }
+    if let Some(body) = text.strip_prefix('=') {
+        return (!body.is_empty()).then_some(body);
+    }
+    let t = text.trim();
+    if !t.starts_with(['+', '-', '@']) {
+        return None;
+    }
+    // Numbers, fractions and error codes win over a prefix, as at commit;
+    // no `+ - @` text is a date, so the clock does not matter.
+    let e = parse_entry(text, &xf, &entry_ctx(wb, None)).ok()?;
+    e.cell.formula.as_ref()?;
+    formula_prefix(t)
 }
 
 /// A pasted field as a cell of style `style`, read as Excel re-reads pasted
@@ -1058,7 +1074,7 @@ fn parse_date(t: &str, ctx: &EntryCtx) -> Option<(f64, &'static str)> {
 
 /// `+2+3` → `2+3`, `+A99` → `+A99`, `-L1` → `-L1`, `@SUM(1,2)` → `SUM(1,2)`:
 /// the formula source a `+ - @` prefix makes, when it parses.
-fn formula_prefix(t: &str) -> Option<String> {
+fn formula_prefix(t: &str) -> Option<&str> {
     let mut chars = t.chars();
     let first = chars.next()?;
     let rest = chars.as_str();
@@ -1072,7 +1088,7 @@ fn formula_prefix(t: &str) -> Option<String> {
         _ => return None,
     };
     crate::engine::Engine::validate(src).ok()?;
-    Some(src.to_string())
+    Some(src)
 }
 
 #[cfg(test)]
@@ -1885,6 +1901,49 @@ mod tests {
         assert_eq!(typed_formula(wb, 0, 0, 0, "=SUM("), None);
         let cell = entry_cell(wb, 0, 0, 0, "=SUM(", None).unwrap();
         assert_eq!(cell.value, CellValue::Text("=SUM(".into()));
+    }
+
+    #[test]
+    fn typed_formula_takes_prefixed_formulas() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        for (text, body) in [
+            ("+2+3", "2+3"),
+            ("+A1", "+A1"),
+            ("-A1", "-A1"),
+            ("@SUM(1,2)", "SUM(1,2)"),
+            ("+Sales[Qty]", "+Sales[Qty]"),
+            (" -A1 ", "-A1"),
+        ] {
+            assert_eq!(typed_formula(wb, 0, 0, 0, text), Some(body), "{text}");
+            // The body is exactly what a commit stores.
+            let cell = entry_cell(wb, 0, 1, 1, text, None).unwrap();
+            assert_eq!(cell.formula.as_deref(), Some(body), "{text}");
+        }
+        for text in [
+            "-5", "+5", "+.5", "-", "+", "@", "+1+", "-1 1/2", "TRUE", "abc", "#N/A",
+        ] {
+            assert_eq!(typed_formula(wb, 0, 0, 0, text), None, "{text}");
+            let cell = entry_cell(wb, 0, 1, 1, text, None).unwrap();
+            assert_eq!(cell.formula, None, "{text}");
+        }
+        assert_eq!(typed_formula(wb, 0, 0, 0, "=+A1"), Some("+A1"));
+        let text = wb.styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        wb.sheets[0].set_cell(
+            0,
+            0,
+            Cell {
+                style: text,
+                ..Cell::default()
+            },
+        );
+        assert_eq!(typed_formula(wb, 0, 0, 0, "+A1"), None);
+        assert_eq!(typed_formula(wb, 0, 0, 0, "@SUM(1,2)"), None);
+        assert_eq!(range_formula(wb, 0, (0, 0, 0, 1), "+A9"), Some("+A9"));
     }
 
     #[test]

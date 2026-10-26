@@ -7842,6 +7842,46 @@ mod table_verb_tests {
     }
 
     #[test]
+    fn cell_set_refuses_a_prefixed_unknown_column_1750() {
+        let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
+        for bad in ["+SUM(Sales[Nope])", "-Sales[Nope]", "@SUM(Sales[Nope])"] {
+            let e = call(&mut a, "cell.set", vec![("ref", "H1"), ("text", bad)]).unwrap_err();
+            assert_eq!(
+                e, "formula error: unknown column 'Nope' in table 'Sales'",
+                "{bad}"
+            );
+            let g = call(&mut a, "cell.get", vec![("ref", "H1")]).unwrap();
+            assert_eq!(g.get_str("formula"), None, "{bad}");
+            assert_eq!(g.get_str("text").unwrap_or(""), "", "{bad}");
+            let args = Json::obj(vec![
+                ("start", Json::Str("H1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(vec![
+                        Json::Str("1".into()),
+                        Json::Str(bad.into()),
+                    ])]),
+                ),
+            ]);
+            let e = dispatch(&mut a, "range.set", &args).unwrap_err();
+            assert!(e.contains("formula error at I1"), "{bad}: {e}");
+            let g = call(&mut a, "cell.get", vec![("ref", "H1")]).unwrap();
+            assert_eq!(g.get_str("text").unwrap_or(""), "", "{bad}");
+        }
+        for (ok, stored) in [
+            ("+SUM(Sales[Qty])", "=+SUM(Sales[Qty])"),
+            ("@SUM(Sales[Qty])", "=SUM(Sales[Qty])"),
+        ] {
+            put(&mut a, "H2", ok);
+            assert_eq!(
+                formula_value(&mut a, "H2").0.as_deref(),
+                Some(stored),
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
     fn range_set_writing_a_header_and_a_formula_using_it_684() {
         let mut a = app_683("Sales", &["Item", "Qty", "Price", "Region"], 4);
         let row = |start: &str, cells: &[&str]| {
