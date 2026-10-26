@@ -218,6 +218,32 @@ struct RemovedSheetStash {
     serial: usize,
 }
 
+impl RemovedSheetStash {
+    /// The names of the other sheets whose records this removal made: every
+    /// sheet a restore would put a rewrite back on (cells, rules,
+    /// Consolidate, charts, and the scope of a rewritten defined name).
+    /// Tables are found by table name, not sheet, so they are not listed.
+    fn sheets_read(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self
+            .cell_guards
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(self.rewritten_cells.iter().map(|r| r.sheet.as_str()))
+            .chain(self.rewritten_consolidate.iter().map(|r| r.sheet.as_str()))
+            .chain(self.rewritten_rules.iter().map(|r| r.sheet.as_str()))
+            .chain(self.rewritten_charts.iter().map(|r| r.sheet.as_str()))
+            .chain(
+                self.rewritten_names
+                    .iter()
+                    .filter_map(|r| r.scope_sheet.as_deref()),
+            )
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
 /// One Consolidate reference, or CF/DV formula, `remove_sheet` rewrote (see
 /// [`RemovedSheetStash::rewritten_consolidate`] and
 /// [`RemovedSheetStash::rewritten_rules`]).
@@ -3205,14 +3231,14 @@ impl Session {
     /// it: see below) or shares one with another above it, rather than minting a
     /// duplicate name. A stash above it that has its name is taken to have been
     /// stashed while its sheet was gone (an import over the removed name, then
-    /// its undo), provided every sheet its rewritten cells are guarded on is
-    /// still live under its name: when every stash above is such, none is unwound, they stay stashed in place
+    /// its undo), provided every sheet its rewrites name (`RemovedSheetStash::sheets_read`)
+    /// is still live under its name: when every stash above is such, none is unwound, they stay stashed in place
     /// with their frames, and a restore of one is refused by name while the
     /// restored sheet is live. Known limit: with another stash below, e.g.
     /// [B, A, A_imp], A restores but B is then refused (B's restore would unwind
     /// A_imp, whose name A now holds); and if the
     /// restored sheet is renamed, the ghost can later come back with a frame
-    /// that did not have it (its index only; names and formulas are guarded).
+    /// that did not have it (its index only; every sheet k's rewrites name is checked live).
     /// These checks run BEFORE any stash is
     /// consumed, so a rejected restore leaves the stack intact for a correct
     /// later attempt. **INTERNAL-ONLY**: this
@@ -3309,9 +3335,10 @@ impl Session {
         // above `k`, nothing is unwound: they stay stashed as they are (their
         // frame is untouched) and `k` restores as the top. The name alone
         // cannot tell (a rename or a `sheet.add` can give two live sheets one
-        // name), so every sheet `k`'s rewritten cells are guarded on must
-        // still be live under its name: a renamed or removed neighbour takes
-        // the unwinding path below, which refuses. The rest of this block is
+        // name), so every sheet `k`'s rewrites name (`sheets_read`) must still
+        // be live under its name: a renamed or removed neighbour takes the
+        // unwinding path below, which refuses while the later stash has `k`'s
+        // name. The rest of this block is
         // that non-ghost path:
         // every entry from `k` up comes back for a moment, so each must be
         // free to: a sheet with its name may have been re-created after
@@ -3325,9 +3352,9 @@ impl Session {
                     .eq_ignore_ascii_case(&self.removed_sheet_stashes[k].name)
             })
             && self.removed_sheet_stashes[k]
-                .cell_guards
+                .sheets_read()
                 .iter()
-                .all(|(name, _)| self.pkg.workbook.sheet_index(name).is_some());
+                .all(|name| self.pkg.workbook.sheet_index(name).is_some());
         let names: Vec<&str> = self.removed_sheet_stashes[k..]
             .iter()
             .take(if ghosts_only { 1 } else { usize::MAX })
@@ -7095,6 +7122,53 @@ mod tests {
         assert!(out.contains("\"ok\":false"), "{out}");
         assert_eq!(stash_order(&s), ["A", "a"]);
         assert_eq!(sheet_order(&s), ["B", "C"]);
+    }
+
+    /// Remove C (k) with the neighbour's records set by `prep`, rename B to
+    /// C, remove that C: the stack is [C, C]. B is no longer live under its
+    /// name, so the later C is no ghost and restoring k is refused, nothing
+    /// changed.
+    fn renamed_neighbour_refuses(prep: impl FnOnce(&mut Session)) {
+        let mut s = abc_session();
+        prep(&mut s);
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"B","name":"C"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(stash_order(&s), ["C", "C"]);
+        let before = sheet_order(&s);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(
+            out.contains(r#"cannot restore \"C\": a sheet named \"C\" was removed after it"#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), before);
+        assert_eq!(stash_order(&s), ["C", "C"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_a_neighbour_tied_by_rules_only_is_not_a_ghost_guard() {
+        renamed_neighbour_refuses(|s| add_rules_reading_c(s, "B"));
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_a_neighbour_tied_by_a_scoped_name_only_is_not_a_ghost_guard() {
+        renamed_neighbour_refuses(|s| {
+            s.pkg.workbook.defined_names.push(DefinedName {
+                name: "n".into(),
+                scope: Some(2),
+                formula: "C!$A$1".into(),
+            });
+        });
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_a_neighbour_tied_by_consolidate_only_is_not_a_ghost_guard() {
+        renamed_neighbour_refuses(|s| {
+            s.pkg.workbook.sheets[2].consolidate = Some(gridcore::edit::ConsolidateSettings {
+                refs: vec!["C!$A$1:$B$2".into(), "Sheet1!$A$1".into()],
+                ..Default::default()
+            });
+        });
     }
 
     #[test]
