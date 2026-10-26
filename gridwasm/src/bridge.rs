@@ -3479,9 +3479,9 @@ impl Session {
     /// The sheet comes back at its original index (`RemovedSheetStash::index`,
     /// clamped to the end): added at the end, then moved there with
     /// `SheetPackage::move_sheet`, which keeps the part list, the `<sheet>`
-    /// elements and every stored sheet index in step. When that shifts other
-    /// sheets the undo and redo history, which names sheets by index, is
-    /// cleared (as `sheet.remove` does). The global names, Consolidate
+    /// elements and every stored sheet index in step. Every restore clears the
+    /// undo and redo history, which names sheets by index (as `sheet.remove`
+    /// does). The global names, Consolidate
     /// references, other sheets' CF and DV formulas, tables' calculated
     /// formulas and charts the removal rewrote get their text back, each
     /// unless it changed since. A sheet's cell formulas come back only while
@@ -3605,13 +3605,12 @@ impl Session {
         // retries the table or names it.
         let mut carried: Vec<StashedTables> = Vec::new();
         for _ in &later {
-            carried.push(self.restore_top().2);
+            carried.push(self.restore_top(false).2);
         }
         carried.reverse();
         let name = self.removed_sheet_stashes[k].name.clone();
         let removed_active = self.removed_sheet_stashes[k].removed_active;
-        let (had_pivots, cells_kept, refused) = self.restore_top();
-        let tables_kept: Vec<String> = refused.iter().map(|(t, _)| t.name.clone()).collect();
+        let (had_pivots, cells_kept, pending) = self.restore_top(true);
         self.removed_sheet_stashes.extend(ghosts);
         for ((later_name, was_active, serial), refused) in later.iter().zip(carried) {
             let si = self
@@ -3632,6 +3631,10 @@ impl Session {
             .workbook
             .sheet_index(&name)
             .expect("the restored sheet is live");
+        // Its tables last: the sheets removed after it are gone again, so
+        // only what is live now can hold a name, an id or a part name.
+        let refused = self.put_back_tables(new_idx, pending);
+        let tables_kept: Vec<String> = refused.iter().map(|(t, _)| t.name.clone()).collect();
         if !later.is_empty() {
             // The unwinding moved the active sheet and cursor about: put them
             // back as they were, or on the restored sheet when it was the
@@ -3690,21 +3693,41 @@ impl Session {
         Ok(out)
     }
 
+    /// Put `tables` back on sheet `idx` (`SheetPackage::restore_table`);
+    /// those that cannot come back are returned.
+    fn put_back_tables(&mut self, idx: usize, tables: StashedTables) -> StashedTables {
+        let mut kept = Vec::new();
+        for (table, xml) in tables {
+            let restored = match &xml {
+                Some(xml) => self.pkg.restore_table(idx, table.clone(), xml).is_ok(),
+                None => false,
+            };
+            if !restored {
+                kept.push((table, xml));
+            }
+        }
+        kept
+    }
+
     /// Pop the top of `Session::removed_sheet_stashes` and put its sheet
     /// back (see [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed)),
     /// leaving the pivot refresh and the engine rebuild to the caller.
     /// Whether the sheet had pivots, the sheets whose cell formulas were
-    /// left as they are (`RemovedSheetStash::cell_guards`) and the tables
-    /// that could not come back (a name taken since, or no part kept). The
-    /// caller has checked that no live sheet has the stashed name.
-    fn restore_top(&mut self) -> (bool, Vec<String>, StashedTables) {
+    /// left as they are (`RemovedSheetStash::cell_guards`) and its tables:
+    /// the ones that could not come back (a name taken since, or no part
+    /// kept), or with `defer_tables` all of them, not yet put back (see
+    /// [`Self::put_back_tables`]; the unwinding of a non-top restore asks, so
+    /// a name or id only a sheet that is back for a moment holds is not
+    /// held against them). The caller has checked that no live sheet has the
+    /// stashed name.
+    fn restore_top(&mut self, defer_tables: bool) -> (bool, Vec<String>, StashedTables) {
         let stash = self
             .removed_sheet_stashes
             .pop()
             .expect("stash presence verified by the caller");
         let appended = self.pkg.add_sheet(&stash.name);
-        // The sheet and its tables change the package behind the history's
-        // back, as the removal did.
+        // The sheet's index, and with it every index the history names,
+        // changes behind its back, as it does in the removal.
         self.undo.clear();
         self.redo.clear();
         // Back to its old place in the tab order. `move_sheet` carries the
@@ -3714,13 +3737,10 @@ impl Session {
         let target = stash.index.min(appended);
         if target != appended && self.pkg.move_sheet(appended, target) {
             new_idx = target;
-            // The sheets from there on moved up a place, and the history
-            // names sheets by index.
+            // The sheets from there on moved up a place.
             if self.active >= new_idx {
                 self.active += 1;
             }
-            self.undo.clear();
-            self.redo.clear();
         }
         self.pkg.workbook.sheets[new_idx] = stash.sheet;
         for cm in &stash.comments {
@@ -3734,16 +3754,11 @@ impl Session {
             }
         }
         // Its tables, before the rewrites below: they may name one.
-        let mut tables_kept: StashedTables = Vec::new();
-        for (table, xml) in stash.tables {
-            let restored = match &xml {
-                Some(xml) => self.pkg.restore_table(new_idx, table.clone(), xml).is_ok(),
-                None => false,
-            };
-            if !restored {
-                tables_kept.push((table, xml));
-            }
-        }
+        let tables_kept = if defer_tables {
+            stash.tables
+        } else {
+            self.put_back_tables(new_idx, stash.tables)
+        };
         // The names the removal rewrote read as they did, unless they
         // changed since; each guard is `restore_is_lossless`'s too.
         for r in &stash.rewritten_names {
@@ -7825,6 +7840,53 @@ mod tests {
                 assert!(out.contains(r#""tablesKept":["Table1"]"#), "{out}");
             }
         }
+    }
+
+    /// #1795 r2: a non-top restore checks its tables once the sheets removed
+    /// after it are gone again: a table name only such a sheet holds (it is
+    /// back for a moment) does not refuse the table for good.
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_takes_its_tables_after_the_unwinding_1795() {
+        let mut s = table_on_c();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        // Another sheet makes a table of that name, and is removed too.
+        s.pkg
+            .add_table(1, (0, 0, 1, 1), true, "TableStyleLight1")
+            .expect("table");
+        assert_eq!(s.pkg.workbook.tables[0].name, "Table1");
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        let out = restore(&mut s, "C");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(!out.contains("tablesKept"), "{out}");
+        let t = &s.pkg.workbook.tables;
+        assert_eq!(t.len(), 1, "A's table is stashed again, C's is live");
+        assert_eq!(s.pkg.workbook.sheets[t[0].sheet].name, "C");
+        // And A's own table is back with A, which has no clash then.
+        s.pkg.workbook.tables.clear();
+        let out = restore(&mut s, "A");
+        assert!(!out.contains("tablesKept"), "{out}");
+        assert_eq!(s.pkg.workbook.tables.len(), 1);
+    }
+
+    /// #1795 r2: the same for an id and a part name: the table keeps what it
+    /// had when only a briefly restored sheet's table held it.
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_keeps_a_table_its_id_and_part_1795() {
+        let mut s = table_on_c();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.pkg
+            .add_table(1, (0, 0, 1, 1), true, "TableStyleLight1")
+            .expect("table");
+        s.pkg.workbook.tables[0].name = "Other".into();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        let out = restore(&mut s, "C");
+        assert!(!out.contains("tablesKept"), "{out}");
+        let t = &s.pkg.workbook.tables;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].name, "Table1");
+        assert_eq!(t[0].part, "xl/tables/table1.xml");
+        let xml = String::from_utf8_lossy(s.pkg.part(&t[0].part).expect("part")).into_owned();
+        assert!(xml.contains(" id=\"1\""), "{xml}");
     }
 
     /// #1795 r1: a restore clears the history, as a removal does: a step

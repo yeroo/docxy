@@ -10324,12 +10324,15 @@ impl SheetPackage {
     /// sheet: the model `table` (its `sheet` and `part` set here) and its
     /// `xml` part as it was, wired as [`add_table`](Self::add_table) wires a
     /// new one, so its style, totals row and filter survive a save. The part
-    /// keeps its name when that is free, else takes the first free
-    /// `xl/tables/tableN.xml`. Returns the table's index, or why it can't be
-    /// put back, with the package as it was: a name another table or a
-    /// defined name has taken (they compare case-insensitively), or a range
-    /// another table, a PivotTable or an array formula holds
-    /// ([`crate::edit::table_range_conflict`]).
+    /// keeps its name only when that is free and a direct child of
+    /// `xl/tables/`, else it takes the first free `xl/tables/tableN.xml`.
+    /// Returns the table's index, or why it can't be put back, with the
+    /// package as it was: a name another table or a defined name has taken
+    /// (they compare case-insensitively), a range another table, a PivotTable
+    /// or an array formula holds ([`crate::edit::table_range_conflict`]), a
+    /// worksheet that can't take a `<tableParts>` entry
+    /// ([`Self::sheet_takes`]), or an id that is taken and that the part has
+    /// no `id` attribute to replace.
     ///
     /// The part's `id` is kept when no other table part has it, and then the
     /// removal's note of it (`removed_table_ids`, which makes a save drop the
@@ -10387,7 +10390,7 @@ impl SheetPackage {
                 // Two tables with one id corrupt the file: refuse rather
                 // than keep it.
                 let patched = set_table_id(&text, fresh)
-                    .ok_or_else(|| format!("the id of \"{}\" is taken", table.name))?;
+                    .ok_or_else(|| format!("\"{}\" has no id that can be replaced", table.name))?;
                 bytes = patched.into_bytes();
             }
         }

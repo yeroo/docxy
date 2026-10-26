@@ -956,9 +956,8 @@ worth knowing:
   refers to, count as edits. The sheet's Excel tables come back with it, with
   their parts (style, totals row, filter); one whose name was taken since is
   left out and named in the reply's `tablesKept` (absent when every table came
-  back). The cells then recalculate. When the restore shifts
-  other sheets, the undo/redo history is cleared, as `sheet.remove` itself
-  clears it.
+  back). The cells then recalculate. Every restore clears the undo/redo
+  history, as `sheet.remove` itself does.
 - **Agent sheet-removals are undoable in any order.** The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
@@ -971,7 +970,8 @@ worth knowing:
   older than the 16th is forgotten, and its undo shows a warning (`"Offxy:
   couldn't undo … — nothing left to reverse"` or `restore mismatch: …`),
   instead of silently failing or reviving the wrong sheet.
-- **An agent `sheet.remove`/`sheet.import-csv` invalidates earlier grid
+- **An agent `sheet.remove`/`sheet.import-csv`/`sheet.restore-removed`
+  invalidates earlier grid
   edits' undo entries.** These verbs clear the workbook's own undo history
   (mirroring the terminal apps, whose package-parts churn can't be represented
   as a stack entry), so any grid edits made *before* one of them can no longer
