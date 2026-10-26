@@ -2997,10 +2997,10 @@ impl Editor {
     /// paragraphs. `first_line` > 0 is a first-line indent, < 0 a hanging indent,
     /// 0 none. Used by the Paragraph dialog.
     ///
-    /// A list item that had a direct left indent and is set to 0 keeps the
-    /// margin as `w:left="0"`, as Decrease Indent does (#1792); one with
-    /// none is left to its level's indent, as the dialog passes 0 back for
-    /// every item it did not change.
+    /// A list item that had a direct left indent when called and is set to 0
+    /// keeps the margin as `w:left="0"`, as Decrease Indent does (#1792); one
+    /// with none is left to its level's indent, as the dialog passes 0 back
+    /// for every item it did not change.
     pub fn set_indent(&mut self, left: i32, first_line: i32) {
         let styles = self.styles.clone();
         self.for_each_para(move |pr| {
@@ -4121,7 +4121,13 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, listed: bool) {
         pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
         return;
     }
-    let direct = had_direct_left(pr);
+    // A style-numbered item's in-session indent cannot be told from nothing
+    // once Increase wrote it, so only a loaded (or pinned) left counts there.
+    let direct = if pr.in_list() {
+        had_direct_left(pr)
+    } else {
+        pr.has_loaded_left_indent()
+    };
     pr.indent = (pr.indent + delta).max(0);
     if delta == 0 {
         return;
@@ -7295,6 +7301,21 @@ mod tests {
     }
 
     const BULLET: &str = "<w:pStyle w:val=\"ListBullet\"/>";
+
+    /// #1792: an Increase on a style-numbered item with no `w:ind` writes an
+    /// indent that is not loaded, so the Decrease after it saves none, as
+    /// before; a loaded one still pins.
+    #[test]
+    fn increase_then_decrease_on_a_style_numbered_item_leaves_no_indent() {
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "");
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"720\"/>"), true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
 
     /// #1792: a style-numbered item (the numbering comes from its paragraph
     /// style) with a direct left indent keeps the margin at 0 too.
