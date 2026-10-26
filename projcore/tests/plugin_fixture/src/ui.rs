@@ -95,8 +95,8 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.bold","kind":"toggle","label":"Bold","tip":"Bold on the selected cells (the view's cells)","keytip":"XB","icon":"bold"},
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"},
     {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"},
-    {"id":"fixture.layout","kind":"button","label":"Layout (fixture)","tip":"Sets or clears the Layout dialog's chart settings (#1695)","keytip":"XL","icon":"table"}]},
-    {"title":"Fixture Styles","before":"Schedule","controls":[
+    {"id":"fixture.layout","kind":"button","label":"Layout (fixture)","tip":"Sets or clears the Layout dialog's chart settings (#1695)","keytip":"XL","icon":"table"}]}]},
+    {"tab":"View","groups":[{"title":"Fixture Styles","controls":[
     {"id":"fixture.styles","kind":"gallery","label":"Styles","tip":"Two sections of palette tiles (#1761)","swatches":[
       {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
       {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},

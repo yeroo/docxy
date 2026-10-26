@@ -1673,8 +1673,8 @@
   `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
   A palette tile shows no label, its label is the tooltip.
 - `ribbon-read` adds `section` and, on a palette tile, `palette` and `marks`.
-  The fixture's `fixture.styles` gallery (group "Fixture Styles", before
-  Schedule) has two sections; `project-plugin-ui.uit` reads it and shoots it
+  The fixture's `fixture.styles` gallery (group "Fixture Styles", last on the
+  View tab) has two sections; `project-plugin-ui.uit` reads it and shoots it
   (a `shot` is evidence, not a comparison with the plugin repo's capture).
 
 ## Project timescale and Timeline pane (#1535)
