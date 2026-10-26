@@ -198,8 +198,9 @@ impl Settings {
     }
 
     /// `text` with record 10's thousands separator dropped and its decimal
-    /// separator a point, as the cell grammar reads numbers: a lag of
-    /// `1FS+0,5d` in a decimal-comma file is `1FS+0.5d`.
+    /// separator a point, as [`Settings::number`] and the cell grammar read
+    /// numbers: `1.234,5` in a decimal-comma file is `1234.5`. Of the
+    /// links, only a `%` lag entry goes through it ([`Reader::link_entry`]).
     fn point_decimals(&self, text: &str) -> String {
         text.chars()
             .filter(|&c| c != self.thousands || c == self.decimal)
@@ -984,11 +985,26 @@ impl Reader {
             })
             .collect();
         order.sort_by_key(|&i| keys[i]);
+        // The umbrella row (the first in ID order, stating outline level 0)
+        // without a UID of its own is UID 0, the project summary, unless a
+        // row claims UID 0.
+        let umbrella = order.first().copied().filter(|&i| {
+            let raw = &tasks[i];
+            raw.has_outline_level
+                && raw.task.outline_level == 0
+                && raw.uid.is_none()
+                && !tasks.iter().any(|t| t.uid == Some(0))
+        });
         let mut used: std::collections::HashSet<i32> = std::collections::HashSet::new();
         let mut next = tasks.iter().filter_map(|t| t.uid).max().unwrap_or(0);
         let mut uids = vec![0; tasks.len()];
         for (i, raw) in tasks.iter().enumerate() {
-            uids[i] = match raw.uid {
+            let uid = if umbrella == Some(i) {
+                Some(0)
+            } else {
+                raw.uid
+            };
+            uids[i] = match uid {
                 Some(uid) if used.insert(uid) => uid,
                 _ => {
                     next = next.saturating_add(1);

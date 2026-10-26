@@ -378,6 +378,25 @@ fn a_stated_outline_level_0_row_is_the_project_summary() {
             .collect::<Vec<_>>(),
         [(1, 1), (2, 1)]
     );
+    // Without a Unique ID of its own (no column, or the field empty) the
+    // umbrella row is UID 0 all the same.
+    for head in [
+        "60,Name,Outline Level,Duration,ID\r\n61,1,3,40,90\r\n\
+         70,Plan,0,3d,0\r\n70,A,1,2d,1\r\n",
+        "60,Name,Outline Level,Duration,ID,Unique ID\r\n61,1,3,40,90,98\r\n\
+         70,Plan,0,3d,0,\r\n70,A,1,2d,1,5\r\n",
+    ] {
+        let project = read_mpx(&mpx(head)).unwrap();
+        assert!(project.tasks[0].is_project_summary(), "{head}");
+        assert_ne!(project.tasks[1].uid, 0);
+    }
+    // A row that claims UID 0 keeps it; the umbrella then takes a fresh one.
+    let project = read_mpx(&mpx(
+        "60,Name,Outline Level,ID,Unique ID\r\n61,1,3,90,98\r\n\
+         70,Plan,0,0,\r\n70,A,1,1,0\r\n",
+    ))
+    .unwrap();
+    assert_eq!((project.tasks[0].uid, project.tasks[1].uid), (1, 0));
     // Hosts hide it as they hide an MSPDI UID 0 summary (#1511).
     assert_eq!(
         crate::editor::Editor::new(with.clone()).visible_rows(),

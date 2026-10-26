@@ -38,7 +38,7 @@ Built bottom-up, each a pure module:
 | `datetime` | a civil wall-clock instant (minutes since 1970), proleptic-Gregorian conversion, MSPDI ISO parse/format |
 | `model` | the pure domain: `Task`, `Predecessor`, `Resource`, `Assignment`, `Calendar`, `Project`; `LinkType`/`ConstraintType` with MSPDI's integer codes pinned once |
 | `mspdi` | read **and** write MS Project's MSPDI XML — the interop bridge |
-| `mpx` | read MPX, Project's older comma-separated interchange text (`.mpx`, or any unclaimed file starting `MPX,`); never written (#309) |
+| `mpx` | read MPX, Project's older comma-separated interchange text (`.mpx`, or any unclaimed file starting `MPX,` or `MPX;`); never written (#309) |
 | `schedule` | the CPM engine + resource leveling |
 | `assign` | assignment dates and costs from the schedule and rate tables, and the refresh of stored totals an edit made stale |
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
@@ -409,7 +409,8 @@ refusal is what it was before plugins existed.
 - **`projcore::formats`** holds the `ProjectFormat` trait (extensions, label,
   reads/writes, `read(bytes)`, `write(project, source)`, `is_default`) and the
   `Registry` hosts consult for Open's file list, Save As's types, reads and
-  writes, and the save-path check. The built-in `.yppx` and `.xml` (MSPDI) come first,
+  writes, and the save-path check. The built-in `.yppx`, `.xml` (MSPDI) and the
+  read-only `.mpx` (MPX, #309) come first,
   then what the host registers: `mppread::project::MppImport`, the read-only
   `.mpp` import, then the plugins. A later registration for an extension
   replaces, in place, its reader (when it reads) and its writer (when it
