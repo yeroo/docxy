@@ -3004,12 +3004,18 @@ impl Editor {
     pub fn set_indent(&mut self, left: i32, first_line: i32) {
         let styles = self.styles.clone();
         self.for_each_para(move |pr| {
-            let pin = left <= 0 && had_direct_left(pr) && list_item(styles.as_deref(), pr);
+            let listed = list_item(styles.as_deref(), pr);
+            let pin = if left <= 0 {
+                (listed && had_direct_left(pr)).then_some(0)
+            } else {
+                // A style-numbered item that had a loaded left keeps it.
+                (listed && !pr.in_list() && pr.has_loaded_left_indent()).then_some(left)
+            };
             pr.indent = left.max(0);
             pr.first_line = first_line;
             pr.forget_loaded_indent(&[IndentSide::Left, IndentSide::FirstLine]);
-            if pin {
-                pr.pin_left_indent_zero();
+            if let Some(twips) = pin {
+                pr.pin_left_indent(twips);
             }
         });
     }
@@ -4135,6 +4141,10 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, listed: bool) {
     if listed && direct && pr.indent == 0 {
         // No `w:left` would hand the item back to its level's (or style's) indent.
         pr.pin_left_indent_zero();
+    } else if listed && direct && !pr.in_list() {
+        // A style-numbered item keeps a loaded left while it moves, so a
+        // later Decrease to the margin still pins (as after a reload).
+        pr.pin_left_indent(pr.indent);
     } else {
         // The loaded left indent goes, character units included: a
         // decrease clamped to zero twips must still clear `w:leftChars`.
@@ -7301,6 +7311,28 @@ mod tests {
     }
 
     const BULLET: &str = "<w:pStyle w:val=\"ListBullet\"/>";
+
+    /// #1792: a style-numbered item loaded with a left indent keeps it "loaded"
+    /// as it moves, so the Decrease that reaches 0 pins, as after a reload.
+    #[test]
+    fn decrease_in_steps_on_a_style_numbered_item_pins_at_the_margin() {
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"1440\"/>"), true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        // Pinned at 0, Increase then Decrease pins again.
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        // The dialog's nonzero set keeps it too.
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"1440\"/>"), true);
+        ed.set_indent(720, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
 
     /// #1792: an Increase on a style-numbered item with no `w:ind` writes an
     /// indent that is not loaded, so the Decrease after it saves none, as
