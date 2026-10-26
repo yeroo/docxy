@@ -31708,11 +31708,10 @@ fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
                 .is_some_and(|k| k.eq_ignore_ascii_case(typed))
     };
     commands
-        || tab
-            .groups
-            .iter()
-            .flat_map(|g| g.items.iter())
-            .any(|c| matches!(c, Control::Gallery(gal) if gallery(gal.key_tip)))
+        || tab.groups.iter().flat_map(|g| g.items.iter()).any(|c| {
+            // As `tab_keytip_gallery`: a gallery with no tiles opens nothing.
+            matches!(c, Control::Gallery(gal) if !gal.items.is_empty() && gallery(gal.key_tip))
+        })
         || tab.groups.iter().any(|g| {
             let key = g.launcher_key;
             g.launcher.is_some()
@@ -31933,8 +31932,9 @@ fn keytip_badge(text: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// What a ribbon flyout shows (#1020): one collapsed group, whole, or the
-/// overflow chevron's list of the groups it holds.
+/// What a ribbon flyout shows (#1020): one collapsed group, whole, the
+/// overflow chevron's list of the groups it holds, or one contributed gallery
+/// a KeyTip opened (#1762), whether or not its group is collapsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlyoutTarget {
     Group(&'static str),
@@ -31945,7 +31945,8 @@ pub(crate) enum FlyoutTarget {
 
 /// An open ribbon flyout, and the ribbon it belongs to: it closes when the
 /// window shows another document, another ribbon tab, or the group is no
-/// longer collapsed (`Docxy::flyout_still_fits`).
+/// longer collapsed (`Docxy::flyout_still_fits`); a KeyTip-opened gallery
+/// stays as long as the tab does.
 #[derive(Clone, Copy)]
 pub(crate) struct RibbonFlyout {
     pub doc: usize,
@@ -35739,9 +35740,14 @@ impl Docxy {
                     self.dispatch(a, window, cx);
                 } else if let Some(id) = gallery {
                     // A contributed gallery's letter opens it as a flyout,
-                    // drawn or not (#1762).
+                    // drawn or not (#1762). A minimised or hidden ribbon body
+                    // would close it at once (`flyout_still_fits`): say so.
                     self.font_box = None;
-                    self.open_ribbon_flyout(FlyoutTarget::Gallery(id));
+                    if self.ribbon_min || self.ribbon_body_hidden() {
+                        self.set_status("Show the ribbon to open that gallery");
+                    } else {
+                        self.open_ribbon_flyout(FlyoutTarget::Gallery(id));
+                    }
                     cx.notify();
                 } else {
                     cx.notify();
@@ -36073,8 +36079,9 @@ impl Docxy {
             })
     }
 
-    /// Open the flyout of a collapsed group or of the overflow chevron. It
-    /// replaces any menu or other flyout, as a press outside them would.
+    /// Open the flyout of a collapsed group, of the overflow chevron or of a
+    /// contributed gallery (#1762). It replaces any menu or other flyout, as a
+    /// press outside them would.
     pub(crate) fn open_ribbon_flyout(&mut self, target: FlyoutTarget) {
         self.close_menu();
         self.ribbon_flyout = Some(RibbonFlyout {
@@ -36088,7 +36095,7 @@ impl Docxy {
     /// Whether the open flyout still belongs to what the window shows: the
     /// same document and ribbon tab, and its group still collapsed (a wider
     /// window draws the group in place again) or, for the chevron, groups
-    /// still in it.
+    /// still in it; a gallery's stays with the tab, drawn in place or not.
     fn flyout_still_fits(&self, f: RibbonFlyout, window: &Window) -> bool {
         if f.doc != self.active
             || f.docs != self.tabs.len()
@@ -36259,7 +36266,9 @@ impl Docxy {
     /// The open ribbon flyout, under its collapsed button (or the chevron),
     /// slid to stay inside the window: the whole group at full size, drawn by
     /// the same renderer as in place, so every control works as it does
-    /// there; or the chevron's list of groups. A press outside closes it.
+    /// there; or the chevron's list of groups; or one contributed gallery,
+    /// wrapped to the window under its own probe, else its group's collapsed
+    /// button (#1762). A press outside closes it.
     fn ribbon_flyout_el(
         &self,
         window: &Window,

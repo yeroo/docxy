@@ -1687,9 +1687,11 @@
   copy) and a `gallery-<id>` probe. `tab_keytip_gallery` (after the command,
   split and launcher lookups; a two-letter key waits through `tab_keytip_starts`)
   opens `FlyoutTarget::Gallery(id)`: the gallery alone, wrapped and with its
-  section headers, under its probe, else its collapsed group's button, else the
-  ribbon body, whether its group is drawn in place or not (so it stays open for
-  the same tab, `flyout_still_fits`). A gallery with no tiles opens nothing.
+  section headers, anchored under its probe, else its collapsed group's button,
+  else the overflow chevron, else the ribbon body, whether its group is drawn
+  in place or not (so it stays open for the same tab, `flyout_still_fits`). The
+  `gallery-<id>` probe is drawn on every in-place frame; only the badge needs
+  the KeyTips up. A minimised or hidden ribbon body opens nothing and says so. A gallery with no tiles opens nothing.
   `ribbon-read` reports `key_tip` on each `galleries` entry and `ribbon-flyout`
   names the open `gallery`; `ribbon_export` is unchanged. The fixture's
   `fixture.styles` is `XG` (`project-plugin-ui.uit`, not run on macOS).

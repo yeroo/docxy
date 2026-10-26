@@ -1882,6 +1882,12 @@ fn a_gallerys_keytip_opens_it_and_a_two_letter_one_waits() {
     assert!(!crate::tab_keytip_starts(&task, "GC"));
     // The key is a gallery's, not a command's.
     assert_eq!(crate::tab_keytip_cmd(&task, "GC"), None);
+    // An empty gallery's key waits for nothing: G alone on a tab with only it.
+    let only_empty = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[{"title":"E","controls":[
+          {"id":"g.empty","kind":"gallery","label":"Empty","keytip":"GE","swatches":[]}]}]}]}"##,
+    );
+    assert!(!crate::tab_keytip_starts(&only_empty, "G"));
 }
 
 #[test]
