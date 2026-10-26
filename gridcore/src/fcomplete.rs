@@ -10,6 +10,7 @@
 //! `start..caret` of the buffer with the chosen [`Item::insert`].
 
 use crate::formula::FUNCTION_NAMES;
+use crate::names::name_eq;
 use crate::sheet::Workbook;
 
 /// What an item is, for its icon.
@@ -263,7 +264,7 @@ fn names(prefix: &str, wb: &Workbook, sheet: usize) -> Vec<Item> {
         });
     }
     for t in &wb.tables {
-        if starts(&t.name) && !items.iter().any(|i| i.label.eq_ignore_ascii_case(&t.name)) {
+        if starts(&t.name) && !items.iter().any(|i| name_eq(&i.label, &t.name)) {
             items.push(Item {
                 label: t.name.clone(),
                 insert: t.name.clone(),

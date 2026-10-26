@@ -350,8 +350,8 @@ impl Engine {
     /// the table around the cell, and not at all outside one or in a formula
     /// that calls LAMBDA (`[y]` may be its parameter). Loading a file never
     /// comes through here, so stored formulas stay lenient. Names compare
-    /// ASCII-case-insensitively like the evaluator (full Unicode folding is a
-    /// separate follow-up).
+    /// case-insensitively over Unicode ([`crate::names::name_eq`]), as the
+    /// evaluator and every table rename and rewrite do (#1750).
     pub fn validate_in(
         wb: &Workbook,
         sheet: usize,
@@ -6101,6 +6101,48 @@ mod tests {
         assert!(v(1, 3, "LAMBDA(y,[y]+1)(2)").is_ok());
         // Plain `validate` and a stored formula stay lenient.
         assert!(Engine::validate("SUM(Sales[Nope])").is_ok());
+    }
+
+    /// [`calc_column_wb`] with Cyrillic names: table `Продажи`, columns
+    /// `Кол` (B) and `Цена` (C).
+    fn cyrillic_wb(calc: &str) -> Workbook {
+        let mut wb = calc_column_wb("Продажи", calc);
+        wb.sheets[0].set_cell(0, 1, Cell::text("Кол"));
+        wb.sheets[0].set_cell(0, 2, Cell::text("Цена"));
+        wb.tables[0].columns[1] = "Кол".into();
+        wb.tables[0].columns[2] = "Цена".into();
+        wb
+    }
+
+    #[test]
+    fn validate_in_folds_unicode_case() {
+        // #1750: Excel compares table and column names over Unicode case.
+        let wb = cyrillic_wb("[@Кол]*[@Цена]");
+        let v = |r, c, s: &str| Engine::validate_in(&wb, 0, r, c, s);
+        for ok in [
+            "SUM(продажи[кол])",
+            "SUM(ПРОДАЖИ[КОЛ])",
+            "продажи[[#Headers],[КОЛ]]",
+            "SUM(продажи[[кол]:[ЦЕНА]])",
+        ] {
+            assert!(v(0, 7, ok).is_ok(), "{ok}");
+        }
+        assert!(v(1, 3, "[кол]*[@цена]").is_ok());
+        assert_eq!(
+            v(0, 7, "SUM(продажи[нет])").unwrap_err(),
+            "unknown column 'нет' in table 'Продажи'"
+        );
+        assert!(v(1, 3, "[нет]").is_err());
+        // The folded spelling evaluates as the exact one does.
+        let mut wb = cyrillic_wb("[@кол]*[@ЦЕНА]");
+        wb.sheets[0].set_cell(0, 7, Cell::formula("SUM(Продажи[Кол])"));
+        wb.sheets[0].set_cell(1, 7, Cell::formula("SUM(продажи[кол])"));
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "H1"), CellValue::Number(7.0));
+        assert_eq!(value_at(&wb, "H2"), CellValue::Number(7.0));
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(6.0));
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(20.0));
     }
 
     #[test]

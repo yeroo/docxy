@@ -54,6 +54,7 @@ use gridcore::legacy::{SourceFormat, open_workbook_ex as open_any};
 use gridcore::model::{
     DataModel, MODEL_PART, ModelSpec, Relationship, model_part_xml, model_pivot, parse_model_part,
 };
+use gridcore::names::name_eq;
 use gridcore::options::{EditOptions, EnterMove};
 use gridcore::outline::{self, Axis, OutlineError};
 use gridcore::sheet::{
@@ -2064,7 +2065,7 @@ impl TableChange {
     /// What a relationship end on column `col` of this table reads after the
     /// edit, when it changed.
     fn column_after(&self, col: &str) -> Option<String> {
-        let same = |x: &str| x.eq_ignore_ascii_case(col);
+        let same = |x: &str| name_eq(x, col);
         if self.removed == Some(true) {
             return Some("#REF!".to_string());
         }
@@ -2132,7 +2133,7 @@ fn column_changes(before: &WbSnapshot, after: &WbSnapshot) -> Vec<TableChange> {
                         .collect();
                 } else if a.columns.len() < b.columns.len() {
                     let deleted: Vec<bool> = (b.columns.iter())
-                        .map(|x| !a.columns.iter().any(|y| y.eq_ignore_ascii_case(x)))
+                        .map(|x| !a.columns.iter().any(|y| name_eq(y, x)))
                         .collect();
                     if deleted.contains(&true) {
                         ch.deleted = deleted;
@@ -3977,9 +3978,10 @@ impl App {
         let wb = &self.pkg.workbook;
         let mut written: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
         for t in &wb.tables {
-            let kept = before.tables.iter().any(|b| {
-                b.sheet == t.sheet && b.range == t.range && b.name.eq_ignore_ascii_case(&t.name)
-            });
+            let kept = before
+                .tables
+                .iter()
+                .any(|b| b.sheet == t.sheet && b.range == t.range && name_eq(&b.name, &t.name));
             if t.header_rows == 0 || !kept {
                 continue;
             }
@@ -4061,7 +4063,7 @@ impl App {
             let mut to = r.clone();
             for ch in changes {
                 for end in [&mut to.from, &mut to.to] {
-                    if end.0.eq_ignore_ascii_case(&ch.table.name) {
+                    if name_eq(&end.0, &ch.table.name) {
                         if let Some(col) = ch.column_after(&end.1) {
                             end.1 = col;
                         }
@@ -4202,7 +4204,7 @@ impl App {
     fn rename_table_in_model(&mut self, old: &str, new: &str) {
         for r in &mut self.model_rels {
             for table in [&mut r.from.0, &mut r.to.0] {
-                if table.eq_ignore_ascii_case(old) {
+                if name_eq(table, old) {
                     *table = new.to_string();
                 }
             }
