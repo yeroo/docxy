@@ -2654,6 +2654,14 @@ fn rects_overlap(a: Area, b: Area) -> bool {
     a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
 }
 
+/// Whether another table or a defined name already has `name` (they compare
+/// case-insensitively), so a table can't take it.
+pub fn table_name_taken(wb: &crate::sheet::Workbook, name: &str) -> bool {
+    let tables = wb.tables.iter().map(|t| &t.name);
+    let names = wb.defined_names.iter().map(|d| &d.name);
+    tables.chain(names).any(|n| crate::names::name_eq(n, name))
+}
+
 /// Why a table can't cover `rect` on `sheet`, or `None` when it can: Excel
 /// refuses a table over another table, over a PivotTable, or over part of a
 /// multi-cell array formula. `ignore` is the table being resized, which may

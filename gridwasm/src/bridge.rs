@@ -164,6 +164,11 @@ struct RemovedSheetStash {
     /// its pivot. Reconstituted on restore via `ctl_reregister_pivot`,
     /// `.sheet` re-pointed at the restored sheet's NEW index.
     pivots: Vec<gridcore::pivot::Pivot>,
+    /// Every Excel table on the removed sheet, with its part's XML as it was
+    /// (`SheetPackage::remove_sheet` drops both), put back by
+    /// `SheetPackage::restore_table`: the part keeps its style, totals row
+    /// and filter. `None` for a table whose part the package did not hold.
+    tables: StashedTables,
     /// Where the sheet stood in the tab order (its index at removal), so a
     /// restore puts it back there (`SheetPackage::move_sheet`) and not at
     /// the end.
@@ -201,7 +206,12 @@ struct RemovedSheetStash {
     /// insert, a sort or a move: a restore gives the sheet its formulas back
     /// only while every one of these cells still holds the same, and skips
     /// the whole sheet otherwise (an edit of any of them included). Cells
-    /// added since elsewhere do not count.
+    /// added since elsewhere do not count. A cell the removal rewrote must
+    /// still read its rewritten text exactly; any other formula only with its
+    /// sheet qualifiers masked ([`gridcore::formula::mask_sheet_qualifiers`]),
+    /// so a rename of another sheet, which rewrites those, does not skip the
+    /// sheet (#1795). Addresses stay compared: a row or column edit of
+    /// another sheet that shifts a cell a formula refers to still does.
     cell_guards: Vec<CellGuard>,
     /// The other sheets' tables whose calculated-column formulas it rewrote,
     /// by table name, before and after; put back on a table still reading
@@ -217,6 +227,10 @@ struct RemovedSheetStash {
     /// name. A non-top restore that removes this sheet again keeps it.
     serial: usize,
 }
+
+/// A removed sheet's tables, each with its part's XML (see
+/// [`RemovedSheetStash::tables`]).
+type StashedTables = Vec<(gridcore::sheet::Table, Option<Vec<u8>>)>;
 
 /// One Consolidate reference, or CF/DV formula, `remove_sheet` rewrote (see
 /// [`RemovedSheetStash::rewritten_consolidate`] and
@@ -240,17 +254,22 @@ struct RewrittenCell {
 /// [`RemovedSheetStash::cell_guards`]).
 type CellGuard = (String, Vec<((u32, u32), Held)>);
 
-/// What a cell holds for [`RemovedSheetStash::cell_guards`]: its formula's
-/// text, else its value.
+/// What a cell holds for [`RemovedSheetStash::cell_guards`]: a rewritten
+/// formula's exact text (what the restore replaces), another formula's text
+/// with its sheet qualifiers masked ([`gridcore::formula::mask_sheet_qualifiers`]:
+/// a rename of another sheet rewrites those, and moves no cell here), else
+/// its value.
 #[derive(PartialEq)]
 enum Held {
+    Exact(String),
     Formula(String),
     Value(gridcore::sheet::CellValue),
 }
 
 /// Every cell of `sheet` with what it holds, but the cells of an array its
-/// anchor fills (their values follow a recalculation, not an edit).
-fn held_cells(sheet: &Sheet) -> Vec<((u32, u32), Held)> {
+/// anchor fills (their values follow a recalculation, not an edit);
+/// `rewritten` are the cells whose formula the removal rewrote.
+fn held_cells(sheet: &Sheet, rewritten: &[(u32, u32)]) -> Vec<((u32, u32), Held)> {
     let mut filled = std::collections::HashSet::new();
     for (&(r, c), cell) in &sheet.cells {
         if let Some((rows, cols)) = cell.spill.filter(|_| cell.formula.is_some()) {
@@ -269,7 +288,8 @@ fn held_cells(sheet: &Sheet) -> Vec<((u32, u32), Held)> {
         .filter(|(at, _)| !filled.contains(*at))
         .map(|(&at, cell)| {
             let held = match &cell.formula {
-                Some(f) => Held::Formula(f.clone()),
+                Some(f) if rewritten.contains(&at) => Held::Exact(f.clone()),
+                Some(f) => Held::Formula(gridcore::formula::mask_sheet_qualifiers(f)),
                 None => Held::Value(cell.value.clone()),
             };
             (at, held)
@@ -282,7 +302,13 @@ fn still_holds(sheet: &Sheet, guard: &[((u32, u32), Held)]) -> bool {
     guard.iter().all(|(at, held)| {
         let cell = sheet.cells.get(at);
         match held {
-            Held::Formula(f) => cell.and_then(|c| c.formula.as_deref()) == Some(f.as_str()),
+            Held::Exact(f) => cell.and_then(|c| c.formula.as_deref()) == Some(f.as_str()),
+            Held::Formula(f) => {
+                cell.and_then(|c| c.formula.as_deref())
+                    .map(gridcore::formula::mask_sheet_qualifiers)
+                    .as_ref()
+                    == Some(f)
+            }
             Held::Value(v) => match cell {
                 Some(c) => c.formula.is_none() && c.value == *v,
                 None => v.is_empty(),
@@ -477,9 +503,13 @@ fn apply_chart(wb: &mut gridcore::sheet::Workbook, r: &RewrittenChart, write: bo
 fn restore_is_lossless(wb: &mut gridcore::sheet::Workbook, stash: &RemovedSheetStash) -> bool {
     let intact = intact_cell_sheets(wb, &stash.cell_guards);
     stash
-        .rewritten_names
+        .tables
         .iter()
-        .all(|r| apply_name(wb, r, false))
+        .all(|(t, xml)| xml.is_some() && !gridcore::edit::table_name_taken(wb, &t.name))
+        && stash
+            .rewritten_names
+            .iter()
+            .all(|r| apply_name(wb, r, false))
         && stash
             .rewritten_consolidate
             .iter()
@@ -3077,6 +3107,15 @@ impl Session {
             .map(|(i, d)| (i, d.clone()))
             .collect();
         let removed_active = self.active == si;
+        // The sheet's tables with their parts, which the removal drops.
+        let tables: StashedTables = self
+            .pkg
+            .workbook
+            .tables
+            .iter()
+            .filter(|t| t.sheet == si)
+            .map(|t| (t.clone(), self.pkg.part(&t.part).map(<[u8]>::to_vec)))
+            .collect();
         // Every pivot the impending `remove_sheet` cascade is about to drop
         // — same filter (`.sheet == si`) the cascade itself uses, captured
         // BEFORE the call so the stash has something to reconstitute from.
@@ -3318,7 +3357,12 @@ impl Session {
                 .iter()
                 .find(|sh| sh.name == r.sheet)
             {
-                cell_guards.push((r.sheet.clone(), held_cells(sh)));
+                let rewritten: Vec<(u32, u32)> = rewritten_cells
+                    .iter()
+                    .filter(|c| c.sheet == r.sheet)
+                    .map(|c| c.at)
+                    .collect();
+                cell_guards.push((r.sheet.clone(), held_cells(sh, &rewritten)));
             }
         }
         // A stack: the latest removal is restored first, and the oldest is
@@ -3333,6 +3377,7 @@ impl Session {
             defined_names,
             removed_active,
             pivots,
+            tables,
             index: si,
             rewritten_names,
             rewritten_consolidate,
@@ -3434,17 +3479,28 @@ impl Session {
     /// The sheet comes back at its original index (`RemovedSheetStash::index`,
     /// clamped to the end): added at the end, then moved there with
     /// `SheetPackage::move_sheet`, which keeps the part list, the `<sheet>`
-    /// elements and every stored sheet index in step. When that shifts other
-    /// sheets the undo and redo history, which names sheets by index, is
-    /// cleared (as `sheet.remove` does). The global names, Consolidate
+    /// elements and every stored sheet index in step. Every restore clears the
+    /// undo and redo history, which names sheets by index (as `sheet.remove`
+    /// does). The global names, Consolidate
     /// references, other sheets' CF and DV formulas, tables' calculated
     /// formulas and charts the removal rewrote get their text back, each
     /// unless it changed since. A sheet's cell formulas come back only while
     /// none of that sheet's cells was edited or moved since the removal
     /// (`RemovedSheetStash::cell_guards`); otherwise they all stay as they
-    /// are, and the reply's `cellsKept` names that sheet. A rename or a row or
-    /// column edit of another sheet that rewrote a formula here counts as an
-    /// edit (a known limit). The cells recalculate.
+    /// are, and the reply's `cellsKept` names that sheet. A formula the
+    /// removal did not rewrite is compared with its sheet qualifiers masked,
+    /// so a rename of another sheet that rewrote it is no edit; a rewritten
+    /// formula that also names the renamed sheet, or a row or column edit of
+    /// another sheet that shifts a cell a formula here refers to, still counts
+    /// as one (known limits). The sheet's Excel tables come back with their
+    /// parts (`SheetPackage::restore_table`: style, totals row, filter), each
+    /// unless its name was taken since or no part was kept: the reply's
+    /// `tablesKept` names those. A non-top restore is refused, before any
+    /// change, while a sheet it would unwind holds a table (restore those
+    /// first, in stack order): the tables of a sheet that is back for a
+    /// moment would be unwired, and no removal would rewrite their formulas.
+    /// The target's own tables are wired before the later sheets go again, so
+    /// that removal rewrites and records their formulas. The cells recalculate.
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
         if self.removed_sheet_stashes.is_empty() {
             return Err("nothing to restore".into());
@@ -3526,6 +3582,29 @@ impl Session {
                 ));
             }
         }
+        // The sheets unwound hold no table: it would be unwired while they
+        // are back and rewritten by no removal (a formula of one naming a
+        // sheet that goes again), so they are restored first, in stack order.
+        if !ghosts_only {
+            let holding: Vec<String> = self.removed_sheet_stashes[k + 1..]
+                .iter()
+                .rev()
+                .filter(|st| !st.tables.is_empty())
+                .map(|st| format!("\"{}\"", st.name))
+                .collect();
+            if !holding.is_empty() {
+                return Err(format!(
+                    "cannot restore \"{}\": restore {} first, {}",
+                    self.removed_sheet_stashes[k].name,
+                    holding.join(", "),
+                    if holding.len() == 1 {
+                        "it holds a table"
+                    } else {
+                        "they hold tables"
+                    }
+                ));
+            }
+        }
         // The non-ghost path: the sheets removed after `k`, oldest first, to
         // remove again once `k` is back: each entry's positions hold only in
         // its own frame, so the stack is unwound to `k` and the later
@@ -3548,12 +3627,23 @@ impl Session {
         );
         // A later sheet's pivots are re-registered and removed again with it;
         // only `k`'s own call for a refresh.
+        // The latest comes back first (none holds a table: checked above).
         for _ in &later {
             self.restore_top();
         }
         let name = self.removed_sheet_stashes[k].name.clone();
         let removed_active = self.removed_sheet_stashes[k].removed_active;
-        let (had_pivots, cells_kept) = self.restore_top();
+        let (had_pivots, cells_kept, pending) = self.restore_top();
+        // Its tables now, with only live ones about, and before the later
+        // sheets go again: their removal then rewrites these tables' formulas
+        // and records them, as it does every live table's.
+        let at = self
+            .pkg
+            .workbook
+            .sheet_index(&name)
+            .expect("the restored sheet is live");
+        let refused = self.put_back_tables(at, pending);
+        let tables_kept: Vec<String> = refused.iter().map(|(t, _)| t.name.clone()).collect();
         self.removed_sheet_stashes.extend(ghosts);
         for (later_name, was_active, serial) in &later {
             let si = self
@@ -3615,24 +3705,56 @@ impl Session {
             }
             out.push(']');
         }
+        if !tables_kept.is_empty() {
+            out.push_str(",\"tablesKept\":[");
+            for (i, table) in tables_kept.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                json::push_str(&mut out, table);
+            }
+            out.push(']');
+        }
         out.push_str(",\"inverse\":{\"verb\":\"sheet.remove\",\"args\":{\"sheet\":");
         out.push_str(&new_idx.to_string());
         out.push_str("}},\"undoSteps\":0}");
         Ok(out)
     }
 
+    /// Put `tables` back on sheet `idx` (`SheetPackage::restore_table`);
+    /// those that cannot come back are returned.
+    fn put_back_tables(&mut self, idx: usize, tables: StashedTables) -> StashedTables {
+        let mut kept = Vec::new();
+        for (table, xml) in tables {
+            let restored = match &xml {
+                Some(xml) => self.pkg.restore_table(idx, table.clone(), xml).is_ok(),
+                None => false,
+            };
+            if !restored {
+                kept.push((table, xml));
+            }
+        }
+        kept
+    }
+
     /// Pop the top of `Session::removed_sheet_stashes` and put its sheet
     /// back (see [`ctl_sheet_restore_removed`](Self::ctl_sheet_restore_removed)),
     /// leaving the pivot refresh and the engine rebuild to the caller.
-    /// Whether the sheet had pivots, and the sheets whose cell formulas were
-    /// left as they are (`RemovedSheetStash::cell_guards`). The caller has
-    /// checked that no live sheet has the stashed name.
-    fn restore_top(&mut self) -> (bool, Vec<String>) {
+    /// Whether the sheet had pivots, the sheets whose cell formulas were
+    /// left as they are (`RemovedSheetStash::cell_guards`) and its tables,
+    /// not yet put back ([`Self::put_back_tables`]: the caller wires them
+    /// once the sheets that go again are back, before they go). The caller
+    /// has checked that no live sheet has the stashed name.
+    fn restore_top(&mut self) -> (bool, Vec<String>, StashedTables) {
         let stash = self
             .removed_sheet_stashes
             .pop()
             .expect("stash presence verified by the caller");
         let appended = self.pkg.add_sheet(&stash.name);
+        // The sheet's index, and with it every index the history names,
+        // changes behind its back, as it does in the removal.
+        self.undo.clear();
+        self.redo.clear();
         // Back to its old place in the tab order. `move_sheet` carries the
         // part, the `<sheet>` element and every stored sheet index (names,
         // tables, pivots) with it, so what follows uses the final index.
@@ -3640,13 +3762,10 @@ impl Session {
         let target = stash.index.min(appended);
         if target != appended && self.pkg.move_sheet(appended, target) {
             new_idx = target;
-            // The sheets from there on moved up a place, and the history
-            // names sheets by index.
+            // The sheets from there on moved up a place.
             if self.active >= new_idx {
                 self.active += 1;
             }
-            self.undo.clear();
-            self.redo.clear();
         }
         self.pkg.workbook.sheets[new_idx] = stash.sheet;
         for cm in &stash.comments {
@@ -3659,6 +3778,8 @@ impl Session {
                     .set_comment(new_idx, cm.row, cm.col, &cm.author, &cm.text);
             }
         }
+        // Its tables are left to the caller (`Self::put_back_tables`).
+        let tables = stash.tables;
         // The names the removal rewrote read as they did, unless they
         // changed since; each guard is `restore_is_lossless`'s too.
         for r in &stash.rewritten_names {
@@ -3724,7 +3845,7 @@ impl Session {
             self.window.1 = 0;
         }
         self.dirty = true;
-        (had_pivots, cells_kept)
+        (had_pivots, cells_kept, tables)
     }
 
     /// Reinsert a pivot into `workbook.pivots`, pointed at `dest_sheet`, as
@@ -7548,6 +7669,255 @@ mod tests {
         let out = restore(&mut s, "C");
         assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
         assert_eq!(row21(&s, 0).0, "#REF!+Bee!A1");
+    }
+
+    /// Sheet C with a styled table over A1:B3 (`Item`, `Qty`), and a total
+    /// of its Qty column on Sheet1.
+    fn table_on_c() -> Session {
+        let mut s = abc_session();
+        s.active = 3;
+        for (r, c, v) in [
+            (0, 0, "Item"),
+            (0, 1, "Qty"),
+            (1, 0, "Pen"),
+            (1, 1, "3"),
+            (2, 0, "Ink"),
+            (2, 1, "4"),
+        ] {
+            s.dispatch(&format!("set\t{r}\t{c}\t{v}"));
+        }
+        s.pkg
+            .add_table(3, (0, 0, 2, 1), true, "TableStyleDark3")
+            .expect("table");
+        s.active = 0;
+        s.dispatch("set\t20\t0\t=SUM(Table1[Qty])");
+        s
+    }
+
+    /// #1795: a restore brings the removed sheet's tables back, with their
+    /// parts as they were, so structured references and a save keep them.
+    #[test]
+    fn ctl_sheet_restore_removed_gives_back_the_sheets_tables_1795() {
+        let mut s = table_on_c();
+        assert_eq!(row21(&s, 0).1, number(7.0));
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert!(s.pkg.workbook.tables.is_empty());
+        let out = restore(&mut s, "C");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(!out.contains("tablesKept"), "{out}");
+        let t = &s.pkg.workbook.tables;
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            (t[0].name.as_str(), t[0].sheet, t[0].range),
+            ("Table1", 3, (0, 0, 2, 1))
+        );
+        assert_eq!(row21(&s, 0), ("SUM(Table1[Qty])".into(), number(7.0)));
+        let re = Session::open(&s.save()).expect("reopen");
+        let t = &re.pkg.workbook.tables;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].sheet, 3);
+        let xml = String::from_utf8_lossy(re.pkg.part(&t[0].part).expect("part")).into_owned();
+        assert!(xml.contains("TableStyleDark3"), "{xml}");
+    }
+
+    /// #1795: a table whose name something took since stays out, and the
+    /// reply names it; the rest of the sheet still comes back.
+    #[test]
+    fn ctl_sheet_restore_removed_names_a_table_whose_name_was_taken_1795() {
+        let mut s = table_on_c();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.pkg.workbook.defined_names.push(DefinedName {
+            name: "table1".into(),
+            scope: None,
+            formula: "Sheet1!$A$1".into(),
+        });
+        let out = restore(&mut s, "C");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(out.contains(r#""tablesKept":["Table1"]"#), "{out}");
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert_eq!(s.pkg.workbook.sheets[3].name, "C");
+        assert_eq!(
+            s.pkg.workbook.sheets[3].cell(1, 1).map(|c| c.value.clone()),
+            Some(number(3.0))
+        );
+    }
+
+    /// #1795: the ghost check counts a table name clash as a lossy restore.
+    #[test]
+    fn restore_is_lossless_counts_a_taken_table_name_1795() {
+        let mut s = table_on_c();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        let stash = s.removed_sheet_stashes.pop().expect("stash");
+        assert!(restore_is_lossless(&mut s.pkg.workbook, &stash));
+        s.pkg.workbook.defined_names.push(DefinedName {
+            name: "TABLE1".into(),
+            scope: None,
+            formula: "Sheet1!$A$1".into(),
+        });
+        assert!(!restore_is_lossless(&mut s.pkg.workbook, &stash));
+    }
+
+    /// #1795 r2: a rename of a sheet a formula on Sheet1 refers to rewrites
+    /// that formula's text (and reprints a non-canonical one) but moves no
+    /// cell of Sheet1: the restore still gives the removal's rewrites back.
+    #[test]
+    fn ctl_sheet_restore_removed_survives_another_sheets_rename_1795() {
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=C!A1+1");
+        s.dispatch("set\t21\t0\t=B!A1*5");
+        s.dispatch("set\t22\t0\t=1");
+        // As a file written elsewhere spells it: a rename prints it anew.
+        s.pkg.workbook.sheets[0]
+            .cells
+            .get_mut(&(22, 0))
+            .expect("cell")
+            .formula = Some("sum(B!A1) + 1".into());
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(row21(&s, 0).0, "#REF!+1");
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"B","name":"Bee"}}"#);
+        let text = |r: u32| {
+            s.pkg.workbook.sheets[0]
+                .cell(r, 0)
+                .and_then(|c| c.formula.clone())
+        };
+        assert_eq!(text(21).as_deref(), Some("Bee!A1*5"));
+        assert_eq!(text(22).as_deref(), Some("SUM(Bee!A1)+1"));
+        let out = restore(&mut s, "C");
+        assert!(!out.contains("cellsKept"), "{out}");
+        assert_eq!(row21(&s, 0), ("C!A1+1".into(), number(4.0)));
+    }
+
+    /// #1795 r1: rows that differ only in the addresses their other-sheet
+    /// references name still tell a swapped pair from a rename.
+    #[test]
+    fn ctl_sheet_restore_removed_skips_rows_swapped_that_differ_in_other_sheet_addresses_1795() {
+        let mut s = abc_session();
+        for (r, addr) in [(1, 5), (2, 6)] {
+            s.dispatch(&format!("set\t{r}\t0\t=C!B{addr}"));
+            s.dispatch(&format!("set\t{r}\t1\t=B!B{addr}"));
+        }
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        let sh = &mut s.pkg.workbook.sheets[0];
+        for c in 0..2 {
+            let a = sh.cells.remove(&(1, c)).expect("cell");
+            let b = sh.cells.remove(&(2, c)).expect("cell");
+            sh.cells.insert((1, c), b);
+            sh.cells.insert((2, c), a);
+        }
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
+    }
+
+    /// #1795 r2: formulas of the sheet itself that moved still skip it (a
+    /// sort or move permutes rows of formulas), and the reply names it.
+    #[test]
+    fn ctl_sheet_restore_removed_still_skips_a_sheet_whose_formulas_moved_1795() {
+        let mut s = abc_session();
+        for r in 1..4 {
+            s.dispatch(&format!("set\t{r}\t0\t=D{}+1", r + 1));
+            s.dispatch(&format!("set\t{r}\t1\t=C!B{}*2", r + 1));
+        }
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        // Rows 1 and 2 swap places, as a sort by another column would.
+        let sh = &mut s.pkg.workbook.sheets[0];
+        for c in 0..2 {
+            let a = sh.cells.remove(&(1, c)).expect("cell");
+            let b = sh.cells.remove(&(2, c)).expect("cell");
+            sh.cells.insert((1, c), b);
+            sh.cells.insert((2, c), a);
+        }
+        let out = restore(&mut s, "C");
+        assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
+    }
+
+    /// #1795 r4: a non-top restore is refused, with nothing changed, while a
+    /// sheet it would unwind holds a table; restoring in stack order works.
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_is_refused_while_a_later_sheet_holds_a_table_1795()
+    {
+        let mut s = table_on_c();
+        s.pkg.workbook.tables[0].calculated_formulas = vec![None, Some("B!A1*2".into())];
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        let order = sheet_order(&s);
+        let out = restore(&mut s, "B");
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert!(
+            out.contains(r#"restore \"C\" first, it holds a table"#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), order);
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert_eq!(s.removed_sheet_stashes.len(), 2, "the stack is intact");
+        // In stack order it works, and the formula comes back.
+        let out = restore(&mut s, "C");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        let out = restore(&mut s, "B");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(
+            s.pkg.workbook.tables[0].calculated_formulas,
+            vec![None, Some("B!A1*2".to_string())]
+        );
+    }
+
+    /// #1795 r5: the sheets to restore first are named latest-removed first,
+    /// the order that works.
+    #[test]
+    fn ctl_sheet_restore_removed_refusal_names_the_table_sheets_latest_first_1795() {
+        let mut s = abc_session();
+        for sheet in [2, 3] {
+            s.pkg
+                .add_table(sheet, (0, 0, 1, 1), true, "TableStyleLight1")
+                .expect("table");
+        }
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let out = restore(&mut s, "A");
+        assert!(
+            out.contains(r#"restore \"C\", \"B\" first, they hold tables"#),
+            "{out}"
+        );
+        for name in ["C", "B", "A"] {
+            let out = restore(&mut s, name);
+            assert!(out.contains("\"ok\":true"), "{name}: {out}");
+        }
+        assert_eq!(s.pkg.workbook.tables.len(), 2);
+    }
+
+    /// #1795 r3: a table a non-top restore brings back is live when the
+    /// later sheets (which hold no table) are removed again, so that removal
+    /// rewrites its formulas and records them for the later restore.
+    #[test]
+    fn ctl_sheet_restore_removed_non_top_restore_rewrites_its_tables_formulas_1795() {
+        let mut s = table_on_c();
+        s.pkg.workbook.tables[0].calculated_formulas = vec![None, Some("B!A1*2".into())];
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
+        let out = restore(&mut s, "C");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert!(!out.contains("tablesKept"), "{out}");
+        let calc = |s: &Session| s.pkg.workbook.tables[0].calculated_formulas.clone();
+        assert_eq!(s.pkg.workbook.tables.len(), 1);
+        assert_eq!(calc(&s), vec![None, Some("#REF!*2".to_string())]);
+        let out = restore(&mut s, "B");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(calc(&s), vec![None, Some("B!A1*2".to_string())]);
+    }
+
+    /// #1795 r1: a restore clears the history, as a removal does: a step
+    /// taken in between must not undo to a workbook without the sheet.
+    #[test]
+    fn ctl_sheet_restore_removed_clears_the_history_1795() {
+        let mut s = table_on_c();
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        s.dispatch("insrow\t40\t1");
+        restore(&mut s, "C");
+        s.dispatch("undo");
+        assert_eq!(s.pkg.workbook.sheets.len(), 4);
+        assert_eq!(s.pkg.workbook.tables.len(), 1);
     }
 
     /// #1734: a table's calculated-column formula and an in-memory chart's

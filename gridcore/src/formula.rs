@@ -3200,6 +3200,18 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
     map_sheet_qualifiers(e, &fix, &whole_name)
 }
 
+/// `src` with every sheet qualifier replaced by one placeholder and printed
+/// canonically: two formulas that differ only in which sheets they name (a
+/// rename of one, or `Jan!B5` against `Feb!B5`) print alike, while addresses
+/// and everything else stay. `src` itself when it does not parse.
+pub fn mask_sheet_qualifiers(src: &str) -> String {
+    let Ok(ast) = parse(src) else {
+        return src.to_string();
+    };
+    let fix = |s: &Option<String>| s.as_ref().map(|_| "_S_".to_string());
+    to_string(&map_sheet_qualifiers(&ast, &fix, &|_| None))
+}
+
 /// A sheet-scoped name's `(sheet, name)`, from the text the parser gave it
 /// (`sheet_prefix` + name; the name itself holds no `!`).
 fn scoped_name(n: &str) -> Option<(String, &str)> {
@@ -13813,6 +13825,30 @@ fn fin_db(cost: f64, salvage: f64, life: f64, period: f64, month: f64) -> Option
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mask_sheet_qualifiers_cuts_names_and_keeps_addresses_1795() {
+        assert_eq!(
+            mask_sheet_qualifiers("Jan!B5+C5"),
+            mask_sheet_qualifiers("'My ''x'' Sheet'!B5+C5")
+        );
+        assert_ne!(
+            mask_sheet_qualifiers("Jan!B5"),
+            mask_sheet_qualifiers("Jan!B6")
+        );
+        assert_eq!(
+            mask_sheet_qualifiers("SUM(Sheet1:Sheet3!A1:B2)"),
+            mask_sheet_qualifiers("SUM(X:Y!A1:B2)")
+        );
+        // A rename reprints a formula canonically: the same text either way.
+        let renamed = rename_sheet_in_formula("sum(B!A1) + 1", "B", "Bee").unwrap();
+        assert_eq!(
+            mask_sheet_qualifiers("sum(B!A1) + 1"),
+            mask_sheet_qualifiers(&renamed)
+        );
+        assert_eq!(mask_sheet_qualifiers("A1+\"b!c\""), "A1+\"b!c\"");
+        assert_eq!(mask_sheet_qualifiers("1+"), "1+", "unparsable: as it is");
+    }
+
     use super::*;
     use std::collections::HashMap;
 
