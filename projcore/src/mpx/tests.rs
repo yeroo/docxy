@@ -83,6 +83,26 @@ fn dates_follow_the_date_order_and_two_digit_years_pivot_at_80() {
 }
 
 #[test]
+fn an_exception_record_reads_two_digit_years_by_the_fixed_pivot() {
+    let project = read_mpx(&mpx("20,Standard,0,1,1,1,1,1,0\r\n\
+         26,03/04/26,03/04/26,0\r\n26,03/04/85,03/05/85,0\r\n\
+         61,1,90,98\r\n70,A,1,1\r\n"))
+    .unwrap();
+    let ranges: Vec<(DateTime, DateTime)> = project.calendars[0]
+        .exceptions
+        .iter()
+        .map(|e| (e.from.unwrap(), e.to.unwrap().start_of_day()))
+        .collect();
+    assert_eq!(
+        ranges,
+        [
+            (at(2026, 3, 4, 0, 0), at(2026, 3, 4, 0, 0)),
+            (at(1985, 3, 4, 0, 0), at(1985, 3, 5, 0, 0)),
+        ]
+    );
+}
+
+#[test]
 fn times_read_am_pm_and_24_hours() {
     let s = Settings::default();
     for (text, minutes) in [
@@ -213,18 +233,27 @@ fn tasks_order_by_id_and_a_nameless_levelless_row_is_blank() {
 
 #[test]
 fn rows_without_an_id_keep_their_place_and_duplicate_uids_are_renumbered() {
-    let project = read_mpx(&mpx("60,Name,ID,Unique ID\r\n61,1,90,98\r\n\
-         70,C,3,7\r\n70,A,1,7\r\n70,NoId,,\r\n70,B,2,1\r\n"))
+    let project = read_mpx(&mpx(
+        "60,Name,ID,Unique ID,Predecessors\r\n61,1,90,98,70\r\n\
+         70,C,3,7,2\r\n70,A,1,7\r\n70,NoId,,\r\n70,B,2,1\r\n",
+    ))
     .unwrap();
     let rows: Vec<(&str, i32, i32)> = project
         .tasks
         .iter()
         .map(|t| (t.name.as_str(), t.id, t.uid))
         .collect();
-    // NoId follows A, the row before it; the second UID 7 takes a fresh one.
+    // NoId follows A, the row before it, with an ID no row uses; the second
+    // UID 7 takes a fresh one.
     assert_eq!(
         rows,
-        [("A", 1, 8), ("NoId", 2, 9), ("B", 2, 1), ("C", 3, 7)]
+        [("A", 1, 8), ("NoId", 4, 9), ("B", 2, 1), ("C", 3, 7)]
+    );
+    // C's `2` is B, unambiguously.
+    let c = project.tasks.iter().find(|t| t.name == "C").unwrap();
+    assert_eq!(
+        c.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+        [1]
     );
 }
 
@@ -266,6 +295,37 @@ fn predecessors_name_task_ids_with_type_and_lag() {
             (20, LinkType::StartStart, -480)
         ]
     );
+}
+
+#[test]
+fn predecessor_lists_split_on_the_header_delimiter_and_lags_take_record_10_decimals() {
+    // A semicolon file, decimal comma: MPXJ joins the list with `;`.
+    let project = read_mpx(
+        "MPX;Microsoft Project for Windows;4.0;ANSI\r\n10;$;1;2;.;,\r\n\
+         60;Name;Predecessors;ID;Unique ID\r\n61;1;70;90;98\r\n\
+         70;A;;1;10\r\n70;B;;2;20\r\n70;C;\"1FS+0,5d;2SS\";3;30\r\n"
+            .as_bytes(),
+    )
+    .unwrap();
+    let links: Vec<(i32, LinkType, i64)> = project.tasks[2]
+        .predecessors
+        .iter()
+        .map(|p| (p.uid, p.link, p.lag))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (10, LinkType::FinishStart, 240),
+            (20, LinkType::StartStart, 0)
+        ]
+    );
+    // A comma file with a decimal point keeps reading `0.5d`.
+    let project = read_mpx(&mpx(
+        "60,Name,Predecessors,ID,Unique ID\r\n61,1,70,90,98\r\n\
+         70,A,,1,10\r\n70,B,\"1FS+0.5d\",2,20\r\n",
+    ))
+    .unwrap();
+    assert_eq!(project.tasks[1].predecessors[0].lag, 240);
 }
 
 #[test]
@@ -415,6 +475,18 @@ fn resources_and_assignments() {
     assert_eq!(alice.cost_per_use.as_ref().unwrap().to_f64(), Some(0.1));
     assert_eq!(alice.accrue_at, Some(AccrueAt::Prorated));
     assert_eq!(project.resources.len(), 3);
+
+    // A rate converts to an hour unrounded: $1.00/d prices an 8-hour day at
+    // $1.00, and $45,000.00/y a 2080-hour year at $45,000.00.
+    let project = read_mpx(&mpx("40,Name,Standard Rate,Overtime Rate,ID,Unique ID\r\n\
+         41,1,42,43,40,49\r\n50,Ann,$1.00/d,\"$45,000.00/y\",1,1\r\n\
+         61,1,90,98\r\n70,A,1,1\r\n"))
+    .unwrap();
+    let ann = &project.resources[0];
+    let per_hour = |rate: &Option<Rate>| rate.as_ref().unwrap().to_f64().unwrap();
+    assert_eq!(per_hour(&ann.standard_rate), 0.125);
+    assert_eq!(per_hour(&ann.standard_rate) * 8.0, 1.0);
+    assert!((per_hour(&ann.overtime_rate) * 2080.0 - 45_000.0).abs() < 1e-9);
 
     let project = read_mpx(&corpus("22-progress.mpx")).unwrap();
     let assignments: Vec<(i32, i32, i32, f64, i64)> = project

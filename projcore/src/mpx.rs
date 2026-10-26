@@ -67,7 +67,10 @@ pub fn read_mpx(bytes: &[u8]) -> Result<Project, String> {
         }
         _ => return Err("not an MPX file: expected an MPX header".into()),
     };
-    let mut reader = Reader::default();
+    let mut reader = Reader {
+        delimiter,
+        ..Reader::default()
+    };
     for record in records(&text, delimiter).into_iter().skip(1) {
         reader.record(&record);
     }
@@ -193,13 +196,20 @@ impl Settings {
     /// A plain number as the file writes it: the thousands separator
     /// dropped, its decimal separator a point.
     fn number(&self, text: &str) -> Option<f64> {
-        let cleaned: String = text
-            .trim()
-            .chars()
+        self.point_decimals(text.trim())
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+    }
+
+    /// `text` with record 10's thousands separator dropped and its decimal
+    /// separator a point, as the cell grammar reads numbers: a lag of
+    /// `1FS+0,5d` in a decimal-comma file is `1FS+0.5d`.
+    fn point_decimals(&self, text: &str) -> String {
+        text.chars()
             .filter(|&c| c != self.thousands || c == self.decimal)
             .map(|c| if c == self.decimal { '.' } else { c })
-            .collect();
-        cleaned.parse::<f64>().ok().filter(|v| v.is_finite())
+            .collect()
     }
 
     /// Money (`$1,250.50`, `-$0.12`, `($0.12)`) as decimal text.
@@ -249,8 +259,10 @@ impl Settings {
         }
         let mut year: i64 = y.parse().ok()?;
         if y.len() <= 2 {
-            // Two-digit years (exception records): 00-79 are 2000-2079,
-            // 80-99 are 1980-1999, as MPXJ's reader reads `26` as 2026.
+            // Two-digit years (exception records): a fixed pivot of our own,
+            // 00-79 are 2000-2079 and 80-99 are 1980-1999, so a file reads
+            // the same on any day. MPXJ's reader uses a window around today
+            // instead; both read the corpus's `26` as 2026.
             year += if year < 80 { 2000 } else { 1900 };
         }
         let month: u32 = m.parse().ok()?;
@@ -361,6 +373,9 @@ struct CalendarDraft {
 
 #[derive(Default)]
 struct Reader {
+    /// The header's field delimiter, which also separates the entries of a
+    /// Predecessors list (MPXJ joins them with it: `"1;2"` in a `MPX;` file).
+    delimiter: char,
     settings: Settings,
     hours_per_day: Option<f64>,
     hours_per_week: Option<f64>,
@@ -683,7 +698,8 @@ impl Reader {
             "y" | "yr" => (value / (52.0 * hours_per_week), 7),
             _ => return None,
         };
-        Some((Rate::from_f64(round_cents(per_hour))?, format))
+        // Unrounded: $1.00/d is 0.125 an hour, which prices a day at $1.00.
+        Some((Rate::from_f64(per_hour)?, format))
     }
 
     /// Record 70: a task, read by the ids of the last record 61.
@@ -933,14 +949,19 @@ impl Reader {
         for (row, &i) in order.iter().enumerate() {
             position[i] = row;
         }
+        // A row without an ID takes one no row of the file uses, so the
+        // links, which name the file's IDs, stay unambiguous.
+        let mut next_id = tasks.iter().filter_map(|t| t.id).max().unwrap_or(0);
         proj.tasks = order
             .iter()
-            .enumerate()
-            .map(|(row, &i)| {
+            .map(|&i| {
                 let raw = &mut tasks[i];
                 let mut t = std::mem::take(&mut raw.task);
                 t.uid = uids[i];
-                t.id = raw.id.unwrap_or(row as i32 + 1);
+                t.id = raw.id.unwrap_or_else(|| {
+                    next_id = next_id.saturating_add(1);
+                    next_id
+                });
                 t.is_null = t.name.is_empty() && !raw.has_outline_level;
                 if t.is_null {
                     t.outline_level = 0;
@@ -1015,12 +1036,12 @@ impl Reader {
                 continue;
             }
             let mut links = Vec::new();
-            for entry in text.split(',') {
-                let entry = entry.trim();
+            for entry in text.split(self.delimiter) {
+                let entry = self.settings.point_decimals(entry.trim());
                 if entry.is_empty() {
                     continue;
                 }
-                let Ok(parsed) = parse_task_predecessors(entry, &Task::default(), &proj) else {
+                let Ok(parsed) = parse_task_predecessors(&entry, &Task::default(), &proj) else {
                     continue;
                 };
                 for link in parsed {
@@ -1081,11 +1102,6 @@ struct ParsedAssignment {
 struct Duration {
     minutes: i64,
     format: LagFormat,
-}
-
-/// Two decimals, as Project shows money.
-fn round_cents(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
 }
 
 /// Field ids of a record 41 or 61.
