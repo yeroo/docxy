@@ -226,11 +226,13 @@ jobs:
         run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture
       - name: Sweep runner unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
-      # The slowest script took 13 s locally: a per-script --timeout turns a hang
-      # into an ERROR row with a summary written, well inside the step's limit.
+      # A per-script --timeout turns a hang into an ERROR row with a summary written,
+      # well inside the step's limit. The slowest scripts take 84-87 s on this runner
+      # (inputs-typing-sheet-data, inputs-typing-doc-layout; run 40136693640), so 300 s
+      # leaves over 3x headroom for a slower day (Windows gets 420, #1785).
       - name: Sweep
         timeout-minutes: 30
-        run: python3 scripts/ui-linux-sweep.py --timeout 120 --run "$GITHUB_WORKSPACE/uiharness-runs/sweep"
+        run: python3 scripts/ui-linux-sweep.py --timeout 300 --run "$GITHUB_WORKSPACE/uiharness-runs/sweep"
       # cancelled() too: a job that hits timeout-minutes is cancelled, not failed,
       # and that is when the transcripts matter most.
       - name: Upload the sweep's transcripts and evidence
