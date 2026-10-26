@@ -3000,7 +3000,9 @@ impl Editor {
     /// A list item that had a direct left indent when called and is set to 0
     /// keeps the margin as `w:left="0"`, as Decrease Indent does (#1792); one
     /// with none is left to its level's indent, as the dialog passes 0 back
-    /// for every item it did not change.
+    /// for every item it did not change. An indent written in session counts
+    /// as direct here (an explicit request for the margin), unlike for a
+    /// style-numbered item in Decrease Indent.
     pub fn set_indent(&mut self, left: i32, first_line: i32) {
         let styles = self.styles.clone();
         self.for_each_para(move |pr| {
@@ -7331,6 +7333,16 @@ mod tests {
         ed.set_indent(720, 0);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
         ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1792: `set_indent(0, ..)` asks for the margin, so an indent an Increase
+    /// wrote in session on a style-numbered item counts there.
+    #[test]
+    fn set_indent_zero_counts_an_indent_written_in_session() {
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(720);
+        ed.set_indent(0, 0);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
     }
 
