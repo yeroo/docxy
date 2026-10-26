@@ -28760,7 +28760,8 @@ mod sheet_save_tests {
         for name in ["a[b].xlsx", "a]b.xlsx", "a[b]"]
             .into_iter()
             .map(String::from)
-            .chain("<>?:|*\"".chars().map(|c| format!("a{c}b.xlsx")))
+            // Two letters first: on Windows `a:b` is a path on drive A.
+            .chain("<>?:|*\"".chars().map(|c| format!("ab{c}c.xlsx")))
         {
             let target = sheet_save_target(&dir.path(&name)).unwrap();
             assert_eq!(sheet_save_as_name(&target), Err(SHEET_BAD_NAME), "{name}");

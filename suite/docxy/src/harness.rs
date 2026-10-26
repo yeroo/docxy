@@ -8908,7 +8908,8 @@ mod tests {
         use crate::Kind;
         let base = Path::new("/sandbox/case");
         let ok = |kind, raw: &str| save_as_target(kind, Some(base), None, raw, None, true);
-        for raw in ["a[b]", "a]b.xlsx", "a[b].xlsm", "a:b", "a|b"] {
+        // Not `a:b`: on Windows that is a path on drive A.
+        for raw in ["a[b]", "a]b.xlsx", "a[b].xlsm", "ab:c", "ab|c"] {
             assert_eq!(
                 ok(Kind::Xlsx, raw),
                 Err(crate::SHEET_BAD_NAME.into()),
