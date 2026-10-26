@@ -235,7 +235,8 @@ impl Settings {
     /// The time is `None` for a bare date.
     fn date(&self, text: &str) -> Option<(DateTime, Option<u32>)> {
         let text = text.trim();
-        // A leading weekday name (`Mon 03/02/26`, date formats 9 to 11).
+        // A leading weekday name (`Mon 03/02/26`, MPXJ's date formats 8 and 9;
+        // 10 spells the month and 11 has no date).
         let text = match text.split_once(' ') {
             Some((day, rest)) if day.chars().all(char::is_alphabetic) => rest.trim_start(),
             _ => text,
@@ -852,29 +853,36 @@ impl Reader {
         }
     }
 
-    /// A link entry with its lag in a unit the Predecessors cell grammar
-    /// reads: MPXJ's `emon` becomes `emo`; a working month and a year,
-    /// which the cell does not take, become their minutes (`m`, or `em`
-    /// elapsed). Any other entry is unchanged.
-    fn lag_for_cell(&self, entry: &str) -> String {
-        let lower = entry.to_ascii_lowercase();
-        let unit = lower.trim_end_matches('?').trim_end();
-        let Some(sign) = entry.rfind(['+', '-']) else {
-            return entry.to_string();
+    /// One Predecessors entry: the text the cell grammar reads (the task ID
+    /// and link type, or the whole entry for a `%` lag, its numbers in the
+    /// cell's decimals) and, for any other lag, the lag read here by
+    /// [`Reader::duration`] on the file's own separators, once, signed.
+    /// `None` when the lag does not read: the entry is dropped.
+    fn link_entry(&self, entry: &str) -> Option<LinkEntry> {
+        // The lag starts at the first sign: an ID is digits, a type letters.
+        let Some(sign) = entry.find(['+', '-']) else {
+            return Some(LinkEntry {
+                link: entry.to_string(),
+                lag: None,
+            });
         };
-        if unit.ends_with("emon") {
-            return format!("{}emo{}", &entry[..unit.len() - 4], &entry[unit.len()..]);
+        let lag = entry[sign + 1..].trim();
+        if lag.trim_end_matches('?').trim_end().ends_with('%') {
+            return Some(LinkEntry {
+                link: self.settings.point_decimals(entry),
+                lag: None,
+            });
         }
-        let elapsed = unit.ends_with("ey");
-        if !(elapsed || unit.ends_with("mon") || unit.ends_with('y')) {
-            return entry.to_string();
-        }
-        let Some(lag) = self.duration(&entry[sign + 1..]) else {
-            return entry.to_string();
+        let d = self.duration(lag)?;
+        let minutes = if entry[sign..].starts_with('-') {
+            -d.minutes
+        } else {
+            d.minutes
         };
-        let mark = if lag.format.estimated() { "?" } else { "" };
-        let e = if elapsed { "e" } else { "" };
-        format!("{}{}{e}m{mark}", &entry[..=sign], lag.minutes)
+        Some(LinkEntry {
+            link: entry[..sign].trim_end().to_string(),
+            lag: Some((minutes, d.format)),
+        })
     }
 
     /// The project the records described.
@@ -882,16 +890,17 @@ impl Reader {
         if self.tasks.is_empty() {
             return Err("not an MPX project: no task records".into());
         }
-        // Each task's link entries, split on the delimiter, in the cell
-        // grammar's numbers and units.
-        let link_entries: Vec<Vec<String>> = self
+        // Each task's link entries, split on the delimiter, with their lags
+        // read ([`Reader::link_entry`]).
+        let link_entries: Vec<Vec<LinkEntry>> = self
             .tasks
             .iter()
             .map(|t| {
                 t.predecessors
                     .split(self.delimiter)
-                    .map(|e| self.lag_for_cell(&self.settings.point_decimals(e.trim())))
+                    .map(str::trim)
                     .filter(|e| !e.is_empty())
+                    .filter_map(|e| self.link_entry(e))
                     .collect()
             })
             .collect();
@@ -1010,7 +1019,13 @@ impl Reader {
                     t.outline_level = 0;
                     t.wbs = None;
                 } else {
-                    t.outline_level = t.outline_level.max(1);
+                    // A stated level 0 is Project's umbrella row, the
+                    // project summary (MPXJ: "an invisible task with an
+                    // outline level as zero"), kept as `read_mspdi` keeps it;
+                    // only a row that states no level becomes level 1.
+                    if !raw.has_outline_level {
+                        t.outline_level = 1;
+                    }
                     t.milestone = raw.milestone.unwrap_or(t.duration_min == 0);
                 }
                 t
@@ -1079,10 +1094,14 @@ impl Reader {
             }
             let mut links = Vec::new();
             for entry in &link_entries[i] {
-                let Ok(parsed) = crate::editor::parse_predecessors(entry, &proj) else {
+                let Ok(parsed) = crate::editor::parse_predecessors(&entry.link, &proj) else {
                     continue;
                 };
-                for link in parsed {
+                for mut link in parsed {
+                    if let Some((lag, format)) = entry.lag {
+                        link.lag = lag;
+                        link.lag_format = format;
+                    }
                     if link.uid != proj.tasks[row].uid
                         && !links
                             .iter()
@@ -1126,6 +1145,13 @@ impl Reader {
         }
         Ok(proj)
     }
+}
+
+/// A Predecessors entry: the text the cell grammar parses and the lag read
+/// apart from it (minutes of its kind and the format), if it has one.
+struct LinkEntry {
+    link: String,
+    lag: Option<(i64, LagFormat)>,
 }
 
 /// A record 75 read, before its resource resolves.

@@ -301,24 +301,38 @@ fn predecessors_name_task_ids_with_type_and_lag() {
 
 #[test]
 fn predecessor_lists_split_on_the_header_delimiter_and_lags_take_record_10_decimals() {
-    // A semicolon file, decimal comma: MPXJ joins the list with `;`.
+    // A semicolon file, decimal comma: MPXJ joins the list with `;`. Each
+    // number is read once on the file's separators: `0,5mon` is half of a
+    // 20-day month, not 5 months.
     let project = read_mpx(
         "MPX;Microsoft Project for Windows;4.0;ANSI\r\n10;$;1;2;.;,\r\n\
          60;Name;Predecessors;ID;Unique ID\r\n61;1;70;90;98\r\n\
-         70;A;;1;10\r\n70;B;;2;20\r\n70;C;\"1FS+0,5d;2SS\";3;30\r\n"
+         70;A;;1;10\r\n70;B;;2;20\r\n70;X;;4;40\r\n\
+         70;C;\"1FS+0,5d;2SS;4FS-0,5mon\";3;30\r\n70;D;\"1FS+1,5d;2+50%\";5;50\r\n"
             .as_bytes(),
     )
     .unwrap();
-    let links: Vec<(i32, LinkType, i64)> = project.tasks[2]
-        .predecessors
-        .iter()
-        .map(|p| (p.uid, p.link, p.lag))
-        .collect();
+    let links = |name: &str| -> Vec<(i32, LinkType, i64, i64)> {
+        let task = project.tasks.iter().find(|t| t.name == name).unwrap();
+        task.predecessors
+            .iter()
+            .map(|p| (p.uid, p.link, p.lag, p.lag_format.code()))
+            .collect()
+    };
     assert_eq!(
-        links,
+        links("C"),
         [
-            (10, LinkType::FinishStart, 240),
-            (20, LinkType::StartStart, 0)
+            (10, LinkType::FinishStart, 240, 7),
+            (20, LinkType::StartStart, 0, 7),
+            (40, LinkType::FinishStart, -4800, 11),
+        ]
+    );
+    // A `%` lag still goes through the cell grammar.
+    assert_eq!(
+        links("D"),
+        [
+            (10, LinkType::FinishStart, 720, 7),
+            (20, LinkType::FinishStart, 50, 19),
         ]
     );
     // A comma file with a decimal point keeps reading `0.5d`.
@@ -328,6 +342,63 @@ fn predecessor_lists_split_on_the_header_delimiter_and_lags_take_record_10_decim
     ))
     .unwrap();
     assert_eq!(project.tasks[1].predecessors[0].lag, 240);
+
+    // Project's `mo` and MPXJ's `mon` are both a working month lag.
+    let project = read_mpx(&mpx(
+        "60,Name,Predecessors,ID,Unique ID\r\n61,1,70,90,98\r\n\
+         70,A,,1,10\r\n70,B,1FS+1mo,2,20\r\n70,C,1FS+1mon,3,30\r\n",
+    ))
+    .unwrap();
+    for task in &project.tasks[1..] {
+        let p = &task.predecessors[0];
+        assert_eq!(
+            (p.uid, p.lag, p.lag_format.code()),
+            (10, 9600, 11),
+            "{}",
+            task.name
+        );
+    }
+}
+
+#[test]
+fn a_stated_outline_level_0_row_is_the_project_summary() {
+    // Project's umbrella row: ID 0, UID 0, level 0.
+    let tasks = "70,A,1,2d,,1,1\r\n70,B,1,1d,1,2,2\r\n";
+    let head = "60,Name,Outline Level,Duration,Predecessors,ID,Unique ID\r\n\
+         61,1,3,40,70,90,98\r\n";
+    let with = read_mpx(&mpx(&format!("{head}70,Plan,0,3d,,0,0\r\n{tasks}"))).unwrap();
+    let without = read_mpx(&mpx(&format!("{head}{tasks}"))).unwrap();
+    let summary = &with.tasks[0];
+    assert_eq!((summary.uid, summary.outline_level), (0, 0));
+    assert!(summary.is_project_summary());
+    assert_eq!(
+        with.tasks[1..]
+            .iter()
+            .map(|t| (t.uid, t.outline_level))
+            .collect::<Vec<_>>(),
+        [(1, 1), (2, 1)]
+    );
+    // Hosts hide it as they hide an MSPDI UID 0 summary (#1511).
+    assert_eq!(
+        crate::editor::Editor::new(with.clone()).visible_rows(),
+        [1, 2]
+    );
+    // A row that states no level is still level 1.
+    let levelless = read_mpx(&mpx("61,1,90,98\r\n70,A,1,1\r\n")).unwrap();
+    assert_eq!(levelless.tasks[0].outline_level, 1);
+    // The umbrella row changes no task's schedule.
+    let (a, b) = (
+        crate::schedule::schedule(&with),
+        crate::schedule::schedule(&without),
+    );
+    for uid in [1, 2] {
+        let (x, y) = (a.get(uid).unwrap(), b.get(uid).unwrap());
+        assert_eq!(
+            (x.early_start, x.early_finish),
+            (y.early_start, y.early_finish),
+            "UID {uid}"
+        );
+    }
 }
 
 #[test]
@@ -344,8 +415,8 @@ fn mpxj_month_units_read_as_months() {
     // An elapsed month is 30 days.
     assert_eq!((link.lag, link.lag_format.code()), (30 * 1440, 12));
 
-    // A working month or a year as a lag, which the cell grammar does not
-    // spell, keeps its time in minutes; `emon?` stays an estimated month.
+    // Lags in months and years, which the cell grammar does not spell, are
+    // read by the duration rules; `emon?` stays an estimated month.
     let project = read_mpx(&mpx("60,Name,Duration,Predecessors,ID,Unique ID\r\n\
          61,1,40,70,90,98\r\n70,A,1y,,1,1\r\n70,B,2ey,,2,2\r\n\
          70,C,1d,\"1FS+1mon,2SS-1ey\",3,3\r\n70,D,1d,1FS+1emon?,4,4\r\n"))
@@ -360,7 +431,9 @@ fn mpxj_month_units_read_as_months() {
         .iter()
         .map(|p| (p.uid, p.lag, p.lag_format.code()))
         .collect();
-    assert_eq!(links, [(1, 9600, 3), (2, -365 * 1440, 4)]);
+    // Each lag keeps its own unit: a working month (11), an elapsed year in
+    // elapsed days (8; MSPDI has no year format).
+    assert_eq!(links, [(1, 9600, 11), (2, -365 * 1440, 8)]);
     let d = &project.tasks[3].predecessors[0];
     assert_eq!((d.lag, d.lag_format.code()), (30 * 1440, 44));
 }

@@ -1873,7 +1873,9 @@
   `proj.open`/`proj.reload`).
 - Rows are read by the field ids of the 41/61 record before them; tasks are
   ordered by ID (a row with no ID keeps its place), a row with no name and
-  no outline level is blank, links name task IDs. Dates are whole days: a
+  no outline level is blank, a stated level 0 is kept (Project's umbrella
+  row, the project summary when it is UID 0), links name task IDs and a
+  lag other than `%` is read by the duration rules, not the cell grammar. Dates are whole days: a
   constraint, actual, stop or stored date lands on `editor::day_start` /
   `day_end` of the task calendar by its kind. Start/Finish are only the
   stored dates, never constraints. Enumerations are Project's English words
