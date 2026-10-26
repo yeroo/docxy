@@ -352,6 +352,10 @@ test a swatch gallery draws palette tiles under section headers
   # their headers.
   call window-size {"w":640,"h":800}
   call ribbon-layout {"tab":"View"}
+  shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.settled is true
+  assert reply.groups.-1.state is collapsed
   call ribbon-flyout {"action":"open","group":"Fixture Styles"}
   assert reply.open is true
   assert reply.group is Fixture Styles
