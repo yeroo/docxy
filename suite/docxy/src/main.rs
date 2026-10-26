@@ -37774,9 +37774,9 @@ impl Docxy {
     ) -> AnyElement {
         let g = style_gallery::TILE;
         let geom = ribbon_fit::gallery_geom(gal);
-        let (per_row, _) = ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal), max_w);
-        let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
-        let layout = plugin_ui::gallery_layout(&sections, per_row);
+        let (per_row, _) =
+            ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal, max_w), max_w);
+        let layout = plugin_ui::gallery_rows(gal, max_w, per_row);
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);
@@ -37859,6 +37859,8 @@ impl Docxy {
             .map(|row| match row {
                 plugin_ui::Row::Header(text) => div()
                     .h(px(plugin_ui::HEADER_H))
+                    .w_full()
+                    .overflow_hidden()
                     .text_size(px(g.name_size))
                     .text_color(pal.dim)
                     .whitespace_nowrap()

@@ -1671,7 +1671,11 @@
   longest run: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
   both wrap by, so the estimate is the width drawn). Height is
   `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
-  A palette tile shows no label, its label is the tooltip.
+  A palette tile shows no label, its label is the tooltip. Sections show in
+  the flyout (expanded) copy only: in place (`max_w` None) a group is one
+  fixed-height strip, so `gallery_span`/`gallery_rows` give every tile on one
+  row with no headers, exactly as before sections; a header is clipped to the
+  gallery's width.
 - `ribbon-read` adds `section` and, on a palette tile, `palette` and `marks`.
   The fixture's `fixture.styles` gallery (group "Fixture Styles", last on the
   View tab) has two sections; `project-plugin-ui.uit` reads it and shoots it

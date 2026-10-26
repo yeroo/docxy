@@ -379,7 +379,7 @@ pub(crate) fn model_control_w<A: 'static>(
         Control::Gallery(gal) => {
             gallery_row(
                 gallery_geom(gal),
-                crate::plugin_ui::gallery_span(gal),
+                crate::plugin_ui::gallery_span(gal, max_w),
                 max_w,
             )
             .1

@@ -2234,13 +2234,18 @@ fn a_gallery_lays_out_a_header_per_section_and_wraps_inside_it() {
 }
 
 #[test]
-fn a_sectioned_gallerys_estimate_is_the_width_and_height_it_draws() {
+fn a_gallery_in_place_is_one_strip_and_its_flyout_shows_the_sections() {
     let gal = tile_gallery();
-    assert_eq!(gallery_span(&gal), 3, "the longest section run");
     let t = crate::style_gallery::TILE;
     let tw = ribbon_fit::approx_tw;
+    let n = gal.items.len();
+    // In place: every tile on one row, no headers, 62 px high.
+    assert_eq!(gallery_span(&gal, None), n);
+    let rows = gallery_rows(&gal, None, n);
+    assert_eq!(rows, [Row::Tiles(0, n)]);
+    assert_eq!(layout_height(&rows, t.h, t.gap), t.h);
     let control = Control::Gallery(gal);
-    let drawn = 3. * t.w + 2. * t.gap;
+    let drawn = n as f32 * t.w + (n as f32 - 1.) * t.gap;
     assert_eq!(
         ribbon_fit::model_control_w(&control, false, None, &tw),
         drawn
@@ -2248,14 +2253,43 @@ fn a_sectioned_gallerys_estimate_is_the_width_and_height_it_draws() {
     let Control::Gallery(gal) = &control else {
         unreachable!()
     };
-    // Narrowed to two tiles, the drawn width follows the same span.
-    let (k, w) =
-        ribbon_fit::gallery_row(ribbon_fit::gallery_geom(gal), gallery_span(gal), Some(140.));
+    // In a flyout: the longest section run wraps and the headers are drawn.
+    assert_eq!(gallery_span(gal, Some(400.)), 3);
+    let flyout = ribbon_fit::model_control_w(&control, false, Some(400.), &tw);
+    assert_eq!(flyout, 3. * t.w + 2. * t.gap);
+    let (k, w) = ribbon_fit::gallery_row(
+        ribbon_fit::gallery_geom(gal),
+        gallery_span(gal, Some(140.)),
+        Some(140.),
+    );
     assert_eq!((k, w), (2, 2. * t.w + t.gap));
-    let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
-    let rows = gallery_layout(&sections, k);
-    // 2 headers, 2 + 1 tile rows of Scheduling, 1 of Presentation (2 tiles).
+    let rows = gallery_rows(gal, Some(140.), k);
+    // 2 headers, 2 tile rows of Scheduling (3 -> 2 + 1), 1 of Presentation.
     assert_eq!(rows.len(), 2 + 2 + 1);
     let expect = 3. * t.h + 2. * HEADER_H + 4. * t.gap;
     assert_eq!(layout_height(&rows, t.h, t.gap), expect);
+}
+
+#[test]
+fn a_palette_tiles_link_leaves_the_on_track_bar_under_the_diamond() {
+    let (w, h) = tile_body();
+    let marks = palette_tile_marks(&blue(), w, h);
+    let bar = marks.iter().find(|m| m.color == 0x3366CC).unwrap();
+    let link = marks.iter().find(|m| m.color == LINK_COLOR).unwrap();
+    let dia = marks
+        .iter()
+        .find(|m| m.shape == MarkShape::Diamond)
+        .unwrap();
+    assert!(
+        link.x >= bar.x + bar.w - 1. && link.x <= bar.x + bar.w,
+        "the link touches the bar's right end: {link:?} vs {bar:?}"
+    );
+    assert!(
+        (dia.x + dia.w / 2. - link.x).abs() <= 1.,
+        "{dia:?} {link:?}"
+    );
+    assert!(link.y >= bar.y + bar.h && link.y + link.h <= dia.y + 1.);
+    for m in &marks {
+        assert!(m.x >= 0. && m.x + m.w <= w && m.y + m.h <= h, "{m:?}");
+    }
 }

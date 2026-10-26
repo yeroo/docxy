@@ -60,9 +60,13 @@ pub(crate) fn palette_tile_marks(palette: &Palette, w: f32, h: f32) -> Vec<Mark>
     let manual_y = unit;
     let track_y = 2. * unit;
     let dia = (unit * 0.9).floor().max(4.);
-    let end = (right - dia).max(left + 4.);
+    let track_x = left + (w * 0.2).floor();
+    let track_w = (w * 0.55).floor() - 2.;
+    // The link leaves the on-track bar's right end and the diamond hangs
+    // centred on it, all inside the box.
+    let link_x = (track_x + track_w - 1.).min(w - (dia / 2.).ceil() - 1.);
+    let end = link_x - (dia / 2.).floor();
     let dia_y = (h - dia).max(track_y + bar_h);
-    let link_x = end + (dia / 2.).floor();
     vec![
         rect(left, 0., right - left, bracket_h, summary),
         rect(left, 0., post, bracket_h + bar_h, summary),
@@ -75,9 +79,9 @@ pub(crate) fn palette_tile_marks(palette: &Palette, w: f32, h: f32) -> Vec<Mark>
             tile_color(palette, "manual"),
         ),
         rect(
-            left + (w * 0.2).floor(),
+            track_x,
             track_y,
-            (w * 0.55).floor() - 2.,
+            track_w,
             bar_h,
             tile_color(palette, "on-track"),
         ),

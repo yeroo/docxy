@@ -321,7 +321,7 @@ test a Bold toggle styles the selected cell and reads its state from the view's 
 
 test a swatch gallery draws palette tiles under section headers
   # #1761: the "Fixture Styles" group (last on the View tab) has six swatches in two
-  # sections; a swatch whose preview names a palette is a palette tile (marks
+  # sections (headers show in its flyout only); a swatch whose preview names a palette is a palette tile (marks
   # counted), one with only a colour is the flat tile.
   open copy:../fixtures/project-clipboard.xml
   call ribbon-read {}
@@ -338,7 +338,24 @@ test a swatch gallery draws palette tiles under section headers
   assert reply.tabs.5.groups.-1.commands.4.section is Presentation Styles
   assert reply.tabs.5.groups.-1.commands.4.checked is false
   assert reply.tabs.5.groups.-1.commands.1.checked is true
+  # In place the group is one 62 px strip of six tiles, no headers; the width
+  # drawn is the estimate (estimates_ok), and nothing is clipped.
+  call ribbon-layout {"tab":"View"}
   shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.settled is true
+  assert reply.estimates_ok is true
+  assert reply.any_clipped is false
+  # Narrow, the group collapses; its flyout draws the two sections under
+  # their headers.
+  call window-size {"w":640,"h":800}
+  call ribbon-layout {"tab":"View"}
+  call ribbon-flyout {"action":"open","group":"Fixture Styles"}
+  assert reply.open is true
+  assert reply.group is Fixture Styles
+  shot window
+  shot ribbon-flyout
+  call ribbon-flyout {"action":"close"}
 
 test a swatch sets the plan's palette (an edit) and the gallery follows
   open copy:../fixtures/project-clipboard.xml
