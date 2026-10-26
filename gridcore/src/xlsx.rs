@@ -125,8 +125,9 @@ pub struct SheetPackage {
     /// Kept as ids, since a table added later may take a freed id.
     removed_table_ids: Vec<u32>,
     /// `(sheetId, name)` of the pivots a removal took out: the save drops the
-    /// pivot slicer and timeline caches over them (#1797). Cleared for a pair
-    /// a pivot added later takes.
+    /// pivot slicer and timeline caches over them (#1797). A pivot added or
+    /// re-registered later under the same pair has a cache of its own, which
+    /// the old caches never filtered, so the pair stays noted.
     removed_pivots: Vec<(String, String)>,
     /// The editable workbook. Mutate it, then [`save_xlsx`].
     pub workbook: Workbook,
@@ -11088,13 +11089,6 @@ impl SheetPackage {
             &format!("../pivotTables/pivotTable{n}.xml"),
         );
 
-        // A pair a removal noted is this pivot's now: the caches that named
-        // the old one must not be struck over it at the save.
-        if let Some(id) = self.sheet_id_of(dest_sheet) {
-            let name = format!("PivotTable{n}");
-            self.removed_pivots
-                .retain(|(t, p)| !(*t == id && *p == name));
-        }
         self.workbook.pivots.push(crate::pivot::Pivot {
             name: format!("PivotTable{n}"),
             sheet: dest_sheet,
@@ -11199,8 +11193,11 @@ impl SheetPackage {
                 self.removed_pivots.push(key);
             }
         }
+        // Another pivot may share the cache (one `cacheId`): it keeps the
+        // cache part, its override, the workbook's relationship and entry.
+        let shared = (self.workbook.pivots.iter()).any(|q| q.cache_part == piv.cache_part);
         self.parts
-            .retain(|(n, _)| *n != piv.part && *n != piv.cache_part);
+            .retain(|(n, _)| *n != piv.part && (shared || *n != piv.cache_part));
         if let Some(p) = self
             .parts
             .iter_mut()
@@ -11208,7 +11205,11 @@ impl SheetPackage {
         {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.part));
-            let xml = remove_element_containing(&xml, "<Override", &format!("/{}", piv.cache_part));
+            let xml = if shared {
+                xml
+            } else {
+                remove_element_containing(&xml, "<Override", &format!("/{}", piv.cache_part))
+            };
             p.1 = xml.into_bytes();
         }
         // workbook.xml.rels: drop the cache relationship, remembering its rId.
@@ -11216,7 +11217,10 @@ impl SheetPackage {
         let wb_rels = rels_part_name(&wb_part);
         let wb_dir = workbook_dir(&self.parts);
         let mut cache_rid = String::new();
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == wb_rels) {
+        if let Some(p) = (self.parts.iter_mut())
+            .filter(|_| !shared)
+            .find(|(n, _)| *n == wb_rels)
+        {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
             // The rel whose Target resolves to the cache part, however the
             // file spells it (`../pivotCache/…`, `/xl/pivotCache/…`).
@@ -20069,6 +20073,31 @@ b",
         preload(&pkg)
     }
 
+    /// The package with a second pivot, also named `PivotTable1`, on Data
+    /// (sheetId 1), sharing the first one's cache (`cacheId` 1).
+    fn with_pivot_on_data(mut pkg: SheetPackage) -> SheetPackage {
+        let table = ptext(&pkg, "xl/pivotTables/pivotTable1.xml").replace("A3:B5", "E3:F5");
+        pkg.parts
+            .push(("xl/pivotTables/pivotTable2.xml".into(), table.into_bytes()));
+        let rels = ptext(&pkg, "xl/worksheets/_rels/sheet1.xml.rels").replace(
+            "</Relationships>",
+            r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable2.xml"/></Relationships>"#,
+        );
+        let at = pkg
+            .parts
+            .iter()
+            .position(|(n, _)| n == "xl/worksheets/_rels/sheet1.xml.rels")
+            .unwrap();
+        pkg.parts[at].1 = rels.into_bytes();
+        let pkg = preload(&pkg);
+        assert_eq!(pkg.workbook.pivots.len(), 2, "both pivots load");
+        assert_eq!(
+            pkg.workbook.pivots[0].cache_part,
+            pkg.workbook.pivots[1].cache_part
+        );
+        pkg
+    }
+
     /// Everything of the pivot slicer fixture that still exists.
     fn pivot_slicer_leftovers(pkg: &SheetPackage) -> Vec<&'static str> {
         let mut out = Vec::new();
@@ -20172,11 +20201,16 @@ b",
 
     #[test]
     fn a_cache_over_a_pivot_that_stays_loses_only_the_removed_entry() {
-        // The caches also filter Data's `PivotTable1`, which stays: the same
-        // name on another sheet is another pivot.
-        let mut pkg = pivot_slicer_package(&[("2", "PivotTable1"), ("1", "PivotTable1")]);
+        // The caches also filter Data's `PivotTable1`, a real pivot sharing
+        // the cache that stays: the same name on another sheet is another
+        // pivot.
+        let mut pkg = with_pivot_on_data(pivot_slicer_package(&[
+            ("2", "PivotTable1"),
+            ("1", "PivotTable1"),
+        ]));
         assert!(pkg.remove_sheet(1));
         let re = preload(&pkg);
+        assert_eq!(re.workbook.pivots.len(), 1);
         let slicer = ptext(&re, "xl/slicerCaches/slicerCache1.xml");
         let timeline = ptext(&re, "xl/timelineCaches/timelineCache1.xml");
         for xml in [&slicer, &timeline] {
@@ -20193,6 +20227,31 @@ b",
             "{:?}",
             pivot_slicer_leftovers(&re)
         );
+    }
+
+    #[test]
+    fn removing_a_pivot_keeps_a_cache_another_pivot_shares() {
+        let mut pkg = with_pivot_on_data(pivot_slicer_package(&[("1", "PivotTable1")]));
+        let report = pkg
+            .workbook
+            .pivots
+            .iter()
+            .position(|p| p.sheet == 1)
+            .unwrap();
+        let cache = pkg.workbook.pivots[report].cache_part.clone();
+        assert!(pkg.remove_pivot(report));
+        assert!(pkg.part(&cache).is_some(), "the shared cache part stays");
+        let rels = ptext(&pkg, "xl/_rels/workbook.xml.rels");
+        assert!(rels.contains("pivotCacheDefinition1.xml"), "{rels}");
+        assert!(ptext(&pkg, "xl/workbook.xml").contains("<pivotCache "));
+        let re = preload(&pkg);
+        assert_eq!(re.workbook.pivots.len(), 1, "the other pivot still loads");
+        assert!(re.part(&cache).is_some());
+        // The last one out takes the cache with it.
+        let mut re = re;
+        assert!(re.remove_pivot(0));
+        assert!(re.part(&cache).is_none());
+        assert!(!ptext(&re, "xl/_rels/workbook.xml.rels").contains("pivotCacheDefinition1"));
     }
 
     #[test]
@@ -20227,7 +20286,7 @@ b",
     }
 
     #[test]
-    fn a_pivot_added_over_a_removed_ones_name_is_not_struck() {
+    fn a_pivot_added_over_a_removed_ones_name_does_not_save_the_old_caches() {
         let mut pkg = pivot_slicer_package(&[("2", "PivotTable1")]);
         assert!(pkg.remove_pivot(0));
         assert_eq!(
@@ -20252,9 +20311,10 @@ b",
             )
             .expect("add_pivot");
         assert_eq!(pkg.workbook.pivots[idx].name, "PivotTable1");
-        assert!(pkg.removed_pivots.is_empty());
+        // The new pivot has a cache of its own: the old caches stay noted.
+        assert_eq!(pkg.removed_pivots.len(), 1);
         let re = preload(&pkg);
-        assert!(re.part("xl/slicerCaches/slicerCache1.xml").is_some());
+        assert_eq!(pivot_slicer_leftovers(&re), Vec::<&str>::new());
     }
 
     #[test]

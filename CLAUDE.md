@@ -1832,20 +1832,22 @@
 
 - `remove_pivot` notes the pivot as `(sheetId, name)` in
   `SheetPackage::removed_pivots` (sheetId of its sheet's `<sheet>`, name from
-  its table part; neither found means nothing is noted), and `remove_sheet`
+  its table part; either not found means nothing is noted), and `remove_sheet`
   goes through it. The save runs `drop_pivot_slicers` right after
   `drop_table_slicers`: a cache in `xl/slicerCaches` or `xl/timelineCaches`
   whose `<pivotTables><pivotTable tabId name/>` entries are all noted goes with
   its slicers or timelines (`SlicerKind`: `SLICERS`, `TIMELINES`; part, sheet
   and workbook ext entries, `tle:timeslicer` anchors, relationship, defined
   name), through the `drop_slicer_caches` shared with tables; a cache that
-  also filters a pivot that stays only loses the noted entries. `add_pivot`
-  clears a noted pair its new pivot takes. Synthetic fixtures only, as for
+  also filters a pivot that stays only loses the noted entries. A pivot added later under a
+  noted pair keeps it noted (its cache is its own). `remove_pivot` keeps the
+  cache part, override, workbook rel and `<pivotCache>` entry while another
+  pivot shares the cache. Synthetic fixtures only, as for
   table slicers; restoring slicers on a sheet restore is not done.
 - The `Slicer_<name>` name of a dropped slicer cache stays in
   `Workbook::defined_names` until a reload (the file is right on every save).
-  The suite's Go To leaves `Slicer_` and `NativeTimeline_` names out of its
-  list.
+  The suite's Go To leaves `Slicer_` and `NativeTimeline_` names whose formula
+  is `#N/A` out of its list (a user's own name over a range stays).
 
 ## Sheet hyperlinks in .xls, and file URI forms (#1726)
 
