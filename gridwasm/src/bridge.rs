@@ -3588,6 +3588,7 @@ impl Session {
         if !ghosts_only {
             let holding: Vec<String> = self.removed_sheet_stashes[k + 1..]
                 .iter()
+                .rev()
                 .filter(|st| !st.tables.is_empty())
                 .map(|st| format!("\"{}\"", st.name))
                 .collect();
@@ -7857,6 +7858,33 @@ mod tests {
             s.pkg.workbook.tables[0].calculated_formulas,
             vec![None, Some("B!A1*2".to_string())]
         );
+    }
+
+    /// #1795 r5: the sheets to restore first are named latest-removed first,
+    /// the order that works.
+    #[test]
+    fn ctl_sheet_restore_removed_refusal_names_the_table_sheets_latest_first_1795() {
+        let mut s = abc_session();
+        for sheet in [2, 3] {
+            s.pkg
+                .add_table(sheet, (0, 0, 1, 1), true, "TableStyleLight1")
+                .expect("table");
+        }
+        for name in ["A", "B", "C"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let out = restore(&mut s, "A");
+        assert!(
+            out.contains(r#"restore \"C\", \"B\" first, they hold tables"#),
+            "{out}"
+        );
+        for name in ["C", "B", "A"] {
+            let out = restore(&mut s, name);
+            assert!(out.contains("\"ok\":true"), "{name}: {out}");
+        }
+        assert_eq!(s.pkg.workbook.tables.len(), 2);
     }
 
     /// #1795 r3: a table a non-top restore brings back is live when the

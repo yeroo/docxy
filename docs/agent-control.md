@@ -960,7 +960,10 @@ worth knowing:
   sheet removed after it holds a table: restore those first, latest first
   (the error names them). The cells then recalculate. Every restore clears the undo/redo
   history, as `sheet.remove` itself does.
-- **Agent sheet-removals are undoable in any order.** The restore is
+- **Agent sheet-removals are undoable in any order**, except that an
+  out-of-order undo is refused (`cannot restore …`, nothing changed) while a
+  sheet removed after it holds a table (restore that one first) or has the
+  same name. The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
   first. An undo out of order (a removal with later ones still stashed, as
