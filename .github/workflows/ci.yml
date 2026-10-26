@@ -202,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     # No DOCXY_BUILD_KIND here on purpose: build-info.uit asserts this sweep's suite
     # reports kind `local` (and so a manual build), the one kind only a hand build has (#1023).
-    # Two cold release builds come first; the sweep itself took 105 s locally.
+    # Two cold release builds come first; the sweep itself takes ~14 min on the runner (run 40136693640).
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -226,8 +226,11 @@ jobs:
         run: cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture
       - name: Sweep runner unit tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
-      # A per-script --timeout turns a hang into an ERROR row with a summary written,
-      # well inside the step's limit. The slowest scripts take 84-87 s on this runner
+      # A per-script --timeout turns a hang into an ERROR row. Scripts run in
+      # sequence and a healthy sweep takes ~14 of the step's 30 min (run 40136693640:
+      # 13m41s), so about three 300 s hangs fit; past that the summary is written only
+      # if the cancel reaches the sweep as KeyboardInterrupt (ui-linux-sweep.py), and
+      # the transcripts upload either way. The slowest scripts take 84-87 s on this runner
       # (inputs-typing-sheet-data, inputs-typing-doc-layout; run 40136693640), so 300 s
       # leaves over 3x headroom for a slower day (Windows gets 420, #1785).
       - name: Sweep
