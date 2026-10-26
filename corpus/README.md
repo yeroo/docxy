@@ -14,6 +14,10 @@ and to drive the corpus verify sweeps.
   compares the RTF, HTML and PDF importers against. Made by
   `tools/gen_word_import.ps1`, which needs a real, human-attended Word; see
   [`word-import/README.md`](word-import/README.md).
+- `mspdi/` — the self-oracling MSPDI scheduling corpus (see its README), and
+  `mpx/` — MPXJ's MPX of each of those files, in three date orders, the oracle
+  of `projcore`'s MPX reader (#309, [`mpx/README.md`](mpx/README.md)); made by
+  `tools/gen_mpx_corpus.py`.
 - `tools/classify.py`, `tools/classify_xlsx.py` — regenerate the manifests by
   scanning each file's parts/XML.
 - `tools/fetch-corpus.sh` / `.ps1` — fetch or update the third-party corpus

@@ -536,7 +536,7 @@ mod tests {
         use projcore::formats::{ProjectFormat, Registry};
         let mut registry = Registry::new();
         registry.register(Box::new(MppImport));
-        assert_eq!(registry.open_extensions(), ["yppx", "xml", "mpp"]);
+        assert_eq!(registry.open_extensions(), ["yppx", "xml", "mpx", "mpp"]);
         assert_eq!(registry.save_extensions(), ["yppx", "xml"]);
         assert!(registry.writer("mpp").is_none());
         let path = std::path::Path::new("plan.MPP");

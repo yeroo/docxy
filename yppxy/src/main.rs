@@ -9,8 +9,9 @@
 //!
 //! Usage:
 //!   yppxy                              start a new schedule
-//!   yppxy <file.(xml|yppx|mpp)>        open MSPDI XML, a .yppx package, or a
+//!   yppxy <file.(xml|yppx|mpp|mpx)>    open MSPDI XML, a .yppx package, a
 //!                                      legacy .mpp (validated task tables)
+//!                                      or an MPX text file
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --report-md <report> <out.md>
 //!                                      headless: export a View Report
@@ -128,14 +129,14 @@ fn main() -> ExitCode {
         Err(m) => {
             eprintln!("{m}");
             eprintln!(
-                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
+                "usage: yppxy [file.(xml|yppx|mpp|mpx)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
             );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
         println!(
-            "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
+            "usage: yppxy [file.(xml|yppx|mpp|mpx)] [--gantt-md <out>] [--report-md <report> <out>] [--command <id>] [--save <out.(yppx|xml)>] | --version (-V)"
         );
         return ExitCode::SUCCESS;
     }
@@ -305,8 +306,9 @@ fn load(path: &str) -> Result<Project, String> {
     read_file(formats::global().registry, path).map(|(project, _)| project)
 }
 
-/// Read the project at `path` by its extension's reader (`.yppx`, `.mpp`, a
-/// plugin's type; anything else is MSPDI), with the file's bytes.
+/// Read the project at `path` by its extension's reader (`.yppx`, `.mpp`,
+/// `.mpx`, a plugin's type; anything else is MPX by its header, else
+/// MSPDI), with the file's bytes.
 fn read_file(registry: &Registry, path: &str) -> Result<(Project, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let mut project = registry.read(Path::new(path), &bytes)?;

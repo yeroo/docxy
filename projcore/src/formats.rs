@@ -1,8 +1,9 @@
 //! The file formats a host opens and saves project schedules in.
 //!
 //! A [`ProjectFormat`] reads and/or writes one or more file extensions. A
-//! [`Registry`] starts with the two built-in formats, the native `.yppx`
-//! package ([`Yppx`]) and MSPDI XML `.xml` ([`Mspdi`]); a host registers
+//! [`Registry`] starts with the built-in formats, the native `.yppx`
+//! package ([`Yppx`]), MSPDI XML `.xml` ([`Mspdi`]) and the read-only MPX
+//! import `.mpx` ([`Mpx`]); a host registers
 //! more: `mppread`'s read-only `.mpp` import, and the format plugins
 //! `plugin::load_plugins` finds (behind the `plugins` feature, so the
 //! default build stays dependency-free). The registry is what the Open
@@ -11,6 +12,7 @@
 //! ([`Registry::save_target`]) consult.
 
 use crate::model::Project;
+use crate::mpx::{is_mpx, read_mpx};
 use crate::mspdi::{read_mspdi, write_mspdi};
 use crate::yppx::{read_yppx, write_yppx};
 use std::path::{Path, PathBuf};
@@ -108,6 +110,32 @@ impl ProjectFormat for Mspdi {
     }
 }
 
+/// MPX ([`crate::mpx`]), the text interchange format: read, never written,
+/// so a plan opened from it is an import that saves through Save As.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Mpx;
+
+impl ProjectFormat for Mpx {
+    fn extensions(&self) -> &[&str] {
+        &["mpx"]
+    }
+    fn label(&self) -> &str {
+        "MPX"
+    }
+    fn reads(&self) -> bool {
+        true
+    }
+    fn writes(&self) -> bool {
+        false
+    }
+    fn read(&self, bytes: &[u8]) -> Result<Project, String> {
+        read_mpx(bytes)
+    }
+    fn write(&self, _project: &Project, _source: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        Err("MPX files can be opened but not saved".into())
+    }
+}
+
 /// One extension the registry knows: the formats that read and write it.
 struct Slot {
     ext: String,
@@ -135,7 +163,8 @@ impl Default for Registry {
 }
 
 impl Registry {
-    /// The built-in formats: `.yppx` ([`Yppx`]) and `.xml` ([`Mspdi`]).
+    /// The built-in formats: `.yppx` ([`Yppx`]), `.xml` ([`Mspdi`]) and the
+    /// `.mpx` import ([`Mpx`]).
     pub fn new() -> Registry {
         let mut registry = Registry {
             formats: Vec::new(),
@@ -143,6 +172,7 @@ impl Registry {
         };
         registry.register(Box::new(Yppx));
         registry.register(Box::new(Mspdi));
+        registry.register(Box::new(Mpx));
         registry
     }
 
@@ -305,8 +335,10 @@ impl Registry {
     }
 
     /// Read the file at `path` from its `bytes` with the reader of its
-    /// extension. A file whose extension no format claims is read as MSPDI
-    /// XML, as the hosts always have; one only a writer claims is refused.
+    /// extension. A file whose extension no format claims is read as MPX
+    /// when it starts with an MPX header ([`crate::mpx::is_mpx`]), else as
+    /// MSPDI XML, as the hosts always have; one only a writer claims is
+    /// refused.
     pub fn read(&self, path: &Path, bytes: &[u8]) -> Result<Project, String> {
         let ext = extension(path);
         match self.reader(ext) {
@@ -317,6 +349,7 @@ impl Registry {
                     format.label(),
                     normalize(ext)
                 )),
+                None if is_mpx(bytes) => read_mpx(bytes),
                 None => Mspdi.read(bytes),
             },
         }
@@ -421,7 +454,7 @@ mod tests {
     #[test]
     fn built_ins_read_and_write_yppx_and_xml() {
         let registry = Registry::new();
-        assert_eq!(registry.open_extensions(), ["yppx", "xml"]);
+        assert_eq!(registry.open_extensions(), ["yppx", "xml", "mpx"]);
         assert_eq!(registry.save_extensions(), ["yppx", "xml"]);
         assert_eq!(
             registry.save_types(),
@@ -445,6 +478,61 @@ mod tests {
         );
         assert_eq!(registry.for_extension(".XML").unwrap().label(), "MSPDI");
         assert!(registry.for_extension("mpp").is_none());
+    }
+
+    /// The MPX of `corpus/mpx/02-link-fs.mpx`, cut to what a read needs.
+    const MPX: &[u8] = b"MPX,Microsoft Project for Windows,4.0,ANSI\r\n\
+        60,Name,Duration,ID,Unique ID\r\n61,1,40,90,98\r\n\
+        70,A,2d,1,1\r\n70,B,2d,2,2\r\n";
+
+    #[test]
+    fn mpx_is_a_built_in_import() {
+        let registry = Registry::new();
+        let format = registry.for_extension("MPX").unwrap();
+        assert_eq!(format.label(), "MPX");
+        assert!(format.reads() && !format.writes());
+        assert!(registry.writer("mpx").is_none());
+        assert!(!registry.has_extra_writers());
+        let project = registry.read(Path::new("plan.Mpx"), MPX).unwrap();
+        let names: Vec<&str> = project.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["A", "B"]);
+        // Nothing writes it: a save to .mpx is refused like any unwritable type.
+        assert_eq!(
+            registry.save_target(Path::new("plan.mpx")).unwrap_err(),
+            REFUSAL
+        );
+        assert_eq!(registry.default_save_extension(Some("mpx")), "yppx");
+        // An .mpx whose bytes are not MPX fails as MPX, never as MSPDI.
+        let xml = write_mspdi(&Project::default());
+        assert!(
+            registry
+                .read(Path::new("plan.mpx"), xml.as_bytes())
+                .unwrap_err()
+                .contains("MPX")
+        );
+    }
+
+    #[test]
+    fn an_unclaimed_extension_with_an_mpx_header_reads_as_mpx() {
+        let registry = Registry::new();
+        let semicolons = String::from_utf8(MPX.to_vec()).unwrap().replace(',', ";");
+        let bom = [b"\xEF\xBB\xBF".as_slice(), MPX].concat();
+        for bytes in [MPX, semicolons.as_bytes(), bom.as_slice()] {
+            for name in ["plan.txt", "plan", "plan.mpp"] {
+                let project = registry.read(Path::new(name), bytes).unwrap();
+                assert_eq!(project.tasks.len(), 2, "{name}");
+            }
+        }
+        // `MPX` followed by anything but `,` or `;` is not the header: the
+        // bytes go to MSPDI with today's error.
+        for bytes in [b"MPX".as_slice(), b"MPXJ,1", b"MPX 1", b"mpx,1", b" MPX,1"] {
+            assert_eq!(
+                registry.read(Path::new("plan.txt"), bytes).unwrap_err(),
+                "not an MSPDI document: expected <Project> root",
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
     }
 
     #[test]
@@ -494,7 +582,7 @@ mod tests {
         registry.register(named(&["fakeproj", ".FP2"], "Fake", true, true));
         assert_eq!(
             registry.open_extensions(),
-            ["yppx", "xml", "mpp", "fakeproj", "fp2"]
+            ["yppx", "xml", "mpx", "mpp", "fakeproj", "fp2"]
         );
         assert_eq!(
             registry.save_extensions(),
@@ -528,7 +616,7 @@ mod tests {
             registry.write(&project, mpp, None).unwrap(),
             b"Plugin:P:none"
         );
-        assert_eq!(registry.open_extensions()[2], "mpp");
+        assert_eq!(registry.open_extensions()[3], "mpp");
         assert_eq!(
             registry.save_extensions(),
             ["yppx", "xml", "mpp", "fakeproj", "fp2"]

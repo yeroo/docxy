@@ -27,6 +27,11 @@ mod effort;
 mod fields;
 mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
+// Re-entering a task's cell goes through `parse_task_predecessors`, which
+// keeps links shown in a fallback unit; the plain parser stays in the crate
+// (the tests and the MPX reader).
+pub(crate) use cells::parse_predecessors;
+use cells::{bracket_units, parse_resource_token, same_shown_units};
 pub use cells::{
     day_end, day_finish, day_start, format_duration_exact, format_lag, format_link_id,
     format_predecessors, format_resource_names, parse_cell_date, parse_lag,
@@ -41,11 +46,6 @@ pub use fields::{
     SymbolPosition, field_names, format_date_field, format_project_date, task_mode_name,
 };
 pub(crate) use fields::{format_work, two_decimals};
-// Re-entering a task's cell goes through `parse_task_predecessors`, which
-// keeps links shown in a fallback unit; the plain parser stays internal.
-#[cfg(test)]
-use cells::parse_predecessors;
-use cells::{bracket_units, parse_resource_token, same_shown_units};
 mod display;
 mod leveling;
 mod moving;
