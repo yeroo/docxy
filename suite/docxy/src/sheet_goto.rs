@@ -100,6 +100,14 @@ fn default_ok(mut d: Dialog) -> Dialog {
     d
 }
 
+/// A name Go To does not list: Excel's built-ins and the `Slicer_` /
+/// `NativeTimeline_` names of slicers and timelines (#1797), which are not
+/// places to go to, and which a dropped table slicer leaves in the model
+/// until the file is reloaded.
+fn hidden_name(name: &str) -> bool {
+    name.starts_with("_xlnm") || name.starts_with("Slicer_") || name.starts_with("NativeTimeline_")
+}
+
 /// Go To: the defined names, a Reference box and Special….
 pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
     let v = sheet_view(tab)?;
@@ -121,7 +129,7 @@ pub(crate) fn goto_dialog(tab: &DocTab) -> Result<Dialog, String> {
         .workbook
         .defined_names
         .iter()
-        .filter(|n| n.scope.is_none_or(|s| s == v.active) && !n.name.starts_with("_xlnm"))
+        .filter(|n| n.scope.is_none_or(|s| s == v.active) && !hidden_name(&n.name))
         .map(|n| n.name.clone())
         .collect();
     d.controls = vec![
@@ -462,6 +470,30 @@ mod tests {
         set(&mut t, "names", Value::Choice(Some(0)));
         assert_eq!(click(&mut t, "OK"), Some(Ok(())));
         assert_eq!(view(&mut t).sel, at("D9"));
+    }
+
+    #[test]
+    fn go_to_leaves_slicer_and_timeline_names_out() {
+        let mut t = tab();
+        for name in [
+            "Slicer_Item",
+            "NativeTimeline_Date",
+            "Rate",
+            "_xlnm.Print_Area",
+        ] {
+            view(&mut t)
+                .pkg
+                .workbook
+                .defined_names
+                .push(gridcore::sheet::DefinedName {
+                    name: name.into(),
+                    scope: None,
+                    formula: "Sheet1!$D$9".into(),
+                });
+        }
+        t.dialogs.push(goto_dialog(&t).unwrap());
+        let names = &t.dialogs.top().unwrap().controls[0];
+        assert_eq!(names.items, vec!["Rate".to_string()]);
     }
 
     /// #707 r6 m2: Enter and Escape on Go To and Go To Special press
