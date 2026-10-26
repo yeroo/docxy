@@ -504,7 +504,8 @@ fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
 /// [`save_types`]). The extension rules are the app's own:
 /// `sheet_save_target`, the project formats registry's `save_target` (the
 /// built-ins and any type a format plugin writes), and [`doc_save_format`].
-/// `format`, when given, must be one the tab kind saves and must agree with
+/// A workbook target also passes `sheet_save_as_name`, the name Excel's Save
+/// As refuses (#804). `format`, when given, must be one the tab kind saves and must agree with
 /// an explicit extension.
 fn save_as_target(
     kind: crate::Kind,
@@ -569,6 +570,8 @@ fn save_as_target(
     let (path, written) = match kind {
         Kind::Xlsx => {
             let path = crate::sheet_save_target(&path)?;
+            // Excel's name and length rule (#804), before "already exists".
+            crate::sheet_save_as_name(&path)?;
             // The target keeps a workbook extension: its kind is the format.
             let written =
                 gridcore::xlsx::SpreadsheetKind::from_path(&path).map_or("xlsx", |k| k.extension());
@@ -8895,6 +8898,37 @@ mod tests {
             docs.len() + 1
         );
         assert!(save_types(Kind::Look, true, None).is_err());
+    }
+
+    /// #804: a workbook's `save-as` refuses the names Excel's Save As does,
+    /// the `.xlsx` it adds counted in the 218-character path; a document
+    /// keeps its brackets.
+    #[test]
+    fn save_as_refuses_a_workbook_name_excel_refuses() {
+        use crate::Kind;
+        let base = Path::new("/sandbox/case");
+        let ok = |kind, raw: &str| save_as_target(kind, Some(base), None, raw, None, true);
+        for raw in ["a[b]", "a]b.xlsx", "a[b].xlsm", "a:b", "a|b"] {
+            assert_eq!(
+                ok(Kind::Xlsx, raw),
+                Err(crate::SHEET_BAD_NAME.into()),
+                "{raw}"
+            );
+        }
+        // "/sandbox/case/" is 14 characters, ".xlsx" 5.
+        let fits = "x".repeat(crate::SHEET_MAX_PATH - 19);
+        assert_eq!(
+            ok(Kind::Xlsx, &fits),
+            Ok((base.join(format!("{fits}.xlsx")), "xlsx"))
+        );
+        assert_eq!(
+            ok(Kind::Xlsx, &format!("{fits}x")),
+            Err(crate::SHEET_BAD_NAME.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "a[b].docx"),
+            Ok((base.join("a[b].docx"), "docx"))
+        );
     }
 
     /// #699: `save-as` resolves the path the dialog would have answered with,
