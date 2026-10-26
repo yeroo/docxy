@@ -38,9 +38,11 @@ fn records_split_on_the_delimiter_outside_quotes() {
 #[test]
 fn bytes_decode_as_utf8_else_windows_1252() {
     assert_eq!(decode("\u{FEFF}Café".as_bytes()), "Café");
+    // The bytes Windows-1252 leaves undefined are their C1 controls, as in
+    // every other legacy import (`opccore::codepage`).
     assert_eq!(
         decode(b"Caf\xe9 \x80\x81\x8d\x8f\x90\x9d\x9f"),
-        "Café €\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}Ÿ"
+        "Café €\u{81}\u{8D}\u{8F}\u{90}\u{9D}Ÿ"
     );
     let project = read_mpx(
         &[
@@ -329,6 +331,72 @@ fn predecessor_lists_split_on_the_header_delimiter_and_lags_take_record_10_decim
 }
 
 #[test]
+fn mpxj_month_units_read_as_months() {
+    // MPXJ's spelling (corpus/mpx/variants): B is `1mon`, its link `1FS+1emon`.
+    let project = read_mpx(&corpus("variants/month-units.mpx")).unwrap();
+    let b = &project.tasks[1];
+    // A working month is Project's default 20 days of 8 hours.
+    assert_eq!(b.duration_min, 20 * 8 * 60);
+    assert_eq!(b.duration_format, Some(11));
+    assert!(!b.milestone);
+    let link = &b.predecessors[0];
+    assert_eq!((link.uid, link.link), (1, LinkType::FinishStart));
+    // An elapsed month is 30 days.
+    assert_eq!((link.lag, link.lag_format.code()), (30 * 1440, 12));
+
+    // A working month or a year as a lag, which the cell grammar does not
+    // spell, keeps its time in minutes; `emon?` stays an estimated month.
+    let project = read_mpx(&mpx("60,Name,Duration,Predecessors,ID,Unique ID\r\n\
+         61,1,40,70,90,98\r\n70,A,1y,,1,1\r\n70,B,2ey,,2,2\r\n\
+         70,C,1d,\"1FS+1mon,2SS-1ey\",3,3\r\n70,D,1d,1FS+1emon?,4,4\r\n"))
+    .unwrap();
+    let durations: Vec<(i64, Option<u8>)> = project.tasks[..2]
+        .iter()
+        .map(|t| (t.duration_min, t.duration_format))
+        .collect();
+    assert_eq!(durations, [(52 * 40 * 60, None), (2 * 365 * 1440, Some(8))]);
+    let links: Vec<(i32, i64, i64)> = project.tasks[2]
+        .predecessors
+        .iter()
+        .map(|p| (p.uid, p.lag, p.lag_format.code()))
+        .collect();
+    assert_eq!(links, [(1, 9600, 3), (2, -365 * 1440, 4)]);
+    let d = &project.tasks[3].predecessors[0];
+    assert_eq!((d.lag, d.lag_format.code()), (30 * 1440, 44));
+}
+
+#[test]
+fn weekday_prefixed_dates_read_as_their_date() {
+    // Date format 9 (corpus/mpx/variants): `Mon 03/02/26`.
+    let project = read_mpx(&corpus("variants/weekday-dates.mpx")).unwrap();
+    assert_eq!(project.start_date, Some(at(2026, 3, 2, 8, 0)));
+    assert_eq!(project.tasks[0].stored_start, Some(at(2026, 3, 2, 8, 0)));
+    assert_eq!(project.tasks[1].stored_finish, Some(at(2026, 3, 6, 17, 0)));
+    // It schedules as the corpus file it was written from, 06-lag.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mspdi/06-lag.xml");
+    let twin = crate::mspdi::read_mspdi(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let dates = |p: &Project| {
+        let s = crate::schedule::schedule(p);
+        p.tasks
+            .iter()
+            .map(|t| {
+                let r = s.get(t.uid).unwrap();
+                (t.uid, r.early_start, r.early_finish)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(dates(&project), dates(&twin));
+    let s = Settings::default();
+    assert_eq!(s.date("Fri 03/06/26"), Some((at(2026, 3, 6, 0, 0), None)));
+    assert_eq!(
+        s.date("Fri 03/06/26 01:00 pm"),
+        Some((at(2026, 3, 6, 0, 0), Some(13 * 60)))
+    );
+    // A month spelled out is a known limit: not read.
+    assert_eq!(s.date("02 March 2026"), None);
+}
+
+#[test]
 fn record_11_hours_convert_days_and_weeks() {
     let project = read_mpx(&mpx("11,1,0,1,7.50,30.00,,,0,0\r\n\
          60,Name,Duration,ID,Unique ID\r\n61,1,40,90,98\r\n\
@@ -515,6 +583,12 @@ fn notes_records_follow_their_row() {
     .unwrap();
     assert_eq!(project.resources[0].notes.as_deref(), Some("Ann's\nnote"));
     assert_eq!(project.tasks[0].notes.as_deref(), Some("Task note"));
+    // MPXJ writes a line break inside a note as U+007F (corpus/mpx/variants).
+    let project = read_mpx(&corpus("variants/multiline-note.mpx")).unwrap();
+    assert_eq!(
+        project.tasks[0].notes.as_deref(),
+        Some("Pour slab\nCheck rebar")
+    );
 }
 
 #[test]

@@ -22,8 +22,9 @@
 //! - 75 an assignment of the task before it.
 //!
 //! Anything else is ignored, as is a field that does not parse (the model's
-//! default stays). Only a file without the header, or without a task
-//! record, is refused.
+//! default stays). Only a file without the header, without a task record,
+//! or whose calendar has no working time (as the MSPDI reader refuses it)
+//! is refused.
 //!
 //! What the file states is read as written; what it does not carry is not
 //! guessed. Dates are whole days (Project writes no time), so a constraint,
@@ -36,13 +37,16 @@
 //! the MSPDI reader keeps, never as a constraint, so the schedule is the
 //! scheduler's. Enumerated values (constraint type, priority, accrue at, yes
 //! and no) are Project's English words; a localised file's words read as the
-//! default.
+//! default. Dates are numeric, optionally after a weekday name (`Mon
+//! 03/02/26`); the date formats that spell the month (`02 March 2026`,
+//! `02 Mar 26`) are not read, a known limit. Durations take MPXJ's units:
+//! `m h d w mon y`, elapsed with a leading `e`, and Project's `mo`.
 //!
 //! The rules were checked against MPXJ 16.8.0's writer and reader on the
 //! `corpus/mpx` files (`corpus/mpx/README.md`); there is no Project oracle.
 
 use crate::datetime::DateTime;
-use crate::editor::{day_end, day_start, parse_task_predecessors};
+use crate::editor::{day_end, day_start};
 use crate::model::{
     AccrueAt, Assignment, Calendar, CalendarException, ConstraintType, DayWorking, LagFormat,
     LagUnit, Project, Rate, Resource, Task, TaskType, WorkingTime,
@@ -83,21 +87,12 @@ fn decode(bytes: &[u8]) -> String {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
-        Err(_) => bytes.iter().map(|&b| cp1252(b)).collect(),
-    }
-}
-
-/// One Windows-1252 byte as a character; the five bytes the code page leaves
-/// undefined are U+FFFD.
-fn cp1252(byte: u8) -> char {
-    const HIGH: [char; 32] = [
-        '€', '\u{FFFD}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{FFFD}', 'Ž',
-        '\u{FFFD}', '\u{FFFD}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ',
-        '\u{FFFD}', 'ž', 'Ÿ',
-    ];
-    match byte {
-        0x80..=0x9F => HIGH[usize::from(byte - 0x80)],
-        _ => char::from(byte),
+        // The five bytes the code page leaves undefined are their C1
+        // controls, as in every other legacy import (`opccore::xml`).
+        Err(_) => bytes
+            .iter()
+            .map(|&b| opccore::codepage::decode(1252, b).unwrap_or(char::from(b)))
+            .collect(),
     }
 }
 
@@ -240,6 +235,11 @@ impl Settings {
     /// The time is `None` for a bare date.
     fn date(&self, text: &str) -> Option<(DateTime, Option<u32>)> {
         let text = text.trim();
+        // A leading weekday name (`Mon 03/02/26`, date formats 9 to 11).
+        let text = match text.split_once(' ') {
+            Some((day, rest)) if day.chars().all(char::is_alphabetic) => rest.trim_start(),
+            _ => text,
+        };
         let (date, time) = match text.split_once(' ') {
             Some((d, t)) => (d, Some(t.trim())),
             None => (text, None),
@@ -487,7 +487,7 @@ impl Reader {
             51 => {
                 if !self.last_row_is_task {
                     if let Some(r) = self.resources.last_mut() {
-                        r.notes = Some(crate::text::normalize_newlines(field(1)));
+                        r.notes = Some(note(field(1)));
                     }
                 }
             }
@@ -499,7 +499,7 @@ impl Reader {
             71 => {
                 if self.last_row_is_task {
                     if let Some(t) = self.tasks.last_mut() {
-                        t.task.notes = Some(crate::text::normalize_newlines(field(1)));
+                        t.task.notes = Some(note(field(1)));
                     }
                 }
             }
@@ -777,42 +777,47 @@ impl Reader {
             Some(rest) => (rest.trim_end().to_string(), true),
             None => (t, false),
         };
-        let (number, unit, elapsed) = [
-            ("emo", LagUnit::Month, true),
-            ("em", LagUnit::Minute, true),
-            ("eh", LagUnit::Hour, true),
-            ("ed", LagUnit::Day, true),
-            ("ew", LagUnit::Week, true),
-            ("mo", LagUnit::Month, false),
-            ("m", LagUnit::Minute, false),
-            ("h", LagUnit::Hour, false),
-            ("d", LagUnit::Day, false),
-            ("w", LagUnit::Week, false),
+        // MPXJ's unit table, longest suffix first: it writes months `mon`
+        // and `emon`; `mo`/`emo` are Project's own spelling. A year has no
+        // MSPDI format, so it is kept in days.
+        let (number, unit, elapsed, year) = [
+            ("emon", LagUnit::Month, true, false),
+            ("emo", LagUnit::Month, true, false),
+            ("em", LagUnit::Minute, true, false),
+            ("eh", LagUnit::Hour, true, false),
+            ("ed", LagUnit::Day, true, false),
+            ("ew", LagUnit::Week, true, false),
+            ("ey", LagUnit::Day, true, true),
+            ("mon", LagUnit::Month, false, false),
+            ("mo", LagUnit::Month, false, false),
+            ("m", LagUnit::Minute, false, false),
+            ("h", LagUnit::Hour, false, false),
+            ("d", LagUnit::Day, false, false),
+            ("w", LagUnit::Week, false, false),
+            ("y", LagUnit::Day, false, true),
         ]
         .into_iter()
-        .find_map(|(suffix, unit, elapsed)| {
+        .find_map(|(suffix, unit, elapsed, year)| {
             t.strip_suffix(suffix)
-                .map(|n| (n.trim().to_string(), unit, elapsed))
+                .map(|n| (n.trim().to_string(), unit, elapsed, year))
         })
-        .unwrap_or((t.clone(), LagUnit::Day, false));
+        .unwrap_or((t.clone(), LagUnit::Day, false, false));
         let value = self.settings.number(&number)?;
-        let per = if elapsed {
-            match unit {
-                LagUnit::Minute => 1.0,
-                LagUnit::Hour => 60.0,
-                LagUnit::Day => 1440.0,
-                LagUnit::Week => 7.0 * 1440.0,
-                _ => 30.0 * 1440.0,
-            }
-        } else {
-            let hours_per_day = self.hours_per_day.unwrap_or(8.0);
-            match unit {
-                LagUnit::Minute => 1.0,
-                LagUnit::Hour => 60.0,
-                LagUnit::Day => hours_per_day * 60.0,
-                LagUnit::Week => self.hours_per_week.unwrap_or(hours_per_day * 5.0) * 60.0,
-                _ => 20.0 * hours_per_day * 60.0,
-            }
+        // Elapsed: a month is 30 days and a year 365. Working: a month is
+        // Project's default 20 days and a year 52 weeks, as `rate` counts.
+        let hours_per_day = self.hours_per_day.unwrap_or(8.0);
+        let hours_per_week = self.hours_per_week.unwrap_or(hours_per_day * 5.0);
+        let per = match (elapsed, year, unit) {
+            (true, true, _) => 365.0 * 1440.0,
+            (false, true, _) => 52.0 * hours_per_week * 60.0,
+            (_, _, LagUnit::Minute) => 1.0,
+            (_, _, LagUnit::Hour) => 60.0,
+            (true, _, LagUnit::Day) => 1440.0,
+            (true, _, LagUnit::Week) => 7.0 * 1440.0,
+            (true, _, _) => 30.0 * 1440.0,
+            (false, _, LagUnit::Day) => hours_per_day * 60.0,
+            (false, _, LagUnit::Week) => hours_per_week * 60.0,
+            (false, _, _) => 20.0 * hours_per_day * 60.0,
         };
         let minutes = (value * per).round();
         if !(minutes.is_finite() && minutes >= 0.0 && minutes < i64::MAX as f64 / 10.0) {
@@ -847,11 +852,49 @@ impl Reader {
         }
     }
 
+    /// A link entry with its lag in a unit the Predecessors cell grammar
+    /// reads: MPXJ's `emon` becomes `emo`; a working month and a year,
+    /// which the cell does not take, become their minutes (`m`, or `em`
+    /// elapsed). Any other entry is unchanged.
+    fn lag_for_cell(&self, entry: &str) -> String {
+        let lower = entry.to_ascii_lowercase();
+        let unit = lower.trim_end_matches('?').trim_end();
+        let Some(sign) = entry.rfind(['+', '-']) else {
+            return entry.to_string();
+        };
+        if unit.ends_with("emon") {
+            return format!("{}emo{}", &entry[..unit.len() - 4], &entry[unit.len()..]);
+        }
+        let elapsed = unit.ends_with("ey");
+        if !(elapsed || unit.ends_with("mon") || unit.ends_with('y')) {
+            return entry.to_string();
+        }
+        let Some(lag) = self.duration(&entry[sign + 1..]) else {
+            return entry.to_string();
+        };
+        let mark = if lag.format.estimated() { "?" } else { "" };
+        let e = if elapsed { "e" } else { "" };
+        format!("{}{}{e}m{mark}", &entry[..=sign], lag.minutes)
+    }
+
     /// The project the records described.
     fn finish(self) -> Result<Project, String> {
         if self.tasks.is_empty() {
             return Err("not an MPX project: no task records".into());
         }
+        // Each task's link entries, split on the delimiter, in the cell
+        // grammar's numbers and units.
+        let link_entries: Vec<Vec<String>> = self
+            .tasks
+            .iter()
+            .map(|t| {
+                t.predecessors
+                    .split(self.delimiter)
+                    .map(|e| self.lag_for_cell(&self.settings.point_decimals(e.trim())))
+                    .filter(|e| !e.is_empty())
+                    .collect()
+            })
+            .collect();
         let assignments: Vec<ParsedAssignment> = self
             .assignments
             .iter()
@@ -1031,17 +1074,12 @@ impl Reader {
         // Links: the file names tasks by ID; each entry reads on its own, so
         // one that names no task drops only itself.
         for (row, &i) in order.iter().enumerate() {
-            let text = &tasks[i].predecessors;
-            if text.is_empty() {
+            if link_entries[i].is_empty() {
                 continue;
             }
             let mut links = Vec::new();
-            for entry in text.split(self.delimiter) {
-                let entry = self.settings.point_decimals(entry.trim());
-                if entry.is_empty() {
-                    continue;
-                }
-                let Ok(parsed) = parse_task_predecessors(&entry, &Task::default(), &proj) else {
+            for entry in &link_entries[i] {
+                let Ok(parsed) = crate::editor::parse_predecessors(entry, &proj) else {
                     continue;
                 };
                 for link in parsed {
@@ -1102,6 +1140,11 @@ struct ParsedAssignment {
 struct Duration {
     minutes: i64,
     format: LagFormat,
+}
+
+/// A notes record's text: MPXJ writes a line break inside a note as U+007F.
+fn note(text: &str) -> String {
+    crate::text::normalize_newlines(&text.replace('\u{7F}', "\n"))
 }
 
 /// Field ids of a record 41 or 61.
