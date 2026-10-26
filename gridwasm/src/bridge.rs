@@ -132,7 +132,8 @@ enum UndoAction {
 /// stashes are a stack (`Session::removed_sheet_stashes`): a `sheet.remove`
 /// pushes one, and a successful restore takes the one it names out (the top
 /// directly; an older one by unwinding the stack to it and removing the
-/// later sheets again, see `ctl_sheet_restore_removed`).
+/// later sheets again, unless only same-name stashes lie above it, which stay
+/// stashed in place in their own frame; see `ctl_sheet_restore_removed`).
 struct RemovedSheetStash {
     name: String,
     sheet: Sheet,
@@ -3201,10 +3202,11 @@ impl Session {
     /// restore …`) when a sheet with the stashed name, or with the name of a
     /// stash above it, already exists (an intervening same-name `sheet.add`),
     /// or a stash above it has its name (unless only such stashes lie above
-    /// it, below) or shares one with another above it, rather than minting a
-    /// duplicate name. A stash above it that has its name was stashed while its
-    /// sheet was gone (an import over the removed name, then its undo): when
-    /// every stash above is such, none is unwound, they stay stashed in place
+    /// it: see below) or shares one with another above it, rather than minting a
+    /// duplicate name. A stash above it that has its name is taken to have been
+    /// stashed while its sheet was gone (an import over the removed name, then
+    /// its undo), provided every sheet its rewritten cells are guarded on is
+    /// still live under its name: when every stash above is such, none is unwound, they stay stashed in place
     /// with their frames, and a restore of one is refused by name while the
     /// restored sheet is live. Known limit: with another stash below, e.g.
     /// [B, A, A_imp], A restores but B is then refused (B's restore would unwind
@@ -3232,8 +3234,9 @@ impl Session {
     /// into its fresh part on save, with a hidden `_xlnm._FilterDatabase`
     /// (#690: a save writes a filter the model holds). The stashes are a
     /// stack — each `sheet.remove` pushes one — and calling this with
-    /// nothing stashed errors (`"nothing to restore"`). An older stash is
-    /// restored by unwinding: the stashes above it are restored (latest
+    /// nothing stashed errors (`"nothing to restore"`). Unless only
+    /// same-name stashes lie above it (they stay stashed in place, see above),
+    /// an older stash is restored by unwinding: the stashes above it are restored (latest
     /// first), then it, then the sheets above it are removed again, oldest
     /// first, each stashing afresh with its old `removed_active`. Every
     /// sheet then stands where it would had the restored sheet never been
@@ -3300,14 +3303,17 @@ impl Session {
                 .rposition(|st| st.name == req)
                 .ok_or_else(|| format!("restore mismatch: no stashed sheet named \"{req}\""))?,
         };
-        // A same-name stash above `k` is a ghost: live names are unique, so it
-        // was stashed while `k`'s sheet was gone and never coexisted with it
-        // (an import over the removed name, then its undo). When only ghosts
-        // lie above `k`, nothing is unwound: they stay stashed as they are
-        // (their frame is untouched) and `k` restores as the top. A ghost
-        // beside another kind of entry is still refused below, as the
-        // unwinding would need frames the skipped ghost leaves wrong.
-        // Every entry from `k` up comes back for a moment, so each must be
+        // A same-name stash above `k` is taken to be a ghost: one stashed
+        // while `k`'s sheet was gone (an import over the removed name, then
+        // its undo), which never coexisted with it. When only ghosts lie
+        // above `k`, nothing is unwound: they stay stashed as they are (their
+        // frame is untouched) and `k` restores as the top. The name alone
+        // cannot tell (a rename or a `sheet.add` can give two live sheets one
+        // name), so every sheet `k`'s rewritten cells are guarded on must
+        // still be live under its name: a renamed or removed neighbour takes
+        // the unwinding path below, which refuses. The rest of this block is
+        // that non-ghost path:
+        // every entry from `k` up comes back for a moment, so each must be
         // free to: a sheet with its name may have been re-created after
         // removal (an intervening same-name `sheet.add`; `add_sheet` doesn't
         // dedupe, so restoring would mint a duplicate sheet name), or two of
@@ -3317,7 +3323,11 @@ impl Session {
             && self.removed_sheet_stashes[k + 1..].iter().all(|st| {
                 st.name
                     .eq_ignore_ascii_case(&self.removed_sheet_stashes[k].name)
-            });
+            })
+            && self.removed_sheet_stashes[k]
+                .cell_guards
+                .iter()
+                .all(|(name, _)| self.pkg.workbook.sheet_index(name).is_some());
         let names: Vec<&str> = self.removed_sheet_stashes[k..]
             .iter()
             .take(if ghosts_only { 1 } else { usize::MAX })
@@ -3347,10 +3357,11 @@ impl Session {
                 ));
             }
         }
-        // The sheets removed after `k`, oldest first, to remove again once
-        // `k` is back: each entry's positions hold only in its own frame, so
-        // the stack is unwound to `k` and the later removals replayed, each
-        // stashing afresh.
+        // The non-ghost path: the sheets removed after `k`, oldest first, to
+        // remove again once `k` is back: each entry's positions hold only in
+        // its own frame, so the stack is unwound to `k` and the later
+        // removals replayed, each stashing afresh. (A ghost tail is split off
+        // here and pushed back after `k`'s restore.)
         let ghosts = if ghosts_only {
             self.removed_sheet_stashes.split_off(k + 1)
         } else {
@@ -7043,6 +7054,47 @@ mod tests {
         assert!(out.contains("\"ok\":false"), "{out}");
         assert_eq!(sheet_order(&s), before);
         assert_eq!(stash_order(&s), ["A", "B", "A"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_a_renamed_neighbour_is_not_taken_for_a_ghost_guard_gone() {
+        // B!A1 reads A; remove A (B is guarded), rename B to A, remove that
+        // A: the stack is [A, A], but B is not live under its name, so the
+        // top A is no ghost and restoring the first A is refused, nothing
+        // changed.
+        let mut s = abc_session();
+        s.active = 2;
+        s.dispatch("set\t1\t0\t=A!A1");
+        s.active = 0;
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"B","name":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        assert_eq!(stash_order(&s), ["A", "A"]);
+        let before = sheet_order(&s);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(
+            out.contains(r#"cannot restore \"A\": a sheet named \"A\" was removed after it"#),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), before);
+        assert_eq!(stash_order(&s), ["A", "A"]);
+    }
+
+    #[test]
+    fn ctl_sheet_restore_removed_a_removed_guard_sheet_is_not_taken_for_a_ghost() {
+        // Sheet1!A21 reads A; Sheet1 is renamed "a" then removed after A: the
+        // guard is gone, so the later "a" is no ghost and the restore of A is
+        // refused rather than dropping Sheet1's rewritten formula.
+        let mut s = abc_session();
+        s.dispatch("set\t20\t0\t=A!A1");
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":"Sheet1","name":"a"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"a"}}"#);
+        assert_eq!(stash_order(&s), ["A", "a"]);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert_eq!(stash_order(&s), ["A", "a"]);
+        assert_eq!(sheet_order(&s), ["B", "C"]);
     }
 
     #[test]
