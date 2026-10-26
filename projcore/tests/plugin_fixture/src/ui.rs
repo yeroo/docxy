@@ -96,14 +96,6 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.sheet","kind":"button","label":"Sheet (fixture)","tip":"A modeless dialog with a grid and buttons of its own","keytip":"XS","icon":"table"},
     {"id":"fixture.bars","kind":"button","label":"Bars (fixture)","tip":"Sets or resets the view's bar style rows and one task's bar override (#1696)","keytip":"XR","icon":"table"},
     {"id":"fixture.layout","kind":"button","label":"Layout (fixture)","tip":"Sets or clears the Layout dialog's chart settings (#1695)","keytip":"XL","icon":"table"}]}]},
-    {"tab":"View","groups":[{"title":"Fixture Styles","controls":[
-    {"id":"fixture.styles","kind":"gallery","label":"Styles","tip":"Two sections of palette tiles (#1761)","swatches":[
-      {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
-      {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},
-      {"id":"fixture.styles.2","label":"Blue two","section":"Scheduling Styles","preview":"fixture.blue"},
-      {"id":"fixture.styles.3","label":"Red two","section":"Presentation Styles","preview":"fixture.red"},
-      {"id":"fixture.styles.4","label":"Colour only","section":"Presentation Styles","color":"#44AA66"},
-      {"id":"fixture.styles.5","label":"Blue three","section":"Presentation Styles","preview":"fixture.blue"}]}]}]},
     {"tab":"Gantt Chart Format","groups":[{"title":"Fixture Format","before":"Bar Styles","launcher":{"id":"fixture.font","tip":"Font (fixture launcher)","keytip":"ZN"},"controls":[
     {"id":"fixture.format","kind":"button","label":"Format (fixture)","tip":"A group placed before Bar Styles; sets or clears the plan's gridlines","icon":"font-name"},
     {"id":"fixture.flat","kind":"toggle","label":"Flat","tip":"A toggle with no icon on a tab that fits: its drawn label is measured (#1608)","icon":""}]},
@@ -112,7 +104,15 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct25","kind":"button","label":"25%"},
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
-    {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]}],
+    {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]},
+    {"tab":"View","groups":[{"title":"Fixture Styles","controls":[
+    {"id":"fixture.styles","kind":"gallery","label":"Styles","tip":"Two sections of palette tiles (#1761)","swatches":[
+      {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
+      {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},
+      {"id":"fixture.styles.2","label":"Blue two","section":"Scheduling Styles","preview":"fixture.blue"},
+      {"id":"fixture.styles.3","label":"Red two","section":"Presentation Styles","preview":"fixture.red"},
+      {"id":"fixture.styles.4","label":"Colour only","section":"Presentation Styles","color":"#44AA66"},
+      {"id":"fixture.styles.5","label":"Blue three","section":"Presentation Styles","preview":"fixture.blue"}]}]}]}],
   "menus":[{"menu":"row","items":[{"id":"fixture.rename","label":"Rename (fixture)","icon":"comment","after":"Notes..."},{"id":"fixture.mark","label":"Mark (fixture)","icon":"comment","after":"Rename (fixture)"}]}],
   "dialogs":[
     {"id":"task-information","header":[{"name":"fixture.head","label":"Fixture head:","kind":"label","value":"on every page"}],
