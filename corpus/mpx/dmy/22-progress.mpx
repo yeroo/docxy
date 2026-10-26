@@ -1,0 +1,27 @@
+MPX,Microsoft Project for Windows,4.0,ANSI
+10,$,1,2,",",.
+11,1,0,1,8.00,40.00,,,0,0
+12,1,0,480,/,:,am,pm,20,20
+20,Standard,0,1,1,1,1,1,0
+25,1
+25,2,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,3,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,4,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,5,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,6,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,7
+30,Project1,,,Standard,02/03/2026,10/03/2026,1,26/10/2026,,,,,,,,,,,,,,,02/03/2026
+40,Name,ID,Max Units,Standard Rate,Unique ID
+41,1,40,41,42,49
+50,Alice,1,1,$400.00/d,1
+60,Name,WBS,Outline Level,Actual Work,Remaining Work,Work Variance,% Work Complete,Actual Cost,Remaining Cost,Duration,Actual Duration,Remaining Duration,% Complete,Start,Finish,Actual Start,Actual Finish,Start Variance,Finish Variance,Predecessors,Fixed,Critical,CV,ID,Constraint Type,Unique ID,Stop,Resume No Earlier Than,Resume
+61,1,2,3,22,23,24,25,32,33,40,42,43,44,50,51,58,59,66,67,70,80,82,88,90,91,98,150,151,152
+70,Excavate,1,1,2d,,0m,100%,$8.00,,2d,2d,,100%,02/03/2026,03/03/2026,02/03/2026,03/03/2026,0m,0m,,No,No,-$0.12,1,As Soon As Possible,1,03/03/2026,03/03/2026,03/03/2026
+75,1,1,16h,16h,16h,,,$8.00,$8.00,02/03/2026,03/03/2026,,1
+76,,0,0,NA,NA
+70,Pour,2,1,2d,2d,480m,50%,$8.00,$8.00,4d,2d,2d,50%,04/03/2026,09/03/2026,04/03/2026,,0m,480m,1,No,Yes,-$0.08,2,As Soon As Possible,2,05/03/2026,06/03/2026,06/03/2026
+75,1,1,32h,24h,16h,,,$12.00,$8.00,04/03/2026,09/03/2026,,1
+76,,0,0,NA,NA
+70,Cure,3,1,,1d,,0%,,$4.00,1d,,1d,0%,10/03/2026,10/03/2026,,,480m,480m,2,No,Yes,$0.00,3,As Soon As Possible,3
+75,1,1,8h,,,,,,,10/03/2026,10/03/2026,,1
+76,,0,0,NA,NA

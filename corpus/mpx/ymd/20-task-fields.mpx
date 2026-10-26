@@ -1,0 +1,21 @@
+MPX,Microsoft Project for Windows,4.0,ANSI
+10,$,1,2,",",.
+11,1,0,1,8.00,40.00,,,0,0
+12,2,0,480,/,:,am,pm,20,20
+20,Standard,0,1,1,1,1,1,0
+25,1
+25,2,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,3,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,4,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,5,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,6,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,7
+30,Project1,,,Standard,2026/03/02,2026/03/05,1,2026/10/26
+60,Name,WBS,Outline Level,Text1,Contact,Work,Cost,Duration,Duration1,Start,Finish,Predecessors,Fixed,Critical,Rollup,ID,Constraint Type,Delay,Free Slack,Total Slack,Priority,Unique ID,Summary,Hide Bar,Created
+61,1,2,3,4,15,20,30,40,46,50,51,70,80,82,84,90,91,92,93,94,95,98,120,123,125
+70,Phase,1,1,,,,,3d,,2026/03/02,2026/03/05,,Yes,Yes,No,1,As Soon As Possible,,0h,0m,Medium,1,Yes,No,2026/02/27
+70,Excavate,1.1,2,Civil,,2d,$12.51,2d,4d,2026/03/02,2026/03/03,,No,Yes,Yes,2,As Soon As Possible,,0d,0m,Highest,2,,No,2026/02/27
+70,Pour,1.2,2,M&E,Site lead,0d,,1d,,2026/03/04,2026/03/05,"2,3",No,Yes,No,4,As Soon As Possible,1d,0m,0m,Medium,4,,Yes,2026/02/27
+71,Check forms & rebar
+70,,,,,,,,,,,,,No,No,,3,,,0h,,,3
+70,Inspect,2,1,,,,,1d,,2026/03/02,2026/03/02,,Yes,No,No,5,As Soon As Possible,,1380m,1380m,Medium,5,,No,2026/02/27

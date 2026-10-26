@@ -1,0 +1,30 @@
+MPX,Microsoft Project for Windows,4.0,ANSI
+10,$,1,2,",",.
+11,1,0,1,8.00,40.00,,,0,0
+12,1,0,480,/,:,am,pm,20,20
+20,Standard,0,1,1,1,1,1,0
+25,1
+25,2,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,3,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,4,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,5,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,6,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,7
+30,Project1,,,Standard,02/03/2026,09/03/2026,1,26/10/2026
+60,Name,WBS,Outline Level,Duration,Start,Finish,Constraint Date,Predecessors,Fixed,Milestone,Critical,ID,Constraint Type,Free Slack,Total Slack,Unique ID
+61,1,2,3,40,50,51,68,70,80,81,82,90,91,93,94,98
+70,A,1,1,5d,02/03/2026,06/03/2026,,,No,No,Yes,1,As Soon As Possible,0d,0m,1
+70,"M1 FS A, FNET Fri 17",2,1,0d,06/03/2026,06/03/2026,06/03/2026,1,No,Yes,Yes,2,Finish No Earlier Than,0m,0m,2
+70,B,3,1,2d,02/03/2026,03/03/2026,,,No,No,No,3,As Soon As Possible,0d,1440m,3
+70,"M2 FS B, FNET Fri 17",4,1,0d,06/03/2026,06/03/2026,06/03/2026,3,No,Yes,Yes,4,Finish No Earlier Than,0m,0m,4
+70,M3 FNET Fri 17,5,1,0d,06/03/2026,06/03/2026,06/03/2026,,No,Yes,Yes,5,Finish No Earlier Than,0m,0m,5
+70,M4 FNET Mon 08,6,1,0d,09/03/2026,09/03/2026,09/03/2026,,No,Yes,Yes,6,Finish No Earlier Than,0m,0m,6
+70,M5 FNET Wed 12,7,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,7,Finish No Earlier Than,1200m,1200m,7
+70,M6 FNET Wed 13,8,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,8,Finish No Earlier Than,1200m,1200m,8
+70,M7 FNET Wed 19,9,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,9,Finish No Earlier Than,960m,960m,9
+70,M8 FNET Sat 10,10,1,0d,07/03/2026,07/03/2026,07/03/2026,,No,Yes,Yes,10,Finish No Earlier Than,0m,0m,10
+70,M9 FNET Wed 10,11,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,11,Finish No Earlier Than,1320m,1320m,11
+70,M10 SNET Wed 19,12,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,12,Start No Earlier Than,960m,960m,12
+70,M11 SNET Fri 17,13,1,0d,06/03/2026,06/03/2026,06/03/2026,,No,Yes,Yes,13,Start No Earlier Than,0m,0m,13
+70,M12 FNET Wed 07,14,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,14,Finish No Earlier Than,1440m,1440m,14
+70,M13 FNET Wed 12:30,15,1,0d,04/03/2026,04/03/2026,04/03/2026,,No,Yes,No,15,Finish No Earlier Than,1200m,1200m,15

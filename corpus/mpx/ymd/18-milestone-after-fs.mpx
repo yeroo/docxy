@@ -1,0 +1,21 @@
+MPX,Microsoft Project for Windows,4.0,ANSI
+10,$,1,2,",",.
+11,1,0,1,8.00,40.00,,,0,0
+12,2,0,480,/,:,am,pm,20,20
+20,Standard,0,1,1,1,1,1,0
+25,1
+25,2,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,3,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,4,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,5,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,6,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,7
+30,Project1,,,Standard,2026/03/02,2026/03/09,1,2026/10/26
+60,Name,WBS,Outline Level,Duration,Start,Finish,Predecessors,Fixed,Milestone,Critical,ID,Constraint Type,Free Slack,Total Slack,Unique ID
+61,1,2,3,40,50,51,70,80,81,82,90,91,93,94,98
+70,A,1,1,2d,2026/03/02,2026/03/03,,No,No,No,1,As Soon As Possible,0d,1920m,1
+70,Sign-off,2,1,0d,2026/03/03,2026/03/03,1,No,Yes,No,2,As Soon As Possible,1920m,1920m,2
+70,Chain A,3,1,1d,2026/03/02,2026/03/02,,No,No,Yes,3,As Soon As Possible,0d,0m,3
+70,M1,4,1,0d,2026/03/02,2026/03/02,3,No,Yes,Yes,4,As Soon As Possible,0d,0m,4
+70,B,5,1,5d,2026/03/03,2026/03/09,4,No,No,Yes,5,As Soon As Possible,0d,0m,5
+70,M2,6,1,0d,2026/03/09,2026/03/09,5,No,Yes,Yes,6,As Soon As Possible,0m,0m,6

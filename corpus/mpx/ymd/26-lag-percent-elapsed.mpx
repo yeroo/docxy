@@ -1,0 +1,29 @@
+MPX,Microsoft Project for Windows,4.0,ANSI
+10,$,1,2,",",.
+11,1,0,1,8.00,40.00,,,0,0
+12,2,0,480,/,:,am,pm,20,20
+20,Standard,0,1,1,1,1,1,0
+25,1
+25,2,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,3,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,4,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,5,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,6,08:00 am,12:00 pm,01:00 pm,05:00 pm
+25,7
+30,Project1,,,Standard,2026/03/02,2026/03/13,1,2026/10/26
+60,Name,WBS,Outline Level,Duration,Start,Finish,Predecessors,Fixed,Milestone,Critical,ID,Constraint Type,Free Slack,Total Slack,Unique ID
+61,1,2,3,40,50,51,70,80,81,82,90,91,93,94,98
+70,A,1,1,4d,2026/03/02,2026/03/05,,No,No,Yes,1,As Soon As Possible,0d,0m,1
+70,B,2,1,1d,2026/03/10,2026/03/10,1FS+50%,No,No,No,2,As Soon As Possible,1440m,1440m,2
+70,C,3,1,1d,2026/03/05,2026/03/05,1FS-25%,No,No,No,3,As Soon As Possible,2880m,2880m,3
+70,D,4,1,1d,2026/03/09,2026/03/09,1FS+2ed,No,No,No,4,As Soon As Possible,1920m,1920m,4
+70,E,5,1,1d,2026/03/05,2026/03/05,1FS-1ed,No,No,No,5,As Soon As Possible,2880m,2880m,5
+70,F,6,1,1d,2026/03/09,2026/03/09,1SS+5ed,No,No,No,6,As Soon As Possible,1920m,1920m,6
+70,G,7,1,1d,2026/03/06,2026/03/07,1FF+2ed,No,No,No,7,As Soon As Possible,2400m,2400m,7
+70,H,8,1,1d,2026/03/13,2026/03/13,1FS+1ew,No,No,Yes,8,As Soon As Possible,0m,0m,8
+70,P,9,1,6d,2026/03/02,2026/03/09,,No,No,Yes,9,As Soon As Possible,0d,0m,9
+70,Q,10,1,1d,2026/03/09,2026/03/09,9FS-2ed,No,No,No,10,As Soon As Possible,1920m,1920m,10
+70,M,11,1,0d,2026/03/07,2026/03/07,1FS+2ed,No,Yes,No,11,As Soon As Possible,2400m,2400m,11
+70,S,12,1,1d,2026/03/03,2026/03/04,1SF+2ed,No,No,No,12,As Soon As Possible,3840m,3840m,12
+70,W,13,1,1d,2026/03/06,2026/03/09,1FS+3h,No,No,No,13,As Soon As Possible,2220m,2220m,13
+70,X,14,1,1d,2026/03/13,2026/03/13,9SS+150%,No,No,Yes,14,As Soon As Possible,0m,0m,14
