@@ -1667,8 +1667,8 @@
   `palette_entry`, `manual` falling back to `on-track`, then the built-in
   colours; proportions are by estimate, no capture of Project's tile is in
   this repository), `gallery_layout` (a header row per run of equal non-empty
-  sections, every section on a new row) and `span_of`/`gallery_span` (the
-  longest run: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
+  sections, every section on a new row) and `span_of`/`gallery_span` (in a
+  flyout the longest section run, in place every tile: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
   both wrap by, so the estimate is the width drawn). Height is
   `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
   A palette tile shows no label, its label is the tooltip. Sections show in
