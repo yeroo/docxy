@@ -48,13 +48,15 @@ impl LineType {
 
     /// The dash and gap lengths in pixels a host draws this type with, or
     /// `None` for a continuous line. The pattern is shared so the hosts and
-    /// their tests agree.
+    /// their tests agree. These are Project 2024's own patterns at 96 DPI
+    /// (100 % scaling): `pjCloseDot` 1/1, `pjDot` 1/3, `pjDash` 4/4; a host
+    /// painting in logical pixels scales them with its scale factor.
     pub fn dash(self) -> Option<(f32, f32)> {
         match self {
             LineType::None | LineType::Solid => None,
-            LineType::Dotted => Some((1., 2.)),
-            LineType::ShortDashed => Some((4., 3.)),
-            LineType::LongDashed => Some((8., 4.)),
+            LineType::Dotted => Some((1., 1.)),
+            LineType::ShortDashed => Some((1., 3.)),
+            LineType::LongDashed => Some((4., 4.)),
         }
     }
 
@@ -594,13 +596,22 @@ mod tests {
         assert!(LineType::None.segments(10.).is_empty());
         assert_eq!(
             LineType::Dotted.segments(7.),
-            vec![(0., 1.), (3., 1.), (6., 1.)]
+            vec![(0., 1.), (2., 1.), (4., 1.), (6., 1.)]
         );
         assert_eq!(
-            LineType::ShortDashed.segments(10.),
-            vec![(0., 4.), (7., 3.)]
+            LineType::ShortDashed.segments(9.),
+            vec![(0., 1.), (4., 1.), (8., 1.)]
         );
-        assert_eq!(LineType::LongDashed.segments(8.), vec![(0., 8.)]);
+        assert_eq!(LineType::LongDashed.segments(10.), vec![(0., 4.), (8., 2.)]);
         assert!(LineType::Solid.segments(0.).is_empty());
+    }
+
+    #[test]
+    fn dash_patterns_are_projects() {
+        assert_eq!(LineType::None.dash(), None);
+        assert_eq!(LineType::Solid.dash(), None);
+        assert_eq!(LineType::Dotted.dash(), Some((1., 1.)));
+        assert_eq!(LineType::ShortDashed.dash(), Some((1., 3.)));
+        assert_eq!(LineType::LongDashed.dash(), Some((4., 4.)));
     }
 }

@@ -1478,7 +1478,8 @@
 - `projcore::formatting::gridlines` is Project's Gridlines dialog as data:
   `Line` (the fourteen "Line to change" entries, Project's names and order),
   `LineType` (none, solid, dotted, short-dashed, long-dashed; `segments` is
-  the one dash pattern), `Gridline` (type, colour or Automatic, and for the
+  the one dash pattern: Project's own at 96 DPI, on/off px Dotted 1/1,
+  Short dashed 1/3, Long dashed 4/4, #1759), `Gridline` (type, colour or Automatic, and for the
   row and column lines an interval with its own type and colour) and
   `Gridlines` (only lines set away from `Line::default_style` are stored:
   solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
