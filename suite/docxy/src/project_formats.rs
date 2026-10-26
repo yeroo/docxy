@@ -432,7 +432,10 @@ pub(crate) mod tests {
     fn without_plugins_the_lists_are_the_built_ins() {
         let formats = global();
         assert!(formats.errors.is_empty());
-        assert_eq!(formats.registry.open_extensions(), ["yppx", "xml", "mpp"]);
+        assert_eq!(
+            formats.registry.open_extensions(),
+            ["yppx", "xml", "mpx", "mpp"]
+        );
         assert_eq!(
             formats.save_types(None),
             [("Project schedule", "yppx"), ("MSPDI", "xml")]
@@ -477,7 +480,15 @@ pub(crate) mod tests {
         assert_eq!(formats.source(Path::new("a.mpp"), b"x".to_vec()), None);
         assert_eq!(
             formats.read(Path::new("Cargo.toml")).unwrap_err(),
-            "expected .yppx, .xml or .mpp"
+            "expected .yppx, .xml, .mpx or .mpp"
+        );
+        // The built-in MPX reader (#309) makes .mpx a project type and an
+        // import, by the same rule as .mpp.
+        assert!(formats.is_project_path(Path::new("a.MPX")));
+        assert!(formats.is_import(Path::new("a.mpx")));
+        assert_eq!(
+            formats.import_note(Path::new("missing.mpx")).as_deref(),
+            Some("imported from .mpx")
         );
     }
 
@@ -485,7 +496,10 @@ pub(crate) mod tests {
     fn a_plugin_writer_lists_its_type_and_keeps_the_source() {
         let _plugins = Override::new(vec![mpp_writer()]);
         let formats = global();
-        assert_eq!(formats.registry.open_extensions(), ["yppx", "xml", "mpp"]);
+        assert_eq!(
+            formats.registry.open_extensions(),
+            ["yppx", "xml", "mpx", "mpp"]
+        );
         assert_eq!(
             formats.save_types(None),
             [

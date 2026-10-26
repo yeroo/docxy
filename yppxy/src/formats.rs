@@ -470,7 +470,7 @@ pub(crate) mod tests {
     #[test]
     fn without_plugins_the_lists_are_the_built_ins() {
         let formats = global();
-        assert_eq!(formats.open_exts, ["yppx", "xml", "mpp"]);
+        assert_eq!(formats.open_exts, ["yppx", "xml", "mpx", "mpp"]);
         assert!(formats.save_types.is_empty());
         assert!(formats.save_types_for(None).is_empty());
         assert!(formats.save_types_for(Some("plan.xml")).is_empty());
@@ -491,12 +491,18 @@ pub(crate) mod tests {
             formats.opened_status("a.mpp", 0),
             "Opened a.mpp — .mpp metadata only (no task table found)"
         );
+        // The built-in MPX import (#309) is an import like .mpp.
+        assert_eq!(formats.default_save_extension(Some("a.mpx")), "yppx");
+        assert_eq!(
+            formats.opened_status("a.MPX", 2),
+            "Opened a.MPX — 2 .mpx tasks imported"
+        );
     }
 
     #[test]
     fn a_plugin_writer_lists_its_type_and_keeps_the_source() {
         let formats = with_mpp_writer();
-        assert_eq!(formats.open_exts, ["yppx", "xml", "mpp"]);
+        assert_eq!(formats.open_exts, ["yppx", "xml", "mpx", "mpp"]);
         let types: Vec<_> = formats
             .save_types
             .iter()

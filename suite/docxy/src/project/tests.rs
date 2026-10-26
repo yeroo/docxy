@@ -1144,7 +1144,7 @@ fn a_plugin_type_is_a_project_only_while_its_plugin_is_loaded() {
     assert!(!is_project_path(&path));
     assert_eq!(
         project_from_path(&path).unwrap_err(),
-        "expected .yppx, .xml or .mpp"
+        "expected .yppx, .xml, .mpx or .mpp"
     );
     let mut bound = new_project_tab("Project1");
     bound.path = Some(path.clone());

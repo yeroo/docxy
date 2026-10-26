@@ -41,7 +41,7 @@ fn the_fixture_plugin_round_trips_a_project() {
     for format in formats {
         registry.register(format);
     }
-    assert_eq!(registry.open_extensions(), ["yppx", "xml", "fakeproj"]);
+    assert_eq!(registry.open_extensions(), ["yppx", "xml", "mpx", "fakeproj"]);
     assert_eq!(registry.save_extensions(), ["yppx", "xml", "fakeproj"]);
     assert_eq!(registry.save_types()[2], ("fakeproj", "Fake Project"));
     // So a new plan's Save As proposes it, first; an opened .xml stays .xml.
