@@ -1033,6 +1033,9 @@ and the tab unchanged:
   any other document extension, which the save would otherwise write as a
   Word package under that name;
 - a `format` that does not match the extension given;
+- a workbook name Excel refuses (`< > ? [ ] : | * "` in the file name, or a
+  full path over 218 UTF-16 units with `.xlsx` added): `That file name is not
+  valid: …`, checked before an existing file (#804);
 - an existing file, unless `"overwrite": true` (the dialog would ask);
 - a write that fails: the reply is the tab's status (`save failed: …`), and
   the tab stays bound where it was.
