@@ -15,3 +15,5 @@ tools/wordshim/docxy-word.tlb binary
 
 # Word-written import fixtures: keep the bytes Word wrote (CRLF in .rtf/.htm).
 corpus/word-import/** -text
+# MPXJ-written MPX fixtures (#309): keep the CRLF records MPXJ wrote.
+corpus/mpx/**/*.mpx -text
