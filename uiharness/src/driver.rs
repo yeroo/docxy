@@ -89,7 +89,7 @@ where
 const STEADY_ATTEMPTS: usize = 4;
 
 /// How long [`judge_until`] keeps re-polling a border that reads wrong.
-pub const BORDER_DEADLINE: Duration = Duration::from_secs(2);
+const BORDER_DEADLINE: Duration = Duration::from_secs(2);
 
 /// And how many steady shots it takes at most, whatever the clock says, so a
 /// slow capture cannot keep it looping.
@@ -108,7 +108,9 @@ fn same_pixels(a: &Shot, b: &Shot) -> bool {
 /// geometry from the new one (#1783). So shots are taken until two in a row
 /// agree, each settled twice over, with frames drawn in between. That reduces
 /// the chance of judging a stale picture but does not prove the picture fresh:
-/// two stale captures in a row would agree too.
+/// two stale captures in a row would agree too, and [`judge_until`] stops on
+/// the first verdict that passes, so such a pair that satisfies the
+/// expectation passes.
 ///
 /// Returns the shot, whether two agreed, and how many captures it took.
 fn steady_shot<F>(mut shoot: F) -> Result<(Shot, bool, usize), String>
@@ -142,7 +144,7 @@ pub struct Judged<C> {
 
 impl<C> Judged<C> {
     /// What to add after the capture's own description on a failure: empty
-    /// when the first steady shot was the one judged.
+    /// when the first two captures agreed and were judged.
     pub fn polling(&self) -> String {
         let mut s = String::new();
         if self.attempts > 1 || self.captures > 2 || !self.steady {
@@ -167,7 +169,7 @@ impl<C> Judged<C> {
 /// A verdict that `done` calls final (it passed, or a side could not be read
 /// at all, which a new picture cannot change) is returned at once, and so is
 /// a shot that fails outright (a moved window, a hung app).
-pub fn judge_until<C, F, J, D, N>(
+fn judge_until<C, F, J, D, N>(
     mut shoot: F,
     mut judge: J,
     done: D,
@@ -200,7 +202,7 @@ where
     }
 }
 
-/// [`judge_until`] for a border expectation: the check both the runner's
+/// `judge_until` for a border expectation: the check both the runner's
 /// `assert border` and the CLI's `assert` make.
 pub fn judge_border<F>(
     exp: &BorderExpect,
@@ -678,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_frame_without_the_border_cannot_pass_a_no_border_assertion() {
+    fn a_single_stale_capture_cannot_pass_a_no_border_assertion() {
         // The stale capture lacks the border, so judged alone it would pass a
         // `no border`; the fresh frames that follow disagree with it, so it is
         // never judged, and the steady fresh frame fails as it should.

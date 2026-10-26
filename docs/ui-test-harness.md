@@ -2275,12 +2275,14 @@ that never agrees, such as one holding a blinking caret, is judged on its last
 and a failure says `region not steady`). A verdict that reads wrong is polled
 again, a new steady shot each time, for up to 2 s (at most 8 attempts); a side
 that cannot be read at all is geometry and is not polled. The reported verdict
-and the filed PNG are the last attempt's, and a failure's `capture:` line says
-how many attempts and captures it took. A passing assertion costs one extra
-capture; a genuinely failing one now takes about 2 s. Steadiness reduces the
-chance of judging a stale frame but does not rule it out: two stale captures in
-a row agree too. For `assert border` the re-poll covers that; a `no border`
-that passes on two stale frames is not caught. `shot` steps are evidence only
+and the filed PNG are the last attempt's; when judging took more than the
+first two captures, a failure's `capture:` line says how many attempts and
+captures it did. A passing assertion costs one extra capture; a genuinely
+failing one now takes about 2 s. Steadiness reduces the chance of judging a
+stale frame but does not rule it out: two stale captures in a row agree too.
+The re-poll corrects a stale pair that fails the expectation, not one that
+satisfies it: that one passes, whatever the assertion (a `border` judged
+before the border was wrongly removed, a `no border` before it appeared). `shot` steps are evidence only
 and are taken once, as before.
 
 ## Not covered
