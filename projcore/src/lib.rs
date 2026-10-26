@@ -44,6 +44,7 @@ pub mod json;
 pub mod leveling;
 pub mod marked;
 pub mod model;
+pub mod mpx;
 pub mod mspdi;
 pub mod plugin_abi;
 pub mod report;
