@@ -31218,6 +31218,7 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                     vec![Control::Gallery(rs::Gallery {
                         id: "styles",
                         tip: rs::ScreenTip::default(),
+                        key_tip: "",
                         // Word's Quick Styles order: Normal, No Spacing, headings, then Title/Subtitle.
                         items: vec![
                             rs::GalleryItem {
@@ -31698,8 +31699,19 @@ fn tab_keytip_starts(tab: &rs::Tab<Act>, typed: &str) -> bool {
             }),
             _ => false,
         });
-    // A group launcher's KeyTip (a plugin's, #1669) waits the same way.
+    // A gallery's KeyTip (#1762) and a group launcher's (a plugin's, #1669)
+    // wait the same way.
+    let gallery = |key: &str| {
+        key.len() > typed.len()
+            && key
+                .get(..typed.len())
+                .is_some_and(|k| k.eq_ignore_ascii_case(typed))
+    };
     commands
+        || tab.groups.iter().flat_map(|g| g.items.iter()).any(|c| {
+            // As `tab_keytip_gallery`: a gallery with no tiles opens nothing.
+            matches!(c, Control::Gallery(gal) if !gal.items.is_empty() && gallery(gal.key_tip))
+        })
         || tab.groups.iter().any(|g| {
             let key = g.launcher_key;
             g.launcher.is_some()
@@ -31738,6 +31750,24 @@ fn tab_keytip_split(tab: &rs::Tab<Act>, key: &str) -> Option<&'static str> {
                 if !primary.key_tip.is_empty() && primary.key_tip.eq_ignore_ascii_case(key) =>
             {
                 Some(primary.id)
+            }
+            _ => None,
+        })
+}
+
+/// The contributed gallery on a tab whose KeyTip is `key`: its id, which the
+/// letter opens as a flyout (#1762). A gallery with no tiles opens nothing.
+fn tab_keytip_gallery(tab: &rs::Tab<Act>, key: &str) -> Option<&'static str> {
+    tab.groups
+        .iter()
+        .flat_map(|g| g.items.iter())
+        .find_map(|c| match c {
+            Control::Gallery(gal)
+                if !gal.key_tip.is_empty()
+                    && !gal.items.is_empty()
+                    && gal.key_tip.eq_ignore_ascii_case(key) =>
+            {
+                Some(gal.id)
             }
             _ => None,
         })
@@ -31902,17 +31932,21 @@ fn keytip_badge(text: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// What a ribbon flyout shows (#1020): one collapsed group, whole, or the
-/// overflow chevron's list of the groups it holds.
+/// What a ribbon flyout shows (#1020): one collapsed group, whole, the
+/// overflow chevron's list of the groups it holds, or one contributed gallery
+/// a KeyTip opened (#1762), whether or not its group is collapsed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlyoutTarget {
     Group(&'static str),
     Overflow,
+    /// One contributed gallery, by id, opened by its KeyTip (#1762).
+    Gallery(&'static str),
 }
 
 /// An open ribbon flyout, and the ribbon it belongs to: it closes when the
 /// window shows another document, another ribbon tab, or the group is no
-/// longer collapsed (`Docxy::flyout_still_fits`).
+/// longer collapsed (`Docxy::flyout_still_fits`); a KeyTip-opened gallery
+/// stays as long as the tab does.
 #[derive(Clone, Copy)]
 pub(crate) struct RibbonFlyout {
     pub doc: usize,
@@ -35678,7 +35712,12 @@ impl Docxy {
                 let tab = self.active_ribbon_tab_def();
                 let split = tab_keytip_split(&tab, &typed);
                 let act = tab_keytip_cmd(&tab, &typed);
-                if split.is_none() && act.is_none() && tab_keytip_starts(&tab, &typed) {
+                let gallery = tab_keytip_gallery(&tab, &typed);
+                if split.is_none()
+                    && act.is_none()
+                    && gallery.is_none()
+                    && tab_keytip_starts(&tab, &typed)
+                {
                     self.keytip_prefix = typed;
                     return;
                 }
@@ -35699,6 +35738,17 @@ impl Docxy {
                     cx.notify();
                 } else if let Some(a) = act {
                     self.dispatch(a, window, cx);
+                } else if let Some(id) = gallery {
+                    // A contributed gallery's letter opens it as a flyout,
+                    // drawn or not (#1762). A minimised or hidden ribbon body
+                    // would close it at once (`flyout_still_fits`): say so.
+                    self.font_box = None;
+                    if self.ribbon_min || self.ribbon_body_hidden() {
+                        self.set_status("Show the ribbon to open that gallery");
+                    } else {
+                        self.open_ribbon_flyout(FlyoutTarget::Gallery(id));
+                    }
+                    cx.notify();
                 } else {
                     cx.notify();
                 }
@@ -36029,8 +36079,9 @@ impl Docxy {
             })
     }
 
-    /// Open the flyout of a collapsed group or of the overflow chevron. It
-    /// replaces any menu or other flyout, as a press outside them would.
+    /// Open the flyout of a collapsed group, of the overflow chevron or of a
+    /// contributed gallery (#1762). It replaces any menu or other flyout, as a
+    /// press outside them would.
     pub(crate) fn open_ribbon_flyout(&mut self, target: FlyoutTarget) {
         self.close_menu();
         self.ribbon_flyout = Some(RibbonFlyout {
@@ -36044,7 +36095,7 @@ impl Docxy {
     /// Whether the open flyout still belongs to what the window shows: the
     /// same document and ribbon tab, and its group still collapsed (a wider
     /// window draws the group in place again) or, for the chevron, groups
-    /// still in it.
+    /// still in it; a gallery's stays with the tab, drawn in place or not.
     fn flyout_still_fits(&self, f: RibbonFlyout, window: &Window) -> bool {
         if f.doc != self.active
             || f.docs != self.tabs.len()
@@ -36063,6 +36114,9 @@ impl Docxy {
                 .iter()
                 .position(|t| *t == title)
                 .is_some_and(|i| now.fit.in_flyout(i)),
+            // Opened from a KeyTip, whatever the group's state: it stays
+            // while the window shows the same tab.
+            FlyoutTarget::Gallery(_) => true,
         }
     }
 
@@ -36212,7 +36266,9 @@ impl Docxy {
     /// The open ribbon flyout, under its collapsed button (or the chevron),
     /// slid to stay inside the window: the whole group at full size, drawn by
     /// the same renderer as in place, so every control works as it does
-    /// there; or the chevron's list of groups. A press outside closes it.
+    /// there; or the chevron's list of groups; or one contributed gallery,
+    /// wrapped to the window under its own probe, else its group's collapsed
+    /// button (#1762). A press outside closes it.
     fn ribbon_flyout_el(
         &self,
         window: &Window,
@@ -36224,6 +36280,17 @@ impl Docxy {
             let probes = self.probes.borrow();
             let own = match f.target {
                 FlyoutTarget::Group(t) => probes.current(&format!("ribbon-collapsed:{t}")),
+                FlyoutTarget::Gallery(id) => {
+                    probes.current(&format!("gallery-{id}")).or_else(|| {
+                        let tab = self.active_ribbon_tab_def();
+                        let g = tab.groups.iter().find(|g| {
+                            g.items
+                                .iter()
+                                .any(|c| matches!(c, Control::Gallery(gal) if gal.id == id))
+                        })?;
+                        probes.current(&format!("ribbon-collapsed:{}", g.title))
+                    })
+                }
                 FlyoutTarget::Overflow => None,
             };
             own.or_else(|| probes.current("ribbon-overflow"))
@@ -36238,6 +36305,23 @@ impl Docxy {
         let tw = ribbon_text_width(window);
         let content = match f.target {
             FlyoutTarget::Overflow => self.ribbon_overflow_list(window, pal, cx),
+            FlyoutTarget::Gallery(id) => {
+                let tab = self.active_ribbon_tab_def();
+                let gal = tab
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.items.iter())
+                    .find(|c| matches!(c, Control::Gallery(gal) if gal.id == id))?;
+                // Wrapped to the window, as a group's flyout copy is, so the
+                // section headers show (#1761).
+                let slot = format!("{FLYOUT_PROBE_PREFIX}ribbon-content:gallery:{id}");
+                div()
+                    .flex()
+                    .min_h(px(94.))
+                    .p_1()
+                    .child(self.render_control(gal, false, slot, Some(room - 17.), pal, cx))
+                    .into_any_element()
+            }
             FlyoutTarget::Group(title) if self.ribbon_is_model() => {
                 let tab = self.active_ribbon_tab_def();
                 let g = tab.groups.iter().find(|g| g.title == title)?;
@@ -37873,14 +37957,24 @@ impl Docxy {
                 }
             })
             .collect();
+        // A contributed gallery's KeyTip (#1762) shows on the one in the
+        // ribbon, not a flyout's copy (`max_w` is set there).
+        let keytip =
+            (self.keytips == KeyTip::Commands && max_w.is_none() && !gal.key_tip.is_empty())
+                .then_some(gal.key_tip);
         div()
             .id(gal.id)
+            .relative()
             .flex()
             .flex_col()
             .gap(px(g.gap))
             .w(px(per_row as f32 * g.w + (per_row as f32 - 1.) * g.gap))
             .h(px(plugin_ui::layout_height(&layout, g.h, g.gap)))
+            .when(max_w.is_none(), |d| {
+                d.child(probe(&self.probes, format!("gallery-{}", gal.id)))
+            })
             .children(rows)
+            .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .into_any_element()
     }
 

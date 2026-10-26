@@ -1857,6 +1857,40 @@ fn a_launcher_keytip_runs_it_after_its_first_letter_waits() {
 }
 
 #[test]
+fn a_gallerys_keytip_opens_it_and_a_two_letter_one_waits() {
+    let task = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[{"title":"Styles","controls":[
+          {"id":"g.keyed","kind":"gallery","label":"Keyed","keytip":"GC","swatches":[{"id":"g.0","label":"A","color":"#3366CC"}]},
+          {"id":"g.plain","kind":"gallery","label":"Plain","swatches":[{"id":"g.1","label":"B","color":"#3366CC"}]},
+          {"id":"g.empty","kind":"gallery","label":"Empty","keytip":"GE","swatches":[]}]}]}]}"##,
+    );
+    let galleries: Vec<_> = task.groups.last().unwrap().items.iter().collect();
+    let keys: Vec<&str> = galleries
+        .iter()
+        .map(|c| match c {
+            Control::Gallery(g) => g.key_tip,
+            _ => panic!("a gallery"),
+        })
+        .collect();
+    assert_eq!(keys, ["GC", "", "GE"]);
+    assert_eq!(crate::tab_keytip_gallery(&task, "GC"), Some("g.keyed"));
+    assert_eq!(crate::tab_keytip_gallery(&task, "gc"), Some("g.keyed"));
+    assert_eq!(crate::tab_keytip_gallery(&task, "G"), None);
+    // A gallery with no tiles opens nothing.
+    assert_eq!(crate::tab_keytip_gallery(&task, "GE"), None);
+    assert!(crate::tab_keytip_starts(&task, "g"));
+    assert!(!crate::tab_keytip_starts(&task, "GC"));
+    // The key is a gallery's, not a command's.
+    assert_eq!(crate::tab_keytip_cmd(&task, "GC"), None);
+    // An empty gallery's key waits for nothing: G alone on a tab with only it.
+    let only_empty = extended(
+        r##"{"ribbon":[{"tab":"Task","groups":[{"title":"E","controls":[
+          {"id":"g.empty","kind":"gallery","label":"Empty","keytip":"GE","swatches":[]}]}]}]}"##,
+    );
+    assert!(!crate::tab_keytip_starts(&only_empty, "G"));
+}
+
+#[test]
 fn a_multibyte_keytip_never_panics_the_keytip_lookups() {
     // "ÉX" and "ZÉ": a typed first letter must not slice inside the É.
     let task = extended(

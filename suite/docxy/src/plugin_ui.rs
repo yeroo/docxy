@@ -198,6 +198,7 @@ fn control_of(c: &ui::Control, manifests: &[&ui::Manifest]) -> Control<Act> {
                 body: "",
                 shortcut: "",
             },
+            key_tip: intern(&c.keytip),
             items: c
                 .swatches
                 .iter()

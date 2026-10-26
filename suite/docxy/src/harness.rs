@@ -2580,6 +2580,11 @@ fn flyout_json(app: &crate::Docxy) -> Json {
         None => (false, Json::Null, false),
         Some(crate::FlyoutTarget::Overflow) => (true, Json::Null, true),
         Some(crate::FlyoutTarget::Group(t)) => (true, Json::Str(t.into()), false),
+        Some(crate::FlyoutTarget::Gallery(_)) => (true, Json::Null, false),
+    };
+    let gallery = match app.ribbon_flyout.map(|f| f.target) {
+        Some(crate::FlyoutTarget::Gallery(id)) => Json::Str(id.into()),
+        _ => Json::Null,
     };
     let probes = app.probes.borrow();
     let inside = match (
@@ -2595,6 +2600,7 @@ fn flyout_json(app: &crate::Docxy) -> Json {
         ("open", Json::Bool(open)),
         ("group", group),
         ("overflow", Json::Bool(overflow)),
+        ("gallery", gallery),
         ("inside", inside),
     ])
 }
@@ -2877,6 +2883,7 @@ fn tab_json(
                 if let crate::Control::Gallery(g) = control {
                     galleries.push(Json::obj(vec![
                         ("id", Json::Str(g.id.into())),
+                        ("key_tip", Json::Str(g.key_tip.into())),
                         (
                             "items",
                             Json::Arr(g.items.iter().map(|i| Json::Str(i.label.into())).collect()),
