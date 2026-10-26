@@ -3495,8 +3495,12 @@ impl Session {
     /// as one (known limits). The sheet's Excel tables come back with their
     /// parts (`SheetPackage::restore_table`: style, totals row, filter), each
     /// unless its name was taken since or no part was kept: the reply's
-    /// `tablesKept` names those, and a non-top restore keeps them with the
-    /// sheet's stash. The cells recalculate.
+    /// `tablesKept` names those. A non-top restore is refused, before any
+    /// change, while a sheet it would unwind holds a table (restore those
+    /// first, in stack order): the tables of a sheet that is back for a
+    /// moment would be unwired, and no removal would rewrite their formulas.
+    /// The target's own tables are wired before the later sheets go again, so
+    /// that removal rewrites and records their formulas. The cells recalculate.
     fn ctl_sheet_restore_removed(&mut self, args: &json::Json) -> Result<String, String> {
         if self.removed_sheet_stashes.is_empty() {
             return Err("nothing to restore".into());
@@ -3578,6 +3582,28 @@ impl Session {
                 ));
             }
         }
+        // The sheets unwound hold no table: it would be unwired while they
+        // are back and rewritten by no removal (a formula of one naming a
+        // sheet that goes again), so they are restored first, in stack order.
+        if !ghosts_only {
+            let holding: Vec<String> = self.removed_sheet_stashes[k + 1..]
+                .iter()
+                .filter(|st| !st.tables.is_empty())
+                .map(|st| format!("\"{}\"", st.name))
+                .collect();
+            if !holding.is_empty() {
+                return Err(format!(
+                    "cannot restore \"{}\": restore {} first, {}",
+                    self.removed_sheet_stashes[k].name,
+                    holding.join(", "),
+                    if holding.len() == 1 {
+                        "it holds a table"
+                    } else {
+                        "they hold tables"
+                    }
+                ));
+            }
+        }
         // The non-ghost path: the sheets removed after `k`, oldest first, to
         // remove again once `k` is back: each entry's positions hold only in
         // its own frame, so the stack is unwound to `k` and the later
@@ -3600,14 +3626,10 @@ impl Session {
         );
         // A later sheet's pivots are re-registered and removed again with it;
         // only `k`'s own call for a refresh.
-        // The latest comes back first, with its tables unwired: it goes again
-        // at once, so they hold no name, id or part name meanwhile, and are
-        // carried into the stash it makes again.
-        let mut carried: Vec<StashedTables> = Vec::new();
+        // The latest comes back first (none holds a table: checked above).
         for _ in &later {
-            carried.push(self.restore_top().2);
+            self.restore_top();
         }
-        carried.reverse();
         let name = self.removed_sheet_stashes[k].name.clone();
         let removed_active = self.removed_sheet_stashes[k].removed_active;
         let (had_pivots, cells_kept, pending) = self.restore_top();
@@ -3622,7 +3644,7 @@ impl Session {
         let refused = self.put_back_tables(at, pending);
         let tables_kept: Vec<String> = refused.iter().map(|(t, _)| t.name.clone()).collect();
         self.removed_sheet_stashes.extend(ghosts);
-        for ((later_name, was_active, serial), refused) in later.iter().zip(carried) {
+        for (later_name, was_active, serial) in &later {
             let si = self
                 .pkg
                 .workbook
@@ -3632,7 +3654,6 @@ impl Session {
                 .expect("a sheet just restored can be removed again");
             let stash = self.removed_sheet_stashes.last_mut().expect("just pushed");
             stash.removed_active = *was_active;
-            stash.tables.extend(refused);
             // Its inverse, already handed out, names this serial.
             stash.serial = *serial;
         }
@@ -3720,11 +3741,9 @@ impl Session {
     /// leaving the pivot refresh and the engine rebuild to the caller.
     /// Whether the sheet had pivots, the sheets whose cell formulas were
     /// left as they are (`RemovedSheetStash::cell_guards`) and its tables,
-    /// not yet put back ([`Self::put_back_tables`]: a non-top restore brings
-    /// several sheets back for a moment, and the later ones go again at once,
-    /// so their tables stay in their stashes, while the target's are wired
-    /// once only live tables are about). The caller has checked that no live
-    /// sheet has the stashed name.
+    /// not yet put back ([`Self::put_back_tables`]: the caller wires them
+    /// once the sheets that go again are back, before they go). The caller
+    /// has checked that no live sheet has the stashed name.
     fn restore_top(&mut self) -> (bool, Vec<String>, StashedTables) {
         let stash = self
             .removed_sheet_stashes
@@ -7810,89 +7829,39 @@ mod tests {
         assert!(out.contains(r#""cellsKept":["Sheet1"]"#), "{out}");
     }
 
-    /// #1795 r1: a table a restore could not take while another sheet's
-    /// removal was unwound stays with that sheet's stash, which names it (or
-    /// brings it back once the name is free).
+    /// #1795 r4: a non-top restore is refused, with nothing changed, while a
+    /// sheet it would unwind holds a table; restoring in stack order works.
     #[test]
-    fn ctl_sheet_restore_removed_non_top_restore_keeps_a_refused_table_for_later_1795() {
-        for free_it in [false, true] {
-            let mut s = table_on_c();
-            s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
-            s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
-            // Another sheet has made a table of that name since.
-            s.pkg
-                .add_table(0, (30, 0, 31, 1), true, "TableStyleLight1")
-                .expect("table");
-            assert_eq!(s.pkg.workbook.tables[0].name, "Table1");
-            let out = restore(&mut s, "A");
-            assert!(out.contains("\"ok\":true"), "{out}");
-            assert!(!out.contains("tablesKept"), "A has no table: {out}");
-            if free_it {
-                s.pkg.workbook.tables.clear();
-            }
-            let out = restore(&mut s, "C");
-            assert!(out.contains("\"ok\":true"), "{out}");
-            if free_it {
-                assert!(!out.contains("tablesKept"), "{out}");
-                let t = &s.pkg.workbook.tables;
-                assert_eq!(t.len(), 1);
-                assert_eq!(s.pkg.workbook.sheets[t[0].sheet].name, "C");
-            } else {
-                assert!(out.contains(r#""tablesKept":["Table1"]"#), "{out}");
-            }
-        }
-    }
-
-    /// #1795 r2: a non-top restore checks its tables once the sheets removed
-    /// after it are gone again: a table name only such a sheet holds (it is
-    /// back for a moment) does not refuse the table for good.
-    #[test]
-    fn ctl_sheet_restore_removed_non_top_restore_takes_its_tables_after_the_unwinding_1795() {
+    fn ctl_sheet_restore_removed_non_top_restore_is_refused_while_a_later_sheet_holds_a_table_1795()
+    {
         let mut s = table_on_c();
+        s.pkg.workbook.tables[0].calculated_formulas = vec![None, Some("B!A1*2".into())];
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"B"}}"#);
         s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
-        // Another sheet makes a table of that name, and is removed too.
-        s.pkg
-            .add_table(1, (0, 0, 1, 1), true, "TableStyleLight1")
-            .expect("table");
-        assert_eq!(s.pkg.workbook.tables[0].name, "Table1");
-        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
+        let order = sheet_order(&s);
+        let out = restore(&mut s, "B");
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert!(
+            out.contains("restore \"C\" first, it holds a table"),
+            "{out}"
+        );
+        assert_eq!(sheet_order(&s), order);
+        assert!(s.pkg.workbook.tables.is_empty());
+        assert_eq!(s.removed_sheet_stashes.len(), 2, "the stack is intact");
+        // In stack order it works, and the formula comes back.
         let out = restore(&mut s, "C");
         assert!(out.contains("\"ok\":true"), "{out}");
-        assert!(!out.contains("tablesKept"), "{out}");
-        let t = &s.pkg.workbook.tables;
-        assert_eq!(t.len(), 1, "A's table is stashed again, C's is live");
-        assert_eq!(s.pkg.workbook.sheets[t[0].sheet].name, "C");
-        // And A's own table is back with A, which has no clash then.
-        s.pkg.workbook.tables.clear();
-        let out = restore(&mut s, "A");
-        assert!(!out.contains("tablesKept"), "{out}");
-        assert_eq!(s.pkg.workbook.tables.len(), 1);
-    }
-
-    /// #1795 r2: the same for an id and a part name: the table keeps what it
-    /// had when only a briefly restored sheet's table held it.
-    #[test]
-    fn ctl_sheet_restore_removed_non_top_restore_keeps_a_table_its_id_and_part_1795() {
-        let mut s = table_on_c();
-        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
-        s.pkg
-            .add_table(1, (0, 0, 1, 1), true, "TableStyleLight1")
-            .expect("table");
-        s.pkg.workbook.tables[0].name = "Other".into();
-        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"A"}}"#);
-        let out = restore(&mut s, "C");
-        assert!(!out.contains("tablesKept"), "{out}");
-        let t = &s.pkg.workbook.tables;
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].name, "Table1");
-        assert_eq!(t[0].part, "xl/tables/table1.xml");
-        let xml = String::from_utf8_lossy(s.pkg.part(&t[0].part).expect("part")).into_owned();
-        assert!(xml.contains(" id=\"1\""), "{xml}");
+        let out = restore(&mut s, "B");
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(
+            s.pkg.workbook.tables[0].calculated_formulas,
+            vec![None, Some("B!A1*2".to_string())]
+        );
     }
 
     /// #1795 r3: a table a non-top restore brings back is live when the
-    /// later sheets are removed again, so that removal rewrites its formulas
-    /// and records them for the later restore.
+    /// later sheets (which hold no table) are removed again, so that removal
+    /// rewrites its formulas and records them for the later restore.
     #[test]
     fn ctl_sheet_restore_removed_non_top_restore_rewrites_its_tables_formulas_1795() {
         let mut s = table_on_c();

@@ -956,7 +956,9 @@ worth knowing:
   refers to, count as edits. The sheet's Excel tables come back with it, with
   their parts (style, totals row, filter); one whose name was taken since is
   left out and named in the reply's `tablesKept` (absent when every table came
-  back). The cells then recalculate. Every restore clears the undo/redo
+  back). An out-of-order restore is refused, with nothing changed, while a
+  sheet removed after it holds a table: restore those first, latest first
+  (the error names them). The cells then recalculate. Every restore clears the undo/redo
   history, as `sheet.remove` itself does.
 - **Agent sheet-removals are undoable in any order.** The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
