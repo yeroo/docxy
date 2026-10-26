@@ -706,12 +706,19 @@ impl ParProps {
     }
 
     /// Pin the left indent at an explicit `w:left="0"`, as the loaded `w:ind`
-    /// (see `serialize::pin_shadow_left_zero`): a list item decreased to the
+    /// (see `serialize::pin_shadow_left`): a list item decreased to the
     /// margin keeps it there, where no `w:left` would bring its numbering
     /// level's indent back (#1728). The paragraph then has a loaded left
     /// indent, as it does when the file is opened again.
     pub fn pin_left_indent_zero(&mut self) {
-        crate::serialize::pin_shadow_left_zero(&mut self.shadow);
+        crate::serialize::pin_shadow_left(&mut self.shadow, 0);
+    }
+
+    /// As [`Self::pin_left_indent_zero`] for any `twips`: a style-numbered
+    /// item keeps "has a loaded left indent" while it moves, so a later
+    /// Decrease to the margin still pins (#1792).
+    pub fn pin_left_indent(&mut self, twips: i32) {
+        crate::serialize::pin_shadow_left(&mut self.shadow, twips);
     }
 
     /// Set the paragraph's direct alignment, as an edit does: a left is

@@ -2975,9 +2975,10 @@ impl Editor {
     pub fn change_indent(&mut self, delta: i32) {
         let step = delta.signum();
         let paths = self.selected_para_paths();
+        let styles = self.styles.clone();
         let moves = |p: &ParProps| -> bool {
             let mut stepped = p.clone();
-            step_indent(&mut stepped, step, delta);
+            step_indent(&mut stepped, step, delta, list_item(styles.as_deref(), p));
             stepped != *p
         };
         let any = paths
@@ -2986,17 +2987,38 @@ impl Editor {
         if !any {
             return;
         }
-        self.for_each_para(|pr| step_indent(pr, step, delta));
+        self.for_each_para(|pr| {
+            let listed = list_item(styles.as_deref(), pr);
+            step_indent(pr, step, delta, listed)
+        });
     }
 
     /// Set the left indent and first-line delta (twips) of the selected
     /// paragraphs. `first_line` > 0 is a first-line indent, < 0 a hanging indent,
     /// 0 none. Used by the Paragraph dialog.
+    ///
+    /// A list item that had a direct left indent when called and is set to 0
+    /// keeps the margin as `w:left="0"`, as Decrease Indent does (#1792); one
+    /// with none is left to its level's indent, as the dialog passes 0 back
+    /// for every item it did not change. An indent written in session counts
+    /// as direct here (an explicit request for the margin), unlike for a
+    /// style-numbered item in Decrease Indent.
     pub fn set_indent(&mut self, left: i32, first_line: i32) {
+        let styles = self.styles.clone();
         self.for_each_para(move |pr| {
+            let listed = list_item(styles.as_deref(), pr);
+            let pin = if left <= 0 {
+                (listed && had_direct_left(pr)).then_some(0)
+            } else {
+                // A style-numbered item that had a loaded left keeps it.
+                (listed && !pr.in_list() && pr.has_loaded_left_indent()).then_some(left)
+            };
             pr.indent = left.max(0);
             pr.first_line = first_line;
             pr.forget_loaded_indent(&[IndentSide::Left, IndentSide::FirstLine]);
+            if let Some(twips) = pin {
+                pr.pin_left_indent(twips);
+            }
         });
     }
 
@@ -4101,23 +4123,49 @@ fn hrule_kind(text: &str) -> Option<BorderKind> {
 }
 
 /// One paragraph's Increase/Decrease Indent (see [`Editor::change_indent`]).
-fn step_indent(pr: &mut ParProps, step: i32, delta: i32) {
+/// `listed` is [`list_item`] for it.
+fn step_indent(pr: &mut ParProps, step: i32, delta: i32, listed: bool) {
     if steps_level(pr) {
         pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
         return;
     }
+    // A style-numbered item's in-session indent cannot be told from nothing
+    // once Increase wrote it, so only a loaded (or pinned) left counts there.
+    let direct = if pr.in_list() {
+        had_direct_left(pr)
+    } else {
+        pr.has_loaded_left_indent()
+    };
     pr.indent = (pr.indent + delta).max(0);
     if delta == 0 {
         return;
     }
-    if pr.in_list() && pr.indent == 0 {
-        // No `w:left` would hand the item back to its level's indent.
+    if listed && direct && pr.indent == 0 {
+        // No `w:left` would hand the item back to its level's (or style's) indent.
         pr.pin_left_indent_zero();
+    } else if listed && direct && !pr.in_list() {
+        // A style-numbered item keeps a loaded left while it moves, so a
+        // later Decrease to the margin still pins (as after a reload).
+        pr.pin_left_indent(pr.indent);
     } else {
         // The loaded left indent goes, character units included: a
         // decrease clamped to zero twips must still clear `w:leftChars`.
         pr.forget_loaded_indent(&[IndentSide::Left]);
     }
+}
+
+/// Whether the paragraph carries a left indent of its own, set in session or loaded.
+fn had_direct_left(p: &ParProps) -> bool {
+    p.indent > 0 || p.has_loaded_left_indent()
+}
+
+/// Whether the paragraph is a list item: a nonzero direct `numId`, or, with
+/// no direct `numId` at all (0 cancels the style's), numbering from its
+/// paragraph style, which needs the editor's styles context (#1792).
+fn list_item(styles: Option<&EditStyles>, p: &ParProps) -> bool {
+    p.in_list()
+        || (p.num_id.is_none()
+            && styles.is_some_and(|s| s.sheet.style_num_pr(p.style_id.as_deref()).is_some()))
 }
 
 /// Whether Increase/Decrease Indent moves this paragraph's list level rather
@@ -7240,6 +7288,159 @@ mod tests {
         let mut ed = loaded_list_item(0, "<w:ind w:leftChars=\"0\" w:left=\"0\"/>");
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    const LIST_STYLES: &str = "<w:styles xmlns:w=\"w\">\
+        <w:style w:type=\"paragraph\" w:styleId=\"ListBullet\"><w:pPr><w:numPr>\
+        <w:numId w:val=\"5\"/></w:numPr></w:pPr></w:style>\
+        <w:style w:type=\"paragraph\" w:styleId=\"Plain\"/></w:styles>";
+
+    /// A loaded `<w:p>` with the given pPr children and, optionally, the styles above.
+    fn loaded_ppr(ppr: &str, styles: bool) -> Editor {
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body><w:p><w:pPr>{ppr}</w:pPr><w:r><w:t>a</w:t></w:r></w:p>\
+             </w:body></w:document>"
+        );
+        let mut ed = Editor::new(crate::load::parse_document_xml(
+            &xml,
+            &crate::load::Relationships::default(),
+        ));
+        if styles {
+            ed.set_styles_xml(Some(LIST_STYLES.into()));
+        }
+        ed.select_all();
+        ed
+    }
+
+    const BULLET: &str = "<w:pStyle w:val=\"ListBullet\"/>";
+
+    /// #1792: a style-numbered item loaded with a left indent keeps it "loaded"
+    /// as it moves, so the Decrease that reaches 0 pins, as after a reload.
+    #[test]
+    fn decrease_in_steps_on_a_style_numbered_item_pins_at_the_margin() {
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"1440\"/>"), true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        // Pinned at 0, Increase then Decrease pins again.
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        // The dialog's nonzero set keeps it too.
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"1440\"/>"), true);
+        ed.set_indent(720, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1792: `set_indent(0, ..)` asks for the margin, so an indent an Increase
+    /// wrote in session on a style-numbered item counts there.
+    #[test]
+    fn set_indent_zero_counts_an_indent_written_in_session() {
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(720);
+        ed.set_indent(0, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1792: an Increase on a style-numbered item with no `w:ind` writes an
+    /// indent that is not loaded, so the Decrease after it saves none, as
+    /// before; a loaded one still pins.
+    #[test]
+    fn increase_then_decrease_on_a_style_numbered_item_leaves_no_indent() {
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "");
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"720\"/>"), true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1792: a style-numbered item (the numbering comes from its paragraph
+    /// style) with a direct left indent keeps the margin at 0 too.
+    #[test]
+    fn decrease_indent_pins_a_style_numbered_items_margin() {
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"720\"/>"), true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        let steps = ed.undo_names().len();
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        assert_eq!(ed.undo_names().len(), steps, "idempotent, no new step");
+        // Other attributes keep their order.
+        let mut ed = loaded_ppr(
+            &format!("{BULLET}<w:ind w:left=\"720\" w:hanging=\"360\"/>"),
+            true,
+        );
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\" w:hanging=\"360\"/>");
+    }
+
+    #[test]
+    fn decrease_indent_on_a_style_numbered_item_needs_the_styles_and_a_direct_indent() {
+        // No styles context: not known to be a list item, as before.
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"720\"/>"), false);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "");
+        // No direct left indent: nothing to move, no step, no `w:left`.
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "");
+        assert!(ed.undo_names().is_empty());
+        // A style that is not numbered, and a direct numId 0 over one.
+        for ppr in [
+            "<w:pStyle w:val=\"Plain\"/><w:ind w:left=\"720\"/>".to_string(),
+            format!("{BULLET}<w:numPr><w:numId w:val=\"0\"/></w:numPr><w:ind w:left=\"720\"/>"),
+        ] {
+            let mut ed = loaded_ppr(&ppr, true);
+            ed.change_indent(-720);
+            assert_eq!(saved_ind(&ed), "", "{ppr}");
+        }
+    }
+
+    /// #1792: the Paragraph dialog's left indent 0 on a list item that had a
+    /// direct indent keeps the margin; one with none is left to its level.
+    #[test]
+    fn set_indent_zero_pins_a_list_items_margin_only_when_it_had_a_direct_indent() {
+        let direct = "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"9990\"/></w:numPr>";
+        for (ppr, styles) in [
+            (format!("{direct}<w:ind w:left=\"720\"/>"), false),
+            (format!("{BULLET}<w:ind w:left=\"720\"/>"), true),
+        ] {
+            let mut ed = loaded_ppr(&ppr, styles);
+            ed.set_indent(0, -360);
+            assert_eq!(
+                saved_ind(&ed),
+                "<w:ind w:left=\"0\" w:hanging=\"360\"/>",
+                "{ppr}"
+            );
+        }
+        // The dialog passes 0 back for an item it did not change.
+        for (ppr, styles) in [(direct.to_string(), false), (BULLET.to_string(), true)] {
+            let mut ed = loaded_ppr(&ppr, styles);
+            ed.set_indent(0, 0);
+            assert_eq!(saved_ind(&ed), "", "{ppr}");
+        }
+        // Not a list item, a positive indent, a style item without styles.
+        for (ppr, left, styles) in [
+            ("<w:ind w:left=\"720\"/>".to_string(), 0, true),
+            (format!("{direct}<w:ind w:left=\"720\"/>"), 360, false),
+            (format!("{BULLET}<w:ind w:left=\"720\"/>"), 0, false),
+        ] {
+            let mut ed = loaded_ppr(&ppr, styles);
+            ed.set_indent(left, 0);
+            let want = if left > 0 {
+                "<w:ind w:left=\"360\"/>"
+            } else {
+                ""
+            };
+            assert_eq!(saved_ind(&ed), want, "{ppr}");
+        }
     }
 
     #[test]

@@ -105,6 +105,16 @@
   idempotent, attribute order kept), so the level's indent does not come
   back and it stays on the direct path in session as after a reload. A
   step that changes no paragraph (`step_indent` on a clone) records no undo.
+  The pin also covers an item numbered through its paragraph style (no direct
+  `numId`, `style_num_pr` set, a styles context) and `Editor::set_indent(0, ..)`,
+  both only when the item had a direct left indent when called (the Paragraph
+  dialog passes 0 back for items it did not change) (#1792). In
+  Increase/Decrease a style item counts only a loaded (or pinned) left, and
+  it stays pinned as it moves (`ParProps::pin_left_indent`); the indent an
+  in-session Increase wrote on a style item with no loaded left is not pinned
+  at 0, as it cannot be told from none. `set_indent(0, ..)` is an explicit
+  request for the margin, so on any list item it also counts an indent
+  written in session.
 - `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
