@@ -88,6 +88,14 @@ test save-as writes a workbook as one of the four workbook types only
   call-error save-as {"path":"book3.csv"} => Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm
   call-error save-as {"path":"book3","format":"md"} => Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm
 
+test save-as refuses a workbook name Excel refuses (#804)
+  open copy:../fixtures/basic.xlsx
+  call-error save-as {"path":"a[b].xlsx"} => That file name is not valid
+  call-error save-as {"path":"a]b"} => That file name is not valid
+  call-error save-as {"path":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"} => That file name is not valid
+  assert title is basic.xlsx
+  assert dirty is false
+
 test save-as writes a Project as yppx or MSPDI xml
   open copy:../fixtures/schedule.xml
   call save-as {"path":"plan","format":"yppx"}

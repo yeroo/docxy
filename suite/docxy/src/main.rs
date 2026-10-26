@@ -27195,7 +27195,17 @@ fn save_sheet_tab_now(
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
-            finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
+            // A name Excel refuses is refused like a failed write: the arm
+            // still answers true, so Backstage closes and the status shows.
+            if let Some(Err(e)) = target
+                .as_deref()
+                .and_then(|t| sheet_save_target(t).ok())
+                .map(|p| sheet_save_as_name(&p))
+            {
+                tab.status = e.into();
+            } else {
+                finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
+            }
         }
         // Never in a harness instance: rfd runs its own modal loop on this
         // thread and stops the control pump dead (see the "No modal dialog
@@ -27226,12 +27236,42 @@ fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
 /// What a workbook refuses to be saved as.
 const SHEET_SAVE_FORMATS: &str = "Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm";
 
+/// Excel's longest workbook path (#804), in UTF-16 units as Windows counts.
+const SHEET_MAX_PATH: usize = 218;
+
+/// What Excel's Save As says of a name it refuses (#804).
+const SHEET_BAD_NAME: &str = "That file name is not valid: a workbook name cannot contain < > ? [ ] : | \" or *, and its full path cannot be longer than 218 characters";
+
+/// Excel's own check on a Save As target (#804), on the path
+/// [`sheet_save_target`] answered (so an added `.xlsx` counts), taken as it
+/// will be written (not canonicalised). Only the file name is checked for
+/// characters: a folder named `[old]` is fine. In-place Save never asks, so
+/// a workbook opened from such a name still saves over itself.
+fn sheet_save_as_name(path: &std::path::Path) -> Result<(), &'static str> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let bad = name.contains(['<', '>', '?', '[', ']', ':', '|', '*', '"']);
+    let long = path.as_os_str().to_string_lossy().encode_utf16().count() > SHEET_MAX_PATH;
+    if bad || long {
+        Err(SHEET_BAD_NAME)
+    } else {
+        Ok(())
+    }
+}
+
 /// Save As a workbook tab to `target` without a dialog: the commit a Save
 /// makes first, then the write the dialog's answer feeds. Returns whether the
 /// file was written.
 fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
     if tab.access.protected {
         tab.status = open_mode::PROTECTED_STATUS.into();
+        return false;
+    }
+    // A bad extension keeps `finish_sheet_save`'s own words.
+    if let Some(Err(e)) = sheet_save_target(target)
+        .ok()
+        .map(|p| sheet_save_as_name(&p))
+    {
+        tab.status = e.into();
         return false;
     }
     let begun = tab.circle_cmd_begin();
@@ -28465,10 +28505,10 @@ mod load_failed_save_tests {
 #[cfg(test)]
 mod sheet_save_tests {
     use super::{
-        DocTab, Kind, PivotDef, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS,
-        SHEET_SAVE_FORMATS, SheetSaveDecision, SheetView, Surface, finish_sheet_save,
-        macro_free_question, new_sheet_surface, save_sheet_tab, save_sheet_to, sheet_bytes,
-        sheet_save_decision, sheet_save_target, tab_from_path,
+        DocTab, Kind, PivotDef, SHEET_BAD_NAME, SHEET_MAX_PATH, SHEET_NEVER_SAVED_HARNESS,
+        SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS, SheetSaveDecision, SheetView, Surface,
+        finish_sheet_save, macro_free_question, new_sheet_surface, save_sheet_tab, save_sheet_to,
+        sheet_bytes, sheet_save_as_name, sheet_save_decision, sheet_save_target, tab_from_path,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28710,6 +28750,93 @@ mod sheet_save_tests {
         assert!(!save_sheet_to(&mut other, &dir.path("copy.csv")));
         assert_eq!(other.status.as_ref(), SHEET_SAVE_FORMATS);
         assert!(other.path.is_none());
+    }
+
+    /// #804: Excel's Save As refuses `[ ]` (its external-reference brackets)
+    /// and the other characters its message lists, in the file name only.
+    #[test]
+    fn sheet_save_as_refuses_excels_bad_names() {
+        let dir = Scratch::new();
+        for name in ["a[b].xlsx", "a]b.xlsx", "a[b]"]
+            .into_iter()
+            .map(String::from)
+            // Two letters first: on Windows `a:b` is a path on drive A.
+            .chain("<>?:|*\"".chars().map(|c| format!("ab{c}c.xlsx")))
+        {
+            let target = sheet_save_target(&dir.path(&name)).unwrap();
+            assert_eq!(sheet_save_as_name(&target), Err(SHEET_BAD_NAME), "{name}");
+        }
+        for name in ["a-b (1).xlsx", "na\u{ef}ve.xlsx", "book"] {
+            let target = sheet_save_target(&dir.path(name)).unwrap();
+            assert_eq!(sheet_save_as_name(&target), Ok(()), "{name}");
+        }
+        // A folder may hold them; only the name and the length count.
+        assert_eq!(
+            sheet_save_as_name(&dir.path("[old]").join("book.xlsx")),
+            Ok(())
+        );
+    }
+
+    /// #804: the full path, `.xlsx` added, may be 218 UTF-16 units, not 219.
+    #[test]
+    fn sheet_save_as_path_limit_is_218() {
+        let dir = Scratch::new();
+        let units = |p: &Path| p.as_os_str().to_string_lossy().encode_utf16().count();
+        // An extensionless name of `n` x's, its path counted with `.xlsx`.
+        let base = units(&dir.path("x.xlsx")) - 1;
+        assert!(base < SHEET_MAX_PATH, "scratch folder too deep: {base}");
+        let named = |n: usize| sheet_save_target(&dir.path(&"x".repeat(n))).unwrap();
+        let at_limit = named(SHEET_MAX_PATH - base);
+        assert_eq!(units(&at_limit), SHEET_MAX_PATH);
+        assert_eq!(sheet_save_as_name(&at_limit), Ok(()));
+        let over = named(SHEET_MAX_PATH - base + 1);
+        assert_eq!(units(&over), SHEET_MAX_PATH + 1);
+        assert_eq!(sheet_save_as_name(&over), Err(SHEET_BAD_NAME));
+        // A character outside the BMP counts twice, as Windows counts it.
+        let wide = format!("{}\u{1F600}", "x".repeat(SHEET_MAX_PATH - base - 1));
+        let wide = sheet_save_target(&dir.path(&wide)).unwrap();
+        assert_eq!(units(&wide), SHEET_MAX_PATH + 1);
+        assert_eq!(sheet_save_as_name(&wide), Err(SHEET_BAD_NAME));
+    }
+
+    /// #804: Save As without a dialog (the harness's write) refuses such a
+    /// name, writes nothing and leaves the tab as it was.
+    #[test]
+    fn save_sheet_to_refuses_a_bracket_name_and_writes_nothing() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Book1.xlsx");
+        for name in ["a[b].xlsx", "a[b]"] {
+            assert!(!save_sheet_to(&mut tab, &dir.path(name)), "{name}");
+            assert_eq!(tab.status.as_ref(), SHEET_BAD_NAME);
+        }
+        assert!(std::fs::read_dir(&dir.0).unwrap().next().is_none());
+        assert_eq!(tab.title.as_ref(), "Book1.xlsx");
+        assert!(tab.path.is_none());
+        assert!(tab.dirty);
+        // A bad extension keeps its own words.
+        assert!(!save_sheet_to(&mut tab, &dir.path("a[b].csv")));
+        assert_eq!(tab.status.as_ref(), SHEET_SAVE_FORMATS);
+    }
+
+    /// #804: the Save As dialog's answer is refused the same way, before
+    /// the macro question; in-place Save over such a name still writes.
+    #[test]
+    fn save_as_dialog_refuses_a_bracket_name_but_save_in_place_does_not() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Book1.xlsx");
+        save_sheet_tab(&mut tab, false, true, |_| Some(dir.path("a[b]")), not_asked);
+        assert!(!dir.path("a[b]").exists() && !dir.path("a[b].xlsx").exists());
+        assert_eq!(tab.status.as_ref(), SHEET_BAD_NAME);
+        assert_eq!(tab.title.as_ref(), "Book1.xlsx");
+        assert!(tab.path.is_none());
+        assert!(tab.dirty);
+
+        let bound = dir.path("a[b].xlsx");
+        std::fs::write(&bound, b"old").unwrap();
+        let mut tab = sheet_tab(Some(bound.clone()), "a[b].xlsx");
+        assert!(save_sheet_tab(&mut tab, false, false, |_| None, not_asked));
+        assert!(!tab.dirty, "{}", tab.status);
+        assert_ne!(std::fs::read(&bound).unwrap(), b"old");
     }
 
     /// A sheet tab over `pkg`, loaded from `path` as the Open dialog loads it.

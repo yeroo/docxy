@@ -1775,6 +1775,18 @@
   `uiharness/cases/doc-run-styles.uit` was written without being run (macOS
   cannot drive the window).
 
+## Sheet Save As names (#804)
+
+- A workbook Save As refuses, as Excel does, a file name holding
+  `< > ? [ ] : | * "` (the brackets are external-reference syntax) or a full
+  path over 218 UTF-16 units, `.xlsx` added and not canonicalised
+  (`sheet_save_as_name`, `SHEET_BAD_NAME`): the harness's `save-as` (before
+  "already exists"), `save_sheet_to`, and the Save As dialog's answer, which
+  sets the status and writes nothing like a failed write. A folder may hold
+  the characters. In-place Save never asks, so a workbook opened from such a
+  name saves over itself. Documents, Projects and terminal `xlsxy` are not
+  checked.
+
 ## Sheet notes follow row/column insert and delete (#1335)
 
 - `SheetPackage::shift_comments(sheet, &EditShift)` (gridcore
