@@ -454,8 +454,8 @@
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
   implementing `projcore::plugin_abi` (C ABI, MSPDI XML text across it) that
   adds project file types. `projcore::formats::Registry` holds the built-in
-  `.yppx` and `.xml`, then the host's `mppread::project::MppImport` (read-only
-  `.mpp`), then the plugins; a later registration replaces an extension's
+  `.yppx`, `.xml` and `.mpx` (read-only, #309), then the host's
+  `mppread::project::MppImport` (read-only `.mpp`), then the plugins; a later registration replaces an extension's
   reader and/or writer in place. The loader is `projcore::formats::plugin`,
   behind the `plugins` feature (it adds `libloading`), which only native hosts
   enable; projcore's default and wasm builds stay dependency-free.
@@ -1868,8 +1868,9 @@
   the existing rule, with no host code naming it. `Registry::read` reads a
   file whose extension nothing claims as MPX when it starts `MPX,` or `MPX;`
   (`mpx::is_mpx`, after an optional BOM), else as MSPDI as before; the
-  suite's `Formats::read` refuses such an extension before that, so only
-  yppxy and projctl sniff.
+  suite's `Formats::read` refuses such an extension before that and projctl
+  never calls `Registry::read`, so only yppxy sniffs (its CLI and
+  `proj.open`/`proj.reload`).
 - Rows are read by the field ids of the 41/61 record before them; tasks are
   ordered by ID (a row with no ID keeps its place), a row with no name and
   no outline level is blank, links name task IDs. Dates are whole days: a
@@ -1877,7 +1878,9 @@
   `day_end` of the task calendar by its kind. Start/Finish are only the
   stored dates, never constraints. Enumerations are Project's English words
   (Priority as MPXJ maps them, Medium = 500); units are fractions (`1` =
-  100%), as MPXJ writes and reads them.
+  100%), as MPXJ writes and reads them; durations take MPXJ's `mon`/`emon`
+  and `y`/`ey` beside Project's `mo`/`emo`, a weekday before a date is
+  skipped (month names are not read), and a note's U+007F is a line break.
 - MPX has no task calendar, Manual, Active or Honor Constraints field, and
   constraint dates have no time: `projcore/tests/mpx_corpus.rs` compares
   `corpus/mpx` (MPXJ 16.8.0's MPX of `corpus/mspdi`, three date orders)
