@@ -3065,7 +3065,8 @@ impl Session {
         // != Some(idx))`, so they'd otherwise vanish silently too.
         // Each with its index in the list: the restore puts it back there, so
         // the list returns to its order before the removal and an older
-        // entry's `rewritten_names` positions still hold.
+        // entry's `rewritten_names` positions still hold (for restores in
+        // order; a ghost left stashed may come back out of order).
         let defined_names: Vec<(usize, DefinedName)> = self
             .pkg
             .workbook
@@ -3379,7 +3380,10 @@ impl Session {
     /// [B, A, A_imp], A restores but B is then refused (B's restore would unwind
     /// A_imp, whose name A now holds); and if the
     /// restored sheet is renamed, the ghost can later come back with a frame
-    /// that did not have it (its index only; the rewrites are checked, see above).
+    /// that did not have k's names: its index, its scoped names' places and its
+    /// `rewritten_names` positions may be off, and a name rewrite whose guard
+    /// no longer holds is skipped as on any top restore (the lossless check
+    /// covers k's own rewrites only).
     /// These checks run BEFORE any stash is
     /// consumed, so a rejected restore leaves the stack intact for a correct
     /// later attempt. **INTERNAL-ONLY**: this
