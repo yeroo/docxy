@@ -28,7 +28,7 @@ use ctlcore::json::Json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uiharness::probe::ProbeOpts;
-use uiharness::{BorderExpect, Driver, Run, check_border_clipped, control_dir, parse_border};
+use uiharness::{BorderExpect, Driver, Run, control_dir, judge_border, parse_border};
 
 const USAGE: &str = "\
 uiharness — drive a suite instance started with --harness
@@ -294,15 +294,22 @@ fn run(a: Args) -> Result<String, String> {
 
         // Take the picture and read it. The expectation names the region, so
         // the crop that is checked and the PNG that is filed are the same
-        // pixels, from the same settled frame.
+        // pixels: those of the steady shot the verdict was made on (#1783).
         Command::Assert(exp) => {
-            let s = d.shot(&exp.region)?;
+            let judged = judge_border(&exp, ProbeOpts::default(), || d.shot(&exp.region))?;
+            let (s, check) = (&judged.shot, &judged.check);
             let path = save(&a, &exp.region, &s.image)?;
-            let check = check_border_clipped(&exp, &s.image, ProbeOpts::default(), s.clipped);
             let mut report = check.report(Some(&path));
             report.push_str(&format!(
-                "  capture:  {}x{} via {}\n",
-                s.image.w, s.image.h, s.capture.how
+                "  capture:  {}x{} via {}{}\n",
+                s.image.w,
+                s.image.h,
+                s.capture.how,
+                if check.passed() {
+                    String::new()
+                } else {
+                    judged.polling()
+                }
             ));
             // A failed expectation is a failed process: `Err` here is what puts
             // the report on stderr and a non-zero code on the exit.
