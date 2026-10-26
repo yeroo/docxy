@@ -69,7 +69,10 @@ fn looks_like_r1c1(name: &str) -> bool {
 /// compares them case-insensitively over all of Unicode (`Продажи` is
 /// `продажи`). Simple per-character lowercase, not full case folding, so
 /// `ß` is not `SS`. Every lookup, uniqueness check and rewrite of a table or
-/// column name goes through it, so they all agree (#1750). A loaded file
+/// column name goes through it, so they all agree (#1750), as do the data
+/// model's and the pivots' column lookups ([`crate::frame::Frame::col_index`]).
+/// Sheet names, defined names, LET/LAMBDA parameters and measure names still
+/// compare ASCII-case-insensitively. A loaded file
 /// holding two tables whose names differ only in non-ASCII case (Excel never
 /// writes one) resolves to the first.
 pub fn name_eq(a: &str, b: &str) -> bool {

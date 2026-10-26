@@ -609,6 +609,19 @@ mod tests {
     }
 
     #[test]
+    fn relationships_fold_unicode_case() {
+        // #1750: a table and its column, named in another case.
+        let mut m = DataModel::default();
+        m.add_csv("Продажи", "Товар,Кол\nРучка,3\n");
+        m.add_csv("Товары", "Код,Имя\nРучка,Pen\n");
+        m.relate("продажи", "ТОВАР", "ТОВАРЫ", "код").unwrap();
+        let f = m.expanded_frame("ПРОДАЖИ").unwrap();
+        assert_eq!(f.col_index("кол"), Some(1));
+        assert_eq!(f.col_index("товары[имя]"), Some(3));
+        assert!(m.relate("продажи", "нет", "Товары", "Код").is_err());
+    }
+
+    #[test]
     fn expanded_frame_joins_transitively() {
         let m = star();
         let f = m.expanded_frame("Sales").unwrap();

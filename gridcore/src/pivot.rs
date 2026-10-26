@@ -449,7 +449,7 @@ pub fn refresh_pivots(wb: &mut Workbook) -> RefreshOutcome {
         // Calculated-field formula lookups for the calc parser.
         let calc_of = |name: &str| -> Option<String> {
             p.calc_formulas.iter().find_map(|(fi, f)| {
-                (p.fields.get(*fi).map(|n| n.eq_ignore_ascii_case(name)) == Some(true))
+                (p.fields.get(*fi).map(|n| crate::names::name_eq(n, name)) == Some(true))
                     .then(|| f.clone())
             })
         };

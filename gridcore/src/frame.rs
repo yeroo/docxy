@@ -8,6 +8,7 @@
 
 use crate::engine::cell_to_value;
 use crate::formula::{ExcelError, Value, compare, to_text};
+use crate::names::name_eq;
 use crate::sheet::{Cell, CellValue, Sheet, Workbook};
 
 /// A columnar snapshot: equal-length value columns with header names.
@@ -80,9 +81,10 @@ impl Frame {
         self.cols.first().map(|c| c.len()).unwrap_or(0)
     }
 
-    /// Column index by header name, case-insensitive.
+    /// Column index by header name, case-insensitive over Unicode as table
+    /// column names compare ([`name_eq`]).
     pub fn col_index(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
+        self.names.iter().position(|n| name_eq(n, name))
     }
 
     /// Parse delimited text (RFC 4180-ish: quoted fields, doubled quotes,
