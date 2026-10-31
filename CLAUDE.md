@@ -1847,13 +1847,17 @@
 - A workbook Save As refuses, as Excel does, a file name holding
   `< > ? [ ] : | * "` (the brackets are external-reference syntax) or a full
   path over 218 UTF-16 units, the added extension counted and not
-  canonicalised (`gridcore::save_name::check`, `BAD_NAME`, `MAX_PATH`, the
-  one rule both hosts call). The suite (`sheet_save_as_name`): the harness's
+  canonicalised (`gridcore::save_name::check`, `BAD_NAME`, `MAX_PATH`,
+  shared by the suite and terminal `xlsxy`; xlcomshim's `Workbook.SaveAs`
+  does not check). The suite (`sheet_save_as_name`): the harness's
   `save-as` (before "already exists"), `save_sheet_to`, and the Save As
   dialog's answer, which sets the status and writes nothing like a failed
   write. Terminal `xlsxy` (`App::refuse_bad_save_name`, after Protected
   View's refusal in `request_save_as` and `save_as_type`): Backstage Save As
-  and the F12 prompt (a typed path is checked as typed), for every Save As
+  (whose typed name is also checked whole before it is joined to the folder,
+  `save_name::has_bad_char`: on Windows `c:report` would join as a
+  drive-relative path) and the F12 prompt (a typed path is checked as typed,
+  so `c:` there is a drive), for every Save As
   type (text, web page, PDF, `.xls`), before the macro-free and
   compatibility questions and before the binding moves. A folder may hold
   the characters. In-place Save never asks, so a workbook opened from such a

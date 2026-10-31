@@ -1,5 +1,6 @@
-//! Excel's check on a Save As target (#804, FIL-CASE-031), shared by every
-//! host that saves a workbook: the suite and terminal `xlsxy`.
+//! Excel's check on a Save As target (#804, FIL-CASE-031), shared by the
+//! suite and terminal `xlsxy`. (xlcomshim's `Workbook.SaveAs` does not call
+//! it.)
 //!
 //! Excel refuses a file name holding `< > ? [ ] : | * "` (the brackets are
 //! external-reference syntax) or a full path over 218 UTF-16 units. In-place
@@ -23,9 +24,17 @@ const BAD_CHARS: [char; 9] = ['<', '>', '?', '[', ']', ':', '|', '*', '"'];
 /// named `[old]` is fine.
 pub fn check(path: &Path) -> Result<(), &'static str> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let bad = name.contains(BAD_CHARS);
+    let bad = has_bad_char(&name);
     let long = path.as_os_str().to_string_lossy().encode_utf16().count() > MAX_PATH;
     if bad || long { Err(BAD_NAME) } else { Ok(()) }
+}
+
+/// Whether a typed name holds a character a workbook name cannot. A host
+/// whose name field is joined to a folder checks the typed text with this
+/// before the join: on Windows `a:b.xlsx` parses as drive `A:` plus
+/// `b.xlsx`, so after a join [`check`] would see only `b.xlsx` (#1807).
+pub fn has_bad_char(name: &str) -> bool {
+    name.contains(BAD_CHARS)
 }
 
 #[cfg(test)]
@@ -41,6 +50,16 @@ mod tests {
         }
         assert_eq!(check(Path::new("dir/a b (1).xlsx")), Ok(()));
         assert_eq!(check(Path::new("dir/a'b#c.xlsx")), Ok(()));
+    }
+
+    #[test]
+    fn a_typed_name_is_checked_whole() {
+        assert!(has_bad_char("c:report.xlsx"));
+        for c in BAD_CHARS {
+            assert!(has_bad_char(&format!("ab{c}c")), "{c}");
+        }
+        assert!(!has_bad_char("sub/report.xlsx"));
+        assert!(!has_bad_char("report (1).xlsx"));
     }
 
     #[test]

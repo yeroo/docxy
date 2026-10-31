@@ -8729,8 +8729,15 @@ impl App {
             None if name.contains('.') => name,
             None => format!("{name}.xlsx"),
         };
-        let path = dir.join(&fname).to_string_lossy().into_owned();
         self.backstage = None;
+        // The typed name is checked before the join (#1807): on Windows
+        // `c:report.xlsx` is drive C: plus `report.xlsx`, and the join would
+        // drop the folder and hide the colon from the full-path check.
+        if gridcore::save_name::has_bad_char(&fname) {
+            self.status = Some(gridcore::save_name::BAD_NAME.to_string());
+            return;
+        }
+        let path = dir.join(&fname).to_string_lossy().into_owned();
         match chosen {
             Some(t) => self.save_as_type(path, t),
             None => self.request_save_as(path),
@@ -15761,8 +15768,9 @@ mod tests {
             assert_eq!(save_as_state(app), before, "{what}");
             assert!(app.confirm.is_none(), "{what} asked");
         };
+        // A two-letter stem, so `ab:c` never parses as a Windows drive.
         for c in ['<', '>', '?', '[', ']', ':', '|', '*', '"'] {
-            let name = format!("a{c}b.xlsx");
+            let name = format!("ab{c}c.xlsx");
             app.status = None;
             app.request_save_as(dir.join(&name).to_string_lossy().into_owned());
             refused(&app, &name);
@@ -15799,6 +15807,24 @@ mod tests {
         app.commit_save_as(dir.clone(), "a[b]".into());
         refused(&app, "Backstage");
         assert!(app.backstage.is_none());
+        // A drive-like name in the name field is refused on every OS: on
+        // Windows the join would make it drive-relative `c:report.xlsx`.
+        for (name, typed) in [
+            ("c:report", None),
+            ("c:report.csv", None),
+            ("c:report", Some("CSV UTF-8 (Comma delimited)")),
+        ] {
+            app.open_backstage();
+            if let Some(label) = typed {
+                let b = app.backstage.as_mut().unwrap();
+                b.type_sel = save_type_at(label);
+                b.type_touched = true;
+            }
+            app.status = None;
+            app.commit_save_as(dir.clone(), name.into());
+            refused(&app, name);
+            assert!(app.backstage.is_none());
+        }
         let written: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
