@@ -2032,8 +2032,10 @@
   a duration without a unit or whose estimate is committed, which converts
   first so the unit stays, an effort rescale); an auto task's typed finish
   is a constraint and keeps it. A progress write (`progress_of`) first
-  re-expresses an elapsed task as the working minutes of its scheduled
-  span, its stored actual and remaining scaled alike, then stores it in
+  re-expresses an elapsed task as the working minutes of its wall-clock
+  window (its elapsed duration from its actual start, else its scheduled
+  start; never the tracked schedule's span, which counts it as working
+  minutes), its stored actual and remaining scaled alike, then stores it in
   working time (unmeasured: Project keeps progress on an elapsed duration).
 - The schedule runs an automatic elapsed leaf on the 24x7 clock, start
   included (`Scheduler::elapsed`): it starts at its driven or constraint
@@ -2068,6 +2070,6 @@
   complete elapsed task, so such a plan writes scheduled dates and
   wall-clock slack. The `.mpp` import keeps an auto task's elapsed
   Duration (FixedData +84) and format (`mpp::elapsed_duration_format`)
-  unless it is in progress; a manual task's elapsed duration is not
-  decoded (#225). `oracle_corpus` compares UID 25 (dates, late dates,
+  unless it is in progress (`mpp::carries_duration_format`, which the
+  oracle shares); a manual task's elapsed duration is not decoded (#225). `oracle_corpus` compares UID 25 (dates, late dates,
   slacks, imported unpinned) and UID 30 in every snapshot that has them.
