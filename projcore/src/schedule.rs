@@ -734,7 +734,6 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// The calendar whose timeline `tl()` returns for `task`.
     /// An elapsed leaf's wall-clock duration (#484): it runs on the 24x7
     /// clock, start included, so its dates are instants, not working
     /// indexes. `None` for a working, zero-length or tracked task (a tracked
@@ -744,6 +743,7 @@ impl<'a> Scheduler<'a> {
             .then_some(task.duration_min)
     }
 
+    /// The calendar whose timeline `tl()` returns for `task`.
     fn calendar_uid(&self, task: &Task) -> i32 {
         task.calendar_uid
             .filter(|uid| self.timelines.contains_key(uid))
@@ -2898,8 +2898,6 @@ fn fs_milestone_instant(tl: &Timeline, predecessor_finish: i64, lag: i64) -> i64
     }
 }
 
-/// SF at zero lag preserves the predecessor's actual start, including across
-/// calendars. Nonzero lag uses the successor calendar's working-start mapping.
 /// The latest instant an elapsed predecessor's linked endpoint may take
 /// (its finish for FS/FF, its start for SS/SF) without moving its successor
 /// (#484): the inverse of the forward link. A successor that keeps the
@@ -2969,6 +2967,8 @@ fn elapsed_link_start(
     }
 }
 
+/// SF at zero lag preserves the predecessor's actual start, including across
+/// calendars. Nonzero lag uses the successor calendar's working-start mapping.
 fn sf_bound(tl: &Timeline, predecessor_start: i64, lag: i64) -> (i64, i64) {
     let index = tl.to_index(predecessor_start) + lag;
     (
@@ -4449,7 +4449,12 @@ impl Scheduler<'_> {
         // An elapsed task (#484) is held too: it runs on the wall clock,
         // which the leveler's working-index booking does not model, so it
         // keeps its CPM dates and is booked over its whole span
-        // (unmeasured).
+        // (unmeasured). Known limit: it is not placed from its leveled
+        // predecessors either, so an elapsed task FS-linked from a task the
+        // pass delays keeps its CPM start, before that predecessor's leveled
+        // finish, in the Level All overlay and in the pass's booking (a
+        // written delay still moves it through its link on the committed
+        // schedule).
         let held = |t: &Task| {
             fixed(t) || scope.held(t) || self.schedulable_alap(t) || self.elapsed(t).is_some()
         };
