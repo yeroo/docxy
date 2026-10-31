@@ -2390,10 +2390,12 @@ mod tests {
             "2026-03-03T17:00:00"
         );
 
-        // An elapsed format keeps the span: projcore cannot schedule elapsed duration.
+        // An elapsed format keeps its stored Duration as elapsed minutes,
+        // which projcore schedules on the clock (#484), not the span.
         put(&mut s, NEWEST_PROGRESS.duration_format, &8u16.to_le_bytes());
         let elapsed = crate::project::project_from_mpp(&file(&s, true)).unwrap();
-        assert_eq!(elapsed.tasks[0].duration_min, 960);
+        assert_eq!(elapsed.tasks[0].duration_min, 480);
+        assert_eq!(elapsed.tasks[0].duration_format, Some(8));
 
         // An unknown format likewise keeps the span.
         put(

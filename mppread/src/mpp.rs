@@ -202,6 +202,13 @@ pub fn working_duration_format(code: u16) -> bool {
     matches!(code & !32, 3 | 5 | 7 | 9 | 11)
 }
 
+/// Auto task DurationFormat codes measured in elapsed (wall-clock) time,
+/// estimated or not; their Duration (FixedData +84) is elapsed minutes, as
+/// projcore holds it for such a task (#484).
+pub fn elapsed_duration_format(code: u16) -> bool {
+    matches!(code & !32, 4 | 6 | 8 | 10 | 12)
+}
+
 /// Decode task rows only when the binary table has a recognized structure.
 pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
     crate::taskdecode::decode(bytes)

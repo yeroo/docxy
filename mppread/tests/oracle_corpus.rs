@@ -19,6 +19,25 @@ fn null_uids(xml: &str) -> std::collections::HashSet<i32> {
     out
 }
 
+/// The text of task `uid`'s own `<name>` element in an MSPDI file (not a
+/// baseline's), if it has one.
+fn task_field(xml: &str, uid: i32, name: &str) -> Option<String> {
+    xml.split("<Task>").skip(1).find_map(|after_start| {
+        let (task, _) = after_start.split_once("</Task>")?;
+        let direct = task.split("<Baseline>").next().unwrap();
+        let own = direct
+            .split_once("<UID>")
+            .and_then(|(_, s)| s.split_once("</UID>"))
+            .and_then(|(s, _)| s.trim().parse::<i32>().ok());
+        if own != Some(uid) {
+            return None;
+        }
+        let (_, rest) = direct.split_once(&format!("<{name}>"))?;
+        let (text, _) = rest.split_once(&format!("</{name}>"))?;
+        Some(text.trim().to_string())
+    })
+}
+
 fn duration_formats(xml: &str) -> std::collections::HashMap<i32, i32> {
     let mut out = std::collections::HashMap::new();
     for after_start in xml.split("<Task>").skip(1) {
@@ -210,9 +229,12 @@ fn check_task_fields(
     source: Oracle,
 ) {
     // A decoded working DurationFormat reaches the model as the MSPDI reader
-    // keeps it; any other reads as days.
+    // keeps it, and so does an auto task's elapsed one (#484); any other
+    // reads as days.
     if let Some(format) = a.duration_format {
-        let expected = if mppread::mpp::working_duration_format(format) {
+        let expected = if mppread::mpp::working_duration_format(format)
+            || (!a.manual && mppread::mpp::elapsed_duration_format(format))
+        {
             e.duration_format
         } else {
             None
@@ -768,16 +790,17 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let mut selected = 0usize;
         let mut duration_compared = 0usize;
         let mut split_duration_compared = false;
-        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, recurring exception, nonworking start, fractional progress
+        let mut dropped = [0usize; 4]; // split, delayed assignment, recurring exception, fractional progress
+        let mut elapsed_compared = Vec::new();
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.is_null || task.summary || task.manual || expected_task.milestone {
                 continue;
             }
-            if formats
-                .get(&task.uid)
-                .is_some_and(|&format| mppread::mpp::working_duration_format(format as u16))
-            {
+            if formats.get(&task.uid).is_some_and(|&format| {
+                mppread::mpp::working_duration_format(format as u16)
+                    || mppread::mpp::elapsed_duration_format(format as u16)
+            }) {
                 assert_eq!(
                     task.duration_min,
                     expected_task.duration_min,
@@ -806,13 +829,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[1] += 1;
                 continue;
             }
-            if formats
-                .get(&task.uid)
-                .is_some_and(|format| matches!(format & !32, 4 | 6 | 8 | 10 | 12))
-            {
-                dropped[2] += 1;
-                continue;
-            }
             let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
             if exceptions
                 .iter()
@@ -824,13 +840,13 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                     })
                 })
             {
-                dropped[3] += 1;
+                dropped[2] += 1;
                 continue;
             }
             if mpp.file_stem().is_some_and(|stem| stem == "p6-fractional") && task.uid == 2 {
                 // Project retains subminute actual and remaining duration here;
                 // the minute-resolution scheduler ends one minute earlier.
-                dropped[5] += 1;
+                dropped[3] += 1;
                 continue;
             }
             selected += 1;
@@ -841,20 +857,8 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display(),
                 task.uid
             );
-            let calendar = imported
-                .calendar(task.calendar_uid.unwrap_or(imported.default_calendar_uid))
-                .map(|cal| imported.resolved_calendar(cal))
-                .unwrap_or_else(|| imported.project_calendar());
-            let working_start = calendar
-                .day(start.day_number())
-                .iter()
-                .any(|slot| slot.from <= start.minute_of_day() && start.minute_of_day() < slot.to);
-            if !working_start {
-                // Project can retain a MustStartOn timestamp before work starts;
-                // projcore moves the scheduled start to the first working slot.
-                dropped[4] += 1;
-                continue;
-            }
+            // An elapsed task (#484) and a Must Start On before the day's
+            // opening (#434) keep Project's stored instants too.
             let result = scheduled.get(task.uid).unwrap();
             assert_eq!(
                 (result.early_start, result.early_finish),
@@ -863,13 +867,79 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display(),
                 task.uid
             );
+            if task.elapsed_duration() {
+                // Its late dates and its slack, which Project reports in
+                // wall-clock minutes (#484).
+                let late = |name| {
+                    projcore::DateTime::parse_mspdi(&task_field(&xml_text, task.uid, name).unwrap())
+                };
+                assert_eq!(
+                    (Some(result.late_start), Some(result.late_finish)),
+                    (late("LateStart"), late("LateFinish")),
+                    "{}: late dates UID {}",
+                    mpp.display(),
+                    task.uid
+                );
+                for (name, minutes) in [
+                    ("TotalSlack", result.total_slack_min),
+                    ("FreeSlack", result.free_slack_min),
+                    ("StartSlack", result.start_slack_min),
+                    ("FinishSlack", result.finish_slack_min),
+                ] {
+                    assert_eq!(
+                        task_field(&xml_text, task.uid, name),
+                        Some((minutes * 10).to_string()),
+                        "{}: {name} UID {}",
+                        mpp.display(),
+                        task.uid
+                    );
+                }
+                elapsed_compared.push(task.uid);
+            }
             compared_uids.push(task.uid);
         }
-        if dropped.iter().any(|&n| n > 0) {
+        if dropped.iter().any(|&n| n > 0) || !elapsed_compared.is_empty() {
             eprintln!(
-                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start/fractional-progress = {dropped:?}",
+                "{}: duration-compared {duration_compared}, date-selected {selected}, elapsed date/slack-compared {elapsed_compared:?}, exclusions split/delayed-assignment/recurring-exception/fractional-progress = {dropped:?}",
                 mpp.display()
             );
+        }
+        let snapshot_step = mpp
+            .file_stem()
+            .and_then(|stem| stem.to_str()?.get(..2)?.parse::<u32>().ok())
+            .filter(|_| mpp.parent().is_some_and(|dir| dir.ends_with("snapshots")));
+        if let Some(step) = snapshot_step {
+            // UID 25 "S15 elapsed" (#435) is compared from step 15 on, with
+            // its elapsed Duration and no import pin, so the pin cannot be
+            // what reproduces it; UID 30 "S20 mso task" (#434) from step 20
+            // on, its 08:00 start before the 08:30 opening from step 31.
+            if step >= 15 {
+                assert!(
+                    elapsed_compared.contains(&25),
+                    "{}: UID 25 elapsed task was not compared",
+                    mpp.display()
+                );
+                let s15 = imported.task(25).unwrap();
+                assert_eq!(
+                    (s15.duration_min, s15.duration_format),
+                    (4320, Some(8)),
+                    "{}: UID 25 duration",
+                    mpp.display()
+                );
+                assert_eq!(
+                    (s15.constraint, s15.constraint_date),
+                    (projcore::ConstraintType::AsSoonAsPossible, None),
+                    "{}: UID 25 pinned",
+                    mpp.display()
+                );
+            }
+            if step >= 20 {
+                assert!(
+                    compared_uids.contains(&30),
+                    "{}: UID 30 MSO task was not compared",
+                    mpp.display()
+                );
+            }
         }
         let stem = mpp.file_stem().unwrap().to_string_lossy();
         if stem == "13-split-task" {
