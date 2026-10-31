@@ -6089,7 +6089,7 @@ impl App {
     /// workbook package, the active sheet as text, or Excel's refusal for a
     /// type nothing here writes.
     fn save_as_type(&mut self, path: String, t: usize) {
-        if self.refuse_protected().is_err() {
+        if self.refuse_protected().is_err() || self.refuse_bad_save_name(&path) {
             return;
         }
         let ty = SAVE_TYPES[t];
@@ -6125,7 +6125,7 @@ impl App {
     /// (`out.csv` is CSV UTF-8, never a workbook under a `.csv` name); an
     /// extension no type has keeps the workbook package.
     fn request_save_as(&mut self, path: String) {
-        if self.refuse_protected().is_err() {
+        if self.refuse_protected().is_err() || self.refuse_bad_save_name(&path) {
             return;
         }
         // The type the workbook is bound to wins while the name keeps its
@@ -6135,6 +6135,22 @@ impl App {
         match bound.or_else(|| type_for_path(&path)) {
             Some(t) => self.save_as_type(path, t),
             None => self.request_save_as_package(path),
+        }
+    }
+
+    /// Excel's Save As refusal of a name holding `< > ? [ ] : | * "` or a
+    /// full path over 218 UTF-16 units (#804, #1807, `gridcore::save_name`),
+    /// for every Save As type, before anything is asked or written and before
+    /// the binding moves. `path` is the file that will be written, as typed
+    /// (a relative F12 path is not resolved). In-place Save never checks, so
+    /// a workbook opened from such a name still saves over itself.
+    fn refuse_bad_save_name(&mut self, path: &str) -> bool {
+        match gridcore::save_name::check(Path::new(path)) {
+            Ok(()) => false,
+            Err(msg) => {
+                self.status = Some(msg.to_string());
+                true
+            }
         }
     }
 
@@ -15714,6 +15730,158 @@ mod tests {
         app.request_save_as(xlsx.to_string_lossy().into_owned());
         assert!(!app.compat() && Path::new(&app.path) == xlsx);
         assert_eq!((app.max_rows(), app.max_cols()), (MAX_ROWS, MAX_COLS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a refused Save As must leave alone (#1807): the binding, its
+    /// type, the template and the import flag.
+    fn save_as_state(app: &App) -> (String, Option<usize>, Option<String>, bool) {
+        (
+            app.path.clone(),
+            app.text_type,
+            app.template.clone(),
+            app.import_unsaved,
+        )
+    }
+
+    /// #1807: every Save As entry refuses, as Excel does (#804), a name
+    /// holding `< > ? [ ] : | * "`, whatever the type, before anything is
+    /// written or the binding moves.
+    #[test]
+    fn save_as_refuses_a_name_excel_refuses_for_every_type() {
+        let dir = tmp("save-as-bad-name");
+        let mut app = two_sheet_app(&dir);
+        let before = save_as_state(&app);
+        let refused = |app: &App, what: &str| {
+            assert_eq!(
+                app.status.as_deref(),
+                Some(gridcore::save_name::BAD_NAME),
+                "{what}"
+            );
+            assert_eq!(save_as_state(app), before, "{what}");
+            assert!(app.confirm.is_none(), "{what} asked");
+        };
+        for c in ['<', '>', '?', '[', ']', ':', '|', '*', '"'] {
+            let name = format!("a{c}b.xlsx");
+            app.status = None;
+            app.request_save_as(dir.join(&name).to_string_lossy().into_owned());
+            refused(&app, &name);
+        }
+        // A text type, a web page and PDF, by name and from the type list.
+        for name in ["a[b].csv", "a[b].txt", "a[b].htm", "a[b].pdf", "a[b].xls"] {
+            app.status = None;
+            app.request_save_as(dir.join(name).to_string_lossy().into_owned());
+            refused(&app, name);
+        }
+        for (name, label) in [
+            ("a[b].csv", "CSV UTF-8 (Comma delimited)"),
+            ("a[b].pdf", "PDF"),
+            ("a[b].xls", "Excel 97-2003 Workbook"),
+            ("a[b].xlsx", "Excel Workbook"),
+        ] {
+            app.status = None;
+            app.save_as_type(
+                dir.join(name).to_string_lossy().into_owned(),
+                save_type_at(label),
+            );
+            refused(&app, label);
+        }
+        // The F12 prompt.
+        app.status = None;
+        app.open_prompt(PromptKind::SaveAs);
+        app.prompt.as_mut().unwrap().text = dir.join("p|q.xlsx").to_string_lossy().into_owned();
+        app.commit_prompt();
+        refused(&app, "F12 prompt");
+        // Backstage: the `.xlsx` it adds is part of the name checked, and
+        // it closes with the reason on the status line.
+        app.open_backstage();
+        app.status = None;
+        app.commit_save_as(dir.clone(), "a[b]".into());
+        refused(&app, "Backstage");
+        assert!(app.backstage.is_none());
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(written.is_empty(), "{written:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1807: the refusal comes before Excel's questions: neither the
+    /// macro-free nor the compatibility check asks about a name it refuses.
+    #[test]
+    fn a_bad_save_as_name_is_refused_before_any_question() {
+        let dir = macro_dir("bad-name-macros");
+        let mut app = App::new(xlsm_pkg(), dir.join("in.xlsm").to_str().unwrap());
+        app.commit_save_as(dir.clone(), "out[1].xlsx".into());
+        assert!(app.confirm.is_none(), "asked about the macros");
+        assert_eq!(app.status.as_deref(), Some(gridcore::save_name::BAD_NAME));
+        assert!(!dir.join("out[1].xlsx").exists());
+
+        let mut app = two_sheet_app(&dir);
+        app.pkg.workbook.sheets[app.sheet].protection = Some("sheet=\"1\"".into());
+        let good = dir.join("old.xls").to_string_lossy().into_owned();
+        assert!(
+            app.compat_losses_to_ask(&good).is_some(),
+            "the fixture loses something"
+        );
+        app.save_as_type(
+            dir.join("old*.xls").to_string_lossy().into_owned(),
+            save_type_at("Excel 97-2003 Workbook"),
+        );
+        assert!(app.confirm.is_none(), "asked about the losses");
+        assert_eq!(app.status.as_deref(), Some(gridcore::save_name::BAD_NAME));
+        assert!(!dir.join("old*.xls").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1807: the full path written may be 218 UTF-16 units, not 219; a
+    /// folder may hold the characters a name cannot.
+    #[test]
+    fn save_as_takes_a_218_unit_path_and_a_bracketed_folder() {
+        let dir = tmp("save-as-long");
+        let base = dir.to_string_lossy().encode_utf16().count() + 1;
+        let max = gridcore::save_name::MAX_PATH;
+        assert!(base + 6 < max, "scratch folder too deep: {base}");
+        // `x…x.xlsx` filling the path to `units`.
+        let named = |units: usize| format!("{}.xlsx", "x".repeat(units - base - 5));
+        let mut app = two_sheet_app(&dir);
+        let over = dir.join(named(max + 1)).to_string_lossy().into_owned();
+        assert_eq!(over.encode_utf16().count(), max + 1);
+        app.request_save_as(over.clone());
+        assert_eq!(app.status.as_deref(), Some(gridcore::save_name::BAD_NAME));
+        assert!(!Path::new(&over).exists());
+        let at = dir.join(named(max)).to_string_lossy().into_owned();
+        assert_eq!(at.encode_utf16().count(), max);
+        app.request_save_as(at.clone());
+        assert!(Path::new(&at).exists(), "{:?}", app.status);
+        assert_eq!(app.path, at);
+
+        let folder = dir.join("[old]");
+        std::fs::create_dir_all(&folder).unwrap();
+        let book = folder.join("book.xlsx").to_string_lossy().into_owned();
+        app.request_save_as(book.clone());
+        assert!(Path::new(&book).exists(), "{:?}", app.status);
+        assert_eq!(app.path, book);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1807: in-place Save never asks, so a workbook bound to a name Save
+    /// As would refuse still saves over itself.
+    #[test]
+    fn a_workbook_bound_to_a_bracket_name_saves_in_place() {
+        let dir = tmp("save-bad-name-in-place");
+        let path = dir.join("a[b].xlsx");
+        let mut app = App::new(new_xlsx(), path.to_str().unwrap());
+        app.modified = true;
+        app.save_current().unwrap();
+        assert!(path.exists());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        assert_ne!(app.status.as_deref(), Some(gridcore::save_name::BAD_NAME));
+        assert_eq!(Path::new(&app.path), path);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
