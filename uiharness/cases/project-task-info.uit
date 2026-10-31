@@ -60,13 +60,10 @@ test project task information: OK writes General, Advanced and Notes as one undo
   call field-read {"dialog-field":"percent"}
   assert reply.value is 50
   call pointer-click {"dialog-tab":"Notes"}
-  # Notes opens with the caret at the end; Home goes to the start of the
-  # second line, after "check" and the break.
+  # Notes opens with the caret at the end of what OK wrote: 8 is "check",
+  # the break and "it" ("checkit" would be 7), so the break was kept.
   call field-read {"dialog-field":"notes"}
   assert reply.caret is 8
-  call real-key {"key":"home"}
-  call field-read {"dialog-field":"notes"}
-  assert reply.caret is 6
   call real-key {"key":"escape"}
   key ctrl+z
   assert selected_name is B
