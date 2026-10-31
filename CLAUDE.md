@@ -1026,6 +1026,15 @@
   well `frame`: `n * w + (n - 1) * gap`. It is never capped, so a wide gallery
   collapses honestly; `fit_with` keeps no state, so a group collapsed at a
   narrow width is full again at a wide one (`plugin_ui` tests pin both).
+- `fit_with` ends with a back-fill (#1763): once the collapse passes fit, groups
+  they took too early (a wider group's collapse can free more than the small
+  ones before it) come back, highest priority first, in two rounds under
+  `LabelsFirst` (labels were dropped first, so they return last): collapsed
+  groups to IconOnly (Full when icon-only saves nothing; Full only under
+  `WholeGroups`), then IconOnly groups to Full. It does not run when the
+  chevron is needed. The result is not monotone in the width (the
+  collapse is greedy); the tests that pin the collapse order read
+  `fit_passes(.., false)`, the passes without it.
 
 ## Project table: resizable columns and AutoFilter (#1533)
 

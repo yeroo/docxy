@@ -284,8 +284,10 @@ test a collapsed sheet group's flyout shows the whole group and its toggles work
   call ribbon-flyout {}
   assert reply.open is false
   key escape
-  # Esc closes it too, and edits nothing under it.
-  call ribbon-flyout {"action":"open","group":"Number"}
+  # Esc closes it too, and edits nothing under it. Font again: the
+  # back-fill (#1763) may give Number back at this width on one platform's
+  # fonts and not another's, while Font, opened above, is collapsed on both.
+  call ribbon-flyout {"action":"open","group":"Font"}
   assert reply.open is true
   key escape
   call ribbon-flyout {}
@@ -302,7 +304,9 @@ test document Home narrow: no "N more", every command reachable
   assert reply.any_clipped is false
   assert reply.estimates_ok is true
   assert reply.groups.4.title is Editing
-  assert reply.groups.4.state is collapsed
+  # Collapsed, or icon-only when the back-fill (#1763) gives it room back:
+  # either way it is not drawn whole, and Find is still reachable.
+  assert reply.groups.4.state is not full
   # Find is in Editing, a group the old ribbon hid behind "N more".
   call ribbon-click {"tab":"Home","command":"find"}
   assert find_open is true
@@ -455,17 +459,12 @@ test a flyout wider than the window wraps inside it
   assert reply.inside is true
   call ribbon-click {"tab":"Table Design","command":"tablestyles:Grid Table 4 Accent 1"}
   assert table.style is GridTable4-Accent1
-  # Header Row is a check box in a column: it flips its state, and the
-  # Table Style Options flyout stays open to show it (#1020 r2).
-  call ribbon-flyout {"action":"open","group":"Table Style Options"}
-  assert reply.open is true
-  call ribbon-click {"tab":"Table Design","command":"header-row"}
-  call ribbon-flyout {}
-  assert reply.open is true
-  assert reply.group is Table Style Options
-  call ribbon-click {"tab":"Table Design","command":"header-row"}
-  call ribbon-flyout {}
-  assert reply.open is true
+  # Table Style Options went first, but once Table Styles collapsed it fits
+  # again, and the back-fill (#1763) gives it back: it has no flyout.
+  call ribbon-layout {}
+  assert reply.groups.0.title is Table Style Options
+  assert reply.groups.0.state is not collapsed
+  call-error ribbon-flyout {"action":"open","group":"Table Style Options"} => is not collapsed
   open ../fixtures/basic.xlsx
   call window-size {"w":460,"h":800}
   call ribbon-layout {"tab":"Formulas"}
