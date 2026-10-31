@@ -2306,9 +2306,11 @@ pub(crate) fn to_working_format(t: &mut Task) {
 /// A duration changed without being typed (a manual task's new finish, a
 /// milestone toggle) commits an estimated one, as in Project. Its format
 /// then drops the estimated bit with the estimate, and a format with no
-/// working unit (elapsed, null), which would misstate the new working
-/// minutes, becomes days.
+/// working unit (null), which would misstate the new working minutes,
+/// becomes days. An elapsed format first moves to the same unit in working
+/// time (`to_working_format`, #484), so it keeps its unit.
 fn commit_estimate(t: &mut Task) {
+    to_working_format(t);
     t.estimated = estimate_after(t.estimated, false);
     if t.estimated != Some(true) {
         t.duration_format = t.duration_format.map(|f| f & !32).filter(|&f| f != 7);
@@ -2563,9 +2565,10 @@ mod tests {
 
     /// #484: `duration_min` is elapsed minutes only under an elapsed
     /// format. A write of working minutes over one (a manual task's typed
-    /// finish, a duration set without a unit) moves the format to the same
-    /// unit in working time; an auto task's typed finish is a constraint and
-    /// keeps the elapsed duration.
+    /// finish, a duration set without a unit, a duration whose estimate is
+    /// committed, progress) moves the format to the same unit in working
+    /// time; an auto task's typed finish is a constraint and keeps the
+    /// elapsed duration.
     #[test]
     fn a_working_duration_write_takes_an_elapsed_format_to_working_time() {
         let at = |d, h| DateTime::from_ymd_hm(2026, 3, d, h, 0);
@@ -2586,6 +2589,8 @@ mod tests {
                 elapsed(1, 8, false),
                 elapsed(2, 6, true),
                 elapsed(3, 40, false),
+                elapsed(4, 10, false),
+                elapsed(5, 8, false),
             ],
             ..Project::default()
         });
@@ -2598,13 +2603,40 @@ mod tests {
         // Manual: the working time Mon 08:00 to Wed 17:00, in working time.
         ed.set_finish_at(2, at(4, 17)).unwrap();
         let t = ed.project().task(2).unwrap();
-        assert_eq!(t.duration_min, 3 * 480);
-        assert!(!t.elapsed_duration(), "{:?}", t.duration_format);
+        // Elapsed hours (6) become working hours (5), not days: the unit
+        // moves before the committed estimate looks at it (r1 m4).
+        assert_eq!((t.duration_min, t.duration_format), (3 * 480, Some(5)));
         // Minutes set without a unit: estimated elapsed days (40) become
         // estimated working days (39), the estimate kept.
         ed.set_duration_min(3, 960, true).unwrap();
         let t = ed.project().task(3).unwrap();
         assert_eq!((t.duration_min, t.duration_format), (960, Some(39)));
+        // A duration with no `?` stated commits the estimate: elapsed weeks
+        // (10) become working weeks (9).
+        ed.update_task(
+            4,
+            TaskPatch {
+                duration_min: Some(2400),
+                ..TaskPatch::default()
+            },
+        )
+        .unwrap();
+        let t = ed.project().task(4).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (2400, Some(9)));
+        // Progress (r1 M1): the 72 elapsed hours from Mon 08:00 cover three
+        // working days to Thu 08:00; an actual of one day is a third of
+        // those, and the duration is working days from then on.
+        ed.set_actual_duration(5, 480).unwrap();
+        let t = ed.project().task(5).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (3 * 480, None));
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.percent_complete
+            ),
+            (Some(480), Some(960), Some(33))
+        );
     }
 
     #[test]

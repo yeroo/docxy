@@ -53,6 +53,34 @@ fn share(whole: i64, percent: i64) -> i64 {
 }
 
 impl Editor {
+    /// Task `i`'s progress fields in working minutes, which every setter
+    /// computes and types. An elapsed task (#484) is re-expressed as the
+    /// working minutes its scheduled span covers on its calendar, its
+    /// recorded actual and remaining durations scaled alike, so progress
+    /// never mixes elapsed and working minutes: storing it then moves the
+    /// format to working time (`store_progress`). Unmeasured against
+    /// Project 2024, which keeps progress on an elapsed duration.
+    fn progress_of(&self, i: usize) -> Progress {
+        let task = &self.proj.tasks[i];
+        let mut p = Progress::of(task);
+        if !task.elapsed_duration() || task.duration_min <= 0 {
+            return p;
+        }
+        let Some(r) = self.sched.get(task.uid) else {
+            return p;
+        };
+        let calendar = crate::assign::task_calendar(&self.proj, task);
+        let working = crate::schedule::working_minutes_on(&calendar, r.early_start, r.early_finish);
+        let scale = |m: i64| {
+            i64::try_from(i128::from(m) * i128::from(working) / i128::from(task.duration_min))
+                .unwrap_or(working)
+        };
+        p.actual = p.actual.map(scale);
+        p.remaining = p.remaining.map(scale);
+        p.duration = working;
+        p
+    }
+
     /// The leaf task at `uid` whose progress can be set: summaries roll up,
     /// milestones have no duration to progress through.
     fn progress_row(&self, uid: i32) -> Result<usize, String> {
@@ -107,10 +135,10 @@ impl Editor {
         task.actual_finish = new.finish;
         task.actual_duration_min = new.actual;
         task.remaining_duration_min = new.remaining;
-        if task.duration_min != new.duration {
-            // Progress is counted in working time (#484).
-            super::super::to_working_format(task);
-        }
+        // Progress is counted in working time (#484), so an elapsed task's
+        // duration becomes working time with it (`progress_of`), even where
+        // the minutes coincide.
+        super::super::to_working_format(task);
         task.duration_min = new.duration;
         if new.percent != task.percent_complete.unwrap_or(0) {
             task.percent_complete = Some(new.percent);
@@ -132,7 +160,7 @@ impl Editor {
     /// refused.
     pub fn set_actual_start(&mut self, uid: i32, start: Option<DateTime>) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
-        let mut p = Progress::of(&self.proj.tasks[i]);
+        let mut p = self.progress_of(i);
         let old = p;
         match start {
             Some(start) => {
@@ -173,7 +201,7 @@ impl Editor {
         finish: Option<DateTime>,
     ) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
-        let mut p = Progress::of(&self.proj.tasks[i]);
+        let mut p = self.progress_of(i);
         let old = p;
         match finish {
             Some(finish) => {
@@ -223,7 +251,7 @@ impl Editor {
     /// has an actual finish keeps it, so only its whole duration is accepted.
     pub fn set_actual_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
-        let mut p = Progress::of(&self.proj.tasks[i]);
+        let mut p = self.progress_of(i);
         let old = p;
         if minutes < 0 {
             return Err("Actual duration cannot be negative".into());
@@ -251,7 +279,7 @@ impl Editor {
     /// that has an actual finish takes only 0. It does not start a task.
     pub fn set_remaining_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
-        let mut p = Progress::of(&self.proj.tasks[i]);
+        let mut p = self.progress_of(i);
         let old = p;
         if minutes < 0 {
             return Err("Remaining duration cannot be negative".into());
@@ -315,7 +343,7 @@ impl Editor {
             .ok()
             .filter(|p| *p <= 100)
             .ok_or("% Complete is 0 to 100")?;
-        let old = Progress::of(task);
+        let old = self.progress_of(i);
         // Only a recorded actual that already gives this percent of the
         // current duration is left alone (the duration may have moved since).
         if old.percent == percent

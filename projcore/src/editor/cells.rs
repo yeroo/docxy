@@ -220,11 +220,12 @@ impl Editor {
             let task = &mut proj.tasks[i];
             let old = task.duration_min;
             let changed = was_blank || duration != old;
+            // The working time up to the finish, so never elapsed (#484),
+            // in the same unit: before the estimate is committed.
+            to_working_format(task);
             if changed {
                 commit_estimate(task);
             }
-            // The working time up to the finish, so never elapsed (#484).
-            to_working_format(task);
             task.manual_start = Some(start);
             task.manual_finish = Some(finish);
             task.duration_min = duration;
