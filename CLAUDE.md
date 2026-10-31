@@ -114,7 +114,10 @@
   in-session Increase wrote on a style item with no loaded left is not pinned
   at 0, as it cannot be told from none. `set_indent(0, ..)` is an explicit
   request for the margin, so on any list item it also counts an indent
-  written in session.
+  written in session. The suite's Left-marker ruler drag calls it on every
+  move, so it takes `Editor::indent_base()` at the drag start and moves
+  through `set_indent_from`, which reads "had a direct left" from that base
+  (by paragraph path), not from an earlier move of the same drag (#1814).
 - `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before

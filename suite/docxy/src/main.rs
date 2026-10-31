@@ -5465,6 +5465,9 @@ struct Docxy {
     drawn_preview: std::cell::RefCell<Option<table_tab::DrawnPreview>>,
     // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
+    // A Left-marker drag's paragraphs as they were at its start: whether each
+    // had a direct left indent, which decides the `w:left="0"` pin (#1814).
+    ruler_indent_base: Vec<(Vec<usize>, bool)>,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
@@ -14831,6 +14834,7 @@ impl Docxy {
             doc_preview: None,
             drawn_preview: Default::default(),
             ruler_drag: None,
+            ruler_indent_base: Vec::new(),
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
@@ -16389,6 +16393,7 @@ impl Docxy {
             self.comment_text.clear();
             self.comment_reset();
             self.ruler_drag = None;
+            self.ruler_indent_base.clear();
             self.ruler_guide = None;
             self.doc_entry_tab = None;
         }
@@ -25249,6 +25254,17 @@ impl Docxy {
             }
             return;
         }
+        // The editor the moves edit (`with_editor`): the open header or
+        // footer, else the body.
+        self.ruler_indent_base = match handle {
+            RulerHandle::Left => self
+                .tabs
+                .get(self.active)
+                .and_then(tab_edit_target_ref)
+                .map(Editor::indent_base)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         self.ruler_drag = Some(RulerDrag {
             handle,
             start_x: x,
@@ -25274,7 +25290,10 @@ impl Docxy {
         match result.change {
             RulerChange::First(first) => self.with_editor(window, cx, |e| e.set_first_line(first)),
             RulerChange::Left { indent, first } => {
-                self.with_editor(window, cx, |e| e.set_indent(indent, first))
+                // The pin is decided from the drag start, not an earlier move.
+                let base = std::mem::take(&mut self.ruler_indent_base);
+                self.with_editor(window, cx, |e| e.set_indent_from(indent, first, &base));
+                self.ruler_indent_base = base;
             }
             RulerChange::Right(right) => {
                 self.with_editor(window, cx, |e| e.set_right_indent(right))
@@ -25324,6 +25343,7 @@ impl Docxy {
     }
 
     fn ruler_drag_end(&mut self, cx: &mut Context<Self>) {
+        self.ruler_indent_base.clear();
         if self.ruler_drag.take().is_some() {
             self.ruler_guide = None;
             cx.notify();
