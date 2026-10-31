@@ -107,6 +107,10 @@ impl Editor {
         task.actual_finish = new.finish;
         task.actual_duration_min = new.actual;
         task.remaining_duration_min = new.remaining;
+        if task.duration_min != new.duration {
+            // Progress is counted in working time (#484).
+            super::super::to_working_format(task);
+        }
         task.duration_min = new.duration;
         if new.percent != task.percent_complete.unwrap_or(0) {
             task.percent_complete = Some(new.percent);

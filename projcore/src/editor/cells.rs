@@ -223,6 +223,8 @@ impl Editor {
             if changed {
                 commit_estimate(task);
             }
+            // The working time up to the finish, so never elapsed (#484).
+            to_working_format(task);
             task.manual_start = Some(start);
             task.manual_finish = Some(finish);
             task.duration_min = duration;

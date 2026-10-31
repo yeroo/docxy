@@ -702,7 +702,10 @@ mod tests {
         assert_eq!(cells(&rows[2]), "0.10w | 0.90w | 0.90w", "leaf");
         assert_eq!(cells(&rows[3]), "0d | 0.10w | 0.10w", "milestone");
         assert_eq!(cells(&rows[4]), "1w | -0.50w | 0w", "negative");
-        assert_eq!(cells(&rows[5]), "4h | 4.50d | 4.50d", "elapsed");
+        // An elapsed task's slack is wall-clock minutes (#484): Mon 08:00 to
+        // its late start Fri 13:00 is 101 h, shown here in 8-hour days (the
+        // elapsed slack display is a follow-up).
+        assert_eq!(cells(&rows[5]), "4h | 12.62d | 12.62d", "elapsed");
     }
 
     #[test]

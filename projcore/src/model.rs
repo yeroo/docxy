@@ -324,7 +324,10 @@ pub struct Task {
     pub outline_level: u32,
     pub summary: bool,
     pub milestone: bool,
-    /// Duration as **working minutes** (span of working time, not wall-clock).
+    /// Duration as **working minutes** (span of working time, not
+    /// wall-clock), or **elapsed (wall-clock) minutes** for a leaf whose
+    /// `duration_format` is elapsed (see [`Task::elapsed_duration`]), as an
+    /// MSPDI `<Duration>` states it for such a task (#484).
     pub duration_min: i64,
     pub predecessors: Vec<Predecessor>,
     pub constraint: ConstraintType,
@@ -602,6 +605,18 @@ impl Task {
 
     pub fn is_milestone(&self) -> bool {
         self.milestone || self.duration_min == 0
+    }
+
+    /// Whether this leaf's Duration is elapsed (`DurationFormat` 4, 6, 8, 10
+    /// or 12, estimated or not): its `duration_min` is wall-clock minutes,
+    /// and the scheduler runs it on the 24x7 clock, start included (#484).
+    /// A summary's never is, nor a percent or unknown code.
+    pub fn elapsed_duration(&self) -> bool {
+        !self.summary
+            && self
+                .duration_format
+                .and_then(|code| LagFormat::from_code(i64::from(code)))
+                .is_some_and(|f| f.kind() == LagKind::Elapsed && f.unit() != LagUnit::Percent)
     }
 
     /// The working unit this task's Duration and slack show in, from its
