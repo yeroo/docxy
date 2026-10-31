@@ -74,6 +74,7 @@ pub mod outline;
 pub mod pivot;
 pub mod pivotcalc;
 pub mod print;
+pub mod save_name;
 pub mod sheet;
 pub mod stats;
 pub mod textio;
