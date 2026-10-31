@@ -1674,7 +1674,7 @@ test project task-information/notes: OK applies
   call pointer-click {"dialog-field":"notes"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Ab1 "}
-  call real-key {"key":"enter"}
+  call pointer-click {"dialog-button":"OK"}
   assert dialog is not task-information
   click C1
   key alt t c

@@ -1651,7 +1651,7 @@ dialogs! {
             Field::date("deadline", "2026-03-02", "x").on("Advanced").kept("2026-03-02"),
             dropdown("ttype").on("Advanced"),
             checkbox("effort").on("Advanced"),
-            Field::text("notes").on("Notes").kept("Ab1"),
+            Field::richtext("notes").on("Notes").kept("Ab1"),
         ],
         reopen: &[],
         accept_closes: true,

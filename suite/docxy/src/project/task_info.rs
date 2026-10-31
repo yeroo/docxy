@@ -262,15 +262,17 @@ pub(crate) fn task_info_dialog(
             c
         },
         {
-            let mut c = field(
-                "notes",
-                "&Notes (\\n = new line):",
-                ControlKind::Text,
-                projcore::text::notes_to_line(task.notes.as_deref().unwrap_or("")),
-                4,
-            );
+            let mut c = field("notes", "&Notes:", ControlKind::Richtext, String::new(), 4);
+            // The stored formatting (#1801), else the plain notes as typed:
+            // plain text is never read as markup, so a note that starts
+            // with `<p>` opens as it reads (#1803).
+            c.set_markup(&task.rich_notes.clone().unwrap_or_else(|| {
+                projcore::richtext::Rich::plain(task.notes.as_deref().unwrap_or("")).to_markup()
+            }));
             // Opening on Notes to add to a note must not replace it.
             c.append_on_open = true;
+            // The box fills the sized dialog's page (#1803, #1519 o2).
+            c.fill = true;
             c
         },
     ];
@@ -553,7 +555,15 @@ pub(crate) fn apply_task_info_in(
             ed.set_deadline(uid, deadline)?;
         }
         if changed("notes") {
-            ed.set_notes(uid, &projcore::text::notes_from_line(&text_of(d, "notes")))?;
+            // The control's markup: an edit keeps the formatting of the text
+            // it did not touch, and a style-only change is a change (#1803).
+            let markup = d
+                .controls
+                .iter()
+                .find(|c| c.name == "notes")
+                .map(Control::markup)
+                .unwrap_or_default();
+            ed.set_rich_notes(uid, &markup)?;
         }
         Ok(())
     })()

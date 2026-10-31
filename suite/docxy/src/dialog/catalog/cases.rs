@@ -177,6 +177,17 @@ impl Test {
         self.call("real-type", &format!("{{\"text\":{}}}", js(text)))
     }
 
+    /// Press the dialog's default button the way a person would from `f`:
+    /// Enter, or a click on OK from a multiline field, where Enter is a new
+    /// line (#1803).
+    fn accept_from(&mut self, f: &Field) -> &mut Self {
+        if f.kind.is_multiline() {
+            self.call("pointer-click", r#"{"dialog-button":"OK"}"#)
+        } else {
+            self.key("enter")
+        }
+    }
+
     fn read(&mut self, f: &Field) -> &mut Self {
         self.call(
             "field-read",
@@ -397,7 +408,7 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
 
     if f.skip_ok.is_none() {
         let mut t = Test::new(e, f, "OK applies");
-        t.open(e, f).fill(f, f.sample).key("enter");
+        t.open(e, f).fill(f, f.sample).accept_from(f);
         if e.accept_closes {
             t.assert(&format!("dialog is not {}", e.dialog.as_str()));
         }
@@ -447,7 +458,7 @@ fn text_tests(e: &Entry, f: &Field) -> Vec<Test> {
             }
             Refuse::AtOk => {
                 t.fill(f, bad)
-                    .key("enter")
+                    .accept_from(f)
                     .assert(&format!("dialog is {}", e.dialog.as_str()));
             }
         }
@@ -635,6 +646,30 @@ mod tests {
             edits.contains(r#"{"text":"1234"}"#),
             "a number field edits digits"
         );
+    }
+
+    /// #1803: Enter is a new line in a multiline field, so its OK case
+    /// clicks OK; a single-line field's still presses Enter.
+    #[test]
+    fn a_multiline_field_is_accepted_with_the_ok_button() {
+        static FIELDS: &[Field] = &[Field::richtext("notes"), Field::text("name")];
+        let tests = entry_tests(&entry(FIELDS));
+        let ok = |name: &str| {
+            tests
+                .iter()
+                .find(|t| t.starts_with(&format!("test doc user-name/{name}: OK applies")))
+                .unwrap_or_else(|| panic!("{name} has an OK test"))
+                .clone()
+        };
+        let notes = ok("notes");
+        assert!(
+            notes.contains(r#"call pointer-click {"dialog-button":"OK"}"#),
+            "{notes}"
+        );
+        assert!(!notes.contains(r#"{"key":"enter"}"#), "{notes}");
+        let name = ok("name");
+        assert!(name.contains(r#"call real-key {"key":"enter"}"#), "{name}");
+        assert!(!name.contains("dialog-button"), "{name}");
     }
 
     /// #1029: a field skipped says why and gets no test; a dropdown gets a

@@ -37,8 +37,16 @@ test project task information: OK writes General, Advanced and Notes as one undo
   call real-type {"text":"2026-02-27"}
   call pointer-click {"dialog-tab":"Notes"}
   call pointer-click {"dialog-field":"notes"}
-  call real-type {"text":"check\\nit"}
+  call real-type {"text":"check"}
   call real-key {"key":"enter"}
+  call real-type {"text":"it"}
+  # Enter is a new line in the Notes box (#1803): OK is the button. A case
+  # cannot write a line break in an expected value, so the caret shows it:
+  # "check", the break and "it" are 8 characters.
+  assert dialog is task-information
+  call field-read {"dialog-field":"notes"}
+  assert reply.caret is 8
+  call pointer-click {"dialog-button":"OK"}
   assert dialog is none
   assert dirty is true
   assert selected_name is Build
@@ -52,8 +60,13 @@ test project task information: OK writes General, Advanced and Notes as one undo
   call field-read {"dialog-field":"percent"}
   assert reply.value is 50
   call pointer-click {"dialog-tab":"Notes"}
+  # Notes opens with the caret at the end; Home goes to the start of the
+  # second line, after "check" and the break.
   call field-read {"dialog-field":"notes"}
-  assert reply.value is check\nit
+  assert reply.caret is 8
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"notes"}
+  assert reply.caret is 6
   call real-key {"key":"escape"}
   key ctrl+z
   assert selected_name is B
@@ -75,7 +88,7 @@ test project task information: Notes... opens on the Notes page and an unchanged
   assert dialog is task-information
   call dialog-read {}
   assert reply.tab is Notes
-  call real-key {"key":"enter"}
+  call pointer-click {"dialog-button":"OK"}
   assert dialog is none
   assert dirty is false
   assert undo_depth is 0
@@ -314,3 +327,28 @@ test project task information: Help says what F1 says and leaves the dialog open
   call real-key {"key":"escape"}
   assert dialog is none
   assert undo_depth is 0
+
+test project task information: Bold in the Notes box is kept as rich notes
+  open copy:../fixtures/project-clipboard.xml
+  click C2
+  call ribbon-click {"tab":"Task","command":"Notes..."}
+  assert dialog is task-information
+  call pointer-click {"dialog-field":"notes"}
+  call real-type {"text":"word"}
+  call real-key {"key":"ctrl+a"}
+  call pointer-click {"dialog-richtool":"notes:bold"}
+  call pointer-click {"dialog-button":"OK"}
+  assert dialog is none
+  assert undo_depth is 1
+  call task.get {"uid":2,"fields":["Notes"]}
+  assert reply.fields.Notes.value is word
+  assert reply.rich_notes is <p><b>word</b></p>
+  key alt t c
+  call pointer-click {"dialog-tab":"Notes"}
+  call dialog-read {}
+  assert reply.tab is Notes
+  assert reply.controls.3.name is notes
+  assert reply.controls.3.value is <p><b>word</b></p>
+  assert reply.controls.3.richtext.bold is true
+  call real-key {"key":"escape"}
+  assert dialog is none

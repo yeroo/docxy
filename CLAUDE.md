@@ -868,8 +868,7 @@
 ## Rich task notes (#1801)
 
 - `Task::rich_notes` is the notes' `projcore::richtext` markup beside the
-  plain `notes` every reader uses (MSPDI `<Notes>`, the grid, search, the
-  suite's built-in Notes field): `Some` only when it formats something
+  plain `notes` every reader uses (MSPDI `<Notes>`, the grid, search): `Some` only when it formats something
   (bold, italic, a non-left alignment, a bullet), and then its plain text is
   `notes` (`richtext::split_notes` is the one rule). `Editor::set_rich_notes`
   sets both as one undo step (a style-only change is a step, the value held
@@ -891,8 +890,13 @@
   formatting only; `formatting::rich_notes_json`) in the suite's
   `view_json` and yppxy's `run_command`. The fixture's `fixture.richnote`
   (a command with no control) is the loop, `yppxy/tests/plugins.rs`.
-- Out of scope: resource and assignment notes, rich editing in the
-  built-in Notes field, RTF (the plugin converts).
+- The suite's Task Information Notes page edits it (#1803): a filling
+  `richtext` control prefilled with `rich_notes`, else the plain notes as
+  `Rich::plain` (never parsed, so a note starting `<p>` reads as typed),
+  written with `set_rich_notes` from its markup, so an edit keeps the
+  formatting of what it did not touch. Enter is a new line there; the
+  generated cases press OK for a multiline field (`accept_from`).
+- Out of scope: resource and assignment notes, RTF (the plugin converts).
 
 ## Project leveling as a plan edit (#1594)
 
@@ -1248,8 +1252,8 @@
   on a Gantt bar does not open it (the bar has only a right-press handler).
 - Each field is the grid cell's own text (`cell_edit_text` to prefill,
   `apply_cell` to write), so Predecessors and Resources are one text field each
-  in the column's grammar, not tables (until #1536, below). Notes is one line, `\n` = new line (no
-  multiline control). Constraint type + date go through `Editor::set_constraint_typed`
+  in the column's grammar, not tables (until #1536, below). Notes is a rich-text
+  box (#1803, under Rich task notes). Constraint type + date go through `Editor::set_constraint_typed`
   (the date resolved by `parse_stamp`); the
   date follows the type (ASAP and ALAP disable it).
 - OK writes only the fields that changed (`Dialog::changed`), inside
