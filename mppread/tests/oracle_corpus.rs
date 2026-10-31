@@ -229,12 +229,10 @@ fn check_task_fields(
     source: Oracle,
 ) {
     // A decoded working DurationFormat reaches the model as the MSPDI reader
-    // keeps it, and so does an auto task's elapsed one (#484); any other
-    // reads as days.
+    // keeps it, and so does the elapsed one of an auto task not in progress
+    // (#484, `carries_duration_format`); any other reads as days.
     if let Some(format) = a.duration_format {
-        let expected = if mppread::mpp::working_duration_format(format)
-            || (!a.manual && mppread::mpp::elapsed_duration_format(format))
-        {
+        let expected = if mppread::mpp::carries_duration_format(format, a.manual, a.in_progress()) {
             e.duration_format
         } else {
             None
@@ -797,9 +795,11 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             if task.is_null || task.summary || task.manual || expected_task.milestone {
                 continue;
             }
+            // An in-progress elapsed row keeps its working span, not the
+            // elapsed Duration, so only the rows the import carries compare.
+            let in_progress = task.actual_start.is_some() && task.actual_finish.is_none();
             if formats.get(&task.uid).is_some_and(|&format| {
-                mppread::mpp::working_duration_format(format as u16)
-                    || mppread::mpp::elapsed_duration_format(format as u16)
+                mppread::mpp::carries_duration_format(format as u16, task.manual, in_progress)
             }) {
                 assert_eq!(
                     task.duration_min,

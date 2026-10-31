@@ -209,6 +209,25 @@ pub fn elapsed_duration_format(code: u16) -> bool {
     matches!(code & !32, 4 | 6 | 8 | 10 | 12)
 }
 
+/// Whether a decoded `DurationFormat` (and, for an auto task, its decoded
+/// Duration) reaches the model as stored: a working code always; an elapsed
+/// one only for an auto task that is not in progress (#484). A manual
+/// task's elapsed duration is not decoded (#225), and the schedule places
+/// an in-progress task from its actuals as working minutes, so those keep
+/// the working span and read as days.
+pub fn carries_duration_format(code: u16, manual: bool, in_progress: bool) -> bool {
+    working_duration_format(code) || (!manual && !in_progress && elapsed_duration_format(code))
+}
+
+impl MppTask {
+    /// Started (an actual start) and not finished (no actual finish).
+    pub fn in_progress(&self) -> bool {
+        self.progress
+            .as_ref()
+            .is_some_and(|p| p.actual_start.is_some() && p.actual_finish.is_none())
+    }
+}
+
 /// Decode task rows only when the binary table has a recognized structure.
 pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
     crate::taskdecode::decode(bytes)

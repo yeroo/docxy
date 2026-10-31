@@ -420,22 +420,12 @@ fn import_tasks(
             // The unit the duration shows (and saves) in, as the MSPDI reader
             // keeps it: days is no format. A working code goes with the
             // working minutes imported below, and an auto task's elapsed
-            // code with its elapsed minutes (#484); a manual task's elapsed
-            // duration is not decoded (#225), nor is a null code, so they
-            // read as days. An in-progress auto task keeps the working span
-            // as before #484 too: the schedule places it from its actuals as
-            // working minutes, which an elapsed format would contradict.
-            let in_progress = t
-                .progress
-                .as_ref()
-                .is_some_and(|p| p.actual_start.is_some() && p.actual_finish.is_none());
-            let keeps_elapsed = !t.manual && !in_progress;
+            // code with its elapsed minutes unless it is in progress (#484);
+            // see `carries_duration_format`. Anything else reads as days.
+            let carries = |f| crate::mpp::carries_duration_format(f, t.manual, t.in_progress());
             task.duration_format = t
                 .duration_format
-                .filter(|&f| {
-                    crate::mpp::working_duration_format(f)
-                        || (keeps_elapsed && crate::mpp::elapsed_duration_format(f))
-                })
+                .filter(|&f| carries(f))
                 .and_then(|f| u8::try_from(f).ok())
                 .filter(|&f| f != 7);
             if let Some(p) = &t.progress {
@@ -467,10 +457,7 @@ fn import_tasks(
                 // clock (#484), not the working span between the dates.
                 task.duration_min = t
                     .duration_format
-                    .filter(|&fmt| {
-                        crate::mpp::working_duration_format(fmt)
-                            || (keeps_elapsed && crate::mpp::elapsed_duration_format(fmt))
-                    })
+                    .filter(|&fmt| carries(fmt))
                     .and(t.duration_min)
                     .unwrap_or_else(span);
                 if legacy {
