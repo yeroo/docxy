@@ -341,10 +341,13 @@ impl Registry {
     }
 
     /// Read the file at `path` from its `bytes` with the reader of its
-    /// extension. A file whose extension no format claims is read as MPX
-    /// when it starts with an MPX header ([`crate::mpx::is_mpx`]), else as
-    /// MSPDI XML, as the hosts always have (the MSPDI reader takes MPX too,
-    /// so `.xml` does the same); one only a writer claims is refused.
+    /// extension; one only a writer claims is refused. A file whose
+    /// extension no format claims is read as MPX when it starts with an MPX
+    /// header ([`crate::mpx::is_mpx`]), else by the built-in MSPDI reader, as
+    /// the hosts always have. That is the one rule the built-in [`Mspdi`]
+    /// reader follows for `.xml` too; the sniff is kept here as well so an
+    /// unclaimed extension stays MPX-aware should a plugin replace the
+    /// `.xml` reader.
     pub fn read(&self, path: &Path, bytes: &[u8]) -> Result<Project, String> {
         let ext = extension(path);
         match self.reader(ext) {

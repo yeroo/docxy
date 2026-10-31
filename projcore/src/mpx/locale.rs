@@ -317,7 +317,7 @@ static SV: Locale = Locale {
 };
 
 /// Spanish. The bundle's `Sí` and `Mínima` carry a U+00AD after the `í`,
-/// which every comparison drops ([`norm`]), so Project's plain spelling
+/// which every comparison drops ([`folded`]), so Project's plain spelling
 /// matches too.
 static ES: Locale = Locale {
     yes: &["Sí\u{AD}"],

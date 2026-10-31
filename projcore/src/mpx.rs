@@ -40,7 +40,7 @@
 //! Enumerated values (constraint type, priority, accrue at, yes and no),
 //! duration and rate units and link types are read in the words of one
 //! locale for the whole file, chosen from what its rows hold
-//! ([`locale::choose`]): MPXJ's English, German, French, Italian,
+//! (`locale::choose`): MPXJ's English, German, French, Italian,
 //! Portuguese, Swedish, Spanish and Russian (#1805). A word the locale does
 //! not know is read as English, as is a unit whose locale suffix leaves no
 //! number (German `2em`), else the model's default stays. A file whose
