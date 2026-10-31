@@ -3004,11 +3004,46 @@ impl Editor {
     /// as direct here (an explicit request for the margin), unlike for a
     /// style-numbered item in Decrease Indent.
     pub fn set_indent(&mut self, left: i32, first_line: i32) {
+        let base = self.indent_base();
+        self.set_indent_from(left, first_line, &base);
+    }
+
+    /// Whether each selected paragraph has a direct left indent now, by path:
+    /// the state a sequence of [`Self::set_indent_from`] calls (the suite's
+    /// ruler drag) decides its `w:left="0"` pin from (#1814).
+    pub fn indent_base(&self) -> Vec<(Vec<usize>, bool)> {
+        self.selected_para_paths()
+            .into_iter()
+            .map(|path| {
+                let direct =
+                    resolve_para(&self.doc.body, &path).is_some_and(|p| had_direct_left(&p.props));
+                (path, direct)
+            })
+            .collect()
+    }
+
+    /// [`Self::set_indent`], with "had a direct left indent" read from
+    /// `base` (from [`Self::indent_base`] at the drag start) rather than the
+    /// live paragraph, so an earlier move of the same drag does not count
+    /// (#1814). A paragraph `base` does not name reads the live one.
+    pub fn set_indent_from(&mut self, left: i32, first_line: i32, base: &[(Vec<usize>, bool)]) {
         let styles = self.styles.clone();
-        self.for_each_para(move |pr| {
+        self.checkpoint(EditKind::Structural);
+        for (i, path) in self.selected_para_paths().into_iter().enumerate() {
+            let Some(p) = para_mut(&mut self.doc.body, &path) else {
+                continue;
+            };
+            let pr = &mut p.props;
             let listed = list_item(styles.as_deref(), pr);
             let pin = if left <= 0 {
-                (listed && had_direct_left(pr)).then_some(0)
+                // The base lists the same paths in order: look it up by
+                // position, searching only when the selection changed.
+                let direct = base
+                    .get(i)
+                    .filter(|(b, _)| *b == path)
+                    .or_else(|| base.iter().find(|(b, _)| *b == path))
+                    .map_or_else(|| had_direct_left(pr), |(_, d)| *d);
+                (listed && direct).then_some(0)
             } else {
                 // A style-numbered item that had a loaded left keeps it.
                 (listed && !pr.in_list() && pr.has_loaded_left_indent()).then_some(left)
@@ -3019,7 +3054,7 @@ impl Editor {
             if let Some(twips) = pin {
                 pr.pin_left_indent(twips);
             }
-        });
+        }
     }
 
     /// Set just the first-line delta (twips) of the selected paragraphs, leaving
@@ -7441,6 +7476,62 @@ mod tests {
             };
             assert_eq!(saved_ind(&ed), want, "{ppr}");
         }
+    }
+
+    /// #1814: a ruler drag decides the pin from the drag start, so a list
+    /// item with no direct left indent dragged right and back saves none.
+    #[test]
+    fn ruler_drag_back_to_the_start_writes_no_left_on_an_item_without_one() {
+        let direct = "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"9990\"/></w:numPr>";
+        for (ppr, styles) in [(direct, false), (BULLET, true)] {
+            let mut ed = loaded_ppr(ppr, styles);
+            let base = ed.indent_base();
+            ed.set_indent_from(180, 0, &base);
+            assert_eq!(saved_ind(&ed), "<w:ind w:left=\"180\"/>", "{ppr}");
+            ed.set_indent_from(0, 0, &base);
+            assert_eq!(saved_ind(&ed), "", "{ppr}");
+            // Separate calls ask for the margin each time: the second pins.
+            let mut ed = loaded_ppr(ppr, styles);
+            ed.set_indent(180, 0);
+            ed.set_indent(0, 0);
+            assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>", "{ppr}");
+        }
+    }
+
+    /// #1814: an item that had a direct left at the drag start still keeps
+    /// the margin, and a style item keeps its pinned left as it moves on.
+    #[test]
+    fn ruler_drag_to_zero_still_pins_a_loaded_left() {
+        let direct = "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"9990\"/></w:numPr>";
+        for (ppr, styles) in [
+            (format!("{direct}<w:ind w:left=\"720\"/>"), false),
+            (format!("{BULLET}<w:ind w:left=\"720\"/>"), true),
+        ] {
+            let mut ed = loaded_ppr(&ppr, styles);
+            let base = ed.indent_base();
+            ed.set_indent_from(360, 0, &base);
+            ed.set_indent_from(0, 0, &base);
+            assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>", "{ppr}");
+        }
+        let mut ed = loaded_ppr(&format!("{BULLET}<w:ind w:left=\"720\"/>"), true);
+        let base = ed.indent_base();
+        ed.set_indent_from(0, 0, &base);
+        ed.set_indent_from(360, 0, &base);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"360\"/>");
+    }
+
+    /// #1814: a paragraph the base does not name reads the live paragraph,
+    /// as `set_indent` does.
+    #[test]
+    fn set_indent_from_with_an_empty_base_reads_the_live_paragraph() {
+        let direct = "<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"9990\"/></w:numPr>";
+        let mut ed = loaded_ppr(direct, false);
+        ed.set_indent_from(180, 0, &[]);
+        ed.set_indent_from(0, 0, &[]);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        let mut ed = loaded_ppr(direct, false);
+        ed.set_indent_from(0, 0, &[]);
+        assert_eq!(saved_ind(&ed), "");
     }
 
     #[test]

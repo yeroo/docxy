@@ -5465,6 +5465,9 @@ struct Docxy {
     drawn_preview: std::cell::RefCell<Option<table_tab::DrawnPreview>>,
     // In-progress drag of a ruler marker.
     ruler_drag: Option<RulerDrag>,
+    // A Left-marker drag's paragraphs as they were at its start: whether each
+    // had a direct left indent, which decides the `w:left="0"` pin (#1814).
+    ruler_indent_base: RulerIndentBase,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
@@ -6696,12 +6699,12 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 mod ruler_geom_tests {
     use super::{
         BandProbe, Block, DocTab, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal,
-        Paragraph, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect, Surface,
-        doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items,
-        next_tab_stop, page_flow, page_needs_scroll, page_of_block, paragraph_indent_layout,
-        pin_vertical_to_owner, print_caret_page, px_tw, ruler_band, ruler_colors,
-        ruler_drag_result, ruler_text_rect, tab_from_path, tab_page_flow, tracked_page,
-        tracked_page_geom, tw_px, vruler_geom,
+        Paragraph, RulerChange, RulerDrag, RulerHandle, RulerIndentBase, RulerProbe, ScreenRect,
+        Surface, doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit,
+        leading_items, next_tab_stop, page_flow, page_needs_scroll, page_of_block,
+        paragraph_indent_layout, pin_vertical_to_owner, print_caret_page, px_tw, ruler_band,
+        ruler_colors, ruler_drag_result, ruler_text_rect, tab_from_path, tab_page_flow,
+        tracked_page, tracked_page_geom, tw_px, vruler_geom,
     };
     use docxcore::model::{
         PageGeom, ParProps, RevisionKind, RevisionMetadata, Run, TabAlign, TabLeader, TabStop,
@@ -7162,6 +7165,24 @@ mod ruler_geom_tests {
         }
     }
 
+    /// #1814: a header drag's base is never applied to the body (Esc closed
+    /// the header mid-drag), nor the body's to a header.
+    #[test]
+    fn ruler_indent_base_applies_only_to_the_editor_it_came_from() {
+        let base = RulerIndentBase {
+            hf: true,
+            paras: vec![(vec![0], true)],
+        };
+        assert_eq!(base.for_editor(true), &[(vec![0], true)]);
+        assert!(base.for_editor(false).is_empty());
+        let body = RulerIndentBase {
+            hf: false,
+            paras: vec![(vec![2], false)],
+        };
+        assert_eq!(body.for_editor(false), &[(vec![2], false)]);
+        assert!(body.for_editor(true).is_empty());
+    }
+
     #[test]
     fn every_drag_handle_returns_the_stored_value_and_matching_guide() {
         for zoom in [1.0, 2.0] {
@@ -7576,6 +7597,23 @@ struct RulerDrag {
     /// A margin drag already took its undo checkpoint on the body editor, so
     /// later moves of the same drag ride on it.
     sect_checkpointed: bool,
+}
+
+/// A Left-marker drag's paragraphs at its start (`Editor::indent_base`),
+/// and whether they came from the open header or footer's editor (#1814).
+#[derive(Default)]
+struct RulerIndentBase {
+    hf: bool,
+    paras: Vec<(Vec<usize>, bool)>,
+}
+
+impl RulerIndentBase {
+    /// The base for a move that edits the header or footer (`hf_now`) or the
+    /// body: empty (the live paragraphs decide) when that is not the editor
+    /// it was taken from, as its paths name another story's paragraphs.
+    fn for_editor(&self, hf_now: bool) -> &[(Vec<usize>, bool)] {
+        if self.hf == hf_now { &self.paras } else { &[] }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -14831,6 +14869,7 @@ impl Docxy {
             doc_preview: None,
             drawn_preview: Default::default(),
             ruler_drag: None,
+            ruler_indent_base: RulerIndentBase::default(),
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
@@ -16389,6 +16428,7 @@ impl Docxy {
             self.comment_text.clear();
             self.comment_reset();
             self.ruler_drag = None;
+            self.ruler_indent_base = RulerIndentBase::default();
             self.ruler_guide = None;
             self.doc_entry_tab = None;
         }
@@ -25249,6 +25289,17 @@ impl Docxy {
             }
             return;
         }
+        // The editor the moves edit (`with_editor`): the open header or
+        // footer, else the body.
+        self.ruler_indent_base = match (handle, self.tabs.get(self.active)) {
+            (RulerHandle::Left, Some(tab)) => RulerIndentBase {
+                hf: tab.hf_edit.is_some(),
+                paras: tab_edit_target_ref(tab)
+                    .map(Editor::indent_base)
+                    .unwrap_or_default(),
+            },
+            _ => RulerIndentBase::default(),
+        };
         self.ruler_drag = Some(RulerDrag {
             handle,
             start_x: x,
@@ -25274,7 +25325,17 @@ impl Docxy {
         match result.change {
             RulerChange::First(first) => self.with_editor(window, cx, |e| e.set_first_line(first)),
             RulerChange::Left { indent, first } => {
-                self.with_editor(window, cx, |e| e.set_indent(indent, first))
+                // The pin is decided from the drag start, not an earlier move.
+                // A header or footer closed (or opened) mid-drag leaves
+                // `with_editor` editing another editor: no base there.
+                let base = std::mem::take(&mut self.ruler_indent_base);
+                let hf_now = self
+                    .tabs
+                    .get(self.active)
+                    .is_some_and(|t| t.hf_edit.is_some());
+                let paras = base.for_editor(hf_now);
+                self.with_editor(window, cx, |e| e.set_indent_from(indent, first, paras));
+                self.ruler_indent_base = base;
             }
             RulerChange::Right(right) => {
                 self.with_editor(window, cx, |e| e.set_right_indent(right))
@@ -25324,6 +25385,7 @@ impl Docxy {
     }
 
     fn ruler_drag_end(&mut self, cx: &mut Context<Self>) {
+        self.ruler_indent_base = RulerIndentBase::default();
         if self.ruler_drag.take().is_some() {
             self.ruler_guide = None;
             cx.notify();
