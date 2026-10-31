@@ -1,0 +1,26 @@
+MPX;Microsoft Project for Windows;4.0;ANSI
+10;kr;2;2; ;,
+11;1;0;1;8,00;40,00;;;0;0
+12;2;1;480;-;:;;;9;9
+20;Standard;0;1;1;1;1;1;0
+25;1
+25;2;08:00;12:00;13:00;17:00
+25;3;08:00;12:00;13:00;17:00
+25;4;08:00;12:00;13:00;17:00
+25;5;08:00;12:00;13:00;17:00
+25;6;08:00;12:00;13:00;17:00
+25;7
+30;Project1;;;Standard;mån 26-03-02;tors 26-03-05;1;lör 26-10-31
+40;Namn;ID;Standardkostnad;Påförs;Eget ID
+41;1;40;42;45;49
+50;Crew;1;50,00 kr/t;End;1
+60;Namn;WBS;Dispositionsnivå;Text1;Contact;Arbete;Kostnad;Varaktighet;Varaktighet1;Start;Slut;Villkorsdatum;Föregående aktiviteter;Fast;Critical;Upplyft;ID;Villkorstyp;Förskjutning;Fritt slack;Totalt slack;Prioritet;Eget ID;Sammanfattning;Hide Bar;Skapad
+61;1;2;3;4;15;20;30;40;46;50;51;68;70;80;82;84;90;91;92;93;94;95;98;120;123;125
+70;Phase;1;1;;;;;3d;;mån 26-03-02;tors 26-03-05;;;Ja;Ja;Nej;1;As Soon As Possible;;0t;0m;Medium;1;Ja;Nej;fre 26-02-27
+70;Excavate;1.1;2;Civil;;2d;12,51 kr;2d;4d;mån 26-03-02;tis 26-03-03;;;Nej;Ja;Ja;2;As Soon As Possible;;0d;0m;Highest;2;;Nej;fre 26-02-27
+75;1;1;16t;;;;;;;mån 26-03-02;tis 26-03-03;;1
+76;;0;0;NA;NA
+70;Pour;1.2;2;M&E;Site lead;0d;;1d;;ons 26-03-04;tors 26-03-05;;"2;3";Nej;Ja;Nej;4;As Soon As Possible;1d;0d;0m;Medium;4;;Ja;fre 26-02-27
+71;Check forms & rebar
+70;;;;;;;;;;;;;;Nej;Nej;;3;;;0t;;;3
+70;Inspect;2;1;;;;;1d;;mån 26-03-02;mån 26-03-02;ons 26-03-04;"2SS+1d;4FF+1ed";Ja;Nej;Nej;5;Start No Earlier Than;;1380m;1380m;Medium;5;;Nej;fre 26-02-27

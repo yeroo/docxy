@@ -36,7 +36,17 @@ MPX of one corpus file with one change, written by
   month (MPXJ writes `1mon`, `1FS+1emon`);
 - `weekday-dates.mpx`: 06-lag in date format 9 (`Mon 03/02/26`);
 - `multiline-note.mpx`: 02-link-fs with a two-line note (MPXJ writes the
-  line break as U+007F).
+  line break as U+007F);
+- `month-names-{full,full-time,short,weekday}.mpx` (#1805): 09-constraint-snet
+  in the date formats that spell the month (3 MDY `March 05 2026`, 2 MDY with
+  the time, 5 DMY `05 Mar '26`, 10 YMD `Thu '26 Mar 05`);
+- `locale-<l>.mpx` (#1805): one plan (20-task-fields with an SS+1d and an
+  FF+1ed link, a Start No Earlier Than constraint and an assignment of a
+  resource accruing at End) in each locale MPXJ's writer knows but Chinese
+  (en de fr it pt sv es ru), with the locale's words, units, link types,
+  date format, separators and code page (Russian is Windows-1251). The
+  script reads each back with MPXJ in its locale and fails unless it gives
+  the English file's tasks.
 
 ## Regenerating
 
