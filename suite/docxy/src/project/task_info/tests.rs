@@ -203,7 +203,7 @@ fn the_pages_open_prefilled_in_the_grid_cells_grammar() {
     assert_eq!(read(&t, "deadline"), "2026-03-02");
     assert_eq!(read(&t, "ttype"), "Fixed Work");
     assert_eq!(read(&t, "effort"), "checked");
-    assert_eq!(read(&t, "notes"), "Line 1\\nLine 2");
+    assert_eq!(read(&t, "notes"), "Line 1\nLine 2");
 }
 
 fn parse_preds(ed: &ProjectEditor, text: &str) -> Vec<projcore::Predecessor> {
@@ -242,7 +242,7 @@ fn ok_writes_every_changed_field_as_one_undo_step() {
     put(&mut t, "deadline", "2026-05-01");
     put(&mut t, "ttype", "Fixed Duration");
     set(&mut t, "effort", Json::Bool(true));
-    put(&mut t, "notes", "first\\nsecond");
+    put(&mut t, "notes", "first\nsecond");
     dialog_click(&mut t, "OK").unwrap();
     assert!(!t.dialogs.is_open());
     let task = v(&t).ed.project().task(2).unwrap().clone();
@@ -385,6 +385,7 @@ fn clearing_the_notes_and_the_deadline_removes_them() {
     dialog_click(&mut t, "OK").unwrap();
     let task = v(&t).ed.project().task(2).unwrap();
     assert_eq!((task.notes.clone(), task.deadline), (None, None));
+    assert_eq!(task.rich_notes, None);
 }
 
 #[test]
@@ -1290,4 +1291,209 @@ fn going_back_to_the_first_page_keeps_the_top_row_focus() {
     let d = stack.top().unwrap();
     assert_eq!(d.focused().map(|c| c.name), Some("name"));
     assert_eq!(d.value("name"), Some(&Value::Text("Second!".into())));
+}
+
+// ---- #1803: the Notes page is a rich-text control ----
+
+const BOLD_NOTE: &str = "<p><b>bold</b></p>";
+
+/// Second with `rich_notes` set and the plan saved, so an OK that writes
+/// nothing leaves it clean.
+fn rich_tab(markup: &str) -> DocTab {
+    let mut t = tab();
+    vm(&mut t).ed.set_rich_notes(2, markup).unwrap();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    t
+}
+
+fn markup(t: &DocTab) -> String {
+    t.dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .find(|c| c.name == "notes")
+        .unwrap()
+        .markup()
+}
+
+fn notes_index(t: &DocTab) -> usize {
+    t.dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == "notes")
+        .unwrap()
+}
+
+fn plain() -> Modifiers {
+    Modifiers::default()
+}
+
+#[test]
+fn the_notes_page_is_a_filling_richtext() {
+    let t = tab();
+    let d = task_info_dialog(&v(&t).ed, 2, InfoPage::Notes).unwrap();
+    let c = d.controls.iter().find(|c| c.name == "notes").unwrap();
+    assert_eq!(c.kind, ControlKind::Richtext);
+    assert!(c.append_on_open);
+    assert!(d.fills(c), "the box fills the sized dialog's page");
+    // `project-task-info.uit` reads it as `reply.controls.3` on the Notes
+    // page, after the top row's Name, Duration and Estimated.
+    let json = d.to_json(0);
+    let shown = json.get("controls").and_then(Json::as_array).unwrap();
+    assert_eq!(shown[3].get_str("name"), Some("notes"));
+}
+
+/// AC1: the stored markup prefills the control; plain notes open as plain
+/// paragraphs, one per line, with no `\n` escape.
+#[test]
+fn notes_prefill_shows_rich_notes_markup() {
+    let mut t = rich_tab("<p><b>Head</b></p>\n<li>item</li>");
+    open(&mut t, ProjectAct::Notes);
+    assert_eq!(markup(&t), "<p><b>Head</b></p>\n<li>item</li>");
+    assert_eq!(read(&t, "notes"), "Head\nitem");
+    dialog_click(&mut t, "Cancel").unwrap();
+
+    vm(&mut t).ed.set_notes(2, "one\ntwo").unwrap();
+    open(&mut t, ProjectAct::Notes);
+    assert_eq!(read(&t, "notes"), "one\ntwo");
+    assert_eq!(markup(&t), "<p>one</p>\n<p>two</p>");
+}
+
+/// Plain notes are never read as markup: one that starts with `<p>` opens
+/// as typed, an untouched OK writes nothing and an edit keeps the `<p>`.
+#[test]
+fn plain_notes_that_look_like_markup_open_as_typed() {
+    let mut t = tab();
+    vm(&mut t).ed.set_notes(2, "<p>see attached").unwrap();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let before = state(&t);
+    open(&mut t, ProjectAct::Notes);
+    assert_eq!(read(&t, "notes"), "<p>see attached");
+    dialog_click(&mut t, "OK").unwrap();
+    assert_eq!(state(&t), before);
+
+    open(&mut t, ProjectAct::Notes);
+    t.dialogs.top_dialog_mut().unwrap().type_char('!').unwrap();
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("<p>see attached!"));
+    assert_eq!(task.rich_notes, None);
+}
+
+/// AC2: an OK with the Notes page untouched writes nothing and keeps the
+/// formatting.
+#[test]
+fn untouched_notes_ok_keeps_rich_notes_and_records_nothing() {
+    let mut t = rich_tab(BOLD_NOTE);
+    let before = state(&t);
+    open(&mut t, ProjectAct::Notes);
+    dialog_click(&mut t, "OK").unwrap();
+    assert!(!t.dialogs.is_open());
+    assert_eq!(state(&t), before);
+    assert!(!v(&t).ed.dirty());
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(task.rich_notes.as_deref(), Some(BOLD_NOTE));
+}
+
+/// AC3: typing into a formatted note keeps the formatting (the caret at
+/// the end takes the bold before it), as one undo step with the dialog's
+/// other changes.
+#[test]
+fn typing_into_formatted_notes_keeps_the_formatting() {
+    let mut t = rich_tab(BOLD_NOTE);
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    open(&mut t, ProjectAct::Notes);
+    for ch in " x".chars() {
+        let s = ch.to_string();
+        assert!(dialog_key(&mut t, &s, Some(&s), plain()));
+    }
+    put(&mut t, "priority", "700");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap().clone();
+    assert_eq!(task.notes.as_deref(), Some("bold x"));
+    assert_eq!(task.rich_notes.as_deref(), Some("<p><b>bold x</b></p>"));
+    assert_eq!(task.priority, Some(700));
+    assert_eq!(
+        v(&t).ed.undo_depth(),
+        depth + 1,
+        "notes and priority in one step"
+    );
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+/// AC4: Bold over the whole note is a change of style only: one undo step,
+/// `rich_notes` set, `notes` as it was; Undo restores both.
+#[test]
+fn bold_only_change_is_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.set_notes(2, "word").unwrap();
+    vm(&mut t).ed.mark_saved();
+    let depth = v(&t).ed.undo_depth();
+    open(&mut t, ProjectAct::Notes);
+    let i = notes_index(&t);
+    let d = t.dialogs.top_dialog_mut().unwrap();
+    d.select_all();
+    d.rich_tool_at(i, crate::dialog::RichTool::Bold).unwrap();
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap().clone();
+    assert_eq!(task.notes.as_deref(), Some("word"));
+    assert_eq!(task.rich_notes.as_deref(), Some("<p><b>word</b></p>"));
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(v(&t).ed.dirty());
+    apply_project_act(&mut t, ProjectAct::Undo);
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("word"));
+    assert_eq!(task.rich_notes, None);
+}
+
+/// AC5 for a formatted note: clearing the box removes both.
+#[test]
+fn clearing_a_formatted_note_removes_the_markup_too() {
+    let mut t = rich_tab(BOLD_NOTE);
+    open(&mut t, ProjectAct::Notes);
+    put(&mut t, "notes", "");
+    dialog_click(&mut t, "OK").unwrap();
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!((task.notes.clone(), task.rich_notes.clone()), (None, None));
+}
+
+/// AC6: Enter in the Notes box is a new line and leaves the dialog open;
+/// from a single-line field it still presses OK.
+#[test]
+fn enter_in_the_notes_box_is_a_new_line() {
+    let mut t = tab();
+    open(&mut t, ProjectAct::Notes);
+    assert_eq!(
+        t.dialogs.top().unwrap().focused().map(|c| c.name),
+        Some("notes")
+    );
+    assert_eq!(t.dialogs.key_button("enter", true), None);
+    for (key, typed) in [("a", Some("a")), ("enter", None), ("b", Some("b"))] {
+        assert!(dialog_key(&mut t, key, typed, plain()));
+    }
+    assert!(t.dialogs.is_open(), "Enter did not press OK");
+    assert_eq!(read(&t, "notes"), "a\nb");
+    // From the top row's Name, Enter is OK, which writes the two lines.
+    let name = t
+        .dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .position(|c| c.name == "name")
+        .unwrap();
+    t.dialogs.top_dialog_mut().unwrap().focus = Some(name);
+    assert_eq!(t.dialogs.key_button("enter", true).as_deref(), Some("OK"));
+    assert!(dialog_key(&mut t, "enter", None, plain()));
+    assert!(!t.dialogs.is_open());
+    let task = v(&t).ed.project().task(2).unwrap();
+    assert_eq!(task.notes.as_deref(), Some("a\nb"));
+    assert_eq!(task.rich_notes, None, "plain lines carry no markup");
 }

@@ -553,7 +553,7 @@ fn task_information_pages_replace_by_name_or_follow_and_take_the_prefill() {
     // replaces none, so `project-plugin-ui.uit`'s check passes).
     let check = d.catalog_check().unwrap_err();
     assert!(
-        check.contains("notes (text, Notes)") && !check.contains("fx."),
+        check.contains("notes (richtext, Notes)") && !check.contains("fx."),
         "{check}"
     );
     // The grid's cells by address, with the column's kind checked.

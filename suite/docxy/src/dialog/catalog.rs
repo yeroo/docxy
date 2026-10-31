@@ -129,6 +129,15 @@ impl Field {
         }
     }
 
+    /// A rich-text field (#1803): a multiline box with a toolbar, typed as
+    /// a text field; Enter is a new line there, so its cases press OK.
+    pub const fn richtext(name: &'static str) -> Self {
+        Self {
+            kind: ControlKind::Richtext,
+            ..Self::text(name)
+        }
+    }
+
     /// A number field: `sample` typed, a letter refused as it is typed.
     pub const fn number(name: &'static str, sample: &'static str) -> Self {
         Self {
