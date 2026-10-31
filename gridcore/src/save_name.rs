@@ -7,7 +7,7 @@
 //! Save never asks, so a workbook opened from such a name still saves over
 //! itself; only Save As runs this check.
 
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Excel's longest workbook path, in UTF-16 units as Windows counts.
 pub const MAX_PATH: usize = 218;
@@ -29,12 +29,24 @@ pub fn check(path: &Path) -> Result<(), &'static str> {
     if bad || long { Err(BAD_NAME) } else { Ok(()) }
 }
 
-/// Whether a typed name holds a character a workbook name cannot. A host
-/// whose name field is joined to a folder checks the typed text with this
-/// before the join: on Windows `a:b.xlsx` parses as drive `A:` plus
-/// `b.xlsx`, so after a join [`check`] would see only `b.xlsx` (#1807).
+/// Whether a name holds a character a workbook name cannot.
 pub fn has_bad_char(name: &str) -> bool {
     name.contains(BAD_CHARS)
+}
+
+/// Whether a name typed in a field that is joined to a folder (Backstage
+/// Save As) passes what the join would hide from [`check`] (#1807): its last
+/// piece (after the last `/` or `\`, split on both on every OS: on Unix a
+/// `\` stays in the file name, which [`check`] still sees) must hold no bad
+/// character, and it must not be drive-relative. On Windows `c:report` is
+/// drive `C:` plus `report`, and joining it replaces the folder. A folder part
+/// such as `[old]/book` is fine; the joined path still goes through [`check`].
+pub fn typed_name_ok(name: &str) -> bool {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let path = Path::new(name);
+    let drive_relative =
+        matches!(path.components().next(), Some(Component::Prefix(_))) && !path.has_root();
+    !has_bad_char(last) && !drive_relative
 }
 
 #[cfg(test)]
@@ -53,13 +65,25 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_name_is_checked_whole() {
-        assert!(has_bad_char("c:report.xlsx"));
+    fn a_typed_name_checks_its_last_piece() {
+        assert!(!typed_name_ok("c:report.xlsx"));
         for c in BAD_CHARS {
-            assert!(has_bad_char(&format!("ab{c}c")), "{c}");
+            assert!(!typed_name_ok(&format!("ab{c}c.xlsx")), "{c}");
+            assert!(!typed_name_ok(&format!("sub/ab{c}c.xlsx")), "{c}");
+            assert!(!typed_name_ok(&format!("sub\\ab{c}c.xlsx")), "{c}");
         }
-        assert!(!has_bad_char("sub/report.xlsx"));
-        assert!(!has_bad_char("report (1).xlsx"));
+        assert!(typed_name_ok("report (1).xlsx"));
+        assert!(typed_name_ok("sub/report.xlsx"));
+        assert!(typed_name_ok("[old]/book.xlsx"));
+        assert!(typed_name_ok("[old]\\book.xlsx"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_relative_typed_name_is_refused_on_windows() {
+        assert!(!typed_name_ok("c:sub\\r.xlsx"));
+        assert!(!typed_name_ok("c:sub/r.xlsx"));
+        assert!(typed_name_ok("C:\\Users\\me\\report.xlsx"));
     }
 
     #[test]

@@ -1854,9 +1854,10 @@
   dialog's answer, which sets the status and writes nothing like a failed
   write. Terminal `xlsxy` (`App::refuse_bad_save_name`, after Protected
   View's refusal in `request_save_as` and `save_as_type`): Backstage Save As
-  (whose typed name is also checked whole before it is joined to the folder,
-  `save_name::has_bad_char`: on Windows `c:report` would join as a
-  drive-relative path) and the F12 prompt (a typed path is checked as typed,
+  (`save_name::typed_name_ok` first checks what the join to the folder
+  would hide: the typed name's last piece after `/` or `\`, and a Windows
+  drive-relative `c:report`, which would replace the folder; a folder part
+  like `[old]/book` is fine) and the F12 prompt (a typed path is checked as typed,
   so `c:` there is a drive), for every Save As
   type (text, web page, PDF, `.xls`), before the macro-free and
   compatibility questions and before the binding moves. A folder may hold

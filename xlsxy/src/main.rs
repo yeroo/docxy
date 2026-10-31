@@ -8730,10 +8730,10 @@ impl App {
             None => format!("{name}.xlsx"),
         };
         self.backstage = None;
-        // The typed name is checked before the join (#1807): on Windows
+        // What the join would hide is checked first (#1807): on Windows
         // `c:report.xlsx` is drive C: plus `report.xlsx`, and the join would
-        // drop the folder and hide the colon from the full-path check.
-        if gridcore::save_name::has_bad_char(&fname) {
+        // drop the folder and the colon. A folder part like `[old]/` is fine.
+        if !gridcore::save_name::typed_name_ok(&fname) {
             self.status = Some(gridcore::save_name::BAD_NAME.to_string());
             return;
         }
@@ -15807,6 +15807,17 @@ mod tests {
         app.commit_save_as(dir.clone(), "a[b]".into());
         refused(&app, "Backstage");
         assert!(app.backstage.is_none());
+        // A folder part may hold the characters (#804): `[old]/book` saves
+        // into `[old]` as `book.xlsx`.
+        let old = dir.join("[old]");
+        std::fs::create_dir_all(&old).unwrap();
+        app.open_backstage();
+        app.commit_save_as(dir.clone(), "[old]/book".into());
+        let book = old.join("book.xlsx");
+        assert!(book.exists(), "{:?}", app.status);
+        assert_eq!(Path::new(&app.path), book);
+        std::fs::remove_dir_all(&old).unwrap();
+        let mut app = two_sheet_app(&dir);
         // A drive-like name in the name field is refused on every OS: on
         // Windows the join would make it drive-relative `c:report.xlsx`.
         for (name, typed) in [
