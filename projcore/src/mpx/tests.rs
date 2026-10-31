@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::LinkType;
+use crate::model::{AccrueAt, ConstraintType, LagUnit, LinkType};
 
 fn corpus(name: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -484,8 +484,8 @@ fn weekday_prefixed_dates_read_as_their_date() {
         s.date("Fri 03/06/26 01:00 pm"),
         Some((at(2026, 3, 6, 0, 0), Some(13 * 60)))
     );
-    // A month spelled out is a known limit: not read.
-    assert_eq!(s.date("02 March 2026"), None);
+    // A month spelled out reads too (#1805).
+    assert_eq!(s.date("March 02 2026"), Some((at(2026, 3, 2, 0, 0), None)));
 }
 
 #[test]
@@ -732,4 +732,304 @@ fn a_calendar_without_working_time_is_refused_as_mspdi_refuses_it() {
          61,1,90,98\r\n70,A,1,1\r\n"))
     .unwrap_err();
     assert!(err.contains("has no working time"), "{err}");
+}
+
+/// The language of the locale [`locale::choose`] takes for a file.
+fn chosen(bytes: &[u8]) -> &'static str {
+    let text = decode(bytes);
+    let delimiter = text.chars().nth(3).unwrap();
+    let locale = locale::choose(&records(&text, delimiter), delimiter);
+    let i = locale::LOCALES
+        .iter()
+        .position(|l| std::ptr::eq(*l, locale))
+        .unwrap();
+    ["en", "de", "fr", "it", "pt", "sv", "es", "ru"][i]
+}
+
+/// Each task's UID and early start and finish.
+fn dates(p: &Project) -> Vec<(i32, DateTime, DateTime)> {
+    let s = crate::schedule::schedule(p);
+    p.tasks
+        .iter()
+        .map(|t| {
+            let r = s.get(t.uid).unwrap();
+            (t.uid, r.early_start, r.early_finish)
+        })
+        .collect()
+}
+
+#[test]
+fn english_month_names_read_in_every_date_order() {
+    let mdy = Settings::default();
+    let dmy = Settings {
+        date_order: DateOrder::Dmy,
+        ..Settings::default()
+    };
+    let ymd = Settings {
+        date_order: DateOrder::Ymd,
+        ..Settings::default()
+    };
+    let day = Some((at(2026, 3, 2, 0, 0), None));
+    // MPXJ's formats 3 and 5 in each order, any case, `Sept` and `'YY`.
+    for text in ["March 02 2026", "mar 02 2026", "MARCH 02 '26", "Mar. 02 26"] {
+        assert_eq!(mdy.date(text), day, "{text}");
+    }
+    for text in ["02 March 2026", "02 Mar '26", "02-Mar-2026"] {
+        assert_eq!(dmy.date(text), day, "{text}");
+    }
+    for text in ["2026 March 02", "'26 Mar 02"] {
+        assert_eq!(ymd.date(text), day, "{text}");
+    }
+    assert_eq!(
+        dmy.date("30 Sept 2026"),
+        Some((at(2026, 9, 30, 0, 0), None))
+    );
+    // Format 2 has a time, format 10 a weekday first.
+    assert_eq!(
+        mdy.date("March 02 2026 01:30 pm"),
+        Some((at(2026, 3, 2, 0, 0), Some(13 * 60 + 30)))
+    );
+    assert_eq!(mdy.date("Mon Mar 02 '26"), day);
+    assert_eq!(dmy.date("Mon 02 Mar '26"), day);
+    assert_eq!(ymd.date("Mon '26 Mar 02"), day);
+    // A month leading the date is no weekday, even with a time after it.
+    assert_eq!(
+        mdy.date("Mar 02 '26 08:00 am"),
+        Some((at(2026, 3, 2, 0, 0), Some(8 * 60)))
+    );
+    // Not a date: an unknown word, a second word, a bad day, no year.
+    for text in [
+        "Foo 02 2026",
+        "March April 2026",
+        "March 32 2026",
+        "March 02",
+        "Mon",
+    ] {
+        assert_eq!(mdy.date(text), None, "{text}");
+    }
+    // Localised month names are not read. A weekday spelled as an English
+    // month (Spanish and Italian `mar`, Tuesday) before a numeric date is
+    // still a weekday.
+    assert_eq!(dmy.date("02 März 2026"), None);
+    assert_eq!(dmy.date("mar 03/03/26"), Some((at(2026, 3, 3, 0, 0), None)));
+    assert_eq!(
+        dmy.date("Mar. 03/03/26 08:00"),
+        Some((at(2026, 3, 3, 0, 0), Some(8 * 60)))
+    );
+}
+
+#[test]
+fn weekdays_may_end_in_a_dot_and_be_any_language() {
+    let dmy = Settings {
+        date_order: DateOrder::Dmy,
+        date_sep: '.',
+        ..Settings::default()
+    };
+    assert_eq!(dmy.date("Mo. 02.03.26"), Some((at(2026, 3, 2, 0, 0), None)));
+    // Swedish format 9: YMD with the two-digit year first.
+    let ymd = Settings {
+        date_order: DateOrder::Ymd,
+        date_sep: '-',
+        ..Settings::default()
+    };
+    assert_eq!(ymd.date("mån 26-03-02"), Some((at(2026, 3, 2, 0, 0), None)));
+    assert_eq!(
+        ymd.date("tors 26-03-05"),
+        Some((at(2026, 3, 5, 0, 0), None))
+    );
+    assert_eq!(ymd.date("26-03-05"), Some((at(2026, 3, 5, 0, 0), None)));
+}
+
+#[test]
+fn month_name_variants_schedule_as_their_numeric_twins() {
+    // corpus/mpx/variants: 09-constraint-snet in formats 3, 2, 5 and 10.
+    for (variant, twin) in [
+        ("month-names-full", "09-constraint-snet"),
+        ("month-names-full-time", "09-constraint-snet"),
+        ("month-names-short", "dmy/09-constraint-snet"),
+        ("month-names-weekday", "ymd/09-constraint-snet"),
+    ] {
+        let project = read_mpx(&corpus(&format!("variants/{variant}.mpx"))).unwrap();
+        let twin = read_mpx(&corpus(&format!("{twin}.mpx"))).unwrap();
+        assert_eq!(project.start_date, Some(at(2026, 3, 2, 8, 0)), "{variant}");
+        let task = &project.tasks[0];
+        assert_eq!(
+            task.constraint,
+            ConstraintType::StartNoEarlierThan,
+            "{variant}"
+        );
+        assert_eq!(
+            task.constraint_date, twin.tasks[0].constraint_date,
+            "{variant}"
+        );
+        assert_eq!(task.stored_start, twin.tasks[0].stored_start, "{variant}");
+        assert_eq!(task.stored_finish, twin.tasks[0].stored_finish, "{variant}");
+        assert_eq!(dates(&project), dates(&twin), "{variant}");
+    }
+}
+
+#[test]
+fn localised_files_read_as_the_english_one() {
+    // corpus/mpx/variants/locale-*.mpx: one plan, written by MPXJ in each
+    // locale with its own words, units, link types, dates and code page.
+    let english = read_mpx(&corpus("variants/locale-en.mpx")).unwrap();
+    let inspect = english.tasks.iter().find(|t| t.name == "Inspect").unwrap();
+    assert_eq!(inspect.constraint, ConstraintType::StartNoEarlierThan);
+    let links: Vec<(i32, LinkType, i64, i64)> = inspect
+        .predecessors
+        .iter()
+        .map(|p| (p.uid, p.link, p.lag, p.lag_format.code()))
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (2, LinkType::StartStart, 8 * 60, 7),
+            (4, LinkType::FinishFinish, 1440, 8)
+        ]
+    );
+    assert_eq!(english.tasks[1].priority, Some(900));
+    assert_eq!(chosen(&corpus("variants/locale-en.mpx")), "en");
+    assert_eq!(english.tasks[0].rollup, Some(false));
+    assert_eq!(english.resources[0].accrue_at, Some(AccrueAt::End));
+    assert_eq!(english.resources[0].standard_rate_format, Some(2));
+    assert_eq!(english.assignments.len(), 1);
+    let want = format!("{english:?}");
+    for l in ["de", "fr", "it", "pt", "sv", "es", "ru"] {
+        let bytes = corpus(&format!("variants/locale-{l}.mpx"));
+        assert_eq!(chosen(&bytes), l);
+        let project = read_mpx(&bytes).unwrap();
+        assert_eq!(format!("{project:?}"), want, "locale-{l}.mpx");
+    }
+}
+
+#[test]
+fn russian_files_decode_as_windows_1251() {
+    let bytes = corpus("variants/locale-ru.mpx");
+    assert!(std::str::from_utf8(&bytes).is_err());
+    assert!(decode(&bytes).contains("Как можно раньше"));
+    // The same bytes under an `ANSI` header are Windows-1252.
+    let ansi = [b"MPX,x,4.0,ANSI\r\n".as_slice(), b"70,\xc4\xe0"].concat();
+    assert_eq!(decode(&ansi).lines().nth(1), Some("70,Äà"));
+    let ru = [b"MPX,x,4.0,ru\r\n".as_slice(), b"70,\xc4\xe0"].concat();
+    assert_eq!(decode(&ru).lines().nth(1), Some("70,Да"));
+    // UTF-8 stays UTF-8 whatever the header says.
+    assert_eq!(
+        decode("MPX,x,4.0,RU\r\n70,Да".as_bytes()).lines().nth(1),
+        Some("70,Да")
+    );
+}
+
+/// A task file in `header` (`;`-delimited) with the Duration, Predecessors,
+/// Milestone and Constraint Type columns.
+fn localised(rows: &str) -> Project {
+    read_mpx(
+        format!(
+            "MPX;x;4.0;ANSI\r\n12;1;1;480;.;:;;;20;20\r\n\
+             61;1;40;70;81;91;90;98\r\n{rows}"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn one_locale_reads_the_whole_file() {
+    // `t` is a day in German and an hour in Swedish: the words decide.
+    let de = localised("70;A;1t;;Nein;;1;1\r\n70;B;2t;1EA+1t;Ja;;2;2\r\n");
+    assert_eq!(de.tasks[0].duration_min, 8 * 60);
+    assert!(de.tasks[1].milestone);
+    let link = &de.tasks[1].predecessors[0];
+    assert_eq!((link.link, link.lag), (LinkType::FinishStart, 8 * 60));
+    let sv = localised("70;A;1t;;Nej;;1;1\r\n70;B;2t;1FS+1t;Ja;;2;2\r\n");
+    assert_eq!(sv.tasks[0].duration_min, 60);
+    assert_eq!(sv.tasks[1].predecessors[0].lag, 60);
+    // Without Yes/No a Swedish hour still outscores English, which has no
+    // `t`; German and Swedish tie on `t` alone, and German, first, wins (a
+    // known limit).
+    let only_units = localised("70;A;1t;;;;1;1\r\n");
+    assert_eq!(only_units.tasks[0].duration_min, 8 * 60);
+    // Swedish words are English but Yes/No: a file of English words alone
+    // is English.
+    let english = localised("70;A;1h;;;As Soon As Possible;1;1\r\n");
+    assert_eq!(english.tasks[0].duration_min, 60);
+    // A word the chosen locale does not know is read as English, else the
+    // model's default stays; nothing fails.
+    let mixed = localised(
+        "70;A;1t;;Nein;Start No Earlier Than;1;1\r\n\
+         70;B;1t;;Vielleicht;Irgendwann;2;2\r\n",
+    );
+    assert_eq!(
+        mixed.tasks[0].constraint,
+        ConstraintType::StartNoEarlierThan
+    );
+    assert_eq!(mixed.tasks[1].constraint, ConstraintType::AsSoonAsPossible);
+    assert!(!mixed.tasks[1].milestone);
+    assert_eq!(mixed.tasks[1].duration_min, 8 * 60);
+    // Spanish Project writes `Sí` without MPXJ's U+00AD.
+    let es = localised("70;A;1d;;Sí;Lo antes posible;1;1\r\n");
+    assert!(es.tasks[0].milestone);
+}
+
+#[test]
+fn localised_link_types_and_units() {
+    let de = &locale::LOCALES[1];
+    assert_eq!(de.english_link("2AA+1t"), "2SS+1t");
+    assert_eq!(de.english_link("2aa"), "2SS");
+    assert_eq!(de.english_link("12 EE"), "12 FF");
+    // English types and anything that is not ID-then-type stay.
+    assert_eq!(de.english_link("2FS"), "2FS");
+    assert_eq!(de.english_link("AA"), "AA");
+    assert_eq!(de.english_link("2"), "2");
+    let ru = &locale::RU;
+    assert_eq!(ru.english_link("2НН+1день"), "2SS+1день");
+    // Units: the longest suffix of the locale, else English's.
+    fn unit(l: &locale::Locale, t: &'static str) -> Option<(&'static str, LagUnit, bool)> {
+        l.unit(t).map(|(n, u)| (n, u.unit, u.elapsed))
+    }
+    assert_eq!(unit(ru, "1каждый день"), Some(("1", LagUnit::Day, true)));
+    assert_eq!(unit(ru, "1день"), Some(("1", LagUnit::Day, false)));
+    let it = &locale::LOCALES[3];
+    assert_eq!(unit(it, "2m"), Some(("2", LagUnit::Month, false)));
+    assert_eq!(unit(it, "2tm"), Some(("2", LagUnit::Month, true)));
+    assert_eq!(unit(it, "2h"), Some(("2", LagUnit::Hour, false)));
+    assert_eq!(unit(&locale::EN, "2"), None);
+}
+
+#[test]
+fn free_text_never_chooses_the_locale() {
+    // Names that are other locales' words (Italian `Fine` End, `Alto` High,
+    // German `Ende`, `Ja`, Spanish `Fin`) and units English reads leave an
+    // English file English: `30m` stays minutes, not Italian months.
+    let file = mpx("40,Name,Initials,ID,Unique ID\r\n41,1,2,40,49\r\n\
+         50,Alto,Fine,1,1\r\n\
+         60,Name,WBS,Text1,Duration,ID,Unique ID\r\n61,1,2,4,40,90,98\r\n\
+         70,Fine,Ende,Ja,30m,1,1\r\n70,Ende,Fin,Alto,2mo,2,2\r\n\
+         70,Fin,Si,Nein,2em,3,3\r\n");
+    assert_eq!(chosen(&file), "en");
+    let project = read_mpx(&file).unwrap();
+    let durations: Vec<(i64, Option<u8>)> = project
+        .tasks
+        .iter()
+        .map(|t| (t.duration_min, t.duration_format))
+        .collect();
+    assert_eq!(
+        durations,
+        [(30, Some(3)), (2 * 20 * 8 * 60, Some(11)), (2, Some(4))]
+    );
+}
+
+#[test]
+fn a_locale_unit_that_leaves_no_number_falls_back_to_english() {
+    // German has `m` and `h` but not `em`/`eh`: `2em` is English's elapsed
+    // minutes, not `2e` minutes, so the duration and the lag survive.
+    let de = localised("70;A;2em;;Nein;;1;1\r\n70;B;1t;1EA+2eh;Ja;;2;2\r\n");
+    assert_eq!(de.tasks[0].duration_min, 2);
+    let link = &de.tasks[1].predecessors[0];
+    assert_eq!((link.lag, link.lag_format.code()), (120, 6));
+    // Italian `o` is an hour: `2mo` is English's months.
+    let it = &locale::LOCALES[3];
+    let unit = it.unit("2mo").unwrap();
+    assert_eq!((unit.0, unit.1.unit), ("2", LagUnit::Month));
+    let unit = locale::LOCALES[1].unit("2ey").unwrap();
+    assert_eq!((unit.0, unit.1.elapsed, unit.1.year), ("2", true, true));
 }

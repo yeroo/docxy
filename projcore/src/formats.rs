@@ -84,7 +84,10 @@ impl ProjectFormat for Yppx {
     }
 }
 
-/// MS Project's MSPDI XML ([`crate::mspdi`]), UTF-8.
+/// MS Project's MSPDI XML ([`crate::mspdi`]), UTF-8. An MPX file saved
+/// under an `.xml` name ([`crate::mpx::is_mpx`], tested before the bytes
+/// must be UTF-8, as an `ANSI` MPX file need not be) is read as MPX; a Save
+/// then writes it as MSPDI under its own name, the type the name says.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mspdi;
 
@@ -102,6 +105,9 @@ impl ProjectFormat for Mspdi {
         true
     }
     fn read(&self, bytes: &[u8]) -> Result<Project, String> {
+        if is_mpx(bytes) {
+            return read_mpx(bytes);
+        }
         let xml = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
         read_mspdi(xml)
     }
@@ -335,10 +341,13 @@ impl Registry {
     }
 
     /// Read the file at `path` from its `bytes` with the reader of its
-    /// extension. A file whose extension no format claims is read as MPX
-    /// when it starts with an MPX header ([`crate::mpx::is_mpx`]), else as
-    /// MSPDI XML, as the hosts always have; one only a writer claims is
-    /// refused.
+    /// extension; one only a writer claims is refused. A file whose
+    /// extension no format claims is read as MPX when it starts with an MPX
+    /// header ([`crate::mpx::is_mpx`]), else by the built-in MSPDI reader, as
+    /// the hosts always have. That is the one rule the built-in [`Mspdi`]
+    /// reader follows for `.xml` too; the sniff is kept here as well so an
+    /// unclaimed extension stays MPX-aware should a plugin replace the
+    /// `.xml` reader.
     pub fn read(&self, path: &Path, bytes: &[u8]) -> Result<Project, String> {
         let ext = extension(path);
         match self.reader(ext) {
@@ -533,6 +542,50 @@ mod tests {
                 String::from_utf8_lossy(bytes)
             );
         }
+    }
+
+    #[test]
+    fn an_xml_file_holding_mpx_reads_as_mpx_and_saves_as_mspdi() {
+        let registry = Registry::new();
+        let project = registry.read(Path::new("plan.xml"), MPX).unwrap();
+        let names: Vec<&str> = project.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["A", "B"]);
+        // An `ANSI` MPX file is not UTF-8 (`\xe9` is é in Windows-1252):
+        // the sniff comes first.
+        let ansi = b"MPX,Microsoft Project for Windows,4.0,ANSI\r\n\
+            60,Name,Duration,ID,Unique ID\r\n61,1,40,90,98\r\n\
+            70,Caf\xe9,2d,1,1\r\n70,B,2d,2,2\r\n";
+        let project = registry.read(Path::new("plan.XML"), ansi).unwrap();
+        assert_eq!(project.tasks[0].name, "Caf\u{e9}");
+        // It is the `.xml` type, so it saves in place, as MSPDI.
+        assert_eq!(
+            registry.save_target(Path::new("plan.xml")).unwrap(),
+            Path::new("plan.xml")
+        );
+        let bytes = registry
+            .write(&project, Path::new("plan.xml"), Some(ansi))
+            .unwrap();
+        assert_eq!(
+            read_mspdi(std::str::from_utf8(&bytes).unwrap())
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
+        // A real MSPDI file reads as before.
+        let xml = write_mspdi(&project);
+        assert_eq!(
+            registry
+                .read(Path::new("plan.xml"), xml.as_bytes())
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
+        assert_eq!(
+            registry.read(Path::new("plan.xml"), b"<x/>").unwrap_err(),
+            "not an MSPDI document: root element is <x>, expected <Project>"
+        );
     }
 
     #[test]

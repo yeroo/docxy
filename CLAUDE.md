@@ -1961,7 +1961,7 @@
 ## MPX import (#309)
 
 - `projcore::mpx::read_mpx` reads MPX (dependency-free; UTF-8, else
-  Windows-1252; the delimiter is the character after `MPX` in the header,
+  Windows-1252, or 1251 when the header's code page field is `RU`; the delimiter is the character after `MPX` in the header,
   record 10 is only the number format). `formats::Mpx` (`.mpx`, label "MPX")
   is a built-in of `Registry::new`, read-only, so every host lists it in
   Open and treats an opened `.mpx` as an import (Save goes to Save As) by
@@ -1970,7 +1970,10 @@
   (`mpx::is_mpx`, after an optional BOM), else as MSPDI as before; the
   suite's `Formats::read` refuses such an extension before that and projctl
   never calls `Registry::read`, so only yppxy sniffs (its CLI and
-  `proj.open`/`proj.reload`).
+  `proj.open`/`proj.reload`). The MSPDI reader (`formats::Mspdi`) reads
+  MPX bytes as MPX too (#1805), sniffed before its UTF-8 check, so an MPX
+  file named `.xml` opens; it is the `.xml` type, not an import, so Save
+  rewrites it as MSPDI under its own name, by design.
 - Rows are read by the field ids of the 41/61 record before them; tasks are
   ordered by ID (a row with no ID keeps its place), a row with no name and
   no outline level is blank, a stated level 0 is kept (Project's umbrella
@@ -1978,11 +1981,25 @@
   lag other than `%` is read by the duration rules, not the cell grammar. Dates are whole days: a
   constraint, actual, stop or stored date lands on `editor::day_start` /
   `day_end` of the task calendar by its kind. Start/Finish are only the
-  stored dates, never constraints. Enumerations are Project's English words
-  (Priority as MPXJ maps them, Medium = 500); units are fractions (`1` =
-  100%), as MPXJ writes and reads them; durations take MPXJ's `mon`/`emon`
-  and `y`/`ey` beside Project's `mo`/`emo`, a weekday before a date is
-  skipped (month names are not read), and a note's U+007F is a line break.
+  stored dates, never constraints. Enumerations (Priority as MPXJ maps
+  them, Medium = 500), Yes/No, link types and duration and rate units are
+  the words of one locale per file (`mpx/locale.rs`, #1805: MPXJ's
+  `LocaleData` bundles for en de fr it pt sv es ru, units by meaning, never
+  by the bundle's index; Chinese is English): `RU` in the header is
+  Russian, else the word, duration and Predecessors fields (by their 61/41
+  ids as MPXJ types them, record 75 by place; never a name or other free
+  text) score a locale word, a unit English does not read or a link type
+  English lacks; ties go to English, then table order (German before
+  Swedish on `t` alone, a known limit). A word the locale lacks is read as
+  English, as is a unit whose locale suffix leaves no number (German
+  `2em`); U+00AD is ignored (MPXJ's Spanish `Sí`). Units are fractions (`1` = 100%), as MPXJ writes
+  and reads them; durations take MPXJ's `mon`/`emon` and `y`/`ey` beside
+  Project's `mo`/`emo`, the longest suffix first; dates may spell the month
+  in English (formats 2, 3, 5, 10: `March 05 2026`, `05 Mar '26`), and a
+  weekday before a date (a word, maybe ending in `.`, that is not an
+  English month or comes before a numeric date: Spanish `mar 03/03/26`) is
+  skipped; localised month names are not read; a note's
+  U+007F is a line break.
 - MPX has no task calendar, Manual, Active or Honor Constraints field, and
   constraint dates have no time: `projcore/tests/mpx_corpus.rs` compares
   `corpus/mpx` (MPXJ 16.8.0's MPX of `corpus/mspdi`, three date orders)
