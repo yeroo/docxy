@@ -422,13 +422,19 @@ fn import_tasks(
             // working minutes imported below, and an auto task's elapsed
             // code with its elapsed minutes (#484); a manual task's elapsed
             // duration is not decoded (#225), nor is a null code, so they
-            // read as days.
-            let manual = t.manual;
+            // read as days. An in-progress auto task keeps the working span
+            // as before #484 too: the schedule places it from its actuals as
+            // working minutes, which an elapsed format would contradict.
+            let in_progress = t
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.actual_start.is_some() && p.actual_finish.is_none());
+            let keeps_elapsed = !t.manual && !in_progress;
             task.duration_format = t
                 .duration_format
                 .filter(|&f| {
                     crate::mpp::working_duration_format(f)
-                        || (!manual && crate::mpp::elapsed_duration_format(f))
+                        || (keeps_elapsed && crate::mpp::elapsed_duration_format(f))
                 })
                 .and_then(|f| u8::try_from(f).ok())
                 .filter(|&f| f != 7);
@@ -463,7 +469,7 @@ fn import_tasks(
                     .duration_format
                     .filter(|&fmt| {
                         crate::mpp::working_duration_format(fmt)
-                            || crate::mpp::elapsed_duration_format(fmt)
+                            || (keeps_elapsed && crate::mpp::elapsed_duration_format(fmt))
                     })
                     .and(t.duration_min)
                     .unwrap_or_else(span);
@@ -712,6 +718,52 @@ mod tests {
         assert_eq!(tasks[0].constraint_date, None);
         assert_eq!(tasks[1].duration_format, None);
         assert_eq!(tasks[1].duration_min, 3 * 480);
+    }
+
+    /// #484 r1: an in-progress auto task with an elapsed code keeps the
+    /// working span and no format, as before #484, since the schedule
+    /// places it from its actuals as working minutes; a complete one keeps
+    /// its elapsed Duration and format (it sits on its actual dates).
+    #[test]
+    fn an_in_progress_elapsed_auto_task_keeps_its_working_span() {
+        let progress = |finish: Option<&str>| crate::mpp::MppProgress {
+            percent_complete: 33,
+            percent_work_complete: 0,
+            physical_percent_complete: 0,
+            actual_start: Some("2026-03-02 08:00".into()),
+            actual_finish: finish.map(Into::into),
+            stop: None,
+            resume: None,
+            actual_duration_min: 1440,
+            remaining_duration_min: 2880,
+            work_min: 0,
+            actual_work_min: 0,
+            remaining_work_min: 0,
+            cost: projcore::Rate::parse("0").unwrap(),
+            actual_cost: projcore::Rate::parse("0").unwrap(),
+            remaining_cost: projcore::Rate::parse("0").unwrap(),
+        };
+        let row = |uid, finish| {
+            let mut row = later(
+                current(uid, uid, "Elapsed", 1),
+                "2026-03-02 08:00",
+                "2026-03-05 08:00",
+            );
+            row.duration_format = Some(8);
+            row.duration_min = Some(4320);
+            row.progress = Some(progress(finish));
+            row
+        };
+        let tasks = import_current(vec![row(1, None), row(2, Some("2026-03-05 08:00"))]).unwrap();
+        assert_eq!(
+            (tasks[0].duration_min, tasks[0].duration_format),
+            (3 * 480, None)
+        );
+        assert!(!tasks[0].elapsed_duration());
+        assert_eq!(
+            (tasks[1].duration_min, tasks[1].duration_format),
+            (4320, Some(8))
+        );
     }
 
     #[test]
