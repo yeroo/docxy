@@ -3029,16 +3029,19 @@ impl Editor {
     pub fn set_indent_from(&mut self, left: i32, first_line: i32, base: &[(Vec<usize>, bool)]) {
         let styles = self.styles.clone();
         self.checkpoint(EditKind::Structural);
-        for path in self.selected_para_paths() {
+        for (i, path) in self.selected_para_paths().into_iter().enumerate() {
             let Some(p) = para_mut(&mut self.doc.body, &path) else {
                 continue;
             };
             let pr = &mut p.props;
             let listed = list_item(styles.as_deref(), pr);
             let pin = if left <= 0 {
+                // The base lists the same paths in order: look it up by
+                // position, searching only when the selection changed.
                 let direct = base
-                    .iter()
-                    .find(|(b, _)| *b == path)
+                    .get(i)
+                    .filter(|(b, _)| *b == path)
+                    .or_else(|| base.iter().find(|(b, _)| *b == path))
                     .map_or_else(|| had_direct_left(pr), |(_, d)| *d);
                 (listed && direct).then_some(0)
             } else {
