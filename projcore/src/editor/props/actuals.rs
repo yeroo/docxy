@@ -6,6 +6,13 @@
 //! undo step. How each field moves the others is not measured against
 //! Project 2024 beyond `corpus/mspdi/22-progress.xml`; the rules not pinned
 //! by it are noted on the setters.
+//!
+//! Every setter counts in working minutes. On a task with an elapsed
+//! `DurationFormat` (#484) each one first re-expresses the duration as the
+//! working minutes of its wall-clock window (its recorded actual and
+//! remaining durations scaled alike) and stores it in the same unit in
+//! working time, so "the duration stays" below means that working
+//! equivalent there (`Editor::progress_of`; unmeasured against Project).
 use super::*;
 
 /// The progress fields a setter settles together.
@@ -55,22 +62,33 @@ fn share(whole: i64, percent: i64) -> i64 {
 impl Editor {
     /// Task `i`'s progress fields in working minutes, which every setter
     /// computes and types. An elapsed task (#484) is re-expressed as the
-    /// working minutes its scheduled span covers on its calendar, its
-    /// recorded actual and remaining durations scaled alike, so progress
-    /// never mixes elapsed and working minutes: storing it then moves the
-    /// format to working time (`store_progress`). Unmeasured against
-    /// Project 2024, which keeps progress on an elapsed duration.
+    /// working minutes its wall-clock window covers on its calendar (its
+    /// elapsed duration from its actual start, else its scheduled start),
+    /// its recorded actual and remaining durations scaled alike, so
+    /// progress never mixes elapsed and working minutes: storing it then
+    /// moves the format to working time (`store_progress`). The window, not
+    /// the scheduled span: a tracked elapsed task is scheduled from its
+    /// actuals as working minutes (`Scheduler::elapsed`), so its span is
+    /// already inflated. Unmeasured against Project 2024, which keeps
+    /// progress on an elapsed duration.
     fn progress_of(&self, i: usize) -> Progress {
         let task = &self.proj.tasks[i];
         let mut p = Progress::of(task);
         if !task.elapsed_duration() || task.duration_min <= 0 {
             return p;
         }
-        let Some(r) = self.sched.get(task.uid) else {
+        let Some(start) = task
+            .actual_start
+            .or_else(|| self.sched.get(task.uid).map(|r| r.early_start))
+        else {
             return p;
         };
         let calendar = crate::assign::task_calendar(&self.proj, task);
-        let working = crate::schedule::working_minutes_on(&calendar, r.early_start, r.early_finish);
+        let working = crate::schedule::working_minutes_on(
+            &calendar,
+            start,
+            start.add_minutes(task.duration_min),
+        );
         let scale = |m: i64| {
             i64::try_from(i128::from(m) * i128::from(working) / i128::from(task.duration_min))
                 .unwrap_or(working)
@@ -194,7 +212,8 @@ impl Editor {
     /// finish before the actual start is refused. Clearing it keeps the actual
     /// start and duration: % Complete is their share and the remaining duration
     /// what is left. With no actual duration recorded it records 99 % of the
-    /// duration as the actual and the rest as remaining.
+    /// duration as the actual and the rest as remaining. An elapsed task's
+    /// duration is re-expressed in working time first (see the module doc).
     pub fn set_actual_finish(
         &mut self,
         uid: i32,
@@ -244,7 +263,9 @@ impl Editor {
 
     /// Set the task's Actual Duration in working minutes, 0 to its duration.
     /// % Complete becomes its share and the remaining duration what is left;
-    /// the duration stays. A task with no actual start takes its scheduled
+    /// the duration stays (an elapsed one is re-expressed as the working
+    /// minutes of its wall-clock window and moved to a working format,
+    /// #484: see `progress_of`). A task with no actual start takes its scheduled
     /// start (Project marks a task started once work is recorded). Reaching
     /// the whole duration gives 100 % and no remaining duration but invents no
     /// actual finish: only [`Self::set_actual_finish`] types one. A task that
@@ -277,6 +298,8 @@ impl Editor {
     /// completes the task as an actual duration of the whole does; it is
     /// refused when nothing is done (the task would have no duration). A task
     /// that has an actual finish takes only 0. It does not start a task.
+    /// An elapsed task's done part is counted in working time first (see the
+    /// module doc).
     pub fn set_remaining_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         let mut p = self.progress_of(i);
@@ -296,7 +319,10 @@ impl Editor {
                 "Remaining duration 0 with no work done would leave a zero duration".into(),
             );
         }
-        let old_duration = p.duration;
+        // Against the stored minutes, which `update_task` compares with:
+        // an elapsed task's working `p.duration` may differ from them, and
+        // a path chosen against it could store without an undo step.
+        let old_duration = self.proj.tasks[i].duration_min;
         p.duration = duration;
         p.remaining = Some(minutes);
         if p.actual.is_some() || p.start.is_some() {
@@ -331,8 +357,9 @@ impl Editor {
     /// is invented at 100 %), and is left untouched (`Ok(false)`, `Stop` and
     /// `Resume` kept) when it already has that percent and an actual
     /// duration: the stored percent is what is compared, so a recorded actual
-    /// that rounds differently is not rewritten. Refused as
-    /// [`Self::set_percent_complete`] refuses.
+    /// that rounds differently is not rewritten. An elapsed task's duration
+    /// is re-expressed in working time first (see the module doc). Refused
+    /// as [`Self::set_percent_complete`] refuses.
     pub fn set_percent_complete_synced(&mut self, uid: i32, percent: i32) -> Result<bool, String> {
         let i = self.property_row(uid)?;
         let task = &self.proj.tasks[i];

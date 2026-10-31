@@ -2639,6 +2639,71 @@ mod tests {
         );
     }
 
+    /// #484 r2: an in-progress elapsed task's progress is re-expressed over
+    /// its wall-clock window (72 elapsed hours from its actual start Mon
+    /// 08:00 cover three working days), not its scheduled span, which the
+    /// tracked path already inflates; and a remaining-duration edit whose
+    /// new duration equals the stored elapsed minutes is still one undo
+    /// step of its own.
+    #[test]
+    fn progress_on_an_in_progress_elapsed_task_counts_its_wall_clock_window() {
+        let at = |d, h| DateTime::from_ymd_hm(2026, 3, d, h, 0);
+        let started = |uid: i32, actual: Option<i64>| Task {
+            uid,
+            id: uid,
+            name: format!("E{uid}"),
+            outline_level: 1,
+            duration_min: 4320,
+            duration_format: Some(8),
+            actual_start: Some(at(2, 8)),
+            actual_duration_min: actual,
+            ..Task::default()
+        };
+        let mut ed = Editor::new(Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                started(1, Some(1440)),
+                started(2, None),
+                Task {
+                    uid: 3,
+                    id: 3,
+                    name: "Plain".into(),
+                    outline_level: 1,
+                    duration_min: 480,
+                    ..Task::default()
+                },
+            ],
+            ..Project::default()
+        });
+        ed.set_percent_complete_synced(1, 50).unwrap();
+        let t = ed.project().task(1).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (3 * 480, None));
+        assert_eq!(
+            (
+                t.actual_duration_min,
+                t.remaining_duration_min,
+                t.percent_complete
+            ),
+            (Some(720), Some(720), Some(50))
+        );
+        // Undo grouping: the earlier rename survives the undo of the edit.
+        ed.rename(3, "Renamed").unwrap();
+        let before = ed.project().task(2).unwrap().clone();
+        ed.set_remaining_duration(2, 4320).unwrap();
+        assert_eq!(ed.project().task(2).unwrap().duration_min, 4320);
+        assert!(ed.undo());
+        let t = ed.project().task(2).unwrap();
+        assert_eq!(
+            (t.duration_min, t.duration_format, t.remaining_duration_min),
+            (
+                before.duration_min,
+                before.duration_format,
+                before.remaining_duration_min
+            )
+        );
+        assert_eq!(ed.project().task(3).unwrap().name, "Renamed");
+    }
+
     #[test]
     fn package_parts_survive_edit_undo_and_redo() {
         use crate::yppx::{read_yppx, write_yppx};

@@ -610,7 +610,9 @@ impl Task {
     /// Whether this leaf's Duration is elapsed (`DurationFormat` 4, 6, 8, 10
     /// or 12, estimated or not): its `duration_min` is wall-clock minutes,
     /// and the scheduler runs it on the 24x7 clock, start included (#484).
-    /// A summary's never is, nor a percent or unknown code.
+    /// A summary's never is, nor a percent or unknown code. A tracked task
+    /// is still placed from its actuals as working minutes, as before; see
+    /// `Scheduler::elapsed`.
     pub fn elapsed_duration(&self) -> bool {
         !self.summary
             && self
