@@ -27236,26 +27236,23 @@ fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
 /// What a workbook refuses to be saved as.
 const SHEET_SAVE_FORMATS: &str = "Workbooks can only be saved as .xlsx, .xlsm, .xltx or .xltm";
 
-/// Excel's longest workbook path (#804), in UTF-16 units as Windows counts.
-const SHEET_MAX_PATH: usize = 218;
+/// Excel's longest workbook path (#804), in UTF-16 units as Windows counts;
+/// the tests' name for `gridcore::save_name::MAX_PATH`.
+#[cfg(test)]
+const SHEET_MAX_PATH: usize = gridcore::save_name::MAX_PATH;
 
-/// What Excel's Save As says of a name it refuses (#804).
-const SHEET_BAD_NAME: &str = "That file name is not valid: a workbook name cannot contain < > ? [ ] : | \" or *, and its full path cannot be longer than 218 characters";
+/// What Excel's Save As says of a name it refuses (#804); the tests' name
+/// for `gridcore::save_name::BAD_NAME`.
+#[cfg(test)]
+const SHEET_BAD_NAME: &str = gridcore::save_name::BAD_NAME;
 
-/// Excel's own check on a Save As target (#804), on the path
-/// [`sheet_save_target`] answered (so an added `.xlsx` counts), taken as it
-/// will be written (not canonicalised). Only the file name is checked for
-/// characters: a folder named `[old]` is fine. In-place Save never asks, so
-/// a workbook opened from such a name still saves over itself.
+/// Excel's own check on a Save As target (#804, `gridcore::save_name`), on
+/// the path [`sheet_save_target`] answered (so an added `.xlsx` counts),
+/// taken as it will be written (not canonicalised). Only the file name is
+/// checked for characters: a folder named `[old]` is fine. In-place Save
+/// never asks, so a workbook opened from such a name still saves over itself.
 fn sheet_save_as_name(path: &std::path::Path) -> Result<(), &'static str> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let bad = name.contains(['<', '>', '?', '[', ']', ':', '|', '*', '"']);
-    let long = path.as_os_str().to_string_lossy().encode_utf16().count() > SHEET_MAX_PATH;
-    if bad || long {
-        Err(SHEET_BAD_NAME)
-    } else {
-        Ok(())
-    }
+    gridcore::save_name::check(path)
 }
 
 /// Save As a workbook tab to `target` without a dialog: the commit a Save

@@ -457,6 +457,11 @@ fn protected_view_writes_nothing() {
     refused(&app, "save_as_type");
     app.commit_save_as(dir.clone(), "copy".to_string());
     refused(&app, "commit_save_as");
+    // A name Save As would refuse anyway keeps Protected View's words.
+    app.request_save_as(dir.join("a[b].xlsx").to_string_lossy().into_owned());
+    refused(&app, "request_save_as of a bad name");
+    app.save_as_type(dir.join("a[b].csv").to_string_lossy().into_owned(), 1);
+    refused(&app, "save_as_type of a bad name");
     app.export_csv();
     refused(&app, "export_csv");
     app.export_pdf();
