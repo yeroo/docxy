@@ -734,6 +734,18 @@ fn a_calendar_without_working_time_is_refused_as_mspdi_refuses_it() {
     assert!(err.contains("has no working time"), "{err}");
 }
 
+/// The language of the locale [`locale::choose`] takes for a file.
+fn chosen(bytes: &[u8]) -> &'static str {
+    let text = decode(bytes);
+    let delimiter = text.chars().nth(3).unwrap();
+    let locale = locale::choose(&records(&text, delimiter), delimiter);
+    let i = locale::LOCALES
+        .iter()
+        .position(|l| std::ptr::eq(*l, locale))
+        .unwrap();
+    ["en", "de", "fr", "it", "pt", "sv", "es", "ru"][i]
+}
+
 /// Each task's UID and early start and finish.
 fn dates(p: &Project) -> Vec<(i32, DateTime, DateTime)> {
     let s = crate::schedule::schedule(p);
@@ -795,10 +807,15 @@ fn english_month_names_read_in_every_date_order() {
     ] {
         assert_eq!(mdy.date(text), None, "{text}");
     }
-    // Localised month names are not read; a Spanish weekday spelled as an
-    // English month (`mar`, Tuesday) is read as March and fails.
+    // Localised month names are not read. A weekday spelled as an English
+    // month (Spanish and Italian `mar`, Tuesday) before a numeric date is
+    // still a weekday.
     assert_eq!(dmy.date("02 März 2026"), None);
-    assert_eq!(dmy.date("mar 03/03/26"), None);
+    assert_eq!(dmy.date("mar 03/03/26"), Some((at(2026, 3, 3, 0, 0), None)));
+    assert_eq!(
+        dmy.date("Mar. 03/03/26 08:00"),
+        Some((at(2026, 3, 3, 0, 0), Some(8 * 60)))
+    );
 }
 
 #[test]
@@ -871,14 +888,7 @@ fn localised_files_read_as_the_english_one() {
         ]
     );
     assert_eq!(english.tasks[1].priority, Some(900));
-    assert_eq!(
-        locale::choose(
-            &records(&decode(&corpus("variants/locale-en.mpx")), ','),
-            ','
-        )
-        .code,
-        "en"
-    );
+    assert_eq!(chosen(&corpus("variants/locale-en.mpx")), "en");
     assert_eq!(english.tasks[0].rollup, Some(false));
     assert_eq!(english.resources[0].accrue_at, Some(AccrueAt::End));
     assert_eq!(english.resources[0].standard_rate_format, Some(2));
@@ -886,10 +896,7 @@ fn localised_files_read_as_the_english_one() {
     let want = format!("{english:?}");
     for l in ["de", "fr", "it", "pt", "sv", "es", "ru"] {
         let bytes = corpus(&format!("variants/locale-{l}.mpx"));
-        let text = decode(&bytes);
-        let delimiter = text.chars().nth(3).unwrap();
-        let records = records(&text, delimiter);
-        assert_eq!(locale::choose(&records, delimiter).code, l);
+        assert_eq!(chosen(&bytes), l);
         let project = read_mpx(&bytes).unwrap();
         assert_eq!(format!("{project:?}"), want, "locale-{l}.mpx");
     }
@@ -966,7 +973,6 @@ fn one_locale_reads_the_whole_file() {
 #[test]
 fn localised_link_types_and_units() {
     let de = &locale::LOCALES[1];
-    assert_eq!(de.code, "de");
     assert_eq!(de.english_link("2AA+1t"), "2SS+1t");
     assert_eq!(de.english_link("2aa"), "2SS");
     assert_eq!(de.english_link("12 EE"), "12 FF");
@@ -987,4 +993,43 @@ fn localised_link_types_and_units() {
     assert_eq!(unit(it, "2tm"), Some(("2", LagUnit::Month, true)));
     assert_eq!(unit(it, "2h"), Some(("2", LagUnit::Hour, false)));
     assert_eq!(unit(&locale::EN, "2"), None);
+}
+
+#[test]
+fn free_text_never_chooses_the_locale() {
+    // Names that are other locales' words (Italian `Fine` End, `Alto` High,
+    // German `Ende`, `Ja`, Spanish `Fin`) and units English reads leave an
+    // English file English: `30m` stays minutes, not Italian months.
+    let file = mpx("40,Name,Initials,ID,Unique ID\r\n41,1,2,40,49\r\n\
+         50,Alto,Fine,1,1\r\n\
+         60,Name,WBS,Text1,Duration,ID,Unique ID\r\n61,1,2,4,40,90,98\r\n\
+         70,Fine,Ende,Ja,30m,1,1\r\n70,Ende,Fin,Alto,2mo,2,2\r\n\
+         70,Fin,Si,Nein,2em,3,3\r\n");
+    assert_eq!(chosen(&file), "en");
+    let project = read_mpx(&file).unwrap();
+    let durations: Vec<(i64, Option<u8>)> = project
+        .tasks
+        .iter()
+        .map(|t| (t.duration_min, t.duration_format))
+        .collect();
+    assert_eq!(
+        durations,
+        [(30, Some(3)), (2 * 20 * 8 * 60, Some(11)), (2, Some(4))]
+    );
+}
+
+#[test]
+fn a_locale_unit_that_leaves_no_number_falls_back_to_english() {
+    // German has `m` and `h` but not `em`/`eh`: `2em` is English's elapsed
+    // minutes, not `2e` minutes, so the duration and the lag survive.
+    let de = localised("70;A;2em;;Nein;;1;1\r\n70;B;1t;1EA+2eh;Ja;;2;2\r\n");
+    assert_eq!(de.tasks[0].duration_min, 2);
+    let link = &de.tasks[1].predecessors[0];
+    assert_eq!((link.lag, link.lag_format.code()), (120, 6));
+    // Italian `o` is an hour: `2mo` is English's months.
+    let it = &locale::LOCALES[3];
+    let unit = it.unit("2mo").unwrap();
+    assert_eq!((unit.0, unit.1.unit), ("2", LagUnit::Month));
+    let unit = locale::LOCALES[1].unit("2ey").unwrap();
+    assert_eq!((unit.0, unit.1.elapsed, unit.1.year), ("2", true, true));
 }

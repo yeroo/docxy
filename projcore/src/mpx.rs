@@ -42,7 +42,8 @@
 //! locale for the whole file, chosen from what its rows hold
 //! ([`locale::choose`]): MPXJ's English, German, French, Italian,
 //! Portuguese, Swedish, Spanish and Russian (#1805). A word the locale does
-//! not know is read as English, else the model's default stays. A file whose
+//! not know is read as English, as is a unit whose locale suffix leaves no
+//! number (German `2em`), else the model's default stays. A file whose
 //! header names the code page `RU` is Russian and, unless it is UTF-8,
 //! Windows-1251; Chinese (`ZH`) is read as an English file. English units are
 //! MPXJ's (`m h d w mon y`, elapsed with a leading `e`) and Project's `mo`.
@@ -273,11 +274,21 @@ impl Settings {
         let text = text.trim();
         // A leading weekday (`Mon 03/02/26`, `Thu Mar 05 '26`, German
         // `Mo. 02.03.26`, Swedish `mån 26-03-02`): a word, maybe ending in a
-        // dot, that is not an English month (MDY `Mar 05 '26`). A localised
-        // weekday spelled as one (Spanish `mar`) is then read as the month,
-        // and the date does not read: no worse than before.
+        // dot, that is not an English month (MDY `Mar 05 '26`), or is one
+        // before a numeric date (Spanish or Italian `mar`, Tuesday:
+        // `mar 03/03/26`).
+        let numeric_date = |word: &str| {
+            !word.contains(char::is_alphabetic)
+                && word.split([self.date_sep, '/', '-', '.']).count() == 3
+        };
         let text = match text.split_once(' ') {
-            Some((day, rest)) if is_word(day) && month_number(day).is_none() => rest.trim_start(),
+            Some((day, rest))
+                if is_word(day)
+                    && (month_number(day).is_none()
+                        || numeric_date(rest.trim_start().split(' ').next().unwrap_or(""))) =>
+            {
+                rest.trim_start()
+            }
             _ => text,
         };
         // A numeric date is one word of digits and separators; its time may
@@ -826,8 +837,8 @@ impl Reader {
         let hours_per_week = self.hours_per_week.unwrap_or(40.0);
         let unit = unit.trim().to_lowercase();
         // The locale's working units (`/t` is a German day), else these.
-        let unit = match self.locale().unit(&unit) {
-            Some(("", u)) if !u.elapsed => match (u.unit, u.year) {
+        let unit = match self.locale().rate_unit(&unit) {
+            Some(u) if !u.elapsed => match (u.unit, u.year) {
                 (_, true) => "y",
                 (LagUnit::Minute, _) => "m",
                 (LagUnit::Hour, _) => "h",

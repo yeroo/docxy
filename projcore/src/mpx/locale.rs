@@ -54,9 +54,6 @@ const EYEAR: Unit = u(LagUnit::Day, true, true);
 /// FF, FS, SF, SS (MPXJ's `RELATION_TYPES` order).
 #[derive(Debug)]
 pub(super) struct Locale {
-    /// The bundle's language, for the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub code: &'static str,
     yes: &'static [&'static str],
     no: &'static [&'static str],
     constraints: [&'static str; 8],
@@ -70,7 +67,6 @@ pub(super) struct Locale {
 /// English, also the fallback of every other locale. The units add
 /// Project's own `mo`/`emo` to MPXJ's.
 pub(super) static EN: Locale = Locale {
-    code: "en",
     yes: &["Yes"],
     no: &["No"],
     constraints: [
@@ -123,7 +119,6 @@ pub(super) static EN: Locale = Locale {
 };
 
 static DE: Locale = Locale {
-    code: "de",
     yes: &["Ja"],
     no: &["Nein"],
     constraints: [
@@ -167,7 +162,6 @@ static DE: Locale = Locale {
 };
 
 static FR: Locale = Locale {
-    code: "fr",
     yes: &["Oui"],
     no: &["Non"],
     constraints: [
@@ -210,7 +204,6 @@ static FR: Locale = Locale {
 };
 
 static IT: Locale = Locale {
-    code: "it",
     yes: &["Si"],
     no: &["No"],
     constraints: [
@@ -255,7 +248,6 @@ static IT: Locale = Locale {
 };
 
 static PT: Locale = Locale {
-    code: "pt",
     yes: &["Sim"],
     no: &["Não"],
     constraints: [
@@ -302,7 +294,6 @@ static PT: Locale = Locale {
 
 /// Swedish: only Yes/No and the hour (`t`) differ from English.
 static SV: Locale = Locale {
-    code: "sv",
     yes: &["Ja"],
     no: &["Nej"],
     constraints: EN.constraints,
@@ -329,7 +320,6 @@ static SV: Locale = Locale {
 /// which every comparison drops ([`norm`]), so Project's plain spelling
 /// matches too.
 static ES: Locale = Locale {
-    code: "es",
     yes: &["Sí\u{AD}"],
     no: &["No"],
     constraints: [
@@ -374,7 +364,6 @@ static ES: Locale = Locale {
 
 /// Russian, written in Windows-1251 (header code page `RU`).
 pub(super) static RU: Locale = Locale {
-    code: "ru",
     yes: &["Да"],
     no: &["Нет"],
     constraints: [
@@ -520,10 +509,26 @@ impl Locale {
             .map(|(_, n, unit)| (n.trim_end(), unit))
     }
 
+    /// The unit a rate's `/unit` names exactly (`h`, German `t`, Russian
+    /// `час`), this locale's, else English's.
+    pub fn rate_unit(&self, text: &str) -> Option<Unit> {
+        let exact = |l: &Locale| {
+            l.units
+                .iter()
+                .find(|(suffix, _)| *suffix == text)
+                .map(|&(_, u)| u)
+        };
+        exact(self).or_else(|| exact(&EN))
+    }
+
     /// The number and unit of a duration (lower case, without its `?`): by
-    /// this locale's suffixes, else English's; `None` for a bare number.
+    /// this locale's suffixes when what is left is a number, else English's
+    /// (German `2em` is no `2e` in minutes but English's elapsed minutes);
+    /// `None` for a bare number.
     pub fn unit<'a>(&self, text: &'a str) -> Option<(&'a str, Unit)> {
-        self.own_unit(text).or_else(|| EN.own_unit(text))
+        self.own_unit(text)
+            .filter(|(number, _)| is_number(number))
+            .or_else(|| EN.own_unit(text))
     }
 }
 
@@ -550,17 +555,58 @@ fn word_locales() -> &'static HashMap<String, u8> {
     })
 }
 
-/// Score a file's field `value` for each locale: one for a Yes/No,
-/// constraint, priority or Accrue At word of the locale's, one for a
-/// duration whose unit is the locale's and not English's (`2t`). A field
-/// without a letter says nothing.
-fn score_field(scores: &mut [u32; LOCALES.len()], value: &str) {
+/// What a field may say about the locale: a word (Yes/No, constraint
+/// type, priority, Accrue At), a duration or work with its unit, or the
+/// Predecessors list. Free text (names, WBS, Text, notes) says nothing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    Word,
+    Duration,
+    Links,
+}
+
+/// The kind of a task row's field by its id (record 61), as MPXJ 16.8.0's
+/// `MPXTaskField` types them: BOOLEAN, TASK_TYPE (Fixed), CONSTRAINT and
+/// PRIORITY are words, DURATION and WORK durations, Predecessors the links
+/// (Successors, 71, is not read).
+fn task_kind(id: u32) -> Option<Kind> {
+    match id {
+        80..=84 | 91 | 95 | 110..=120 | 122 | 123 | 135 | 136 => Some(Kind::Word),
+        20..=24 | 40..=43 | 45..=48 | 66 | 67 | 92..=94 => Some(Kind::Duration),
+        70 => Some(Kind::Links),
+        _ => None,
+    }
+}
+
+/// The kind of a resource row's field by its id (record 41), by
+/// `MPXResourceField`: Accrue At and the BOOLEAN fields are words, WORK and
+/// DURATION durations.
+fn resource_kind(id: u32) -> Option<Kind> {
+    match id {
+        45 | 46 | 51 => Some(Kind::Word),
+        20..=25 => Some(Kind::Duration),
+        _ => None,
+    }
+}
+
+/// The kind of an assignment's field by its place (record 75 is fixed: work,
+/// baseline, actual and overtime work, then the delay).
+fn assignment_kind(place: usize) -> Option<Kind> {
+    matches!(place, 3..=6 | 12).then_some(Kind::Duration)
+}
+
+/// Score a file's field `value` of `kind` for each locale: a word field one
+/// for each locale whose Yes/No, constraint, priority or Accrue At word it
+/// is, a duration one for each locale whose unit it has, when English does
+/// not read it (`2t`).
+fn score_field(scores: &mut [u32; LOCALES.len()], value: &str, kind: Kind) {
     if !value.contains(char::is_alphabetic) {
         return;
     }
-    if value.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+    if kind == Kind::Duration {
         let low = lower(value);
-        if EN.own_unit(&low).is_some() {
+        // What English reads as a number and a unit is no evidence.
+        if matches!(EN.own_unit(&low), Some((number, _)) if is_number(number)) {
             return;
         }
         for (score, l) in scores.iter_mut().zip(LOCALES).skip(1) {
@@ -569,6 +615,7 @@ fn score_field(scores: &mut [u32; LOCALES.len()], value: &str) {
             }
         }
     } else if let Some(mask) = word_locales().get(&folded(value).collect::<String>()) {
+        // A word field.
         for (i, score) in scores.iter_mut().enumerate() {
             *score += u32::from(mask & (1 << i) != 0);
         }
@@ -584,7 +631,7 @@ fn score_link(scores: &mut [u32; LOCALES.len()], entry: &str) {
         }
     }
     if let Some(sign) = entry.find(['+', '-']) {
-        score_field(scores, &entry[sign + 1..]);
+        score_field(scores, &entry[sign + 1..], Kind::Duration);
     }
 }
 
@@ -608,12 +655,14 @@ fn is_number(text: &str) -> bool {
 
 /// The locale a file is written in, from its records (the header first).
 /// `RU` in the header's code page field is Russian. Otherwise each locale
-/// scores the fields of the task (70), resource (50) and assignment (75)
-/// rows ([`score_field`]) and the entries of the task rows'
-/// Predecessors field (id 70 of the last record 61, split on `delimiter`,
-/// [`score_link`]); the highest wins, ties going to the first in
-/// [`LOCALES`], English. Every field counts, also those the reader does not
-/// keep (Critical, Summary): they are written in the same words.
+/// scores the word and duration fields of the task (70), resource (50) and
+/// assignment (75) rows, by the ids of the last record 61 and 41
+/// ([`task_kind`], [`resource_kind`], [`assignment_kind`]; never free text
+/// such as a name, so a task named `Fine` says nothing), with
+/// [`score_field`], and the entries of the task rows' Predecessors field
+/// (split on `delimiter`, [`score_link`]). A locale other than English wins
+/// only with a higher score than every locale before it in [`LOCALES`], so
+/// English wins ties and a file with no evidence.
 ///
 /// A known limit: a German file whose only evidence is days (`2t`) ties
 /// with Swedish (`t` hours) and is read as German, the first.
@@ -627,24 +676,32 @@ pub(super) fn choose(records: &[Vec<String>], delimiter: char) -> &'static Local
     }
     let mut scores = [0u32; LOCALES.len()];
     let mut task_fields: Vec<u32> = Vec::new();
+    let mut resource_fields: Vec<u32> = Vec::new();
     for record in records.iter().skip(1) {
         let Some(kind) = record.first().and_then(|k| k.trim().parse::<u32>().ok()) else {
             continue;
         };
+        let field_kind = |i: usize| match kind {
+            70 => task_fields.get(i).copied().and_then(task_kind),
+            50 => resource_fields.get(i).copied().and_then(resource_kind),
+            75 => assignment_kind(i + 1),
+            _ => None,
+        };
         match kind {
             61 => task_fields = super::ids(&record[1..]),
+            41 => resource_fields = super::ids(&record[1..]),
             50 | 70 | 75 => {
                 for (i, value) in record[1..].iter().enumerate() {
                     let value = value.trim();
-                    if value.is_empty() {
-                        continue;
-                    }
-                    if kind == 70 && task_fields.get(i) == Some(&70) {
-                        for entry in value.split(delimiter) {
-                            score_link(&mut scores, entry.trim());
+                    match field_kind(i) {
+                        _ if value.is_empty() => {}
+                        Some(Kind::Links) => {
+                            for entry in value.split(delimiter) {
+                                score_link(&mut scores, entry.trim());
+                            }
                         }
-                    } else {
-                        score_field(&mut scores, value);
+                        Some(kind) => score_field(&mut scores, value, kind),
+                        None => {}
                     }
                 }
             }

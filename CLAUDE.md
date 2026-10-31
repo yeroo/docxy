@@ -1986,16 +1986,19 @@
   the words of one locale per file (`mpx/locale.rs`, #1805: MPXJ's
   `LocaleData` bundles for en de fr it pt sv es ru, units by meaning, never
   by the bundle's index; Chinese is English): `RU` in the header is
-  Russian, else every task, resource and assignment field and Predecessors
-  entry scores (a locale word, a unit or link type English lacks), ties to
-  English, then table order (German before Swedish on `t` alone, a known
-  limit). A word the locale lacks is read as English, U+00AD is ignored
-  (MPXJ's Spanish `Sí`). Units are fractions (`1` = 100%), as MPXJ writes
+  Russian, else the word, duration and Predecessors fields (by their 61/41
+  ids as MPXJ types them, record 75 by place; never a name or other free
+  text) score a locale word, a unit English does not read or a link type
+  English lacks; ties go to English, then table order (German before
+  Swedish on `t` alone, a known limit). A word the locale lacks is read as
+  English, as is a unit whose locale suffix leaves no number (German
+  `2em`); U+00AD is ignored (MPXJ's Spanish `Sí`). Units are fractions (`1` = 100%), as MPXJ writes
   and reads them; durations take MPXJ's `mon`/`emon` and `y`/`ey` beside
   Project's `mo`/`emo`, the longest suffix first; dates may spell the month
   in English (formats 2, 3, 5, 10: `March 05 2026`, `05 Mar '26`), and a
   weekday before a date (a word, maybe ending in `.`, that is not an
-  English month) is skipped; localised month names are not read; a note's
+  English month or comes before a numeric date: Spanish `mar 03/03/26`) is
+  skipped; localised month names are not read; a note's
   U+007F is a line break.
 - MPX has no task calendar, Manual, Active or Honor Constraints field, and
   constraint dates have no time: `projcore/tests/mpx_corpus.rs` compares
