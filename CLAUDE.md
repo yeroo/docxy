@@ -2020,3 +2020,42 @@
   `corpus/mpx` (MPXJ 16.8.0's MPX of `corpus/mspdi`, three date orders)
   with the twins and lists those exclusions; `every_exclusion_is_needed`
   drops a stale one.
+
+## Elapsed task durations and MSO before opening (#484)
+
+- A leaf whose `DurationFormat` is elapsed (4, 6, 8, 10, 12, estimated or
+  not: `Task::elapsed_duration`) holds **elapsed (wall-clock) minutes** in
+  `duration_min`, as MSPDI `<Duration>` states them; every other leaf holds
+  working minutes. The editor computes or parses only working minutes, so
+  a write of one over an elapsed format moves the format to the same unit in
+  working time (`editor::to_working_format`: a manual task's typed finish,
+  a duration without a unit, an effort rescale, progress); an auto task's
+  typed finish is a constraint and keeps it.
+- The schedule runs an automatic elapsed leaf on the 24x7 clock, start
+  included (`Scheduler::elapsed`): it starts at its driven or constraint
+  instant unsnapped (unlinked: the raw project start) and finishes its
+  duration later; its late finish is the latest instant each successor
+  allows (`elapsed_pred_bound`: the morning side of the successor's index,
+  or its exact instant for an elapsed successor or an FS milestone) and its
+  late start that duration before. Its four slacks are wall-clock minutes
+  (late less early instants). Measured (Project 2024): unlinked, on
+  08:00 and 08:30 calendars (snapshots 15..46 UID 25: start 08:00, finish
+  +72 h, slack 260400 tenths). Unmeasured, following the rule: links,
+  constraints, ALAP, a stored leveling delay (added unsnapped), a percent
+  lag off an elapsed predecessor (a share of its elapsed minutes). The
+  leveler holds an elapsed task at its CPM dates, booked over its span. A
+  tracked elapsed task stays on its actuals and its remaining work is
+  working time, as before (unmeasured). The grid and Markdown show the
+  elapsed slack as working days (a display follow-up); terminal `yppxy` gets
+  all of it through projcore.
+- An honored Must Start On whose instant is before a working day's first
+  working minute keeps that instant as its start; its index, so its finish,
+  is the opening's (snapshots 31..46 UID 30: 08:00..17:30 on a calendar that
+  opens at 08:30, late start 08:00). A date in a lunch break or on a
+  nonworking day still snaps (unmeasured).
+- `mspdi::schedule_reproduces` no longer gives up on an elapsed task, so
+  such a plan writes scheduled dates and wall-clock slack. The `.mpp` import
+  keeps an auto task's elapsed Duration (FixedData +84) and format
+  (`mpp::elapsed_duration_format`); a manual task's elapsed duration is not
+  decoded (#225). `oracle_corpus` compares UID 25 (dates, late dates,
+  slacks, imported unpinned) and UID 30 in every snapshot that has them.
