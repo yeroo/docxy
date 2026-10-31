@@ -35,21 +35,33 @@
 //! a plan using them reads as Project's defaults. A task's Start and Finish
 //! columns are the dates Project computed: they are kept as the stored dates
 //! the MSPDI reader keeps, never as a constraint, so the schedule is the
-//! scheduler's. Enumerated values (constraint type, priority, accrue at, yes
-//! and no) are Project's English words; a localised file's words read as the
-//! default. Dates are numeric, optionally after a weekday name (`Mon
-//! 03/02/26`); the date formats that spell the month (`02 March 2026`,
-//! `02 Mar 26`) are not read, a known limit. Durations take MPXJ's units:
-//! `m h d w mon y`, elapsed with a leading `e`, and Project's `mo`.
+//! scheduler's.
+//!
+//! Enumerated values (constraint type, priority, accrue at, yes and no),
+//! duration and rate units and link types are read in the words of one
+//! locale for the whole file, chosen from what its rows hold
+//! ([`locale::choose`]): MPXJ's English, German, French, Italian,
+//! Portuguese, Swedish, Spanish and Russian (#1805). A word the locale does
+//! not know is read as English, else the model's default stays. A file whose
+//! header names the code page `RU` is Russian and, unless it is UTF-8,
+//! Windows-1251; Chinese (`ZH`) is read as an English file. English units are
+//! MPXJ's (`m h d w mon y`, elapsed with a leading `e`) and Project's `mo`.
+//!
+//! Dates are numeric, or spell the month in English (`March 05 2026`,
+//! `05 Mar '26`, MPXJ's date formats 2, 3, 5 and 10), in the file's date
+//! order, optionally after a weekday (`Mon 03/02/26`, `Mo. 02.03.26`, `mån
+//! 26-03-02`). Localised month names are not read.
 //!
 //! The rules were checked against MPXJ 16.8.0's writer and reader on the
 //! `corpus/mpx` files (`corpus/mpx/README.md`); there is no Project oracle.
 
+mod locale;
+
 use crate::datetime::DateTime;
 use crate::editor::{day_end, day_start};
 use crate::model::{
-    AccrueAt, Assignment, Calendar, CalendarException, ConstraintType, DayWorking, LagFormat,
-    LagUnit, Project, Rate, Resource, Task, TaskType, WorkingTime,
+    Assignment, Calendar, CalendarException, ConstraintType, DayWorking, LagFormat, LagUnit,
+    Project, Rate, Resource, Task, TaskType, WorkingTime,
 };
 
 /// Whether `bytes` start as an MPX file does: `MPX` and a `,` or `;`
@@ -71,28 +83,50 @@ pub fn read_mpx(bytes: &[u8]) -> Result<Project, String> {
         }
         _ => return Err("not an MPX file: expected an MPX header".into()),
     };
+    let records = records(&text, delimiter);
     let mut reader = Reader {
         delimiter,
+        locale: Some(locale::choose(&records, delimiter)),
         ..Reader::default()
     };
-    for record in records(&text, delimiter).into_iter().skip(1) {
+    for record in records.into_iter().skip(1) {
         reader.record(&record);
     }
     reader.finish()
 }
 
 /// The text of the file: UTF-8 when it is valid UTF-8 (a byte order mark
-/// dropped), else Windows-1252, the `ANSI` code page Project writes.
+/// dropped), else the header's code page ([`header_code_page`]).
 fn decode(bytes: &[u8]) -> String {
     let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
-        // The five bytes the code page leaves undefined are their C1
-        // controls, as in every other legacy import (`opccore::xml`).
-        Err(_) => bytes
-            .iter()
-            .map(|&b| opccore::codepage::decode(1252, b).unwrap_or(char::from(b)))
-            .collect(),
+        Err(_) => {
+            let page = header_code_page(bytes);
+            // The bytes a code page leaves undefined are their C1 controls,
+            // as in every other legacy import (`opccore::xml`).
+            bytes
+                .iter()
+                .map(|&b| opccore::codepage::decode(page, b).unwrap_or(char::from(b)))
+                .collect()
+        }
+    }
+}
+
+/// The Windows code page of the header's fourth field, read as ASCII before
+/// the file is decoded: `RU` is 1251, as MPXJ writes Russian; `ANSI` and
+/// anything else 1252, the code page Project writes.
+fn header_code_page(bytes: &[u8]) -> i32 {
+    let line = bytes
+        .split(|&b| b == b'\r' || b == b'\n')
+        .next()
+        .unwrap_or(&[]);
+    let Some(&delimiter) = line.get(3) else {
+        return 1252;
+    };
+    match line.split(|&b| b == delimiter).nth(3) {
+        Some(field) if field.trim_ascii().eq_ignore_ascii_case(b"RU") => 1251,
+        _ => 1252,
     }
 }
 
@@ -233,32 +267,46 @@ impl Settings {
     }
 
     /// A date, with its time when one follows it (`03/02/2026 08:00 am`).
-    /// The time is `None` for a bare date.
+    /// The time is `None` for a bare date. The month may be an English name
+    /// (`March 05 2026`, `05 Mar '26`), and a weekday may come first.
     fn date(&self, text: &str) -> Option<(DateTime, Option<u32>)> {
         let text = text.trim();
-        // A leading weekday name (`Mon 03/02/26`, MPXJ's date formats 8 and 9;
-        // 10 spells the month and 11 has no date).
+        // A leading weekday (`Mon 03/02/26`, `Thu Mar 05 '26`, German
+        // `Mo. 02.03.26`, Swedish `mån 26-03-02`): a word, maybe ending in a
+        // dot, that is not an English month (MDY `Mar 05 '26`). A localised
+        // weekday spelled as one (Spanish `mar`) is then read as the month,
+        // and the date does not read: no worse than before.
         let text = match text.split_once(' ') {
-            Some((day, rest)) if day.chars().all(char::is_alphabetic) => rest.trim_start(),
+            Some((day, rest)) if is_word(day) && month_number(day).is_none() => rest.trim_start(),
             _ => text,
         };
-        let (date, time) = match text.split_once(' ') {
-            Some((d, t)) => (d, Some(t.trim())),
-            None => (text, None),
+        // A numeric date is one word of digits and separators; its time may
+        // hold letters (`am`).
+        let first = text.split(' ').next().unwrap_or("");
+        let numeric =
+            !first.contains(char::is_alphabetic) && first.contains([self.date_sep, '/', '-', '.']);
+        let (y, m, d, time) = if !numeric && text.contains(char::is_alphabetic) {
+            self.month_name_date(text)?
+        } else {
+            let (date, time) = match text.split_once(' ') {
+                Some((d, t)) => (d, Some(t.trim())),
+                None => (text, None),
+            };
+            let parts: Vec<&str> = date.split([self.date_sep, '/', '-', '.']).collect();
+            let [a, b, c] = parts.as_slice() else {
+                return None;
+            };
+            let (y, m, d) = match self.date_order {
+                DateOrder::Mdy => (c, a, b),
+                DateOrder::Dmy => (c, b, a),
+                DateOrder::Ymd => (a, b, c),
+            };
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if !(digits(y) && digits(m) && digits(d)) {
+                return None;
+            }
+            (*y, m.parse().ok()?, d.parse().ok()?, time)
         };
-        let parts: Vec<&str> = date.split([self.date_sep, '/', '-', '.']).collect();
-        let [a, b, c] = parts.as_slice() else {
-            return None;
-        };
-        let (y, m, d) = match self.date_order {
-            DateOrder::Mdy => (c, a, b),
-            DateOrder::Dmy => (c, b, a),
-            DateOrder::Ymd => (a, b, c),
-        };
-        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if !(digits(y) && digits(m) && digits(d)) {
-            return None;
-        }
         let mut year: i64 = y.parse().ok()?;
         if y.len() <= 2 {
             // Two-digit years (exception records): a fixed pivot of our own,
@@ -267,8 +315,7 @@ impl Settings {
             // instead; both read the corpus's `26` as 2026.
             year += if year < 80 { 2000 } else { 1900 };
         }
-        let month: u32 = m.parse().ok()?;
-        let day: u32 = d.parse().ok()?;
+        let (month, day): (u32, u32) = (m, d);
         if !(1..=12).contains(&month) || !(1..=31).contains(&day) || !(1..=9999).contains(&year) {
             return None;
         }
@@ -282,6 +329,52 @@ impl Settings {
             _ => None,
         };
         Some((at, time))
+    }
+
+    /// The year, month, day and time of a date that spells its month in
+    /// English (MPXJ's date formats 2, 3, 5 and 10): three words, one of
+    /// them the month, the other two the day and the year in the file's date
+    /// order with the month taken out (day then year, or year then day for
+    /// YMD), a year maybe written `'26`; what follows is the time. The three
+    /// may also be joined by a date separator (`05-Mar-2026`).
+    fn month_name_date<'a>(&self, text: &'a str) -> Option<(&'a str, u32, u32, Option<&'a str>)> {
+        let (date, time) = match text.split_once(' ') {
+            Some((first, rest)) if first.split([self.date_sep, '/', '-']).count() == 3 => (
+                first.split([self.date_sep, '/', '-']).collect::<Vec<_>>(),
+                Some(rest),
+            ),
+            None if text.split([self.date_sep, '/', '-']).count() == 3 => {
+                (text.split([self.date_sep, '/', '-']).collect(), None)
+            }
+            _ => {
+                let mut words = text.splitn(4, ' ').filter(|w| !w.is_empty());
+                let date: Vec<&str> = words.by_ref().take(3).collect();
+                (date, words.next())
+            }
+        };
+        let [a, b, c] = date.as_slice() else {
+            return None;
+        };
+        let at = [a, b, c]
+            .iter()
+            .position(|w| w.contains(char::is_alphabetic))?;
+        let month = month_number(date[at])?;
+        let mut rest = date
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != at)
+            .map(|(_, w)| *w);
+        let (first, second) = (rest.next()?, rest.next()?);
+        let (y, d) = match self.date_order {
+            DateOrder::Ymd => (first, second),
+            DateOrder::Mdy | DateOrder::Dmy => (second, first),
+        };
+        let y = y.strip_prefix('\'').unwrap_or(y);
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if !(digits(y) && digits(d)) {
+            return None;
+        }
+        Some((y, month, d.parse().ok()?, time.map(str::trim)))
     }
 
     /// A time of day in minutes after midnight: `08:00 am`, `01:00 pm` or
@@ -337,6 +430,39 @@ fn strip_suffix_word<'a>(text: &'a str, word: &str) -> Option<&'a str> {
     text.strip_suffix(word.as_str()).map(str::trim_end)
 }
 
+/// Letters, maybe ending in one `.`: a weekday's or month's abbreviation.
+fn is_word(text: &str) -> bool {
+    let text = text.strip_suffix('.').unwrap_or(text);
+    !text.is_empty() && text.chars().all(char::is_alphabetic)
+}
+
+/// The month (1 to 12) an English month name or its first three letters
+/// name, any case, with an optional final `.` (`Sept` too).
+fn month_number(text: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let word = text.strip_suffix('.').unwrap_or(text).to_lowercase();
+    if word == "sept" {
+        return Some(9);
+    }
+    MONTHS
+        .iter()
+        .position(|m| *m == word || (word.chars().count() == 3 && m.starts_with(&word)))
+        .map(|i| i as u32 + 1)
+}
+
 /// A task row (record 70) as read, before the tasks are ordered and the
 /// fields that need the whole plan (links, dates on the calendar) resolve.
 #[derive(Default)]
@@ -378,6 +504,9 @@ struct Reader {
     /// The header's field delimiter, which also separates the entries of a
     /// Predecessors list (MPXJ joins them with it: `"1;2"` in a `MPX;` file).
     delimiter: char,
+    /// The words the file is written in; `None` (a test's bare reader) is
+    /// English.
+    locale: Option<&'static locale::Locale>,
     settings: Settings,
     hours_per_day: Option<f64>,
     hours_per_week: Option<f64>,
@@ -402,6 +531,10 @@ struct Reader {
 }
 
 impl Reader {
+    fn locale(&self) -> &'static locale::Locale {
+        self.locale.unwrap_or(&locale::EN)
+    }
+
     fn record(&mut self, record: &[String]) {
         let Some(kind) = record.first().and_then(|k| k.trim().parse::<u32>().ok()) else {
             return;
@@ -665,7 +798,7 @@ impl Reader {
                     }
                 }
                 44 => r.cost_per_use = self.settings.money(value),
-                45 => r.accrue_at = accrue_at(value),
+                45 => r.accrue_at = self.locale().accrue_at(value),
                 49 => uid = value.parse().ok(),
                 _ => {}
             }
@@ -691,7 +824,20 @@ impl Reader {
         let value = self.settings.money(amount)?.to_f64()?;
         let hours_per_day = self.hours_per_day.unwrap_or(8.0);
         let hours_per_week = self.hours_per_week.unwrap_or(40.0);
-        let (per_hour, format) = match unit.trim().to_ascii_lowercase().as_str() {
+        let unit = unit.trim().to_lowercase();
+        // The locale's working units (`/t` is a German day), else these.
+        let unit = match self.locale().unit(&unit) {
+            Some(("", u)) if !u.elapsed => match (u.unit, u.year) {
+                (_, true) => "y",
+                (LagUnit::Minute, _) => "m",
+                (LagUnit::Hour, _) => "h",
+                (LagUnit::Day, _) => "d",
+                (LagUnit::Week, _) => "w",
+                _ => "mo",
+            },
+            _ => unit.as_str(),
+        };
+        let (per_hour, format) = match unit {
             "m" | "min" => (value * 60.0, 1),
             "h" | "hr" => (value, 2),
             "d" | "day" => (value / hours_per_day, 3),
@@ -740,23 +886,23 @@ impl Reader {
                 68 => raw.constraint_date = self.settings.date(value),
                 70 => raw.predecessors = value.to_string(),
                 80 => {
-                    if yes_no(value) == Some(true) {
+                    if self.locale().yes_no(value) == Some(true) {
                         t.task_type = Some(TaskType::FixedDuration);
                     }
                 }
-                81 => raw.milestone = yes_no(value),
-                84 => t.rollup = yes_no(value),
+                81 => raw.milestone = self.locale().yes_no(value),
+                84 => t.rollup = self.locale().yes_no(value),
                 90 => raw.id = value.parse().ok(),
-                91 => t.constraint = constraint_type(value).unwrap_or_default(),
+                91 => t.constraint = self.locale().constraint_type(value).unwrap_or_default(),
                 92 => {
                     if let Some(d) = self.duration(value) {
                         t.leveling_delay = d.minutes.checked_mul(10);
                         t.leveling_delay_format = Some(d.format.code() as i32);
                     }
                 }
-                95 => t.priority = priority(value),
+                95 => t.priority = self.locale().priority(value),
                 98 => raw.uid = value.parse().ok(),
-                123 => t.hide_bar = yes_no(value),
+                123 => t.hide_bar = self.locale().yes_no(value),
                 125 => {
                     t.create_date = self
                         .settings
@@ -772,39 +918,32 @@ impl Reader {
     }
 
     /// A duration or lag-like delay: `2d`, `16h`, `1440m`, `1w`, `1mo`,
-    /// elapsed `2ed`, estimated `2d?`; a bare number is days.
+    /// elapsed `2ed`, estimated `2d?`, in the file's locale's units
+    /// ([`locale::Locale::unit`]: German `2t`, Russian `2день`); a bare
+    /// number is days.
     fn duration(&self, text: &str) -> Option<Duration> {
-        let t = text.trim().to_ascii_lowercase();
+        let t = text.trim().to_lowercase();
         let (t, estimated) = match t.strip_suffix('?') {
-            Some(rest) => (rest.trim_end().to_string(), true),
-            None => (t, false),
+            Some(rest) => (rest.trim_end(), true),
+            None => (t.as_str(), false),
         };
-        // MPXJ's unit table, longest suffix first: it writes months `mon`
-        // and `emon`; `mo`/`emo` are Project's own spelling. A year has no
-        // MSPDI format, so it is kept in days.
-        let (number, unit, elapsed, year) = [
-            ("emon", LagUnit::Month, true, false),
-            ("emo", LagUnit::Month, true, false),
-            ("em", LagUnit::Minute, true, false),
-            ("eh", LagUnit::Hour, true, false),
-            ("ed", LagUnit::Day, true, false),
-            ("ew", LagUnit::Week, true, false),
-            ("ey", LagUnit::Day, true, true),
-            ("mon", LagUnit::Month, false, false),
-            ("mo", LagUnit::Month, false, false),
-            ("m", LagUnit::Minute, false, false),
-            ("h", LagUnit::Hour, false, false),
-            ("d", LagUnit::Day, false, false),
-            ("w", LagUnit::Week, false, false),
-            ("y", LagUnit::Day, false, true),
-        ]
-        .into_iter()
-        .find_map(|(suffix, unit, elapsed, year)| {
-            t.strip_suffix(suffix)
-                .map(|n| (n.trim().to_string(), unit, elapsed, year))
-        })
-        .unwrap_or((t.clone(), LagUnit::Day, false, false));
-        let value = self.settings.number(&number)?;
+        // A year has no MSPDI format, so it is kept in days.
+        let (
+            number,
+            locale::Unit {
+                unit,
+                elapsed,
+                year,
+            },
+        ) = self.locale().unit(t).unwrap_or((
+            t,
+            locale::Unit {
+                unit: LagUnit::Day,
+                elapsed: false,
+                year: false,
+            },
+        ));
+        let value = self.settings.number(number)?;
         // Elapsed: a month is 30 days and a year 365. Working: a month is
         // Project's default 20 days and a year 52 weeks, as `rate` counts.
         let hours_per_day = self.hours_per_day.unwrap_or(8.0);
@@ -860,6 +999,8 @@ impl Reader {
     /// [`Reader::duration`] on the file's own separators, once, signed.
     /// `None` when the lag does not read: the entry is dropped.
     fn link_entry(&self, entry: &str) -> Option<LinkEntry> {
+        // A localised link type (`2EA+1t`) in English first.
+        let entry = &self.locale().english_link(entry);
         // The lag starts at the first sign: an ID is digits, a type letters.
         let Some(sign) = entry.find(['+', '-']) else {
             return Some(LinkEntry {
@@ -1197,67 +1338,12 @@ fn ids(fields: &[String]) -> Vec<u32> {
         .collect()
 }
 
-/// `Yes`/`No` (also `1`/`0`, `True`/`False`).
-fn yes_no(text: &str) -> Option<bool> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "yes" | "1" | "true" => Some(true),
-        "no" | "0" | "false" => Some(false),
-        _ => None,
-    }
-}
-
 /// `50%` or `50` as a whole percentage, 0 to 100.
 fn percent(text: &str) -> Option<u8> {
     let t = text.trim();
     let t = t.strip_suffix('%').unwrap_or(t).trim();
     let value: f64 = t.parse().ok()?;
     (0.0..=100.0).contains(&value).then(|| value.round() as u8)
-}
-
-/// Project's constraint type names, in English.
-fn constraint_type(text: &str) -> Option<ConstraintType> {
-    use ConstraintType::*;
-    let name = text.trim().to_ascii_lowercase();
-    Some(match name.as_str() {
-        "as soon as possible" => AsSoonAsPossible,
-        "as late as possible" => AsLateAsPossible,
-        "must start on" => MustStartOn,
-        "must finish on" => MustFinishOn,
-        "start no earlier than" => StartNoEarlierThan,
-        "start no later than" => StartNoLaterThan,
-        "finish no earlier than" => FinishNoEarlierThan,
-        "finish no later than" => FinishNoLaterThan,
-        _ => return name.parse().ok().and_then(ConstraintType::from_code),
-    })
-}
-
-/// Project's priority names, as MPXJ maps them (`Medium` is 500,
-/// `Do Not Level` 1000), or a number from 0 to 1000.
-fn priority(text: &str) -> Option<i32> {
-    let name = text.trim().to_ascii_lowercase();
-    Some(match name.as_str() {
-        "lowest" => 100,
-        "very low" => 200,
-        "lower" => 300,
-        "low" => 400,
-        "medium" => 500,
-        "high" => 600,
-        "higher" => 700,
-        "very high" => 800,
-        "highest" => 900,
-        "do not level" => 1000,
-        _ => return name.parse().ok().filter(|n| (0..=1000).contains(n)),
-    })
-}
-
-/// Project's Accrue At names.
-fn accrue_at(text: &str) -> Option<AccrueAt> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "start" => Some(AccrueAt::Start),
-        "end" => Some(AccrueAt::End),
-        "prorated" => Some(AccrueAt::Prorated),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
