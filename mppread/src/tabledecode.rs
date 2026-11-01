@@ -11,6 +11,7 @@
 //! Var2Data offset `u32` at +4, field key `u16` at +8 and the table's tag
 //! `u16` at +10. Each Var2Data value is a `u32` length and that many bytes.
 use crate::cfb::Cfb;
+use crate::varmeta::{self, BlockError, HeaderError, RawEntry, Trailing};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -342,32 +343,26 @@ pub fn read(
     let Some(Index { rows, indexed_uids }) = index else {
         return Ok(None); // Present table in an unvalidated row layout.
     };
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err(format!("{name}: invalid VarMeta header"));
-    }
-    let vars = u32_at(&vm, 8) as usize;
-    if 24usize.checked_add(vars.checked_mul(12).ok_or("VarMeta count overflow")?) != Some(vm.len())
-        || u32_at(&vm, 20) as usize != v2.len()
-    {
-        return Err(format!("{name}: VarMeta count or Var2Data length mismatch"));
-    }
+    let keyed = varmeta::entries(&vm, &v2, Trailing::Refused).map_err(|e| match e {
+        HeaderError::Magic => format!("{name}: invalid VarMeta header"),
+        HeaderError::Length => format!("{name}: VarMeta count or Var2Data length mismatch"),
+    })?;
     let mut fields = HashMap::new();
-    for i in 0..vars {
-        let entry = &vm[24 + i * 12..24 + (i + 1) * 12];
-        let (uid, off, key) = (
-            u32_at(entry, 0),
-            u32_at(entry, 4) as usize,
-            u16_at(entry, 8),
-        );
-        if u16_at(entry, 10) != marker || !indexed_uids.contains(&uid) {
+    for RawEntry {
+        index: i,
+        uid,
+        offset,
+        key,
+        tag,
+    } in keyed
+    {
+        if tag != marker || !indexed_uids.contains(&uid) {
             return Err(format!("{name}: invalid VarMeta entry {i}"));
         }
-        let Some(head) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
-            return Err(format!("{name}: Var2Data offset at entry {i}"));
-        };
-        let len = u32_at(&v2, off) as usize;
-        let Some(end) = head.checked_add(len).filter(|&n| n <= v2.len()) else {
-            return Err(format!("{name}: Var2Data length at entry {i}"));
+        let (head, end) = match varmeta::block(&v2, offset) {
+            Ok(r) => (r.start, r.end),
+            Err(BlockError::Offset) => return Err(format!("{name}: Var2Data offset at entry {i}")),
+            Err(BlockError::Length) => return Err(format!("{name}: Var2Data length at entry {i}")),
         };
         if fields.insert((uid, key), head..end).is_some() {
             return Err(format!("{name}: duplicate VarMeta key ({uid},{key})"));

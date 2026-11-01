@@ -2120,3 +2120,30 @@
   unless it is in progress (`mpp::carries_duration_format`, which the
   oracle shares); a manual task's elapsed duration is not decoded (#225). `oracle_corpus` compares UID 25 (dates, late dates,
   slacks, imported unpinned) and UID 30 in every snapshot that has them.
+
+## Custom fields from .mpp (#292)
+
+- `mppread/src/customfields.rs` reads task custom fields of the current
+  layout only (MPP12 and MPP9 decode none). A value is a task VarMeta entry
+  whose key is the low word of its MSPDI FieldID (`0x0B40_0000 | key`):
+  Text1 `0x0033` (UTF-16 + NUL), Start1 `0x0034`, Finish1 `0x0035`, Date1
+  `0x0109` (the four-byte task timestamp), Number1 `0x0057` (`f64`, written
+  `42`). Only keys in `FIELDS` are read (UID 33 also has `0x00a4`..`0x00aa`
+  holding 0.0, which the XML omits); a value that does not decode is left
+  out, never an error. Values are kept ascending by FieldID (Project's own
+  value order is neither that nor VarMeta's). UID 0's values are decoded
+  with its row but dropped by the import with the project summary row.
+- Definitions come from `TBkndTask/Props` (a `props::entries` stream): key
+  `0x0440_0001`, 36 bytes not understood, a `u32` count, a `u32` length
+  (`count * 88`), then 88-byte records ascending by FieldID (FieldID +0,
+  type +4, SecondaryPID +8, Guid +20 in Windows layout). SecondaryGuid is
+  derived (the Guid's first 28 characters plus the SecondaryPID in hex: six
+  of six in the corpus); FieldName comes from `FIELDS`, so a record of a
+  field not there is skipped. A block of any other shape gives no
+  definitions. `TBkndAssn/Props` (assignment definitions?) is not read.
+- Flag1's value is not read: UID 33 of snapshots 23..46 sets two Fixed2Meta
+  bits (byte 0x1f bit 7, byte 0x3d bit 7) and also carries field 188744339,
+  which has no definition, so nothing tells which bit is Flag1.
+  `custom_field_oracles` lists both FieldIDs as exclusions and asserts each is
+  needed; `custom_fields_round_trip_through_mspdi` covers `.xml` and `.yppx`
+  Save As (one `write_mspdi`).

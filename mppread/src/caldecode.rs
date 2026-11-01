@@ -1,4 +1,6 @@
 //! Validated calendar-table decoding for current Project `.mpp` files.
+use crate::utf16::{self, Utf16Error};
+use crate::varmeta::{self, BlockError, HeaderError, Trailing};
 use crate::{cfb::Cfb, props};
 use projcore::{Calendar, CalendarException, DateTime, DayWorking, WorkWeek, WorkingTime};
 use std::collections::{HashMap, HashSet};
@@ -14,32 +16,19 @@ fn i32_at(b: &[u8], o: usize) -> i32 {
 }
 
 fn block(data: &[u8], off: usize) -> Result<&[u8], String> {
-    let header = off
-        .checked_add(4)
-        .filter(|&n| n <= data.len())
-        .ok_or("calendar Var2Data offset out of range")?;
-    let end = header
-        .checked_add(u32_at(data, off) as usize)
-        .filter(|&n| n <= data.len())
-        .ok_or("calendar Var2Data block out of range")?;
-    Ok(&data[header..end])
+    match varmeta::block(data, off) {
+        Ok(range) => Ok(&data[range]),
+        Err(BlockError::Offset) => Err("calendar Var2Data offset out of range".into()),
+        Err(BlockError::Length) => Err("calendar Var2Data block out of range".into()),
+    }
 }
 
 fn name(value: &[u8]) -> Result<String, String> {
-    if value.len() < 4 || !value.len().is_multiple_of(2) {
-        return Err("invalid calendar name block".into());
-    }
-    let units: Vec<_> = value
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    if units.last() != Some(&0) {
-        return Err("unterminated calendar name".into());
-    }
-    let s = String::from_utf16(&units[..units.len() - 1])
-        .map_err(|_| "invalid UTF-16 calendar name")?;
+    let s = utf16::terminated(value, 4).map_err(|e| match e {
+        Utf16Error::Length => "invalid calendar name block",
+        Utf16Error::Unterminated => "unterminated calendar name",
+        Utf16Error::Invalid => "invalid UTF-16 calendar name",
+    })?;
     if s.is_empty() || s.chars().any(char::is_control) {
         return Err("invalid calendar name".into());
     }
@@ -47,19 +36,11 @@ fn name(value: &[u8]) -> Result<String, String> {
 }
 
 fn exception_name(value: &[u8]) -> Result<String, &'static str> {
-    if value.len() < 2 || !value.len().is_multiple_of(2) {
-        return Err("invalid UTF-16 length");
-    }
-    let units: Vec<_> = value
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    if units.last() != Some(&0) {
-        return Err("unterminated UTF-16");
-    }
-    let s = String::from_utf16(&units[..units.len() - 1]).map_err(|_| "invalid UTF-16")?;
+    let s = utf16::terminated(value, 2).map_err(|e| match e {
+        Utf16Error::Length => "invalid UTF-16 length",
+        Utf16Error::Unterminated => "unterminated UTF-16",
+        Utf16Error::Invalid => "invalid UTF-16",
+    })?;
     if s.chars().any(|c| {
         !matches!(c, '\t' | '\n' | '\r') && !(' '..='\u{FFFD}').contains(&c) && c < '\u{10000}'
     }) {
@@ -379,30 +360,20 @@ fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, Strin
     let v2 = cfb
         .read_path(&format!("{resource_prefix}Var2Data"))
         .ok_or("missing resource Var2Data for calendar names")?;
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("invalid resource VarMeta for calendar names".into());
-    }
-    let count = u32_at(&vm, 8) as usize;
-    if 24usize.checked_add(
-        count
-            .checked_mul(12)
-            .ok_or("resource VarMeta count overflow")?,
-    ) != Some(vm.len())
-        || u32_at(&vm, 20) as usize != v2.len()
-    {
-        return Err("resource VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::entries(&vm, &v2, Trailing::Refused).map_err(|e| match e {
+        HeaderError::Magic => "invalid resource VarMeta for calendar names",
+        HeaderError::Length => "resource VarMeta count or Var2Data length mismatch",
+    })?;
     let mut names = HashMap::new();
-    for i in 0..count {
-        let e = &vm[24 + i * 12..36 + i * 12];
-        if u16_at(e, 8) != 1 {
+    for e in keyed {
+        if e.key != 1 {
             continue;
         }
-        let uid = i32_at(e, 0);
-        if uid <= 0 || u16_at(e, 10) != 0x0c40 {
-            return Err(format!("invalid resource name entry {i}"));
+        let uid = e.uid as i32;
+        if uid <= 0 || e.tag != 0x0c40 {
+            return Err(format!("invalid resource name entry {}", e.index));
         }
-        let value = block(&v2, u32_at(e, 4) as usize)?;
+        let value = block(&v2, e.offset)?;
         if names.insert(uid, name(value)?).is_some() {
             return Err(format!("duplicate resource name UID {uid}"));
         }
@@ -523,31 +494,20 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, St
     if uids.len() != rows.len() {
         return Err("duplicate calendar UID".into());
     }
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("invalid calendar VarMeta header".into());
-    }
-    let var_count = u32_at(&vm, 8) as usize;
-    if 24usize.checked_add(
-        var_count
-            .checked_mul(12)
-            .ok_or("calendar VarMeta count overflow")?,
-    ) != Some(vm.len())
-        || u32_at(&vm, 20) as usize != v2.len()
-    {
-        return Err("calendar VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::entries(&vm, &v2, Trailing::Refused).map_err(|e| match e {
+        HeaderError::Magic => "invalid calendar VarMeta header",
+        HeaderError::Length => "calendar VarMeta count or Var2Data length mismatch",
+    })?;
     let mut fields: HashMap<(i32, u16), &[u8]> = HashMap::new();
-    for i in 0..var_count {
-        let e = &vm[24 + i * 12..36 + i * 12];
-        let uid = i32_at(e, 0);
-        let key = u16_at(e, 8);
-        if !indexed_uids.contains(&uid) || u16_at(e, 10) != 0x0d40 {
+    for e in keyed {
+        let (i, uid, key) = (e.index, e.uid as i32, e.key);
+        if !indexed_uids.contains(&uid) || e.tag != 0x0d40 {
             return Err(format!(
                 "invalid calendar VarMeta entry {i}: UID {uid}, key {key}, tag {:#x}",
-                u16_at(e, 10)
+                e.tag
             ));
         }
-        let value = block(&v2, u32_at(e, 4) as usize)?;
+        let value = block(&v2, e.offset)?;
         if fields.insert((uid, key), value).is_some() {
             return Err(format!("duplicate calendar VarMeta key ({uid},{key})"));
         }
@@ -650,7 +610,10 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, St
             .map(|c| c.uid)
             .ok_or("calendar project Props has no default and UID 1 is absent")?,
     };
-    let default = calendars.iter().find(|c| c.uid == default_uid).unwrap();
+    let default = calendars
+        .iter()
+        .find(|c| c.uid == default_uid)
+        .ok_or("default calendar vanished")?;
     if !default
         .resolve_week(|uid| calendars.iter().find(|c| c.uid == uid))
         .iter()

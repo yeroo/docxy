@@ -63,6 +63,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .transpose()
         })
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
+    let custom_field_definitions = table.custom_field_definitions;
     let decoded = table.tasks;
     let name = [
         info.title.clone(),
@@ -130,6 +131,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         resources,
         assignments,
         new_tasks_are_manual,
+        extended_attribute_definitions: custom_field_definitions,
         ..cal_ref
     };
     if let Some(error) = projcore::schedule::calendar_error(&project) {
@@ -316,7 +318,11 @@ fn import_tasks(
                     ..Task::default()
                 });
             }
-            let level = t.outline_level.expect("validated task outline");
+            // The decoders give every non-blank row a level; a row without
+            // one is refused rather than panicking (#105).
+            let level = t
+                .outline_level
+                .ok_or_else(|| format!("missing outline level for UID {}", t.uid))?;
             let outline_summary = summaries[i];
             let mut task = Task {
                 uid: t.uid as i32,
@@ -413,6 +419,7 @@ fn import_tasks(
                 task.display_as_summary = fields.display_as_summary;
                 task.is_published = fields.is_published;
                 task.subproject_name = fields.subproject_name.clone();
+                task.extended_attributes = fields.extended_attributes.clone();
             }
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
@@ -616,6 +623,16 @@ mod tests {
             outline_level: Some(level),
             ..crate::mpp::MppTask::default()
         }
+    }
+
+    #[test]
+    fn a_row_without_an_outline_level_is_refused_not_a_panic() {
+        let mut row = task(1, 7, "No level", 1);
+        row.outline_level = None;
+        assert_eq!(
+            import_tasks(vec![task(0, 0, "Project", 0), row]).unwrap_err(),
+            "missing outline level for UID 7"
+        );
     }
 
     fn blank(id: u32, uid: u32) -> crate::mpp::MppTask {

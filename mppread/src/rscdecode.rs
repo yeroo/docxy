@@ -73,17 +73,8 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>, Strin
 }
 
 fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
-    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) || bytes[bytes.len() - 2..] != [0, 0] {
-        return Err(format!("invalid resource name for UID {uid}"));
-    }
-    let units: Vec<_> = bytes[..bytes.len() - 2]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|x| u16::from_le_bytes(*x))
-        .collect();
-    let value =
-        String::from_utf16(&units).map_err(|_| format!("invalid resource name for UID {uid}"))?;
+    let value = crate::utf16::terminated(bytes, 2)
+        .map_err(|_| format!("invalid resource name for UID {uid}"))?;
     if value.chars().any(char::is_control) {
         return Err(format!("invalid resource name for UID {uid}"));
     }

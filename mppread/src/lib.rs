@@ -22,6 +22,7 @@
 mod assndecode;
 mod caldecode;
 pub mod cfb;
+mod customfields;
 mod fixedmeta;
 pub mod mpp;
 pub mod oleps;
@@ -34,6 +35,7 @@ mod rscdecode;
 mod rtf;
 mod tabledecode;
 mod taskdecode;
+mod utf16;
 pub mod vardata;
 pub mod varmeta;
 

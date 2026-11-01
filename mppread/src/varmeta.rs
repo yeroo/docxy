@@ -142,50 +142,222 @@ pub struct VarEntry<'a> {
 /// them). UIDs are not checked against a FixedMeta index and tags are
 /// returned as found. MPP9's 8-byte entries are not read.
 pub fn var_entries<'a>(varmeta: &[u8], var2data: &'a [u8]) -> Result<Vec<VarEntry<'a>>, String> {
-    if varmeta.len() < 24 || u32le(varmeta, 0) != MAGIC {
-        return Err("invalid VarMeta header".into());
-    }
-    let count = u32le(varmeta, 8) as usize;
-    if count
-        .checked_mul(12)
-        .and_then(|n| n.checked_add(24))
-        .is_none_or(|n| n > varmeta.len())
-        || u32le(varmeta, 20) as usize != var2data.len()
-    {
-        return Err("VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = entries(varmeta, var2data, Trailing::Ignored).map_err(|e| match e {
+        HeaderError::Magic => "invalid VarMeta header".to_string(),
+        HeaderError::Length => "VarMeta count or Var2Data length mismatch".to_string(),
+    })?;
     let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let e = &varmeta[24 + i * 12..36 + i * 12];
-        let (uid, offset, key, tag) =
-            (u32le(e, 0), u32le(e, 4) as usize, u16le(e, 8), u16le(e, 10));
-        let Some(start) = offset.checked_add(4).filter(|&n| n <= var2data.len()) else {
-            return Err(format!("Var2Data offset out of range at entry {i}"));
-        };
-        let Some(end) = start
-            .checked_add(u32le(var2data, offset) as usize)
-            .filter(|&n| n <= var2data.len())
-        else {
-            return Err(format!("Var2Data block out of range at entry {i}"));
-        };
-        if !seen.insert((uid, key)) {
-            return Err(format!("duplicate VarMeta key ({uid},{key})"));
+    let mut out = Vec::new();
+    for e in keyed {
+        let i = e.index;
+        let value = block(var2data, e.offset).map_err(|b| match b {
+            BlockError::Offset => format!("Var2Data offset out of range at entry {i}"),
+            BlockError::Length => format!("Var2Data block out of range at entry {i}"),
+        })?;
+        if !seen.insert((e.uid, e.key)) {
+            return Err(format!("duplicate VarMeta key ({},{})", e.uid, e.key));
         }
         out.push(VarEntry {
-            uid,
-            offset,
-            key,
-            tag,
-            value: &var2data[start..end],
+            uid: e.uid,
+            offset: e.offset,
+            key: e.key,
+            tag: e.tag,
+            value: &var2data[value],
         });
     }
     Ok(out)
 }
 
+/// What [`entries`] does with bytes after the counted entries (#438). The
+/// task reader and [`var_entries`] ignore them; the resource, assignment and
+/// calendar readers refuse them, as each did before the copies were shared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trailing {
+    Ignored,
+    Refused,
+}
+
+/// Why a VarMeta stream's header is refused: no magic or under 24 bytes
+/// (`Magic`), or a count that the stream cannot hold (or, with
+/// [`Trailing::Refused`], does not fill exactly) or a Var2Data length that
+/// is not the sibling stream's (`Length`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeaderError {
+    Magic,
+    Length,
+}
+
+/// One counted 12-byte entry as stored, before its value is checked:
+/// `index` is its place among the counted entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RawEntry {
+    pub index: usize,
+    pub uid: u32,
+    pub offset: usize,
+    pub key: u16,
+    pub tag: u16,
+}
+
+/// The one VarMeta header check (#438): magic, the entry count at +8, the
+/// Var2Data length at +20. Yields the counted 12-byte entries in stream
+/// order. Callers check tags, UIDs, values ([`block`]) and duplicates in
+/// their own order, so each keeps its own error for a malformed entry.
+pub(crate) fn entries<'a>(
+    varmeta: &'a [u8],
+    var2data: &[u8],
+    trailing: Trailing,
+) -> Result<impl Iterator<Item = RawEntry> + 'a, HeaderError> {
+    let count = counted(varmeta, var2data, trailing, 12)?;
+    Ok((0..count).map(move |index| {
+        let e = &varmeta[24 + index * 12..36 + index * 12];
+        RawEntry {
+            index,
+            uid: u32le(e, 0),
+            offset: u32le(e, 4) as usize,
+            key: u16le(e, 8),
+            tag: u16le(e, 10),
+        }
+    }))
+}
+
+/// [`entries`] for MPP9's 8-byte entries (`[uid u16][key u16][offset
+/// u32]`), which carry no tag (`tag` is 0).
+pub(crate) fn legacy_entries<'a>(
+    varmeta: &'a [u8],
+    var2data: &[u8],
+) -> Result<impl Iterator<Item = RawEntry> + 'a, HeaderError> {
+    let count = counted(varmeta, var2data, Trailing::Ignored, 8)?;
+    Ok((0..count).map(move |index| {
+        let e = &varmeta[24 + index * 8..32 + index * 8];
+        RawEntry {
+            index,
+            uid: u32::from(u16le(e, 0)),
+            offset: u32le(e, 4) as usize,
+            key: u16le(e, 2),
+            tag: 0,
+        }
+    }))
+}
+
+/// The header check behind [`entries`]: the number of `stride`-byte
+/// entries the header counts.
+fn counted(
+    varmeta: &[u8],
+    var2data: &[u8],
+    trailing: Trailing,
+    stride: usize,
+) -> Result<usize, HeaderError> {
+    if varmeta.len() < 24 || u32le(varmeta, 0) != MAGIC {
+        return Err(HeaderError::Magic);
+    }
+    let count = u32le(varmeta, 8) as usize;
+    let end = count.checked_mul(stride).and_then(|n| n.checked_add(24));
+    let fits = match trailing {
+        Trailing::Ignored => end.is_some_and(|n| n <= varmeta.len()),
+        Trailing::Refused => end == Some(varmeta.len()),
+    };
+    if !fits || u32le(varmeta, 20) as usize != var2data.len() {
+        return Err(HeaderError::Length);
+    }
+    Ok(count)
+}
+
+/// Why a Var2Data block is refused: its `u32` length prefix is not inside
+/// the stream (`Offset`), or the value it counts runs past the end
+/// (`Length`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockError {
+    Offset,
+    Length,
+}
+
+/// The value of the Var2Data block at `offset`: the bytes after its `u32`
+/// length prefix, as a range of `var2data`.
+pub(crate) fn block(var2data: &[u8], offset: usize) -> Result<std::ops::Range<usize>, BlockError> {
+    let start = offset
+        .checked_add(4)
+        .filter(|&n| n <= var2data.len())
+        .ok_or(BlockError::Offset)?;
+    let end = start
+        .checked_add(u32le(var2data, offset) as usize)
+        .filter(|&n| n <= var2data.len())
+        .ok_or(BlockError::Length)?;
+    Ok(start..end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VarMeta header counting `count` entries of `stride` bytes, followed
+    /// by `entries` and then `extra` trailing bytes, for a Var2Data of
+    /// `v2_len` bytes.
+    fn varmeta(count: u32, entries: &[u8], extra: usize, v2_len: u32) -> Vec<u8> {
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        vm[8..12].copy_from_slice(&count.to_le_bytes());
+        vm[20..24].copy_from_slice(&v2_len.to_le_bytes());
+        vm.extend_from_slice(entries);
+        vm.extend(std::iter::repeat_n(0, extra));
+        vm
+    }
+
+    fn entry(uid: u32, offset: u32, key: u16, tag: u16) -> Vec<u8> {
+        let mut e = uid.to_le_bytes().to_vec();
+        e.extend(offset.to_le_bytes());
+        e.extend(key.to_le_bytes());
+        e.extend(tag.to_le_bytes());
+        e
+    }
+
+    #[test]
+    fn shared_header_keeps_each_callers_trailing_rule() {
+        let v2 = [2, 0, 0, 0, 0x41, 0];
+        let vm = varmeta(1, &entry(7, 0, 0x0e, 0x0b40), 4, 6);
+        let got: Vec<_> = entries(&vm, &v2, Trailing::Ignored).unwrap().collect();
+        assert_eq!(
+            got,
+            [RawEntry {
+                index: 0,
+                uid: 7,
+                offset: 0,
+                key: 0x0e,
+                tag: 0x0b40
+            }]
+        );
+        assert_eq!(
+            entries(&vm, &v2, Trailing::Refused).err(),
+            Some(HeaderError::Length)
+        );
+        let exact = varmeta(1, &entry(7, 0, 0x0e, 0x0b40), 0, 6);
+        assert_eq!(entries(&exact, &v2, Trailing::Refused).unwrap().count(), 1);
+        // A count past the stream, a wrong Var2Data length or no magic.
+        assert!(entries(&varmeta(2, &[], 12, 6), &v2, Trailing::Ignored).is_err());
+        assert!(entries(&varmeta(1, &[0; 12], 0, 5), &v2, Trailing::Ignored).is_err());
+        assert_eq!(
+            entries(&[0; 24], &v2, Trailing::Ignored).err(),
+            Some(HeaderError::Magic)
+        );
+    }
+
+    #[test]
+    fn legacy_entries_read_eight_byte_entries() {
+        let mut e = 3u16.to_le_bytes().to_vec();
+        e.extend(0x0b00u16.to_le_bytes());
+        e.extend(0u32.to_le_bytes());
+        let vm = varmeta(1, &e, 0, 4);
+        let got: Vec<_> = legacy_entries(&vm, &[0; 4]).unwrap().collect();
+        assert_eq!((got[0].uid, got[0].key, got[0].tag), (3, 0x0b00, 0));
+    }
+
+    #[test]
+    fn blocks_are_bounded_by_var2data() {
+        let v2 = [2, 0, 0, 0, 0x41, 0];
+        assert_eq!(block(&v2, 0), Ok(4..6));
+        assert_eq!(block(&v2, 3), Err(BlockError::Offset));
+        assert_eq!(block(&[9, 0, 0, 0, 0], 0), Err(BlockError::Length));
+        assert_eq!(block(&v2, usize::MAX), Err(BlockError::Offset));
+    }
 
     // Build a Var2Data stream from named blocks; return the bytes and each
     // name's block offset.

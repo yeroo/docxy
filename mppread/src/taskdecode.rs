@@ -1,4 +1,6 @@
 //! Validated task-table decoding for current Project, MPP12 and MPP9 storage.
+use crate::utf16::Utf16Error;
+use crate::varmeta::{self, BlockError, HeaderError, RawEntry, Trailing};
 use crate::{
     cfb::Cfb,
     fixedmeta,
@@ -267,21 +269,11 @@ pub fn decode_text(
     let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
         return Err(format!("{what} Var2Data block out of range for UID {uid}"));
     };
-    let value = &v2[header_end..end];
-    if value.len() < 2 || !value.len().is_multiple_of(2) {
-        return Err(format!("invalid {what} block for UID {uid}"));
-    }
-    let units: Vec<u16> = value
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    if *units.last().unwrap() != 0 {
-        return Err(format!("unterminated {what} for UID {uid}"));
-    }
-    let name = String::from_utf16(&units[..units.len() - 1])
-        .map_err(|_| format!("invalid UTF-16 {what} for UID {uid}"))?;
+    let name = crate::utf16::terminated(&v2[header_end..end], 2).map_err(|e| match e {
+        Utf16Error::Length => format!("invalid {what} block for UID {uid}"),
+        Utf16Error::Unterminated => format!("unterminated {what} for UID {uid}"),
+        Utf16Error::Invalid => format!("invalid UTF-16 {what} for UID {uid}"),
+    })?;
     if (!allow_empty && name.is_empty()) || name.chars().any(char::is_control) {
         return Err(format!("invalid {what} for UID {uid}"));
     }
@@ -324,10 +316,12 @@ struct VarExtra {
     commitment_finish: Option<String>,
     /// `None` without a key (Project's default 0); `Some(None)` unreadable.
     commitment_type: Option<Option<i32>>,
+    /// Custom field values (#292), in VarMeta order.
+    custom: Vec<projcore::model::ExtendedAttributeValue>,
 }
 
 /// A keyed four-byte timestamp; NA and an unreadable value are no date.
-fn var_date(value: &[u8]) -> Option<String> {
+pub(crate) fn var_date(value: &[u8]) -> Option<String> {
     (value.len() == 4)
         .then(|| {
             crate::mpp::decode_checked_timestamp(value, 0)
@@ -338,40 +332,38 @@ fn var_date(value: &[u8]) -> Option<String> {
 }
 
 fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("invalid VarMeta header".into());
-    }
-    let count = u32_at(vm, 8) as usize;
-    if 24usize
-        .checked_add(count.checked_mul(12).ok_or("VarMeta count overflow")?)
-        .is_none_or(|n| n > vm.len())
-        || u32_at(vm, 20) as usize != v2.len()
-    {
-        return Err("VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::entries(vm, v2, Trailing::Ignored).map_err(|e| match e {
+        HeaderError::Magic => "invalid VarMeta header",
+        HeaderError::Length => "VarMeta count or Var2Data length mismatch",
+    })?;
     let mut seen = HashSet::new();
     let mut names = HashMap::new();
     let mut notes = HashMap::new();
     let mut physical_percent = HashMap::new();
     let mut wbs = HashMap::new();
     let mut extra: HashMap<u32, VarExtra> = HashMap::new();
-    for i in 0..count {
-        let e = &vm[24 + i * 12..24 + (i + 1) * 12];
-        let uid = u32_at(e, 0);
-        let off = u32_at(e, 4) as usize;
-        let key = u16_at(e, 8);
-        if u16_at(e, 10) != 0x0b40 || !uids.contains(&uid) {
+    for RawEntry {
+        index: i,
+        uid,
+        offset: off,
+        key,
+        tag,
+    } in keyed
+    {
+        if tag != 0x0b40 || !uids.contains(&uid) {
             return Err(format!("invalid VarMeta entry {i}"));
         }
         if !seen.insert((uid, key)) {
             return Err(format!("duplicate VarMeta key ({uid},{key})"));
         }
-        let Some(header_end) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
-            return Err(format!("Var2Data offset out of range at entry {i}"));
-        };
-        let len = u32_at(v2, off) as usize;
-        let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
-            return Err(format!("Var2Data block out of range at entry {i}"));
+        let (header_end, end) = match varmeta::block(v2, off) {
+            Ok(r) => (r.start, r.end),
+            Err(BlockError::Offset) => {
+                return Err(format!("Var2Data offset out of range at entry {i}"));
+            }
+            Err(BlockError::Length) => {
+                return Err(format!("Var2Data block out of range at entry {i}"));
+            }
         };
         if key == 0x000e {
             names.insert(uid, decode_name(v2, off, uid)?);
@@ -414,7 +406,8 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                             .map(i32::from),
                     )
                 }
-                _ => {}
+                // Custom field keys (#292) overlap none of the keys above.
+                _ => row.custom.extend(crate::customfields::value(key, value)),
             }
         }
     }
@@ -430,7 +423,16 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     })
 }
 
-fn guid_text(raw: &[u8]) -> String {
+/// Custom field values ascending by FieldID, the order Project lists the
+/// definitions in (its own value order is neither this nor VarMeta's).
+fn sorted_custom(
+    mut values: Vec<projcore::model::ExtendedAttributeValue>,
+) -> Vec<projcore::model::ExtendedAttributeValue> {
+    values.sort_by_key(|v| v.field_id.parse::<u32>().unwrap_or(u32::MAX));
+    values
+}
+
+pub(crate) fn guid_text(raw: &[u8]) -> String {
     let a = u32::from_le_bytes(raw[..4].try_into().unwrap());
     let b = u16::from_le_bytes(raw[4..6].try_into().unwrap());
     let c = u16::from_le_bytes(raw[6..8].try_into().unwrap());
@@ -514,6 +516,7 @@ fn current_fields(
         commitment_start: extra.commitment_start,
         commitment_finish: extra.commitment_finish,
         commitment_type: extra.commitment_type.unwrap_or(Some(0)),
+        extended_attributes: sorted_custom(extra.custom),
         display_as_summary: Some(
             fixed2.meta[DISPLAY_AS_SUMMARY_FLAG.0] & DISPLAY_AS_SUMMARY_FLAG.1 != 0,
         ),
@@ -522,36 +525,23 @@ fn current_fields(
 }
 
 fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, String>, String> {
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("unrecognized legacy VarMeta layout".into());
-    }
-    let count = u32_at(vm, 8) as usize;
-    let end = 24usize
-        .checked_add(
-            count
-                .checked_mul(8)
-                .ok_or("legacy VarMeta count overflow")?,
-        )
-        .ok_or("legacy VarMeta count overflow")?;
-    if end > vm.len() || u32_at(vm, 20) as usize != v2.len() {
-        return Err("legacy VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::legacy_entries(vm, v2).map_err(|e| match e {
+        HeaderError::Magic => "unrecognized legacy VarMeta layout",
+        HeaderError::Length => "legacy VarMeta count or Var2Data length mismatch",
+    })?;
     let mut seen = HashSet::new();
     let mut out = HashMap::new();
-    for e in vm[24..end].as_chunks::<8>().0 {
-        let uid = u16_at(e, 0) as u32;
-        let key = u16_at(e, 2);
-        let off = u32_at(e, 4) as usize;
-        if off.checked_add(4).is_none_or(|n| n > v2.len()) {
-            return Err("legacy Var2Data offset out of range".into());
-        }
-        let len = u32_at(v2, off) as usize;
-        if off
-            .checked_add(4)
-            .and_then(|n| n.checked_add(len))
-            .is_none_or(|n| n > v2.len())
-        {
-            return Err("legacy Var2Data block out of range".into());
+    for RawEntry {
+        uid,
+        offset: off,
+        key,
+        ..
+    } in keyed
+    {
+        match varmeta::block(v2, off) {
+            Ok(_) => {}
+            Err(BlockError::Offset) => return Err("legacy Var2Data offset out of range".into()),
+            Err(BlockError::Length) => return Err("legacy Var2Data block out of range".into()),
         }
         if key == 0x0b00 {
             if !seen.insert((uid, key)) {
@@ -703,6 +693,9 @@ pub struct Table {
     pub project_start: Result<Option<String>, String>,
     /// Use task-only import and legacy scheduling rules (MPP9/MPP12).
     pub legacy: bool,
+    /// The task custom-field definitions of `TBkndTask/Props` (#292), as
+    /// MSPDI `ExtendedAttribute` elements; empty for MPP9 and MPP12.
+    pub custom_field_definitions: Vec<projcore::model::XmlElement>,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
@@ -740,6 +733,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             new_tasks_are_manual: Ok(false),
             project_start: Ok(None),
             legacy: false,
+            custom_field_definitions: Vec::new(),
         });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
@@ -773,6 +767,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 // Calendars/resources/assignments have not been validated for
                 // this format. Use the established legacy task-only import.
                 legacy: true,
+                custom_field_definitions: Vec::new(),
             })
         }
         fixedmeta::TaskIndex::Current(indexed) => {
@@ -831,11 +826,18 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 .as_ref()
                 .ok_or_else(|| "missing project Props stream".to_string())
                 .and_then(|props| crate::props::project_start(props));
+            // An unreadable definitions stream gives none: the values are
+            // kept either way, as they were not read before #292.
+            let custom_field_definitions = cfb
+                .read_path(&format!("{prefix}Props"))
+                .map(|p| crate::customfields::definitions(&p))
+                .unwrap_or_default();
             Ok(Table {
                 tasks,
                 new_tasks_are_manual,
                 project_start,
                 legacy: false,
+                custom_field_definitions,
             })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
@@ -845,6 +847,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 new_tasks_are_manual: Ok(false),
                 project_start: Ok(None),
                 legacy: true,
+                custom_field_definitions: Vec::new(),
             })
         }
     }
@@ -1775,6 +1778,44 @@ mod tests {
         let mut empty = fixture();
         add_var(&mut empty, 1, CONTACT_KEY, &[0, 0]);
         assert_eq!(fields(&empty).contact, None);
+    }
+
+    #[test]
+    fn custom_field_values_import_and_malformed_ones_are_dropped() {
+        // 23-custom-fields UID 33's Text1, Number1 and Date1 (#292).
+        let mut s = fixture();
+        let text: Vec<u8> = "corpus-text\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        add_var(&mut s, 1, 0x0033, &text);
+        add_var(&mut s, 1, 0x0057, &42f64.to_le_bytes());
+        add_var(&mut s, 1, 0x0109, &[0xc0, 0x12, 0xa4, 0x3a]);
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let got: Vec<_> = imported.tasks[0]
+            .extended_attributes
+            .iter()
+            .map(|a| (a.field_id.as_str(), a.value.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("188743731", Some("corpus-text")),
+                ("188743767", Some("42")),
+                ("188743945", Some("2025-02-05T08:00:00")),
+            ]
+        );
+        // A key outside the table, Flag1 (not read) and malformed values of
+        // known keys import with the value dropped, never refused.
+        let mut bad = fixture();
+        add_var(&mut bad, 1, 0x00a4, &0f64.to_le_bytes());
+        add_var(&mut bad, 1, 0x0048, &[1, 0]);
+        add_var(&mut bad, 1, 0x0033, &[0x41, 0x00]);
+        add_var(&mut bad, 1, 0x0057, &[1, 2, 3]);
+        add_var(&mut bad, 1, 0x0109, &[0x41, 0x38, 0x2c, 0x3c]);
+        let imported = crate::project::project_from_mpp(&file(&bad, true)).unwrap();
+        assert!(imported.tasks[0].extended_attributes.is_empty());
+        assert!(imported.extended_attribute_definitions.is_empty());
     }
 
     #[test]
