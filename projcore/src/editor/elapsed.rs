@@ -19,6 +19,11 @@ use super::*;
 pub(super) const ELAPSED_NO_WORKING_TIME: &str =
     "This elapsed task spans no working time; durations and progress are edited in working time";
 
+/// The refusal of a write on an elapsed task (whose window does hold working
+/// time) when one assignment's own span holds none and it has actual work,
+/// which the conversion would otherwise lose ([`Editor::elapsed_to_working`]).
+pub(super) const ELAPSED_ASSIGNMENT_NO_WORKING_TIME: &str = "An assignment's actual work on this elapsed task lies outside working time; durations and progress are edited in working time";
+
 /// What a write of working minutes over an elapsed task does
 /// ([`Editor::in_working_time`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,7 +65,10 @@ impl Editor {
     /// rule of a duration going to zero ([`rescale_work`]: the units stay,
     /// a Fixed Work task keeps its work), so the write's own duration then
     /// sets the work from the units, or the units from a Fixed Work task's
-    /// work. A working task is left alone.
+    /// work. Over a window that does hold working time, one assignment whose
+    /// own span holds none keeps its work, unless it has actual work there:
+    /// the write is then refused (`ELAPSED_ASSIGNMENT_NO_WORKING_TIME`). A
+    /// working task is left alone.
     pub(super) fn elapsed_to_working(&mut self, i: usize, write: Write) -> Result<(), String> {
         let task = &self.proj.tasks[i];
         if !task.elapsed_duration() {
@@ -98,9 +106,12 @@ impl Editor {
     /// span's density, which its dates, read as they are, keep. None on a
     /// task off the clock (a tracked one is scheduled in working time
     /// already), a window with no working time, or a span of no length. A
-    /// span with no working time (an evening after an FS link) takes the
-    /// window's factor, unless the assignment has actual work, which it
-    /// would lose: that refuses the conversion (`ELAPSED_NO_WORKING_TIME`).
+    /// span with no working time (an evening after an FS link) has nothing
+    /// to re-express by: the assignment keeps its work (a factor of 1), as
+    /// a progress write keeps a working task's, and its work then runs from
+    /// the next working minute; with actual work, which would have to sit
+    /// outside working time, the conversion is refused
+    /// (`ELAPSED_ASSIGNMENT_NO_WORKING_TIME`).
     fn own_spans(&self, i: usize, working: i64) -> Result<Vec<(usize, Factor)>, String> {
         let task = &self.proj.tasks[i];
         if working <= 0 || !crate::schedule::on_the_clock(task) {
@@ -123,8 +134,15 @@ impl Editor {
                     (true, false)
                         if actual(a.actual_work_min) || actual(a.actual_overtime_work_min) =>
                     {
-                        Some(Err(ELAPSED_NO_WORKING_TIME.to_string()))
+                        Some(Err(ELAPSED_ASSIGNMENT_NO_WORKING_TIME.to_string()))
                     }
+                    (true, false) => Some(Ok((
+                        k,
+                        Factor {
+                            working: 1,
+                            wall: 1,
+                        },
+                    ))),
                     _ => None,
                 }
             })

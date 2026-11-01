@@ -773,20 +773,15 @@ fn priced_plan(
     ed
 }
 
-/// r12 M1: an elapsed task from Fri 17:00 (its window to Mon 17:00 holds
-/// Monday) with the Inspector's two hours Fri 17:00 to 19:00, no working
-/// time. With her actual work entered, a progress write on the task would
-/// lose it: refused, the plan as it was. Without, she takes the window's
-/// factor (480 of 4320): 13 of her 120 minutes.
+/// r12 M1, r13: an elapsed task from Fri 17:00 (its window to Mon 17:00
+/// holds Monday) with the Inspector's two hours Fri 17:00 to 19:00, no
+/// working time. With her actual work entered, a progress write on the
+/// task would put it outside working time: refused, the plan as it was.
+/// Without, she keeps her work and its price, as a progress write on a
+/// working task keeps them, and starts at the next working minute.
 #[test]
-fn an_assignment_span_with_no_working_time_refuses_or_takes_the_window() {
-    let plan = || {
-        let mut ed = window_plan(at(6, 17), 4320, Some(8), None, false);
-        let mut proj = ed.project().clone();
-        proj.assignments[0].work_min = 120;
-        ed = Editor::new(proj);
-        ed
-    };
+fn an_assignment_span_with_no_working_time_refuses_or_keeps_its_work() {
+    let plan = || priced_plan(at(6, 17), 4320, Some(8), 120, Calendar::standard(1));
     let mut ed = plan();
     let patch = crate::editor::AssignmentPatch {
         actual_work_min: Some(120),
@@ -797,17 +792,32 @@ fn an_assignment_span_with_no_working_time_refuses_or_takes_the_window() {
     let depth = ed.undo_depth();
     assert_eq!(
         ed.set_actual_start(1, Some(at(6, 17))).map(drop),
-        Err(ELAPSED_NO_WORKING_TIME.to_string())
+        Err(ELAPSED_ASSIGNMENT_NO_WORKING_TIME.to_string())
     );
     assert_eq!(ed.project(), &before);
     assert_eq!(ed.undo_depth(), depth);
-    // Without actuals: the window's factor, and the write applies.
+    // Without actuals: her work as it was, priced whole (her task's start
+    // moved to Monday, so the refresh prices her: 60 regular minutes at
+    // 60/h and 60 overtime at 90/h), not cut to the window's 480 / 4320.
     let mut ed = plan();
     ed.set_actual_start(1, Some(at(6, 17))).unwrap();
-    let a = &ed.project().assignments[0];
-    assert_eq!(a.work_min, 120 * 480 / 4320);
     assert!(!ed.project().task(1).unwrap().elapsed_duration());
     assert_eq!(ed.undo_depth(), 1);
+    let a = &ed.project().assignments[0];
+    assert_eq!(
+        (a.work_min, a.overtime_work_min, a.regular_work_min),
+        (120, Some(60), Some(60))
+    );
+    assert_eq!(
+        a.cost.as_ref().map(crate::model::Rate::as_str),
+        Some("15000")
+    );
+    // In working time she starts with her task (whose actual start the
+    // write pinned at Fri 17:00) and her two working hours end Mon 10:00,
+    // within the task (Mon 17:00).
+    let span = crate::assign::assignment_span(ed.project(), ed.schedule(), a);
+    assert_eq!(span, Some((at(6, 17), at(9, 10))));
+    assert_eq!(ed.disp_finish(1), Some(at(9, 17)));
 }
 
 /// r12 M2: a conversion that leaves an assignment's work as it is (a

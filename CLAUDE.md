@@ -2043,9 +2043,11 @@
   start or working Delay to its actual finish or work / units on the
   clock), so it keeps its dates over a weekend, delayed, shorter, or with
   its own actuals; contoured work and a tracked task's the window's. A
-  span holding no working time (an evening after an FS link) takes the
-  window's factor, or refuses the write (`ELAPSED_NO_WORKING_TIME`) when
-  the assignment has actual work it would lose. Only figures the factor
+  span holding no working time (an evening after an FS link) keeps its
+  work (a factor of 1, as a progress write keeps a working task's), so in
+  working time its work runs from the next working minute and, when longer
+  than the task's working minutes, finishes after its task; with actual work there the write is refused
+  (`ELAPSED_ASSIGNMENT_NO_WORKING_TIME`). Only figures the factor
   changes are rewritten, so a factor of 1 keeps the priced fields; where
   the work changes the refresh derives what `set_work` clears (regular
   work, costs, remaining overtime) and the planned spread is dropped;
