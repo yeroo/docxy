@@ -97,7 +97,8 @@ cargo test -p mppread --test oracle_corpus -- --nocapture
 ```
 
 The test also checks the 50 generated snapshots under `snapshots/`, including
-all 50 MPP12 variants, which must decode and import their core task tables.
+all 50 MPP12 variants, which must decode and import their core task tables and
+task Notes.
 Project's Save As conversion removes inactive rows and converts manual tasks;
 the comparisons pin those differences and compare dependency lags in minutes.
 It skips an absent corpus, and checks expected
@@ -338,11 +339,14 @@ The importer validates the newest Project 2024 task layout and the MPP9 layout
 used by the three local legacy samples. The newest layout is checked against
 generated snapshots and paired Project 2024 XML exports. MPP12 now imports
 core task names, dates, outline and dependencies from validated 264-byte
-records, including minute/day lags and leads. Its calendars, resources,
-assignments, baselines, progress, Notes and other task fields remain outside
-the task-only import. Unknown blank-row shapes and lag formats are refused.
-Task Notes are retained only on the current-layout path; the MPP9 legacy path has no
-paired XML and Project 16 cannot save MPP9, so legacy Notes have no oracle.
+records, including minute/day lags and leads, and task Notes (the
+current-layout keyed RTF, equal to the paired XML in every snapshot). Its
+calendars, resources, assignments, baselines, progress, WBS codes, custom
+fields and other task fields remain outside the task-only import: Save As
+MPP12 drops the inactive row the 2024 XML still numbers, so generated WBS
+codes have no oracle. Unknown blank-row shapes and lag formats are refused.
+The MPP9 legacy path has no paired XML and Project 16 cannot save MPP9, so
+legacy Notes have no oracle and are not read.
 StatusManager is not decoded: Project desktop drops a seeded StatusManager when
 it saves `.mpp` (`task-extra/e10-status-manager`), so there is no oracle.
 Task custom fields (#292) are read for Text1, Start1, Finish1, Number1 and

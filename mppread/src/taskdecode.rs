@@ -963,7 +963,10 @@ fn decode_current(
 
 /// Project 2007 task records: UID +0, ID +4, outline level +40,
 /// Start/Finish +88/+92. VarMeta uses the current 12-byte keyed entries.
-/// Only the core task table is imported; unvalidated fields remain absent.
+/// Only the core task table and the Notes (`0x000f`, equal to the paired XML
+/// in every MPP12 snapshot) are imported; unvalidated fields remain absent.
+/// WBS is not: Save As MPP12 drops inactive rows the 2024 XML still numbers,
+/// so the corpus has no oracle for generated codes (#867).
 fn decode_mpp12(
     cfb: &Cfb,
     prefix: &str,
@@ -1006,6 +1009,10 @@ fn decode_mpp12(
             start,
             finish,
             outline_level: Some(level),
+            fields: Some(MppTaskFields {
+                notes: var.notes.get(&row.uid).cloned(),
+                ..MppTaskFields::default()
+            }),
             ..MppTask::default()
         });
     }
@@ -1215,6 +1222,56 @@ mod tests {
         assert_eq!(project.tasks[0].uid, 42);
         assert!(!project.new_tasks_are_manual);
         assert!(!crate::mpp::is_mpp12(&file(&fixture(), true)));
+    }
+
+    #[test]
+    fn mpp12_imports_task_notes() {
+        let mut s = mpp12_fixture();
+        let note =
+            b"{\\rtf1\\ansi\\deff0 First line.\\par\r\nSecond \\u171?line\\u187?.\\par\r\n}\r\n\0";
+        add_var(&mut s, 42, TASK_NOTES_KEY, note);
+        let bytes = mpp12_file(&s);
+        let expected = "First line.\nSecond «line».";
+        let tasks = decode(&bytes).unwrap();
+        assert_eq!(tasks[0].fields.as_ref().unwrap().notes, None);
+        assert_eq!(
+            tasks[1].fields.as_ref().unwrap().notes.as_deref(),
+            Some(expected)
+        );
+        let imported = crate::project::project_from_mpp(&bytes).unwrap();
+        assert_eq!(imported.tasks[0].notes.as_deref(), Some(expected));
+        let reread = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+        assert_eq!(reread.tasks[0].notes.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn mpp12_leaves_other_fields_unset() {
+        let mut s = mpp12_fixture();
+        let text = |t: &str| -> Vec<u8> {
+            t.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        };
+        // An explicit WBS code and a Text1 custom field value: both decode
+        // on the current layout, neither has an MPP12 oracle (#867).
+        add_var(&mut s, 42, 0x0010, &text("CUSTOM"));
+        add_var(&mut s, 42, 0x0033, &text("value"));
+        let bytes = mpp12_file(&s);
+        let tasks = decode(&bytes).unwrap();
+        for task in &tasks {
+            assert_eq!(
+                task.fields,
+                Some(MppTaskFields::default()),
+                "UID {}",
+                task.uid
+            );
+        }
+        let imported = crate::project::project_from_mpp(&bytes).unwrap();
+        let baseline = crate::project::project_from_mpp(&mpp12_file(&mpp12_fixture())).unwrap();
+        assert_eq!(imported.tasks, baseline.tasks);
+        assert_eq!(imported.tasks[0].wbs, None);
+        assert!(imported.tasks[0].extended_attributes.is_empty());
     }
 
     #[test]

@@ -330,8 +330,8 @@ legacy binary `.mpp` files. It decodes OLE property-set metadata and validates
 the counted task tables in supported MPP9, MPP12 (Project 2007), and current Project files before
 importing task names, dates, outline levels, and predecessor links. Unsupported
 layouts return an import error. MPP12 imports core task names, dates, outline
-and dependencies, including validated minute/day lags and leads. MPP12
-resources, assignments, calendars, progress and other task fields are not
+and dependencies, including validated minute/day lags and leads, and task
+Notes. MPP12 resources, assignments, calendars, progress and other task fields are not
 imported; the suite labels this as a task-only import. Unvalidated MPP12 blank
 row shapes and lag formats are still refused.
 

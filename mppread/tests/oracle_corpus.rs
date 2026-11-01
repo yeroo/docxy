@@ -1992,6 +1992,21 @@ fn check_mpp12_pair(mpp: &Path, xml: &Path) {
         got.sort();
         want.sort();
         assert_eq!(got, want, "{context}: predecessor UID/type/lag");
+        // Notes are the one field MPP12 brings beyond the core table (#867);
+        // WBS has no oracle there (Save As MPP12 drops the inactive row the
+        // XML still numbers), so it stays absent.
+        let fields = a.fields.as_ref().expect("MPP12 rows carry fields");
+        assert_eq!(fields.notes, e.notes, "{context}: notes");
+        assert_eq!(
+            fields,
+            &mppread::mpp::MppTaskFields {
+                notes: e.notes.clone(),
+                ..Default::default()
+            },
+            "{context}: MPP12 imports no other field"
+        );
+        assert_eq!(project.tasks[i].notes, e.notes, "{context}: imported notes");
+        assert_eq!(project.tasks[i].wbs, None, "{context}: WBS");
         assert_eq!(project.tasks[i].name, a.name);
         assert_eq!(project.tasks[i].stored_start.map(dt), a.start);
         assert_eq!(project.tasks[i].stored_finish.map(dt), a.finish);
@@ -2001,6 +2016,20 @@ fn check_mpp12_pair(mpp: &Path, xml: &Path) {
             project.start_date.map(dt),
             raw[0].start,
             "empty plan keeps its project start"
+        );
+    }
+    if step == Some(7) {
+        // The first noted snapshot: its notes survive a Save As MSPDI.
+        assert!(project.tasks.iter().any(|t| t.notes.is_some()));
+        let reread = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&project)).unwrap();
+        let notes = |p: &projcore::Project| -> Vec<_> {
+            p.tasks.iter().map(|t| (t.uid, t.notes.clone())).collect()
+        };
+        assert_eq!(
+            notes(&reread),
+            notes(&project),
+            "{}: notes after MSPDI",
+            mpp.display()
         );
     }
 }

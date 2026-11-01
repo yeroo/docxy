@@ -356,7 +356,7 @@ control verbs drive both (docs/agent-control.md).
   task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
   locate rows and names, then reads dates, outline levels and validated task
   fields at known offsets. MPP12 (Project 2007) currently imports only core
-  task names, dates, outline and dependencies; calendars, resources,
+  task names, dates, outline, dependencies and task Notes; calendars, resources,
   assignments, progress and other task fields remain unsupported. Its 50
   snapshots are checked against XML with pinned downgrade differences:
   inactive rows disappear, manual tasks become automatic, and lag units may
