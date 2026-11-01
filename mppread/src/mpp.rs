@@ -88,8 +88,8 @@ pub struct MppTask {
     pub calendar_uid: Option<i32>,
     /// Recorded progress as Project stored it. `None` for MPP9 and blank rows.
     pub progress: Option<MppProgress>,
-    /// Task fields validated for the current MPP layout. `None` for MPP9 and
-    /// blank rows.
+    /// Task fields validated for the current MPP layout; for MPP12 only
+    /// `notes` is set. `None` for MPP9 and blank rows.
     pub fields: Option<MppTaskFields>,
 }
 
