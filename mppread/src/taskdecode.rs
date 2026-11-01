@@ -397,9 +397,6 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                 PRE_LEVELED_FINISH_KEY => row.pre_leveled_finish = var_date(value),
                 COMMITMENT_START_KEY => row.commitment_start = var_date(value),
                 COMMITMENT_FINISH_KEY => row.commitment_finish = var_date(value),
-                _ if let Some(custom) = crate::customfields::value(key, value) => {
-                    row.custom.push(custom)
-                }
                 // MSPDI CommitmentType is 0..=2; e7-commitment-type stores 2.
                 COMMITMENT_TYPE_KEY => {
                     row.commitment_type = Some(
@@ -409,7 +406,8 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                             .map(i32::from),
                     )
                 }
-                _ => {}
+                // Custom field keys (#292) overlap none of the keys above.
+                _ => row.custom.extend(crate::customfields::value(key, value)),
             }
         }
     }
