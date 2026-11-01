@@ -1530,9 +1530,10 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// nothing scheduled below them, and for every task of a plan with an input
 /// Project schedules by and docxy's schedule ignores: `ScheduleFromStart` 0,
 /// a non-zero assignment `LevelingDelay` (a task's is part of the schedule
-/// since #1594), an
-/// elapsed task `DurationFormat`, or a work resource whose calendar differs
-/// from its task's. See `scheduled_dates` and `schedule_reproduces`.
+/// since #1594), a work resource whose calendar differs from its task's, or
+/// an in-progress task with an elapsed `DurationFormat`. An untracked or
+/// complete elapsed task is scheduled since #484, so it no longer keeps
+/// them. See `scheduled_dates` and `schedule_reproduces`.
 ///
 /// A plan with no `StartDate` is scheduled from the earliest stored, pinned
 /// (manual) or actual start of its scheduled tasks, else 2020-01-06 08:00, so
@@ -1816,13 +1817,15 @@ fn pinned_start_date(
 /// - `ScheduleFromStart` 0: docxy schedules forward;
 /// - a non-zero assignment `LevelingDelay`: Project's leveling result on the
 ///   assignment, which the schedule ignores (a task's is part of it, #1594);
-/// - an elapsed `DurationFormat` on a task: the schedule counts every duration
-///   in working time;
 /// - a work assignment whose resource's calendar has other working time than
 ///   its task's calendar (resource calendars are not scheduled), unless the
 ///   task ignores resource calendars. A resource calendar that states nothing
 ///   of its own and derives from the task's calendar, as Project makes one for
-///   each resource, has the same working time.
+///   each resource, has the same working time;
+/// - an in-progress leaf with an elapsed `DurationFormat` (#484): the
+///   schedule places it from its actuals as working minutes, while its
+///   actual and remaining durations are wall-clock. A complete one is placed
+///   on its actual dates, which hold whatever the format.
 ///
 /// An assignment `Delay` is not one: the schedule moves the assignment within
 /// its task, not the task. (An assignment whose flat work runs past the task's
@@ -1838,24 +1841,16 @@ fn schedule_reproduces(proj: &Project) -> bool {
     if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {
         return false;
     }
-    let elapsed = |t: &Task| {
-        t.duration_format
-            .and_then(|code| LagFormat::from_code(i64::from(code)))
-            .is_some_and(|f| f.kind() == LagKind::Elapsed)
-    };
-    // A task's LevelingDelay is part of the schedule since #1594; an
-    // assignment's still only moves the assignment.
-    if proj
-        .tasks
-        .iter()
-        .any(|t| !t.is_null && !t.summary && elapsed(t))
-    {
-        return false;
-    }
+    // A task's LevelingDelay is part of the schedule since #1594, and an
+    // untracked elapsed Duration since #484; an assignment's LevelingDelay
+    // still only moves the assignment.
     !proj
         .assignments
         .iter()
         .any(|a| nonzero(a.leveling_delay) || resource_calendar_differs(proj, a))
+        && !proj.tasks.iter().any(|t| {
+            t.elapsed_duration() && matches!(t.tracked(), Some(Tracked::InProgress { .. }))
+        })
 }
 
 /// Whether `a`'s work resource works on a calendar other than its task's.
@@ -4884,6 +4879,162 @@ mod tests {
         &xml[at..at + xml[at..].find("</Task>").unwrap()]
     }
 
+    /// The Standard calendar of `corpus/mspdi/02-link-fs.xml`, opening at
+    /// `open` and closing at `close` instead of 08:00 and 17:00.
+    fn standard_calendar_xml(open: &str, close: &str) -> String {
+        let standard = include_str!("../../corpus/mspdi/02-link-fs.xml");
+        standard[standard.find("<Calendar>").unwrap()
+            ..standard.find("</Calendar>").unwrap() + "</Calendar>".len()]
+            .replace("<FromTime>08:00:00", &format!("<FromTime>{open}"))
+            .replace("<ToTime>17:00:00", &format!("<ToTime>{close}"))
+    }
+
+    /// Issue #484: a plan with an elapsed task is scheduled, so it writes its
+    /// scheduled dates (a stale stored pair is corrected on every task), the
+    /// elapsed Duration with its format, and the elapsed task's slack on the
+    /// wall clock, as Project 2024 writes it (15-elapsed-duration UID 25:
+    /// TotalSlack 260400).
+    #[test]
+    fn a_plan_with_an_elapsed_task_writes_its_scheduled_dates_and_wall_clock_slack() {
+        let calendar = standard_calendar_xml("08:00:00", "17:00:00");
+        let xml = format!(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID>
+            <Tasks>
+            <Task><UID>1</UID><Name>E</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT72H0M0S</Duration><DurationFormat>8</DurationFormat>
+              <Start>2026-03-09T08:00:00</Start><Finish>2026-03-12T08:00:00</Finish></Task>
+            <Task><UID>2</UID><Name>T</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT122H0M0S</Duration><DurationFormat>7</DurationFormat>
+              <Start>2026-03-03T08:00:00</Start><Finish>2026-03-24T10:00:00</Finish></Task>
+            </Tasks>
+            <Calendars>{calendar}</Calendars></Project>"
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        assert_eq!(proj.task(1).unwrap().duration_min, 4320);
+        let saved = write_mspdi(&proj);
+        let field = |uid, name: &str| {
+            let task = one_task_xml(&saved, uid);
+            let open = format!("<{name}>");
+            let at = task.find(&open).unwrap() + open.len();
+            task[at..at + task[at..].find('<').unwrap()].to_string()
+        };
+        assert_eq!(field(1, "Start"), "2026-03-02T08:00:00");
+        assert_eq!(field(1, "Finish"), "2026-03-05T08:00:00");
+        assert_eq!(field(1, "Duration"), "PT72H0M0S");
+        assert_eq!(field(1, "DurationFormat"), "8");
+        assert_eq!(field(1, "LateStart"), "2026-03-20T10:00:00");
+        assert_eq!(field(1, "LateFinish"), "2026-03-23T10:00:00");
+        for name in ["TotalSlack", "FreeSlack", "StartSlack", "FinishSlack"] {
+            assert_eq!(field(1, name), "260400", "{name}");
+        }
+        // The working task's stale stored dates are corrected too.
+        assert_eq!(field(2, "Start"), "2026-03-02T08:00:00");
+        assert_eq!(field(2, "Finish"), "2026-03-23T10:00:00");
+    }
+
+    /// Issue #484 r1: an in-progress elapsed task's actual and remaining
+    /// durations are wall-clock, which the schedule's tracked path does not
+    /// model, so a plan with one keeps every task's stored dates, the
+    /// task's and its successor's included. A complete elapsed task sits on
+    /// its actual dates, so its plan is still scheduled.
+    #[test]
+    fn a_plan_with_an_in_progress_elapsed_task_keeps_its_stored_dates() {
+        let calendar = standard_calendar_xml("08:00:00", "17:00:00");
+        let plan = |actuals: &str| {
+            format!(
+                "<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID>
+                <Tasks>
+                <Task><UID>1</UID><Name>E</Name><OutlineLevel>1</OutlineLevel>
+                  <Duration>PT72H0M0S</Duration><DurationFormat>8</DurationFormat>
+                  <Start>2026-03-02T08:00:00</Start><Finish>2026-03-05T08:00:00</Finish>
+                  {actuals}</Task>
+                <Task><UID>2</UID><Name>T</Name><OutlineLevel>1</OutlineLevel>
+                  <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
+                  <Start>2026-03-05T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>
+                  <PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task>
+                </Tasks>
+                <Calendars>{calendar}</Calendars></Project>"
+            )
+        };
+        let field = |saved: &str, uid, name: &str| {
+            let task = one_task_xml(saved, uid);
+            let open = format!("<{name}>");
+            let at = task.find(&open).unwrap() + open.len();
+            task[at..at + task[at..].find('<').unwrap()].to_string()
+        };
+        let in_progress = read_mspdi(&plan(
+            "<ActualStart>2026-03-02T08:00:00</ActualStart>\
+             <ActualDuration>PT24H0M0S</ActualDuration>\
+             <RemainingDuration>PT48H0M0S</RemainingDuration>",
+        ))
+        .unwrap();
+        assert!(matches!(
+            in_progress.task(1).unwrap().tracked(),
+            Some(Tracked::InProgress { .. })
+        ));
+        let saved = write_mspdi(&in_progress);
+        assert_eq!(field(&saved, 1, "Start"), "2026-03-02T08:00:00");
+        assert_eq!(field(&saved, 1, "Finish"), "2026-03-05T08:00:00");
+        assert_eq!(field(&saved, 2, "Start"), "2026-03-05T08:00:00");
+        assert_eq!(field(&saved, 2, "Finish"), "2026-03-05T17:00:00");
+        // Complete: placed on its actual dates; the successor follows them.
+        let complete = read_mspdi(&plan(
+            "<ActualStart>2026-03-02T08:00:00</ActualStart>\
+             <ActualFinish>2026-03-04T12:00:00</ActualFinish>",
+        ))
+        .unwrap();
+        let saved = write_mspdi(&complete);
+        assert_eq!(field(&saved, 1, "Finish"), "2026-03-04T12:00:00");
+        assert_eq!(field(&saved, 2, "Start"), "2026-03-04T13:00:00");
+    }
+
+    /// Issue #484: the 31-calendar-hours shape (the Standard calendar opens
+    /// at 08:30, the project starts at 08:00) schedules from MSPDI as Project
+    /// 2024 stores it, with no date pins: the elapsed task UID 25 starts at
+    /// 08:00, the Must Start On task UID 30 keeps its 08:00 and finishes
+    /// 17:30, and an ordinary task starts 08:30.
+    #[test]
+    fn the_calendar_hours_shape_schedules_as_project_stores_it_without_pins() {
+        let calendar = standard_calendar_xml("08:30:00", "17:30:00");
+        let xml = format!(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID>
+            <Tasks>
+            <Task><UID>2</UID><Name>Plain</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><DurationFormat>39</DurationFormat></Task>
+            <Task><UID>25</UID><Name>S15 elapsed</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT72H0M0S</Duration><DurationFormat>8</DurationFormat></Task>
+            <Task><UID>30</UID><Name>S20 mso task</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><DurationFormat>39</DurationFormat>
+              <ConstraintType>2</ConstraintType>
+              <ConstraintDate>2026-03-12T08:00:00</ConstraintDate></Task>
+            </Tasks>
+            <Calendars>{calendar}</Calendars></Project>"
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        assert_eq!(
+            proj.task(25).unwrap().constraint,
+            ConstraintType::AsSoonAsPossible
+        );
+        let sched = crate::schedule::schedule(&proj);
+        let at = |d, h, m| DateTime::from_ymd_hm(2026, 3, d, h, m);
+        let r = |uid| *sched.get(uid).unwrap();
+        assert_eq!(
+            (r(2).early_start, r(2).early_finish),
+            (at(2, 8, 30), at(2, 17, 30))
+        );
+        assert_eq!(
+            (r(25).early_start, r(25).early_finish),
+            (at(2, 8, 0), at(5, 8, 0))
+        );
+        assert_eq!(
+            (r(30).early_start, r(30).early_finish),
+            (at(12, 8, 0), at(12, 17, 30))
+        );
+        assert_eq!((r(30).late_start, r(30).total_slack_min), (at(12, 8, 0), 0));
+        // The elapsed task's late finish is the project finish (UID 30's).
+        assert_eq!(r(25).late_finish, at(12, 17, 30));
+    }
+
     /// Issue #343: an auto task read with stale Start/Finish saves the dates
     /// it is scheduled to, the same as its EarlyStart/EarlyFinish.
     #[test]
@@ -5300,10 +5451,8 @@ mod tests {
             ("", "", "", false),
             ("", "<LevelingDelay>4800</LevelingDelay>", "", true),
             ("<LevelingDelay>0</LevelingDelay>", "", "", false),
-            ("<DurationFormat>8</DurationFormat>", "", "", true),
             ("<DurationFormat>7</DurationFormat>", "", "", false),
             ("<DurationFormat>39</DurationFormat>", "", "", false),
-            ("<DurationFormat>40</DurationFormat>", "", "", true),
             ("", "", ALICE_OFF_MONDAYS, true),
             (
                 "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",

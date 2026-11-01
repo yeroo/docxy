@@ -87,7 +87,7 @@ fn ctrl_c_x_v_map_to_the_clipboard_acts() {
 }
 
 #[test]
-fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
+fn pasting_a_duration_back_keeps_its_unit_and_converts_an_elapsed_one() {
     let mut t = tab();
     // A manual summary over A, then B, C, D as leaves.
     vm(&mut t).ed.add_task(None, "C", 800, false).unwrap();
@@ -110,8 +110,8 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
     t.dirty = false;
     let before = v(&t).ed.project().clone();
     // Summary (days text), a weeks leaf, a weeks leaf of 800 min
-    // (`0.3333w`), an elapsed-days leaf (days text), a weeks milestone.
-    for (row, text) in [(0, "2d"), (1, "0.4w"), (2, "0.3333w"), (3, "1d"), (4, "0w")] {
+    // (`0.3333w`), a weeks milestone: pasted back, no edit.
+    for (row, text) in [(0, "2d"), (1, "0.4w"), (2, "0.3333w"), (4, "0w")] {
         at(&mut t, row, COL_DURATION);
         let copied = project_copy_text(v(&t));
         assert_eq!(copied, text, "row {row}");
@@ -120,7 +120,29 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
         assert_eq!(v(&t).ed.undo_depth(), 0, "row {row}");
         assert!(!t.dirty, "row {row}");
     }
-    // Ctrl+Delete gives the elapsed leaf a new task's day, in days.
+    // The elapsed-days leaf copies its 480 elapsed minutes as `1d`, which
+    // pasted back is a working day (#484 r6: any duration written to an
+    // elapsed task is working minutes; the `1d` edit text is the display
+    // follow-up's): one undo step to 480 working minutes, in days.
+    at(&mut t, 3, COL_DURATION);
+    let copied = project_copy_text(v(&t));
+    assert_eq!(copied, "1d");
+    paste_project_text(&mut t, &copied);
+    let d = v(&t).ed.project().task(4).unwrap();
+    assert_eq!(
+        (d.duration_min, d.duration_format),
+        (480, None),
+        "{}",
+        t.status
+    );
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    let others =
+        |p: &Project| -> Vec<Task> { p.tasks.iter().filter(|t| t.uid != 4).cloned().collect() };
+    assert_eq!(others(v(&t).ed.project()), others(&before));
+    // Ctrl+Delete gives the elapsed leaf a new task's day, in days: from the
+    // plan before the paste, so the reset is what replaces the format.
+    t.surface = Surface::Project(ProjectView::new(before.clone(), false));
     reset_cell(&mut vm(&mut t).ed, 4, COL_DURATION).unwrap();
     let d = v(&t).ed.project().task(4).unwrap();
     assert_eq!((d.duration_min, d.duration_format), (480, None));

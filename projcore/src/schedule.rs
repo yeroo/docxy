@@ -340,6 +340,14 @@ impl Timeline {
     }
 }
 
+/// Whether task `task` runs on the 24x7 clock (#484): an elapsed leaf of
+/// some length that is not tracked (a tracked one stays on its actuals,
+/// unmeasured for an elapsed one). Its dates, and its flat-work
+/// assignments' ([`crate::assign::assignment_span`]), are instants.
+pub(crate) fn on_the_clock(task: &Task) -> bool {
+    task.elapsed_duration() && task.duration_min > 0 && task.tracked().is_none()
+}
+
 /// A scheduler bound to a project: owns one timeline per calendar and the
 /// derived link/order structures.
 struct Scheduler<'a> {
@@ -524,6 +532,9 @@ impl<'a> Scheduler<'a> {
                     .or_insert(extent);
             }
         }
+        // An elapsed task's span is wall-clock minutes here (#484): no
+        // index arithmetic reads it (`Scheduler::elapsed` takes every such
+        // site), and as a horizon budget it over-estimates, which is safe.
         let scheduled_spans: Vec<i64> = proj
             .tasks
             .iter()
@@ -731,6 +742,16 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// An elapsed leaf's wall-clock duration (#484): it runs on the 24x7
+    /// clock, start included, so its dates are instants, not working
+    /// indexes. `None` for a working, zero-length or tracked task (a tracked
+    /// one stays on its actuals, unmeasured for an elapsed one).
+    /// A delayed assignment does not extend it
+    /// ([`crate::assign::delayed_extent_min`]).
+    fn elapsed(&self, task: &Task) -> Option<i64> {
+        on_the_clock(task).then_some(task.duration_min)
+    }
+
     /// The calendar whose timeline `tl()` returns for `task`.
     fn calendar_uid(&self, task: &Task) -> i32 {
         task.calendar_uid
@@ -922,7 +943,13 @@ impl<'a> Scheduler<'a> {
         let mut spans: HashMap<i32, (i64, i64, i64)> = HashMap::new();
         for &i in leaves {
             let t = &self.proj.tasks[i];
-            if linked.contains(&t.uid) || fixed(t) || !is_backward(t.constraint) {
+            // An elapsed task's late window is wall-clock and needs no
+            // pre-start timeline (#484).
+            if linked.contains(&t.uid)
+                || fixed(t)
+                || !is_backward(t.constraint)
+                || self.elapsed(t).is_some()
+            {
                 continue;
             }
             let Some(dates) = self.constraint_dates(t, false).filter(|d| d.clamped) else {
@@ -962,6 +989,14 @@ impl<'a> Scheduler<'a> {
         let tl = self.tl(task);
         if linked {
             tl.abs_start(0)
+        } else if self.elapsed(task).is_some() {
+            // An elapsed task is on the 24x7 clock (#484): unlinked, it
+            // starts at the raw project start, not the next working minute
+            // (Project 2024: 31-calendar-hours UID 25 starts 08:00 on a
+            // calendar that opens at 08:30).
+            // No timeline origin lies after the raw anchor, so its index
+            // is the first working minute's.
+            self.raw_anchor
         } else {
             tl.snap(self.raw_anchor)
         }
@@ -1317,6 +1352,8 @@ impl<'a> Scheduler<'a> {
                 let tl = self.tl(task);
                 let finish = if task.duration_min == 0 {
                     start
+                } else if let Some(e) = self.elapsed(task) {
+                    start.saturating_add(e)
                 } else {
                     tl.abs_finish(tl.to_index(start) + self.scheduled_span(i))
                 };
@@ -1335,6 +1372,50 @@ impl<'a> Scheduler<'a> {
     /// past it (issue #469). Milestones keep their zero span.
     fn scheduled_span(&self, index: usize) -> i64 {
         self.scheduled_spans[index]
+    }
+
+    /// An automatic elapsed leaf's late finish (#484): the successor bound
+    /// `finish_abs`, then its own constraint and deadline as wall-clock
+    /// instants (a start date bounds the finish its duration later),
+    /// unsnapped. Unmeasured beyond the unconstrained case.
+    fn elapsed_late_finish(
+        &self,
+        t: &Task,
+        elapsed: i64,
+        mut finish_abs: i64,
+        linked: bool,
+        graph: &LeafGraph,
+        (es_abs, ef_abs): (&HashMap<i32, i64>, &HashMap<i32, i64>),
+    ) -> i64 {
+        if let Some(bounds) = graph.late_bounds.get(&t.uid) {
+            for &(kind, date, start_of) in bounds {
+                if !self.starts_summary(t.uid, start_of, graph, es_abs, ef_abs) {
+                    continue;
+                }
+                let bound = if kind == ConstraintType::StartNoLaterThan {
+                    date.saturating_add(elapsed)
+                } else {
+                    date
+                };
+                finish_abs = finish_abs.min(bound);
+            }
+        }
+        if let Some(dates) = self.constraint_dates(t, linked) {
+            let instant = dates.raw.max(dates.floor);
+            match t.constraint {
+                ConstraintType::MustFinishOn => finish_abs = instant,
+                ConstraintType::FinishNoLaterThan => finish_abs = finish_abs.min(instant),
+                ConstraintType::StartNoLaterThan => {
+                    finish_abs = finish_abs.min(instant.saturating_add(elapsed));
+                }
+                ConstraintType::MustStartOn => finish_abs = instant.saturating_add(elapsed),
+                _ => {}
+            }
+        }
+        if let Some(deadline) = t.deadline {
+            finish_abs = finish_abs.min(deadline.minutes());
+        }
+        finish_abs
     }
 
     /// A successor's late start and finish as they bound its predecessors
@@ -1369,6 +1450,10 @@ impl<'a> Scheduler<'a> {
         if delay == 0 {
             return (sls, slf);
         }
+        if self.elapsed(successor).is_some() {
+            // An elapsed task adds its delay unsnapped (#484).
+            return (sls.saturating_sub(delay), slf.saturating_sub(delay));
+        }
         if successor.duration_min == 0 && link == LinkType::FinishStart {
             // A milestone keeps its predecessor's finish instant and adds
             // the delay from there (the forward pass's FS milestone rule), so
@@ -1402,6 +1487,16 @@ impl<'a> Scheduler<'a> {
     ) -> i64 {
         let pred_tl = self.tl(&self.proj.tasks[predecessor]);
         let succ_tl = self.tl(successor);
+        if let Some(e) = self.elapsed(&self.proj.tasks[predecessor]) {
+            // An elapsed predecessor is on the 24x7 clock (#484).
+            let exact = (successor.duration_min == 0 && link == LinkType::FinishStart)
+                || self.elapsed(successor).is_some();
+            let bound = elapsed_pred_bound(succ_tl, link, offset, start, finish, exact);
+            return match link {
+                LinkType::FinishStart | LinkType::FinishFinish => bound.saturating_sub(e),
+                LinkType::StartStart | LinkType::StartFinish => bound,
+            };
+        }
         inverse_link(
             pred_tl,
             succ_tl,
@@ -1429,6 +1524,9 @@ impl<'a> Scheduler<'a> {
         let mut ef_abs: HashMap<i32, i64> = HashMap::new();
         let mut es_abs: HashMap<i32, i64> = HashMap::new();
         let mut driven_es: HashMap<i32, i64> = HashMap::new();
+        // An automatic elapsed leaf's link-driven start as an instant: its
+        // slack is wall-clock (#484).
+        let mut driven_abs: HashMap<i32, i64> = HashMap::new();
         let mut delay_driven: HashMap<i32, i64> = HashMap::new();
         // Where each in-progress task's remaining work resumes, and the
         // finish its FF/SF links drive for a tracked task (indices).
@@ -1454,6 +1552,7 @@ impl<'a> Scheduler<'a> {
             } else {
                 self.scheduled_span(i)
             };
+            let elapsed = self.elapsed(t);
             for p in graph.incoming.get(&t.uid).into_iter().flatten() {
                 let Some((ps_abs, pf_abs)) = self.absolute_span(p.uid, graph, &es_abs, &ef_abs)
                 else {
@@ -1468,6 +1567,13 @@ impl<'a> Scheduler<'a> {
                         fs_milestone_start =
                             Some(fs_milestone_start.map_or(instant, |s| s.max(instant)));
                         instant
+                    }
+                    // An elapsed task is on the 24x7 clock (#484): a link
+                    // with no working lag starts or finishes it at the
+                    // predecessor's exact instant, even outside working
+                    // time; a working lag still counts on its calendar.
+                    _ if elapsed.is_some() => {
+                        elapsed_link_start(tl, p.link, ps_abs, pf_abs, lag, elapsed.unwrap())
                     }
                     LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + lag),
                     LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + lag),
@@ -1499,6 +1605,11 @@ impl<'a> Scheduler<'a> {
             let mut driven_start = start_abs;
             let mut finish_bound = None;
             let mut held_milestone: Option<i64> = None;
+            // An honored Must Start On before its day's first working minute
+            // keeps that instant as the start (#484, measured: Project 2024
+            // 31-calendar-hours UID 30); its index, so its finish, is the
+            // next working minute's.
+            let mut held_start: Option<i64> = None;
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
             }
@@ -1533,6 +1644,9 @@ impl<'a> Scheduler<'a> {
                 let s_idx = tl.to_index(s_abs);
                 let f_abs = match pinned_finish {
                     Some(finish) => tl.clamp(finish.minutes()).max(s_abs),
+                    // An elapsed manual task finishes its wall-clock duration
+                    // after its start (#484).
+                    None if elapsed.is_some() => s_abs.saturating_add(t.duration_min),
                     None => finish_instant(
                         t,
                         tl,
@@ -1574,8 +1688,56 @@ impl<'a> Scheduler<'a> {
                 } = dates;
                 finish_bound = dates.finish_bound;
                 match t.constraint {
+                    // An elapsed task takes its constraint date as a
+                    // wall-clock instant, unsnapped, floored as a milestone's
+                    // is; a finish date puts its start its duration before
+                    // (#484, unmeasured beyond the rule).
+                    _ if elapsed.is_some() => {
+                        let e = elapsed.unwrap();
+                        let instant = dates.raw.max(floor);
+                        let honor = self.proj.honor_constraints;
+                        match t.constraint {
+                            ConstraintType::MustStartOn if honor => start_abs = instant,
+                            ConstraintType::MustStartOn | ConstraintType::StartNoEarlierThan => {
+                                start_abs = start_abs.max(instant);
+                            }
+                            ConstraintType::FinishNoEarlierThan => {
+                                start_abs = start_abs.max(instant.saturating_sub(e).max(floor));
+                            }
+                            ConstraintType::MustFinishOn | ConstraintType::FinishNoLaterThan
+                                if t.constraint == ConstraintType::MustFinishOn || honor =>
+                            {
+                                let previous_start = start_abs;
+                                start_abs = dates.raw.saturating_sub(e);
+                                if linked_start.is_none() {
+                                    start_abs = start_abs.max(floor);
+                                }
+                                if t.constraint == ConstraintType::FinishNoLaterThan {
+                                    start_abs = start_abs.min(previous_start);
+                                } else if !honor {
+                                    start_abs = start_abs.max(previous_start);
+                                }
+                            }
+                            ConstraintType::StartNoLaterThan if honor => {
+                                start_abs = start_abs.min(instant);
+                            }
+                            _ => {}
+                        }
+                    }
                     ConstraintType::MustStartOn => {
                         start_abs = if self.proj.honor_constraints {
+                            // Only before the day's first working minute, on
+                            // a day that works: a lunch break or a
+                            // nonworking day stays snapped (unmeasured).
+                            let day_start = dates.raw.div_euclid(1440) * 1440;
+                            if t.duration_min != 0
+                                && dates.raw >= floor
+                                && ds != dates.raw
+                                && ds.div_euclid(1440) == dates.raw.div_euclid(1440)
+                                && tl.to_index(day_start) == tl.to_index(dates.raw)
+                            {
+                                held_start = Some(dates.raw);
+                            }
                             ds
                         } else {
                             start_abs.max(ds)
@@ -1666,12 +1828,18 @@ impl<'a> Scheduler<'a> {
             // late-start instant, even in a nonworking gap. So do binding
             // MFO/FNLT/SNLT and SNET/FNET milestones. Later start-type
             // links/constraints still snap.
-            let s_abs =
-                if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
-                    start_abs
-                } else {
-                    tl.snap(start_abs)
-                };
+            // An elapsed task keeps its instant too: it is on the 24x7
+            // clock (#484). So does an MSO held before its day's opening.
+            let s_abs = if fs_milestone_start == Some(start_abs)
+                || held_milestone == Some(start_abs)
+                || elapsed.is_some()
+            {
+                start_abs
+            } else if let Some(held) = held_start.filter(|&h| tl.snap(h) == start_abs) {
+                held
+            } else {
+                tl.snap(start_abs)
+            };
             // A stored LevelingDelay (Project's last leveling, or docxy's
             // own, #1594) holds the task past its driven start, once that is
             // on working time, by that elapsed time; the delayed instant
@@ -1681,17 +1849,41 @@ impl<'a> Scheduler<'a> {
             let s_abs = match t.leveling_delay.filter(|d| *d > 0) {
                 Some(tenths) if !self.schedulable_alap(t) => {
                     delay_driven.insert(t.uid, s_abs);
-                    tl.snap(s_abs.saturating_add(tenths / 10))
+                    let delayed = s_abs.saturating_add(tenths / 10);
+                    if elapsed.is_some() {
+                        delayed
+                    } else {
+                        tl.snap(delayed)
+                    }
                 }
                 _ => s_abs,
             };
             let s_idx = tl.to_index(s_abs);
             // A delayed flat-work assignment finishes past the task's stored
-            // Duration: the task finishes with it (issue #469).
-            let f_idx = s_idx + self.scheduled_span(i);
-            let f_abs =
-                finish_instant(t, tl, s_abs, f_idx, finish_bounds.into_iter(), finish_bound);
+            // Duration: the task finishes with it (issue #469). An elapsed
+            // task finishes its wall-clock duration after its start (#484).
+            let (f_idx, f_abs) = match elapsed {
+                Some(e) => {
+                    let f_abs = s_abs.saturating_add(e);
+                    (tl.to_index(f_abs), f_abs)
+                }
+                None => {
+                    let f_idx = s_idx + self.scheduled_span(i);
+                    let f_abs = finish_instant(
+                        t,
+                        tl,
+                        s_abs,
+                        f_idx,
+                        finish_bounds.into_iter(),
+                        finish_bound,
+                    );
+                    (f_idx, f_abs)
+                }
+            };
             driven_es.insert(t.uid, tl.to_index(driven_start));
+            if elapsed.is_some() {
+                driven_abs.insert(t.uid, driven_start);
+            }
             es.insert(t.uid, s_idx);
             ef.insert(t.uid, f_idx);
             es_abs.insert(t.uid, s_abs);
@@ -1844,8 +2036,24 @@ impl<'a> Scheduler<'a> {
                     ));
                 }
             }
+            // An automatic elapsed leaf is on the 24x7 clock (#484): each
+            // successor allows it the latest instant its forward link
+            // accepts, and its late start is its wall-clock duration before
+            // its late finish, unsnapped.
+            let elapsed = self.elapsed(t).filter(|_| !pinned);
             for (suid, link, offset, sls, slf, milestone) in bounds {
                 let successor = &self.proj.tasks[graph.by_uid[&suid]];
+                if let Some(e) = elapsed {
+                    let exact = (milestone && link == LinkType::FinishStart)
+                        || self.elapsed(successor).is_some();
+                    let bound =
+                        elapsed_pred_bound(self.tl(successor), link, offset, sls, slf, exact);
+                    finish_abs = finish_abs.min(match link {
+                        LinkType::FinishStart | LinkType::FinishFinish => bound,
+                        LinkType::StartStart | LinkType::StartFinish => bound.saturating_add(e),
+                    });
+                    continue;
+                }
                 let inverse = if legacy {
                     legacy_inverse_link(tl, link, offset, sls, slf, span)
                 } else {
@@ -1864,6 +2072,14 @@ impl<'a> Scheduler<'a> {
                 };
                 finish_abs = finish_abs.min(inverse.finish);
                 bound_instant = bound_instant.min(inverse.allowed_milestone);
+            }
+            if let Some(e) = elapsed {
+                let linked = linked_tasks.contains(&t.uid);
+                let finish_abs =
+                    self.elapsed_late_finish(t, e, finish_abs, linked, graph, (&es_abs, &ef_abs));
+                lf_abs.insert(t.uid, finish_abs);
+                ls_abs.insert(t.uid, finish_abs.saturating_sub(e));
+                continue;
             }
             // Hard constraints (backward-affecting).
             let mut hard_finish_bound = false;
@@ -2098,7 +2314,7 @@ impl<'a> Scheduler<'a> {
             // with a pinned finish finishes there (#1052); one whose finish
             // is derived measures from its start plus its stored Duration.
             let pinned_finish = matches!(t.pinned_dates(), Some((_, Some(_))));
-            let finish = if tracked.is_some() || pinned_finish {
+            let finish = if tracked.is_some() || pinned_finish || self.elapsed(t).is_some() {
                 tl.to_index(e_f)
             } else {
                 tl.to_index(e_s)
@@ -2116,6 +2332,20 @@ impl<'a> Scheduler<'a> {
                 (graph, &group_early),
                 legacy,
             );
+            // An automatic elapsed leaf's slack is wall-clock minutes, late
+            // less early instants, as Project 2024 reports it (#484,
+            // measured: 15-elapsed-duration UID 25, 26040 minutes from Mon 6
+            // 08:00 to Fri 24 10:00); a constraint that overrides a link
+            // still shows the conflict.
+            let (total, finish_slack) = match driven_abs.get(&t.uid) {
+                // Both spans are the same wall-clock duration, so the
+                // finish slack equals the start slack.
+                Some(&driven) if !fixed(t) => {
+                    let total = l_s - e_s.max(driven);
+                    (total, total)
+                }
+                _ => (total, total + span_gap),
+            };
             results.insert(
                 t.uid,
                 TaskResult {
@@ -2127,7 +2357,7 @@ impl<'a> Scheduler<'a> {
                     total_slack_min: total,
                     free_slack_min: free.unwrap_or(total).max(0),
                     start_slack_min: total,
-                    finish_slack_min: total + span_gap,
+                    finish_slack_min: finish_slack,
                     // A complete task is never critical (Project 2024).
                     critical: total <= critical_limit
                         && !matches!(tracked, Some(Tracked::Complete { .. })),
@@ -2338,8 +2568,25 @@ impl<'a> Scheduler<'a> {
                 bounds.push((target.uid, offset, target.start, target.milestone));
             }
         }
+        // An automatic elapsed leaf measures its free slack on the wall
+        // clock, to the latest finish each successor allows (#484).
+        let elapsed = self.elapsed(t).filter(|_| !fixed(t));
         for (suid, offset, start, milestone) in bounds {
             let succ = &self.proj.tasks[graph.by_uid[&suid]];
+            if elapsed.is_some() {
+                let exact = milestone || self.elapsed(succ).is_some();
+                let bound = elapsed_pred_bound(
+                    self.tl(succ),
+                    LinkType::FinishStart,
+                    offset,
+                    start,
+                    start,
+                    exact,
+                );
+                let gap = bound - ef_abs[&t.uid];
+                min_gap = Some(min_gap.map_or(gap, |old| old.min(gap)));
+                continue;
+            }
             let inverse = if legacy {
                 legacy_inverse_link(tl, LinkType::FinishStart, offset, start, start, 0)
             } else {
@@ -2623,7 +2870,9 @@ fn inverse_link(
 }
 
 /// Each task's working duration by UID; the first of a duplicated UID wins,
-/// as [`Project::task`] finds it.
+/// as [`Project::task`] finds it. An elapsed predecessor gives its elapsed
+/// minutes, so a percent lag off one takes that share as working time
+/// (#484, unmeasured).
 fn durations(proj: &Project) -> HashMap<i32, i64> {
     let mut out = HashMap::new();
     for t in &proj.tasks {
@@ -2655,6 +2904,75 @@ fn fs_milestone_instant(tl: &Timeline, predecessor_finish: i64, lag: i64) -> i64
         predecessor_finish
     } else {
         tl.abs_finish(tl.to_index(predecessor_finish) + lag)
+    }
+}
+
+/// The latest instant an elapsed predecessor's linked endpoint may take
+/// (its finish for FS/FF, its start for SS/SF) without moving its successor
+/// (#484): the inverse of the forward link. A successor that keeps the
+/// predecessor's exact instant (`exact`: an elapsed successor or an FS
+/// milestone with no working lag), or an elapsed FF/SF lag, bounds it at
+/// that instant; any other successor snaps a predecessor endpoint forward
+/// to its next working minute, so the bound is the morning side of the
+/// successor's index, not the evening `abs_finish` would give.
+fn elapsed_pred_bound(
+    succ_tl: &Timeline,
+    link: LinkType,
+    offset: Offset,
+    succ_start: i64,
+    succ_finish: i64,
+    exact: bool,
+) -> i64 {
+    let endpoint = match link {
+        LinkType::FinishStart | LinkType::StartStart => succ_start,
+        LinkType::FinishFinish | LinkType::StartFinish => succ_finish,
+    };
+    let (working_lag, elapsed_lag) = match offset {
+        Offset::Working(lag) => (lag, 0),
+        Offset::Elapsed(lag) => (0, lag),
+    };
+    let keeps_instant = exact
+        || (matches!(offset, Offset::Elapsed(_))
+            && matches!(link, LinkType::FinishFinish | LinkType::StartFinish));
+    if working_lag == 0 && keeps_instant {
+        endpoint.saturating_sub(elapsed_lag)
+    } else {
+        succ_tl
+            .abs_start(succ_tl.to_index(endpoint) - working_lag)
+            .saturating_sub(elapsed_lag)
+    }
+}
+
+/// The start a link drives an elapsed successor to (#484). The successor
+/// runs on the 24x7 clock, so with no working lag it takes the
+/// predecessor's endpoint (already moved by any elapsed lag) exactly, even
+/// in nonworking time; a working lag still counts on its calendar and lands
+/// on a working start (FS, SS) or finish (FF, SF). A finish link puts the
+/// finish there, and the start `elapsed` wall-clock minutes before it.
+/// Only the zero-lag shape follows from a measurement (the unlinked anchor
+/// case); the linked ones follow the same rule, unmeasured.
+fn elapsed_link_start(
+    tl: &Timeline,
+    link: LinkType,
+    ps_abs: i64,
+    pf_abs: i64,
+    lag: i64,
+    elapsed: i64,
+) -> i64 {
+    match link {
+        LinkType::FinishStart if lag == 0 => pf_abs,
+        LinkType::StartStart if lag == 0 => ps_abs,
+        LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + lag),
+        LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + lag),
+        LinkType::FinishFinish => {
+            let finish = if lag == 0 {
+                pf_abs
+            } else {
+                tl.abs_finish(tl.to_index(pf_abs) + lag)
+            };
+            finish.saturating_sub(elapsed)
+        }
+        LinkType::StartFinish => sf_bound(tl, ps_abs, lag).1.saturating_sub(elapsed),
     }
 }
 
@@ -4137,7 +4455,18 @@ impl Scheduler<'_> {
         // task and its late dates float with the finish, so the leveler
         // neither delays nor books one: an overallocation it causes stays,
         // reported.
-        let held = |t: &Task| fixed(t) || scope.held(t) || self.schedulable_alap(t);
+        // An elapsed task (#484) is held too: it runs on the wall clock,
+        // which the leveler's working-index booking does not model, so it
+        // keeps its CPM dates and is booked over its whole span
+        // (unmeasured). Known limit: it is not placed from its leveled
+        // predecessors either, so an elapsed task FS-linked from a task the
+        // pass delays keeps its CPM start, before that predecessor's leveled
+        // finish, in the Level All overlay and in the pass's booking (a
+        // written delay still moves it through its link on the committed
+        // schedule).
+        let held = |t: &Task| {
+            fixed(t) || scope.held(t) || self.schedulable_alap(t) || self.elapsed(t).is_some()
+        };
 
         // Work-resource capacities and per-task assignments. An assignment
         // books its resource from its `Delay` into the task on; its stored
@@ -4174,7 +4503,7 @@ impl Scheduler<'_> {
             let cpm = base.get(t.uid).expect("leaf scheduled");
             let s_idx = tl.to_index(cpm.early_start.minutes());
             let res = assign.get(&t.uid).map_or(&[][..], Vec::as_slice);
-            if fixed(t) {
+            if fixed(t) || self.elapsed(t).is_some() {
                 let f_idx = tl.to_index(cpm.early_finish.minutes());
                 book(&mut bookings, res, s_idx, f_idx);
             } else {
@@ -13927,5 +14256,231 @@ mod tests {
             ..march2(vec![a, s])
         };
         assert_eq!(schedule(&proj).get(1).unwrap().free_slack_min, 0);
+    }
+}
+
+/// Elapsed task durations and Must Start On before the day's opening (#484).
+#[cfg(test)]
+mod elapsed_tests {
+    use super::*;
+    use crate::model::{Assignment, DayWorking, Resource};
+
+    fn at(d: u32, h: u32, m: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, d, h, m)
+    }
+
+    fn task(uid: i32, duration: i64) -> Task {
+        Task {
+            uid,
+            id: uid,
+            name: format!("T{uid}"),
+            outline_level: 1,
+            duration_min: duration,
+            ..Task::default()
+        }
+    }
+
+    /// `duration` elapsed minutes shown in elapsed days (format 8).
+    fn elapsed(uid: i32, duration: i64) -> Task {
+        Task {
+            duration_format: Some(8),
+            ..task(uid, duration)
+        }
+    }
+
+    /// Standard but 08:30-12:00 and 13:00-17:30, as 31-calendar-hours has it.
+    fn half_past_eight() -> Calendar {
+        let mut cal = Calendar::standard(1);
+        for weekday in 1..=5 {
+            cal.week[weekday] = Some(DayWorking {
+                times: vec![
+                    WorkingTime {
+                        from: 8 * 60 + 30,
+                        to: 12 * 60,
+                    },
+                    WorkingTime {
+                        from: 13 * 60,
+                        to: 17 * 60 + 30,
+                    },
+                ],
+            });
+        }
+        cal
+    }
+
+    /// Project start Mon 2 March 2026 08:00.
+    fn plan(calendar: Calendar, tasks: Vec<Task>) -> Project {
+        Project {
+            start_date: Some(at(2, 8, 0)),
+            calendars: vec![calendar],
+            tasks,
+            ..Project::default()
+        }
+    }
+
+    fn dates(s: &Schedule, uid: i32) -> (DateTime, DateTime) {
+        let r = s.get(uid).unwrap();
+        (r.early_start, r.early_finish)
+    }
+
+    #[test]
+    fn elapsed_task_runs_on_the_clock() {
+        // Project 2024 (31-calendar-hours UID 25): on a calendar that opens
+        // at 08:30, an unlinked 72-elapsed-hour task starts at the raw
+        // project start 08:00 and finishes Thursday 08:00, while an ordinary
+        // task starts 08:30.
+        let mut succ = task(2, 480);
+        succ.predecessors = vec![Predecessor::fs(1)];
+        let s = schedule(&plan(
+            half_past_eight(),
+            vec![elapsed(1, 4320), succ, task(3, 480)],
+        ));
+        assert_eq!(dates(&s, 1), (at(2, 8, 0), at(5, 8, 0)));
+        assert_eq!(dates(&s, 2), (at(5, 8, 30), at(5, 17, 30)));
+        assert_eq!(dates(&s, 3), (at(2, 8, 30), at(2, 17, 30)));
+        // Two elapsed days from Friday 13:00 end on Sunday 13:00; the
+        // working successor waits for Monday's opening (the rule, unmeasured).
+        let mut e = elapsed(1, 2880);
+        e.constraint = ConstraintType::StartNoEarlierThan;
+        e.constraint_date = Some(at(6, 13, 0));
+        let mut succ = task(2, 480);
+        succ.predecessors = vec![Predecessor::fs(1)];
+        let s = schedule(&plan(half_past_eight(), vec![e, succ]));
+        assert_eq!(dates(&s, 1), (at(6, 13, 0), at(8, 13, 0)));
+        assert_eq!(dates(&s, 2), (at(9, 8, 30), at(9, 17, 30)));
+        // An elapsed successor starts at its predecessor's exact finish,
+        // Friday 17:30, not Monday's opening (the rule, unmeasured).
+        let mut follower = elapsed(2, 1440);
+        follower.predecessors = vec![Predecessor::fs(1)];
+        let s = schedule(&plan(half_past_eight(), vec![task(1, 5 * 480), follower]));
+        assert_eq!(dates(&s, 2), (at(6, 17, 30), at(7, 17, 30)));
+    }
+
+    #[test]
+    fn elapsed_task_slack_is_wall_clock() {
+        // Project 2024 (15-elapsed-duration UID 25, same shape in March
+        // 2026): a 72-elapsed-hour task beside a task that finishes the plan
+        // on Monday (three weeks later) at 10:00. Late finish is that instant,
+        // late start 72 hours before it, and all four slacks are 434 hours
+        // on the wall clock (260400 tenths in the file), not working time.
+        let s = schedule(&plan(
+            Calendar::standard(1),
+            vec![elapsed(1, 4320), task(2, 15 * 480 + 120)],
+        ));
+        assert_eq!(s.project_finish, at(23, 10, 0));
+        let r = s.get(1).unwrap();
+        assert_eq!((r.early_start, r.early_finish), (at(2, 8, 0), at(5, 8, 0)));
+        assert_eq!(
+            (r.late_start, r.late_finish),
+            (at(20, 10, 0), at(23, 10, 0))
+        );
+        assert_eq!(
+            (
+                r.total_slack_min,
+                r.free_slack_min,
+                r.start_slack_min,
+                r.finish_slack_min
+            ),
+            (26040, 26040, 26040, 26040)
+        );
+        assert!(!r.critical);
+        // The working task keeps working slack.
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn elapsed_predecessor_of_a_critical_task_has_no_slack() {
+        // A finishes Thursday 08:00; B starts then. The backward pass must
+        // allow A that morning, not Wednesday 17:00 (the evening on the same
+        // working index), or A's late start would fall on Sunday.
+        let mut b = task(2, 480);
+        b.predecessors = vec![Predecessor::fs(1)];
+        let s = schedule(&plan(Calendar::standard(1), vec![elapsed(1, 4320), b]));
+        let a = s.get(1).unwrap();
+        assert_eq!(
+            (a.late_start, a.late_finish),
+            (a.early_start, a.early_finish)
+        );
+        assert_eq!((a.total_slack_min, a.free_slack_min), (0, 0));
+        assert!(a.critical);
+        assert_eq!(dates(&s, 2), (at(5, 8, 0), at(5, 17, 0)));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+        // With an ALAP task in the plan the calendar-aware inverse is used;
+        // the bound is the same.
+        let mut b = task(2, 480);
+        b.predecessors = vec![Predecessor::fs(1)];
+        let mut alap = task(3, 0);
+        alap.constraint = ConstraintType::AsLateAsPossible;
+        let s = schedule(&plan(
+            Calendar::standard(1),
+            vec![elapsed(1, 4320), b, alap],
+        ));
+        let a = s.get(1).unwrap();
+        assert_eq!((a.late_start, a.total_slack_min), (at(2, 8, 0), 0));
+    }
+
+    #[test]
+    fn must_start_on_before_opening_keeps_its_instant() {
+        // Project 2024 (31-calendar-hours UID 30): MSO Thursday 08:00 on a
+        // calendar that opens at 08:30 starts at 08:00 and finishes 17:30,
+        // its late start 08:00 too.
+        let mso = |uid: i32, date: DateTime| {
+            let mut t = task(uid, 480);
+            t.constraint = ConstraintType::MustStartOn;
+            t.constraint_date = Some(date);
+            t
+        };
+        let mut succ = task(2, 480);
+        succ.predecessors = vec![Predecessor::fs(1)];
+        let s = schedule(&plan(half_past_eight(), vec![mso(1, at(5, 8, 0)), succ]));
+        let r = s.get(1).unwrap();
+        assert_eq!(
+            (r.early_start, r.early_finish),
+            (at(5, 8, 0), at(5, 17, 30))
+        );
+        assert_eq!((r.late_start, r.total_slack_min), (at(5, 8, 0), 0));
+        assert_eq!(dates(&s, 2), (at(6, 8, 30), at(6, 17, 30)));
+        // Only before a working day's opening: a Saturday date and one in the
+        // lunch break still snap to the next working minute (unmeasured).
+        let s = schedule(&plan(half_past_eight(), vec![mso(1, at(7, 8, 0))]));
+        assert_eq!(dates(&s, 1).0, at(9, 8, 30));
+        let s = schedule(&plan(half_past_eight(), vec![mso(1, at(5, 12, 30))]));
+        assert_eq!(dates(&s, 1).0, at(5, 13, 0));
+        // Not honored, the date is a floor and the start snaps as before.
+        let mut proj = plan(half_past_eight(), vec![mso(1, at(5, 8, 0))]);
+        proj.honor_constraints = false;
+        assert_eq!(dates(&schedule(&proj), 1).0, at(5, 8, 30));
+    }
+
+    #[test]
+    fn leveling_holds_an_elapsed_task() {
+        // B (working) and E (elapsed) share Alice. The leveler books E at its
+        // CPM dates and never delays it, so B goes after it (unmeasured).
+        let proj = Project {
+            resources: vec![Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                ..Resource::default()
+            }],
+            assignments: [(1, 1), (2, 2)]
+                .map(|(uid, task_uid)| Assignment {
+                    uid,
+                    task_uid,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                })
+                .to_vec(),
+            ..plan(Calendar::standard(1), vec![task(1, 960), elapsed(2, 1440)])
+        };
+        let cpm = schedule(&proj);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(cpm.get(2).unwrap().early_start));
+        assert_eq!(leveled.finish(2), Some(at(3, 8, 0)));
+        assert_eq!(leveled.delay_min(2), Some(0));
+        assert_eq!(leveled.start(1), Some(at(3, 8, 0)));
     }
 }

@@ -18,6 +18,24 @@ struct Saved {
     last_change: Option<Box<Editor>>,
 }
 
+/// The editor state an edit inside a batch can change, at one point of the
+/// batch ([`Editor::savepoint`]). The leveling switch, the highlights and
+/// the last change's record are left to the batch: no setter moves them.
+pub(super) struct Savepoint {
+    proj: Project,
+    sel: usize,
+    sel_uid: Option<i32>,
+    collapsed: std::collections::BTreeSet<i32>,
+    dirty: bool,
+    pushes: u64,
+    pending: Option<Schedule>,
+    sched: Schedule,
+    level: Option<Leveled>,
+    revision: u64,
+    pre_view: Option<display::PreView>,
+    redo: Vec<Project>,
+}
+
 impl Editor {
     /// Run `edit` as ONE undo step. Every setter inside it validates and
     /// snapshots as usual, onto a private history, so [`Self::append_row`]
@@ -96,6 +114,51 @@ impl Editor {
                 result
             }
         }
+    }
+
+    /// A point inside the running batch that [`Self::rollback_to`] returns
+    /// to, whatever the setters after it applied: the batch's own rollback
+    /// covers only the whole batch, and a batch opened inside another is
+    /// part of it (#484: an elapsed task's conversion before an edit that
+    /// changed nothing, inside a projctl `task.set` or a paste).
+    pub(super) fn savepoint(&self) -> Savepoint {
+        debug_assert!(self.batching, "a savepoint lives inside a batch");
+        Savepoint {
+            proj: self.proj.clone(),
+            sel: self.sel,
+            sel_uid: self.sel_uid,
+            collapsed: self.collapsed.clone(),
+            dirty: self.dirty,
+            pushes: self.pushes,
+            pending: self.pending.clone(),
+            sched: self.sched.clone(),
+            level: self.level.clone(),
+            revision: self.revision,
+            pre_view: self.pre_view.clone(),
+            redo: self.redo.clone(),
+        }
+    }
+
+    /// Back to `point`: the plan and what is derived from it, and the
+    /// batch's private history (each snapshot since is dropped, so the
+    /// batch then sees no change of its own from them).
+    pub(super) fn rollback_to(&mut self, point: Savepoint) {
+        debug_assert!(self.batching, "a savepoint lives inside a batch");
+        let made = usize::try_from(self.pushes - point.pushes).unwrap_or(usize::MAX);
+        let keep = self.undo.len().saturating_sub(made);
+        self.undo.truncate(keep);
+        self.redo = point.redo;
+        self.proj = point.proj;
+        self.sel = point.sel;
+        self.sel_uid = point.sel_uid;
+        self.collapsed = point.collapsed;
+        self.dirty = point.dirty;
+        self.pushes = point.pushes;
+        self.pending = point.pending;
+        self.sched = point.sched;
+        self.level = point.level;
+        self.revision = point.revision;
+        self.pre_view = point.pre_view;
     }
 
     fn restore(&mut self, saved: Saved, undo: Vec<Project>, redo: Vec<Project>) {

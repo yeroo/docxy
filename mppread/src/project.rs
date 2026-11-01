@@ -418,12 +418,14 @@ fn import_tasks(
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;
             // The unit the duration shows (and saves) in, as the MSPDI reader
-            // keeps it: days is no format. Only a working code goes with the
-            // working minutes imported above; an elapsed or null one would
-            // make a save misstate them, so it reads as days.
+            // keeps it: days is no format. A working code goes with the
+            // working minutes imported below, and an auto task's elapsed
+            // code with its elapsed minutes unless it is in progress (#484);
+            // see `carries_duration_format`. Anything else reads as days.
+            let carries = |f| crate::mpp::carries_duration_format(f, t.manual, t.in_progress());
             task.duration_format = t
                 .duration_format
-                .filter(|&f| crate::mpp::working_duration_format(f))
+                .filter(|&f| carries(f))
                 .and_then(|f| u8::try_from(f).ok())
                 .filter(|&f| f != 7);
             if let Some(p) = &t.progress {
@@ -451,9 +453,11 @@ fn import_tasks(
             } else if t.manual {
                 task.duration_min = t.manual_duration_min.unwrap_or_else(span);
             } else {
+                // An elapsed Duration is elapsed minutes, scheduled on the
+                // clock (#484), not the working span between the dates.
                 task.duration_min = t
                     .duration_format
-                    .filter(|&fmt| crate::mpp::working_duration_format(fmt))
+                    .filter(|&fmt| carries(fmt))
                     .and(t.duration_min)
                     .unwrap_or_else(span);
                 if legacy {
@@ -659,14 +663,94 @@ mod tests {
                 row
             })
             .collect();
-        let formats: Vec<_> = import_current(rows)
-            .unwrap()
-            .iter()
-            .map(|t| t.duration_format)
-            .collect();
-        // Days is no format, as the MSPDI reader keeps it; an elapsed code
-        // (8) or an unknown one is not carried beside working minutes.
-        assert_eq!(formats, [Some(9), Some(41), None, None, None, None]);
+        let tasks = import_current(rows).unwrap();
+        let formats: Vec<_> = tasks.iter().map(|t| t.duration_format).collect();
+        // Days is no format, as the MSPDI reader keeps it; an unknown code
+        // is not carried. An elapsed one (8) is, with its elapsed minutes
+        // (#484).
+        assert_eq!(formats, [Some(9), Some(41), Some(8), None, None, None]);
+        assert_eq!(tasks[2].duration_min, 2400);
+        assert!(tasks[2].elapsed_duration());
+    }
+
+    /// #484: the auto task 15-elapsed-duration UID 25 decodes Duration 4320
+    /// minutes (72 elapsed hours) with format 8; it keeps both, not the
+    /// 1440 working minutes between its stored Monday 08:00 and Thursday
+    /// 08:00, and reproduces its stored dates without a pin. A manual row
+    /// with an elapsed code keeps no format: its elapsed ManualDuration is
+    /// not decoded (#225).
+    #[test]
+    fn an_elapsed_auto_task_keeps_its_elapsed_duration() {
+        let mut row = later(
+            current(1, 1, "S15 elapsed", 1),
+            "2026-03-02 08:00",
+            "2026-03-05 08:00",
+        );
+        row.duration_format = Some(8);
+        row.duration_min = Some(4320);
+        let mut manual = later(
+            current(2, 2, "Manual", 1),
+            "2026-03-02 08:00",
+            "2026-03-05 08:00",
+        );
+        manual.manual = true;
+        manual.duration_format = Some(8);
+        manual.duration_min = Some(4320);
+        let tasks = import_current(vec![row, manual]).unwrap();
+        assert_eq!(
+            (tasks[0].duration_min, tasks[0].duration_format),
+            (4320, Some(8))
+        );
+        assert_eq!(tasks[0].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(tasks[0].constraint_date, None);
+        assert_eq!(tasks[1].duration_format, None);
+        assert_eq!(tasks[1].duration_min, 3 * 480);
+    }
+
+    /// #484 r1: an in-progress auto task with an elapsed code keeps the
+    /// working span and no format, as before #484, since the schedule
+    /// places it from its actuals as working minutes; a complete one keeps
+    /// its elapsed Duration and format (it sits on its actual dates).
+    #[test]
+    fn an_in_progress_elapsed_auto_task_keeps_its_working_span() {
+        let progress = |finish: Option<&str>| crate::mpp::MppProgress {
+            percent_complete: 33,
+            percent_work_complete: 0,
+            physical_percent_complete: 0,
+            actual_start: Some("2026-03-02 08:00".into()),
+            actual_finish: finish.map(Into::into),
+            stop: None,
+            resume: None,
+            actual_duration_min: 1440,
+            remaining_duration_min: 2880,
+            work_min: 0,
+            actual_work_min: 0,
+            remaining_work_min: 0,
+            cost: projcore::Rate::parse("0").unwrap(),
+            actual_cost: projcore::Rate::parse("0").unwrap(),
+            remaining_cost: projcore::Rate::parse("0").unwrap(),
+        };
+        let row = |uid, finish| {
+            let mut row = later(
+                current(uid, uid, "Elapsed", 1),
+                "2026-03-02 08:00",
+                "2026-03-05 08:00",
+            );
+            row.duration_format = Some(8);
+            row.duration_min = Some(4320);
+            row.progress = Some(progress(finish));
+            row
+        };
+        let tasks = import_current(vec![row(1, None), row(2, Some("2026-03-05 08:00"))]).unwrap();
+        assert_eq!(
+            (tasks[0].duration_min, tasks[0].duration_format),
+            (3 * 480, None)
+        );
+        assert!(!tasks[0].elapsed_duration());
+        assert_eq!(
+            (tasks[1].duration_min, tasks[1].duration_format),
+            (4320, Some(8))
+        );
     }
 
     #[test]

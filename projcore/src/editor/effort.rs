@@ -15,8 +15,8 @@ impl Editor {
     /// step, first recalculating a local task by its type (see [`recalculate`]).
     /// A new duration is checked against the scheduling horizon before
     /// anything changes. A manual task keeps its start and its finish
-    /// follows; the estimate and the milestone flag are left alone. An
-    /// external leaf keeps the assignment work staged against its stored
+    /// follows; the estimate and the milestone flag are left alone, and an
+    /// elapsed task keeps its elapsed format (#484). An external leaf keeps the assignment work staged against its stored
     /// duration; it never enters the local effort recalculation.
     pub(super) fn commit_assignments(
         &mut self,
@@ -27,7 +27,10 @@ impl Editor {
         let task = self.row_as_edited(i);
         let summary = self.proj.is_outline_summary(i);
         let duration = recalculates(&task, summary)
-            .then(|| recalculate(&self.proj, &task, &resources, &mut assignments))
+            .then(|| {
+                let delay = |a: &Assignment| self.delay_in_task_unit(i, a);
+                recalculate(&self.proj, &task, &resources, &mut assignments, &delay)
+            })
             .flatten();
         if duration.is_some() {
             self.validate_cell_horizon(task.uid, duration, None)?;
@@ -37,6 +40,10 @@ impl Editor {
             proj.resources = resources;
             proj.assignments = assignments;
             if let Some(d) = duration {
+                // Work / units, with the work counted over the stored
+                // duration: elapsed minutes on an elapsed task, which keeps
+                // its format, a Delay taken in that unit too (#484,
+                // `assign::delay_in_task_unit`).
                 apply_duration(&mut proj.tasks[i], d, changed);
             }
         })?;
@@ -104,6 +111,7 @@ fn recalculate(
     task: &Task,
     resources: &[Resource],
     assignments: &mut [Assignment],
+    delay: &dyn Fn(&Assignment) -> i64,
 ) -> Option<i64> {
     let uid = task.uid;
     if any_contoured(&proj.resources, &proj.assignments, uid)
@@ -125,7 +133,7 @@ fn recalculate(
     if set_changed {
         redistribute(task, &before, assignments, &after)
     } else {
-        same_resources(task, &before, assignments, &after)
+        same_resources(task, &before, assignments, &after, delay)
     }
 }
 
@@ -197,12 +205,15 @@ fn redistribute(
 ///
 /// The work and delay rules follow this model's own conventions (a delayed
 /// flat assignment finishes with its task); they are not verified against
-/// Project.
+/// Project. Every Delay here is in the task's unit (`delay`,
+/// [`crate::assign::delay_in_task_unit`]): wall-clock on an elapsed task,
+/// whose duration and work ÷ units are (#484).
 fn same_resources(
     task: &Task,
     before: &[&Assignment],
     assignments: &mut [Assignment],
     after: &[usize],
+    delay: &dyn Fn(&Assignment) -> i64,
 ) -> Option<i64> {
     let fixed_duration = task_type(task) == TaskType::FixedDuration;
     // Whether an edit changed the duration some assignment needs.
@@ -221,7 +232,7 @@ fn same_resources(
             if !fixed_duration {
                 changed = true;
             } else if a.work_min > 0 {
-                let span = task.duration_min - a.delay_min();
+                let span = task.duration_min - delay(a);
                 if span > 0 {
                     a.units = a.work_min as f64 / span as f64;
                     a.peak_units = None;
@@ -238,7 +249,7 @@ fn same_resources(
         .iter()
         .map(|&k| &assignments[k])
         .filter(|a| a.units > 0.0 && a.work_min > 0)
-        .map(|a| ((a.work_min as f64 / a.units).round() as i64).saturating_add(a.delay_min()))
+        .map(|a| ((a.work_min as f64 / a.units).round() as i64).saturating_add(delay(a)))
         .max()
         .filter(|&d| d > 0)?;
     Some(if fixed_duration {

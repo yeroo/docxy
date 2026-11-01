@@ -486,3 +486,105 @@ fn a_task_added_under_a_fixed_work_default_keeps_its_work() {
         assert_eq!(alloc(&ed, 1).1, work_after, "{default:?}");
     }
 }
+
+/// #484 r3 M1: an effort recalculation divides work counted over the stored
+/// duration, elapsed minutes on an elapsed task, so its result is elapsed
+/// minutes and the format stays: 3 edays at 50% units are 6 edays, not 18
+/// working days. Adding a resource to an effort-driven elapsed task halves
+/// it in edays the same way.
+#[test]
+fn an_effort_recalculation_keeps_an_elapsed_duration_elapsed() {
+    let elapsed = |driven| {
+        let mut ed = plan(
+            None,
+            driven,
+            3 * 1440,
+            vec![assignment(1, 1, 1.0, 3 * 1440)],
+        );
+        ed.proj.tasks[0].duration_format = Some(8);
+        ed
+    };
+    let format = |ed: &Editor| ed.proj.tasks[0].duration_format;
+    let mut ed = elapsed(None);
+    set(&mut ed, &["Bob[50%]"]);
+    assert_eq!((duration(&ed), format(&ed)), (6 * 1440, Some(8)));
+    assert_eq!(alloc(&ed, 1), (0.5, 3 * 1440));
+    let mut ed = elapsed(Some(true));
+    set(&mut ed, &["Bob", "Carol"]);
+    assert_eq!((duration(&ed), format(&ed)), (3 * 720, Some(8)));
+    assert_eq!((alloc(&ed, 1), alloc(&ed, 2)), ((1.0, 2160), (1.0, 2160)));
+}
+
+/// #484 r9: on an elapsed task the Delay (working time) enters the effort
+/// recalculation in the task's own unit, the wall-clock minutes to where it
+/// lands: one working day from Mon 08:00 is 24 elapsed hours. So Bob's 72
+/// hours after it take a 3-eday task to 4 edays and he finishes with it;
+/// halving his units after that doubles his 72 hours (Fixed Units, Fixed
+/// Work) or halves his work over the span after the delay (Fixed Duration).
+#[test]
+fn an_elapsed_task_takes_a_delay_in_its_own_unit() {
+    let elapsed = |kind| {
+        let mut ed = plan(kind, None, 3 * 1440, vec![assignment(1, 1, 1.0, 3 * 1440)]);
+        ed.proj.tasks[0].duration_format = Some(8);
+        ed.changed();
+        ed
+    };
+    let patch = |delay_min, units| AssignmentPatch {
+        delay_min,
+        units,
+        ..AssignmentPatch::default()
+    };
+    // Bob's assignment finishes with his task, never after it.
+    let finishes_with_task = |ed: &Editor| {
+        let a = &ed.proj.assignments[0];
+        let (_, finish) = crate::assign::assignment_span(&ed.proj, &ed.sched, a).unwrap();
+        assert_eq!(Some(finish), ed.disp_finish(1));
+    };
+    for kind in [
+        None,
+        Some(TaskType::FixedWork),
+        Some(TaskType::FixedDuration),
+    ] {
+        let mut ed = elapsed(kind);
+        ed.set_assignment(1, patch(Some(DAY), None)).unwrap();
+        assert_eq!(
+            (duration(&ed), ed.proj.tasks[0].duration_format),
+            (4 * 1440, Some(8)),
+            "{kind:?}"
+        );
+        assert_eq!(alloc(&ed, 1), (1.0, 3 * 1440), "{kind:?}");
+        finishes_with_task(&ed);
+        ed.set_assignment(1, patch(None, Some(0.5))).unwrap();
+        let want = if kind == Some(TaskType::FixedDuration) {
+            ((0.5, 3 * 720), 4 * 1440)
+        } else {
+            ((0.5, 3 * 1440), 7 * 1440)
+        };
+        assert_eq!((alloc(&ed, 1), duration(&ed)), want, "{kind:?}");
+        finishes_with_task(&ed);
+    }
+    // A Fixed Duration work edit spreads it over the span after the delay.
+    let mut ed = elapsed(Some(TaskType::FixedDuration));
+    ed.set_assignment(1, patch(Some(DAY), None)).unwrap();
+    let work = AssignmentPatch {
+        work_min: Some(3 * 720),
+        ..AssignmentPatch::default()
+    };
+    ed.set_assignment(1, work).unwrap();
+    assert_eq!((alloc(&ed, 1), duration(&ed)), ((0.5, 3 * 720), 4 * 1440));
+    // The Resource Names cell and the Assign prompt stage units the same way.
+    type Units = fn(&mut Editor);
+    let stagers: [Units; 2] = [
+        |ed| set(ed, &["Bob[50%]"]),
+        |ed| {
+            ed.assign_resource(1, "Bob[50%]").unwrap();
+        },
+    ];
+    for stage in stagers {
+        let mut ed = elapsed(Some(TaskType::FixedDuration));
+        ed.set_assignment(1, patch(Some(DAY), None)).unwrap();
+        stage(&mut ed);
+        assert_eq!((alloc(&ed, 1), duration(&ed)), ((0.5, 3 * 720), 4 * 1440));
+        finishes_with_task(&ed);
+    }
+}

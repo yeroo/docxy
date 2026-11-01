@@ -2020,3 +2020,103 @@
   `corpus/mpx` (MPXJ 16.8.0's MPX of `corpus/mspdi`, three date orders)
   with the twins and lists those exclusions; `every_exclusion_is_needed`
   drops a stale one.
+
+## Elapsed task durations and MSO before opening (#484)
+
+- A leaf whose `DurationFormat` is elapsed (4, 6, 8, 10, 12, estimated or
+  not: `Task::elapsed_duration`) holds **elapsed (wall-clock) minutes** in
+  `duration_min`, as MSPDI `<Duration>` states them; every other leaf holds
+  working minutes. The editor computes or parses only working minutes, so
+  every write of some over an elapsed task (a typed duration through
+  `update_task_with`, a manual task's typed finish, every progress setter)
+  first re-expresses the whole task in working time, in the same undo step
+  (`editor/elapsed.rs`, `Editor::elapsed_to_working` run by
+  `in_working_time`), then runs exactly as on a working task. Its window
+  is its elapsed duration from its actual start, else its scheduled start
+  (never the tracked schedule's span, which counts it as working minutes);
+  the duration becomes the working minutes the window covers, the actual,
+  remaining and manual durations scale alike, and each work assignment's
+  work, scheduled overtime and actual (and actual overtime) work scale by
+  one factor, units kept for every task type: a flat assignment of an
+  untracked task its own span's (`Editor::own_spans`: working over
+  wall-clock minutes of the span `assignment_span` dated, from its actual
+  start or working Delay to its actual finish or work / units on the
+  clock), so it keeps its dates over a weekend, delayed, shorter, or with
+  its own actuals; contoured work and a tracked task's the window's. A
+  span holding no working time (an evening after an FS link) keeps its
+  work (a factor of 1, as a progress write keeps a working task's), so in
+  working time its work runs from the next working minute and, when longer
+  than the task's working minutes, finishes after its task; with actual work there the write is refused
+  (`ELAPSED_ASSIGNMENT_NO_WORKING_TIME`). Only figures the factor
+  changes are rewritten, so a factor of 1 keeps the priced fields; where
+  the work changes the refresh derives what `set_work` clears (regular
+  work, costs, remaining overtime) and the planned spread is dropped;
+  dates, delays, baselines, earned value, budgets and protected actuals
+  stay. The format moves to the same unit in working
+  time. A window with no working time (an FS follower over
+  a night or a weekend), or no start, refuses a progress write and any write
+  on a task with progress; a write that replaces the duration (a typed
+  duration, Ctrl+Delete, a milestone toggle, a manual finish) takes the task
+  to zero working minutes first, its work as for a duration going to zero
+  (`rescale_work`: units kept, Fixed Work keeps its work). A progress write
+  or manual finish that fails or changes nothing rolls the conversion back
+  by hand (`Editor::savepoint`/`rollback_to`), also inside an outer batch
+  (projctl `task.set`, a paste); a typed duration is always a change, even
+  of the minutes the conversion gave (`1d` on `1 eday` from a Monday
+  morning). Any duration on an elapsed task is working minutes, whatever
+  its number, so a copied elapsed cell pasted back (`9d` for `3 edays`)
+  is nine working days: that edit text is a display follow-up. An auto
+  task's typed finish is a constraint and keeps the format, and an effort recalculation (work / units, the work counted over
+  the elapsed minutes) is elapsed minutes and keeps it too. Unmeasured:
+  Project keeps progress and typed durations on an elapsed duration.
+- The schedule runs an automatic elapsed leaf on the 24x7 clock, start
+  included (`Scheduler::elapsed`): it starts at its driven or constraint
+  instant unsnapped (unlinked: the raw project start) and finishes its
+  duration later; its late finish is the latest instant each successor
+  allows (`elapsed_pred_bound`: the morning side of the successor's index,
+  or its exact instant for an elapsed successor or an FS milestone) and its
+  late start that duration before. Its four slacks are wall-clock minutes
+  (late less early instants). An assignment's Delay is working time on
+  every task (a LevelingDelay by its format), so on an elapsed task too,
+  and the conversion leaves it as it is; a flat-work assignment's work /
+  units then runs on the clock (`schedule::on_the_clock`,
+  `assign::assignment_span`), so an undelayed one at the units its work was
+  counted at finishes with the task. A delayed one does not extend an
+  elapsed task in the scheduler (`delayed_extent_min` is none there: a
+  working delay plus wall-clock work reaches a point that depends on the
+  task's start), so a plan read with one may finish it after its task (a
+  known limit). The editor's effort and units math (`same_resources`'s
+  longest `work / units + delay`, a Fixed Duration task's span after the
+  delay, the units stages) takes the Delay in the task's unit
+  (`assign::delay_in_task_unit`: on an elapsed task, the wall-clock minutes
+  from its start to where the working Delay lands), so an edit there does
+  store a duration that covers the delayed assignment, which then finishes
+  with its task. Unmeasured; no corpus assignment is on an elapsed task. Measured (Project 2024): unlinked, on
+  08:00 and 08:30 calendars (snapshots 15..46 UID 25: start 08:00, finish
+  +72 h, slack 260400 tenths). Unmeasured, following the rule: links,
+  constraints, ALAP, a stored leveling delay (added unsnapped), a percent
+  lag off an elapsed predecessor (a share of its elapsed minutes). The
+  leveler holds an elapsed task at its CPM dates, booked over its span, and
+  does not place it from leveled predecessors either: an elapsed task
+  FS-linked from a task Level All delays is drawn before that predecessor's
+  leveled finish (a known limit). A tracked elapsed task is scheduled from
+  its actuals as working minutes, as before (`Scheduler::elapsed` is
+  `None`): a complete one sits on its actual dates, but an in-progress
+  one's wall-clock actual and remaining durations would be misplaced, so a
+  plan with one keeps every stored date on save (`schedule_reproduces`),
+  and the `.mpp` import gives an in-progress auto row its working span and
+  no elapsed format, as before #484. The grid and Markdown show the
+  elapsed slack as working days (a display follow-up); terminal `yppxy` gets
+  all of it through projcore.
+- An honored Must Start On whose instant is before a working day's first
+  working minute keeps that instant as its start; its index, so its finish,
+  is the opening's (snapshots 31..46 UID 30: 08:00..17:30 on a calendar that
+  opens at 08:30, late start 08:00). A date in a lunch break or on a
+  nonworking day still snaps (unmeasured).
+- `mspdi::schedule_reproduces` no longer gives up on an untracked or
+  complete elapsed task, so such a plan writes scheduled dates and
+  wall-clock slack. The `.mpp` import keeps an auto task's elapsed
+  Duration (FixedData +84) and format (`mpp::elapsed_duration_format`)
+  unless it is in progress (`mpp::carries_duration_format`, which the
+  oracle shares); a manual task's elapsed duration is not decoded (#225). `oracle_corpus` compares UID 25 (dates, late dates,
+  slacks, imported unpinned) and UID 30 in every snapshot that has them.

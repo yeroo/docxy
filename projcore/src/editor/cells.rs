@@ -198,6 +198,13 @@ impl Editor {
                 Some(finish),
             );
         }
+        // A manual task's finish writes its working minutes to it: an
+        // elapsed one moves to working time first (#484).
+        if task.elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Finish, |ed| {
+                ed.set_finish_at(uid, finish)
+            });
+        }
         self.validate_pinned_day(finish)?;
         let start = match task.pinned_dates().or_else(|| task.manual_summary_dates()) {
             Some((start, _)) => start,
@@ -377,6 +384,7 @@ impl Editor {
         }
         // A blank row is assigned as the task the edit makes it.
         let duration = self.row_as_edited(i).duration_min;
+        let delay = |a: &Assignment| self.delay_in_task_unit(i, a);
         let kind = |rid: i32| resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
         let mut changed = false;
         let mut assignments = self.proj.assignments.clone();
@@ -405,7 +413,7 @@ impl Editor {
             };
             if let Some(u) = units {
                 let kind = kind(a.resource_uid);
-                let work = staged_work(kind, units_span(kind, a, duration), u, raw)?;
+                let work = staged_work(kind, units_span(kind, a, duration, delay(a)), u, raw)?;
                 a.set_units(u, work);
                 changed = true;
             }

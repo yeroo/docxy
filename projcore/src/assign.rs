@@ -73,7 +73,7 @@ pub(crate) fn advance(
 /// Whether the assignment's work runs flat at its units, so its own finish is
 /// its start plus work ÷ units: a work resource (or none, like Project's
 /// unassigned -65535), no contour, positive units.
-fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
+pub(crate) fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
     is_work(&proj.resources, a) && !contoured(a) && a.units.is_finite() && a.units > 0.0
 }
 
@@ -130,12 +130,39 @@ fn delayed_start(cal: &WorkCalendar, task_start: DateTime, a: &Assignment) -> Op
     Some(start)
 }
 
+/// An assignment's `Delay` in its task's own unit, for sums with the task's
+/// duration or an assignment's work ÷ units: its working minutes, or on a
+/// task on the 24x7 clock (#484) the wall-clock minutes from the task's
+/// scheduled start to where that working Delay lands (`delayed_start`; a
+/// task the schedule has not placed yet keeps the working minutes).
+pub(crate) fn delay_in_task_unit(
+    proj: &Project,
+    sched: &Schedule,
+    task: &Task,
+    a: &Assignment,
+) -> i64 {
+    let delay = a.delay_min();
+    if delay == 0 || !crate::schedule::on_the_clock(task) {
+        return delay;
+    }
+    let Some(r) = sched.get(task.uid) else {
+        return delay;
+    };
+    let cal = task_calendar(proj, task);
+    advance(&cal, r.early_start, delay, false)
+        .map_or(delay, |at| (at.minutes() - r.early_start.minutes()).max(0))
+}
+
 /// An assignment's own start and finish on its task's schedule. The start is
 /// its `ActualStart`, else the task's scheduled start moved by its delays; the
 /// finish is its `ActualFinish`, else, for flat work, the start plus work ÷
 /// units of working time (so assignments on one task finish apart), else the
-/// task's finish. Never finishes before it starts. `None` when its task is
-/// not scheduled.
+/// task's finish. On a task on the 24x7 clock (an untracked elapsed task,
+/// #484) the delays are as on any task (the `Delay` working time), but the
+/// work ÷ units runs on the clock, as its work is its elapsed minutes at its
+/// units: an undelayed flat assignment at the units its work was counted at
+/// finishes with the task. Never finishes before it starts. `None` when its
+/// task is not scheduled.
 pub fn assignment_span(
     proj: &Project,
     sched: &Schedule,
@@ -144,6 +171,7 @@ pub fn assignment_span(
     let task = proj.task(a.task_uid)?;
     let r = sched.get(task.uid)?;
     let cal = task_calendar(proj, task);
+    let clock = crate::schedule::on_the_clock(task);
     let start = match a.actual_start {
         Some(start) => start,
         None => delayed_start(&cal, r.early_start, a)?,
@@ -152,7 +180,11 @@ pub fn assignment_span(
         Some(finish) => finish,
         None if is_flat_work(proj, a) => {
             let span = (a.work_min.max(0) as f64 / a.units).round() as i64;
-            advance(&cal, start, span, true)?
+            if clock {
+                start.add_minutes(span)
+            } else {
+                advance(&cal, start, span, true)?
+            }
         }
         None => r.early_finish,
     };
@@ -165,10 +197,16 @@ pub fn assignment_span(
 /// `Duration`, as Project schedules it (issue #469). `None` for an
 /// assignment that cannot extend its task: no `Delay`, recorded actuals
 /// (its own `Start`/`Finish` stand, as in `assignment_span`), a contour
-/// (its units are its peak), or a non-work resource (its work is a
-/// quantity).
+/// (its units are its peak), a non-work resource (its work is a
+/// quantity), or a task on the 24x7 clock (#484): its Delay is working time
+/// and its work wall-clock, so how far that reaches depends on where the
+/// task starts, and the scheduler runs such a task its duration alone (a
+/// known limit: the assignment may finish after its task).
 pub(crate) fn delayed_extent_min(proj: &Project, a: &Assignment) -> Option<i64> {
     if a.delay_min() == 0
+        || proj
+            .task(a.task_uid)
+            .is_some_and(crate::schedule::on_the_clock)
         || a.actual_start.is_some()
         || a.actual_finish.is_some()
         || !is_flat_work(proj, a)
@@ -1302,6 +1340,74 @@ mod tests {
             span(&proj, &assignment(3, -65535, 1.0, 8)),
             (at(2, 8), at(2, 17))
         );
+    }
+
+    /// `plan`'s task as three elapsed days (format 8) from Mon 08:00, with
+    /// Alice and Bob as work resources.
+    fn elapsed_plan() -> Project {
+        let mut proj = plan(at(2, 8), 9);
+        proj.tasks[0].duration_format = Some(8);
+        proj.resources = vec![
+            resource(1, ResourceType::Work, "0", "0"),
+            resource(2, ResourceType::Work, "0", "0"),
+        ];
+        proj
+    }
+
+    #[test]
+    fn a_flat_assignment_on_an_elapsed_task_runs_on_the_clock() {
+        // #484 r7: the work is the elapsed minutes at the units, so Alice at
+        // 100% over 72 elapsed hours finishes with the task, Thu 08:00, and
+        // Bob at 50% over half of it too; a smaller share finishes earlier.
+        let mut proj = elapsed_plan();
+        let alice = assignment(1, 1, 1.0, 72);
+        let bob = assignment(2, 2, 0.5, 36);
+        proj.assignments = vec![alice.clone(), bob.clone()];
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(1).unwrap().early_finish, at(5, 8));
+        assert_eq!(span(&proj, &alice), (at(2, 8), at(5, 8)));
+        assert_eq!(span(&proj, &bob), (at(2, 8), at(5, 8)));
+        assert_eq!(
+            span(&proj, &assignment(3, 2, 0.5, 12)),
+            (at(2, 8), at(3, 8))
+        );
+        // The same task in working time keeps working-time spans.
+        proj.tasks[0].duration_format = None;
+        proj.tasks[0].duration_min = 3 * 480;
+        let alice = assignment(1, 1, 1.0, 24);
+        assert_eq!(span(&proj, &alice), (at(2, 8), at(4, 17)));
+    }
+
+    #[test]
+    fn a_delay_on_an_elapsed_task_is_working_time() {
+        // #484 r8: the Delay is working time on every task, so 12 hours from
+        // Mon 08:00 on Standard (Monday's 8, Tuesday's 4, then lunch) start
+        // Alice Tue 13:00; her 72 hours then run on the clock to Fri 13:00. The task is not extended: how far a
+        // working delay plus wall-clock work reaches depends on its start.
+        let mut proj = elapsed_plan();
+        let alice = Assignment {
+            delay: Some(720 * 10),
+            ..assignment(1, 1, 1.0, 72)
+        };
+        proj.assignments = vec![alice.clone()];
+        assert_eq!(delayed_extent_min(&proj, &alice), None);
+        assert_eq!(span(&proj, &alice), (at(3, 13), at(6, 13)));
+        let sched = schedule(&proj);
+        let r = sched.get(1).unwrap();
+        assert_eq!((r.early_start, r.early_finish), (at(2, 8), at(5, 8)));
+        // A leveling delay counts by its format, as on a working task: 12
+        // working hours land Tue 13:00, 12 elapsed ones Mon 20:00, so the
+        // next working minute.
+        let leveled = |format| Assignment {
+            leveling_delay: Some(720 * 10),
+            leveling_delay_format: Some(format),
+            ..assignment(1, 1, 1.0, 72)
+        };
+        assert_eq!(span(&proj, &leveled(5)).0, at(3, 13));
+        assert_eq!(span(&proj, &leveled(6)).0, at(3, 8));
+        // The same Delay on the task in working time reaches the same start.
+        proj.tasks[0].duration_format = None;
+        assert_eq!(span(&proj, &alice).0, at(3, 13));
     }
 
     #[test]

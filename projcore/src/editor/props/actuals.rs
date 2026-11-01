@@ -6,6 +6,11 @@
 //! undo step. How each field moves the others is not measured against
 //! Project 2024 beyond `corpus/mspdi/22-progress.xml`; the rules not pinned
 //! by it are noted on the setters.
+//!
+//! Every setter counts in working minutes. A task with an elapsed
+//! `DurationFormat` (#484) is first re-expressed in working time over its
+//! wall-clock window, in the same undo step (`Editor::elapsed_to_working`),
+//! so "the duration stays" below means that working equivalent there.
 use super::*;
 
 /// The progress fields a setter settles together.
@@ -128,6 +133,11 @@ impl Editor {
     /// refused.
     pub fn set_actual_start(&mut self, uid: i32, start: Option<DateTime>) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
+        if self.proj.tasks[i].elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_start(uid, start)
+            });
+        }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
         match start {
@@ -162,13 +172,19 @@ impl Editor {
     /// finish before the actual start is refused. Clearing it keeps the actual
     /// start and duration: % Complete is their share and the remaining duration
     /// what is left. With no actual duration recorded it records 99 % of the
-    /// duration as the actual and the rest as remaining.
+    /// duration as the actual and the rest as remaining. An elapsed task's
+    /// duration is re-expressed in working time first (see the module doc).
     pub fn set_actual_finish(
         &mut self,
         uid: i32,
         finish: Option<DateTime>,
     ) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
+        if self.proj.tasks[i].elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_finish(uid, finish)
+            });
+        }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
         match finish {
@@ -212,13 +228,19 @@ impl Editor {
 
     /// Set the task's Actual Duration in working minutes, 0 to its duration.
     /// % Complete becomes its share and the remaining duration what is left;
-    /// the duration stays. A task with no actual start takes its scheduled
+    /// the duration stays (an elapsed one's working equivalent: see the
+    /// module doc). A task with no actual start takes its scheduled
     /// start (Project marks a task started once work is recorded). Reaching
     /// the whole duration gives 100 % and no remaining duration but invents no
     /// actual finish: only [`Self::set_actual_finish`] types one. A task that
     /// has an actual finish keeps it, so only its whole duration is accepted.
     pub fn set_actual_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
+        if self.proj.tasks[i].elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_duration(uid, minutes)
+            });
+        }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
         if minutes < 0 {
@@ -245,8 +267,15 @@ impl Editor {
     /// completes the task as an actual duration of the whole does; it is
     /// refused when nothing is done (the task would have no duration). A task
     /// that has an actual finish takes only 0. It does not start a task.
+    /// An elapsed task's done part is counted in working time first (see the
+    /// module doc).
     pub fn set_remaining_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
+        if self.proj.tasks[i].elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_remaining_duration(uid, minutes)
+            });
+        }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
         if minutes < 0 {
@@ -264,7 +293,6 @@ impl Editor {
                 "Remaining duration 0 with no work done would leave a zero duration".into(),
             );
         }
-        let old_duration = p.duration;
         p.duration = duration;
         p.remaining = Some(minutes);
         if p.actual.is_some() || p.start.is_some() {
@@ -275,7 +303,7 @@ impl Editor {
             p.actual = Some(duration);
             p.remaining = None;
         }
-        if duration == old_duration {
+        if duration == old.duration {
             return Ok(self.store_progress(i, old, p, false));
         }
         // The duration goes through the same edit as a typed one (work
@@ -299,8 +327,9 @@ impl Editor {
     /// is invented at 100 %), and is left untouched (`Ok(false)`, `Stop` and
     /// `Resume` kept) when it already has that percent and an actual
     /// duration: the stored percent is what is compared, so a recorded actual
-    /// that rounds differently is not rewritten. Refused as
-    /// [`Self::set_percent_complete`] refuses.
+    /// that rounds differently is not rewritten. An elapsed task's duration
+    /// is re-expressed in working time first (see the module doc). Refused
+    /// as [`Self::set_percent_complete`] refuses.
     pub fn set_percent_complete_synced(&mut self, uid: i32, percent: i32) -> Result<bool, String> {
         let i = self.property_row(uid)?;
         let task = &self.proj.tasks[i];
@@ -311,7 +340,12 @@ impl Editor {
             .ok()
             .filter(|p| *p <= 100)
             .ok_or("% Complete is 0 to 100")?;
-        let old = Progress::of(task);
+        if self.proj.tasks[i].elapsed_duration() {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_percent_complete_synced(uid, i32::from(percent))
+            });
+        }
+        let old = Progress::of(&self.proj.tasks[i]);
         // Only a recorded actual that already gives this percent of the
         // current duration is left alone (the duration may have moved since).
         if old.percent == percent

@@ -895,7 +895,7 @@ fn a_retyped_estimate_keeps_the_estimated_format_only_with_a_question_mark() {
 }
 
 #[test]
-fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
+fn summaries_and_external_leaves_keep_their_format_and_an_elapsed_leaf_converts() {
     let mut ed = editor();
     ed.indent(20, 1).unwrap();
     ed.set_manual(10, true).unwrap();
@@ -909,9 +909,14 @@ fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
     let span = ed.disp_duration_min(10).unwrap();
     ed.set_duration_typed(10, span, false, LagUnit::Day)
         .unwrap();
-    // An elapsed-days leaf re-entered as its cell spells it.
-    ed.set_duration_typed(30, 480, false, LagUnit::Day).unwrap();
     unchanged(&ed, &before, history);
+    // An elapsed-days leaf re-entered as its cell spells it (`1d` for 480
+    // elapsed minutes) is working minutes, whatever the number (#484 r6):
+    // a day in working time; that edit text is the display follow-up's.
+    ed.set_duration_typed(30, 480, false, LagUnit::Day).unwrap();
+    let t = ed.project().task(30).unwrap();
+    assert_eq!((t.duration_min, t.duration_format), (480, None));
+    assert_eq!(ed.undo_depth(), history.0 + 1);
     // A new duration on it is typed in days, which it now is.
     ed.set_duration(30, "2d").unwrap();
     assert_eq!(ed.project().task(30).unwrap().duration_format, None);
@@ -949,10 +954,14 @@ fn an_unspellable_format_is_replaced_when_the_estimate_or_a_reset_changes_it() {
     let mut ed = with(8, None);
     ed.set_duration(10, "1d?").unwrap();
     assert_eq!(task(&ed), (None, Some(true)));
-    // The same text and estimate keeps it.
+    // The same text and estimate on an elapsed task is working minutes too
+    // (#484 r6): days, one step. A null format keeps the re-entry rule.
     let mut ed = with(8, None);
     ed.set_duration(10, "1d").unwrap();
-    assert_eq!((task(&ed), ed.undo_depth()), ((Some(8), None), 0));
+    assert_eq!((task(&ed), ed.undo_depth()), ((None, None), 1));
+    let mut ed = with(53, Some(true));
+    ed.set_duration_typed(10, 480, true, LagUnit::Day).unwrap();
+    assert_eq!((task(&ed), ed.undo_depth()), ((Some(53), Some(true)), 0));
     // A reset to a new task's day replaces it even at the same minutes.
     let mut ed = with(8, None);
     ed.reset_duration(10, 480, false).unwrap();

@@ -24,6 +24,7 @@ mod batch;
 mod cells;
 mod changes;
 mod effort;
+mod elapsed;
 mod fields;
 mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
@@ -454,6 +455,14 @@ impl Editor {
     /// the schedule actually uses.
     fn new_task_start(&self) -> DateTime {
         self.proj.start_date.unwrap_or(self.sched.project_start)
+    }
+
+    /// Assignment `a`'s Delay in task `i`'s unit
+    /// ([`crate::assign::delay_in_task_unit`]): wall-clock minutes on a task
+    /// on the 24x7 clock (an untracked elapsed task), working minutes on any
+    /// other.
+    fn delay_in_task_unit(&self, i: usize, a: &Assignment) -> i64 {
+        crate::assign::delay_in_task_unit(&self.proj, &self.sched, &self.proj.tasks[i], a)
     }
 
     /// Row `i` as an edit would make it (see [`materialized`]).
@@ -1135,6 +1144,17 @@ impl Editor {
         reentry: bool,
     ) -> Result<(), String> {
         let i = self.index(uid)?;
+        // A duration over an elapsed task is working minutes, whatever its
+        // number: the task in working time first (#484), compared there. So
+        // a copied elapsed cell pasted back (`9d` for `3 edays`) is nine
+        // working days; that edit text is the display follow-up's. An
+        // external leaf's dates are not ours: it is never converted.
+        let t = &self.proj.tasks[i];
+        if t.elapsed_duration() && !t.is_external_leaf() && patch.duration_min.is_some() {
+            return self.in_working_time(i, elapsed::Write::Duration, |ed| {
+                ed.update_task_with(uid, patch, reentry)
+            });
+        }
         if patch.name.is_none()
             && patch.duration_min.is_none()
             && patch.level.is_none()
@@ -1488,7 +1508,8 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             let mut assignments = self.proj.assignments.clone();
-            let span = units_span(kind, &assignments[k], duration);
+            let delay = self.delay_in_task_unit(i, &assignments[k]);
+            let span = units_span(kind, &assignments[k], duration, delay);
             assignments[k].set_units(u, staged_work(kind, span, u, name)?);
             self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
@@ -1937,12 +1958,13 @@ fn staged_work(
 }
 
 /// The minutes an assignment on a task of `duration` stages its units' work
-/// over: a flat work resource works from its delay, as `rescale_work`; a
+/// over: a flat work resource works from its delay (`delay`, in the task's
+/// unit: [`crate::assign::delay_in_task_unit`]), as `rescale_work`; a
 /// contoured one, and a material or cost, span the duration.
-fn units_span(kind: Option<ResourceType>, a: &Assignment, duration: i64) -> i64 {
+fn units_span(kind: Option<ResourceType>, a: &Assignment, duration: i64, delay: i64) -> i64 {
     match kind {
         Some(ResourceType::Work) | None if matches!(a.work_contour, None | Some(0)) => {
-            (duration - a.delay_min()).max(0)
+            (duration - delay).max(0)
         }
         _ => duration,
     }
@@ -2275,9 +2297,11 @@ fn autolink(proj: &mut Project, at: usize) -> bool {
     true
 }
 
-/// Give task `t` duration `min`. A manual task keeps its start; its finish
-/// follows a new duration instead of staying pinned, while repeating the
-/// current duration (`changed` false) keeps a pinned finish.
+/// Give task `t` duration `min`, in the unit `duration_min` holds (an
+/// elapsed task is moved to working time before a working duration is
+/// written, `Editor::elapsed_to_working`). A manual task keeps its start;
+/// its finish follows a new duration instead of staying pinned, while
+/// repeating the current duration (`changed` false) keeps a pinned finish.
 fn apply_duration(t: &mut Task, min: i64, changed: bool) {
     t.duration_min = min;
     if t.manual && changed {
@@ -2289,8 +2313,9 @@ fn apply_duration(t: &mut Task, min: i64, changed: bool) {
 /// A duration changed without being typed (a manual task's new finish, a
 /// milestone toggle) commits an estimated one, as in Project. Its format
 /// then drops the estimated bit with the estimate, and a format with no
-/// working unit (elapsed, null), which would misstate the new working
-/// minutes, becomes days.
+/// working unit (null), which would misstate the new working minutes,
+/// becomes days. An elapsed task is in working time by then
+/// (`Editor::elapsed_to_working`, #484), so it keeps its unit.
 fn commit_estimate(t: &mut Task) {
     t.estimated = estimate_after(t.estimated, false);
     if t.estimated != Some(true) {
@@ -2543,6 +2568,67 @@ pub fn constraint_hint(t: &Task) -> String {
 mod tests {
     use super::*;
     use crate::schedule::TaskResult;
+
+    /// #484: `duration_min` is elapsed minutes only under an elapsed
+    /// format. A write of working minutes over one (a manual task's typed
+    /// finish, a duration set without a unit, a duration whose estimate is
+    /// committed) moves the format to the same unit in working
+    /// time; an auto task's typed finish is a constraint and keeps the
+    /// elapsed duration.
+    #[test]
+    fn a_working_duration_write_takes_an_elapsed_format_to_working_time() {
+        let at = |d, h| DateTime::from_ymd_hm(2026, 3, d, h, 0);
+        let elapsed = |uid: i32, code: u8, manual: bool| Task {
+            uid,
+            id: uid,
+            name: format!("E{uid}"),
+            outline_level: 1,
+            duration_min: 4320,
+            duration_format: Some(code),
+            manual,
+            manual_start: manual.then(|| at(2, 8)),
+            ..Task::default()
+        };
+        let mut ed = Editor::new(Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![
+                elapsed(1, 8, false),
+                elapsed(2, 6, true),
+                elapsed(3, 40, false),
+                elapsed(4, 10, false),
+            ],
+            ..Project::default()
+        });
+        assert!(ed.project().task(1).unwrap().elapsed_duration());
+        // Auto: a Finish No Earlier Than; the elapsed Duration stays.
+        ed.set_finish_at(1, at(13, 17)).unwrap();
+        let t = ed.project().task(1).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (4320, Some(8)));
+        assert_eq!(t.constraint, ConstraintType::FinishNoEarlierThan);
+        // Manual: the working time Mon 08:00 to Wed 17:00, in working time.
+        ed.set_finish_at(2, at(4, 17)).unwrap();
+        let t = ed.project().task(2).unwrap();
+        // Elapsed hours (6) become working hours (5), not days: the unit
+        // moves before the committed estimate looks at it (r1 m4).
+        assert_eq!((t.duration_min, t.duration_format), (3 * 480, Some(5)));
+        // Minutes set without a unit: estimated elapsed days (40) become
+        // estimated working days (39), the estimate kept.
+        ed.set_duration_min(3, 960, true).unwrap();
+        let t = ed.project().task(3).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (960, Some(39)));
+        // A duration with no `?` stated commits the estimate: elapsed weeks
+        // (10) become working weeks (9).
+        ed.update_task(
+            4,
+            TaskPatch {
+                duration_min: Some(2400),
+                ..TaskPatch::default()
+            },
+        )
+        .unwrap();
+        let t = ed.project().task(4).unwrap();
+        assert_eq!((t.duration_min, t.duration_format), (2400, Some(9)));
+    }
 
     #[test]
     fn package_parts_survive_edit_undo_and_redo() {
