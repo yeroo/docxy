@@ -73,7 +73,7 @@ pub(crate) fn advance(
 /// Whether the assignment's work runs flat at its units, so its own finish is
 /// its start plus work ÷ units: a work resource (or none, like Project's
 /// unassigned -65535), no contour, positive units.
-fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
+pub(crate) fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
     is_work(&proj.resources, a) && !contoured(a) && a.units.is_finite() && a.units > 0.0
 }
 

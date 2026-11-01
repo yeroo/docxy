@@ -457,14 +457,15 @@ impl Editor {
         self.proj.start_date.unwrap_or(self.sched.project_start)
     }
 
-    /// Row `i` as an edit would make it (see [`materialized`]).
     /// Assignment `a`'s Delay in task `i`'s unit
-    /// ([`crate::assign::delay_in_task_unit`]): wall-clock minutes on an
-    /// elapsed task, working minutes on any other.
+    /// ([`crate::assign::delay_in_task_unit`]): wall-clock minutes on a task
+    /// on the 24x7 clock (an untracked elapsed task), working minutes on any
+    /// other.
     fn delay_in_task_unit(&self, i: usize, a: &Assignment) -> i64 {
         crate::assign::delay_in_task_unit(&self.proj, &self.sched, &self.proj.tasks[i], a)
     }
 
+    /// Row `i` as an edit would make it (see [`materialized`]).
     fn row_as_edited(&self, i: usize) -> Task {
         materialized(&self.proj, i, self.new_task_start(), &self.collapsed)
     }

@@ -461,3 +461,181 @@ fn a_typed_duration_on_one_elapsed_unit_is_a_change() {
     assert_eq!(a.work_min, 420);
     assert!((a.units - 420.0 / 480.0).abs() < 1e-9, "{}", a.units);
 }
+
+/// Task 1 of three elapsed days from Thu 5 March 08:00 (its window holds
+/// Thursday and Friday, 960 working minutes), typed `kind`: Alice over all
+/// of it, Bob for 24 elapsed hours after a two-hour Delay, Carol for the
+/// first 24 elapsed hours. `elapsed`: as stored; else converted by hand,
+/// each assignment the working time its own span covers (Alice 960, Bob
+/// Thu 10:00 to Fri 10:00 and Carol Thu 08:00 to Fri 08:00, 480 each).
+fn thursday_plan(elapsed: bool, kind: Option<TaskType>, manual: bool) -> Editor {
+    let (duration, alice, share) = if elapsed {
+        (4320, 4320, 1440)
+    } else {
+        (960, 960, 480)
+    };
+    let person = |uid: i32, name: &str| Resource {
+        uid,
+        id: uid,
+        name: name.into(),
+        kind: ResourceType::Work,
+        max_units: 1.0,
+        ..Resource::default()
+    };
+    let assignment = |uid: i32, work_min: i64, delay: Option<i64>| Assignment {
+        uid,
+        task_uid: 1,
+        resource_uid: uid,
+        units: 1.0,
+        work_min,
+        delay,
+        ..Assignment::default()
+    };
+    Editor::new(Project {
+        start_date: Some(at(5, 8)),
+        tasks: vec![Task {
+            uid: 1,
+            id: 1,
+            name: "E".into(),
+            outline_level: 1,
+            duration_min: duration,
+            duration_format: elapsed.then_some(8),
+            task_type: kind,
+            manual,
+            manual_start: manual.then(|| at(5, 8)),
+            manual_duration_min: manual.then_some(duration),
+            ..Task::default()
+        }],
+        resources: vec![person(1, "Alice"), person(2, "Bob"), person(3, "Carol")],
+        assignments: vec![
+            assignment(1, alice, None),
+            assignment(2, share, Some(120 * 10)),
+            assignment(3, share, None),
+        ],
+        ..Project::default()
+    })
+}
+
+/// Every assignment's units, work, delay, actual work and span, and the
+/// task's duration and finish.
+fn all_facts(ed: &Editor) -> String {
+    let p = ed.project();
+    let t = p.task(1).unwrap();
+    let mut out = format!(
+        "duration {} format {:?} actual {:?} remaining {:?} finish {:?}",
+        t.duration_min,
+        t.duration_format,
+        t.actual_duration_min,
+        t.remaining_duration_min,
+        ed.disp_finish(1)
+    );
+    for a in &p.assignments {
+        let span = crate::assign::assignment_span(p, ed.schedule(), a);
+        out += &format!(
+            " | {} {:.6} {} {:?} {:?} {span:?}",
+            a.uid, a.units, a.work_min, a.delay, a.actual_work_min
+        );
+    }
+    out
+}
+
+/// r10: over a window that crosses a weekend, the conversion gives each
+/// flat assignment the working time its own span covered, not the window's
+/// average (which would give Bob and Carol 320 each): a working write on
+/// the elapsed task then equals it on the task converted by hand.
+#[test]
+fn a_working_write_over_a_weekend_window_equals_it_on_the_working_task() {
+    let writes = [
+        Entry::DurationMin,
+        Entry::DurationMinOfElapsed,
+        Entry::TypedConverted,
+        Entry::ManualFinish,
+        Entry::ActualStart,
+        Entry::ActualFinish,
+        Entry::ActualDuration,
+        Entry::RemainingDuration,
+    ];
+    let (mut compared, mut refused) = (0, Vec::new());
+    for write in writes {
+        for kind in [
+            None,
+            Some(TaskType::FixedWork),
+            Some(TaskType::FixedDuration),
+        ] {
+            for manual in [false, true] {
+                if matches!(write, Entry::ManualFinish) && !manual {
+                    continue;
+                }
+                let case = format!("{write:?} {kind:?} manual {manual}");
+                let mut working = thursday_plan(false, kind, manual);
+                let mut elapsed = thursday_plan(true, kind, manual);
+                let want = write.apply(&mut working);
+                assert_eq!(write.apply(&mut elapsed), want, "{case}");
+                if want.is_err() {
+                    refused.push(format!("{write:?}"));
+                    continue;
+                }
+                assert_eq!(all_facts(&elapsed), all_facts(&working), "{case}");
+                compared += 1;
+            }
+        }
+    }
+    // The shared Actual Finish (Wed 17:00) is before this task's start.
+    assert!(refused.iter().all(|w| w == "ActualFinish"), "{refused:?}");
+    assert_eq!((compared, refused.len()), (3 * (2 * 6 + 1), 6));
+}
+
+/// r10: the conversion alone keeps every assignment where it was: the same
+/// start, a finish with no working time between it and the old one (an
+/// instant on the clock lands at the end of the working time before it),
+/// and none past its task.
+#[test]
+fn the_conversion_keeps_every_assignment_on_its_span() {
+    for kind in [
+        None,
+        Some(TaskType::FixedWork),
+        Some(TaskType::FixedDuration),
+    ] {
+        for manual in [false, true] {
+            let case = format!("{kind:?} manual {manual}");
+            let mut ed = thursday_plan(true, kind, manual);
+            let spans = |ed: &Editor| -> Vec<(DateTime, DateTime)> {
+                let p = ed.project();
+                p.assignments
+                    .iter()
+                    .map(|a| crate::assign::assignment_span(p, ed.schedule(), a).unwrap())
+                    .collect()
+            };
+            let before = spans(&ed);
+            ed.elapsed_to_working(0, Write::Progress).unwrap();
+            let after = spans(&ed);
+            let calendar =
+                crate::assign::task_calendar(ed.project(), ed.project().task(1).unwrap());
+            let finish = ed.disp_finish(1).unwrap();
+            for (k, (old, new)) in before.iter().zip(&after).enumerate() {
+                assert_eq!(new.0, old.0, "{case} assignment {k} start");
+                let (early, late) = if new.1 <= old.1 {
+                    (new.1, old.1)
+                } else {
+                    (old.1, new.1)
+                };
+                assert_eq!(
+                    crate::schedule::working_minutes_on(&calendar, early, late),
+                    0,
+                    "{case} assignment {k}: {old:?} -> {new:?}"
+                );
+                assert!(new.1 <= finish, "{case} assignment {k} past {finish:?}");
+            }
+        }
+    }
+    // Actual work recorded on an assignment of an untracked task (as an
+    // import can carry) follows its own factor, so Carol stays half done:
+    // 720 of 1440 becomes 240 of 480, not the window's 160.
+    let mut ed = thursday_plan(true, None, false);
+    let mut proj = ed.project().clone();
+    proj.assignments[2].actual_work_min = Some(720);
+    ed = Editor::new(proj);
+    ed.elapsed_to_working(0, Write::Progress).unwrap();
+    let carol = &ed.project().assignments[2];
+    assert_eq!((carol.work_min, carol.actual_work_min), (480, Some(240)));
+}
