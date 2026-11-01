@@ -316,6 +316,8 @@ struct VarExtra {
     commitment_finish: Option<String>,
     /// `None` without a key (Project's default 0); `Some(None)` unreadable.
     commitment_type: Option<Option<i32>>,
+    /// Custom field values (#292), in VarMeta order.
+    custom: Vec<projcore::model::ExtendedAttributeValue>,
 }
 
 /// A keyed four-byte timestamp; NA and an unreadable value are no date.
@@ -395,6 +397,9 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
                 PRE_LEVELED_FINISH_KEY => row.pre_leveled_finish = var_date(value),
                 COMMITMENT_START_KEY => row.commitment_start = var_date(value),
                 COMMITMENT_FINISH_KEY => row.commitment_finish = var_date(value),
+                _ if let Some(custom) = crate::customfields::value(key, value) => {
+                    row.custom.push(custom)
+                }
                 // MSPDI CommitmentType is 0..=2; e7-commitment-type stores 2.
                 COMMITMENT_TYPE_KEY => {
                     row.commitment_type = Some(
@@ -420,7 +425,16 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     })
 }
 
-fn guid_text(raw: &[u8]) -> String {
+/// Custom field values ascending by FieldID, the order Project lists the
+/// definitions in (its own value order is neither this nor VarMeta's).
+fn sorted_custom(
+    mut values: Vec<projcore::model::ExtendedAttributeValue>,
+) -> Vec<projcore::model::ExtendedAttributeValue> {
+    values.sort_by_key(|v| v.field_id.parse::<u32>().unwrap_or(u32::MAX));
+    values
+}
+
+pub(crate) fn guid_text(raw: &[u8]) -> String {
     let a = u32::from_le_bytes(raw[..4].try_into().unwrap());
     let b = u16::from_le_bytes(raw[4..6].try_into().unwrap());
     let c = u16::from_le_bytes(raw[6..8].try_into().unwrap());
@@ -504,6 +518,7 @@ fn current_fields(
         commitment_start: extra.commitment_start,
         commitment_finish: extra.commitment_finish,
         commitment_type: extra.commitment_type.unwrap_or(Some(0)),
+        extended_attributes: sorted_custom(extra.custom),
         display_as_summary: Some(
             fixed2.meta[DISPLAY_AS_SUMMARY_FLAG.0] & DISPLAY_AS_SUMMARY_FLAG.1 != 0,
         ),
@@ -680,6 +695,9 @@ pub struct Table {
     pub project_start: Result<Option<String>, String>,
     /// Use task-only import and legacy scheduling rules (MPP9/MPP12).
     pub legacy: bool,
+    /// The task custom-field definitions of `TBkndTask/Props` (#292), as
+    /// MSPDI `ExtendedAttribute` elements; empty for MPP9 and MPP12.
+    pub custom_field_definitions: Vec<projcore::model::XmlElement>,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
@@ -717,6 +735,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             new_tasks_are_manual: Ok(false),
             project_start: Ok(None),
             legacy: false,
+            custom_field_definitions: Vec::new(),
         });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
@@ -750,6 +769,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 // Calendars/resources/assignments have not been validated for
                 // this format. Use the established legacy task-only import.
                 legacy: true,
+                custom_field_definitions: Vec::new(),
             })
         }
         fixedmeta::TaskIndex::Current(indexed) => {
@@ -808,11 +828,18 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 .as_ref()
                 .ok_or_else(|| "missing project Props stream".to_string())
                 .and_then(|props| crate::props::project_start(props));
+            // An unreadable definitions stream gives none: the values are
+            // kept either way, as they were not read before #292.
+            let custom_field_definitions = cfb
+                .read_path(&format!("{prefix}Props"))
+                .map(|p| crate::customfields::definitions(&p))
+                .unwrap_or_default();
             Ok(Table {
                 tasks,
                 new_tasks_are_manual,
                 project_start,
                 legacy: false,
+                custom_field_definitions,
             })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
@@ -822,6 +849,7 @@ pub fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 new_tasks_are_manual: Ok(false),
                 project_start: Ok(None),
                 legacy: true,
+                custom_field_definitions: Vec::new(),
             })
         }
     }
@@ -1752,6 +1780,44 @@ mod tests {
         let mut empty = fixture();
         add_var(&mut empty, 1, CONTACT_KEY, &[0, 0]);
         assert_eq!(fields(&empty).contact, None);
+    }
+
+    #[test]
+    fn custom_field_values_import_and_malformed_ones_are_dropped() {
+        // 23-custom-fields UID 33's Text1, Number1 and Date1 (#292).
+        let mut s = fixture();
+        let text: Vec<u8> = "corpus-text\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        add_var(&mut s, 1, 0x0033, &text);
+        add_var(&mut s, 1, 0x0057, &42f64.to_le_bytes());
+        add_var(&mut s, 1, 0x0109, &[0xc0, 0x12, 0xa4, 0x3a]);
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let got: Vec<_> = imported.tasks[0]
+            .extended_attributes
+            .iter()
+            .map(|a| (a.field_id.as_str(), a.value.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("188743731", Some("corpus-text")),
+                ("188743767", Some("42")),
+                ("188743945", Some("2025-02-05T08:00:00")),
+            ]
+        );
+        // A key outside the table, Flag1 (not read) and malformed values of
+        // known keys import with the value dropped, never refused.
+        let mut bad = fixture();
+        add_var(&mut bad, 1, 0x00a4, &0f64.to_le_bytes());
+        add_var(&mut bad, 1, 0x0048, &[1, 0]);
+        add_var(&mut bad, 1, 0x0033, &[0x41, 0x00]);
+        add_var(&mut bad, 1, 0x0057, &[1, 2, 3]);
+        add_var(&mut bad, 1, 0x0109, &[0x41, 0x38, 0x2c, 0x3c]);
+        let imported = crate::project::project_from_mpp(&file(&bad, true)).unwrap();
+        assert!(imported.tasks[0].extended_attributes.is_empty());
+        assert!(imported.extended_attribute_definitions.is_empty());
     }
 
     #[test]

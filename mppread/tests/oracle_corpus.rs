@@ -2004,3 +2004,148 @@ fn check_mpp12_pair(mpp: &Path, xml: &Path) {
         );
     }
 }
+
+/// Custom field values Project's XML lists that the `.mpp` import does not
+/// read (#292): Flag1 (188743752) and field 188744339, which UID 33 of
+/// 23..46 carries with no definition. Both sit in Fixed2Meta bits that the
+/// corpus cannot tell apart (see `mppread/src/customfields.rs`).
+const UNREAD_CUSTOM_FIELDS: [&str; 2] = ["188743752", "188744339"];
+
+/// Every pair directory of the corpus whose files carry task custom fields.
+fn custom_field_pairs() -> Vec<(PathBuf, PathBuf)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp");
+    ["snapshots", "task-extra", "task-fields"]
+        .iter()
+        .flat_map(|dir| pairs(&root.join(dir), ""))
+        .collect()
+}
+
+#[test]
+fn custom_field_oracles() {
+    let cases = custom_field_pairs();
+    if cases.is_empty() {
+        return; // The corpus is git-ignored; see corpus/mpp/README.md.
+    }
+    let (mut with_fields, mut compared, mut excluded) = (0, 0, [0usize; 2]);
+    for (mpp, xml) in &cases {
+        let at = mpp.display();
+        let oracle = projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+        let project = mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap())
+            .unwrap_or_else(|e| panic!("{at}: {e}"));
+        assert_eq!(
+            project.extended_attribute_definitions, oracle.extended_attribute_definitions,
+            "{at}: custom field definitions"
+        );
+        if !oracle.extended_attribute_definitions.is_empty() {
+            with_fields += 1;
+        }
+        let values = |t: &projcore::Task| {
+            let mut v: Vec<_> = t
+                .extended_attributes
+                .iter()
+                .map(|a| (a.field_id.clone(), a.value.clone()))
+                .collect();
+            v.sort();
+            v
+        };
+        let imported: std::collections::HashMap<_, _> =
+            project.tasks.iter().map(|t| (t.uid, values(t))).collect();
+        // The import drops UID 0, the project summary, with its fields.
+        for task in oracle.tasks.iter().filter(|t| t.uid != 0) {
+            let mut want = values(task);
+            want.retain(
+                |(id, _)| match UNREAD_CUSTOM_FIELDS.iter().position(|u| u == id) {
+                    Some(i) => {
+                        excluded[i] += 1;
+                        false
+                    }
+                    None => true,
+                },
+            );
+            compared += want.len();
+            assert_eq!(
+                imported.get(&task.uid),
+                Some(&want),
+                "{at}: custom field values of UID {}",
+                task.uid
+            );
+        }
+    }
+    // MPP12 keeps its task-only import: no custom field is decoded there.
+    let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
+    for (mpp, _) in pairs(&snapshots, "-mpp12") {
+        let project = mppread::project::project_from_mpp(&std::fs::read(&mpp).unwrap()).unwrap();
+        assert!(
+            project.extended_attribute_definitions.is_empty()
+                && project
+                    .tasks
+                    .iter()
+                    .all(|t| t.extended_attributes.is_empty()),
+            "{}",
+            mpp.display()
+        );
+    }
+    println!(
+        "custom fields: {with_fields} files with definitions, {compared} values compared, \
+         excluded Flag1/188744339 = {excluded:?}"
+    );
+    if cases
+        .iter()
+        .any(|(m, _)| m.ends_with("snapshots/23-custom-fields.mpp"))
+    {
+        // 23..46 define them: UID 33's Text1, Number1 and Date1 in each,
+        // and 45/46 add Start1/Finish1 on all 54 non-blank tasks (UID 33 too).
+        assert_eq!(with_fields, 24);
+        assert_eq!(compared, 24 * 3 + 2 * 54 * 2);
+        // Every exclusion is needed: drop one once the import reads it.
+        assert!(excluded.iter().all(|&n| n == 24), "{excluded:?}");
+    }
+}
+
+/// An imported `.mpp`'s custom fields survive Save As: `.yppx` stores its
+/// plan as `project.xml` through the same `write_mspdi`, so one MSPDI round
+/// trip covers both (#292).
+#[test]
+fn custom_fields_round_trip_through_mspdi() {
+    let mpp =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots/45-baseline1.mpp");
+    if !mpp.exists() {
+        return;
+    }
+    let imported = mppread::project::project_from_mpp(&std::fs::read(&mpp).unwrap()).unwrap();
+    let xml = projcore::mspdi::write_mspdi(&imported);
+    assert!(
+        xml.contains("<FieldName>Start1</FieldName>"),
+        "definitions block"
+    );
+    assert!(xml.contains("<Value>corpus-text</Value>"), "a value");
+    let reread = projcore::mspdi::read_mspdi(&xml).unwrap();
+    assert_eq!(imported.extended_attribute_definitions.len(), 6);
+    assert_eq!(
+        reread.extended_attribute_definitions,
+        imported.extended_attribute_definitions
+    );
+    let values = |p: &projcore::Project| -> Vec<_> {
+        p.tasks
+            .iter()
+            .map(|t| (t.uid, t.extended_attributes.clone()))
+            .collect()
+    };
+    assert_eq!(values(&reread), values(&imported));
+    let uid33 = imported.tasks.iter().find(|t| t.uid == 33).unwrap();
+    let ids: Vec<_> = uid33
+        .extended_attributes
+        .iter()
+        .map(|a| a.field_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "188743731",
+            "188743732",
+            "188743733",
+            "188743767",
+            "188743945"
+        ]
+    );
+}

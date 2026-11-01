@@ -63,6 +63,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .transpose()
         })
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
+    let custom_field_definitions = table.custom_field_definitions;
     let decoded = table.tasks;
     let name = [
         info.title.clone(),
@@ -130,6 +131,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         resources,
         assignments,
         new_tasks_are_manual,
+        extended_attribute_definitions: custom_field_definitions,
         ..cal_ref
     };
     if let Some(error) = projcore::schedule::calendar_error(&project) {
@@ -417,6 +419,7 @@ fn import_tasks(
                 task.display_as_summary = fields.display_as_summary;
                 task.is_published = fields.is_published;
                 task.subproject_name = fields.subproject_name.clone();
+                task.extended_attributes = fields.extended_attributes.clone();
             }
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;

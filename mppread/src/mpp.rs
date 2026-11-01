@@ -154,6 +154,9 @@ pub struct MppTaskFields {
     pub is_published: Option<bool>,
     /// The inserted project's path, from the project Props subproject table.
     pub subproject_name: Option<String>,
+    /// Task custom field values (#292, `crate::customfields`), ascending by
+    /// FieldID; empty for MPP9 and MPP12.
+    pub extended_attributes: Vec<projcore::model::ExtendedAttributeValue>,
 }
 
 /// A task's recorded progress, work and cost, in MSPDI's units: whole minutes

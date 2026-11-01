@@ -22,6 +22,7 @@
 mod assndecode;
 mod caldecode;
 pub mod cfb;
+mod customfields;
 mod fixedmeta;
 pub mod mpp;
 pub mod oleps;
