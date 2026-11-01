@@ -613,3 +613,104 @@ fn progress_on_an_elapsed_task_spanning_no_working_time_is_refused() {
     assert_eq!(ed.set_percent_complete_synced(2, 50), refused);
     assert_eq!(ed.undo_depth(), 0);
 }
+
+/// Task 1 elapsed (72 elapsed hours from Mon 08:00, unstarted), typed `kind`
+/// and effort-driven per `driven`, with Alice at 100% for 4320 minutes of
+/// work counted over those elapsed minutes; Bob is free.
+fn elapsed_with_work(kind: Option<TaskType>, driven: Option<bool>) -> Editor {
+    let person = |uid: i32, name: &str| Resource {
+        uid,
+        id: uid,
+        name: name.into(),
+        kind: ResourceType::Work,
+        max_units: 1.0,
+        ..Resource::default()
+    };
+    let mut ed = elapsed_plan(vec![Task {
+        actual_start: None,
+        task_type: kind,
+        effort_driven: driven,
+        ..started_elapsed(1, None)
+    }]);
+    ed.proj.resources = vec![person(1, "Alice"), person(2, "Bob")];
+    ed.proj.assignments = vec![Assignment {
+        uid: 1,
+        task_uid: 1,
+        resource_uid: 1,
+        units: 1.0,
+        work_min: 4320,
+        ..Assignment::default()
+    }];
+    ed
+}
+
+/// `(units, work, remaining work)` of resource `rid`'s assignment on task 1.
+fn alloc_of(ed: &Editor, rid: i32) -> (f64, i64, Option<i64>) {
+    let a = ed
+        .project()
+        .assignments
+        .iter()
+        .find(|a| a.task_uid == 1 && a.resource_uid == rid)
+        .unwrap();
+    (a.units, a.work_min, a.remaining_work_min)
+}
+
+/// r4 M1: a progress edit that moves an elapsed task to working time takes
+/// its assignments' work along at the same units (Fixed Work included: the
+/// span is only re-expressed), in the edit's one undo step, and the refresh
+/// derives the remaining work from it.
+#[test]
+fn progress_on_an_elapsed_task_rescales_its_work_to_working_time() {
+    for kind in [
+        None,
+        Some(TaskType::FixedDuration),
+        Some(TaskType::FixedWork),
+    ] {
+        let mut ed = elapsed_with_work(kind, None);
+        let before = ed.project().clone();
+        assert_eq!(ed.set_actual_duration(1, 480), Ok(true), "{kind:?}");
+        assert_eq!(ed.project().task(1).unwrap().duration_min, 1440, "{kind:?}");
+        assert_eq!(alloc_of(&ed, 1), (1.0, 1440, Some(1440)), "{kind:?}");
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert_eq!(ed.project().assignments, before.assignments, "{kind:?}");
+        assert_eq!(ed.project().tasks, before.tasks, "{kind:?}");
+    }
+}
+
+/// r4 M1: after the progress edit an effort-driven task's work is working
+/// work, so a resource added later shares 1440 minutes, not 4320.
+#[test]
+fn an_effort_driven_elapsed_task_shares_its_rescaled_work() {
+    let mut ed = elapsed_with_work(None, Some(true));
+    ed.set_actual_duration(1, 480).unwrap();
+    ed.set_resources(1, &["Alice".to_string(), "Bob".to_string()])
+        .unwrap();
+    assert_eq!(ed.project().task(1).unwrap().duration_min, 720);
+    assert_eq!((alloc_of(&ed, 1).1, alloc_of(&ed, 2).1), (720, 720));
+}
+
+/// r4 M1: a remaining-duration edit on an elapsed task first re-expresses
+/// its work over the same span in working time (4320 elapsed minutes at
+/// 100% become 1440 working), then rescales it by the duration change as a
+/// typed duration does: Fixed Units work follows the 2000 minutes, Fixed
+/// Work keeps 1440 and lowers its units, never 4320 over 2000.
+#[test]
+fn a_remaining_edit_on_an_elapsed_task_converts_the_work_before_rescaling_it() {
+    for (kind, want) in [
+        (None, (1.0, 2000)),
+        (Some(TaskType::FixedWork), (0.72, 1440)),
+    ] {
+        let mut ed = elapsed_with_work(kind, None);
+        assert_eq!(ed.set_remaining_duration(1, 2000), Ok(true), "{kind:?}");
+        let t = ed.project().task(1).unwrap();
+        assert_eq!(
+            (t.duration_min, t.duration_format),
+            (2000, None),
+            "{kind:?}"
+        );
+        let (units, work, _) = alloc_of(&ed, 1);
+        assert_eq!(((units * 100.0).round() / 100.0, work), want, "{kind:?}");
+        assert_eq!(ed.undo_depth(), 1);
+    }
+}

@@ -2038,8 +2038,11 @@
   start; never the tracked schedule's span, which counts it as working
   minutes), its stored actual and remaining scaled alike, then stores it in
   working time (unmeasured: Project keeps progress on an elapsed duration).
-  A window with no working time (a weekend) refuses the edit, as the task
-  would become a milestone.
+  Its assignments' work, counted over the elapsed minutes, follows to
+  working time at the same units, Fixed Work included (`scale_work`); a
+  remaining-duration edit then rescales it by the duration change as a
+  typed duration does. A window with no working time (a weekend) refuses
+  the edit, as the task would become a milestone.
 - The schedule runs an automatic elapsed leaf on the 24x7 clock, start
   included (`Scheduler::elapsed`): it starts at its driven or constraint
   instant unsnapped (unlinked: the raw project start) and finishes its

@@ -1880,7 +1880,19 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
         effort::fixed_work_units(proj, i, new_min);
         return;
     }
-    let uid = t.uid;
+    scale_work(proj, i, old_min, new_min);
+}
+
+/// [`rescale_work`]'s work rule for every task type, Fixed Work included:
+/// the units stay and the work follows the duration. Alone, it is what an
+/// elapsed task's move to working time does to its work (`store_progress`,
+/// #484): the same span re-expressed, so no effort changes and no units
+/// either.
+fn scale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
+    if proj.is_outline_summary(i) {
+        return;
+    }
+    let uid = proj.tasks[i].uid;
     let Project {
         assignments,
         resources,
@@ -2303,7 +2315,7 @@ fn apply_duration_in_unit(t: &mut Task, min: i64, changed: bool) {
 /// `DurationFormat` moves the format to the same unit in working time:
 /// `duration_min` holds elapsed minutes only under an elapsed format
 /// (#484). Days, the default, is no format; the estimated bit stays.
-pub(crate) fn to_working_format(t: &mut Task) {
+fn to_working_format(t: &mut Task) {
     if t.elapsed_duration() {
         t.duration_format = t
             .duration_format

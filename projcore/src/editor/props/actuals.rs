@@ -157,6 +157,15 @@ impl Editor {
         if !snapshotted {
             self.snapshot();
         }
+        // An elapsed task moving to working time (#484): its assignments'
+        // work was counted over the elapsed minutes, so it follows the
+        // working duration at the same units, as a duration edit's does;
+        // the edit's refresh then derives cost, remaining work and % work
+        // complete from it.
+        if self.proj.tasks[i].elapsed_duration() {
+            let stored = self.proj.tasks[i].duration_min;
+            scale_work(&mut self.proj, i, stored, new.duration);
+        }
         let task = &mut self.proj.tasks[i];
         task.actual_start = new.start;
         task.actual_finish = new.finish;
@@ -165,7 +174,7 @@ impl Editor {
         // Progress is counted in working time (#484), so an elapsed task's
         // duration becomes working time with it (`progress_of`), even where
         // the minutes coincide.
-        super::super::to_working_format(task);
+        to_working_format(task);
         task.duration_min = new.duration;
         if new.percent != task.percent_complete.unwrap_or(0) {
             task.percent_complete = Some(new.percent);
@@ -342,17 +351,22 @@ impl Editor {
         if duration == old.duration {
             return Ok(self.store_progress(i, old, p, false));
         }
-        if duration == stored {
-            // Only an elapsed task (#484): its working duration changes, but
-            // `update_task` compares the stored minutes, sees none, and would
-            // neither open a step nor commit the estimate. Do as it does for
-            // a changed duration; the work keeps its minutes, as its rescale
-            // to the same minutes would.
+        if self.proj.tasks[i].elapsed_duration() {
+            // An elapsed task (#484) moves to working time and changes its
+            // duration at once. `update_task` would rescale its work from
+            // the stored elapsed minutes straight to the new working ones
+            // (a Fixed Work task's units by the ratio of the two units), or,
+            // where the minutes coincide, see no change at all. So: one step,
+            // the work first re-expressed over the same span in working time
+            // at the same units, then rescaled by the duration change as
+            // `update_task` does, the estimate committed, a pin followed.
             self.validate_cell_horizon(uid, Some(duration), None)?;
             self.snapshot();
+            scale_work(&mut self.proj, i, stored, old.duration);
+            rescale_work(&mut self.proj, i, old.duration, duration);
             let task = &mut self.proj.tasks[i];
-            super::super::commit_estimate(task);
-            super::super::apply_duration(task, duration, true);
+            commit_estimate(task);
+            apply_duration(task, duration, true);
             self.store_progress(i, old, p, true);
             return Ok(true);
         }
