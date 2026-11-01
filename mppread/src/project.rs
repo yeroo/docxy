@@ -316,7 +316,11 @@ fn import_tasks(
                     ..Task::default()
                 });
             }
-            let level = t.outline_level.expect("validated task outline");
+            // The decoders give every non-blank row a level; a row without
+            // one is refused rather than panicking (#105).
+            let level = t
+                .outline_level
+                .ok_or_else(|| format!("missing outline level for UID {}", t.uid))?;
             let outline_summary = summaries[i];
             let mut task = Task {
                 uid: t.uid as i32,
@@ -616,6 +620,16 @@ mod tests {
             outline_level: Some(level),
             ..crate::mpp::MppTask::default()
         }
+    }
+
+    #[test]
+    fn a_row_without_an_outline_level_is_refused_not_a_panic() {
+        let mut row = task(1, 7, "No level", 1);
+        row.outline_level = None;
+        assert_eq!(
+            import_tasks(vec![task(0, 0, "Project", 0), row]).unwrap_err(),
+            "missing outline level for UID 7"
+        );
     }
 
     fn blank(id: u32, uid: u32) -> crate::mpp::MppTask {

@@ -610,7 +610,10 @@ pub fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, St
             .map(|c| c.uid)
             .ok_or("calendar project Props has no default and UID 1 is absent")?,
     };
-    let default = calendars.iter().find(|c| c.uid == default_uid).unwrap();
+    let default = calendars
+        .iter()
+        .find(|c| c.uid == default_uid)
+        .ok_or("default calendar vanished")?;
     if !default
         .resolve_week(|uid| calendars.iter().find(|c| c.uid == uid))
         .iter()
