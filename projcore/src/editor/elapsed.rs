@@ -46,9 +46,10 @@ impl Editor {
     /// on its calendar. The duration becomes `working`; the actual,
     /// remaining and manual durations, and its work resources' actual and
     /// actual overtime work, scale by `working / duration`; a flat work
-    /// assignment instead takes the working time its own span covered
-    /// ([`Self::own_spans`]) at the same units, its actual work alike, so it
-    /// keeps its dates (every task type); the format moves to the same unit in working time. The edit's refresh then
+    /// assignment of an untracked task instead by its own span's factor
+    /// ([`Self::own_spans`]), so it keeps its dates; each assignment's work,
+    /// scheduled overtime and actual work by one factor, the units kept
+    /// (every task type); the format moves to the same unit in working time. The edit's refresh then
     /// derives cost, remaining work and % work complete.
     ///
     /// A window with no working time (an FS follower over a night or a
@@ -85,16 +86,19 @@ impl Editor {
         self.edit_row(i, |proj, _| to_working_time(proj, i, working.max(0), &own))
     }
 
-    /// The working work of each flat work assignment of task `i` on the
-    /// 24x7 clock, by its own span (#484 r10): the working minutes, on the
-    /// task's calendar, of the span `assignment_span` dates it over (its
-    /// working Delay, then work ÷ units on the clock), at its units, by its
-    /// index in the plan's assignments. Read before the conversion, so the
-    /// assignment keeps the working time it covered, whatever the rest of
-    /// the window holds (a weekend, a shorter or delayed assignment). None
-    /// on a task off the clock (a tracked one is scheduled in working time
-    /// already) or a window with no working time.
-    fn own_spans(&self, i: usize, working: i64) -> Vec<(usize, i64)> {
+    /// Each flat work assignment's own factor on task `i` on the 24x7 clock
+    /// (#484 r10, r11): the working minutes, on the task's calendar, of the
+    /// span `assignment_span` dates it over, against that span's wall-clock
+    /// minutes, by its index in the plan's assignments. The span is its
+    /// actual start, else its working Delay from the task start, to its
+    /// actual finish, else work ÷ units later on the clock. Read before the
+    /// conversion, so the assignment keeps the working time it covered,
+    /// whatever the rest of the window holds (a weekend, a shorter or
+    /// delayed assignment); with an actual finish its work is its recorded
+    /// span's density, which its dates, read as they are, keep. None on a
+    /// task off the clock (a tracked one is scheduled in working time
+    /// already), a window with no working time, or a span of no length.
+    fn own_spans(&self, i: usize, working: i64) -> Vec<(usize, Factor)> {
         let task = &self.proj.tasks[i];
         if working <= 0 || !crate::schedule::on_the_clock(task) {
             return Vec::new();
@@ -104,13 +108,13 @@ impl Editor {
             .assignments
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.task_uid == task.uid && a.actual_start.is_none())
-            .filter(|(_, a)| a.actual_finish.is_none())
+            .filter(|(_, a)| a.task_uid == task.uid)
             .filter(|(_, a)| crate::assign::is_flat_work(&self.proj, a))
             .filter_map(|(k, a)| {
                 let (start, finish) = crate::assign::assignment_span(&self.proj, &self.sched, a)?;
-                let minutes = crate::schedule::working_minutes_on(&calendar, start, finish);
-                Some((k, (minutes as f64 * a.units).round() as i64))
+                let wall = finish.minutes() - start.minutes();
+                let working = crate::schedule::working_minutes_on(&calendar, start, finish);
+                (wall > 0).then_some((k, Factor { working, wall }))
             })
             .collect()
     }
@@ -158,18 +162,35 @@ fn has_progress(proj: &Project, i: usize) -> bool {
             .any(|a| some(a.actual_work_min) || some(a.actual_overtime_work_min))
 }
 
-/// [`Editor::elapsed_to_working`]'s rewrite of task `i` over `working`
-/// minutes; `own` holds the flat assignments' work by their own spans
-/// ([`Editor::own_spans`]).
-fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, i64)]) {
-    let t = &mut proj.tasks[i];
-    let elapsed = t.duration_min;
-    let scale = move |m: i64| {
-        if elapsed <= 0 {
+/// Working minutes over the wall-clock minutes of a span: what a minute of
+/// it becomes in working time.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Factor {
+    working: i64,
+    wall: i64,
+}
+
+impl Factor {
+    /// `m` re-expressed (`m` itself over a span of no length).
+    fn of(self, m: i64) -> i64 {
+        if self.wall <= 0 {
             return m;
         }
-        i64::try_from(i128::from(m) * i128::from(working) / i128::from(elapsed)).unwrap_or(m)
+        i64::try_from(i128::from(m) * i128::from(self.working) / i128::from(self.wall)).unwrap_or(m)
+    }
+}
+
+/// [`Editor::elapsed_to_working`]'s rewrite of task `i` over `working`
+/// minutes; `own` holds the flat assignments' own factors
+/// ([`Editor::own_spans`]).
+fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, Factor)]) {
+    let t = &mut proj.tasks[i];
+    let elapsed = t.duration_min;
+    let window = Factor {
+        working,
+        wall: elapsed,
     };
+    let scale = |m: i64| window.of(m);
     if elapsed > 0 {
         t.duration_min = working;
     }
@@ -186,11 +207,16 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, i6
         rescale_work(proj, i, elapsed, 0);
         return;
     }
-    // A flat assignment of a task on the clock takes the working time its
-    // own span covered, and its actual work the same factor, so its % work
-    // complete stays; every other work figure (contoured work, a tracked
-    // task's) goes by the window's factor (`rescale_work` would recompute
-    // flat work as the whole duration at its units).
+    // Each work assignment's work figures by one factor: a flat assignment
+    // of a task on the clock its own span's, so it keeps the working time it
+    // covered and its dates, every other (contoured work, a tracked task's)
+    // the window's (`rescale_work` would recompute flat work as the whole
+    // duration at its units). Its scheduled overtime is put back after
+    // `set_work`, within the work, for the refresh to price; what `set_work`
+    // clears otherwise (regular work, costs, remaining overtime, the
+    // planned spread) the refresh derives again. Dates, delays, units,
+    // baselines, earned value, budgets and Project's protected actuals (a
+    // snapshot no edit maintains) stay as they are.
     let Project {
         assignments,
         resources,
@@ -201,20 +227,16 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, i6
         if a.task_uid != uid || kind.is_some_and(|r| r.kind != ResourceType::Work) {
             continue;
         }
-        let old = a.work_min;
-        let work = own
+        let factor = own
             .iter()
             .find(|&&(at, _)| at == k)
-            .map_or_else(|| scale(old), |&(_, work)| work);
-        let by_own = move |m: i64| match own.iter().any(|&(at, _)| at == k) {
-            true if old > 0 => {
-                i64::try_from(i128::from(m) * i128::from(work) / i128::from(old)).unwrap_or(m)
-            }
-            _ => scale(m),
-        };
+            .map_or(window, |&(_, f)| f);
+        let overtime = a.overtime_work_min;
+        let work = factor.of(a.work_min);
         a.set_work(work);
-        a.actual_work_min = a.actual_work_min.map(by_own);
-        a.actual_overtime_work_min = a.actual_overtime_work_min.map(by_own);
+        a.overtime_work_min = overtime.map(|o| factor.of(o).min(work));
+        a.actual_work_min = a.actual_work_min.map(|m| factor.of(m));
+        a.actual_overtime_work_min = a.actual_overtime_work_min.map(|m| factor.of(m));
     }
 }
 

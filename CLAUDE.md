@@ -2035,14 +2035,18 @@
   is its elapsed duration from its actual start, else its scheduled start
   (never the tracked schedule's span, which counts it as working minutes);
   the duration becomes the working minutes the window covers, the actual,
-  remaining and manual durations scale alike, a flat work assignment of an
-  untracked task takes the working time its own span covered
-  (`Editor::own_spans`: its working Delay, then work / units on the clock,
-  as `assignment_span` dated it; units kept for every task type, its actual
-  work by the same factor), so it keeps its dates over a weekend or as a
-  shorter or delayed assignment, while contoured work and a tracked task's
-  work go by the window's factor, and the format moves to the same unit in
-  working time. A window with no working time (an FS follower over
+  remaining and manual durations scale alike, and each work assignment's
+  work, scheduled overtime and actual (and actual overtime) work scale by
+  one factor, units kept for every task type: a flat assignment of an
+  untracked task its own span's (`Editor::own_spans`: working over
+  wall-clock minutes of the span `assignment_span` dated, from its actual
+  start or working Delay to its actual finish or work / units on the
+  clock), so it keeps its dates over a weekend, delayed, shorter, or with
+  its own actuals; contoured work and a tracked task's the window's. The
+  refresh derives what `set_work` clears (regular work, costs, remaining
+  overtime); dates, delays, baselines, earned value, budgets and
+  protected actuals stay. The format moves to the same unit in working
+  time. A window with no working time (an FS follower over
   a night or a weekend), or no start, refuses a progress write and any write
   on a task with progress; a write that replaces the duration (a typed
   duration, Ctrl+Delete, a milestone toggle, a manual finish) takes the task

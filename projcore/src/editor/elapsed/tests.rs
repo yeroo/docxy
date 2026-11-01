@@ -469,10 +469,18 @@ fn a_typed_duration_on_one_elapsed_unit_is_a_change() {
 /// each assignment the working time its own span covers (Alice 960, Bob
 /// Thu 10:00 to Fri 10:00 and Carol Thu 08:00 to Fri 08:00, 480 each).
 fn thursday_plan(elapsed: bool, kind: Option<TaskType>, manual: bool) -> Editor {
+    three_eday_plan(5, elapsed, kind, manual)
+}
+
+/// [`thursday_plan`]'s task from 08:00 on March `day` (2, a Monday: a
+/// window of 1440 working minutes; 5, a Thursday: 960). Bob's and Carol's
+/// spans hold 480 working minutes either way.
+fn three_eday_plan(day: u32, elapsed: bool, kind: Option<TaskType>, manual: bool) -> Editor {
+    let window = if day == 2 { 1440 } else { 960 };
     let (duration, alice, share) = if elapsed {
         (4320, 4320, 1440)
     } else {
-        (960, 960, 480)
+        (window, window, 480)
     };
     let person = |uid: i32, name: &str| Resource {
         uid,
@@ -492,7 +500,7 @@ fn thursday_plan(elapsed: bool, kind: Option<TaskType>, manual: bool) -> Editor 
         ..Assignment::default()
     };
     Editor::new(Project {
-        start_date: Some(at(5, 8)),
+        start_date: Some(at(day, 8)),
         tasks: vec![Task {
             uid: 1,
             id: 1,
@@ -502,7 +510,7 @@ fn thursday_plan(elapsed: bool, kind: Option<TaskType>, manual: bool) -> Editor 
             duration_format: elapsed.then_some(8),
             task_type: kind,
             manual,
-            manual_start: manual.then(|| at(5, 8)),
+            manual_start: manual.then(|| at(day, 8)),
             manual_duration_min: manual.then_some(duration),
             ..Task::default()
         }],
@@ -532,8 +540,15 @@ fn all_facts(ed: &Editor) -> String {
     for a in &p.assignments {
         let span = crate::assign::assignment_span(p, ed.schedule(), a);
         out += &format!(
-            " | {} {:.6} {} {:?} {:?} {span:?}",
-            a.uid, a.units, a.work_min, a.delay, a.actual_work_min
+            " | {} {:.6} {} {:?} {:?} ot {:?} {:?} {:?} {span:?}",
+            a.uid,
+            a.units,
+            a.work_min,
+            a.delay,
+            a.actual_work_min,
+            a.overtime_work_min,
+            a.actual_start,
+            a.actual_finish
         );
     }
     out
@@ -638,4 +653,95 @@ fn the_conversion_keeps_every_assignment_on_its_span() {
     ed.elapsed_to_working(0, Write::Progress).unwrap();
     let carol = &ed.project().assignments[2];
     assert_eq!((carol.work_min, carol.actual_work_min), (480, Some(240)));
+}
+
+/// What an r11 row adds to [`three_eday_plan`] (elapsed figures, the
+/// working twin's a third: each assignment's span holds a third of its
+/// wall-clock minutes in working time).
+#[derive(Clone, Copy, Debug)]
+enum Extra {
+    /// Bob has 6 hours of scheduled overtime.
+    Overtime,
+    /// Carol's actual work, half of it, entered through `set_assignment`
+    /// (which sets her actual start on an untracked task).
+    AssignmentActuals,
+    /// Carol is done: her actual start and finish (her whole clock span)
+    /// and all her work actual.
+    ActualFinish,
+}
+
+impl Extra {
+    fn apply(self, ed: &mut Editor, day: u32, elapsed: bool) {
+        let third = |m: i64| if elapsed { m } else { m / 3 };
+        match self {
+            Extra::Overtime => {
+                let mut proj = ed.project().clone();
+                proj.assignments[1].overtime_work_min = Some(third(360));
+                *ed = Editor::new(proj);
+            }
+            Extra::AssignmentActuals => {
+                let patch = crate::editor::AssignmentPatch {
+                    actual_work_min: Some(third(720)),
+                    ..Default::default()
+                };
+                ed.set_assignment(3, patch).unwrap();
+            }
+            Extra::ActualFinish => {
+                let mut proj = ed.project().clone();
+                let carol = &mut proj.assignments[2];
+                carol.actual_start = Some(at(day, 8));
+                carol.actual_finish = Some(at(day + 1, 8));
+                carol.actual_work_min = Some(third(1440));
+                *ed = Editor::new(proj);
+            }
+        }
+    }
+}
+
+/// r11: scheduled overtime, actual work entered on an assignment, and an
+/// assignment's actual finish come through a progress write on the elapsed
+/// task as on its working twin, from a Monday and over a weekend.
+#[test]
+fn assignment_progress_and_overtime_convert_by_their_own_spans() {
+    let writes = [
+        Entry::ActualStart,
+        Entry::ActualDuration,
+        Entry::RemainingDuration,
+    ];
+    let mut compared = 0;
+    for day in [2, 5] {
+        for extra in [
+            Extra::Overtime,
+            Extra::AssignmentActuals,
+            Extra::ActualFinish,
+        ] {
+            for kind in [
+                None,
+                Some(TaskType::FixedWork),
+                Some(TaskType::FixedDuration),
+            ] {
+                for write in writes {
+                    let case = format!("day {day} {extra:?} {kind:?} {write:?}");
+                    let mut working = three_eday_plan(day, false, kind, false);
+                    extra.apply(&mut working, day, false);
+                    let mut elapsed = three_eday_plan(day, true, kind, false);
+                    extra.apply(&mut elapsed, day, true);
+                    let want = write.apply(&mut working);
+                    assert_eq!(want, Ok(()), "{case}");
+                    assert_eq!(write.apply(&mut elapsed), want, "{case}");
+                    assert_eq!(all_facts(&elapsed), all_facts(&working), "{case}");
+                    let ot = |ed: &Editor| ed.project().assignments[1].overtime_work_min;
+                    // A remaining-duration edit changes the duration, which
+                    // drops overtime on the working twin too (`set_work`).
+                    if matches!(extra, Extra::Overtime)
+                        && !matches!(write, Entry::RemainingDuration)
+                    {
+                        assert_eq!(ot(&elapsed), Some(120), "{case}");
+                    }
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 2 * 3 * 3 * 3);
 }
