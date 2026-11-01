@@ -198,6 +198,11 @@ impl Editor {
                 Some(finish),
             );
         }
+        // A manual task's finish writes its working minutes to it: an
+        // elapsed one moves to working time first (#484).
+        if task.elapsed_duration() {
+            return self.in_working_time(i, |ed| ed.set_finish_at(uid, finish));
+        }
         self.validate_pinned_day(finish)?;
         let start = match task.pinned_dates().or_else(|| task.manual_summary_dates()) {
             Some((start, _)) => start,
@@ -220,9 +225,6 @@ impl Editor {
             let task = &mut proj.tasks[i];
             let old = task.duration_min;
             let changed = was_blank || duration != old;
-            // The working time up to the finish, so never elapsed (#484),
-            // in the same unit: before the estimate is committed.
-            to_working_format(task);
             if changed {
                 commit_estimate(task);
             }

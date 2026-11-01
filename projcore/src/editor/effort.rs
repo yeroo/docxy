@@ -40,7 +40,7 @@ impl Editor {
                 // Work / units, with the work counted over the stored
                 // duration: elapsed minutes on an elapsed task, which keeps
                 // its format (#484).
-                apply_duration_in_unit(&mut proj.tasks[i], d, changed);
+                apply_duration(&mut proj.tasks[i], d, changed);
             }
         })?;
         if changed {

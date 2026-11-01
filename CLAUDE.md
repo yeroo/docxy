@@ -2027,22 +2027,24 @@
   not: `Task::elapsed_duration`) holds **elapsed (wall-clock) minutes** in
   `duration_min`, as MSPDI `<Duration>` states them; every other leaf holds
   working minutes. The editor computes or parses only working minutes, so
-  a write of one over an elapsed format moves the format to the same unit in
-  working time (`editor::to_working_format`: a manual task's typed finish,
-  a duration without a unit or whose estimate is committed, which converts
-  first so the unit stays); an auto task's typed finish is a constraint
-  and keeps it, and an effort recalculation (work / units, the work
-  counted over the elapsed minutes) is elapsed minutes and keeps it too. A progress write (`progress_of`) first
-  re-expresses an elapsed task as the working minutes of its wall-clock
-  window (its elapsed duration from its actual start, else its scheduled
-  start; never the tracked schedule's span, which counts it as working
-  minutes), its stored actual and remaining scaled alike, then stores it in
-  working time (unmeasured: Project keeps progress on an elapsed duration).
-  Its assignments' work, counted over the elapsed minutes, follows to
-  working time at the same units, Fixed Work included (`scale_work`); a
-  remaining-duration edit then rescales it by the duration change as a
-  typed duration does. A window with no working time (a weekend) refuses
-  the edit, as the task would become a milestone.
+  every write of some over an elapsed task (a typed duration through
+  `update_task_with`, a manual task's typed finish, every progress setter)
+  first re-expresses the whole task in working time, in the same undo step
+  (`editor/elapsed.rs`, `Editor::elapsed_to_working` run by
+  `in_working_time`), then runs exactly as on a working task. Its window
+  is its elapsed duration from its actual start, else its scheduled start
+  (never the tracked schedule's span, which counts it as working minutes);
+  the duration becomes the working minutes the window covers, the actual,
+  remaining and manual durations and the work resources' actual and actual
+  overtime work scale alike, the assignments' work follows at the same
+  units for every task type (`scale_work`), and the format moves to the same
+  unit in working time. A window with no working time (a weekend), or no
+  start, refuses the write; an edit that fails or changes nothing rolls the
+  conversion back. The same minutes typed again are a re-entry and convert
+  nothing. An auto task's typed finish is a constraint and keeps the
+  format, and an effort recalculation (work / units, the work counted over
+  the elapsed minutes) is elapsed minutes and keeps it too. Unmeasured:
+  Project keeps progress and typed durations on an elapsed duration.
 - The schedule runs an automatic elapsed leaf on the 24x7 clock, start
   included (`Scheduler::elapsed`): it starts at its driven or constraint
   instant unsnapped (unlinked: the raw project start) and finishes its

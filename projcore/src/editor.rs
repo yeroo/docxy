@@ -24,6 +24,7 @@ mod batch;
 mod cells;
 mod changes;
 mod effort;
+mod elapsed;
 mod fields;
 mod links;
 pub use assignments::{AssignmentPatch, ResourceRef};
@@ -1135,6 +1136,12 @@ impl Editor {
         reentry: bool,
     ) -> Result<(), String> {
         let i = self.index(uid)?;
+        // New working minutes over an elapsed task: the task in working time
+        // first (#484). The same minutes again are a re-entry, not a write.
+        let t = &self.proj.tasks[i];
+        if t.elapsed_duration() && patch.duration_min.is_some_and(|m| m != t.duration_min) {
+            return self.in_working_time(i, |ed| ed.update_task_with(uid, patch, reentry));
+        }
         if patch.name.is_none()
             && patch.duration_min.is_none()
             && patch.level.is_none()
@@ -1885,9 +1892,9 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
 
 /// [`rescale_work`]'s work rule for every task type, Fixed Work included:
 /// the units stay and the work follows the duration. Alone, it is what an
-/// elapsed task's move to working time does to its work (`store_progress`,
-/// #484): the same span re-expressed, so no effort changes and no units
-/// either.
+/// elapsed task's move to working time does to its work
+/// (`Editor::elapsed_to_working`, #484): the same span re-expressed, so no
+/// effort changes and no units either.
 fn scale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     if proj.is_outline_summary(i) {
         return;
@@ -2287,22 +2294,12 @@ fn autolink(proj: &mut Project, at: usize) -> bool {
     true
 }
 
-/// Give task `t` duration `min` in working minutes. A manual task keeps its
-/// start; its finish follows a new duration instead of staying pinned, while
+/// Give task `t` duration `min`, in the unit `duration_min` holds (an
+/// elapsed task is moved to working time before a working duration is
+/// written, `Editor::elapsed_to_working`). A manual task keeps its start;
+/// its finish follows a new duration instead of staying pinned, while
 /// repeating the current duration (`changed` false) keeps a pinned finish.
-/// A new duration moves an elapsed format to working time
-/// (`to_working_format`, #484).
 fn apply_duration(t: &mut Task, min: i64, changed: bool) {
-    if changed {
-        to_working_format(t);
-    }
-    apply_duration_in_unit(t, min, changed);
-}
-
-/// [`apply_duration`] for a duration in the unit `duration_min` already
-/// holds, so the format stays: an effort recalculation (work / units, the
-/// work counted over `duration_min`, elapsed minutes on an elapsed task).
-fn apply_duration_in_unit(t: &mut Task, min: i64, changed: bool) {
     t.duration_min = min;
     if t.manual && changed {
         t.manual_duration_min = Some(min);
@@ -2310,28 +2307,13 @@ fn apply_duration_in_unit(t: &mut Task, min: i64, changed: bool) {
     }
 }
 
-/// Every duration the editor computes or reads from a cell is working time
-/// (no cell parses an elapsed unit yet), so a write of one over an elapsed
-/// `DurationFormat` moves the format to the same unit in working time:
-/// `duration_min` holds elapsed minutes only under an elapsed format
-/// (#484). Days, the default, is no format; the estimated bit stays.
-fn to_working_format(t: &mut Task) {
-    if t.elapsed_duration() {
-        t.duration_format = t
-            .duration_format
-            .map(|code| code - 1)
-            .filter(|&code| code != 7);
-    }
-}
-
 /// A duration changed without being typed (a manual task's new finish, a
 /// milestone toggle) commits an estimated one, as in Project. Its format
 /// then drops the estimated bit with the estimate, and a format with no
 /// working unit (null), which would misstate the new working minutes,
-/// becomes days. An elapsed format first moves to the same unit in working
-/// time (`to_working_format`, #484), so it keeps its unit.
+/// becomes days. An elapsed task is in working time by then
+/// (`Editor::elapsed_to_working`, #484), so it keeps its unit.
 fn commit_estimate(t: &mut Task) {
-    to_working_format(t);
     t.estimated = estimate_after(t.estimated, false);
     if t.estimated != Some(true) {
         t.duration_format = t.duration_format.map(|f| f & !32).filter(|&f| f != 7);

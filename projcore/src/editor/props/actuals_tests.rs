@@ -1,5 +1,5 @@
-use super::actuals::ELAPSED_NO_WORKING_TIME;
 use super::*;
+use crate::editor::elapsed::ELAPSED_NO_WORKING_TIME;
 use crate::mspdi::{read_mspdi, write_mspdi};
 
 /// A summary (1), a 32 h task `Pour` (2, four 8 h days) and a milestone (3).
