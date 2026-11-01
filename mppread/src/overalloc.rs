@@ -8,6 +8,7 @@
 //! have row ID +0, UID +4, MaxUnits × 10000 at +8, and work/nonwork type at +170; a
 //! Fixed2Meta +8 bit 0x10 marks a cost resource among the nonwork ones.
 //! Resource VarMeta key 0x0114 holds availability boundaries and capacities.
+use crate::varmeta::{self, BlockError, Trailing};
 use crate::{cfb::Cfb, mpp::MppTask};
 use std::collections::{HashMap, HashSet};
 
@@ -142,17 +143,8 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
     {
         return Err("resource second fixed table mismatch".into());
     }
-    if vm.len() < 24
-        || vm[..4] != [0xba, 0xad, 0xdf, 0xfa]
-        || 24usize.checked_add(
-            (u32_at(&vm, 8) as usize)
-                .checked_mul(12)
-                .ok_or("resource variable table too large")?,
-        ) != Some(vm.len())
-        || u32_at(&vm, 20) as usize != v2.len()
-    {
-        return Err("resource variable table mismatch".into());
-    }
+    let keyed = varmeta::entries(&vm, &v2, Trailing::Refused)
+        .map_err(|_| "resource variable table mismatch".to_string())?;
     for i in 0..3 {
         if u16_at(&fm, 16 + i * 37) != 4 || u32_at(&fm, 16 + i * 37 + 4) as usize != i * 16 {
             return Err("unrecognized resource schema row".into());
@@ -221,28 +213,22 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
             return Err("invalid resource record".into());
         }
     }
-    for e in vm[24..].as_chunks::<12>().0 {
-        if u16_at(e, 8) != 0x0114 {
+    for e in keyed {
+        if e.key != 0x0114 {
             continue;
         }
-        let uid = u32_at(e, 0);
-        let offset = u32_at(e, 4) as usize;
-        if offset.checked_add(4).is_none_or(|end| end > v2.len()) {
-            return Err("availability offset out of range".into());
-        }
-        let len = u32_at(&v2, offset) as usize;
-        let end = offset
-            .checked_add(4)
-            .and_then(|n| n.checked_add(len))
-            .filter(|&n| n <= v2.len())
-            .ok_or("availability data out of range")?;
+        let uid = e.uid;
+        let value = varmeta::block(&v2, e.offset).map_err(|b| match b {
+            BlockError::Offset => "availability offset out of range",
+            BlockError::Length => "availability data out of range",
+        })?;
         let Some(r) = out.get_mut(&uid) else {
             continue; // A deleted or implicit resource can retain variable fields.
         };
         if !r.periods.is_empty() {
             return Err("duplicate availability".into());
         }
-        r.periods = availability(&v2[offset + 4..end])?;
+        r.periods = availability(&v2[value])?;
     }
     Ok(out)
 }

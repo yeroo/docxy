@@ -33,8 +33,10 @@ pub(crate) fn text(units: &[u16]) -> Result<String, Utf16Error> {
     String::from_utf16(units).map_err(|_| Utf16Error::Invalid)
 }
 
-/// Text that ends in exactly one NUL code unit as its last unit (the NUL is
-/// not part of the result); `bytes` hold at least `min` bytes.
+/// Text whose last code unit is a NUL, without that NUL; `bytes` hold at
+/// least `min` bytes. Only the last NUL is removed: an earlier one stays in
+/// the text (`"ab\0\0"` gives `"ab\0"`), and callers refuse it with the other
+/// control characters themselves.
 pub(crate) fn terminated(bytes: &[u8], min: usize) -> Result<String, Utf16Error> {
     let units = units(bytes, min.max(2))?;
     match units.split_last() {
@@ -55,6 +57,8 @@ mod tests {
     fn terminated_text_drops_its_nul() {
         assert_eq!(terminated(&bytes("ab\0"), 2), Ok("ab".into()));
         assert_eq!(terminated(&bytes("\0"), 2), Ok(String::new()));
+        // Only the last NUL goes; the caller refuses the one left.
+        assert_eq!(terminated(&bytes("ab\0\0"), 2), Ok("ab\0".into()));
     }
 
     #[test]

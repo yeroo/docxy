@@ -2131,7 +2131,8 @@
   `42`). Only keys in `FIELDS` are read (UID 33 also has `0x00a4`..`0x00aa`
   holding 0.0, which the XML omits); a value that does not decode is left
   out, never an error. Values are kept ascending by FieldID (Project's own
-  value order is neither that nor VarMeta's), and UID 0's go with UID 0.
+  value order is neither that nor VarMeta's). UID 0's values are decoded
+  with its row but dropped by the import with the project summary row.
 - Definitions come from `TBkndTask/Props` (a `props::entries` stream): key
   `0x0440_0001`, 36 bytes not understood, a `u32` count, a `u32` length
   (`count * 88`), then 88-byte records ascending by FieldID (FieldID +0,

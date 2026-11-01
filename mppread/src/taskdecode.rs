@@ -321,7 +321,7 @@ struct VarExtra {
 }
 
 /// A keyed four-byte timestamp; NA and an unreadable value are no date.
-fn var_date(value: &[u8]) -> Option<String> {
+pub(crate) fn var_date(value: &[u8]) -> Option<String> {
     (value.len() == 4)
         .then(|| {
             crate::mpp::decode_checked_timestamp(value, 0)

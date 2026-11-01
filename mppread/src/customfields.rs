@@ -78,11 +78,8 @@ pub(crate) fn value(key: u16, value: &[u8]) -> Option<ExtendedAttributeValue> {
             n.is_finite().then(|| format!("{n}"))?
         }
         Kind::Date => {
-            if value.len() != 4 {
-                return None;
-            }
-            let at = crate::mpp::decode_checked_timestamp(value, 0).ok()??;
-            mspdi_date(&at)?
+            let at = crate::taskdecode::var_date(value)?;
+            crate::project::parse_mpp_dt(&at)?.to_mspdi()
         }
     };
     Some(ExtendedAttributeValue {
@@ -90,12 +87,6 @@ pub(crate) fn value(key: u16, value: &[u8]) -> Option<ExtendedAttributeValue> {
         value: Some(text),
         ..ExtendedAttributeValue::default()
     })
-}
-
-/// `YYYY-MM-DD HH:MM` (the task timestamp) as MSPDI's `YYYY-MM-DDTHH:MM:00`.
-fn mspdi_date(at: &str) -> Option<String> {
-    let (date, time) = at.split_once(' ')?;
-    (date.len() == 10 && time.len() == 5).then(|| format!("{date}T{time}:00"))
 }
 
 /// The definitions of a `TBkndTask/Props` stream, in stream (FieldID) order.
