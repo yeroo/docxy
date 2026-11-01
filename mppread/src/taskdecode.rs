@@ -1,4 +1,6 @@
 //! Validated task-table decoding for current Project, MPP12 and MPP9 storage.
+use crate::utf16::Utf16Error;
+use crate::varmeta::{self, BlockError, HeaderError, RawEntry, Trailing};
 use crate::{
     cfb::Cfb,
     fixedmeta,
@@ -267,21 +269,11 @@ pub fn decode_text(
     let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
         return Err(format!("{what} Var2Data block out of range for UID {uid}"));
     };
-    let value = &v2[header_end..end];
-    if value.len() < 2 || !value.len().is_multiple_of(2) {
-        return Err(format!("invalid {what} block for UID {uid}"));
-    }
-    let units: Vec<u16> = value
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    if *units.last().unwrap() != 0 {
-        return Err(format!("unterminated {what} for UID {uid}"));
-    }
-    let name = String::from_utf16(&units[..units.len() - 1])
-        .map_err(|_| format!("invalid UTF-16 {what} for UID {uid}"))?;
+    let name = crate::utf16::terminated(&v2[header_end..end], 2).map_err(|e| match e {
+        Utf16Error::Length => format!("invalid {what} block for UID {uid}"),
+        Utf16Error::Unterminated => format!("unterminated {what} for UID {uid}"),
+        Utf16Error::Invalid => format!("invalid UTF-16 {what} for UID {uid}"),
+    })?;
     if (!allow_empty && name.is_empty()) || name.chars().any(char::is_control) {
         return Err(format!("invalid {what} for UID {uid}"));
     }
@@ -338,40 +330,38 @@ fn var_date(value: &[u8]) -> Option<String> {
 }
 
 fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("invalid VarMeta header".into());
-    }
-    let count = u32_at(vm, 8) as usize;
-    if 24usize
-        .checked_add(count.checked_mul(12).ok_or("VarMeta count overflow")?)
-        .is_none_or(|n| n > vm.len())
-        || u32_at(vm, 20) as usize != v2.len()
-    {
-        return Err("VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::entries(vm, v2, Trailing::Ignored).map_err(|e| match e {
+        HeaderError::Magic => "invalid VarMeta header",
+        HeaderError::Length => "VarMeta count or Var2Data length mismatch",
+    })?;
     let mut seen = HashSet::new();
     let mut names = HashMap::new();
     let mut notes = HashMap::new();
     let mut physical_percent = HashMap::new();
     let mut wbs = HashMap::new();
     let mut extra: HashMap<u32, VarExtra> = HashMap::new();
-    for i in 0..count {
-        let e = &vm[24 + i * 12..24 + (i + 1) * 12];
-        let uid = u32_at(e, 0);
-        let off = u32_at(e, 4) as usize;
-        let key = u16_at(e, 8);
-        if u16_at(e, 10) != 0x0b40 || !uids.contains(&uid) {
+    for RawEntry {
+        index: i,
+        uid,
+        offset: off,
+        key,
+        tag,
+    } in keyed
+    {
+        if tag != 0x0b40 || !uids.contains(&uid) {
             return Err(format!("invalid VarMeta entry {i}"));
         }
         if !seen.insert((uid, key)) {
             return Err(format!("duplicate VarMeta key ({uid},{key})"));
         }
-        let Some(header_end) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
-            return Err(format!("Var2Data offset out of range at entry {i}"));
-        };
-        let len = u32_at(v2, off) as usize;
-        let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
-            return Err(format!("Var2Data block out of range at entry {i}"));
+        let (header_end, end) = match varmeta::block(v2, off) {
+            Ok(r) => (r.start, r.end),
+            Err(BlockError::Offset) => {
+                return Err(format!("Var2Data offset out of range at entry {i}"));
+            }
+            Err(BlockError::Length) => {
+                return Err(format!("Var2Data block out of range at entry {i}"));
+            }
         };
         if key == 0x000e {
             names.insert(uid, decode_name(v2, off, uid)?);
@@ -522,36 +512,23 @@ fn current_fields(
 }
 
 fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, String>, String> {
-    if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
-        return Err("unrecognized legacy VarMeta layout".into());
-    }
-    let count = u32_at(vm, 8) as usize;
-    let end = 24usize
-        .checked_add(
-            count
-                .checked_mul(8)
-                .ok_or("legacy VarMeta count overflow")?,
-        )
-        .ok_or("legacy VarMeta count overflow")?;
-    if end > vm.len() || u32_at(vm, 20) as usize != v2.len() {
-        return Err("legacy VarMeta count or Var2Data length mismatch".into());
-    }
+    let keyed = varmeta::legacy_entries(vm, v2).map_err(|e| match e {
+        HeaderError::Magic => "unrecognized legacy VarMeta layout",
+        HeaderError::Length => "legacy VarMeta count or Var2Data length mismatch",
+    })?;
     let mut seen = HashSet::new();
     let mut out = HashMap::new();
-    for e in vm[24..end].as_chunks::<8>().0 {
-        let uid = u16_at(e, 0) as u32;
-        let key = u16_at(e, 2);
-        let off = u32_at(e, 4) as usize;
-        if off.checked_add(4).is_none_or(|n| n > v2.len()) {
-            return Err("legacy Var2Data offset out of range".into());
-        }
-        let len = u32_at(v2, off) as usize;
-        if off
-            .checked_add(4)
-            .and_then(|n| n.checked_add(len))
-            .is_none_or(|n| n > v2.len())
-        {
-            return Err("legacy Var2Data block out of range".into());
+    for RawEntry {
+        uid,
+        offset: off,
+        key,
+        ..
+    } in keyed
+    {
+        match varmeta::block(v2, off) {
+            Ok(_) => {}
+            Err(BlockError::Offset) => return Err("legacy Var2Data offset out of range".into()),
+            Err(BlockError::Length) => return Err("legacy Var2Data block out of range".into()),
         }
         if key == 0x0b00 {
             if !seen.insert((uid, key)) {

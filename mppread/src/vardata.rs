@@ -78,17 +78,9 @@ pub fn string_at(data: &[u8], offset: usize) -> Option<String> {
 /// Decode a block as a UTF-16LE string if it plausibly is one (even length,
 /// ≥80% printable, non-empty), stripping a trailing NUL terminator.
 pub fn utf16le_string(b: &[u8]) -> Option<String> {
-    if b.len() < 2 || !b.len().is_multiple_of(2) {
-        return None;
-    }
-    let units: Vec<u16> = b
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|c| u16::from_le_bytes(*c))
-        .collect();
+    let units = crate::utf16::units(b, 2).ok()?;
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
-    let s = String::from_utf16(&units[..end]).ok()?;
+    let s = crate::utf16::text(&units[..end]).ok()?;
     let total = s.chars().count();
     if total == 0 || s.chars().any(|c| c.is_control()) {
         return None;

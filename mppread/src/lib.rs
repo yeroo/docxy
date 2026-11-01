@@ -34,6 +34,7 @@ mod rscdecode;
 mod rtf;
 mod tabledecode;
 mod taskdecode;
+mod utf16;
 pub mod vardata;
 pub mod varmeta;
 

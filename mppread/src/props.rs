@@ -84,15 +84,8 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
     let Some(raw) = entries.get(&DEFAULT_CALENDAR_NAME) else {
         return Ok(None);
     };
-    if raw.len() < 4 || !raw.len().is_multiple_of(2) {
-        return Err("invalid default calendar name in Props".into());
-    }
-    let units: Vec<_> = raw
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
+    let units = crate::utf16::units(raw, 4)
+        .map_err(|_| "invalid default calendar name in Props".to_string())?;
     let end = units
         .iter()
         .position(|&u| u == 0)
@@ -100,8 +93,8 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
     if end == 0 || units[end..].iter().any(|&u| u != 0) {
         return Err("invalid default calendar name padding".into());
     }
-    let name =
-        String::from_utf16(&units[..end]).map_err(|_| "invalid UTF-16 default calendar name")?;
+    let name = crate::utf16::text(&units[..end])
+        .map_err(|_| "invalid UTF-16 default calendar name".to_string())?;
     Ok(Some(name))
 }
 
@@ -160,13 +153,8 @@ fn file_moniker_path(b: &[u8], at: usize) -> Result<String, String> {
     {
         return Err(bad());
     }
-    let units: Vec<u16> = b[start..start + bytes]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    String::from_utf16(&units)
+    crate::utf16::units(&b[start..start + bytes], 0)
+        .and_then(|units| crate::utf16::text(&units))
         .ok()
         .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
         .ok_or_else(bad)
