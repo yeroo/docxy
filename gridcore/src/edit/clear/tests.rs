@@ -253,12 +253,14 @@ fn clear_over_x14_only_coverage_plans_an_uncond_area() {
         ranges: vec![(0, 0, 4, 0)],
         formulas: vec!["A1>0".into()],
         ix: 0,
+        validation: None,
     });
     wb.sheets[0].ext_rules.push(ExtRule {
         kind: ExtKind::Dv,
         ranges: vec![(0, 5, 4, 5)],
         formulas: vec!["Z1".into()],
         ix: 0,
+        validation: None,
     });
     let hit = clear_plan(&wb.sheets[0], &[(2, 0, 2, 0)], ClearWhat::Formats, &[]).unwrap();
     assert_eq!(hit.uncond, vec![(2, 0, 2, 0)]);
@@ -282,6 +284,7 @@ fn an_x14_rule_already_named_struck_is_named_once() {
             ranges: vec![(0, 0, 4, 0)],
             formulas: vec!["A1>0".into()],
             ix: 3,
+            validation: None,
         });
     }
     s.ext_removed = vec![(ExtKind::Cf, 3), (ExtKind::Dv, 3)];

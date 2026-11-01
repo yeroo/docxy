@@ -25513,6 +25513,7 @@ mod tests {
                         ranges: vec![(0, 1, 0, 1)],
                         formulas: vec!["Data!$A$1:$A$3".into()],
                         ix: 0,
+                        validation: None,
                     }],
                     Vec::new(),
                 ),
@@ -26449,6 +26450,7 @@ mod tests {
             ranges: vec![(6, 5, 9, 5)], // F7:F10
             formulas: vec!["Z7".into()],
             ix: 0,
+            validation: None,
         });
         let before = every_rule(&app);
         let depth = app.undo.len();

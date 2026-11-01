@@ -29,6 +29,50 @@ pub fn validation_at(sheet: &Sheet, row: u32, col: u32) -> Option<&DataValidatio
     sheet.validations.iter().find(|dv| dv.covers(row, col))
 }
 
+/// The rule the Data Validation dialog shows for (row, col): the classic
+/// rule covering it ([`validation_at`]), else the first Excel 2010
+/// (`extLst`) validation covering it that imposes something, built over its
+/// current ranges and formulas (#1817). Only the dialog reads x14 rules:
+/// entry checking, dropdowns, prompts and circles stay classic.
+pub fn dialog_rule_at(sheet: &Sheet, row: u32, col: u32) -> Option<DataValidation> {
+    match validation_at(sheet, row, col) {
+        Some(dv) => Some(dv.clone()),
+        None => shown_ext(sheet, row, col).map(|(_, dv)| dv),
+    }
+}
+
+/// The x14 validation the dialog shows for (row, col) when no classic rule
+/// covers it, with its place in [`Sheet::ext_rules`].
+fn shown_ext(sheet: &Sheet, row: u32, col: u32) -> Option<(usize, DataValidation)> {
+    sheet.ext_rules.iter().enumerate().find_map(|(i, ext)| {
+        let covers = ext
+            .ranges
+            .iter()
+            .any(|&(r1, c1, r2, c2)| (r1..=r2).contains(&row) && (c1..=c2).contains(&col));
+        if !covers {
+            return None;
+        }
+        ext.to_validation()
+            .filter(DataValidation::is_meaningful)
+            .map(|dv| (i, dv))
+    })
+}
+
+/// The x14 validations (by place) whose built rule imposes on every cell
+/// what `shown` does.
+fn ext_like(sheet: &Sheet, shown: &DataValidation) -> Vec<usize> {
+    sheet
+        .ext_rules
+        .iter()
+        .enumerate()
+        .filter(|(_, ext)| {
+            ext.to_validation()
+                .is_some_and(|dv| same_everywhere(&dv, shown))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// The top-left cell of a rule's ranges (the minimum row and column over all
 /// of them): the cell its formulas are written for, as conditional
 /// formatting's are.
@@ -1079,20 +1123,48 @@ pub fn add_ranges(sheet: &mut Sheet, rule: &DataValidation, ranges: &[Rect]) {
 /// The Data Validation dialog's OK: `rule`'s settings on `range`, its
 /// formulas written for the range's top-left cell (as the dialog shows them,
 /// [`as_seen_from`]). With `apply_to_all`, every cell range whose rule has the
-/// same settings as the one that cell holds now takes them too. "Any value"
-/// without messages ([`DataValidation::is_meaningful`]) leaves the cells
-/// with no rule the dialog shows: an Excel 2010 (`extLst`) one, which it
-/// cannot show, stays.
+/// same settings as the one that cell holds now takes them too, an Excel 2010
+/// (`extLst`) one's included.
+///
+/// The dialog shows an x14 rule when no classic rule covers its cell
+/// ([`dialog_rule_at`], #1817). OK on what an untouched dialog makes of it,
+/// over cells that all carry it and no classic rule, changes nothing, so its
+/// element stays as the file has it. "Any value" without messages
+/// ([`DataValidation::is_meaningful`]) takes off the rules the dialog
+/// decided on (the classic ones, the x14 one it showed, and with
+/// `apply_to_all` those like it); another x14 rule over the cells, which it
+/// did not show, stays (#1734). A rule that imposes something replaces every
+/// rule on the cells, and an edited x14 rule is written as a classic one.
 pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, apply_to_all: bool) {
+    let at = (range.0, range.1);
     let base_at = sheet
         .validations
         .iter()
         .position(|dv| dv.covers(range.0, range.1));
     let base = base_at.map(|i| sheet.validations[i].clone());
+    let ext_shown = match base {
+        Some(_) => None,
+        None => shown_ext(sheet, at.0, at.1),
+    };
+    if let Some((_, shown)) = &ext_shown {
+        if ext_unchanged(sheet, range, rule, shown) {
+            return;
+        }
+    }
+    let shown = base
+        .clone()
+        .or_else(|| ext_shown.as_ref().map(|e| e.1.clone()));
+    // The x14 rules this OK decides on: the one shown, and with
+    // `apply_to_all` every one like what was shown.
+    let mut decided: Vec<usize> = ext_shown.iter().map(|e| e.0).collect();
     let mut ranges = vec![range];
-    if let (true, Some(b)) = (apply_to_all, &base) {
+    if let (true, Some(b)) = (apply_to_all, &shown) {
         for dv in sheet.validations.iter().filter(|dv| same_everywhere(dv, b)) {
             ranges.extend(dv.ranges.iter().copied());
+        }
+        for i in ext_like(sheet, b) {
+            ranges.extend(sheet.ext_rules[i].ranges.iter().copied());
+            decided.push(i);
         }
     }
     let ranges = dedupe(ranges);
@@ -1113,14 +1185,22 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
         .filter(|b| b.ranges.iter().all(|r| ranges.iter().any(|o| inside(r, o))))
         .and(base_at);
     let held = keep.map(|i| sheet.validations.remove(i));
-    // The dialog shows no Excel 2010 (`extLst`) rule, so "Any value" on OK
-    // is no decision about one: only a rule that imposes something replaces
-    // it (#1734). Clear All still takes it off.
-    for &r in &ranges {
-        if rule.is_meaningful() {
+    // "Any value" on OK decides only on the x14 rules the dialog showed: a
+    // rule that imposes something replaces any (#1734). Clear All takes
+    // them all off.
+    if rule.is_meaningful() {
+        for &r in &ranges {
             clear_validation(sheet, r);
-        } else {
+        }
+    } else {
+        for &r in &ranges {
             crate::edit::clear_classic_validation(sheet, r);
+        }
+        if !decided.is_empty() {
+            let cut = crate::edit::areas::RectIndex::new(&ranges);
+            crate::edit::cut_ext_rules_where(sheet, crate::sheet::ExtKind::Dv, &cut, |i| {
+                decided.contains(&i)
+            });
         }
     }
     if !rule.is_meaningful() {
@@ -1143,6 +1223,77 @@ pub fn set_validation(sheet: &mut Sheet, range: Rect, rule: &DataValidation, app
     }
 }
 
+/// Is OK of `rule` (from the dialog opened on `range`'s top-left cell, which
+/// showed the x14 rule `shown`) no change: `rule` is what the untouched
+/// dialog makes of `shown` (the dialog's own reading, so an `operator` Excel
+/// leaves out is compared like for like), every cell of `range` carries an
+/// x14 rule like `shown`, and no classic rule meets `range`?
+fn ext_unchanged(
+    sheet: &Sheet,
+    range: Rect,
+    rule: &DataValidation,
+    shown: &DataValidation,
+) -> bool {
+    let at = (range.0, range.1);
+    // Untouched boxes keep their formulas verbatim, so the context does not
+    // matter here.
+    let Ok(untouched) = DialogBoxes::of(Some(shown), at, false).rule(
+        &crate::entry::EntryCtx::default(),
+        Some(shown),
+        at,
+    ) else {
+        return false;
+    };
+    if !untouched.same_settings(rule) {
+        return false;
+    }
+    if sheet
+        .validations
+        .iter()
+        .any(|dv| dv.ranges.iter().any(|&r| intersect(r, range).is_some()))
+    {
+        return false;
+    }
+    let like: Vec<Rect> = ext_like(sheet, shown)
+        .into_iter()
+        .flat_map(|i| sheet.ext_rules[i].ranges.iter().copied())
+        .collect();
+    covered(range, &like)
+}
+
+/// Is every cell of `rect` in one of `by`?
+fn covered(rect: Rect, by: &[Rect]) -> bool {
+    let mut left = vec![rect];
+    for &b in by {
+        left = left.into_iter().flat_map(|r| minus(r, b)).collect();
+        if left.is_empty() {
+            return true;
+        }
+    }
+    left.is_empty()
+}
+
+/// `a` without `b`: up to four rectangles.
+fn minus(a: Rect, b: Rect) -> Vec<Rect> {
+    let Some(i) = intersect(a, b) else {
+        return vec![a];
+    };
+    let mut out = Vec::new();
+    if i.0 > a.0 {
+        out.push((a.0, a.1, i.0 - 1, a.3));
+    }
+    if i.2 < a.2 {
+        out.push((i.2 + 1, a.1, a.2, a.3));
+    }
+    if i.1 > a.1 {
+        out.push((i.0, a.1, i.2, i.1 - 1));
+    }
+    if i.3 < a.3 {
+        out.push((i.0, i.3 + 1, i.2, a.3));
+    }
+    out
+}
+
 /// Do two rules impose the same thing on every cell they cover: the same
 /// settings, their formulas the same seen from the same cell?
 fn same_everywhere(a: &DataValidation, b: &DataValidation) -> bool {
@@ -1157,21 +1308,21 @@ fn same_everywhere(a: &DataValidation, b: &DataValidation) -> bool {
     probe.same_settings(b)
 }
 
-/// The dialog's Clear All: the cells of `range` lose their rule. With
-/// `apply_to_all`, so does every cell with the same settings as the one the
-/// range's top-left cell holds.
+/// The dialog's Clear All: the cells of `range` lose their rules, Excel 2010
+/// (`extLst`) ones included. With `apply_to_all`, so does every cell with the
+/// same settings as the rule the dialog showed ([`dialog_rule_at`]).
 pub fn clear_all_validation(sheet: &mut Sheet, range: Rect, apply_to_all: bool) {
     let mut ranges = vec![range];
-    if let (true, Some(b)) = (
-        apply_to_all,
-        validation_at(sheet, range.0, range.1).cloned(),
-    ) {
+    if let (true, Some(b)) = (apply_to_all, dialog_rule_at(sheet, range.0, range.1)) {
         for dv in sheet
             .validations
             .iter()
             .filter(|dv| same_everywhere(dv, &b))
         {
             ranges.extend(dv.ranges.iter().copied());
+        }
+        for i in ext_like(sheet, &b) {
+            ranges.extend(sheet.ext_rules[i].ranges.iter().copied());
         }
     }
     for r in ranges {
@@ -2052,9 +2203,9 @@ mod tests {
         assert!(s.validations[0].is_meaningful());
     }
 
-    /// #1734: the dialog shows no Excel 2010 (`extLst`) rule, so OK on "Any
-    /// value" leaves one standing; a rule that imposes something replaces
-    /// it, and Clear All takes it off.
+    /// #1734: OK on "Any value" leaves standing an Excel 2010 (`extLst`)
+    /// rule the dialog did not show (one with no settings read, as here); a
+    /// rule that imposes something replaces it, and Clear All takes it off.
     #[test]
     fn any_value_leaves_an_x14_validation_a_real_rule_replaces_it() {
         use crate::sheet::{ExtKind, ExtRule};
@@ -2063,6 +2214,7 @@ mod tests {
             ranges: vec![(1, 1, 9, 1)],
             formulas: vec!["$Z$1:$Z$3".into()],
             ix: 0,
+            validation: None,
         };
         let mut s = Sheet::default();
         s.ext_rules.push(x14());
@@ -2952,6 +3104,7 @@ mod tests {
             ranges: vec![area("D1:D10")],
             formulas: vec!["Z1".into()],
             ix: 0,
+            validation: None,
         });
         cut(&mut wb, 0, "B1", 0, "D1");
         let ext = &wb.sheets[0].ext_rules[0];
