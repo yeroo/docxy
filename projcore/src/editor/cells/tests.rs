@@ -895,7 +895,7 @@ fn a_retyped_estimate_keeps_the_estimated_format_only_with_a_question_mark() {
 }
 
 #[test]
-fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
+fn summaries_and_external_leaves_keep_their_format_and_an_elapsed_leaf_converts() {
     let mut ed = editor();
     ed.indent(20, 1).unwrap();
     ed.set_manual(10, true).unwrap();

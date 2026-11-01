@@ -12,8 +12,8 @@
 //! typed durations on an elapsed task.
 use super::*;
 
-/// The refusal of a working-time edit on an elapsed task whose wall-clock
-/// window holds no working time while it has progress to re-express
+/// The refusal, on an elapsed task whose wall-clock window holds no working
+/// time, of a progress write, or of any write on a task with progress
 /// ([`Editor::elapsed_to_working`]).
 pub(super) const ELAPSED_NO_WORKING_TIME: &str =
     "This elapsed task spans no working time; durations and progress are edited in working time";
@@ -23,12 +23,13 @@ pub(super) const ELAPSED_NO_WORKING_TIME: &str =
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Write {
     /// A typed duration (`update_task_with`): it replaces the duration, so
-    /// it needs no window, and it is a change of the task even when the
+    /// it needs no window unless the task has progress, and it is a change of the task even when the
     /// minutes typed are the ones the conversion gave (`1d` on `1 eday`
     /// from a Monday morning): the duration is now working time.
     Duration,
     /// A manual task's typed finish: it replaces the duration, so it needs
-    /// no window; its own pinned finish again changes nothing.
+    /// no window unless the task has progress; its own pinned finish again
+    /// changes nothing.
     Finish,
     /// A progress setter: the progress is counted in the window's working
     /// time, so a window with none refuses it.

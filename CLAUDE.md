@@ -2061,7 +2061,12 @@
   allows (`elapsed_pred_bound`: the morning side of the successor's index,
   or its exact instant for an elapsed successor or an FS milestone) and its
   late start that duration before. Its four slacks are wall-clock minutes
-  (late less early instants). Measured (Project 2024): unlinked, on
+  (late less early instants). Its flat-work assignments run on the same
+  clock (`schedule::on_the_clock`, `assign::assignment_span`): the task's
+  start plus the Delay and LevelingDelay as minutes, unsnapped, then work /
+  units, so at the units its work was counted at an assignment finishes
+  with the task; a delayed one extends the task by that wall-clock extent
+  (`delayed_extent_min`, #469) as a working task's does. Unmeasured. Measured (Project 2024): unlinked, on
   08:00 and 08:30 calendars (snapshots 15..46 UID 25: start 08:00, finish
   +72 h, slack 260400 tenths). Unmeasured, following the rule: links,
   constraints, ALAP, a stored leveling delay (added unsnapped), a percent
