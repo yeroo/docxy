@@ -78,6 +78,8 @@ struct StyleDef {
     /// `w:numPr` in the style's `w:pPr`: its `w:numId` (when given) and
     /// `w:ilvl` (when given).
     num_pr: Option<(Option<i32>, Option<i32>)>,
+    /// The left indent attributes of the style's `w:ind`.
+    left: LeftInd,
     /// Display name (`w:name`), e.g. "heading 1".
     name: Option<String>,
     /// Whether this is a paragraph style (`w:type="paragraph"`), so the
@@ -93,6 +95,29 @@ pub struct StyleSheet {
     /// The default paragraph style (`w:type="paragraph" w:default="1"`), which
     /// applies to a paragraph without a `w:pStyle`.
     default_paragraph: Option<String>,
+    /// The left indent of `w:docDefaults/w:pPrDefault/w:pPr/w:ind`, the last
+    /// fallback of [`StyleSheet::style_left_indent`].
+    default_left: LeftInd,
+}
+
+/// The left indent a `w:ind` sets, its twips (`w:left`, else `w:start`) and
+/// its character units (`w:leftChars`, else `w:startChars`, a zero
+/// included: it cancels an inherited count) apart, as Word inherits each
+/// from the most-derived style that sets it (#1815).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LeftInd {
+    twips: Option<i32>,
+    chars: Option<i32>,
+}
+
+impl LeftInd {
+    /// `self`, with what it does not set taken from `base`.
+    fn or(self, base: LeftInd) -> LeftInd {
+        LeftInd {
+            twips: self.twips.or(base.twips),
+            chars: self.chars.or(base.chars),
+        }
+    }
 }
 
 /// An on/off paragraph property a paragraph style can set, resolved by
@@ -394,6 +419,31 @@ impl StyleSheet {
         def.align.or(base)
     }
 
+    fn fold_left(&self, id: &str, seen: &mut HashSet<String>) -> LeftInd {
+        if !seen.insert(id.to_string()) {
+            return LeftInd::default();
+        }
+        let Some(def) = self.styles.get(id) else {
+            return LeftInd::default();
+        };
+        let base = def
+            .based_on
+            .as_ref()
+            .map(|b| self.fold_left(b, seen))
+            .unwrap_or_default();
+        def.left.or(base)
+    }
+
+    /// The left indent attributes a paragraph inherits, each from the
+    /// most-derived style in its chain that sets it, else `w:pPrDefault`.
+    fn inherited_left(&self, para_style: Option<&str>) -> LeftInd {
+        para_style
+            .or(self.default_paragraph.as_deref())
+            .map(|s| self.fold_left(s, &mut HashSet::new()))
+            .unwrap_or_default()
+            .or(self.default_left)
+    }
+
     fn fold_rtl(&self, id: &str, seen: &mut HashSet<String>) -> Option<bool> {
         if !seen.insert(id.to_string()) {
             return None;
@@ -401,6 +451,31 @@ impl StyleSheet {
         let def = self.styles.get(id)?;
         let base = def.based_on.as_ref().and_then(|b| self.fold_rtl(b, seen));
         def.rtl.or(base)
+    }
+
+    /// The left indent a paragraph with no direct one takes from its styles.
+    /// The twips (`w:left`, else `w:start`) and the character units
+    /// (`w:leftChars`, else `w:startChars`) are each inherited from the
+    /// most-derived style in its chain (from `para_style`, else the default
+    /// paragraph style, which is reached through `basedOn` too) that sets
+    /// them, else from `w:docDefaults`' `w:pPrDefault`. A nonzero character
+    /// count wins over the twips (as in Word) and is `Some(1)`: callers ask
+    /// only whether it is nonzero ([`Self::style_left_in_chars`] says it is
+    /// one). `None` when nothing sets one (#1815).
+    pub fn style_left_indent(&self, para_style: Option<&str>) -> Option<i32> {
+        let left = self.inherited_left(para_style);
+        if left.chars.is_some_and(|c| c != 0) {
+            return Some(1);
+        }
+        left.twips
+    }
+
+    /// Whether the left indent a paragraph inherits is a nonzero character
+    /// count, which a direct `w:left` beats only beside a `w:leftChars="0"`.
+    pub fn style_left_in_chars(&self, para_style: Option<&str>) -> bool {
+        self.inherited_left(para_style)
+            .chars
+            .is_some_and(|c| c != 0)
     }
 
     /// Tab stops for a paragraph style (the most-derived style that defines any,
@@ -515,7 +590,9 @@ pub fn parse_styles_xml(xml: &str) -> StyleSheet {
     loop {
         match p.next() {
             Event::Start => match p.name() {
-                "w:docDefaults" => parse_doc_defaults(&mut p, &mut ss.default_run),
+                "w:docDefaults" => {
+                    parse_doc_defaults(&mut p, &mut ss.default_run, &mut ss.default_left)
+                }
                 "w:style" => {
                     let id = p.attr("w:styleId").to_string();
                     let ty = p.attr("w:type");
@@ -574,11 +651,30 @@ fn parse_style(p: &mut XmlParser) -> StyleDef {
     def
 }
 
-fn parse_doc_defaults(p: &mut XmlParser, run: &mut PartialRun) {
+fn parse_doc_defaults(p: &mut XmlParser, run: &mut PartialRun, left: &mut LeftInd) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
                 "w:rPrDefault" => parse_rpr_default(p, run),
+                "w:pPrDefault" => parse_ppr_default(p, left),
+                _ => p.skip_element(),
+            },
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+}
+
+/// `w:pPrDefault`: only its `w:pPr/w:ind` left indent is read.
+fn parse_ppr_default(p: &mut XmlParser, left: &mut LeftInd) {
+    loop {
+        match p.next() {
+            Event::Start => match p.name() {
+                "w:pPr" => {
+                    let mut def = StyleDef::default();
+                    parse_style_ppr(p, &mut def);
+                    *left = def.left;
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
@@ -672,11 +768,24 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
                     p.skip_element();
                 }
                 "w:numPr" => def.num_pr = Some(parse_style_numpr(p)),
+                "w:ind" => {
+                    def.left = parse_ind_left(p);
+                    p.skip_element();
+                }
                 _ => p.skip_element(),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+}
+
+/// The left indent attributes of a `w:ind` (at its start tag).
+fn parse_ind_left(p: &XmlParser) -> LeftInd {
+    let num = |name: &str| p.attr(name).trim().parse::<i32>().ok();
+    LeftInd {
+        twips: num("w:left").or_else(|| num("w:start")),
+        chars: num("w:leftChars").or_else(|| num("w:startChars")),
     }
 }
 
@@ -1172,6 +1281,87 @@ mod tests {
         // The other flag is independent.
         let (style, props) = par(Some("Child"), &[]);
         assert!(!ss.effective_ppr_flag(style.as_deref(), &props, PprFlag::SuppressLineNumbers));
+    }
+
+    /// #1815: the left indent a paragraph takes from its styles.
+    #[test]
+    fn style_left_indent_follows_the_chain() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:styleId="Base"><w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+            <w:style w:styleId="Child"><w:basedOn w:val="Base"/></w:style>
+            <w:style w:styleId="Flat"><w:basedOn w:val="Base"/><w:pPr><w:ind w:left="0"/></w:pPr></w:style>
+            <w:style w:styleId="Start"><w:pPr><w:ind w:start="360"/></w:pPr></w:style>
+            <w:style w:styleId="Both"><w:pPr><w:ind w:left="200" w:start="360"/></w:pPr></w:style>
+            <w:style w:styleId="Neg"><w:pPr><w:ind w:left="-360"/></w:pPr></w:style>
+            <w:style w:styleId="Chars"><w:pPr><w:ind w:left="0" w:leftChars="200"/></w:pPr></w:style>
+            <w:style w:styleId="StartChars"><w:pPr><w:ind w:startChars="100"/></w:pPr></w:style>
+            <w:style w:styleId="ZeroChars"><w:pPr><w:ind w:leftChars="0" w:left="720"/></w:pPr></w:style>
+            <w:style w:styleId="Hanging"><w:pPr><w:ind w:hanging="360"/></w:pPr></w:style>
+            <w:style w:styleId="A"><w:basedOn w:val="B"/></w:style>
+            <w:style w:styleId="B"><w:basedOn w:val="A"/></w:style>
+            </w:styles>"#,
+        );
+        let left = |s: &str| ss.style_left_indent(Some(s));
+        assert_eq!(left("Base"), Some(720));
+        assert_eq!(left("Child"), Some(720), "basedOn");
+        assert_eq!(left("Flat"), Some(0), "most-derived wins");
+        assert_eq!(left("Start"), Some(360));
+        assert_eq!(left("Both"), Some(200), "w:left before w:start");
+        assert_eq!(left("Neg"), Some(-360));
+        assert_eq!(left("Chars"), Some(1), "characters win over twips");
+        assert_eq!(left("StartChars"), Some(1));
+        assert_eq!(left("ZeroChars"), Some(720), "a zero count is absent");
+        assert_eq!(left("Hanging"), None);
+        assert_eq!(left("A"), None, "a cycle ends");
+        assert!(ss.style_left_in_chars(Some("Chars")));
+        assert!(!ss.style_left_in_chars(Some("ZeroChars")));
+        assert!(!ss.style_left_in_chars(Some("Base")));
+        assert_eq!(left("Missing"), None);
+        assert_eq!(ss.style_left_indent(None), None);
+    }
+
+    /// #1815 r1: the twips and the character units are inherited apart, so
+    /// a derived `w:left` does not hide a base's character count, and a
+    /// derived zero count cancels it.
+    #[test]
+    fn style_left_indent_inherits_twips_and_chars_apart() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:docDefaults><w:pPrDefault><w:pPr><w:ind w:leftChars="300"/></w:pPr></w:pPrDefault></w:docDefaults>
+            <w:style w:styleId="Base"><w:pPr><w:ind w:leftChars="200"/></w:pPr></w:style>
+            <w:style w:styleId="Twips"><w:basedOn w:val="Base"/><w:pPr><w:ind w:left="0"/></w:pPr></w:style>
+            <w:style w:styleId="Cancel"><w:basedOn w:val="Base"/><w:pPr><w:ind w:leftChars="0" w:left="360"/></w:pPr></w:style>
+            <w:style w:styleId="Own"><w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+            </w:styles>"#,
+        );
+        assert_eq!(ss.style_left_indent(Some("Twips")), Some(1));
+        assert!(ss.style_left_in_chars(Some("Twips")));
+        assert_eq!(ss.style_left_indent(Some("Cancel")), Some(360));
+        assert!(!ss.style_left_in_chars(Some("Cancel")));
+        // The pPrDefault's count is inherited under a style's twips too.
+        assert_eq!(ss.style_left_indent(Some("Own")), Some(1));
+    }
+
+    /// #1815: the default paragraph style applies without a `w:pStyle`, and
+    /// `w:pPrDefault` is the last fallback.
+    #[test]
+    fn style_left_indent_falls_back_to_defaults() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:docDefaults><w:pPrDefault><w:pPr><w:ind w:left="100"/></w:pPr></w:pPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+            <w:style w:styleId="Plain"/>
+            <w:style w:styleId="OnNormal"><w:basedOn w:val="Normal"/></w:style>
+            </w:styles>"#,
+        );
+        assert_eq!(ss.style_left_indent(None), Some(720));
+        assert_eq!(ss.style_left_indent(Some("OnNormal")), Some(720));
+        assert_eq!(ss.style_left_indent(Some("Plain")), Some(100));
+        let ss = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:pPrDefault><w:pPr><w:ind w:left="100"/></w:pPr></w:pPrDefault></w:docDefaults></w:styles>"#,
+        );
+        assert_eq!(ss.style_left_indent(None), Some(100));
     }
 
     #[test]

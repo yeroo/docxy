@@ -120,6 +120,16 @@
   direct left" from that base (by paragraph path), not from an earlier move
   of the same drag (#1814); a move whose editor is no longer the one the base
   came from (a header closed mid-drag) passes an empty base.
+- A non-list paragraph whose style chain (`StyleSheet::style_left_indent`:
+  `basedOn`, the default paragraph style, then `w:pPrDefault`; twips and
+  `w:leftChars`/`w:startChars` inherited apart, a nonzero count winning)
+  gives a nonzero left pins `w:left="0"` the same way (#1815,
+  `IndentFallback::StyleLeft`; over a count the pin keeps or adds
+  `w:leftChars="0"`, which a lone `w:left` would lose to): at 0 in Decrease when
+  its left was loaded (it stays loaded as it moves), in `set_indent` when it
+  was direct at the start, and any `set_indent` above 0 on it counts as
+  loaded. The steps are not relative to the style's indent (an Increase from
+  none writes 720 over a 720 style; a follow-up). Needs the styles context.
 - `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
