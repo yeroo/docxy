@@ -369,9 +369,6 @@ struct Scheduler<'a> {
     /// because every caller holds the index; an assignment belongs to a task
     /// by UID, so duplicate-UID tasks share their assignments' extents.
     scheduled_spans: Vec<i64>,
-    /// The delayed flat-work extents of the tasks on the 24x7 clock
-    /// ([`on_the_clock`]), in wall-clock minutes by task UID (#484).
-    elapsed_extents: HashMap<i32, i64>,
     /// The calendar summaries measure their spans and slack on.
     summary_cal: WorkCalendar,
     /// Each manual summary's own start and finish (absolute minutes).
@@ -535,12 +532,6 @@ impl<'a> Scheduler<'a> {
                     .or_insert(extent);
             }
         }
-        let elapsed_extents: HashMap<i32, i64> = proj
-            .tasks
-            .iter()
-            .filter(|t| on_the_clock(t))
-            .filter_map(|t| extents.get(&t.uid).map(|&extent| (t.uid, extent)))
-            .collect();
         // An elapsed task's span is wall-clock minutes here (#484): no
         // index arithmetic reads it (`Scheduler::elapsed` takes every such
         // site), and as a horizon budget it over-estimates, which is safe.
@@ -745,7 +736,6 @@ impl<'a> Scheduler<'a> {
             earliest_origin,
             durations,
             scheduled_spans,
-            elapsed_extents,
             floors: manual_summary_floors(proj, &manual_spans),
             summary_cal,
             manual_spans,
@@ -756,14 +746,10 @@ impl<'a> Scheduler<'a> {
     /// clock, start included, so its dates are instants, not working
     /// indexes. `None` for a working, zero-length or tracked task (a tracked
     /// one stays on its actuals, unmeasured for an elapsed one).
-    /// Its span is its duration, extended when a delayed flat-work
-    /// assignment runs past it (#469), all in wall-clock minutes
+    /// A delayed assignment does not extend it
     /// ([`crate::assign::delayed_extent_min`]).
     fn elapsed(&self, task: &Task) -> Option<i64> {
-        on_the_clock(task).then(|| {
-            let extent = self.elapsed_extents.get(&task.uid).copied().unwrap_or(0);
-            task.duration_min.max(extent)
-        })
+        on_the_clock(task).then_some(task.duration_min)
     }
 
     /// The calendar whose timeline `tl()` returns for `task`.

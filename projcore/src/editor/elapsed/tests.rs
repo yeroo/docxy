@@ -5,7 +5,8 @@ fn at(day: u32, hour: u32) -> DateTime {
 }
 
 /// Task 1 of three days from Mon 2 March 08:00, typed `kind`, with Alice at
-/// 100% on it. `elapsed`: 72 elapsed hours (format 8) and Alice's work
+/// 100% on it, and Bob at 100% for a third of its work after a two-hour
+/// Delay (working time on every task, r8). `elapsed`: 72 elapsed hours (format 8) and Alice's work
 /// counted over them; else the same task converted by hand, three working
 /// days (no format), every minute a third. `started`: a third done (actual
 /// duration and Alice's actual work), from Mon 08:00.
@@ -30,23 +31,44 @@ fn plan(elapsed: bool, kind: Option<TaskType>, manual: bool, started: bool) -> E
             percent_complete: started.then_some(33),
             ..Task::default()
         }],
-        resources: vec![Resource {
-            uid: 1,
-            id: 1,
-            name: "Alice".into(),
-            kind: ResourceType::Work,
-            max_units: 1.0,
-            ..Resource::default()
-        }],
-        assignments: vec![Assignment {
-            uid: 1,
-            task_uid: 1,
-            resource_uid: 1,
-            units: 1.0,
-            work_min: m(1440),
-            actual_work_min: started.then(|| m(480)),
-            ..Assignment::default()
-        }],
+        resources: vec![
+            Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                ..Resource::default()
+            },
+            Resource {
+                uid: 2,
+                id: 2,
+                name: "Bob".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                ..Resource::default()
+            },
+        ],
+        assignments: vec![
+            Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: m(1440),
+                actual_work_min: started.then(|| m(480)),
+                ..Assignment::default()
+            },
+            Assignment {
+                uid: 2,
+                task_uid: 1,
+                resource_uid: 2,
+                units: 1.0,
+                work_min: m(480),
+                delay: Some(120 * 10),
+                ..Assignment::default()
+            },
+        ],
         ..Project::default()
     })
 }
@@ -102,10 +124,14 @@ impl Entry {
 fn facts(ed: &Editor) -> String {
     let t = ed.project().task(1).unwrap();
     let a = &ed.project().assignments[0];
+    let bob = ed.project().assignments.get(1).map(|b| {
+        let span = crate::assign::assignment_span(ed.project(), ed.schedule(), b);
+        format!("{:.6} {} {:?} {:?}", b.units, b.work_min, b.delay, span)
+    });
     format!(
         "duration {} format {:?} estimated {:?} manual {:?} pin {:?}..{:?} \
          actual {:?}..{:?} {:?} remaining {:?} percent {:?} constraint {:?} \
-         | units {:.6} work {} actual work {:?} overtime {:?}",
+         | units {:.6} work {} actual work {:?} overtime {:?} | bob {bob:?}",
         t.duration_min,
         t.duration_format,
         t.estimated,

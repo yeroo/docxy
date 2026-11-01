@@ -44,8 +44,9 @@ impl Editor {
     /// working minutes), and `working` the working minutes the window covers
     /// on its calendar. The duration becomes `working`; the actual,
     /// remaining and manual durations, and its work resources' actual and
-    /// actual overtime work, scale by `working / duration`; its assignments'
-    /// work follows at the same units (`scale_work`, every task type); the
+    /// actual overtime work, scale by `working / duration`; so does their
+    /// work, at the same units (every task type: the same span re-expressed,
+    /// an assignment shorter than the task staying its share of it); the
     /// format moves to the same unit in working time. The edit's refresh then
     /// derives cost, remaining work and % work complete.
     ///
@@ -152,7 +153,9 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64) {
         rescale_work(proj, i, elapsed, 0);
         return;
     }
-    scale_work(proj, i, elapsed, working);
+    // Every work figure by the window's factor, flat work included: an
+    // assignment shorter than its task stays its share of it (`rescale_work`
+    // would recompute flat work as the whole duration at its units).
     let Project {
         assignments,
         resources,
@@ -163,6 +166,7 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64) {
         if kind.is_some_and(|r| r.kind != ResourceType::Work) {
             continue;
         }
+        a.set_work(scale(a.work_min));
         a.actual_work_min = a.actual_work_min.map(scale);
         a.actual_overtime_work_min = a.actual_overtime_work_min.map(scale);
     }

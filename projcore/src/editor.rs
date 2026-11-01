@@ -1892,19 +1892,7 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
         effort::fixed_work_units(proj, i, new_min);
         return;
     }
-    scale_work(proj, i, old_min, new_min);
-}
-
-/// [`rescale_work`]'s work rule for every task type, Fixed Work included:
-/// the units stay and the work follows the duration. Alone, it is what an
-/// elapsed task's move to working time does to its work
-/// (`Editor::elapsed_to_working`, #484): the same span re-expressed, so no
-/// effort changes and no units either.
-fn scale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
-    if proj.is_outline_summary(i) {
-        return;
-    }
-    let uid = proj.tasks[i].uid;
+    let uid = t.uid;
     let Project {
         assignments,
         resources,

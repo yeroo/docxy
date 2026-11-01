@@ -2035,10 +2035,10 @@
   is its elapsed duration from its actual start, else its scheduled start
   (never the tracked schedule's span, which counts it as working minutes);
   the duration becomes the working minutes the window covers, the actual,
-  remaining and manual durations and the work resources' actual and actual
-  overtime work scale alike, the assignments' work follows at the same
-  units for every task type (`scale_work`), and the format moves to the same
-  unit in working time. A window with no working time (an FS follower over
+  remaining and manual durations and the work resources' work, actual and
+  actual overtime work scale alike (units kept for every task type, so an
+  assignment shorter than its task stays its share of it), and the format
+  moves to the same unit in working time. A window with no working time (an FS follower over
   a night or a weekend), or no start, refuses a progress write and any write
   on a task with progress; a write that replaces the duration (a typed
   duration, Ctrl+Delete, a milestone toggle, a manual finish) takes the task
@@ -2061,12 +2061,16 @@
   allows (`elapsed_pred_bound`: the morning side of the successor's index,
   or its exact instant for an elapsed successor or an FS milestone) and its
   late start that duration before. Its four slacks are wall-clock minutes
-  (late less early instants). Its flat-work assignments run on the same
-  clock (`schedule::on_the_clock`, `assign::assignment_span`): the task's
-  start plus the Delay and LevelingDelay as minutes, unsnapped, then work /
-  units, so at the units its work was counted at an assignment finishes
-  with the task; a delayed one extends the task by that wall-clock extent
-  (`delayed_extent_min`, #469) as a working task's does. Unmeasured. Measured (Project 2024): unlinked, on
+  (late less early instants). An assignment's Delay is working time on
+  every task (a LevelingDelay by its format), so on an elapsed task too,
+  and the conversion leaves it as it is; a flat-work assignment's work /
+  units then runs on the clock (`schedule::on_the_clock`,
+  `assign::assignment_span`), so an undelayed one at the units its work was
+  counted at finishes with the task. A delayed one does not extend an
+  elapsed task (`delayed_extent_min` is none there: a working delay plus
+  wall-clock work reaches a point that depends on the task's start), so it
+  may finish after its task (a known limit). Unmeasured; no corpus
+  assignment is on an elapsed task. Measured (Project 2024): unlinked, on
   08:00 and 08:30 calendars (snapshots 15..46 UID 25: start 08:00, finish
   +72 h, slack 260400 tenths). Unmeasured, following the rule: links,
   constraints, ALAP, a stored leveling delay (added unsnapped), a percent
