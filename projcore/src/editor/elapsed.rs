@@ -13,9 +13,27 @@
 use super::*;
 
 /// The refusal of a working-time edit on an elapsed task whose wall-clock
-/// window holds no working time ([`Editor::elapsed_to_working`]).
+/// window holds no working time while it has progress to re-express
+/// ([`Editor::elapsed_to_working`]).
 pub(super) const ELAPSED_NO_WORKING_TIME: &str =
-    "This elapsed task spans no working time; progress is counted in working time";
+    "This elapsed task spans no working time; durations and progress are edited in working time";
+
+/// What a write of working minutes over an elapsed task does
+/// ([`Editor::in_working_time`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Write {
+    /// A typed duration (`update_task_with`): it replaces the duration, so
+    /// it needs no window, and it is a change of the task even when the
+    /// minutes typed are the ones the conversion gave (`1d` on `1 eday`
+    /// from a Monday morning): the duration is now working time.
+    Duration,
+    /// A manual task's typed finish: it replaces the duration, so it needs
+    /// no window; its own pinned finish again changes nothing.
+    Finish,
+    /// A progress setter: the progress is counted in the window's working
+    /// time, so a window with none refuses it.
+    Progress,
+}
 
 impl Editor {
     /// Re-express task `i` in working time when it is elapsed, in the
@@ -28,56 +46,82 @@ impl Editor {
     /// actual overtime work, scale by `working / duration`; its assignments'
     /// work follows at the same units (`scale_work`, every task type); the
     /// format moves to the same unit in working time. The edit's refresh then
-    /// derives cost, remaining work and % work complete. Refused, changing
-    /// nothing, with no start or a window with no working time (a weekend):
-    /// the task would become a milestone. A working task is left alone.
-    pub(super) fn elapsed_to_working(&mut self, i: usize) -> Result<(), String> {
+    /// derives cost, remaining work and % work complete.
+    ///
+    /// A window with no working time (an FS follower over a night or a
+    /// weekend), or no start, has nothing to scale by: a `Progress` write,
+    /// or any write on a task with progress (an actual start, duration or
+    /// work), is refused, changing nothing. A write that replaces the
+    /// duration takes the task to zero working minutes, its work by the
+    /// rule of a duration going to zero ([`rescale_work`]: the units stay,
+    /// a Fixed Work task keeps its work), so the write's own duration then
+    /// sets the work from the units, or the units from a Fixed Work task's
+    /// work. A working task is left alone.
+    pub(super) fn elapsed_to_working(&mut self, i: usize, write: Write) -> Result<(), String> {
         let task = &self.proj.tasks[i];
         if !task.elapsed_duration() {
             return Ok(());
         }
+        let elapsed = task.duration_min.max(0);
+        let replaces = write != Write::Progress && !has_progress(&self.proj, i);
         let start = task
             .actual_start
-            .or_else(|| self.sched.get(task.uid).map(|r| r.early_start))
-            .ok_or("The task has no start")?;
-        let calendar = crate::assign::task_calendar(&self.proj, task);
-        let elapsed = task.duration_min.max(0);
-        let working =
-            crate::schedule::working_minutes_on(&calendar, start, start.add_minutes(elapsed));
-        if elapsed > 0 && working <= 0 {
+            .or_else(|| self.sched.get(task.uid).map(|r| r.early_start));
+        let working = match start {
+            Some(start) => {
+                let calendar = crate::assign::task_calendar(&self.proj, task);
+                crate::schedule::working_minutes_on(&calendar, start, start.add_minutes(elapsed))
+            }
+            None if replaces => 0,
+            None => return Err("The task has no start".into()),
+        };
+        if elapsed > 0 && working <= 0 && !replaces {
             return Err(ELAPSED_NO_WORKING_TIME.into());
         }
-        self.edit_row(i, |proj, _| to_working_time(proj, i, working))
+        self.edit_row(i, |proj, _| to_working_time(proj, i, working.max(0)))
     }
 
     /// Run `edit` on elapsed task `i` re-expressed in working time first
     /// ([`Self::elapsed_to_working`]), as one undo step. An `edit` that
-    /// fails, or changes nothing itself, leaves the task as it was (a batch
-    /// this one runs inside keeps the conversion of an `edit` that changed
-    /// nothing, and rolls a failure back with the rest). The callers
-    /// re-enter themselves in `edit`; the task is no longer elapsed there.
+    /// fails, or (except a typed duration, [`Write::Duration`]) makes no
+    /// change of its own, leaves the editor as it was, also inside an outer
+    /// batch, which the conversion then never reaches. The callers re-enter
+    /// themselves in `edit`; the task is no longer elapsed there.
     pub(super) fn in_working_time<T>(
         &mut self,
         i: usize,
+        write: Write,
         edit: impl FnOnce(&mut Editor) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut kept = None;
-        let result = self.batch(|ed| {
-            ed.elapsed_to_working(i)?;
-            let pushes = ed.pushes;
-            let value = edit(ed)?;
-            if ed.pushes == pushes {
-                // Unchanged: roll the conversion back with the batch.
-                kept = Some(value);
-                return Err(String::new());
+        self.batch(|ed| {
+            let point = ed.savepoint();
+            let mut converted = None;
+            let result = ed.elapsed_to_working(i, write).and_then(|()| {
+                converted = Some(ed.pushes);
+                edit(ed)
+            });
+            let unchanged = converted == Some(ed.pushes) && write != Write::Duration;
+            if result.is_err() || unchanged {
+                ed.rollback_to(point);
             }
-            Ok(value)
-        });
-        match kept {
-            Some(value) => Ok(value),
-            None => result,
-        }
+            result
+        })
     }
+}
+
+/// Whether task `i` has progress the conversion has to re-express: an
+/// actual start, finish or duration, or actual work on it.
+fn has_progress(proj: &Project, i: usize) -> bool {
+    let t = &proj.tasks[i];
+    let some = |m: Option<i64>| m.is_some_and(|m| m > 0);
+    t.actual_start.is_some()
+        || t.actual_finish.is_some()
+        || some(t.actual_duration_min)
+        || proj
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == t.uid)
+            .any(|a| some(a.actual_work_min) || some(a.actual_overtime_work_min))
 }
 
 /// [`Editor::elapsed_to_working`]'s rewrite of task `i` over `working`
@@ -102,6 +146,11 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64) {
         return;
     }
     let uid = t.uid;
+    if working == 0 {
+        // Nothing to re-express the work by: a duration going to zero.
+        rescale_work(proj, i, elapsed, 0);
+        return;
+    }
     scale_work(proj, i, elapsed, working);
     let Project {
         assignments,

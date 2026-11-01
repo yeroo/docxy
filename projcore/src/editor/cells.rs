@@ -201,7 +201,9 @@ impl Editor {
         // A manual task's finish writes its working minutes to it: an
         // elapsed one moves to working time first (#484).
         if task.elapsed_duration() {
-            return self.in_working_time(i, |ed| ed.set_finish_at(uid, finish));
+            return self.in_working_time(i, crate::editor::elapsed::Write::Finish, |ed| {
+                ed.set_finish_at(uid, finish)
+            });
         }
         self.validate_pinned_day(finish)?;
         let start = match task.pinned_dates().or_else(|| task.manual_summary_dates()) {

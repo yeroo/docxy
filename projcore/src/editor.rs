@@ -1136,11 +1136,16 @@ impl Editor {
         reentry: bool,
     ) -> Result<(), String> {
         let i = self.index(uid)?;
-        // New working minutes over an elapsed task: the task in working time
-        // first (#484). The same minutes again are a re-entry, not a write.
+        // A duration over an elapsed task is working minutes, whatever its
+        // number: the task in working time first (#484), compared there. So
+        // a copied elapsed cell pasted back (`9d` for `3 edays`) is nine
+        // working days; that edit text is the display follow-up's. An
+        // external leaf's dates are not ours: it is never converted.
         let t = &self.proj.tasks[i];
-        if t.elapsed_duration() && patch.duration_min.is_some_and(|m| m != t.duration_min) {
-            return self.in_working_time(i, |ed| ed.update_task_with(uid, patch, reentry));
+        if t.elapsed_duration() && !t.is_external_leaf() && patch.duration_min.is_some() {
+            return self.in_working_time(i, elapsed::Write::Duration, |ed| {
+                ed.update_task_with(uid, patch, reentry)
+            });
         }
         if patch.name.is_none()
             && patch.duration_min.is_none()

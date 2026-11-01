@@ -2038,11 +2038,20 @@
   remaining and manual durations and the work resources' actual and actual
   overtime work scale alike, the assignments' work follows at the same
   units for every task type (`scale_work`), and the format moves to the same
-  unit in working time. A window with no working time (a weekend), or no
-  start, refuses the write; an edit that fails or changes nothing rolls the
-  conversion back. The same minutes typed again are a re-entry and convert
-  nothing. An auto task's typed finish is a constraint and keeps the
-  format, and an effort recalculation (work / units, the work counted over
+  unit in working time. A window with no working time (an FS follower over
+  a night or a weekend), or no start, refuses a progress write and any write
+  on a task with progress; a write that replaces the duration (a typed
+  duration, Ctrl+Delete, a milestone toggle, a manual finish) takes the task
+  to zero working minutes first, its work as for a duration going to zero
+  (`rescale_work`: units kept, Fixed Work keeps its work). A progress write
+  or manual finish that fails or changes nothing rolls the conversion back
+  by hand (`Editor::savepoint`/`rollback_to`), also inside an outer batch
+  (projctl `task.set`, a paste); a typed duration is always a change, even
+  of the minutes the conversion gave (`1d` on `1 eday` from a Monday
+  morning). Any duration on an elapsed task is working minutes, whatever
+  its number, so a copied elapsed cell pasted back (`9d` for `3 edays`)
+  is nine working days: that edit text is a display follow-up. An auto
+  task's typed finish is a constraint and keeps the format, and an effort recalculation (work / units, the work counted over
   the elapsed minutes) is elapsed minutes and keeps it too. Unmeasured:
   Project keeps progress and typed durations on an elapsed duration.
 - The schedule runs an automatic elapsed leaf on the 24x7 clock, start

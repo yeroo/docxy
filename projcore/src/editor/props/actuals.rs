@@ -134,7 +134,9 @@ impl Editor {
     pub fn set_actual_start(&mut self, uid: i32, start: Option<DateTime>) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         if self.proj.tasks[i].elapsed_duration() {
-            return self.in_working_time(i, |ed| ed.set_actual_start(uid, start));
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_start(uid, start)
+            });
         }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
@@ -179,7 +181,9 @@ impl Editor {
     ) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         if self.proj.tasks[i].elapsed_duration() {
-            return self.in_working_time(i, |ed| ed.set_actual_finish(uid, finish));
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_finish(uid, finish)
+            });
         }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
@@ -233,7 +237,9 @@ impl Editor {
     pub fn set_actual_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         if self.proj.tasks[i].elapsed_duration() {
-            return self.in_working_time(i, |ed| ed.set_actual_duration(uid, minutes));
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_actual_duration(uid, minutes)
+            });
         }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
@@ -266,7 +272,9 @@ impl Editor {
     pub fn set_remaining_duration(&mut self, uid: i32, minutes: i64) -> Result<bool, String> {
         let i = self.progress_row(uid)?;
         if self.proj.tasks[i].elapsed_duration() {
-            return self.in_working_time(i, |ed| ed.set_remaining_duration(uid, minutes));
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
+                ed.set_remaining_duration(uid, minutes)
+            });
         }
         let mut p = Progress::of(&self.proj.tasks[i]);
         let old = p;
@@ -333,7 +341,7 @@ impl Editor {
             .filter(|p| *p <= 100)
             .ok_or("% Complete is 0 to 100")?;
         if self.proj.tasks[i].elapsed_duration() {
-            return self.in_working_time(i, |ed| {
+            return self.in_working_time(i, crate::editor::elapsed::Write::Progress, |ed| {
                 ed.set_percent_complete_synced(uid, i32::from(percent))
             });
         }
