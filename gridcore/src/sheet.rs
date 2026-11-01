@@ -2544,7 +2544,9 @@ pub enum ExtKind {
 
 /// An Excel 2010 conditional-formatting or data-validation element in the
 /// worksheet's `extLst`: it is not evaluated, only moved with the edits that
-/// move its ranges and formulas, so a save can write them back.
+/// move its ranges and formulas, so a save can write them back. A
+/// validation's settings are read for the Data Validation dialog only
+/// ([`ExtRule::validation`], #1817); entry checking stays classic.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtRule {
     pub kind: ExtKind,

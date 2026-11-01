@@ -1910,6 +1910,29 @@
   (`model_edits_for`), so ones added after a table step follow its Undo/Redo;
   the step's recorded `model_edits` still restore its `#REF!` cases.
 
+## Data Validation dialog shows x14 rules (#1817)
+
+- The loader reads an `<x14:dataValidation>`'s attributes as a classic
+  `<dataValidation>`'s (`read_dv_attrs`, one reader for both) into
+  `ExtRule::validation` (`ExtValidation`: the attributes, and which of
+  `ExtRule::formulas` are formula1 and formula2, so every edit that moves the
+  formulas keeps the rule current); `ExtRule::to_validation` builds it.
+  `validation::dialog_rule_at` is what both hosts' dialogs open on and pass
+  as `current`: the classic rule covering the cell, else the first
+  meaningful x14 one. `validation_at` stays classic-only, so entry checking,
+  dropdowns, input prompts and circles still ignore x14 rules (follow-up).
+- `set_validation` with an x14 rule shown: OK of what the untouched dialog
+  makes of it (`DialogBoxes::of(..).rule(..)`, so an `operator` Excel leaves
+  out compares as `between`), over cells that all carry an x14 rule like it
+  and no classic rule, changes nothing, Apply to all or not (the suite and
+  xlsxy say "Data validation unchanged", no undo step), so the element keeps
+  its bytes. "Any value" strikes the x14 rule shown (with Apply to all those
+  like it, `cut_ext_rules_where`); one the dialog did not show stays (#1734).
+  Any other rule replaces them all with a classic `<dataValidation>` (an
+  other-sheet list included), losing attributes the model does not know
+  (`imeMode`); unmeasured against Excel. Clear All's Apply to all reaches
+  like x14 rules too. No x14 rule is ever written.
+
 ## Pivot slicer and timeline caches on save (#1797)
 
 - `remove_pivot` notes the pivot as `(sheetId, name)` in
