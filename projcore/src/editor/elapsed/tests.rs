@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::{Calendar, DayWorking, WorkingTime};
 
 fn at(day: u32, hour: u32) -> DateTime {
     DateTime::from_ymd_hm(2026, 3, day, hour, 0)
@@ -744,4 +745,113 @@ fn assignment_progress_and_overtime_convert_by_their_own_spans() {
         }
     }
     assert_eq!(compared, 2 * 3 * 3 * 3);
+}
+
+/// One elapsed leaf of `minutes` in `format` from the project start
+/// `start`, on `calendar`, with the Inspector at 100% for `work` minutes
+/// (priced at 60/h, a stored cost, regular work and overtime cost).
+fn priced_plan(
+    start: DateTime,
+    minutes: i64,
+    format: Option<u8>,
+    work: i64,
+    calendar: Calendar,
+) -> Editor {
+    let mut ed = window_plan(start, minutes, format, None, false);
+    let mut proj = ed.project().clone();
+    proj.calendars = vec![calendar];
+    proj.default_calendar_uid = 1;
+    proj.resources[0].standard_rate = crate::model::Rate::parse("60");
+    proj.resources[0].overtime_rate = crate::model::Rate::parse("90");
+    let a = &mut proj.assignments[0];
+    a.work_min = work;
+    a.overtime_work_min = Some(60);
+    a.regular_work_min = Some(work - 60);
+    a.cost = crate::model::Rate::parse("777");
+    a.overtime_cost = crate::model::Rate::parse("9000");
+    ed = Editor::new(proj);
+    ed
+}
+
+/// r12 M1: an elapsed task from Fri 17:00 (its window to Mon 17:00 holds
+/// Monday) with the Inspector's two hours Fri 17:00 to 19:00, no working
+/// time. With her actual work entered, a progress write on the task would
+/// lose it: refused, the plan as it was. Without, she takes the window's
+/// factor (480 of 4320): 13 of her 120 minutes.
+#[test]
+fn an_assignment_span_with_no_working_time_refuses_or_takes_the_window() {
+    let plan = || {
+        let mut ed = window_plan(at(6, 17), 4320, Some(8), None, false);
+        let mut proj = ed.project().clone();
+        proj.assignments[0].work_min = 120;
+        ed = Editor::new(proj);
+        ed
+    };
+    let mut ed = plan();
+    let patch = crate::editor::AssignmentPatch {
+        actual_work_min: Some(120),
+        ..Default::default()
+    };
+    ed.set_assignment(1, patch).unwrap();
+    let before = ed.project().clone();
+    let depth = ed.undo_depth();
+    assert_eq!(
+        ed.set_actual_start(1, Some(at(6, 17))).map(drop),
+        Err(ELAPSED_NO_WORKING_TIME.to_string())
+    );
+    assert_eq!(ed.project(), &before);
+    assert_eq!(ed.undo_depth(), depth);
+    // Without actuals: the window's factor, and the write applies.
+    let mut ed = plan();
+    ed.set_actual_start(1, Some(at(6, 17))).unwrap();
+    let a = &ed.project().assignments[0];
+    assert_eq!(a.work_min, 120 * 480 / 4320);
+    assert!(!ed.project().task(1).unwrap().elapsed_duration());
+    assert_eq!(ed.undo_depth(), 1);
+}
+
+/// r12 M2: a conversion that leaves an assignment's work as it is (a
+/// factor of 1: four elapsed hours from Monday 08:00 to 12:00, or any span
+/// on a 24-hour calendar) keeps its priced fields, as the same progress
+/// write on its working twin does.
+#[test]
+fn a_conversion_of_factor_one_keeps_the_priced_fields() {
+    let all_day = Calendar {
+        week: std::array::from_fn(|_| {
+            Some(DayWorking {
+                times: vec![WorkingTime { from: 0, to: 1440 }],
+            })
+        }),
+        ..Calendar::standard(1)
+    };
+    let cases = [
+        ("4 ehrs from Monday", Calendar::standard(1), 240, 6, Some(5)),
+        ("3 edays all day", all_day, 4320, 8, None),
+    ];
+    for (case, calendar, minutes, code, working_code) in cases {
+        let mut elapsed = priced_plan(at(2, 8), minutes, Some(code), minutes, calendar.clone());
+        let mut working = priced_plan(at(2, 8), minutes, working_code, minutes, calendar);
+        working.set_actual_start(1, Some(at(2, 8))).unwrap();
+        elapsed.set_actual_start(1, Some(at(2, 8))).unwrap();
+        let fields = |ed: &Editor| {
+            let a = &ed.project().assignments[0];
+            format!(
+                "{} {:?} {:?} {:?} {:?} {:?} {:?}",
+                a.work_min,
+                a.regular_work_min,
+                a.overtime_work_min,
+                a.cost,
+                a.overtime_cost,
+                a.remaining_overtime_work_min,
+                a.remaining_overtime_cost
+            )
+        };
+        assert_eq!(fields(&elapsed), fields(&working), "{case}");
+        let a = &elapsed.project().assignments[0];
+        assert!(a.cost.is_some() && a.regular_work_min.is_some(), "{case}");
+        assert!(
+            !elapsed.project().task(1).unwrap().elapsed_duration(),
+            "{case}"
+        );
+    }
 }

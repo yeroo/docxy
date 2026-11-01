@@ -2042,10 +2042,15 @@
   wall-clock minutes of the span `assignment_span` dated, from its actual
   start or working Delay to its actual finish or work / units on the
   clock), so it keeps its dates over a weekend, delayed, shorter, or with
-  its own actuals; contoured work and a tracked task's the window's. The
-  refresh derives what `set_work` clears (regular work, costs, remaining
-  overtime); dates, delays, baselines, earned value, budgets and
-  protected actuals stay. The format moves to the same unit in working
+  its own actuals; contoured work and a tracked task's the window's. A
+  span holding no working time (an evening after an FS link) takes the
+  window's factor, or refuses the write (`ELAPSED_NO_WORKING_TIME`) when
+  the assignment has actual work it would lose. Only figures the factor
+  changes are rewritten, so a factor of 1 keeps the priced fields; where
+  the work changes the refresh derives what `set_work` clears (regular
+  work, costs, remaining overtime) and the planned spread is dropped;
+  dates, delays, baselines, earned value, budgets and protected actuals
+  stay. The format moves to the same unit in working
   time. A window with no working time (an FS follower over
   a night or a weekend), or no start, refuses a progress write and any write
   on a task with progress; a write that replaces the duration (a typed

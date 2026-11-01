@@ -82,7 +82,7 @@ impl Editor {
         if elapsed > 0 && working <= 0 && !replaces {
             return Err(ELAPSED_NO_WORKING_TIME.into());
         }
-        let own = self.own_spans(i, working);
+        let own = self.own_spans(i, working)?;
         self.edit_row(i, |proj, _| to_working_time(proj, i, working.max(0), &own))
     }
 
@@ -97,11 +97,14 @@ impl Editor {
     /// delayed assignment); with an actual finish its work is its recorded
     /// span's density, which its dates, read as they are, keep. None on a
     /// task off the clock (a tracked one is scheduled in working time
-    /// already), a window with no working time, or a span of no length.
-    fn own_spans(&self, i: usize, working: i64) -> Vec<(usize, Factor)> {
+    /// already), a window with no working time, or a span of no length. A
+    /// span with no working time (an evening after an FS link) takes the
+    /// window's factor, unless the assignment has actual work, which it
+    /// would lose: that refuses the conversion (`ELAPSED_NO_WORKING_TIME`).
+    fn own_spans(&self, i: usize, working: i64) -> Result<Vec<(usize, Factor)>, String> {
         let task = &self.proj.tasks[i];
         if working <= 0 || !crate::schedule::on_the_clock(task) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let calendar = crate::assign::task_calendar(&self.proj, task);
         self.proj
@@ -114,7 +117,16 @@ impl Editor {
                 let (start, finish) = crate::assign::assignment_span(&self.proj, &self.sched, a)?;
                 let wall = finish.minutes() - start.minutes();
                 let working = crate::schedule::working_minutes_on(&calendar, start, finish);
-                (wall > 0).then_some((k, Factor { working, wall }))
+                let actual = |m: Option<i64>| m.is_some_and(|m| m > 0);
+                match (wall > 0, working > 0) {
+                    (true, true) => Some(Ok((k, Factor { working, wall }))),
+                    (true, false)
+                        if actual(a.actual_work_min) || actual(a.actual_overtime_work_min) =>
+                    {
+                        Some(Err(ELAPSED_NO_WORKING_TIME.to_string()))
+                    }
+                    _ => None,
+                }
             })
             .collect()
     }
@@ -213,8 +225,9 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, Fa
     // the window's (`rescale_work` would recompute flat work as the whole
     // duration at its units). Its scheduled overtime is put back after
     // `set_work`, within the work, for the refresh to price; what `set_work`
-    // clears otherwise (regular work, costs, remaining overtime, the
-    // planned spread) the refresh derives again. Dates, delays, units,
+    // clears otherwise (regular work, costs, remaining overtime) the refresh
+    // derives again, and the planned spread, which described the old work,
+    // is dropped. Dates, delays, units,
     // baselines, earned value, budgets and Project's protected actuals (a
     // snapshot no edit maintains) stay as they are.
     let Project {
@@ -231,10 +244,18 @@ fn to_working_time(proj: &mut Project, i: usize, working: i64, own: &[(usize, Fa
             .iter()
             .find(|&&(at, _)| at == k)
             .map_or(window, |&(_, f)| f);
-        let overtime = a.overtime_work_min;
+        // Only what the factor changes is rewritten: `set_work` clears what
+        // the refresh derives, and an assignment whose inputs did not move
+        // (a factor of 1: hours from a morning, a 24-hour calendar) is not
+        // refreshed.
         let work = factor.of(a.work_min);
-        a.set_work(work);
-        a.overtime_work_min = overtime.map(|o| factor.of(o).min(work));
+        let overtime = a.overtime_work_min.map(|o| factor.of(o).min(work));
+        if work != a.work_min {
+            a.set_work(work);
+        }
+        if overtime != a.overtime_work_min {
+            a.overtime_work_min = overtime;
+        }
         a.actual_work_min = a.actual_work_min.map(|m| factor.of(m));
         a.actual_overtime_work_min = a.actual_overtime_work_min.map(|m| factor.of(m));
     }
