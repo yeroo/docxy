@@ -15,8 +15,8 @@ impl Editor {
     /// step, first recalculating a local task by its type (see [`recalculate`]).
     /// A new duration is checked against the scheduling horizon before
     /// anything changes. A manual task keeps its start and its finish
-    /// follows; the estimate and the milestone flag are left alone. An
-    /// external leaf keeps the assignment work staged against its stored
+    /// follows; the estimate and the milestone flag are left alone, and an
+    /// elapsed task keeps its elapsed format (#484). An external leaf keeps the assignment work staged against its stored
     /// duration; it never enters the local effort recalculation.
     pub(super) fn commit_assignments(
         &mut self,
@@ -37,7 +37,10 @@ impl Editor {
             proj.resources = resources;
             proj.assignments = assignments;
             if let Some(d) = duration {
-                apply_duration(&mut proj.tasks[i], d, changed);
+                // Work / units, with the work counted over the stored
+                // duration: elapsed minutes on an elapsed task, which keeps
+                // its format (#484).
+                apply_duration_in_unit(&mut proj.tasks[i], d, changed);
             }
         })?;
         if changed {

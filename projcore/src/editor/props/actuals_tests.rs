@@ -1,3 +1,4 @@
+use super::actuals::ELAPSED_NO_WORKING_TIME;
 use super::*;
 use crate::mspdi::{read_mspdi, write_mspdi};
 
@@ -474,4 +475,141 @@ fn a_synced_percent_follows_a_duration_that_moved() {
     let mut ed = Editor::new(proj);
     assert_eq!(ed.set_percent_complete_synced(2, 50), Ok(true));
     assert_eq!(pour(&ed).actual_duration_min, Some(1440));
+}
+
+// ---- elapsed tasks (#484) ----
+
+/// An elapsed (`DurationFormat` 8) task `uid` of 72 elapsed hours, started
+/// Mon 2 March 08:00 with `actual` minutes done, in a plan starting then.
+fn started_elapsed(uid: i32, actual: Option<i64>) -> Task {
+    Task {
+        uid,
+        id: uid,
+        name: format!("E{uid}"),
+        outline_level: 1,
+        duration_min: 4320,
+        duration_format: Some(8),
+        actual_start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+        actual_duration_min: actual,
+        ..Task::default()
+    }
+}
+
+fn elapsed_plan(tasks: Vec<Task>) -> Editor {
+    Editor::new(Project {
+        start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+        tasks,
+        ..Project::default()
+    })
+}
+
+/// Progress on an elapsed task is re-expressed over its wall-clock window
+/// (72 elapsed hours from Mon 08:00 cover three working days, to Thu 08:00),
+/// not its scheduled span, which the tracked path already inflates, and the
+/// duration is working time from then on (r1 M1, r2 M1).
+#[test]
+fn progress_on_an_elapsed_task_counts_its_wall_clock_window() {
+    let mut unstarted = started_elapsed(2, None);
+    unstarted.actual_start = None;
+    let mut ed = elapsed_plan(vec![started_elapsed(1, Some(1440)), unstarted]);
+    ed.set_percent_complete_synced(1, 50).unwrap();
+    let t = ed.project().task(1).unwrap();
+    assert_eq!((t.duration_min, t.duration_format), (3 * 480, None));
+    assert_eq!(
+        (
+            t.actual_duration_min,
+            t.remaining_duration_min,
+            t.percent_complete
+        ),
+        (Some(720), Some(720), Some(50))
+    );
+    // Unstarted, from its scheduled start: an actual of one day is a third.
+    ed.set_actual_duration(2, 480).unwrap();
+    let t = ed.project().task(2).unwrap();
+    assert_eq!((t.duration_min, t.duration_format), (3 * 480, None));
+    assert_eq!(
+        (
+            t.actual_duration_min,
+            t.remaining_duration_min,
+            t.percent_complete
+        ),
+        (Some(480), Some(960), Some(33))
+    );
+}
+
+/// A remaining duration whose new working duration equals the stored
+/// elapsed minutes is still a duration change: one undo step of its own
+/// (r2 m2), committing an estimate as any other value does (r3 i2).
+#[test]
+fn a_remaining_edit_to_the_stored_elapsed_minutes_is_a_duration_change() {
+    let estimated = |uid| Task {
+        duration_format: Some(40),
+        estimated: Some(true),
+        ..started_elapsed(uid, None)
+    };
+    let plain = Task {
+        uid: 3,
+        id: 3,
+        name: "Plain".into(),
+        outline_level: 1,
+        duration_min: 480,
+        ..Task::default()
+    };
+    let mut ed = elapsed_plan(vec![estimated(1), estimated(2), plain]);
+    ed.rename(3, "Renamed").unwrap();
+    let before = ed.project().task(1).unwrap().clone();
+    let depth = ed.undo_depth();
+    for (uid, minutes) in [(1, 4320), (2, 4380)] {
+        assert_eq!(ed.set_remaining_duration(uid, minutes), Ok(true));
+        let t = ed.project().task(uid).unwrap();
+        assert_eq!(
+            (
+                t.duration_min,
+                t.duration_format,
+                t.estimated,
+                t.remaining_duration_min
+            ),
+            (minutes, None, Some(false), Some(minutes)),
+            "{minutes}"
+        );
+    }
+    assert_eq!(ed.undo_depth(), depth + 2);
+    assert!(ed.undo());
+    assert!(ed.undo());
+    assert_eq!(ed.project().task(1).unwrap(), &before);
+    assert_eq!(ed.project().task(3).unwrap().name, "Renamed");
+}
+
+/// An elapsed task whose wall-clock window holds no working time (1 eday
+/// from Sat 00:00 by a Start No Earlier Than; 2 edays started Fri 17:00)
+/// takes no progress edit: its working duration would be 0, a milestone
+/// (r3 M2). The task and the undo stack are unchanged.
+#[test]
+fn progress_on_an_elapsed_task_spanning_no_working_time_is_refused() {
+    let sat = DateTime::from_ymd_hm(2026, 3, 7, 0, 0);
+    let fri = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+    let weekend = Task {
+        duration_min: 1440,
+        actual_start: None,
+        constraint: ConstraintType::StartNoEarlierThan,
+        constraint_date: Some(sat),
+        ..started_elapsed(1, None)
+    };
+    let friday = Task {
+        duration_min: 2880,
+        actual_start: Some(fri),
+        ..started_elapsed(2, None)
+    };
+    let mut ed = elapsed_plan(vec![weekend, friday]);
+    let refused = Err(ELAPSED_NO_WORKING_TIME.to_string());
+    for uid in [1, 2] {
+        let before = ed.project().task(uid).unwrap().clone();
+        assert_eq!(ed.set_actual_duration(uid, 480), refused, "{uid}");
+        assert_eq!(ed.set_remaining_duration(uid, 480), refused, "{uid}");
+        assert_eq!(ed.set_actual_finish(uid, Some(sat)), refused, "{uid}");
+        assert_eq!(ed.set_actual_start(uid, Some(fri)), refused, "{uid}");
+        assert_eq!(ed.project().task(uid).unwrap(), &before, "{uid}");
+    }
+    assert_eq!(ed.set_percent_complete_synced(2, 50), refused);
+    assert_eq!(ed.undo_depth(), 0);
 }

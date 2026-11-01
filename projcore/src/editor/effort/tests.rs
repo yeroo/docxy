@@ -486,3 +486,31 @@ fn a_task_added_under_a_fixed_work_default_keeps_its_work() {
         assert_eq!(alloc(&ed, 1).1, work_after, "{default:?}");
     }
 }
+
+/// #484 r3 M1: an effort recalculation divides work counted over the stored
+/// duration, elapsed minutes on an elapsed task, so its result is elapsed
+/// minutes and the format stays: 3 edays at 50% units are 6 edays, not 18
+/// working days. Adding a resource to an effort-driven elapsed task halves
+/// it in edays the same way.
+#[test]
+fn an_effort_recalculation_keeps_an_elapsed_duration_elapsed() {
+    let elapsed = |driven| {
+        let mut ed = plan(
+            None,
+            driven,
+            3 * 1440,
+            vec![assignment(1, 1, 1.0, 3 * 1440)],
+        );
+        ed.proj.tasks[0].duration_format = Some(8);
+        ed
+    };
+    let format = |ed: &Editor| ed.proj.tasks[0].duration_format;
+    let mut ed = elapsed(None);
+    set(&mut ed, &["Bob[50%]"]);
+    assert_eq!((duration(&ed), format(&ed)), (6 * 1440, Some(8)));
+    assert_eq!(alloc(&ed, 1), (0.5, 3 * 1440));
+    let mut ed = elapsed(Some(true));
+    set(&mut ed, &["Bob", "Carol"]);
+    assert_eq!((duration(&ed), format(&ed)), (3 * 720, Some(8)));
+    assert_eq!((alloc(&ed, 1), alloc(&ed, 2)), ((1.0, 2160), (1.0, 2160)));
+}

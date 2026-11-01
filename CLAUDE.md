@@ -2030,13 +2030,16 @@
   a write of one over an elapsed format moves the format to the same unit in
   working time (`editor::to_working_format`: a manual task's typed finish,
   a duration without a unit or whose estimate is committed, which converts
-  first so the unit stays, an effort rescale); an auto task's typed finish
-  is a constraint and keeps it. A progress write (`progress_of`) first
+  first so the unit stays); an auto task's typed finish is a constraint
+  and keeps it, and an effort recalculation (work / units, the work
+  counted over the elapsed minutes) is elapsed minutes and keeps it too. A progress write (`progress_of`) first
   re-expresses an elapsed task as the working minutes of its wall-clock
   window (its elapsed duration from its actual start, else its scheduled
   start; never the tracked schedule's span, which counts it as working
   minutes), its stored actual and remaining scaled alike, then stores it in
   working time (unmeasured: Project keeps progress on an elapsed duration).
+  A window with no working time (a weekend) refuses the edit, as the task
+  would become a milestone.
 - The schedule runs an automatic elapsed leaf on the 24x7 clock, start
   included (`Scheduler::elapsed`): it starts at its driven or constraint
   instant unsnapped (unlinked: the raw project start) and finishes its
