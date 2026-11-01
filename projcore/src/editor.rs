@@ -458,6 +458,13 @@ impl Editor {
     }
 
     /// Row `i` as an edit would make it (see [`materialized`]).
+    /// Assignment `a`'s Delay in task `i`'s unit
+    /// ([`crate::assign::delay_in_task_unit`]): wall-clock minutes on an
+    /// elapsed task, working minutes on any other.
+    fn delay_in_task_unit(&self, i: usize, a: &Assignment) -> i64 {
+        crate::assign::delay_in_task_unit(&self.proj, &self.sched, &self.proj.tasks[i], a)
+    }
+
     fn row_as_edited(&self, i: usize) -> Task {
         materialized(&self.proj, i, self.new_task_start(), &self.collapsed)
     }
@@ -1500,7 +1507,8 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             let mut assignments = self.proj.assignments.clone();
-            let span = units_span(kind, &assignments[k], duration);
+            let delay = self.delay_in_task_unit(i, &assignments[k]);
+            let span = units_span(kind, &assignments[k], duration, delay);
             assignments[k].set_units(u, staged_work(kind, span, u, name)?);
             self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
@@ -1949,12 +1957,13 @@ fn staged_work(
 }
 
 /// The minutes an assignment on a task of `duration` stages its units' work
-/// over: a flat work resource works from its delay, as `rescale_work`; a
+/// over: a flat work resource works from its delay (`delay`, in the task's
+/// unit: [`crate::assign::delay_in_task_unit`]), as `rescale_work`; a
 /// contoured one, and a material or cost, span the duration.
-fn units_span(kind: Option<ResourceType>, a: &Assignment, duration: i64) -> i64 {
+fn units_span(kind: Option<ResourceType>, a: &Assignment, duration: i64, delay: i64) -> i64 {
     match kind {
         Some(ResourceType::Work) | None if matches!(a.work_contour, None | Some(0)) => {
-            (duration - a.delay_min()).max(0)
+            (duration - delay).max(0)
         }
         _ => duration,
     }

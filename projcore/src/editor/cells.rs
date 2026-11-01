@@ -384,6 +384,7 @@ impl Editor {
         }
         // A blank row is assigned as the task the edit makes it.
         let duration = self.row_as_edited(i).duration_min;
+        let delay = |a: &Assignment| self.delay_in_task_unit(i, a);
         let kind = |rid: i32| resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
         let mut changed = false;
         let mut assignments = self.proj.assignments.clone();
@@ -412,7 +413,7 @@ impl Editor {
             };
             if let Some(u) = units {
                 let kind = kind(a.resource_uid);
-                let work = staged_work(kind, units_span(kind, a, duration), u, raw)?;
+                let work = staged_work(kind, units_span(kind, a, duration, delay(a)), u, raw)?;
                 a.set_units(u, work);
                 changed = true;
             }

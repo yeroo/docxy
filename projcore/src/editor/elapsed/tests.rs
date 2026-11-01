@@ -119,7 +119,8 @@ impl Entry {
     }
 }
 
-/// What a write decides on task 1 and Alice's assignment (the refresh's own
+/// What a write decides on task 1, Alice's assignment and Bob's delayed one
+/// (with his span) (the refresh's own
 /// derived fields left out: it runs against different "before" states).
 fn facts(ed: &Editor) -> String {
     let t = ed.project().task(1).unwrap();

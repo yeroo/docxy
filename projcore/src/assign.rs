@@ -130,6 +130,29 @@ fn delayed_start(cal: &WorkCalendar, task_start: DateTime, a: &Assignment) -> Op
     Some(start)
 }
 
+/// An assignment's `Delay` in its task's own unit, for sums with the task's
+/// duration or an assignment's work ÷ units: its working minutes, or on a
+/// task on the 24x7 clock (#484) the wall-clock minutes from the task's
+/// scheduled start to where that working Delay lands (`delayed_start`; a
+/// task the schedule has not placed yet keeps the working minutes).
+pub(crate) fn delay_in_task_unit(
+    proj: &Project,
+    sched: &Schedule,
+    task: &Task,
+    a: &Assignment,
+) -> i64 {
+    let delay = a.delay_min();
+    if delay == 0 || !crate::schedule::on_the_clock(task) {
+        return delay;
+    }
+    let Some(r) = sched.get(task.uid) else {
+        return delay;
+    };
+    let cal = task_calendar(proj, task);
+    advance(&cal, r.early_start, delay, false)
+        .map_or(delay, |at| (at.minutes() - r.early_start.minutes()).max(0))
+}
+
 /// An assignment's own start and finish on its task's schedule. The start is
 /// its `ActualStart`, else the task's scheduled start moved by its delays; the
 /// finish is its `ActualFinish`, else, for flat work, the start plus work ÷

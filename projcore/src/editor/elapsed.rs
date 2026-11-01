@@ -8,7 +8,8 @@
 //! (`set_finish_at`) and every progress setter. The conversion and the edit
 //! are one undo step. An effort recalculation (work / units, the work
 //! counted over the elapsed minutes) is elapsed minutes and does not
-//! convert. Unmeasured against Project 2024, which keeps progress and
+//! convert; an assignment's Delay, working time on every task, enters it as
+//! the wall-clock minutes to where it lands (`assign::delay_in_task_unit`). Unmeasured against Project 2024, which keeps progress and
 //! typed durations on an elapsed task.
 use super::*;
 

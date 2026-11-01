@@ -2067,10 +2067,16 @@
   units then runs on the clock (`schedule::on_the_clock`,
   `assign::assignment_span`), so an undelayed one at the units its work was
   counted at finishes with the task. A delayed one does not extend an
-  elapsed task (`delayed_extent_min` is none there: a working delay plus
-  wall-clock work reaches a point that depends on the task's start), so it
-  may finish after its task (a known limit). Unmeasured; no corpus
-  assignment is on an elapsed task. Measured (Project 2024): unlinked, on
+  elapsed task in the scheduler (`delayed_extent_min` is none there: a
+  working delay plus wall-clock work reaches a point that depends on the
+  task's start), so a plan read with one may finish it after its task (a
+  known limit). The editor's effort and units math (`same_resources`'s
+  longest `work / units + delay`, a Fixed Duration task's span after the
+  delay, the units stages) takes the Delay in the task's unit
+  (`assign::delay_in_task_unit`: on an elapsed task, the wall-clock minutes
+  from its start to where the working Delay lands), so an edit there does
+  store a duration that covers the delayed assignment, which then finishes
+  with its task. Unmeasured; no corpus assignment is on an elapsed task. Measured (Project 2024): unlinked, on
   08:00 and 08:30 calendars (snapshots 15..46 UID 25: start 08:00, finish
   +72 h, slack 260400 tenths). Unmeasured, following the rule: links,
   constraints, ALAP, a stored leveling delay (added unsnapped), a percent

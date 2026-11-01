@@ -381,7 +381,8 @@ impl Editor {
                 // stage left it) to the task finish.
                 let duration = ed.row_as_edited(i).duration_min;
                 let a = ed.proj.assignments.iter().find(|a| a.uid == uid);
-                let work = units_work(kind, duration - a.expect("checked").delay_min(), u)?;
+                let delay = ed.delay_in_task_unit(i, a.expect("checked"));
+                let work = units_work(kind, duration - delay, u)?;
                 stage(ed, &|a| a.set_units(u, work))?;
             }
             if let Some(w) = work {
@@ -393,7 +394,7 @@ impl Editor {
                 let a = a.expect("checked");
                 if w > 0
                     && work_edit_rescales_units(&ed.proj, i, &task, a)
-                    && task.duration_min - a.delay_min() <= 0
+                    && task.duration_min - ed.delay_in_task_unit(i, a) <= 0
                 {
                     return Err("delay must be shorter than the task".into());
                 }
