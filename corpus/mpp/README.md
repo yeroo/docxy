@@ -345,6 +345,11 @@ Task Notes are retained only on the current-layout path; the MPP9 legacy path ha
 paired XML and Project 16 cannot save MPP9, so legacy Notes have no oracle.
 StatusManager is not decoded: Project desktop drops a seeded StatusManager when
 it saves `.mpp` (`task-extra/e10-status-manager`), so there is no oracle.
+Task custom fields (#292) are read for Text1, Start1, Finish1, Number1 and
+Date1 values and their definitions (snapshots 23..46, `custom_field_oracles`).
+Flag1's value and field 188744339 are not: UID 33 sets both, in two Fixed2Meta
+bits the corpus cannot tell apart. Resource and assignment custom fields,
+aliases and lookup tables have no oracle and are not read.
 
 Current Project blank rows are identified by their short FixedMeta record and
 retained with their IDs and UIDs. Superseded task
