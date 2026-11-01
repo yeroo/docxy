@@ -490,33 +490,77 @@ pub(crate) fn forget_shadow_attrs(shadow: &mut Vec<String>, local: &str, attrs: 
 /// Make the loaded `w:ind` in `shadow` set the left indent as an explicit
 /// `twips`: its left attributes ([`IND_LEFT`]) become one `w:left`, in the
 /// place of the first of them (else first); a shadow without a `w:ind` gets
-/// `<w:ind w:left="twips"/>`. Already a lone `w:left` or `w:start` of that
-/// value (no character units), it is left as it is, so pinning again
-/// changes nothing.
-pub(crate) fn pin_shadow_left(shadow: &mut Vec<String>, twips: i32) {
+/// `<w:ind w:left="twips"/>`. When every left attribute it has already says
+/// that (each twips one `twips`, each character count 0, at least one twips
+/// one), it is left as it is, so pinning again changes nothing.
+///
+/// `cancel_chars`: the paragraph inherits a nonzero character count, which
+/// would beat a lone `w:left`, so a zero `w:leftChars`/`w:startChars` is
+/// kept in place, else `w:leftChars="0"` goes after the `w:left` (#1815).
+pub(crate) fn pin_shadow_left(shadow: &mut Vec<String>, twips: i32, cancel_chars: bool) {
     let value = twips.to_string();
     let Some(raw) = shadow.iter_mut().find(|raw| local_name(raw) == "ind") else {
-        shadow.push(format!("<w:ind w:left=\"{value}\"/>"));
+        let cancel = if cancel_chars {
+            " w:leftChars=\"0\""
+        } else {
+            ""
+        };
+        shadow.push(format!("<w:ind w:left=\"{value}\"{cancel}/>"));
         return;
     };
-    let mut attrs = element_attrs_of(raw);
+    let is_chars = |n: &str| n == "w:leftChars" || n == "w:startChars";
+    let is_zero = |v: &str| v.trim().parse::<i64>() == Ok(0);
+    let attrs = element_attrs_of(raw);
     let left: Vec<&(String, String)> = attrs
         .iter()
         .filter(|(n, _)| IND_LEFT.contains(&n.as_str()))
         .collect();
-    if let [(n, v)] = left.as_slice() {
-        if (n == "w:left" || n == "w:start") && v.trim().parse::<i64>() == Ok(i64::from(twips)) {
-            return;
+    let says_twips = left.iter().any(|(n, _)| !is_chars(n))
+        && left.iter().all(|(n, v)| {
+            if is_chars(n) {
+                is_zero(v)
+            } else {
+                v.trim().parse::<i64>() == Ok(i64::from(twips))
+            }
+        });
+    if says_twips && (!cancel_chars || left.iter().any(|(n, _)| is_chars(n))) {
+        return;
+    }
+    let mut out: Vec<(String, String)> = Vec::with_capacity(attrs.len() + 2);
+    let mut placed = false;
+    let mut kept_chars = false;
+    for (n, v) in &attrs {
+        if !IND_LEFT.contains(&n.as_str()) {
+            out.push((n.clone(), v.clone()));
+        } else if cancel_chars && is_chars(n) && is_zero(v) {
+            out.push((n.clone(), v.clone()));
+            kept_chars = true;
+        } else if !placed {
+            out.push(("w:left".to_string(), value.clone()));
+            placed = true;
         }
     }
-    let at = attrs
-        .iter()
-        .position(|(n, _)| IND_LEFT.contains(&n.as_str()))
-        .unwrap_or(0);
-    attrs.retain(|(n, _)| !IND_LEFT.contains(&n.as_str()));
-    attrs.insert(at.min(attrs.len()), ("w:left".to_string(), value));
+    if !placed {
+        // Only zero counts (kept) or no left attribute: `w:left` goes before
+        // the other attributes, as it always did.
+        let at = if kept_chars {
+            out.iter()
+                .position(|(n, _)| is_chars(n))
+                .map_or(0, |i| i + 1)
+        } else {
+            0
+        };
+        out.insert(at, ("w:left".to_string(), value));
+    }
+    if cancel_chars && !kept_chars {
+        let at = out
+            .iter()
+            .position(|(n, _)| n == "w:left")
+            .map_or(0, |i| i + 1);
+        out.insert(at, ("w:leftChars".to_string(), "0".to_string()));
+    }
     let name = crate::table_props::element_name(raw);
-    *raw = empty_element(&name, &attrs);
+    *raw = empty_element(&name, &out);
 }
 
 /// The direct `w:jc`s of an editor-chosen alignment (#1752): a left keeps

@@ -711,14 +711,21 @@ impl ParProps {
     /// level's indent back (#1728). The paragraph then has a loaded left
     /// indent, as it does when the file is opened again.
     pub fn pin_left_indent_zero(&mut self) {
-        crate::serialize::pin_shadow_left(&mut self.shadow, 0);
+        crate::serialize::pin_shadow_left(&mut self.shadow, 0, false);
     }
 
     /// As [`Self::pin_left_indent_zero`] for any `twips`: a style-numbered
     /// item keeps "has a loaded left indent" while it moves, so a later
     /// Decrease to the margin still pins (#1792).
     pub fn pin_left_indent(&mut self, twips: i32) {
-        crate::serialize::pin_shadow_left(&mut self.shadow, twips);
+        crate::serialize::pin_shadow_left(&mut self.shadow, twips, false);
+    }
+
+    /// As [`Self::pin_left_indent`] for a paragraph whose style gives a
+    /// nonzero character-unit left indent, which beats a lone `w:left`: the
+    /// pin keeps (or adds) a `w:leftChars="0"` beside it (#1815).
+    pub fn pin_left_indent_over_chars(&mut self, twips: i32) {
+        crate::serialize::pin_shadow_left(&mut self.shadow, twips, true);
     }
 
     /// Set the paragraph's direct alignment, as an edit does: a left is

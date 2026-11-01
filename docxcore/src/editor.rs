@@ -3062,7 +3062,7 @@ impl Editor {
                     IndentFallback::StyleNum => pr.has_loaded_left_indent().then_some(left),
                     // A value the dialog or ruler set over a style's indent
                     // is explicit, as a reload would see it (#1815).
-                    IndentFallback::StyleLeft => Some(left),
+                    IndentFallback::StyleLeft { .. } => Some(left),
                     IndentFallback::None | IndentFallback::Level => None,
                 }
             };
@@ -3070,7 +3070,7 @@ impl Editor {
             pr.first_line = first_line;
             pr.forget_loaded_indent(&[IndentSide::Left, IndentSide::FirstLine]);
             if let Some(twips) = pin {
-                pr.pin_left_indent(twips);
+                pin_left(pr, twips, fallback);
             }
         }
     }
@@ -4196,15 +4196,15 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
     if fallback != IndentFallback::None && direct && pr.indent == 0 {
         // No `w:left` would hand the paragraph back to its level's (or
         // style's) indent.
-        pr.pin_left_indent_zero();
+        pin_left(pr, 0, fallback);
     } else if matches!(
         fallback,
-        IndentFallback::StyleNum | IndentFallback::StyleLeft
+        IndentFallback::StyleNum | IndentFallback::StyleLeft { .. }
     ) && direct
     {
         // A style item keeps a loaded left while it moves, so a later
         // Decrease to the margin still pins (as after a reload).
-        pr.pin_left_indent(pr.indent);
+        pin_left(pr, pr.indent, fallback);
     } else {
         // The loaded left indent goes, character units included: a
         // decrease clamped to zero twips must still clear `w:leftChars`.
@@ -4238,8 +4238,19 @@ enum IndentFallback {
     /// A list item numbered through its paragraph style (#1792).
     StyleNum,
     /// Not a list item; its paragraph style chain (or `w:pPrDefault`) gives a
-    /// nonzero left indent (#1815). Needs the styles context.
-    StyleLeft,
+    /// nonzero left indent (#1815), in character units when `chars`. Needs
+    /// the styles context.
+    StyleLeft { chars: bool },
+}
+
+/// Pin the paragraph's left at `twips` as explicit, keeping a
+/// `w:leftChars="0"` beside it over a style's character-unit indent.
+fn pin_left(pr: &mut ParProps, twips: i32, fallback: IndentFallback) {
+    if fallback == (IndentFallback::StyleLeft { chars: true }) {
+        pr.pin_left_indent_over_chars(twips);
+    } else {
+        pr.pin_left_indent(twips);
+    }
 }
 
 fn indent_fallback(styles: Option<&EditStyles>, p: &ParProps) -> IndentFallback {
@@ -4247,14 +4258,16 @@ fn indent_fallback(styles: Option<&EditStyles>, p: &ParProps) -> IndentFallback 
         IndentFallback::Level
     } else if list_item(styles, p) {
         IndentFallback::StyleNum
-    } else if styles.is_some_and(|s| {
-        s.sheet
-            .style_left_indent(p.style_id.as_deref())
-            .is_some_and(|n| n != 0)
-    }) {
-        IndentFallback::StyleLeft
     } else {
-        IndentFallback::None
+        let style = p.style_id.as_deref();
+        match styles.map(|s| &s.sheet) {
+            Some(sheet) if sheet.style_left_indent(style).is_some_and(|n| n != 0) => {
+                IndentFallback::StyleLeft {
+                    chars: sheet.style_left_in_chars(style),
+                }
+            }
+            _ => IndentFallback::None,
+        }
     }
 }
 
@@ -7374,8 +7387,15 @@ mod tests {
             assert_eq!(saved_ind(&ed), before, "{ind}");
             assert!(ed.undo_names().is_empty(), "{ind}");
         }
-        // A character-unit zero becomes twips, as any edit of it does.
-        let mut ed = loaded_list_item(0, "<w:ind w:leftChars=\"0\" w:left=\"0\"/>");
+        // A zero character count beside it is already the margin too (#1815
+        // r1): nothing is rewritten and no step is recorded.
+        let ind = "<w:ind w:leftChars=\"0\" w:left=\"0\"/>";
+        let mut ed = loaded_list_item(0, ind);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), ind);
+        assert!(ed.undo_names().is_empty());
+        // A nonzero count at a zero twips still moves to a lone `w:left`.
+        let mut ed = loaded_list_item(0, "<w:ind w:leftChars=\"100\" w:left=\"0\"/>");
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
     }
@@ -7390,6 +7410,8 @@ mod tests {
         <w:basedOn w:val=\"Quote\"/></w:style>\
         <w:style w:type=\"paragraph\" w:styleId=\"Outdent\"><w:pPr>\
         <w:ind w:left=\"-360\"/></w:pPr></w:style>\
+        <w:style w:type=\"paragraph\" w:styleId=\"QuoteChars\"><w:pPr>\
+        <w:ind w:leftChars=\"200\"/></w:pPr></w:style>\
         <w:style w:type=\"paragraph\" w:styleId=\"Flat\"><w:basedOn w:val=\"Quote\"/>\
         <w:pPr><w:ind w:left=\"0\"/></w:pPr></w:style></w:styles>";
 
@@ -7670,6 +7692,54 @@ mod tests {
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"360\"/>");
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    const QUOTE_CHARS: &str = "<w:pStyle w:val=\"QuoteChars\"/>";
+
+    /// #1815 r1: over a style's character-unit indent the pin keeps the
+    /// `w:leftChars="0"` that lets `w:left` apply, or adds one.
+    #[test]
+    fn decrease_indent_over_a_character_unit_style_keeps_the_zero_count() {
+        let mut ed = loaded_ppr(
+            &format!("{QUOTE_CHARS}<w:ind w:leftChars=\"0\" w:left=\"360\"/>"),
+            true,
+        );
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:leftChars=\"0\" w:left=\"0\"/>");
+        let steps = ed.undo_names().len();
+        ed.change_indent(-720);
+        assert_eq!(ed.undo_names().len(), steps, "idempotent, no new step");
+        // Moving, the count stays beside the new left.
+        let mut ed = loaded_ppr(
+            &format!("{QUOTE_CHARS}<w:ind w:leftChars=\"0\" w:left=\"1440\"/>"),
+            true,
+        );
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:leftChars=\"0\" w:left=\"720\"/>");
+        // A paragraph with no `w:ind`: the dialog's value, then Decrease.
+        let mut ed = loaded_ppr(QUOTE_CHARS, true);
+        ed.set_indent(360, 0);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"360\" w:leftChars=\"0\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\" w:leftChars=\"0\"/>");
+        // A twips-only style keeps the lone `w:left` (no count added).
+        let mut ed = loaded_ppr(QUOTE, true);
+        ed.set_indent(360, 0);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #1815 r1: a loaded `<w:ind w:leftChars="0" w:left="0"/>` over a style
+    /// indent is already the margin: Decrease records no step.
+    #[test]
+    fn decrease_at_a_zero_count_and_zero_left_over_a_style_changes_nothing() {
+        for style in [QUOTE, QUOTE_CHARS] {
+            let ind = "<w:ind w:leftChars=\"0\" w:left=\"0\"/>";
+            let mut ed = loaded_ppr(&format!("{style}{ind}"), true);
+            ed.change_indent(-720);
+            assert_eq!(saved_ind(&ed), ind, "{style}");
+            assert!(ed.undo_names().is_empty(), "{style}");
+        }
     }
 
     /// #1815: a ruler drag decides from the drag start, as for list items: a
