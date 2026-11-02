@@ -55,18 +55,31 @@ test save-as writes the Word template types (#636)
   assert reply.title is Macros.dotm
   call save-as {"path":"Back","format":"docm"}
   assert reply.format is docm
-  call-error save-as {"path":"Letter.rtf","format":"dotx"} => 'format' dotx does not match Letter.rtf, which saves as rtf
+  call save-as {"path":"Letter.rtf","format":"dotx"}
+  assert reply.format is dotx
+  assert reply.title is Letter.rtf.dotx
 
 test save-as refuses what the dialog would not write and leaves the tab alone
   open copy:../fixtures/basic.docx
   call-error save-as {"path":"notes.odt"} => Documents can be saved as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html
   call-error save-as {"path":"notes","format":"pdf"} => Documents can be saved as .docx, .docm, .dotx, .dotm, .rtf, .txt, .md or .html
-  call-error save-as {"path":"notes.md","format":"docx"} => does not match notes.md
+  call-error save-as {"path":"bad:name"} => file name is not valid
+  call-error save-as {"path":"bad*name","format":"docx"} => file name is not valid
+  call-error save-as {"path":"b|d.docx"} => file name is not valid
   call-error save-as {"path":""} => non-empty 'path'
   call-error save-as {"path":"basic.docx"} => already exists; pass "overwrite": true
   assert title is basic.docx
   call save-as {"path":"basic.docx","overwrite":true}
   assert reply.title is basic.docx
+
+test save-as appends the format's extension to a name of another type, as Word does (#807)
+  open copy:../fixtures/basic.docx
+  call save-as {"path":"notes.txt","format":"docx"}
+  assert reply.format is docx
+  assert reply.title is notes.txt.docx
+  assert title is notes.txt.docx
+  call save-as {"path":"notes.md","format":"docx"}
+  assert reply.title is notes.md.docx
 
 test a save-as that fails to write is an error
   open copy:../fixtures/basic.docx

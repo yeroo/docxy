@@ -269,6 +269,18 @@
   placed, and the result must be shorter, or the set is left as it was; a set
   that begins mid-paragraph (spilled from the page before) is not balanced.
 
+## Document save-as names (#807)
+
+- The harness's `save-as` on a document (`save_as_target`) refuses, before
+  anything is resolved or written, a name whose last piece (after `/` or `\`,
+  on every platform) holds `: * ? " < > |`, with `DOC_BAD_NAME` ("file name is
+  not valid"); a relative `a:name` is refused, not read as a drive. On Unix a
+  resolved name holding `\` is refused too. A `format` that the name's own
+  extension does not save as (or that names none) appends the format's
+  extension, as Word does: `notes.txt` + docx is `notes.txt.docx`, html
+  appends `.html`. Workbooks and plans still refuse a mismatch. The native
+  dialog is unchanged.
+
 ## Start screen (#806)
 
 - A suite launch with nothing to restore and no file on the command line has

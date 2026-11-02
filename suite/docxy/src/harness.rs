@@ -478,6 +478,22 @@ fn format_extension(format: &str) -> Option<&'static str> {
     })
 }
 
+/// What a document Save As to a name Word refuses says (#807).
+const DOC_BAD_NAME: &str =
+    "That file name is not valid: a document name cannot contain \\ / : * ? \" < > or |";
+
+/// Whether the last piece of a typed document path (after `/` or `\`, on
+/// every platform) is a name Word's Save As accepts: none of
+/// `: * ? " < > |`. A relative `a:name` (drive-relative on Windows) is
+/// refused here; an absolute `C:\dir\x.docx` passes, its drive being
+/// before the last separator. On Unix, where `\` is no separator, the
+/// resolved name is checked for one too (`save_as_target`), so `dir\x.docx`
+/// is refused there as Word never names a file with it.
+fn doc_name_ok(raw: &str) -> bool {
+    let last = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    !last.contains([':', '*', '?', '"', '<', '>', '|'])
+}
+
 /// The format a document path saves as, by the app's own rule
 /// ([`crate::html_bundle::doc_target`], which `save_doc_tab` writes by), or
 /// the refusal. A name naming no format is refused: `save_doc_tab` refuses
@@ -505,8 +521,12 @@ fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
 /// `sheet_save_target`, the project formats registry's `save_target` (the
 /// built-ins and any type a format plugin writes), and [`doc_save_format`].
 /// A workbook target also passes `sheet_save_as_name`, the name Excel's Save
-/// As refuses (#804). `format`, when given, must be one the tab kind saves and must agree with
-/// an explicit extension.
+/// As refuses (#804). `format`, when given, must be one the tab kind saves;
+/// a workbook's or plan's must agree with an explicit extension, while a
+/// document's name whose extension saves as another format (or none) takes
+/// the format's extension appended, as Word's Save As does (`notes.txt` as
+/// docx is `notes.txt.docx`, #807). A document name holding a character
+/// Word refuses is refused with [`DOC_BAD_NAME`] before anything else.
 fn save_as_target(
     kind: crate::Kind,
     base: Option<&Path>,
@@ -526,6 +546,9 @@ fn save_as_target(
         return Err("'format' must not be empty; leave it out to go by the extension".into());
     }
     let format = format.as_deref();
+    if kind == Kind::Docx && !doc_name_ok(raw) {
+        return Err(DOC_BAD_NAME.into());
+    }
     let given = PathBuf::from(raw);
     let mut path = if given.is_absolute() {
         given
@@ -535,6 +558,13 @@ fn save_as_target(
         )?
         .join(given)
     };
+    if kind == Kind::Docx
+        && path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains('\\'))
+    {
+        return Err(DOC_BAD_NAME.into());
+    }
     let projects = crate::project_formats::global();
     let kind_formats: Vec<&'static str> = match kind {
         Kind::Docx => vec!["docx", "docm", "dotx", "dotm", "rtf", "txt", "md", "html"],
@@ -589,6 +619,17 @@ fn save_as_target(
             (path, written)
         }
         _ => {
+            // Word appends the chosen type's extension to a name whose own
+            // extension names another type (#807).
+            if let Some(f) = format.filter(|f| doc_save_format(&path, html_ok).ok() != Some(*f)) {
+                let ext = match f {
+                    "html" => ".html",
+                    f => format_extension(f).unwrap_or_default(),
+                };
+                let mut name = path.file_name().unwrap_or_default().to_os_string();
+                name.push(ext);
+                path.set_file_name(name);
+            }
             let written = doc_save_format(&path, html_ok)?;
             (path, written)
         }
@@ -9015,9 +9056,52 @@ mod tests {
                 "{format}"
             );
         }
+        // #807: a format the extension does not save as is appended, as
+        // Word does; the same format keeps the name.
+        for (name, format, out) in [
+            ("out.rtf", "txt", "out.rtf.txt"),
+            ("notes.txt", "docx", "notes.txt.docx"),
+            ("Letter.rtf", "dotx", "Letter.rtf.dotx"),
+            ("notes.md", "docx", "notes.md.docx"),
+            ("notes.odt", "docx", "notes.odt.docx"),
+            ("notes.foo", "rtf", "notes.foo.rtf"),
+            ("notes.txt", "html", "notes.txt.html"),
+            ("notes.txt", "txt", "notes.txt"),
+            ("notes.md", "md", "notes.md"),
+        ] {
+            assert_eq!(
+                ok(Kind::Docx, name, Some(format)),
+                Ok((at(out), format)),
+                "{name} as {format}"
+            );
+        }
+        // #807: a name Word refuses, before any extension is added.
+        for raw in [
+            "bad:name",
+            "a:name",
+            "b*d",
+            "b?d",
+            "b\"d",
+            "b<d",
+            "b>d",
+            "b|d",
+            "dir/b:d.docx",
+            r"dir\b:d.docx",
+        ] {
+            assert_eq!(ok(Kind::Docx, raw, None), Err(DOC_BAD_NAME.into()), "{raw}");
+            assert_eq!(
+                ok(Kind::Docx, raw, Some("docx")),
+                Err(DOC_BAD_NAME.into()),
+                "{raw} as docx"
+            );
+        }
+        assert!(doc_name_ok(r"C:\dir\x.docx"));
+        assert!(doc_name_ok("/dir/x.docx"));
+        // Unix has no `\` separator: the resolved name holds it, refused.
+        #[cfg(unix)]
         assert_eq!(
-            ok(Kind::Docx, "out.rtf", Some("txt")),
-            Err("'format' txt does not match out.rtf, which saves as rtf".into())
+            ok(Kind::Docx, r"dir\x.docx", None),
+            Err(DOC_BAD_NAME.into())
         );
         assert_eq!(
             ok(Kind::Docx, "out.odt", None),
@@ -9030,10 +9114,6 @@ mod tests {
         assert_eq!(
             ok(Kind::Docx, "out", Some("pdf")),
             Err(DOC_SAVE_FORMATS.into())
-        );
-        assert_eq!(
-            ok(Kind::Docx, "out.md", Some("docx")),
-            Err("'format' docx does not match out.md, which saves as md".into())
         );
         assert_eq!(
             save_as_target(Kind::Docx, Some(base), None, "out.html", None, false),
