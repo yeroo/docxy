@@ -5281,7 +5281,6 @@ fn cond_format_spans(xml: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// An XML boolean attribute's value (`1` / `true`).
 /// A validation element's settings (`<dataValidation>` or
 /// `<x14:dataValidation>`, which share their attributes): no ranges, no
 /// formulas, no element.
@@ -5307,6 +5306,7 @@ fn read_dv_attrs(p: &XmlParser<'_>) -> crate::sheet::DataValidation {
     }
 }
 
+/// An XML boolean attribute's value (`1` / `true`).
 fn flag_attr(v: &str) -> bool {
     matches!(v, "1" | "true")
 }
