@@ -484,8 +484,8 @@ const DOC_BAD_NAME: &str =
 
 /// Whether the last piece of a typed document path (after `/` or `\`, on
 /// every platform) is a name Word's Save As accepts: none of
-/// `: * ? " < > |`. A relative `a:name` (drive-relative on Windows) is
-/// refused here; an absolute `C:\dir\x.docx` passes, its drive being
+/// `: * ? " < > |`. A relative `a:name` is refused here, and on Windows
+/// `save_as_target` refuses any drive-relative path (`c:sub\x.docx`); an absolute `C:\dir\x.docx` passes, its drive being
 /// before the last separator. On Unix, where `\` is no separator, the
 /// resolved name is checked for one too (`save_as_target`), so `dir\x.docx`
 /// is refused there as Word never names a file with it.
@@ -550,6 +550,17 @@ fn save_as_target(
         return Err(DOC_BAD_NAME.into());
     }
     let given = PathBuf::from(raw);
+    // A Windows drive-relative `c:sub\x.docx` would replace the folder in
+    // the join below: Word never reads a name as one.
+    if kind == Kind::Docx
+        && matches!(
+            given.components().next(),
+            Some(std::path::Component::Prefix(_))
+        )
+        && !given.has_root()
+    {
+        return Err(DOC_BAD_NAME.into());
+    }
     let mut path = if given.is_absolute() {
         given
     } else {
@@ -589,6 +600,9 @@ fn save_as_target(
             .unwrap_or_else(|| DOC_SAVE_FORMATS.into()));
         }
     }
+    // Only a name with an extension of its own takes the format's appended
+    // (#807): `..` resolves to no name, so the default below gives it none.
+    let own_extension = path.extension().is_some();
     if path.extension().is_none() {
         // A format plugin's type is named by its extension.
         let format = format.unwrap_or(kind_formats[0]);
@@ -621,7 +635,9 @@ fn save_as_target(
         _ => {
             // Word appends the chosen type's extension to a name whose own
             // extension names another type (#807).
-            if let Some(f) = format.filter(|f| doc_save_format(&path, html_ok).ok() != Some(*f)) {
+            if let Some(f) =
+                format.filter(|f| own_extension && doc_save_format(&path, html_ok).ok() != Some(*f))
+            {
                 let ext = match f {
                     "html" => ".html",
                     f => format_extension(f).unwrap_or_default(),
@@ -9094,6 +9110,20 @@ mod tests {
                 Err(DOC_BAD_NAME.into()),
                 "{raw} as docx"
             );
+        }
+        // `..` names no file: refused as before, never `.docx.docx`.
+        for raw in ["..", "dir/.."] {
+            assert_eq!(
+                ok(Kind::Docx, raw, Some("docx")),
+                Err(DOC_SAVE_FORMATS.into()),
+                "{raw}"
+            );
+        }
+        // A drive-relative path would replace the folder (Windows only
+        // parses the prefix).
+        #[cfg(windows)]
+        for raw in [r"c:sub\x.docx", "c:sub/x.docx"] {
+            assert_eq!(ok(Kind::Docx, raw, None), Err(DOC_BAD_NAME.into()), "{raw}");
         }
         assert!(doc_name_ok(r"C:\dir\x.docx"));
         assert!(doc_name_ok("/dir/x.docx"));

@@ -274,7 +274,9 @@
 - The harness's `save-as` on a document (`save_as_target`) refuses, before
   anything is resolved or written, a name whose last piece (after `/` or `\`,
   on every platform) holds `: * ? " < > |`, with `DOC_BAD_NAME` ("file name is
-  not valid"); a relative `a:name` is refused, not read as a drive. On Unix a
+  not valid"); a relative `a:name` is refused, not read as a drive, as is a
+  Windows drive-relative `c:sub\x.docx` (which would replace the folder). A
+  path that resolves to no name (`..`) gets no extension appended. On Unix a
   resolved name holding `\` is refused too. A `format` that the name's own
   extension does not save as (or that names none) appends the format's
   extension, as Word does: `notes.txt` + docx is `notes.txt.docx`, html
