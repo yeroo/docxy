@@ -956,14 +956,17 @@ worth knowing:
   refers to, count as edits. The sheet's Excel tables come back with it, with
   their parts (style, totals row, filter); one whose name was taken since is
   left out and named in the reply's `tablesKept` (absent when every table came
-  back). An out-of-order restore is refused, with nothing changed, while a
-  sheet removed after it holds a table: restore those first, latest first
-  (the error names them). The cells then recalculate. Every restore clears the undo/redo
+  back). An out-of-order restore brings the tables of the sheets removed
+  after it back for the unwind, so their formulas read as in stack order; it
+  is refused, with nothing changed, while one of those tables could not come
+  back (no part kept, its name taken since, or shared with another removed
+  table): restore that sheet first (the error names it). The cells then
+  recalculate. Every restore clears the undo/redo
   history, as `sheet.remove` itself does.
 - **Agent sheet-removals are undoable in any order**, except that an
   out-of-order undo is refused (`cannot restore …`, nothing changed) while a
-  sheet removed after it holds a table (restore that one first) or has the
-  same name. The restore is
+  sheet removed after it has the same name, or holds a table that could not
+  come back (restore that one first). The restore is
   backed by a stack of stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
   first. An undo out of order (a removal with later ones still stashed, as
