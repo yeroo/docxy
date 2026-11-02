@@ -225,6 +225,40 @@ fn a_truncated_docx_opens_as_its_recovered_text() {
     assert_eq!(std::fs::read(&cut).unwrap(), &bytes[..bytes.len() / 2]);
 }
 
+/// #851: a package over its size budget is not damaged: it keeps the load
+/// error, in words, and is never opened as recovered text.
+#[test]
+fn a_too_large_docx_is_not_recovered() {
+    let dir = Scratch::new();
+    let bytes = std::fs::read(long_docx(&dir, "whole.docx", 3)).unwrap();
+    let bytes = declare_size(bytes, "word/document.xml", u32::MAX);
+    let tab = tab_from_path(&write(&dir, "big.docx", &bytes));
+    assert!(tab.load_failed);
+    assert!(
+        tab.status.starts_with("load error: document too large"),
+        "{}",
+        tab.status
+    );
+    assert_eq!(tab.access.converted, None);
+}
+
+/// Set the declared uncompressed size of the entry named `name` in the ZIP's
+/// central directory.
+fn declare_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
+    let rd16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    let eocd = zip.windows(4).rposition(|s| s == b"PK").unwrap();
+    let mut at = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    loop {
+        assert_eq!(&zip[at..at + 4], b"PK", "no entry {name}");
+        let len = rd16(&zip, at + 28);
+        if &zip[at + 46..at + 46 + len] == name.as_bytes() {
+            zip[at + 24..at + 28].copy_from_slice(&size.to_le_bytes());
+            return zip;
+        }
+        at += 46 + len + rd16(&zip, at + 30) + rd16(&zip, at + 32);
+    }
+}
+
 #[test]
 fn nothing_recoverable_keeps_the_load_error() {
     let dir = Scratch::new();

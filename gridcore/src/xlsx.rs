@@ -34,7 +34,7 @@ mod hyperlink_tests;
 mod hyperlinks;
 pub(crate) use hyperlinks::{has_scheme, model_target};
 mod page;
-mod repair;
+pub(crate) mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
 
 use std::borrow::Cow;

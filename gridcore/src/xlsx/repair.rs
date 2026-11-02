@@ -510,4 +510,4 @@ fn without_attrs(attrs: &str, drop: &[&str]) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

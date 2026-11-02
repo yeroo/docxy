@@ -743,7 +743,7 @@ fn without_attrs_keeps_the_leading_spaces() {
 
 /// Set the declared uncompressed size of the entry named `name` in the ZIP's
 /// central directory, the size the loaders budget and `extract` checks.
-fn declare_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
+pub(crate) fn declare_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
     let rd16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
     let eocd = zip.windows(4).rposition(|s| s == b"PK").unwrap();
     let mut at = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
