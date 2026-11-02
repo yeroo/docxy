@@ -2089,9 +2089,22 @@ pub(crate) fn cut_ext_rules(
     kind: crate::sheet::ExtKind,
     cut: &areas::RectIndex,
 ) {
+    cut_ext_rules_where(sheet, kind, cut, |_| true);
+}
+
+/// [`cut_ext_rules`] for only the rules `pick` names by their place in
+/// [`Sheet::ext_rules`].
+pub(crate) fn cut_ext_rules_where(
+    sheet: &mut Sheet,
+    kind: crate::sheet::ExtKind,
+    cut: &areas::RectIndex,
+    mut pick: impl FnMut(usize) -> bool,
+) {
     let removed = &mut sheet.ext_removed;
+    let mut at = 0usize;
     sheet.ext_rules.retain_mut(|ext| {
-        if ext.kind != kind || !ext.ranges.iter().any(|&r| cut.meets(r)) {
+        at += 1;
+        if ext.kind != kind || !pick(at - 1) || !ext.ranges.iter().any(|&r| cut.meets(r)) {
             return true;
         }
         let Some(by) = cut_rule_ranges(&mut ext.ranges, cut) else {

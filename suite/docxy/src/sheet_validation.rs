@@ -162,8 +162,14 @@ pub(crate) fn dialog(tab: &DocTab) -> Result<Dialog, String> {
         return Err(PROTECTED.into());
     }
     let range = v.range();
-    let current = gridcore::validation::validation_at(v.sheet(), range.0, range.1);
-    let b = DialogBoxes::of(current, (range.0, range.1), v.pkg.workbook.date1904);
+    // An Excel 2010 (`extLst`) rule shows where no classic one covers the
+    // cell (#1817).
+    let current = gridcore::validation::dialog_rule_at(v.sheet(), range.0, range.1);
+    let b = DialogBoxes::of(
+        current.as_ref(),
+        (range.0, range.1),
+        v.pkg.workbook.date1904,
+    );
     let mut d = Dialog::message(
         catalog::DATA_VALIDATION,
         "Data Validation",
@@ -320,8 +326,8 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             .workbook
             .sheets
             .get(sheet)
-            .and_then(|s| gridcore::validation::validation_at(s, range.0, range.1));
-        match rule(top, &ctx, current, (range.0, range.1)) {
+            .and_then(|s| gridcore::validation::dialog_rule_at(s, range.0, range.1));
+        match rule(top, &ctx, current.as_ref(), (range.0, range.1)) {
             Ok(r) => Some(r),
             Err(e) => return Some(Err(e)),
         }
@@ -754,6 +760,70 @@ mod tests {
         press(&mut t, "Cancel").unwrap();
         assert!(view(&mut t).undo_step());
         assert!(view(&mut t).sheet().validations.is_empty());
+    }
+
+    /// #1817: a cell only an Excel 2010 (`extLst`) validation covers opens
+    /// the dialog on that rule, and an untouched OK changes nothing.
+    #[test]
+    fn the_dialog_shows_an_x14_rule() {
+        use gridcore::sheet::{AlertStyle, DataValidation, ExtKind, ExtRule, ExtValidation};
+        let mut t = tab();
+        let attrs = DataValidation {
+            kind: "list".into(),
+            allow_blank: true,
+            show_input: true,
+            show_error: true,
+            prompt_title: "Pick".into(),
+            prompt: Some("From the list".into()),
+            error_style: AlertStyle::Warning,
+            error: "Not on the list".into(),
+            ..DataValidation::default()
+        };
+        let ext = ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![(0, 2, 4, 2)], // C1:C5
+            formulas: vec!["Sheet2!$A$1:$A$5".into()],
+            ix: 0,
+            validation: Some(Box::new(ExtValidation {
+                attrs,
+                formula1: Some(0),
+                formula2: None,
+            })),
+        };
+        view(&mut t).pkg.workbook.sheets[0]
+            .ext_rules
+            .push(ext.clone());
+        let v = view(&mut t);
+        v.anchor = at("C1");
+        v.sel = at("C5");
+        open(&mut t);
+        let d = t.dialogs.top().unwrap();
+        let list = gridcore::validation::KINDS
+            .iter()
+            .position(|k| k.0 == "list")
+            .unwrap();
+        assert_eq!(choice(d, "allow"), list);
+        assert_eq!(text(d, "first"), "=Sheet2!$A$1:$A$5");
+        assert_eq!(text(d, "input-title"), "Pick");
+        assert_eq!(text(d, "input-message"), "From the list");
+        assert_eq!(text(d, "error-message"), "Not on the list");
+        assert!(checked(d, "ignore-blank"));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(t.status, "Data validation unchanged");
+        assert!(view(&mut t).undo.is_empty());
+        let s = view(&mut t).sheet();
+        assert_eq!(s.ext_rules, vec![ext]);
+        assert!(s.validations.is_empty() && s.ext_removed.is_empty());
+        // A changed message makes it a classic rule, its list kept.
+        open(&mut t);
+        t.dialogs.select_tab("Input Message").unwrap();
+        set(&mut t, "input-message", Json::Str("Choose".into()));
+        press(&mut t, "OK").unwrap();
+        assert_eq!(view(&mut t).undo.len(), 1);
+        let s = view(&mut t).sheet();
+        assert!(s.ext_rules.is_empty());
+        assert_eq!(s.validations[0].formula1, "Sheet2!$A$1:$A$5");
+        assert_eq!(s.validations[0].prompt.as_deref(), Some("Choose"));
     }
 
     #[test]

@@ -2590,6 +2590,8 @@ fn parse_worksheet_with(
     let mut ext_depth = 0usize;
     let mut cur_ext: Option<crate::sheet::ExtRule> = None;
     let mut ext_text: Option<bool> = None; // Some(true) = sqref, Some(false) = f
+    // Inside an x14 validation's `<x14:formula1>` (1) or `<x14:formula2>` (2).
+    let mut ext_slot: u8 = 0;
     let mut ext_buf = String::new();
     let ext_cf_spans = x14_spans(xml, crate::sheet::ExtKind::Cf);
     let ext_dv_spans = x14_spans(xml, crate::sheet::ExtKind::Dv);
@@ -2663,14 +2665,32 @@ fn parse_worksheet_with(
                         crate::sheet::ExtKind::Dv => &ext_dv_spans,
                     };
                     let start = p.start_pos();
+                    // A validation's settings are read as the classic
+                    // `<dataValidation>`'s are, so the dialog can show it.
+                    let validation = (kind == crate::sheet::ExtKind::Dv).then(|| {
+                        Box::new(crate::sheet::ExtValidation {
+                            attrs: read_dv_attrs(&p),
+                            formula1: None,
+                            formula2: None,
+                        })
+                    });
+                    ext_slot = 0;
                     cur_ext = spans.iter().position(|&(s, _)| s == start).map(|ix| {
                         crate::sheet::ExtRule {
                             kind,
                             ranges: Vec::new(),
                             formulas: Vec::new(),
                             ix,
+                            validation,
                         }
                     });
+                }
+                "formula1" | "formula2"
+                    if cur_ext
+                        .as_ref()
+                        .is_some_and(|r| r.kind == crate::sheet::ExtKind::Dv) =>
+                {
+                    ext_slot = if local(p.name()) == "formula1" { 1 } else { 2 };
                 }
                 "sqref" if cur_ext.is_some() => {
                     ext_text = Some(true);
@@ -2929,26 +2949,11 @@ fn parse_worksheet_with(
                             ranges.push(r);
                         }
                     }
-                    let pr = p.attr("prompt");
-                    let prompt = (!pr.is_empty()).then(|| decode(pr));
                     let start = p.start_pos();
                     cur_dv = Some(crate::sheet::DataValidation {
                         ranges,
-                        kind: p.attr("type").to_string(),
-                        operator: p.attr("operator").to_string(),
-                        formula1: String::new(),
-                        formula2: String::new(),
-                        prompt,
-                        prompt_title: decode(p.attr("promptTitle")),
-                        allow_blank: flag_attr(p.attr("allowBlank")),
-                        show_input: flag_attr(p.attr("showInputMessage")),
-                        show_error: flag_attr(p.attr("showErrorMessage")),
-                        show_dropdown: !flag_attr(p.attr("showDropDown")),
-                        error_style: crate::sheet::AlertStyle::from_attr(p.attr("errorStyle")),
-                        error_title: decode(p.attr("errorTitle")),
-                        error: decode(p.attr("error")),
                         ix: dv_spans.iter().position(|&(s, _)| s == start),
-                        orig: None,
+                        ..read_dv_attrs(&p)
                     });
                 }
                 "formula1" if cur_dv.is_some() && !in_ext => {
@@ -2981,11 +2986,20 @@ fn parse_worksheet_with(
                             rule.ranges
                                 .extend(text.split_whitespace().filter_map(parse_sqref_token));
                         } else {
+                            let at = rule.formulas.len();
+                            if let Some(v) = rule.validation.as_mut() {
+                                match ext_slot {
+                                    1 => v.formula1 = v.formula1.or(Some(at)),
+                                    2 => v.formula2 = v.formula2.or(Some(at)),
+                                    _ => {}
+                                }
+                            }
                             rule.formulas.push(text);
                         }
                     }
                     ext_text = None;
                 }
+                "formula1" | "formula2" if ext_slot > 0 => ext_slot = 0,
                 "conditionalFormatting" | "dataValidation"
                     if in_ext
                         && cur_ext.as_ref().is_some_and(|r| {
@@ -5265,6 +5279,31 @@ fn cond_format_spans(xml: &str) -> Vec<(usize, usize)> {
         .filter(|c| c.local == "conditionalFormatting")
         .map(|c| (c.start, c.end))
         .collect()
+}
+
+/// A validation element's settings (`<dataValidation>` or
+/// `<x14:dataValidation>`, which share their attributes): no ranges, no
+/// formulas, no element.
+fn read_dv_attrs(p: &XmlParser<'_>) -> crate::sheet::DataValidation {
+    let pr = p.attr("prompt");
+    crate::sheet::DataValidation {
+        ranges: Vec::new(),
+        kind: p.attr("type").to_string(),
+        operator: p.attr("operator").to_string(),
+        formula1: String::new(),
+        formula2: String::new(),
+        prompt: (!pr.is_empty()).then(|| decode(pr)),
+        prompt_title: decode(p.attr("promptTitle")),
+        allow_blank: flag_attr(p.attr("allowBlank")),
+        show_input: flag_attr(p.attr("showInputMessage")),
+        show_error: flag_attr(p.attr("showErrorMessage")),
+        show_dropdown: !flag_attr(p.attr("showDropDown")),
+        error_style: crate::sheet::AlertStyle::from_attr(p.attr("errorStyle")),
+        error_title: decode(p.attr("errorTitle")),
+        error: decode(p.attr("error")),
+        ix: None,
+        orig: None,
+    }
 }
 
 /// An XML boolean attribute's value (`1` / `true`).
@@ -26576,6 +26615,7 @@ mod rule_shift_tests {
                 ranges: vec![(0, 3, 0, 3)],
                 formulas: vec!["SUM(Jan:Mar!$B$2)>1".into()],
                 ix: 0,
+                validation: None,
             });
         assert!(pkg.delete_sheet(3));
         let cell = |pkg: &SheetPackage, r: u32| pkg.workbook.sheets[0].cell(r, 0).unwrap().clone();
@@ -26715,18 +26755,270 @@ mod rule_shift_tests {
         assert!(ws.contains(&keep), "{ws}");
     }
 
-    /// #1734: the Data Validation dialog's OK on "Any value" over a cell an
-    /// x14 validation covers keeps the element in the saved file.
+    /// #1734, #1817: the Data Validation dialog's OK on "Any value" takes
+    /// off the x14 validation it showed (the one on its cell) and keeps one
+    /// over the other cells that it did not show.
     #[test]
-    fn any_value_ok_keeps_an_x14_validation_through_a_save() {
-        let dv = x14_dv("C1:C5", "Z1", None);
-        let mut pkg = one("S", &format!("{MARGINS}{dv}"));
+    fn any_value_ok_strikes_the_shown_x14_rule_only() {
+        let two = format!(
+            r#"<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" {X14_NS}><x14:dataValidations count="2"><x14:dataValidation type="list"><x14:formula1><xm:f>Z1</xm:f></x14:formula1><xm:sqref>A1:A5</xm:sqref></x14:dataValidation><x14:dataValidation type="list"><x14:formula1><xm:f>Z2</xm:f></x14:formula1><xm:sqref>C1</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>"#
+        );
+        let mut pkg = one("S", &format!("{MARGINS}{two}"));
+        let sheet = &pkg.workbook.sheets[0];
+        let shown = crate::validation::dialog_rule_at(sheet, 0, 0).expect("the A1 rule");
+        assert_eq!(shown.formula1, "Z1");
         let any = crate::sheet::DataValidation::default();
-        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 2, 4, 2), &any, false);
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 0, 4, 2), &any, false);
+        let sheet = &pkg.workbook.sheets[0];
+        assert_eq!(sheet.ext_rules.len(), 1);
+        assert_eq!(sheet.ext_rules[0].ranges, vec![(0, 2, 0, 2)]);
+        assert!(sheet.validations.is_empty());
         let (re, ws) = saved(&pkg, SHEET1);
-        assert!(ws.contains("<x14:dataValidations count=\"1\">"), "{ws}");
-        assert!(ws.contains("<xm:sqref>C1:C5</xm:sqref>"), "{ws}");
+        assert!(ws.contains(r#"<x14:dataValidations count="1">"#), "{ws}");
+        assert!(ws.contains("<xm:sqref>C1</xm:sqref>"), "{ws}");
+        assert!(!ws.contains("<xm:f>Z1</xm:f>"), "{ws}");
         assert_eq!(re.workbook.sheets[0].ext_rules.len(), 1);
+    }
+
+    /// An `extLst` with one x14 validation over `sqref` with `attrs`.
+    fn x14_dv_attrs(attrs: &str, sqref: &str, f1: &str, f2: Option<&str>) -> String {
+        x14_dv(sqref, f1, f2).replace(
+            r#"<x14:dataValidation type="list" allowBlank="1">"#,
+            &format!("<x14:dataValidation {attrs}>"),
+        )
+    }
+
+    /// What the dialog opened on `range`'s top-left cell gives on OK, after
+    /// `edit` changed its boxes.
+    fn dialog_ok(
+        sheet: &crate::sheet::Sheet,
+        range: (u32, u32, u32, u32),
+        edit: impl FnOnce(&mut crate::validation::DialogBoxes),
+    ) -> crate::sheet::DataValidation {
+        let at = (range.0, range.1);
+        let cur = crate::validation::dialog_rule_at(sheet, at.0, at.1);
+        let mut b = crate::validation::DialogBoxes::of(cur.as_ref(), at, false);
+        edit(&mut b);
+        b.rule(&crate::entry::EntryCtx::default(), cur.as_ref(), at)
+            .expect("a rule")
+    }
+
+    const X14_LIST_ATTRS: &str = r#"type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" errorStyle="warning" errorTitle="Tom &amp; Jerry" error="Pick &lt;one&gt;" promptTitle="Pick" prompt="From &quot;Sheet2&quot;" showDropDown="1""#;
+
+    fn x14_list_book() -> SheetPackage {
+        let x14 = x14_dv_attrs(X14_LIST_ATTRS, "C1:C5", "Sheet2!$A$1:$A$5", None);
+        load_xlsx(&book(
+            "",
+            &[
+                ("S", Some(&format!("{DATA}{MARGINS}{x14}"))),
+                ("Sheet2", Some(DATA)),
+            ],
+        ))
+        .unwrap()
+    }
+
+    /// #1817: an x14 validation's attributes are read as a classic one's,
+    /// its formulas in their slots.
+    #[test]
+    fn x14_validation_attributes_are_read() {
+        let pkg = x14_list_book();
+        let ext = &pkg.workbook.sheets[0].ext_rules[0];
+        let v = ext.validation.as_ref().expect("settings read");
+        assert_eq!((v.formula1, v.formula2), (Some(0), None));
+        let dv = ext.to_validation().unwrap();
+        assert_eq!(dv.kind, "list");
+        assert_eq!(dv.ranges, vec![(0, 2, 4, 2)]);
+        assert_eq!(dv.formula1, "Sheet2!$A$1:$A$5");
+        assert!(dv.allow_blank && dv.show_input && dv.show_error);
+        assert!(!dv.show_dropdown, "showDropDown=1 hides it");
+        assert_eq!(dv.error_style, crate::sheet::AlertStyle::Warning);
+        assert_eq!(dv.error_title, "Tom & Jerry");
+        assert_eq!(dv.error, "Pick <one>");
+        assert_eq!(dv.prompt_title, "Pick");
+        assert_eq!(dv.prompt.as_deref(), Some("From \"Sheet2\""));
+        // Two formulas, each in its slot.
+        let x14 = x14_dv_attrs(
+            r#"type="whole" operator="between""#,
+            "B1:B2",
+            "B1",
+            Some("$Z$9"),
+        );
+        let pkg = one("S", &format!("{MARGINS}{x14}"));
+        let dv = pkg.workbook.sheets[0].ext_rules[0].to_validation().unwrap();
+        assert_eq!((dv.formula1.as_str(), dv.formula2.as_str()), ("B1", "$Z$9"));
+        assert_eq!(dv.operator, "between");
+        // Conditional formatting carries no settings.
+        let pkg = one("S", &format!("{MARGINS}{}", x14_cf("A1", "A1&gt;1")));
+        assert!(pkg.workbook.sheets[0].ext_rules[0].validation.is_none());
+        assert!(
+            pkg.workbook.sheets[0].ext_rules[0]
+                .to_validation()
+                .is_none()
+        );
+    }
+
+    /// #1817: the dialog falls back to an x14 rule where no classic rule
+    /// covers the cell, as the rule stands now (moved with its rows).
+    #[test]
+    fn dialog_rule_at_falls_back_to_an_x14_rule_and_follows_its_moves() {
+        let mut pkg = x14_list_book();
+        let x14 = x14_dv_attrs(r#"type="whole" operator="greaterThan""#, "B1", "B1", None);
+        let classic = r#"<dataValidations count="1"><dataValidation type="decimal" operator="lessThan" sqref="B1"><formula1>5</formula1></dataValidation></dataValidations>"#;
+        let both = one("S", &format!("{classic}{MARGINS}{x14}"));
+        let dv = crate::validation::dialog_rule_at(&both.workbook.sheets[0], 0, 1).unwrap();
+        assert_eq!(dv.kind, "decimal", "the classic rule wins");
+        let s = &pkg.workbook.sheets[0];
+        assert!(crate::validation::validation_at(s, 0, 2).is_none());
+        assert!(crate::validation::dialog_rule_at(s, 0, 3).is_none());
+        let dv = crate::validation::dialog_rule_at(s, 0, 2).unwrap();
+        assert_eq!(dv.kind, "list");
+        insert_rows(&mut pkg.workbook, 0, 0, 2);
+        let s = &pkg.workbook.sheets[0];
+        assert!(crate::validation::dialog_rule_at(s, 0, 2).is_none());
+        let dv = crate::validation::dialog_rule_at(s, 2, 2).unwrap();
+        assert_eq!(dv.ranges, vec![(2, 2, 6, 2)]);
+        assert_eq!(dv.formula1, "Sheet2!$A$1:$A$5");
+        // A rule that imposes nothing is not shown.
+        let none = x14_dv_attrs(r#"type="none""#, "A1", "Z1", None);
+        let pkg = one("S", &format!("{MARGINS}{none}"));
+        assert!(crate::validation::dialog_rule_at(&pkg.workbook.sheets[0], 0, 0).is_none());
+    }
+
+    /// #1817: OK on an untouched dialog over an x14 rule changes nothing, so
+    /// the element keeps its bytes, also for a between rule whose
+    /// `operator` Excel leaves out.
+    #[test]
+    fn an_unchanged_ok_keeps_an_x14_rule_untouched() {
+        let mut pkg = x14_list_book();
+        let x14 = x14_dv_attrs(X14_LIST_ATTRS, "C1:C5", "Sheet2!$A$1:$A$5", None);
+        let before = pkg.workbook.sheets[0].clone();
+        for (range, all) in [((0, 2, 4, 2), false), ((1, 2, 2, 2), true)] {
+            let ok = dialog_ok(&pkg.workbook.sheets[0], range, |_| {});
+            crate::validation::set_validation(&mut pkg.workbook.sheets[0], range, &ok, all);
+            let s = &pkg.workbook.sheets[0];
+            assert_eq!(s.ext_rules, before.ext_rules);
+            assert!(s.validations.is_empty() && s.ext_removed.is_empty());
+        }
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&x14), "{ws}");
+        assert!(!ws.contains("<dataValidations"), "{ws}");
+        // No `operator`: the dialog reads it as between.
+        let x14 = x14_dv_attrs(r#"type="whole" allowBlank="1""#, "B1:B3", "1", Some("9"));
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        let ok = dialog_ok(&pkg.workbook.sheets[0], (0, 1, 2, 1), |_| {});
+        assert_eq!(ok.operator, "between");
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 1, 2, 1), &ok, false);
+        assert!(pkg.workbook.sheets[0].validations.is_empty());
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&x14), "{ws}");
+        assert!(!ws.contains("<dataValidations"), "{ws}");
+    }
+
+    /// #1817: an edited x14 rule is written as a classic one, its other-sheet
+    /// list kept, and the x14 element goes.
+    #[test]
+    fn a_changed_ok_turns_an_x14_rule_into_a_classic_one_through_a_save() {
+        let mut pkg = x14_list_book();
+        let ok = dialog_ok(&pkg.workbook.sheets[0], (0, 2, 4, 2), |b| {
+            b.prompt = "Choose".into();
+        });
+        assert_eq!(ok.formula1, "Sheet2!$A$1:$A$5");
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 2, 4, 2), &ok, false);
+        let (re, ws) = saved(&pkg, SHEET1);
+        assert!(!ws.contains("x14:dataValidation"), "{ws}");
+        assert!(ws.contains("<dataValidations"), "{ws}");
+        let s = &re.workbook.sheets[0];
+        assert!(s.ext_rules.is_empty());
+        let dv = &s.validations[0];
+        assert_eq!(dv.ranges, vec![(0, 2, 4, 2)]);
+        assert_eq!(dv.formula1, "Sheet2!$A$1:$A$5");
+        assert_eq!(dv.prompt.as_deref(), Some("Choose"));
+        assert_eq!(dv.error_title, "Tom & Jerry");
+        assert_eq!(dv.error_style, crate::sheet::AlertStyle::Warning);
+        assert!(!dv.show_dropdown);
+    }
+
+    /// #1817: an untouched OK over a selection that also holds a classic rule
+    /// is a change: the selection takes the x14 rule's settings.
+    #[test]
+    fn unchanged_ok_over_a_selection_with_a_classic_rule_rewrites_it() {
+        let x14 = x14_dv_attrs(r#"type="list" allowBlank="1""#, "C1:C5", "$Z$1:$Z$3", None);
+        let classic = r#"<dataValidations count="1"><dataValidation type="whole" operator="greaterThan" sqref="C3"><formula1>5</formula1></dataValidation></dataValidations>"#;
+        let mut pkg = one("S", &format!("{classic}{MARGINS}{x14}"));
+        let range = (0, 2, 4, 2);
+        let ok = dialog_ok(&pkg.workbook.sheets[0], range, |_| {});
+        assert_eq!(ok.kind, "list");
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], range, &ok, false);
+        let s = &pkg.workbook.sheets[0];
+        assert!(s.ext_rules.is_empty());
+        assert_eq!(s.validations.len(), 1);
+        assert_eq!(s.validations[0].kind, "list");
+        assert_eq!(s.validations[0].ranges, vec![range]);
+        // A selection reaching past the x14 rule's cells is a change too.
+        let mut pkg = one("S", &format!("{MARGINS}{x14}"));
+        let range = (0, 2, 6, 2);
+        let ok = dialog_ok(&pkg.workbook.sheets[0], range, |_| {});
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], range, &ok, false);
+        let s = &pkg.workbook.sheets[0];
+        assert!(s.ext_rules.is_empty());
+        assert_eq!(s.validations[0].ranges, vec![range]);
+    }
+
+    fn two_like_x14() -> SheetPackage {
+        let two = format!(
+            r#"<extLst><ext uri="{{CCE6A557-97BC-4b89-ADB6-D9C93CAAB3DF}}" {X14_NS}><x14:dataValidations count="3"><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>$Z$1:$Z$3</xm:f></x14:formula1><xm:sqref>A1:A5</xm:sqref></x14:dataValidation><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>$Z$1:$Z$3</xm:f></x14:formula1><xm:sqref>C1:C2</xm:sqref></x14:dataValidation><x14:dataValidation type="list" allowBlank="1"><x14:formula1><xm:f>$Y$1</xm:f></x14:formula1><xm:sqref>E1</xm:sqref></x14:dataValidation></x14:dataValidations></ext></extLst>"#
+        );
+        one("S", &format!("{MARGINS}{two}"))
+    }
+
+    /// #1817: an untouched OK with Apply to all over x14 rules is no change.
+    #[test]
+    fn unchanged_ok_with_apply_to_all_keeps_every_x14_rule() {
+        let mut pkg = two_like_x14();
+        let before = pkg.workbook.sheets[0].clone();
+        let ok = dialog_ok(&pkg.workbook.sheets[0], (0, 0, 1, 0), |_| {});
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 0, 1, 0), &ok, true);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules, before.ext_rules);
+        assert!(s.validations.is_empty() && s.ext_removed.is_empty());
+    }
+
+    /// #1817: Apply to all and Clear All's Apply to all reach the x14 rules
+    /// with the shown rule's settings, and only those.
+    #[test]
+    fn apply_to_all_and_clear_all_reach_x14_rules_with_the_same_settings() {
+        let mut pkg = two_like_x14();
+        let ok = dialog_ok(&pkg.workbook.sheets[0], (0, 0, 0, 0), |b| {
+            b.prompt = "Pick".into();
+        });
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 0, 0, 0), &ok, true);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules.len(), 1, "the unlike E1 rule stays");
+        assert_eq!(s.ext_rules[0].ranges, vec![(0, 4, 0, 4)]);
+        assert_eq!(s.validations.len(), 1);
+        let mut got = s.validations[0].ranges.clone();
+        got.sort();
+        assert_eq!(got, vec![(0, 0, 4, 0), (0, 2, 1, 2)]);
+        // Any value with Apply to all strikes the like ones, not E1.
+        let mut pkg = two_like_x14();
+        let any = crate::sheet::DataValidation::default();
+        crate::validation::set_validation(&mut pkg.workbook.sheets[0], (0, 0, 0, 0), &any, true);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules.len(), 1);
+        assert_eq!(s.ext_rules[0].ranges, vec![(0, 4, 0, 4)]);
+        assert!(s.validations.is_empty());
+        // Clear All with Apply to all the same.
+        let mut pkg = two_like_x14();
+        crate::validation::clear_all_validation(&mut pkg.workbook.sheets[0], (0, 0, 0, 0), true);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules.len(), 1);
+        assert_eq!(s.ext_rules[0].ranges, vec![(0, 4, 0, 4)]);
+        // Without it, only the cell.
+        let mut pkg = two_like_x14();
+        crate::validation::clear_all_validation(&mut pkg.workbook.sheets[0], (0, 0, 0, 0), false);
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(s.ext_rules.len(), 3);
+        assert_eq!(s.ext_rules[0].ranges, vec![(1, 0, 4, 0)]);
     }
 
     #[test]

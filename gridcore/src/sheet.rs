@@ -2544,7 +2544,9 @@ pub enum ExtKind {
 
 /// An Excel 2010 conditional-formatting or data-validation element in the
 /// worksheet's `extLst`: it is not evaluated, only moved with the edits that
-/// move its ranges and formulas, so a save can write them back.
+/// move its ranges and formulas, so a save can write them back. A
+/// validation's settings are read for the Data Validation dialog only
+/// ([`ExtRule::validation`], #1817); entry checking stays classic.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtRule {
     pub kind: ExtKind,
@@ -2556,6 +2558,45 @@ pub struct ExtRule {
     /// The ordinal of its element among the x14 elements of that kind in the
     /// worksheet's top-level `extLst`s (document order).
     pub ix: usize,
+    /// A validation's own settings, read so the Data Validation dialog can
+    /// show it (#1817). `None` for conditional formatting and for a rule
+    /// built in memory.
+    pub validation: Option<Box<ExtValidation>>,
+}
+
+/// An `<x14:dataValidation>`'s attributes, with which of
+/// [`ExtRule::formulas`] are its `formula1` and `formula2`: the formulas
+/// live only there, so every edit that moves them keeps the rule current.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtValidation {
+    /// The attributes; its ranges and formulas are left empty.
+    pub attrs: DataValidation,
+    pub formula1: Option<usize>,
+    pub formula2: Option<usize>,
+}
+
+impl ExtRule {
+    /// The validation as a classic rule over its current ranges and
+    /// formulas (`ix` and `orig` none: it is no `<dataValidation>`).
+    pub fn to_validation(&self) -> Option<DataValidation> {
+        if self.kind != ExtKind::Dv {
+            return None;
+        }
+        let v = self.validation.as_ref()?;
+        let f = |i: Option<usize>| {
+            i.and_then(|i| self.formulas.get(i))
+                .cloned()
+                .unwrap_or_default()
+        };
+        Some(DataValidation {
+            ranges: self.ranges.clone(),
+            formula1: f(v.formula1),
+            formula2: f(v.formula2),
+            ix: None,
+            orig: None,
+            ..v.attrs.clone()
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]

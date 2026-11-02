@@ -6939,7 +6939,9 @@ impl App {
             return;
         }
         let range = self.selection();
-        let current = gridcore::validation::validation_at(self.sheet(), range.0, range.1).cloned();
+        // An Excel 2010 (`extLst`) rule shows where no classic one covers
+        // the cell (#1817).
+        let current = gridcore::validation::dialog_rule_at(self.sheet(), range.0, range.1);
         self.validation_dialog = Some(validationdlg::ValidationDialog::new(
             self.sheet,
             range,
@@ -6971,6 +6973,7 @@ impl App {
                     Ok(rule) => {
                         self.validation_dialog = None;
                         let (sheet, range) = (d.sheet, d.range);
+                        let before = self.rule_state(sheet);
                         self.with_rules(&[sheet], |app| {
                             gridcore::validation::set_validation(
                                 &mut app.pkg.workbook.sheets[sheet],
@@ -6979,7 +6982,13 @@ impl App {
                                 d.apply_all,
                             );
                         });
-                        self.status = Some("Data validation applied".into());
+                        // An OK that changes nothing (an untouched x14 rule)
+                        // records no step.
+                        self.status = Some(if self.rule_state(sheet) == before {
+                            "Data validation unchanged".into()
+                        } else {
+                            "Data validation applied".into()
+                        });
                     }
                 }
             }
@@ -25513,6 +25522,7 @@ mod tests {
                         ranges: vec![(0, 1, 0, 1)],
                         formulas: vec!["Data!$A$1:$A$3".into()],
                         ix: 0,
+                        validation: None,
                     }],
                     Vec::new(),
                 ),
@@ -26438,6 +26448,46 @@ mod tests {
             .collect()
     }
 
+    /// #1817: the dialog opened on a cell only an x14 rule covers shows it,
+    /// and an untouched OK records no step and leaves the rule as it was.
+    #[test]
+    fn an_untouched_ok_on_an_x14_rule_is_no_step() {
+        use gridcore::sheet::{DataValidation, ExtKind, ExtRule, ExtValidation};
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.pkg.workbook.sheets[0].ext_rules.push(ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![(0, 2, 4, 2)], // C1:C5
+            formulas: vec!["$Z$1:$Z$3".into()],
+            ix: 0,
+            validation: Some(Box::new(ExtValidation {
+                attrs: DataValidation {
+                    kind: "list".into(),
+                    allow_blank: true,
+                    show_error: true,
+                    ..DataValidation::default()
+                },
+                formula1: Some(0),
+                formula2: None,
+            })),
+        });
+        let before = every_rule(&app);
+        app.cur = (0, 2);
+        app.anchor = Some((4, 2));
+        app.open_validation_dialog();
+        let shown = app
+            .validation_dialog
+            .as_ref()
+            .unwrap()
+            .rule(&entry_ctx(&app.pkg.workbook, None));
+        assert_eq!(shown.unwrap().formula1, "$Z$1:$Z$3");
+        let depth = app.undo.len();
+        app.validation_dialog_key(KeyCode::Enter);
+        assert!(app.validation_dialog.is_none());
+        assert_eq!(app.status.as_deref(), Some("Data validation unchanged"));
+        assert_eq!(app.undo.len(), depth);
+        assert_eq!(every_rule(&app), before);
+    }
+
     /// #1681: a validation clear that only cuts an Excel 2010 (`extLst`)
     /// rule is an undo step too, and undo gives the rule and its ranges back.
     #[test]
@@ -26449,6 +26499,7 @@ mod tests {
             ranges: vec![(6, 5, 9, 5)], // F7:F10
             formulas: vec!["Z7".into()],
             ix: 0,
+            validation: None,
         });
         let before = every_rule(&app);
         let depth = app.undo.len();

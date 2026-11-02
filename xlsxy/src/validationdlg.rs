@@ -307,6 +307,40 @@ mod tests {
         }
     }
 
+    /// #1817: a cell only an Excel 2010 (`extLst`) list rule covers opens
+    /// on that rule, and OK keeps its other-sheet source.
+    #[test]
+    fn the_dialog_opens_on_an_x14_rule() {
+        use gridcore::sheet::{ExtKind, ExtRule, ExtValidation, Sheet};
+        let mut sheet = Sheet::default();
+        sheet.ext_rules.push(ExtRule {
+            kind: ExtKind::Dv,
+            ranges: vec![(0, 2, 4, 2)], // C1:C5
+            formulas: vec!["Sheet2!$A$1:$A$5".into()],
+            ix: 0,
+            validation: Some(Box::new(ExtValidation {
+                attrs: DataValidation {
+                    kind: "list".into(),
+                    allow_blank: true,
+                    prompt: Some("Pick one".into()),
+                    error: "Not listed".into(),
+                    ..DataValidation::default()
+                },
+                formula1: Some(0),
+                formula2: None,
+            })),
+        });
+        let range = (0, 2, 4, 2);
+        let current = gridcore::validation::dialog_rule_at(&sheet, 0, 2);
+        let d = ValidationDialog::new(0, range, current.as_ref(), false);
+        assert_eq!(KINDS[d.b.kind].0, "list");
+        assert_eq!(d.b.first, "=Sheet2!$A$1:$A$5");
+        assert_eq!(d.b.prompt, "Pick one");
+        assert_eq!(d.b.error, "Not listed");
+        let rule = d.rule(&ctx()).unwrap();
+        assert_eq!(rule.formula1, "Sheet2!$A$1:$A$5");
+    }
+
     #[test]
     fn whole_between_with_an_error_alert() {
         let mut d = ValidationDialog::new(0, (1, 1, 9, 1), None, false);
