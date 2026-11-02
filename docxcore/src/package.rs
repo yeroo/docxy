@@ -17,7 +17,7 @@ use crate::load::{
 use crate::model::{Block, Document, PropertyScope, SectionProperties};
 use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
-use crate::zip::ZipArchive;
+use crate::zip::{ZipArchive, ZipEntry};
 use crate::zipwrite::write_zip;
 use std::borrow::Cow;
 
@@ -4165,8 +4165,21 @@ pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
     None
 }
 
+/// Budget, in bytes, for the sum of the declared uncompressed sizes of the
+/// parts [`load_package`] extracts. A package over it is refused with
+/// [`LoadError::TooLarge`] before anything is extracted, so a small file of
+/// highly compressible parts cannot make opening allocate gigabytes (#851).
+/// Larger than `.yppx`'s budget: real documents with many pictures reach
+/// hundreds of MiB.
+pub const MAX_PACKAGE_UNCOMPRESSED: u64 = 1024 * 1024 * 1024;
+
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.
 pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
+    load_package_within(data, MAX_PACKAGE_UNCOMPRESSED)
+}
+
+/// [`load_package`] with its size budget given.
+fn load_package_within(data: &[u8], budget: u64) -> Result<Package, LoadError> {
     let zip = match ZipArchive::open(data) {
         Some(z) => z,
         None => {
@@ -4187,7 +4200,18 @@ pub fn load_package(data: &[u8]) -> Result<Package, LoadError> {
         .map(|e| e.name.replace('\\', "/"))
         .collect();
     let is_part = opccore::parts::part_flags(&zip, &names);
-    for (e, _) in zip.entries().iter().zip(is_part).filter(|(_, p)| *p) {
+    let entries: Vec<&ZipEntry> = zip
+        .entries()
+        .iter()
+        .zip(is_part)
+        .filter(|(_, p)| *p)
+        .map(|(e, _)| e)
+        .collect();
+    let total = opccore::zip::declared_bytes(entries.iter().copied());
+    if total > budget {
+        return Err(LoadError::TooLarge { total, budget });
+    }
+    for e in entries {
         let bytes = zip.extract(e).ok_or(LoadError::CorruptPart)?;
         if e.name == "word/document.xml" {
             doc_index = Some(parts.len());
@@ -4950,6 +4974,75 @@ fn comment_id_at(xml: &str, start: usize) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Set the declared uncompressed size of the entry named `name` in the ZIP's
+    /// central directory, the size the loaders budget and `extract` checks.
+    fn declare_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
+        let rd16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+        let eocd = zip.windows(4).rposition(|s| s == b"PK").unwrap();
+        let mut at = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        loop {
+            assert_eq!(&zip[at..at + 4], b"PK", "no entry {name}");
+            let len = rd16(&zip, at + 28);
+            if &zip[at + 46..at + 46 + len] == name.as_bytes() {
+                zip[at + 24..at + 28].copy_from_slice(&size.to_le_bytes());
+                return zip;
+            }
+            at += 46 + len + rd16(&zip, at + 30) + rd16(&zip, at + 32);
+        }
+    }
+
+    /// The declared uncompressed bytes of every entry.
+    fn declared_total(zip: &[u8]) -> u64 {
+        opccore::zip::declared_bytes(ZipArchive::open(zip).unwrap().entries())
+    }
+
+    /// #851: a document whose parts declare more than the budget is refused
+    /// before anything is extracted; at exactly the budget it loads.
+    #[test]
+    fn package_over_the_size_budget_is_too_large() {
+        let docx = make_docx("<w:document><w:body><w:p/></w:body></w:document>");
+        let total = declared_total(&docx);
+        assert!(load_package_within(&docx, total).is_ok());
+        assert_eq!(
+            load_package_within(&docx, total - 1).err(),
+            Some(LoadError::TooLarge {
+                total,
+                budget: total - 1
+            })
+        );
+    }
+
+    /// #851: one part declaring 4 GiB is refused by `load_package` itself as
+    /// too large, not extracted and reported corrupt.
+    #[test]
+    fn huge_declared_part_is_too_large() {
+        let docx = make_docx("<w:document><w:body><w:p/></w:body></w:document>");
+        let docx = declare_size(docx, "word/styles.xml", u32::MAX);
+        let error = load_package(&docx).err().unwrap();
+        assert!(matches!(error, LoadError::TooLarge { .. }), "{error:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("too large") && text.contains("1024 MiB"),
+            "{text}"
+        );
+    }
+
+    /// #851: a directory entry is no part, so its declared size is not
+    /// budgeted (nothing extracts it).
+    #[test]
+    fn directory_entry_size_is_not_budgeted() {
+        let mut parts = vec![("word/".to_string(), Vec::new())];
+        let docx = make_docx("<w:document><w:body><w:p/></w:body></w:document>");
+        let zip = ZipArchive::open(&docx).unwrap();
+        parts.extend(
+            zip.entries()
+                .iter()
+                .map(|e| (e.name.clone(), zip.extract(e).unwrap())),
+        );
+        let docx = declare_size(write_zip(&parts), "word/", u32::MAX);
+        assert!(load_package_within(&docx, declared_total(&docx) - u64::from(u32::MAX)).is_ok());
+    }
 
     /// An attribute is read with space around its `=` (FIX r2 #6), and
     /// never as the tail of a longer name.

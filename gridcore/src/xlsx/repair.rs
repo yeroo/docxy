@@ -17,9 +17,9 @@
 //! - anything else fails with [`XlsxError::Unrepairable`] naming the part.
 
 use super::{
-    OoxmlNs, STRICT, SheetPackage, TRANSITIONAL, XlsxError, decode, is_strict_workbook, load_parts,
-    local, minimal_styles_xml, open_container, parse_rels, part_entries, rels_part_name,
-    resolve_relative, utf8_part, workbook_part_name,
+    MAX_PACKAGE_UNCOMPRESSED, OoxmlNs, STRICT, SheetPackage, TRANSITIONAL, XlsxError, decode,
+    is_strict_workbook, load_parts, local, minimal_styles_xml, open_container, parse_rels,
+    part_entries, rels_part_name, resolve_relative, utf8_part, workbook_part_name,
 };
 use crate::sheet::Workbook;
 use opccore::xml::{Event, XmlParser};
@@ -61,10 +61,15 @@ enum Fix {
 /// (see the module docs). A workbook with nothing damaged loads exactly as
 /// [`load_xlsx`] loads it, with empty [`Repairs`].
 pub fn load_xlsx_repair(data: &[u8]) -> Result<(SheetPackage, Repairs), XlsxError> {
+    load_xlsx_repair_within(data, MAX_PACKAGE_UNCOMPRESSED)
+}
+
+/// [`load_xlsx_repair`] with its size budget given.
+fn load_xlsx_repair_within(data: &[u8], budget: u64) -> Result<(SheetPackage, Repairs), XlsxError> {
     let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
     let mut damaged: Vec<String> = Vec::new();
-    for (e, name) in part_entries(&zip)? {
+    for (e, name) in part_entries(&zip, budget)? {
         match zip.extract(e) {
             Some(bytes) => parts.push((name, utf8_part(bytes))),
             None => damaged.push(name),

@@ -740,3 +740,62 @@ fn without_attrs_keeps_the_leading_spaces() {
     );
     assert_eq!(without_attrs("", &["s"]), "");
 }
+
+/// Set the declared uncompressed size of the entry named `name` in the ZIP's
+/// central directory, the size the loaders budget and `extract` checks.
+fn declare_size(mut zip: Vec<u8>, name: &str, size: u32) -> Vec<u8> {
+    let rd16 = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    let eocd = zip.windows(4).rposition(|s| s == b"PK").unwrap();
+    let mut at = u32::from_le_bytes(zip[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    loop {
+        assert_eq!(&zip[at..at + 4], b"PK", "no entry {name}");
+        let len = rd16(&zip, at + 28);
+        if &zip[at + 46..at + 46 + len] == name.as_bytes() {
+            zip[at + 24..at + 28].copy_from_slice(&size.to_le_bytes());
+            return zip;
+        }
+        at += 46 + len + rd16(&zip, at + 30) + rd16(&zip, at + 32);
+    }
+}
+
+/// The declared uncompressed bytes of every entry.
+fn declared_total(zip: &[u8]) -> u64 {
+    opccore::zip::declared_bytes(ZipArchive::open(zip).unwrap().entries())
+}
+
+/// #851: a workbook whose parts declare more than the budget is refused
+/// by both loaders before anything is extracted; at the budget it loads.
+#[test]
+fn workbook_over_the_size_budget_is_too_large() {
+    let book = save_xlsx(&crate::xlsx::new_xlsx());
+    let total = declared_total(&book);
+    let too_large = Some(XlsxError::TooLarge {
+        total,
+        budget: total - 1,
+    });
+    assert!(super::super::load_xlsx_within(&book, total).is_ok());
+    assert_eq!(
+        super::super::load_xlsx_within(&book, total - 1).err(),
+        too_large
+    );
+    assert!(load_xlsx_repair_within(&book, total).is_ok());
+    assert_eq!(load_xlsx_repair_within(&book, total - 1).err(), too_large);
+}
+
+/// #851: a part declaring 4 GiB is too large for both loaders; repair does
+/// not take it for a damaged part to mend.
+#[test]
+fn huge_declared_part_is_too_large_not_damaged() {
+    let book = declare_size(fixture(), "xl/theme/theme1.xml", u32::MAX);
+    for error in [
+        load_xlsx(&book).err().unwrap(),
+        load_xlsx_repair(&book).err().unwrap(),
+    ] {
+        assert!(matches!(error, XlsxError::TooLarge { .. }), "{error:?}");
+        let text = error.to_string();
+        assert!(
+            text.contains("too large") && text.contains("1024 MiB"),
+            "{text}"
+        );
+    }
+}

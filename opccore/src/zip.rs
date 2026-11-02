@@ -47,6 +47,17 @@ fn deflate_cap(uncomp_size: u64) -> Option<usize> {
     usize::try_from(uncomp_size).ok().map(|n| n.max(1))
 }
 
+/// The uncompressed bytes `entries` declare, in total: what extracting them
+/// all may allocate, since [`ZipArchive::extract`] refuses output of any other
+/// size. ZIP64 sizes are 64-bit, so the sum saturates rather than overflow.
+/// The package loaders check it against their budget before extracting
+/// anything (#451, #851).
+pub fn declared_bytes<'a>(entries: impl IntoIterator<Item = &'a ZipEntry>) -> u64 {
+    entries
+        .into_iter()
+        .fold(0, |total, entry| total.saturating_add(entry.uncomp_size))
+}
+
 /// The entry count and central directory offset of a ZIP64 archive, read
 /// from the ZIP64 end record its locator (just before the end record at
 /// `eocd`) points to. `Some(None)` when there is no locator. An ordinary
@@ -227,6 +238,22 @@ impl<'a> ZipArchive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1094: ZIP64 entries declare 64-bit sizes; their total saturates
+    /// instead of overflowing past a budget check.
+    #[test]
+    fn zip64_declared_sizes_saturate() {
+        let entry = |uncomp_size| ZipEntry {
+            name: String::new(),
+            method: 0,
+            comp_size: 0,
+            uncomp_size,
+            local_offset: 0,
+        };
+        let entries = [entry(u64::MAX), entry(1), entry(5)];
+        assert_eq!(declared_bytes(&entries), u64::MAX);
+        assert_eq!(declared_bytes(&entries[1..]), 6);
+    }
 
     /// Builds a minimal valid ZIP with all entries using the STORED method.
     fn make_stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {

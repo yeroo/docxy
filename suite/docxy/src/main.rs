@@ -12645,8 +12645,12 @@ fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, S
                 }
                 (Surface::Sheet(view), status.into(), recalculated)
             }
-            // A repair's refusal names the part, in words.
-            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => (
+            // A repair's refusal names the part, and an oversized package
+            // its size and the limit, in words.
+            Err(
+                e @ (gridcore::xlsx::XlsxError::Unrepairable(_)
+                | gridcore::xlsx::XlsxError::TooLarge { .. }),
+            ) => (
                 Surface::Placeholder,
                 format!("xlsx load error: {e}").into(),
                 false,
