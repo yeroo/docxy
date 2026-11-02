@@ -3626,9 +3626,10 @@ impl Session {
         // before the next (lower) stash comes back: that one may hold
         // rewrites of their calculated formulas, which `restore_top` puts
         // back only on a live table. The replayed removal re-stashes them.
-        // A table that still cannot come back (the pre-check makes this all
-        // but unreachable; a part whose taken id cannot be replaced is the
-        // one way) is carried into its sheet's fresh stash, never dropped.
+        // A table that still cannot come back (past the pre-check, e.g. a
+        // part whose id is taken or missing and cannot be replaced) is
+        // carried into its sheet's fresh stash, never dropped; it keeps the
+        // formula it had (a lower stash's rewrite of it is not put back).
         let mut carried: Vec<StashedTables> = Vec::with_capacity(later.len());
         for (later_name, _, _) in later.iter().rev() {
             let (_, _, pending) = self.restore_top();
@@ -3751,9 +3752,11 @@ impl Session {
     /// Why a non-top restore of stash `k` cannot wire the tables of the
     /// stashes above it while their sheets are back for the unwind, or `None`
     /// when it can: a table with no part kept, one whose name a live table or
-    /// defined name took since, or one sharing a name with a table of another
+    /// defined name took since, one sharing a name with a table of another
     /// stash from `k` up (wiring the later one first would leave the other
-    /// out). The first found, latest stash first; restoring that sheet first
+    /// out), or one sharing a name with a scoped defined name of its own
+    /// stash or a later one (`restore_top` has put those back before the
+    /// table is wired; `k`'s own come back after it). The first found, latest stash first; restoring that sheet first
     /// (in stack order) still works. A taken part name or id is no reason:
     /// `SheetPackage::restore_table` picks a free one, which the replayed
     /// removal then stashes.
@@ -3781,6 +3784,18 @@ impl Session {
                         })
                         .map(|(_, _, other, _)| {
                             format!("\"{}\" holds a table of that name too", other.name)
+                        })
+                        .or_else(|| {
+                            stashes[si..]
+                                .iter()
+                                .find(|o| {
+                                    o.defined_names
+                                        .iter()
+                                        .any(|(_, d)| gridcore::names::name_eq(&d.name, &t.name))
+                                })
+                                .map(|o| {
+                                    format!("\"{}\" holds a defined name of that name", o.name)
+                                })
                         })
                 };
                 if let Some(why) = why {
@@ -8097,6 +8112,43 @@ mod tests {
         assert!(out.contains(r#""tablesKept":["Table1"]"#), "{out}");
         let out = restore(&mut s, "B");
         assert!(out.contains("\"ok\":true"), "{out}");
+    }
+
+    /// #1818 r1: a table of a later stash whose name a scoped defined name of
+    /// a stash above it holds (back before the table is wired) is refused
+    /// with nothing changed; in stack order the table is left out.
+    #[test]
+    fn non_top_restore_refuses_a_later_table_named_like_a_later_scoped_name_1818() {
+        let mut s = abc_session();
+        s.pkg
+            .add_table(2, (0, 0, 1, 1), true, "TableStyleLight1")
+            .expect("table");
+        for name in ["A", "B"] {
+            s.ctl(&format!(
+                r#"{{"verb":"sheet.remove","args":{{"sheet":"{name}"}}}}"#
+            ));
+        }
+        let c = s.pkg.workbook.sheet_index("C").expect("C");
+        s.pkg.workbook.defined_names.push(DefinedName {
+            name: "TABLE1".into(),
+            scope: Some(c),
+            formula: "C!$A$1".into(),
+        });
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"C"}}"#);
+        assert_eq!(s.removed_sheet_stashes[2].defined_names.len(), 1);
+        let before = stack_state_1818(&s);
+        let out = restore(&mut s, "A");
+        assert!(
+            out.contains(
+                r#"cannot restore \"A\": table \"Table1\" of \"B\", removed after it, cannot come back for the unwind (\"C\" holds a defined name of that name); restore \"B\" first"#
+            ),
+            "{out}"
+        );
+        assert_eq!(stack_state_1818(&s), before);
+        assert!(restore(&mut s, "C").contains("\"ok\":true"));
+        let out = restore(&mut s, "B");
+        assert!(out.contains(r#""tablesKept":["Table1"]"#), "{out}");
+        assert!(restore(&mut s, "A").contains("\"ok\":true"));
     }
 
     /// #1818: two later stashes holding tables of one name (C's Table1

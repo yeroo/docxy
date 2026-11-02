@@ -960,7 +960,7 @@ worth knowing:
   after it back for the unwind, so their formulas read as in stack order; it
   is refused, with nothing changed, while one of those tables could not come
   back (no part kept, its name taken since, or shared with another removed
-  table): restore that sheet first (the error names it). The cells then
+  table or a removed sheet's defined name): restore that sheet first (the error names it). The cells then
   recalculate. Every restore clears the undo/redo
   history, as `sheet.remove` itself does.
 - **Agent sheet-removals are undoable in any order**, except that an
