@@ -9335,8 +9335,8 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
 }
 
 /// [`load_bytes`], and whether a failed load may be recovered as text: not
-/// a package over its size budget (#851), which is not damaged, and whose
-/// recovery would only meet the same limit.
+/// a package over its size budget (#851), which is not damaged, so it keeps
+/// its own error rather than opening as recovered text.
 fn load_bytes_checked(bytes: &[u8]) -> (Loaded, bool) {
     let (pkg, status, import) = match docxcore::package::load_package(bytes) {
         Ok(pkg) => (pkg, "loaded".into(), doc_import::DocImport::default()),
@@ -9371,7 +9371,8 @@ fn load_bytes_checked(bytes: &[u8]) -> (Loaded, bool) {
 
 /// [`load_bytes`], or for a Word package that will not load, the text that
 /// can still be read from it, as a converted tab (#633); the load error
-/// stays when nothing can be.
+/// stays when nothing can be, and for a package over its size budget, which
+/// is not recovered (#851).
 fn load_or_recover(path: &std::path::Path, bytes: &[u8]) -> Loaded {
     let (loaded, recoverable) = load_bytes_checked(bytes);
     if !loaded.load_failed || !recoverable {

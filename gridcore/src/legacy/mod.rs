@@ -1120,24 +1120,22 @@ pub(crate) fn builtin_format(id: u32) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// #851: a `mimetype` entry declaring 4 GiB is not read for the ODS
-    /// sniff, ahead of `load_xlsx`'s budget, which then refuses the file.
+    /// #851: a `mimetype` entry declaring more than [`MAX_MIMETYPE`] is not
+    /// read for the ODS sniff (ahead of `load_xlsx`'s budget), even when its
+    /// text would match: the workbook opens as the `.xlsx` it is.
     #[test]
-    fn a_huge_mimetype_entry_is_not_sniffed() {
+    fn a_long_mimetype_entry_is_not_sniffed() {
         let book = crate::xlsx::save_xlsx(&crate::xlsx::new_xlsx());
         let zip = opccore::zip::ZipArchive::open(&book).unwrap();
-        let mut parts = vec![("mimetype".to_string(), ODS_MIMETYPE.as_bytes().to_vec())];
+        let mime = format!("{ODS_MIMETYPE}{}", " ".repeat(MAX_MIMETYPE as usize));
+        let mut parts = vec![("mimetype".to_string(), mime.into_bytes())];
         parts.extend(
             zip.entries()
                 .iter()
                 .map(|e| (e.name.clone(), zip.extract(e).unwrap())),
         );
-        let book = opccore::zipwrite::write_zip(&parts);
-        let book = crate::xlsx::repair::tests::declare_size(book, "mimetype", u32::MAX);
-        match open_workbook_ex(&book) {
-            Err(OpenError::Xlsx(crate::xlsx::XlsxError::TooLarge { .. })) => {}
-            other => panic!("{:?}", other.map(|o| o.format)),
-        }
+        let opened = open_workbook_ex(&opccore::zipwrite::write_zip(&parts)).unwrap();
+        assert_eq!(opened.format, SourceFormat::Xlsx);
     }
 
     #[test]

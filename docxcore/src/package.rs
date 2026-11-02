@@ -4169,8 +4169,9 @@ pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
 /// parts [`load_package`] extracts. A package over it is refused with
 /// [`LoadError::TooLarge`] before anything is extracted, so a small file of
 /// highly compressible parts cannot make opening allocate gigabytes (#851).
-/// Larger than `.yppx`'s budget: real documents with many pictures reach
-/// hundreds of MiB.
+/// It bounds the extracted bytes, not peak memory: parsing the parts takes
+/// more. Larger than `.yppx`'s budget: real documents with many pictures
+/// reach hundreds of MiB.
 pub const MAX_PACKAGE_UNCOMPRESSED: u64 = 1024 * 1024 * 1024;
 
 /// Open a `.docx` from bytes, keeping all parts for a lossless-ish save.

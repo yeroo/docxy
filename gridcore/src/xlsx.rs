@@ -285,8 +285,10 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 /// parts [`load_xlsx`] and [`load_xlsx_repair`] extract. A package over it is
 /// refused with [`XlsxError::TooLarge`] before anything is extracted, so a
 /// small file of highly compressible parts cannot make opening allocate
-/// gigabytes (#851). Larger than `.yppx`'s budget: real workbooks with big
-/// sheets reach hundreds of MiB of XML.
+/// gigabytes (#851). It bounds the extracted bytes, not peak memory:
+/// transcoding a legacy-encoded part and parsing take more. Larger than
+/// `.yppx`'s budget: real workbooks with big sheets reach hundreds of MiB of
+/// XML.
 pub const MAX_PACKAGE_UNCOMPRESSED: u64 = 1024 * 1024 * 1024;
 
 /// Open an `.xlsx` from bytes, keeping all parts for a lossless-ish save.

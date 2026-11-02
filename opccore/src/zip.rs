@@ -47,9 +47,9 @@ fn deflate_cap(uncomp_size: u64) -> Option<usize> {
     usize::try_from(uncomp_size).ok().map(|n| n.max(1))
 }
 
-/// The uncompressed bytes `entries` declare, in total: what extracting them
-/// all may allocate, since [`ZipArchive::extract`] refuses output of any other
-/// size. ZIP64 sizes are 64-bit, so the sum saturates rather than overflow.
+/// The uncompressed bytes `entries` declare, in total: the bytes extracting
+/// them all yields, since [`ZipArchive::extract`] refuses output of any other
+/// size (not peak memory: inflating grows its buffer as it goes). ZIP64 sizes are 64-bit, so the sum saturates rather than overflow.
 /// The package loaders check it against their budget before extracting
 /// anything (#451, #851).
 pub fn declared_bytes<'a>(entries: impl IntoIterator<Item = &'a ZipEntry>) -> u64 {
