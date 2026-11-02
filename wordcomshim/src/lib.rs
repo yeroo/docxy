@@ -222,7 +222,11 @@ mod win {
         fn open(path: &str) -> std::io::Result<DocState> {
             let bytes = std::fs::read(path)?;
             let pkg = load_package(&bytes).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+                let why = match e {
+                    docxcore::load::LoadError::TooLarge { .. } => e.to_string(),
+                    _ => format!("{e:?}"),
+                };
+                std::io::Error::new(std::io::ErrorKind::InvalidData, why)
             })?;
             Ok(DocState {
                 pkg,

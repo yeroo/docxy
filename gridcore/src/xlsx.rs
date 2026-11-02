@@ -34,7 +34,7 @@ mod hyperlink_tests;
 mod hyperlinks;
 pub(crate) use hyperlinks::{has_scheme, model_target};
 mod page;
-mod repair;
+pub(crate) mod repair;
 pub use repair::{Repairs, load_xlsx_repair};
 
 use std::borrow::Cow;
@@ -60,6 +60,13 @@ pub enum XlsxError {
     /// [`load_xlsx_repair`] met a damaged part it can neither empty nor drop
     /// without leaving references to it broken.
     Unrepairable(String),
+    /// The parts would unpack to `total` bytes, over the `budget`
+    /// ([`MAX_PACKAGE_UNCOMPRESSED`]): refused before any part is extracted
+    /// (#851).
+    TooLarge {
+        total: u64,
+        budget: u64,
+    },
 }
 
 impl std::fmt::Display for XlsxError {
@@ -74,6 +81,14 @@ impl std::fmt::Display for XlsxError {
             XlsxError::NotUtf8 => "workbook XML is not valid UTF-8",
             XlsxError::Unrepairable(part) => {
                 return write!(f, "could not repair: {part} is damaged");
+            }
+            XlsxError::TooLarge { total, budget } => {
+                return write!(
+                    f,
+                    "workbook too large: its parts unpack to {} MiB, over the {} MiB limit",
+                    total.div_ceil(1024 * 1024),
+                    budget / (1024 * 1024)
+                );
             }
         })
     }
@@ -266,11 +281,26 @@ fn is_strict_workbook(wb_xml: &str) -> bool {
 // Load
 // ---------------------------------------------------------------------------
 
+/// Budget, in bytes, for the sum of the declared uncompressed sizes of the
+/// parts [`load_xlsx`] and [`load_xlsx_repair`] extract. A package over it is
+/// refused with [`XlsxError::TooLarge`] before anything is extracted, so a
+/// small file of highly compressible parts cannot make opening allocate
+/// gigabytes (#851). It bounds the extracted bytes, not peak memory:
+/// transcoding a legacy-encoded part and parsing take more. Larger than
+/// `.yppx`'s budget: real workbooks with big sheets reach hundreds of MiB of
+/// XML.
+pub const MAX_PACKAGE_UNCOMPRESSED: u64 = 1024 * 1024 * 1024;
+
 /// Open an `.xlsx` from bytes, keeping all parts for a lossless-ish save.
 pub fn load_xlsx(data: &[u8]) -> Result<SheetPackage, XlsxError> {
+    load_xlsx_within(data, MAX_PACKAGE_UNCOMPRESSED)
+}
+
+/// [`load_xlsx`] with its size budget given.
+fn load_xlsx_within(data: &[u8], budget: u64) -> Result<SheetPackage, XlsxError> {
     let zip = open_container(data)?;
     let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
-    for (e, name) in part_entries(&zip)? {
+    for (e, name) in part_entries(&zip, budget)? {
         let bytes = zip.extract(e).ok_or(XlsxError::CorruptPart)?;
         parts.push((name, utf8_part(bytes)));
     }
@@ -294,8 +324,13 @@ fn utf8_part(bytes: Vec<u8>) -> Vec<u8> {
 /// (#1095). Two entries that only differ in their separators would become one
 /// part: [`XlsxError::CorruptPart`]. A directory entry is no part (see
 /// [`opccore::parts::part_flags`]): kept, a save would write it as a part with no
-/// content type, which Excel repairs (#1156).
-fn part_entries<'a>(zip: &'a ZipArchive<'_>) -> Result<Vec<(&'a ZipEntry, String)>, XlsxError> {
+/// content type, which Excel repairs (#1156). Parts whose declared sizes sum
+/// over `budget` are [`XlsxError::TooLarge`], checked here so neither loader
+/// extracts anything first (#851).
+fn part_entries<'a>(
+    zip: &'a ZipArchive<'_>,
+    budget: u64,
+) -> Result<Vec<(&'a ZipEntry, String)>, XlsxError> {
     let names: Vec<String> = zip
         .entries()
         .iter()
@@ -306,14 +341,19 @@ fn part_entries<'a>(zip: &'a ZipArchive<'_>) -> Result<Vec<(&'a ZipEntry, String
         return Err(XlsxError::CorruptPart);
     }
     let parts = opccore::parts::part_flags(zip, &names);
-    Ok(zip
+    let entries: Vec<(&ZipEntry, String)> = zip
         .entries()
         .iter()
         .zip(names)
         .zip(parts)
         .filter(|(_, part)| *part)
         .map(|((e, name), _)| (e, name))
-        .collect())
+        .collect();
+    let total = opccore::zip::declared_bytes(entries.iter().map(|(e, _)| *e));
+    if total > budget {
+        return Err(XlsxError::TooLarge { total, budget });
+    }
+    Ok(entries)
 }
 
 /// The ZIP container of an `.xlsx`, or why `data` is not one.

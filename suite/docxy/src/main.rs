@@ -9331,6 +9331,13 @@ fn track_author(identity: &(String, String)) -> docxcore::editor::TrackAuthor {
 /// An OLE2 file is imported as a Word 97-2003 document (#634), whatever its
 /// extension.
 fn load_bytes(bytes: &[u8]) -> Loaded {
+    load_bytes_checked(bytes).0
+}
+
+/// [`load_bytes`], and whether a failed load may be recovered as text: not
+/// a package over its size budget (#851), which is not damaged, so it keeps
+/// its own error rather than opening as recovered text.
+fn load_bytes_checked(bytes: &[u8]) -> (Loaded, bool) {
     let (pkg, status, import) = match docxcore::package::load_package(bytes) {
         Ok(pkg) => (pkg, "loaded".into(), doc_import::DocImport::default()),
         Err(docxcore::load::LoadError::Ole2) => match docxcore::legacy::doc::import_doc(bytes) {
@@ -9339,11 +9346,14 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
                 doc_import::IMPORTED_STATUS.into(),
                 doc_import::DocImport::IMPORTED,
             ),
-            Err(e) => return Loaded::empty(format!("load error: {e}")),
+            Err(e) => return (Loaded::empty(format!("load error: {e}")), true),
         },
-        Err(e) => return Loaded::empty(format!("load error: {e:?}")),
+        Err(e @ docxcore::load::LoadError::TooLarge { .. }) => {
+            return (Loaded::empty(format!("load error: {e}")), false);
+        }
+        Err(e) => return (Loaded::empty(format!("load error: {e:?}")), true),
     };
-    Loaded {
+    let loaded = Loaded {
         doc: with_final_section(pkg.document.clone(), &pkg),
         comments: docxcore::comments::parse_comments(&pkg),
         notes: docxcore::notes::parse_notes(&pkg),
@@ -9355,15 +9365,17 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
         converted: None,
         converted_docx: None,
         import,
-    }
+    };
+    (loaded, true)
 }
 
 /// [`load_bytes`], or for a Word package that will not load, the text that
 /// can still be read from it, as a converted tab (#633); the load error
-/// stays when nothing can be.
+/// stays when nothing can be, and for a package over its size budget, which
+/// is not recovered (#851).
 fn load_or_recover(path: &std::path::Path, bytes: &[u8]) -> Loaded {
-    let loaded = load_bytes(bytes);
-    if !loaded.load_failed {
+    let (loaded, recoverable) = load_bytes_checked(bytes);
+    if !loaded.load_failed || !recoverable {
         return loaded;
     }
     convert_doc(path, bytes, convert_child::What::Recover).unwrap_or(loaded)
@@ -12645,8 +12657,12 @@ fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, S
                 }
                 (Surface::Sheet(view), status.into(), recalculated)
             }
-            // A repair's refusal names the part, in words.
-            Err(e @ gridcore::xlsx::XlsxError::Unrepairable(_)) => (
+            // A repair's refusal names the part, and an oversized package
+            // its size and the limit, in words.
+            Err(
+                e @ (gridcore::xlsx::XlsxError::Unrepairable(_)
+                | gridcore::xlsx::XlsxError::TooLarge { .. }),
+            ) => (
                 Surface::Placeholder,
                 format!("xlsx load error: {e}").into(),
                 false,
