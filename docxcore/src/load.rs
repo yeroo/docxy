@@ -94,6 +94,13 @@ impl Relationships {
             .iter()
             .map(|(id, (target, external))| (id.as_str(), target.as_str(), *external))
     }
+    /// The relationship ids, sorted (#1639).
+    pub fn ids(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self.map.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }

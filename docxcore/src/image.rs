@@ -123,6 +123,13 @@ pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
 /// Only a drawing whose `a:graphicData` is a picture has one: a group, canvas
 /// or shape holds blips of members that are not the whole drawing.
 pub fn inline_embed(raw: &str) -> Option<String> {
+    let (at, end) = picture_blip(raw)?;
+    crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|rid| !rid.is_empty())
+}
+
+/// Where the `<a:blip ...>` start tag of an inline picture run sits
+/// (`raw[at..end]`, `end` at its `>`), with [`inline_embed`]'s guards.
+fn picture_blip(raw: &str) -> Option<(usize, usize)> {
     const PICTURE_URI: &str = "http://schemas.openxmlformats.org/drawingml/2006/picture";
     inline_extent(raw)?;
     let data = raw.find("<a:graphicData")?;
@@ -138,8 +145,32 @@ pub fn inline_embed(raw: &str) -> Option<String> {
             _ => from = at + 1,
         }
     };
-    let end = at + raw[at..].find('>')?;
-    crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|rid| !rid.is_empty())
+    Some((at, at + raw[at..].find('>')?))
+}
+
+/// `raw` with the `r:embed` of the blip [`inline_embed`] reads set to
+/// `rid` (#1639); every other attribute, an `r:link` included, is kept.
+/// `None` when `raw` is not such a picture.
+pub fn replace_inline_embed(raw: &str, rid: &str) -> Option<String> {
+    let old = inline_embed(raw)?;
+    let (at, end) = picture_blip(raw)?;
+    let tag = &raw[at..end];
+    for quote in ['"', '\''] {
+        let needle = format!("r:embed={quote}{old}{quote}");
+        if let Some(i) = tag
+            .match_indices(&needle)
+            .map(|(i, _)| i)
+            .find(|&i| i > 0 && tag.as_bytes()[i - 1].is_ascii_whitespace())
+        {
+            let start = at + i;
+            return Some(format!(
+                "{}r:embed={quote}{rid}{quote}{}",
+                &raw[..start],
+                &raw[start + needle.len()..]
+            ));
+        }
+    }
+    None
 }
 
 fn be16(b: &[u8], at: usize) -> Option<u32> {
@@ -387,6 +418,26 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn replace_inline_embed_rewrites_only_the_blip_embed() {
+        let run = inline_picture_run("rId7", 952_500, 476_250, 3, "a.png");
+        let out = replace_inline_embed(&run, "rId12").expect("a picture");
+        assert_eq!(inline_embed(&out).as_deref(), Some("rId12"));
+        assert_eq!(out.replace("rId12", "rId7"), run);
+        // r:link (and a longer attribute ending in r:embed) stay as they are.
+        let linked = run.replace(
+            "r:embed=\"rId7\"",
+            "r:link=\"rId7\" xr:embed=\"rId7\" r:embed=\"rId7\"",
+        );
+        assert_ne!(linked, run);
+        let out = replace_inline_embed(&linked, "rId9").expect("a picture");
+        assert!(
+            out.contains("r:link=\"rId7\" xr:embed=\"rId7\" r:embed=\"rId9\""),
+            "{out}"
+        );
+        assert_eq!(replace_inline_embed("<w:r><w:ptab/></w:r>", "rId1"), None);
     }
 
     #[test]
