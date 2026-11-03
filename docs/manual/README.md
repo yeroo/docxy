@@ -1,8 +1,7 @@
 # Manual bundles (#1022)
 
-Each editor's manual is written in its private spec repo (`docxy-word-spec`,
-`docxy-excel-spec`, `docxy-project-spec`) and published here as a bundle that
-the hosts read through the `helpdocs` crate. This file is the format those
+Each editor's manual is written in each editor's spec repository and
+published here as a bundle that the hosts read through the `helpdocs` crate. This file is the format those
 repos publish to. `helpdocs/tests/fixture/` holds a small example of each.
 
 ## Layout
@@ -30,9 +29,11 @@ keys: bold, italic, dialog:font   # optional
 - `area`: the area this page belongs to (see Context help below).
 - `keys`: the context ids this page answers, comma-separated.
 
-A ` #` and everything after it in a value is a comment. The front matter
-ends at the first line that is exactly `---`; without one it is reported
-and the whole file is read as the body.
+In `area` and `keys`, a ` #` and everything after it is a comment. The
+title is kept as written, so `How to correct a #N/A error` is a title. The
+front matter opens on a first line that is `---` and ends at the next such
+line (trailing spaces allowed on both). Without a closing line it is
+reported and the whole file is read as the body.
 
 ## Markdown subset
 
@@ -43,10 +44,13 @@ Blocks:
   A numbered list starts at its first item's number (`3.` starts at 3). A
   line that is not a block of its own continues the item above it. A list
   goes on across blank lines while the next item is deeper, or at its indent
-  and of its kind. An image or fenced code block indented under an item
-  belongs to that item (a screenshot under a step).
-- Fenced code blocks, kept literal. A fence closes at a line that is only
-  the fence.
+  and of its kind. An image, fenced code block or paragraph indented under
+  an item belongs to the nearest item above it with a smaller indent (a
+  screenshot under a step, then its explanation, even after the step's
+  sub-bullets). Its place among the item's sub-lists is kept.
+- Fenced code blocks, kept literal. A fence is three or more backticks and
+  closes at a line of only backticks, at least as many. An opening line
+  whose info string holds a backtick is not a fence.
 - GFM pipe tables. A table needs a header row and an alignment row
   (`:---`, `:---:`, `---:`) with one cell per header cell; otherwise the
   lines are a paragraph. Body rows may have fewer or more cells. A `|` in a

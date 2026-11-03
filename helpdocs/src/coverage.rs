@@ -30,7 +30,9 @@ impl Coverage {
             && self.unused_strict.is_empty()
     }
 
-    /// A count line, then one line per id not exactly covered.
+    /// A count line, a line per unused strict area, then one line per id not
+    /// exactly covered: a strict failure is listed as that only, not again
+    /// under how it resolved.
     pub fn report(&self) -> String {
         let mut out = format!(
             "{} exact, {} by area, {} by root, {} unresolved, {} strict failures\n",
@@ -49,7 +51,10 @@ impl Coverage {
             ("by root", &self.by_root),
             ("by area", &self.by_area),
         ] {
-            for (id, area) in list {
+            for pair @ (id, area) in list {
+                if label != "strict failure" && self.strict_failures.contains(pair) {
+                    continue;
+                }
                 let _ = writeln!(out, "  {label}: {id} ({area})");
             }
         }
@@ -136,6 +141,8 @@ mod tests {
         assert_eq!(c.strict_failures, vec![pair("italic", "home")]);
         assert!(!c.passes());
         assert!(c.report().contains("strict failure: italic (home)"));
+        // Listed once: not again under how it resolved.
+        assert_eq!(c.report().matches("italic").count(), 1, "{}", c.report());
         // Every Home id with a page of its own passes.
         assert!(coverage(&m, [("bold", "Home"), ("table", "Insert")]).passes());
     }

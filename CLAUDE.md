@@ -2212,5 +2212,7 @@
   contextual tabs, the table/H&F/Gantt Format tabs, the sheet's
   `SHEET_RIBBON`) against `helpdocs/tests/fixture/<editor>` until real
   manuals are published. It fails only for a strict area
-  (`# strict: help` in the word fixture). No host shows a manual yet: the
+  (`# strict: help` in the word fixture). Group launchers are not in the
+  walk: a launcher runs an act and carries no id. Their dialogs resolve as
+  `dialog:<id>` in #1855. No host shows a manual yet: the
   viewer, terminal overlays and build pinning are later slices.

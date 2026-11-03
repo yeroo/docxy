@@ -272,18 +272,25 @@ fn page(id: &str, src: &str, problems: &mut Vec<Problem>) -> Page {
     let mut area = None;
     let mut keys = Vec::new();
     let mut body = src;
-    // Front matter closes at the first line that is exactly `---`.
-    let front = src.strip_prefix("---\n").and_then(|rest| {
+    // Front matter opens on a first line that is `---` and closes at the
+    // next such line, both compared after trailing spaces are dropped.
+    let is_fence = |line: &str| line.trim_end() == "---";
+    let opened = src
+        .split_inclusive('\n')
+        .next()
+        .filter(|l| is_fence(l))
+        .map(|l| &src[l.len()..]);
+    let front = opened.and_then(|rest| {
         let mut at = 0;
         for line in rest.split_inclusive('\n') {
-            if line.trim_end_matches('\n') == "---" {
+            if is_fence(line) {
                 return Some((&rest[..at], &rest[at + line.len()..]));
             }
             at += line.len();
         }
         None
     });
-    if front.is_none() && src.starts_with("---\n") {
+    if opened.is_some() && front.is_none() {
         problems.push(Problem::UnclosedFrontMatter(id.to_string()));
     }
     if let Some((matter, after)) = front {
@@ -291,13 +298,15 @@ fn page(id: &str, src: &str, problems: &mut Vec<Problem>) -> Page {
             let Some((k, v)) = line.split_once(':') else {
                 continue;
             };
-            // A value's ` #` comment is dropped.
-            let v = v.split(" #").next().unwrap_or("").trim();
+            // The title is kept as written (`#N/A`); in `area` and `keys` a
+            // ` #` starts a comment.
+            let comment_free = || v.split(" #").next().unwrap_or("").trim();
             match k.trim() {
-                "title" if !v.is_empty() => title = Some(v.to_string()),
-                "area" if !v.is_empty() => area = Some(slug(v)),
+                "title" if !v.trim().is_empty() => title = Some(v.trim().to_string()),
+                "area" if !comment_free().is_empty() => area = Some(slug(comment_free())),
                 "keys" => keys.extend(
-                    v.split(',')
+                    comment_free()
+                        .split(',')
                         .map(|k| k.trim().to_string())
                         .filter(|k| !k.is_empty()),
                 ),
@@ -513,7 +522,7 @@ pub(crate) mod tests {
             ("contents.txt", "a\r\n"),
             (
                 "a.md",
-                "---\r\ntitle: A page   # a comment\r\narea: Page Layout\r\n---\r\n![p](images/p.png)\r\n",
+                "---\r\ntitle: A page\r\narea: Page Layout   # a comment\r\n---\r\n![p](images/p.png)\r\n",
             ),
             ("images\\p.png", "png"),
         ]);
@@ -540,6 +549,39 @@ pub(crate) mod tests {
         assert_eq!(b.keys, vec!["x"]);
         assert_eq!(b.blocks.len(), 1);
         assert_eq!(m.page("c").unwrap().blocks, vec![]);
+    }
+
+    #[test]
+    fn a_title_keeps_its_hash_and_keys_drop_a_comment() {
+        let m = files(&[(
+            "a.md",
+            "---\ntitle: How to correct a #N/A error\nkeys: na, error   # see Excel\n---\n",
+        )]);
+        let a = m.page("a").unwrap();
+        assert_eq!(a.title, "How to correct a #N/A error");
+        assert_eq!(a.keys, vec!["na", "error"]);
+    }
+
+    #[test]
+    fn front_matter_fences_may_have_trailing_spaces() {
+        let m = files(&[
+            ("a.md", "---  \ntitle: A\n--- \nbody\n"),
+            ("b.md", "--- \ntitle: B\n"),
+        ]);
+        let a = m.page("a").unwrap();
+        assert_eq!(a.title, "A");
+        assert_eq!(
+            a.blocks,
+            vec![Block::Paragraph(vec![md::Inline::Text("body".into())])]
+        );
+        assert!(
+            m.problems
+                .contains(&Problem::UnclosedFrontMatter("b".into()))
+        );
+        assert!(
+            !m.problems
+                .contains(&Problem::UnclosedFrontMatter("a".into()))
+        );
     }
 
     #[test]

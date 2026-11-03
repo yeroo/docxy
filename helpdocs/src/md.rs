@@ -147,7 +147,7 @@ pub fn parse(src: &str) -> Vec<Block> {
         if t.is_empty() {
             flush(&mut para, &mut blocks);
             i += 1;
-        } else if t.starts_with("```") {
+        } else if fence_open(t).is_some() {
             flush(&mut para, &mut blocks);
             blocks.push(fence(&lines, &mut i));
         } else if let Some((level, text)) = heading(t) {
@@ -186,11 +186,10 @@ pub fn parse(src: &str) -> Vec<Block> {
         } else if list_item(line).is_some() {
             flush(&mut para, &mut blocks);
             let items = list_items(&lines, &mut i);
+            // Every item is at the first one's indent or deeper: one list.
             let mut at = 0;
-            while at < items.len() {
-                let base = items[at].indent;
-                blocks.push(build_list(&items, &mut at, base));
-            }
+            blocks.push(build_list(&items, &mut at, items[0].indent));
+            debug_assert_eq!(at, items.len());
         } else {
             para.push(line);
             i += 1;
@@ -200,16 +199,31 @@ pub fn parse(src: &str) -> Vec<Block> {
     blocks
 }
 
+/// A fence opener (trimmed line): its backtick count, three or more, and an
+/// info string holding no backtick (CommonMark), so "```x```" is text.
+fn fence_open(t: &str) -> Option<usize> {
+    let n = t.bytes().take_while(|b| *b == b'`').count();
+    (n >= 3 && !t[n..].contains('`')).then_some(n)
+}
+
+/// Whether `line` closes a fence of `n` backticks: only backticks, at least
+/// `n` of them.
+fn fence_closes(line: &str, n: usize) -> bool {
+    let t = line.trim();
+    t.len() >= n && t.bytes().all(|b| b == b'`')
+}
+
 /// The fenced code block opening at `lines[*i]`; `*i` moves past its
-/// closing line, one that is exactly the fence once trimmed (or the end).
-/// The opening line's indent is taken off the body's lines.
+/// closing line (or the end). The opening line's indent is taken off the
+/// body's lines.
 fn fence(lines: &[&str], i: &mut usize) -> Block {
     let open = lines[*i];
     let indent = open.len() - open.trim_start_matches(' ').len();
-    let lang = open.trim().trim_start_matches('`').trim().to_string();
+    let n = fence_open(open.trim()).unwrap_or(3);
+    let lang = open.trim()[n..].trim().to_string();
     let mut body = Vec::new();
     *i += 1;
-    while *i < lines.len() && lines[*i].trim() != "```" {
+    while *i < lines.len() && !fence_closes(lines[*i], n) {
         let l = lines[*i];
         let lead = l.len() - l.trim_start_matches(' ').len();
         body.push(&l[lead.min(indent)..]);
@@ -244,26 +258,41 @@ fn list_items(lines: &[&str], i: &mut usize) -> Vec<RawItem> {
             }
             *i += 1;
         }
-        // Blank lines, and images and fences indented under the item.
+        // Blank lines, and the images, fences and paragraphs indented under
+        // an item: each goes to the nearest item before it with a smaller
+        // indent, tagged with the number of items so far so that it keeps
+        // its place among that item's nested lists.
         let mut j = *i;
         loop {
             while j < lines.len() && lines[j].trim().is_empty() {
                 j += 1;
             }
             let Some(l) = lines.get(j) else { break };
-            let Some(last) = items.last_mut() else { break };
-            let indent = l.len() - l.trim_start_matches(' ').len();
-            if indent <= last.indent {
+            if list_item(l).is_some() {
                 break;
             }
-            if let Some((alt, src)) = image(l.trim()) {
-                last.blocks.push(Block::Image { alt, src });
+            let indent = l.len() - l.trim_start_matches(' ').len();
+            let seq = items.len();
+            let Some(owner) = items.iter_mut().rev().find(|it| it.indent < indent) else {
+                break;
+            };
+            let t = l.trim();
+            let block = if let Some((alt, src)) = image(t) {
                 j += 1;
-            } else if l.trim().starts_with("```") {
-                last.blocks.push(fence(lines, &mut j));
+                Block::Image { alt, src }
+            } else if fence_open(t).is_some() {
+                fence(lines, &mut j)
+            } else if continues_item(lines, j) {
+                let mut text = Vec::new();
+                while j < lines.len() && continues_item(lines, j) {
+                    text.push(lines[j].trim());
+                    j += 1;
+                }
+                Block::Paragraph(inline(&text.join(" ")))
             } else {
                 break;
-            }
+            };
+            owner.blocks.push((seq, block));
             *i = j;
         }
         // Go on only when an item of this list comes next: deeper, or at its
@@ -301,7 +330,7 @@ fn continues_item(lines: &[&str], i: usize) -> bool {
     !t.is_empty()
         && list_item(lines[i]).is_none()
         && heading(t).is_none()
-        && !t.starts_with("```")
+        && fence_open(t).is_none()
         && table_start(lines, i).is_none()
         && image(t).is_none()
 }
@@ -331,27 +360,45 @@ fn cells(row: &str) -> Vec<String> {
         Some(r) if !r.ends_with('\\') => r,
         _ => row,
     };
-    // Split on a `|` that is neither escaped nor in a code span; `\|` is `|`.
+    // Split on a `|` that is not escaped and not in a span (`span_len`);
+    // `\|` is `|`.
     let mut out = Vec::new();
     let mut cell = String::new();
-    let mut in_code = false;
-    let mut chars = row.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' if chars.peek() == Some(&'|') => {
-                cell.push('|');
-                chars.next();
-            }
-            '`' => {
-                in_code = !in_code;
-                cell.push(c);
-            }
-            '|' if !in_code => out.push(std::mem::take(&mut cell).trim().to_string()),
-            _ => cell.push(c),
+    let mut at = 0;
+    while at < row.len() {
+        let rest = &row[at..];
+        if rest.starts_with("\\|") {
+            cell.push('|');
+            at += 2;
+        } else if let Some(n) = span_len(rest) {
+            cell.push_str(&rest[..n]);
+            at += n;
+        } else if rest.starts_with('|') {
+            out.push(std::mem::take(&mut cell).trim().to_string());
+            at += 1;
+        } else {
+            let c = rest.chars().next().unwrap_or(' ');
+            cell.push(c);
+            at += c.len_utf8();
         }
     }
     out.push(cell.trim().to_string());
     out
+}
+
+/// The length of the span `inline` reads whole at the start of `s`: a code
+/// span with its closing backtick, or a `<kbd>` chord with its `</kbd>`.
+/// Every scanner that looks for a delimiter steps over these, so a `|`, `*`
+/// or `]` inside one is never taken, and a lone backtick is plain text.
+fn span_len(s: &str) -> Option<usize> {
+    if let Some(r) = s.strip_prefix('`') {
+        return r.find('`').map(|e| e + 2);
+    }
+    if s.starts_with("<kbd>") {
+        let e = s.find("</kbd>")?;
+        return keys(&s[5..e]).map(|_| e + 6);
+    }
+    None
 }
 
 fn aligns(line: &str) -> Option<Vec<Align>> {
@@ -382,8 +429,9 @@ struct RawItem {
     /// The item's number; 1 for a bullet.
     number: u32,
     text: String,
-    /// Images and fences indented under the item.
-    blocks: Vec<Block>,
+    /// The images, fences and paragraphs indented under the item, each with
+    /// the index of the first item that came after it.
+    blocks: Vec<(usize, Block)>,
 }
 
 fn list_item(line: &str) -> Option<RawItem> {
@@ -410,26 +458,41 @@ fn list_item(line: &str) -> Option<RawItem> {
 }
 
 /// One list from `items[*at]` on: the items at `base` or deeper, a deeper
-/// item nesting under the item before it.
+/// item nesting under the item before it. An item's children are its own
+/// blocks and its nested lists, in the order they were written.
 fn build_list(items: &[RawItem], at: &mut usize, base: usize) -> Block {
     let ordered = items[*at].ordered;
     let start = items[*at].number;
     let mut out: Vec<ListItem> = Vec::new();
+    // The blocks of the last item not placed yet.
+    let mut pending: &[(usize, Block)] = &[];
+    let place = |item: Option<&mut ListItem>, blocks: &[(usize, Block)]| {
+        if let Some(item) = item {
+            item.children.extend(blocks.iter().map(|(_, b)| b.clone()));
+        }
+    };
     while *at < items.len() && items[*at].indent >= base {
         let indent = items[*at].indent;
         if indent > base && !out.is_empty() {
+            // The blocks written before this nested list go first.
+            let n = pending.iter().take_while(|(seq, _)| *seq <= *at).count();
+            place(out.last_mut(), &pending[..n]);
+            pending = &pending[n..];
             let child = build_list(items, at, indent);
             if let Some(last) = out.last_mut() {
                 last.children.push(child);
             }
             continue;
         }
+        place(out.last_mut(), pending);
         out.push(ListItem {
             text: inline(&items[*at].text),
-            children: items[*at].blocks.clone(),
+            children: Vec::new(),
         });
+        pending = &items[*at].blocks;
         *at += 1;
     }
+    place(out.last_mut(), pending);
     Block::List {
         ordered,
         start,
@@ -452,12 +515,11 @@ pub fn inline(s: &str) -> Vec<Inline> {
             }
         }
         let parsed = match c {
-            '`' => rest[1..]
-                .find('`')
-                .map(|e| (Inline::Code(rest[1..1 + e].to_string()), 2 + e)),
-            '<' if rest.starts_with("<kbd>") => rest
-                .find("</kbd>")
-                .and_then(|e| keys(&rest[5..e]).map(|k| (Inline::Keys(k), e + 6))),
+            '`' => span_len(rest).map(|n| (Inline::Code(rest[1..n - 1].to_string()), n)),
+            '<' => span_len(rest).and_then(|n| {
+                let k = keys(&rest[5..n - 6])?;
+                Some((Inline::Keys(k), n))
+            }),
             '*' if rest.starts_with("**") && opens(&rest[2..]) => closer(&rest[2..], "**")
                 .filter(|e| *e > 0)
                 .map(|e| (Inline::Bold(inline(&rest[2..2 + e])), 4 + e)),
@@ -508,16 +570,18 @@ fn opens(s: &str) -> bool {
     s.chars().next().is_some_and(|c| !c.is_whitespace())
 }
 
-/// Where `delim` closes in `s`, skipping code spans. An emphasis closer
-/// (`*`, `**`) must follow a non-space; it is the last `delim.len()` stars of
-/// its run (`***x***`), and an italic closer skips a whole `**...**` span.
+/// Where `delim` closes in `s`, stepping over spans (`span_len`). An
+/// emphasis closer (`*`, `**`) must follow a non-space; it is the last
+/// `delim.len()` stars of its run (`***x***`), and an italic closer skips a
+/// whole `**...**` span, which ends after the first two stars of its closing
+/// run so that the rest can close the italic (`*a **b***`).
 fn closer(s: &str, delim: &str) -> Option<usize> {
     let emphasis = delim.starts_with('*');
     let mut at = 0;
     while at < s.len() {
         let rest = &s[at..];
-        if let Some(e) = rest.strip_prefix('`').and_then(|r| r.find('`')) {
-            at += 2 + e;
+        if let Some(n) = span_len(rest) {
+            at += n;
             continue;
         }
         if emphasis && rest.starts_with('*') {
@@ -527,8 +591,11 @@ fn closer(s: &str, delim: &str) -> Option<usize> {
                 return Some(at + run - delim.len());
             }
             if delim == "*" && run >= 2 && opens(&rest[2..]) {
-                if let Some(e) = closer(&rest[2..], "**") {
-                    at += 4 + e;
+                let inner = &rest[2..];
+                if let Some(e) = closer(inner, "**") {
+                    // Back to where the closing run starts.
+                    let run_start = e - inner[..e].bytes().rev().take_while(|b| *b == b'*').count();
+                    at += 2 + run_start + 2;
                     continue;
                 }
             }
@@ -1048,6 +1115,102 @@ mod tests {
         assert_eq!(
             rows[0],
             vec![vec![t("x | y")], vec![Inline::Code("p|q".into())]]
+        );
+    }
+
+    #[test]
+    fn a_lone_backtick_in_a_kbd_chord_keeps_the_table_cells() {
+        let b = parse(
+            "| <kbd>Ctrl+`</kbd> | Show formulas |\n|---|---|\n| <kbd>Ctrl+`</kbd> | Show formulas |",
+        );
+        let Block::Table { header, rows, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
+        let chord = vec![Inline::Keys(vec!["Ctrl".into(), "`".into()])];
+        assert_eq!(header, &vec![chord.clone(), vec![t("Show formulas")]]);
+        assert_eq!(rows[0], vec![chord, vec![t("Show formulas")]]);
+    }
+
+    #[test]
+    fn a_link_text_may_hold_a_chord_with_a_backtick() {
+        assert_eq!(
+            inline("[<kbd>Ctrl+`</kbd>](keyboard)"),
+            vec![Inline::Link {
+                text: vec![Inline::Keys(vec!["Ctrl".into(), "`".into()])],
+                target: Link::Page {
+                    page: "keyboard".into(),
+                    anchor: None
+                }
+            }]
+        );
+        // A lone backtick is text, and does not hide a closer after it.
+        assert_eq!(inline("*a ` b*"), vec![Inline::Italic(vec![t("a ` b")])]);
+    }
+
+    #[test]
+    fn fences_follow_the_backtick_count() {
+        assert_eq!(
+            parse("````md\n```\ninner\n```\n````\nafter"),
+            vec![
+                Block::Code {
+                    lang: "md".into(),
+                    text: "```\ninner\n```".into()
+                },
+                Block::Paragraph(vec![t("after")])
+            ]
+        );
+        assert_eq!(
+            parse("````\ncode\n````"),
+            vec![Block::Code {
+                lang: String::new(),
+                text: "code".into()
+            }]
+        );
+        assert!(matches!(parse("```x``` is text")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_screenshot_under_a_step_with_sub_bullets_joins_the_step() {
+        let b = parse("1. Open the tab.\n   - note\n\n   ![s](images/s.png)\n2. Click.");
+        assert_eq!(b.len(), 1, "{b:?}");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(items.len(), 2);
+        let (_, _, sub) = list(&items[0].children[0]);
+        assert_eq!(sub[0].text, vec![t("note")]);
+        // The sub-bullets, then the screenshot: the order they were written.
+        assert_eq!(
+            items[0].children[1],
+            Block::Image {
+                alt: "s".into(),
+                src: "images/s.png".into()
+            }
+        );
+        assert_eq!(items[0].children.len(), 2);
+    }
+
+    #[test]
+    fn text_after_a_steps_screenshot_stays_in_the_step() {
+        for src in [
+            "1. Click File.\n   ![File](images/file.png)\n   The File page opens.\n2. Click Save.",
+            "1. Click File.\n   ![File](images/file.png)\n\n   The File page opens.\n2. Click Save.",
+        ] {
+            let b = parse(src);
+            assert_eq!(b.len(), 1, "{b:?}");
+            let (_, _, items) = list(&b[0]);
+            assert_eq!(items.len(), 2);
+            assert_eq!(
+                items[0].children[1],
+                Block::Paragraph(vec![t("The File page opens.")])
+            );
+            assert_eq!(items[1].text, vec![t("Click Save.")]);
+        }
+    }
+
+    #[test]
+    fn an_italic_around_a_bold_that_ends_with_it() {
+        assert_eq!(
+            inline("*a **b***"),
+            vec![Inline::Italic(vec![t("a "), Inline::Bold(vec![t("b")])])]
         );
     }
 }
