@@ -4030,7 +4030,7 @@ fn delete_after_an_id_click_on_a_summary_asks() {
 
 /// #397: Set Baseline is a split button: the primary sets the baseline, its
 /// menu offers Set Baseline... and Clear Baseline.... From the keyboard,
-/// Alt, P, B opens the menu, and its letters B and L pick the item (#1212).
+/// Alt, R, B opens the menu, and its letters B and L pick the item (#1212).
 #[test]
 fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
     let r = project_ribbon();

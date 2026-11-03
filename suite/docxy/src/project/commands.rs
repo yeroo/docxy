@@ -284,7 +284,7 @@ fn report_item(kind: ReportKind) -> (&'static str, &'static str, &'static str) {
     }
 }
 
-/// A View Reports menu button: its KeyTip (Alt, R, then its letter) opens
+/// A View Reports menu button: its KeyTip (Alt, S, then its letter) opens
 /// the menu, whose items take their own letters. The items are the
 /// dropdown's `items`, so `ribbon-read` and the harness see them.
 fn report_dropdown(menu: ReportMenu) -> Control<Act> {
@@ -598,7 +598,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     // once, the arrow opens Set Baseline... / Clear
                     // Baseline... (#397). Project 2024 draws a menu button
                     // here, with no one-press half; the mouse keeps the one
-                    // press. Alt, P, B opens the menu, and its own letters
+                    // press. Alt, R, B opens the menu, and its own letters
                     // B and L pick the item (#1212).
                     Control::Split {
                         primary: cmd(
