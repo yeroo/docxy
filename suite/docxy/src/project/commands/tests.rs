@@ -278,7 +278,7 @@ fn ribbon_context_survives_valid_switches_only() {
             .iter()
             .map(|x| x.2)
             .collect::<Vec<_>>(),
-        ["F", "T", "U", "R", "P", "W", "Y"]
+        ["F", "H", "U", "S", "R", "W", "Y"]
     );
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false, false) == RibbonTab::View);
     assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false, false) == RibbonTab::Home);

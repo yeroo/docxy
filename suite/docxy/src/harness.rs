@@ -7974,7 +7974,7 @@ mod tests {
             .find(|t| t.get_str("name") == Some("Report"))
             .unwrap();
         assert_eq!(report.get_str("kind"), Some("ribbon"));
-        assert_eq!(report.get_str("key_tip"), Some("R"));
+        assert_eq!(report.get_str("key_tip"), Some("S"));
         let groups = report.get("groups").unwrap().as_array().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].get_str("title"), Some("View Reports"));
