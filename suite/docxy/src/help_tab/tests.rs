@@ -153,8 +153,11 @@ fn ribbon_command_ids(kind: Kind) -> Vec<(&'static str, &'static str)> {
         return out;
     }
     let ribbon = ribbon_for(kind);
-    let mut tabs: Vec<(&'static str, Vec<rs::Group<Act>>)> =
-        ribbon.tabs.into_iter().map(|t| (t.name, t.groups)).collect();
+    let mut tabs: Vec<(&'static str, Vec<rs::Group<Act>>)> = ribbon
+        .tabs
+        .into_iter()
+        .map(|t| (t.name, t.groups))
+        .collect();
     tabs.extend(ribbon.contextual.into_iter().map(|t| (t.name, t.groups)));
     let extra = if kind == Kind::Project {
         vec![crate::gantt_format_tab()]
@@ -209,7 +212,11 @@ fn every_ribbon_command_has_a_help_target() {
     // The strict area bites: the document's Help tab is covered command by
     // command, so its six ids are exact.
     let ids = ribbon_command_ids(Kind::Docx);
-    let help: Vec<_> = ids.iter().filter(|(_, tab)| *tab == "Help").copied().collect();
+    let help: Vec<_> = ids
+        .iter()
+        .filter(|(_, tab)| *tab == "Help")
+        .copied()
+        .collect();
     assert_eq!(help.len(), 6, "{help:?}");
     let c = helpdocs::coverage(&fixture_manual(Kind::Docx), help);
     assert_eq!(c.exact.len(), 6);
