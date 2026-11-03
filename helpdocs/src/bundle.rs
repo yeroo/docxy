@@ -60,6 +60,8 @@ pub enum Problem {
     BrokenLink { page: String, target: String },
     /// An image the bundle does not hold.
     MissingImage { page: String, src: String },
+    /// A `.md` file in a subdirectory (not loaded: pages live at the top).
+    NestedPage(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -97,9 +99,12 @@ impl Manual {
         let mut contents_txt = None;
         let mut sources: Vec<(String, String)> = Vec::new();
         for (path, bytes) in files {
-            let path = path.as_ref().replace('\\', "/");
-            let path = path.trim_start_matches("./");
-            let text = || String::from_utf8_lossy(bytes.as_ref()).into_owned();
+            let path = bundle_path(path.as_ref());
+            let path = path.as_str();
+            let text = || {
+                let t = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+                t.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(t)
+            };
             if path == "REVISION" {
                 m.revision = text().lines().next().map(|l| l.trim().to_string());
             } else if path == "contents.txt" {
@@ -108,7 +113,9 @@ impl Manual {
                 m.images.push(path.to_string());
             } else if let Some(stem) = path.strip_suffix(".md") {
                 if path.contains('/') {
-                    continue; // only the editor directory's own pages
+                    // Only the editor directory's own pages load.
+                    m.problems.push(Problem::NestedPage(path.to_string()));
+                    continue;
                 }
                 if valid_page_id(stem) {
                     sources.push((stem.to_string(), text()));
@@ -184,9 +191,7 @@ impl Manual {
             }
             for b in &p.blocks {
                 if let Block::Image { src, .. } = b {
-                    let path = src.replace('\\', "/");
-                    let path = path.trim_start_matches("./");
-                    if !self.images.iter().any(|i| i == path) {
+                    if !self.images.contains(&bundle_path(src)) {
                         problems.push(Problem::MissingImage {
                             page: p.id.clone(),
                             src: src.clone(),
@@ -197,6 +202,12 @@ impl Manual {
         }
         self.problems.extend(problems);
     }
+}
+
+/// A path inside the bundle as it is compared: `/` separators, no `./`.
+fn bundle_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    path.trim_start_matches("./").to_string()
 }
 
 fn link_text(link: &Link) -> String {
@@ -254,28 +265,36 @@ fn page(id: &str, src: &str) -> Page {
     let mut area = None;
     let mut keys = Vec::new();
     let mut body = src;
-    if let Some(rest) = src.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---") {
-            for line in rest[..end].lines() {
-                let Some((k, v)) = line.split_once(':') else {
-                    continue;
-                };
-                // A value's ` #` comment is dropped.
-                let v = v.split(" #").next().unwrap_or("").trim();
-                match k.trim() {
-                    "title" if !v.is_empty() => title = Some(v.to_string()),
-                    "area" if !v.is_empty() => area = Some(slug(v)),
-                    "keys" => keys.extend(
-                        v.split(',')
-                            .map(|k| k.trim().to_string())
-                            .filter(|k| !k.is_empty()),
-                    ),
-                    _ => {}
-                }
+    // Front matter closes at the first line that is exactly `---`.
+    let front = src.strip_prefix("---\n").and_then(|rest| {
+        let mut at = 0;
+        for line in rest.split_inclusive('\n') {
+            if line.trim_end_matches('\n') == "---" {
+                return Some((&rest[..at], &rest[at + line.len()..]));
             }
-            let after = &rest[end + 4..];
-            body = after.split_once('\n').map_or("", |(_, b)| b);
+            at += line.len();
         }
+        None
+    });
+    if let Some((matter, after)) = front {
+        for line in matter.lines() {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            // A value's ` #` comment is dropped.
+            let v = v.split(" #").next().unwrap_or("").trim();
+            match k.trim() {
+                "title" if !v.is_empty() => title = Some(v.to_string()),
+                "area" if !v.is_empty() => area = Some(slug(v)),
+                "keys" => keys.extend(
+                    v.split(',')
+                        .map(|k| k.trim().to_string())
+                        .filter(|k| !k.is_empty()),
+                ),
+                _ => {}
+            }
+        }
+        body = after;
     }
     Page {
         id: id.to_string(),
@@ -493,5 +512,42 @@ pub(crate) mod tests {
         assert_eq!(a.title, "A page");
         assert_eq!(a.area.as_deref(), Some("page-layout"));
         assert_eq!(m.images, vec!["images/p.png"]);
+    }
+
+    #[test]
+    fn front_matter_closes_at_an_exact_dashes_line() {
+        let m = Manual::from_files([
+            ("contents.txt", "a\nb\nc\n"),
+            ("a.md", "---\n---\n# A\n"),
+            ("b.md", "---\ntitle: B\n----\nkeys: x\n---\nbody\n"),
+            ("c.md", "---\ntitle: C\n---x\n---\n"),
+        ]);
+        let a = m.page("a").unwrap();
+        assert_eq!(a.title, "a");
+        assert!(matches!(a.blocks[0], Block::Heading { .. }));
+        let b = m.page("b").unwrap();
+        assert_eq!(b.title, "B");
+        assert_eq!(b.keys, vec!["x"]);
+        assert_eq!(b.blocks.len(), 1);
+        assert_eq!(m.page("c").unwrap().blocks, vec![]);
+    }
+
+    #[test]
+    fn a_page_in_a_subdirectory_is_reported() {
+        let m = files(&[("sub/x.md", "# X")]);
+        assert_eq!(m.problems, vec![Problem::NestedPage("sub/x.md".into())]);
+        assert!(m.page("x").is_none());
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_dropped() {
+        let m = Manual::from_files([
+            ("REVISION", "\u{feff}abc123\n"),
+            ("contents.txt", "\u{feff}# strict: home\nx\n"),
+            ("x.md", ""),
+        ]);
+        assert_eq!(m.revision.as_deref(), Some("abc123"));
+        assert_eq!(m.strict, vec!["home"]);
+        assert_eq!(m.problems, vec![]);
     }
 }

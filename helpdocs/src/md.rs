@@ -159,23 +159,25 @@ pub fn parse(src: &str) -> Vec<Block> {
             });
         } else if let Some((level, text)) = heading(t) {
             flush(&mut para, &mut blocks);
-            let base = slug(&plain(&inline(text)));
-            let n = slugs.iter().filter(|s| **s == base).count();
-            slugs.push(base.clone());
-            let slug = if n == 0 { base } else { format!("{base}-{n}") };
-            blocks.push(Block::Heading {
-                level,
-                text: inline(text),
-                slug,
-            });
+            let text = inline(text);
+            let base = slug(&plain(&text));
+            // The first free one of `base`, `base-1`, `base-2`, ...: a
+            // heading's own `-1` never collides with a repeat's.
+            let mut slug = base.clone();
+            let mut n = 0;
+            while slugs.contains(&slug) {
+                n += 1;
+                slug = format!("{base}-{n}");
+            }
+            slugs.push(slug.clone());
+            blocks.push(Block::Heading { level, text, slug });
             i += 1;
         } else if let Some((alt, src)) = image(t) {
             flush(&mut para, &mut blocks);
             blocks.push(Block::Image { alt, src });
             i += 1;
-        } else if t.starts_with('|') && lines.get(i + 1).and_then(|l| aligns(l)).is_some() {
+        } else if let Some(align) = table_start(&lines, i) {
             flush(&mut para, &mut blocks);
-            let align = aligns(lines[i + 1]).unwrap_or_default();
             let header = cells(t).iter().map(|c| inline(c)).collect();
             let mut rows = Vec::new();
             i += 2;
@@ -194,6 +196,14 @@ pub fn parse(src: &str) -> Vec<Block> {
             while let Some(item) = lines.get(i).and_then(|l| list_item(l)) {
                 items.push(item);
                 i += 1;
+                // A wrapped item: its following plain lines are its text.
+                while i < lines.len() && continues_item(&lines, i) {
+                    if let Some(last) = items.last_mut() {
+                        last.text.push(' ');
+                        last.text.push_str(lines[i].trim());
+                    }
+                    i += 1;
+                }
             }
             let mut at = 0;
             while at < items.len() {
@@ -207,6 +217,29 @@ pub fn parse(src: &str) -> Vec<Block> {
     }
     flush(&mut para, &mut blocks);
     blocks
+}
+
+/// The alignments of a table starting at `lines[i]`: a `|` header row, then
+/// an alignment row with one cell per header cell. Body rows may be ragged.
+fn table_start(lines: &[&str], i: usize) -> Option<Vec<Align>> {
+    let t = lines[i].trim();
+    if !t.starts_with('|') {
+        return None;
+    }
+    let align = aligns(lines.get(i + 1)?)?;
+    (align.len() == cells(t).len()).then_some(align)
+}
+
+/// Whether `lines[i]` continues the list item before it: not blank, and not
+/// a list item, heading, fence, table or image of its own.
+fn continues_item(lines: &[&str], i: usize) -> bool {
+    let t = lines[i].trim();
+    !t.is_empty()
+        && list_item(lines[i]).is_none()
+        && heading(t).is_none()
+        && !t.starts_with("```")
+        && table_start(lines, i).is_none()
+        && image(t).is_none()
 }
 
 fn heading(t: &str) -> Option<(u8, &str)> {
@@ -312,37 +345,28 @@ pub fn inline(s: &str) -> Vec<Inline> {
     let mut text = String::new();
     let mut rest = s;
     while let Some(c) = rest.chars().next() {
+        // An inline image is outside the subset: literal text, not a link.
+        if rest.starts_with("![") {
+            if let Some((_, used)) = link(&rest[1..]) {
+                text.push_str(&rest[..1 + used]);
+                rest = &rest[1 + used..];
+                continue;
+            }
+        }
         let parsed = match c {
             '`' => rest[1..]
                 .find('`')
                 .map(|e| (Inline::Code(rest[1..1 + e].to_string()), 2 + e)),
-            '<' if rest.starts_with("<kbd>") => rest.find("</kbd>").map(|e| {
-                let keys = rest[5..e]
-                    .split('+')
-                    .map(|k| k.trim().to_string())
-                    .filter(|k| !k.is_empty())
-                    .collect();
-                (Inline::Keys(keys), e + 6)
-            }),
-            '*' if rest.starts_with("**") => rest[2..]
-                .find("**")
+            '<' if rest.starts_with("<kbd>") => rest
+                .find("</kbd>")
+                .and_then(|e| keys(&rest[5..e]).map(|k| (Inline::Keys(k), e + 6))),
+            '*' if rest.starts_with("**") => closer(&rest[2..], "**")
                 .filter(|e| *e > 0)
                 .map(|e| (Inline::Bold(inline(&rest[2..2 + e])), 4 + e)),
-            '*' => rest[1..]
-                .find('*')
+            '*' => closer(&rest[1..], "*")
                 .filter(|e| *e > 0)
                 .map(|e| (Inline::Italic(inline(&rest[1..1 + e])), 2 + e)),
-            '[' => rest.find("](").and_then(|m| {
-                let close = rest[m + 2..].find(')')?;
-                let target = Link::classify(&rest[m + 2..m + 2 + close]);
-                Some((
-                    Inline::Link {
-                        text: inline(&rest[1..m]),
-                        target,
-                    },
-                    m + 3 + close,
-                ))
-            }),
+            '[' => link(rest),
             _ => None,
         };
         match parsed {
@@ -363,6 +387,59 @@ pub fn inline(s: &str) -> Vec<Inline> {
         out.push(Inline::Text(text));
     }
     out
+}
+
+/// `[text](target)` at the start of `s`, and the bytes it takes. The first
+/// `]` must be followed by `(`; otherwise the `[` is literal.
+fn link(s: &str) -> Option<(Inline, usize)> {
+    let m = s.find(']')?;
+    let after = s[m + 1..].strip_prefix('(')?;
+    let close = after.find(')')?;
+    let target = Link::classify(&after[..close]);
+    Some((
+        Inline::Link {
+            text: inline(&s[1..m]),
+            target,
+        },
+        m + 3 + close,
+    ))
+}
+
+/// Where `delim` closes in `s`, skipping code spans.
+fn closer(s: &str, delim: &str) -> Option<usize> {
+    let mut at = 0;
+    while at < s.len() {
+        let rest = &s[at..];
+        if rest.starts_with(delim) {
+            return Some(at);
+        }
+        if let Some(e) = rest.strip_prefix('`').and_then(|r| r.find('`')) {
+            at += 2 + e;
+            continue;
+        }
+        at += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+/// The keys of a chord split on `+`; an empty piece is the `+` key
+/// (`Ctrl++`). An empty chord is not one.
+fn keys(chord: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for c in chord.chars() {
+        if c != '+' {
+            cur.push(c);
+        } else if cur.trim().is_empty() {
+            cur = "+".to_string();
+        } else {
+            out.push(std::mem::take(&mut cur).trim().to_string());
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Every link in the blocks, in order.
@@ -520,7 +597,7 @@ mod tests {
                 src: "images/home.png".into()
             }
         );
-        assert!(matches!(b[1], Block::Paragraph(_)));
+        assert_eq!(b[1], Block::Paragraph(vec![t("text ![x](y.png) inline")]));
     }
 
     #[test]
@@ -604,5 +681,92 @@ mod tests {
             parse("para\r\nline")[0],
             Block::Paragraph(vec![t("para line")])
         );
+    }
+
+    fn slugs(src: &str) -> Vec<String> {
+        parse(src)
+            .into_iter()
+            .filter_map(|b| match b {
+                Block::Heading { slug, .. } => Some(slug),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_heading_slug_never_collides_with_a_bumped_one() {
+        assert_eq!(slugs("# A 1\n# A\n# A"), ["a-1", "a", "a-2"]);
+        assert_eq!(slugs("# A\n# A\n# A 1"), ["a", "a-1", "a-1-1"]);
+    }
+
+    #[test]
+    fn a_bracket_without_a_link_is_literal() {
+        let link = Inline::Link {
+            text: vec![t("Home")],
+            target: Link::Page {
+                page: "home".into(),
+                anchor: None,
+            },
+        };
+        assert_eq!(
+            inline("Press [Enter] then see [Home](home)"),
+            vec![t("Press [Enter] then see "), link]
+        );
+    }
+
+    #[test]
+    fn a_wrapped_list_item_keeps_its_lines() {
+        for (src, ordered) in [
+            ("- one\n  wraps here\n- two", false),
+            ("1. one\nwraps here\n2. two", true),
+        ] {
+            let b = parse(src);
+            assert_eq!(b.len(), 1, "{b:?}");
+            let Block::List { ordered: o, items } = &b[0] else {
+                panic!("{b:?}")
+            };
+            assert_eq!(*o, ordered);
+            assert_eq!(items[0].text, vec![t("one wraps here")]);
+            assert_eq!(items[1].text, vec![t("two")]);
+        }
+        // A heading after an item is its own block.
+        assert!(matches!(parse("- a\n# H")[1], Block::Heading { .. }));
+    }
+
+    #[test]
+    fn an_inline_image_is_literal_text() {
+        assert_eq!(
+            inline("text ![x](y.png) inline"),
+            vec![t("text ![x](y.png) inline")]
+        );
+    }
+
+    #[test]
+    fn emphasis_closers_skip_code_spans() {
+        assert_eq!(
+            inline("**a `**` b**"),
+            vec![Inline::Bold(vec![
+                t("a "),
+                Inline::Code("**".into()),
+                t(" b")
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_plus_key_and_an_empty_chord() {
+        assert_eq!(
+            inline("<kbd>Ctrl++</kbd>"),
+            vec![Inline::Keys(vec!["Ctrl".into(), "+".into()])]
+        );
+        assert_eq!(inline("<kbd></kbd>"), vec![t("<kbd></kbd>")]);
+    }
+
+    #[test]
+    fn a_table_needs_one_alignment_per_header_cell() {
+        assert!(matches!(
+            parse("| a | b |\n|---|\n| 1 | 2 |")[0],
+            Block::Paragraph(_)
+        ));
     }
 }

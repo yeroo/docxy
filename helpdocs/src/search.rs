@@ -51,9 +51,38 @@ fn body_lines(blocks: &[Block]) -> Vec<String> {
     lines
 }
 
+/// Up to `SNIPPET_CHARS` of `line`, the window moved right as far as needed
+/// to hold the first query term it finds.
+fn snippet(line: &str, terms: &[String]) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    // Lowercased char by char, so indexes stay those of `line`.
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let end = terms
+        .iter()
+        .filter_map(|t| {
+            let t: Vec<char> = t.chars().collect();
+            lower
+                .windows(t.len())
+                .position(|w| w == t.as_slice())
+                .map(|at| at + t.len())
+        })
+        .min()
+        .unwrap_or(0);
+    let start = end.saturating_sub(SNIPPET_CHARS);
+    chars[start..].iter().take(SNIPPET_CHARS).collect()
+}
+
 pub fn search(manual: &Manual, query: &str) -> Vec<Hit> {
-    let mut terms = tokens(query);
-    terms.dedup();
+    // Each term once, in query order.
+    let mut terms: Vec<String> = Vec::new();
+    for t in tokens(query) {
+        if !terms.contains(&t) {
+            terms.push(t);
+        }
+    }
     if terms.is_empty() {
         return Vec::new();
     }
@@ -87,7 +116,7 @@ pub fn search(manual: &Manual, query: &str) -> Vec<Hit> {
             .iter()
             .zip(&body)
             .find(|(_, toks)| toks.iter().any(|t| terms.contains(t)))
-            .map(|(line, _)| line.trim().chars().take(SNIPPET_CHARS).collect())
+            .map(|(line, _)| snippet(line.trim(), &terms))
             .unwrap_or_else(|| page.title.clone());
         hits.push(Hit {
             page: page.id.clone(),
@@ -170,6 +199,13 @@ mod tests {
         assert_eq!(snippet("a"), "a table item");
         assert_eq!(snippet("b"), "Table too");
         assert_eq!(snippet("c").chars().count(), SNIPPET_CHARS);
+        assert!(snippet("c").ends_with("table"), "{}", snippet("c"));
+    }
+
+    #[test]
+    fn a_repeated_term_counts_once() {
+        let m = manual(&[("p", "---\ntitle: A\n---\nb b")]);
+        assert_eq!(search(&m, "a b a")[0].score, search(&m, "a b")[0].score);
     }
 
     #[test]

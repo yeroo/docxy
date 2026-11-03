@@ -40,14 +40,16 @@ Blocks:
 - Bullet lists (`-` or `*`) and numbered lists (`1.`), nested by indent.
 - Fenced code blocks, kept literal.
 - GFM pipe tables. A table needs a header row and an alignment row
-  (`:---`, `:---:`, `---:`).
+  (`:---`, `:---:`, `---:`) with one cell per header cell; otherwise the
+  lines are a paragraph. Body rows may have fewer or more cells.
 - An image on a line of its own.
 
-Inline:
+Inline (an inline `![alt](src)` is literal text):
 - `**bold**`, `*italic*` and `` `code` ``.
 - Links `[text](target)`.
 - Key chords `<kbd>Ctrl+Shift+L</kbd>`. The chord is split on `+`, so a
-  plus key is written `<kbd>Ctrl+Plus</kbd>`.
+  plus key is written `<kbd>Ctrl+Plus</kbd>` or `<kbd>Ctrl++</kbd>` (an
+  empty piece is the `+` key). An empty `<kbd></kbd>` is literal text.
 
 A link target is one of:
 - another page (`home-font`, or `home-font#effects` for one of its headings);
@@ -90,7 +92,8 @@ with a line before its first contents entry:
 ```
 
 From then on, a command of that area without a page of its own fails the
-test. The directive is case-sensitive and counts only before the first
+test, and so does a strict area no command belongs to (a misspelt or
+renamed tab). The directive is case-sensitive and counts only before the first
 entry; later on it is a plain comment.
 
 ## Problems
@@ -103,4 +106,5 @@ A bundle always loads. These are reported (`Manual::problems`):
 - a bad page id;
 - a key claimed by two pages;
 - a broken link;
-- a missing image.
+- a missing image;
+- a `.md` file in a subdirectory (not loaded).

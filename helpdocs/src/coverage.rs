@@ -18,12 +18,16 @@ pub struct Coverage {
     pub unresolved: Vec<(String, String)>,
     /// Ids of a strict area without a page of their own.
     pub strict_failures: Vec<(String, String)>,
+    /// Strict areas no id belongs to (a misspelt or renamed tab).
+    pub unused_strict: Vec<String>,
 }
 
 impl Coverage {
-    /// Nothing unresolved and no strict failure.
+    /// Nothing unresolved, no strict failure and no unused strict area.
     pub fn passes(&self) -> bool {
-        self.unresolved.is_empty() && self.strict_failures.is_empty()
+        self.unresolved.is_empty()
+            && self.strict_failures.is_empty()
+            && self.unused_strict.is_empty()
     }
 
     /// A count line, then one line per id not exactly covered.
@@ -36,6 +40,9 @@ impl Coverage {
             self.unresolved.len(),
             self.strict_failures.len()
         );
+        for area in &self.unused_strict {
+            let _ = writeln!(out, "  unused strict area: {area}");
+        }
         for (label, list) in [
             ("strict failure", &self.strict_failures),
             ("unresolved", &self.unresolved),
@@ -75,6 +82,12 @@ pub fn coverage<'a>(
             None => c.unresolved.push(pair),
         }
     }
+    c.unused_strict = manual
+        .strict
+        .iter()
+        .filter(|a| !seen.iter().any(|(_, area)| area == *a))
+        .cloned()
+        .collect();
     c
 }
 
@@ -125,6 +138,15 @@ mod tests {
         assert!(c.report().contains("strict failure: italic (home)"));
         // Every Home id with a page of its own passes.
         assert!(coverage(&m, [("bold", "Home"), ("table", "Insert")]).passes());
+    }
+
+    #[test]
+    fn a_strict_area_no_id_uses_fails() {
+        let m = manual("# strict: Hom\nroot\nhome\n");
+        let c = coverage(&m, [("bold", "Home")]);
+        assert_eq!(c.unused_strict, vec!["hom"]);
+        assert!(!c.passes());
+        assert!(c.report().contains("unused strict area: hom"));
     }
 
     #[test]
