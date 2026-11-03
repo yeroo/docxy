@@ -227,6 +227,15 @@ fn tab_edit_target(tab: &mut DocTab) -> Option<&mut Editor> {
     }
 }
 
+/// The story part [`tab_edit_target`] edits: the open header or footer's,
+/// else the body's. A copy's pictures resolve through it, and a paste's are
+/// carried into it (#1639).
+fn tab_edit_target_part(tab: &DocTab) -> &str {
+    tab.hf_edit
+        .as_ref()
+        .map_or("word/document.xml", |hf| hf.part_name.as_str())
+}
+
 /// [`tab_edit_target`], to read.
 fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
     if let Some(hf) = tab.hf_edit.as_ref() {
@@ -2009,6 +2018,9 @@ const CUT_CANCELLED_STATUS: &str =
 struct DocClip {
     clip: Clip,
     text: String,
+    /// The media of the clip's inline pictures, read where they were copied
+    /// from, so a paste into another story or tab carries them (#1639).
+    media: pictures::Media,
 }
 
 /// What a read of the clipboard found (#699).
@@ -24530,6 +24542,20 @@ impl Docxy {
         if cut && self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
+        // The pictures' media is read before a cut runs (#1639); a cut does
+        // not touch the package, but the selection it reads is gone after.
+        let media = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| {
+                let clip = tab_edit_target_ref(t)?.copy()?;
+                Some(pictures::capture(
+                    t.pkg.as_ref()?,
+                    tab_edit_target_part(t),
+                    &clip,
+                ))
+            })
+            .unwrap_or_default();
         let clip = self.edit_target().and_then(|ed| {
             if !cut {
                 return ed.copy();
@@ -24544,7 +24570,7 @@ impl Docxy {
             let rtf = (!plain.is_empty())
                 .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
             let text = self.clipboard_write_rich(doc_copy_text(&clip), rtf, cx);
-            self.clip = Some(DocClip { clip, text });
+            self.clip = Some(DocClip { clip, text, media });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.mark_dirty();
@@ -24565,10 +24591,36 @@ impl Docxy {
         let now = self.clipboard_read(cx);
         let rtf = self.clipboard_read_rtf();
         let clip = doc_paste_clip(self.clip.as_ref(), &now, rtf.as_deref());
-        if let Some(clip) = clip {
+        if let Some(mut clip) = clip {
+            if self.clip.as_ref().is_some_and(|ours| ours.clip == clip) {
+                self.carry_pictures(&mut clip);
+            }
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
             self.refocus(window, cx);
+        }
+    }
+
+    /// Make a paste of the window's own clip name its pictures' media in
+    /// the story it lands in (#1639, [`pictures::carry`]). A tab without a
+    /// package gets one first, as Info's fields do; a tab whose save writes
+    /// none (Markdown, text, RTF) pastes the clip as it is.
+    fn carry_pictures(&mut self, clip: &mut Clip) {
+        let Some(media) = self.clip.as_ref().map(|c| &c.media) else {
+            return;
+        };
+        if media.is_empty() || !clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if !matches!(tab.surface, Surface::Doc(_)) || tab.ensure_package().is_err() {
+            return;
+        }
+        let part = tab_edit_target_part(tab).to_string();
+        if let Some(pkg) = tab.pkg.as_mut() {
+            pictures::carry(pkg, &part, media, clip);
         }
     }
 
@@ -28032,6 +28084,7 @@ mod clipboard_tests {
                 .collect()
         };
         let ours = DocClip {
+            media: Default::default(),
             clip: Clip::from_text("mine"),
             text: "mine".into(),
         };
@@ -28049,6 +28102,7 @@ mod clipboard_tests {
         let got = doc_paste_clip(Some(&ours), &ClipRead::Nothing, Some(bold_rtf)).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD");
         let image_only = DocClip {
+            media: Default::default(),
             clip: Clip::default(),
             text: String::new(),
         };
@@ -28088,6 +28142,7 @@ mod clipboard_tests {
         assert_eq!(text, "\u{FFFC}\u{FFFC}");
         let now = ClipRead::Text(text.clone());
         let ours = DocClip {
+            media: Default::default(),
             text: recorded_after_write(text, &now),
             clip: clip.clone(),
         };
@@ -39678,6 +39733,10 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        // Pictures a package change replaced leave gpui's asset cache (#1639).
+        for tab in &self.tabs {
+            tab.pictures.borrow_mut().release_retired(cx);
+        }
         land_status(
             &mut self.pending_status,
             self.tabs.get_mut(self.active).map(|t| &mut t.status),

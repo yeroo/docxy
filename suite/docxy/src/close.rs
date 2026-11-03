@@ -862,7 +862,9 @@ impl Docxy {
             // the tab the highlighting mode started on (#623).
             self.cancel_pointer_modes();
             self.active = previous_active;
-            remove_tab(&mut self.tabs, &mut self.active, i);
+            let removed = remove_tab(&mut self.tabs, &mut self.active, i);
+            // Its pictures leave gpui's asset cache (#1639).
+            removed.pictures.borrow_mut().release_all(cx);
             // The Info page's result is keyed by tab index (#627).
             self.bs_info_status = None;
             self.drop_grid_state();

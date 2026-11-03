@@ -1832,6 +1832,22 @@
   images stay in gpui's asset cache for the process (no `remove_asset`).
   A run whose rid is missing from its story's relationships (pasted from
   another story keeps its source rid) keeps its frame.
+- A document copy keeps its pictures' media (`DocClip::media`,
+  `pictures::capture`, read from the story part `tab_edit_target_part` names,
+  before a cut runs). A paste of the window's own clip runs `pictures::carry`
+  into the part it lands in: a rid that resolves there to the same bytes is
+  kept, else an image relationship of that part to identical bytes is taken,
+  else the media is added (`add_part_image`) and the run's `r:embed` rewritten
+  (`image::replace_inline_embed`, `Clip::remap_embeds`). So a paste in the same
+  story changes nothing and repeated pastes add one part. As Insert Picture,
+  the part is added outside the undo step: an undone paste leaves it. A tab
+  with no package gets one (`ensure_package`); a Markdown/text/RTF tab pastes
+  the rid as it was. Pictures in a tracked change or hyperlink are not carried.
+- `pictures::Cache` retires the images a stamp change drops; `Docxy::render`
+  releases them from gpui's asset cache (`Image::remove_asset`), and
+  `close_tab_with` releases all of a closed tab's. The window's atlas tile is
+  not freed (it goes with the window); a reload in place (`*tab = fresh`)
+  drops its cache unreleased.
 - Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
   the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
   no pictures, so there is no `.uit` case.
