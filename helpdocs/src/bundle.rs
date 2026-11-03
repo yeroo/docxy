@@ -62,6 +62,9 @@ pub enum Problem {
     MissingImage { page: String, src: String },
     /// A `.md` file in a subdirectory (not loaded: pages live at the top).
     NestedPage(String),
+    /// A page whose front matter has no closing `---` line (its whole file
+    /// is read as the body).
+    UnclosedFrontMatter(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -128,7 +131,10 @@ impl Manual {
         sources.sort();
         let Some(contents_txt) = contents_txt else {
             m.problems.push(Problem::NoContents);
-            m.pages = sources.iter().map(|(id, s)| page(id, s)).collect();
+            for (id, src) in &sources {
+                let p = page(id, src, &mut m.problems);
+                m.pages.push(p);
+            }
             m.check();
             return m;
         };
@@ -138,7 +144,8 @@ impl Manual {
             match sources.iter().position(|(id, _)| *id == e.id) {
                 Some(at) => {
                     let (id, src) = sources.remove(at);
-                    m.pages.push(page(&id, &src));
+                    let p = page(&id, &src, &mut m.problems);
+                    m.pages.push(p);
                     m.contents.push(e);
                 }
                 None => m.problems.push(Problem::MissingPage(e.id)),
@@ -146,7 +153,8 @@ impl Manual {
         }
         for (id, src) in sources {
             m.problems.push(Problem::UnlistedPage(id.clone()));
-            m.pages.push(page(&id, &src));
+            let p = page(&id, &src, &mut m.problems);
+            m.pages.push(p);
         }
         m.check();
         m
@@ -189,14 +197,12 @@ impl Manual {
                     });
                 }
             }
-            for b in &p.blocks {
-                if let Block::Image { src, .. } = b {
-                    if !self.images.contains(&bundle_path(src)) {
-                        problems.push(Problem::MissingImage {
-                            page: p.id.clone(),
-                            src: src.clone(),
-                        });
-                    }
+            for src in md::images(&p.blocks) {
+                if !self.images.contains(&bundle_path(src)) {
+                    problems.push(Problem::MissingImage {
+                        page: p.id.clone(),
+                        src: src.to_string(),
+                    });
                 }
             }
         }
@@ -258,9 +264,10 @@ fn parse_contents(text: &str, problems: &mut Vec<Problem>) -> (Vec<Entry>, Vec<S
 }
 
 /// A page from its source: front matter, then the body.
-fn page(id: &str, src: &str) -> Page {
+/// An unclosed front matter is reported, and the whole file is the body.
+fn page(id: &str, src: &str, problems: &mut Vec<Problem>) -> Page {
     let src = src.replace("\r\n", "\n");
-    let src = src.strip_prefix('\u{feff}').unwrap_or(&src);
+    let src = src.as_str();
     let mut title = None;
     let mut area = None;
     let mut keys = Vec::new();
@@ -276,6 +283,9 @@ fn page(id: &str, src: &str) -> Page {
         }
         None
     });
+    if front.is_none() && src.starts_with("---\n") {
+        problems.push(Problem::UnclosedFrontMatter(id.to_string()));
+    }
     if let Some((matter, after)) = front {
         for line in matter.lines() {
             let Some((k, v)) = line.split_once(':') else {
@@ -530,6 +540,25 @@ pub(crate) mod tests {
         assert_eq!(b.keys, vec!["x"]);
         assert_eq!(b.blocks.len(), 1);
         assert_eq!(m.page("c").unwrap().blocks, vec![]);
+    }
+
+    #[test]
+    fn an_unclosed_front_matter_is_reported() {
+        let m = files(&[("a.md", "---\ntitle: A\n# A\n")]);
+        assert!(
+            m.problems
+                .contains(&Problem::UnclosedFrontMatter("a".into()))
+        );
+        assert_eq!(m.page("a").unwrap().title, "a");
+    }
+
+    #[test]
+    fn a_missing_image_in_a_list_item_is_reported() {
+        let m = files(&[("a.md", "1. Step\n\n   ![s](images/gone.png)\n")]);
+        assert!(m.problems.contains(&Problem::MissingImage {
+            page: "a".into(),
+            src: "images/gone.png".into()
+        }));
     }
 
     #[test]

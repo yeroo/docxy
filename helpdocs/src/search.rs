@@ -43,8 +43,12 @@ fn body_lines(blocks: &[Block]) -> Vec<String> {
                     lines.push(cells.join(" | "));
                 }
             }
-            Block::Paragraph(_) | Block::List { .. } => {
-                md::for_inlines(std::slice::from_ref(b), &mut |i| lines.push(md::plain(i)));
+            Block::Paragraph(text) => lines.push(md::plain(text)),
+            Block::List { items, .. } => {
+                for item in items {
+                    lines.push(md::plain(&item.text));
+                    lines.extend(body_lines(&item.children));
+                }
             }
         }
     }
@@ -64,9 +68,12 @@ fn snippet(line: &str, terms: &[String]) -> String {
         .iter()
         .filter_map(|t| {
             let t: Vec<char> = t.chars().collect();
-            lower
-                .windows(t.len())
-                .position(|w| w == t.as_slice())
+            // A whole token only: no letter or digit on either side.
+            let word = |i: usize| lower.get(i).is_some_and(|c| c.is_alphanumeric());
+            (0..=lower.len().saturating_sub(t.len()))
+                .find(|&at| {
+                    lower[at..].starts_with(&t) && (at == 0 || !word(at - 1)) && !word(at + t.len())
+                })
                 .map(|at| at + t.len())
         })
         .min()
@@ -200,6 +207,14 @@ mod tests {
         assert_eq!(snippet("b"), "Table too");
         assert_eq!(snippet("c").chars().count(), SNIPPET_CHARS);
         assert!(snippet("c").ends_with("table"), "{}", snippet("c"));
+    }
+
+    #[test]
+    fn the_snippet_matches_whole_tokens() {
+        let line = format!("tables {} table", "x ".repeat(100));
+        let m = manual(&[("a", &line)]);
+        let hits = search(&m, "table");
+        assert!(hits[0].snippet.ends_with(" table"), "{}", hits[0].snippet);
     }
 
     #[test]

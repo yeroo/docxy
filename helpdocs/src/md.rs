@@ -20,6 +20,8 @@ pub enum Block {
     Paragraph(Vec<Inline>),
     List {
         ordered: bool,
+        /// The first item's number (`3. foo` starts at 3); 1 for bullets.
+        start: u32,
         items: Vec<ListItem>,
     },
     Code {
@@ -40,7 +42,8 @@ pub enum Block {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListItem {
     pub text: Vec<Inline>,
-    /// Nested lists.
+    /// What sits under the item, in order: images and fenced code indented
+    /// under it, and nested lists.
     pub children: Vec<Block>,
 }
 
@@ -144,19 +147,9 @@ pub fn parse(src: &str) -> Vec<Block> {
         if t.is_empty() {
             flush(&mut para, &mut blocks);
             i += 1;
-        } else if let Some(lang) = t.strip_prefix("```") {
+        } else if t.starts_with("```") {
             flush(&mut para, &mut blocks);
-            let mut body = Vec::new();
-            i += 1;
-            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
-                body.push(lines[i]);
-                i += 1;
-            }
-            i += 1; // the closing fence (or the end)
-            blocks.push(Block::Code {
-                lang: lang.trim().to_string(),
-                text: body.join("\n"),
-            });
+            blocks.push(fence(&lines, &mut i));
         } else if let Some((level, text)) = heading(t) {
             flush(&mut para, &mut blocks);
             let text = inline(text);
@@ -192,19 +185,7 @@ pub fn parse(src: &str) -> Vec<Block> {
             });
         } else if list_item(line).is_some() {
             flush(&mut para, &mut blocks);
-            let mut items = Vec::new();
-            while let Some(item) = lines.get(i).and_then(|l| list_item(l)) {
-                items.push(item);
-                i += 1;
-                // A wrapped item: its following plain lines are its text.
-                while i < lines.len() && continues_item(&lines, i) {
-                    if let Some(last) = items.last_mut() {
-                        last.text.push(' ');
-                        last.text.push_str(lines[i].trim());
-                    }
-                    i += 1;
-                }
-            }
+            let items = list_items(&lines, &mut i);
             let mut at = 0;
             while at < items.len() {
                 let base = items[at].indent;
@@ -217,6 +198,89 @@ pub fn parse(src: &str) -> Vec<Block> {
     }
     flush(&mut para, &mut blocks);
     blocks
+}
+
+/// The fenced code block opening at `lines[*i]`; `*i` moves past its
+/// closing line, one that is exactly the fence once trimmed (or the end).
+/// The opening line's indent is taken off the body's lines.
+fn fence(lines: &[&str], i: &mut usize) -> Block {
+    let open = lines[*i];
+    let indent = open.len() - open.trim_start_matches(' ').len();
+    let lang = open.trim().trim_start_matches('`').trim().to_string();
+    let mut body = Vec::new();
+    *i += 1;
+    while *i < lines.len() && lines[*i].trim() != "```" {
+        let l = lines[*i];
+        let lead = l.len() - l.trim_start_matches(' ').len();
+        body.push(&l[lead.min(indent)..]);
+        *i += 1;
+    }
+    *i += 1; // the closing fence (or the end)
+    Block::Code {
+        lang,
+        text: body.join("\n"),
+    }
+}
+
+/// The items of a list starting at `lines[*i]`, with their wrapped lines and
+/// the images and fences indented under them. The list goes on across blank
+/// lines while the next item is at its first item's indent or deeper.
+fn list_items(lines: &[&str], i: &mut usize) -> Vec<RawItem> {
+    let mut items: Vec<RawItem> = Vec::new();
+    let Some((base, ordered)) = list_item(lines[*i]).map(|it| (it.indent, it.ordered)) else {
+        return items;
+    };
+    while let Some(item) = lines.get(*i).and_then(|l| list_item(l)) {
+        if item.indent < base {
+            break;
+        }
+        items.push(item);
+        *i += 1;
+        // A wrapped item: its following plain lines are its text.
+        while *i < lines.len() && continues_item(lines, *i) {
+            if let Some(last) = items.last_mut() {
+                last.text.push(' ');
+                last.text.push_str(lines[*i].trim());
+            }
+            *i += 1;
+        }
+        // Blank lines, and images and fences indented under the item.
+        let mut j = *i;
+        loop {
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            let Some(l) = lines.get(j) else { break };
+            let Some(last) = items.last_mut() else { break };
+            let indent = l.len() - l.trim_start_matches(' ').len();
+            if indent <= last.indent {
+                break;
+            }
+            if let Some((alt, src)) = image(l.trim()) {
+                last.blocks.push(Block::Image { alt, src });
+                j += 1;
+            } else if l.trim().starts_with("```") {
+                last.blocks.push(fence(lines, &mut j));
+            } else {
+                break;
+            }
+            *i = j;
+        }
+        // Go on only when an item of this list comes next: deeper, or at its
+        // indent and of its kind (a bullet list after a numbered one, past a
+        // blank line, is a list of its own).
+        let gap = j > *i;
+        match lines.get(j).and_then(|l| list_item(l)) {
+            Some(next)
+                if next.indent > base
+                    || (next.indent == base && (!gap || next.ordered == ordered)) =>
+            {
+                *i = j
+            }
+            _ => break,
+        }
+    }
+    items
 }
 
 /// The alignments of a table starting at `lines[i]`: a `|` header row, then
@@ -262,8 +326,32 @@ fn image(t: &str) -> Option<(String, String)> {
 fn cells(row: &str) -> Vec<String> {
     let row = row.trim();
     let row = row.strip_prefix('|').unwrap_or(row);
-    let row = row.strip_suffix('|').unwrap_or(row);
-    row.split('|').map(|c| c.trim().to_string()).collect()
+    // A `\|` at the row's end is a cell's text, not the closing pipe.
+    let row = match row.strip_suffix('|') {
+        Some(r) if !r.ends_with('\\') => r,
+        _ => row,
+    };
+    // Split on a `|` that is neither escaped nor in a code span; `\|` is `|`.
+    let mut out = Vec::new();
+    let mut cell = String::new();
+    let mut in_code = false;
+    let mut chars = row.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                cell.push('|');
+                chars.next();
+            }
+            '`' => {
+                in_code = !in_code;
+                cell.push(c);
+            }
+            '|' if !in_code => out.push(std::mem::take(&mut cell).trim().to_string()),
+            _ => cell.push(c),
+        }
+    }
+    out.push(cell.trim().to_string());
+    out
 }
 
 fn aligns(line: &str) -> Option<Vec<Align>> {
@@ -291,7 +379,11 @@ fn aligns(line: &str) -> Option<Vec<Align>> {
 struct RawItem {
     indent: usize,
     ordered: bool,
+    /// The item's number; 1 for a bullet.
+    number: u32,
     text: String,
+    /// Images and fences indented under the item.
+    blocks: Vec<Block>,
 }
 
 fn list_item(line: &str) -> Option<RawItem> {
@@ -301,7 +393,9 @@ fn list_item(line: &str) -> Option<RawItem> {
         return Some(RawItem {
             indent,
             ordered: false,
+            number: 1,
             text: rest.trim().to_string(),
+            blocks: Vec::new(),
         });
     }
     let digits = t.bytes().take_while(u8::is_ascii_digit).count();
@@ -309,7 +403,9 @@ fn list_item(line: &str) -> Option<RawItem> {
     (digits > 0).then(|| RawItem {
         indent,
         ordered: true,
+        number: t[..digits].parse().unwrap_or(u32::MAX),
         text: rest.trim().to_string(),
+        blocks: Vec::new(),
     })
 }
 
@@ -317,6 +413,7 @@ fn list_item(line: &str) -> Option<RawItem> {
 /// item nesting under the item before it.
 fn build_list(items: &[RawItem], at: &mut usize, base: usize) -> Block {
     let ordered = items[*at].ordered;
+    let start = items[*at].number;
     let mut out: Vec<ListItem> = Vec::new();
     while *at < items.len() && items[*at].indent >= base {
         let indent = items[*at].indent;
@@ -329,12 +426,13 @@ fn build_list(items: &[RawItem], at: &mut usize, base: usize) -> Block {
         }
         out.push(ListItem {
             text: inline(&items[*at].text),
-            children: Vec::new(),
+            children: items[*at].blocks.clone(),
         });
         *at += 1;
     }
     Block::List {
         ordered,
+        start,
         items: out,
     }
 }
@@ -360,10 +458,10 @@ pub fn inline(s: &str) -> Vec<Inline> {
             '<' if rest.starts_with("<kbd>") => rest
                 .find("</kbd>")
                 .and_then(|e| keys(&rest[5..e]).map(|k| (Inline::Keys(k), e + 6))),
-            '*' if rest.starts_with("**") => closer(&rest[2..], "**")
+            '*' if rest.starts_with("**") && opens(&rest[2..]) => closer(&rest[2..], "**")
                 .filter(|e| *e > 0)
                 .map(|e| (Inline::Bold(inline(&rest[2..2 + e])), 4 + e)),
-            '*' => closer(&rest[1..], "*")
+            '*' if opens(&rest[1..]) => closer(&rest[1..], "*")
                 .filter(|e| *e > 0)
                 .map(|e| (Inline::Italic(inline(&rest[1..1 + e])), 2 + e)),
             '[' => link(rest),
@@ -392,7 +490,7 @@ pub fn inline(s: &str) -> Vec<Inline> {
 /// `[text](target)` at the start of `s`, and the bytes it takes. The first
 /// `]` must be followed by `(`; otherwise the `[` is literal.
 fn link(s: &str) -> Option<(Inline, usize)> {
-    let m = s.find(']')?;
+    let m = 1 + closer(s.get(1..)?, "]")?;
     let after = s[m + 1..].strip_prefix('(')?;
     let close = after.find(')')?;
     let target = Link::classify(&after[..close]);
@@ -405,30 +503,57 @@ fn link(s: &str) -> Option<(Inline, usize)> {
     ))
 }
 
-/// Where `delim` closes in `s`, skipping code spans.
+/// Whether emphasis can open before `s`: a character follows, not a space.
+fn opens(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| !c.is_whitespace())
+}
+
+/// Where `delim` closes in `s`, skipping code spans. An emphasis closer
+/// (`*`, `**`) must follow a non-space; it is the last `delim.len()` stars of
+/// its run (`***x***`), and an italic closer skips a whole `**...**` span.
 fn closer(s: &str, delim: &str) -> Option<usize> {
+    let emphasis = delim.starts_with('*');
     let mut at = 0;
     while at < s.len() {
         let rest = &s[at..];
-        if rest.starts_with(delim) {
-            return Some(at);
-        }
         if let Some(e) = rest.strip_prefix('`').and_then(|r| r.find('`')) {
             at += 2 + e;
             continue;
+        }
+        if emphasis && rest.starts_with('*') {
+            let run = rest.bytes().take_while(|b| *b == b'*').count();
+            let after_space = s[..at].chars().next_back().is_none_or(char::is_whitespace);
+            if !after_space && run >= delim.len() {
+                return Some(at + run - delim.len());
+            }
+            if delim == "*" && run >= 2 && opens(&rest[2..]) {
+                if let Some(e) = closer(&rest[2..], "**") {
+                    at += 4 + e;
+                    continue;
+                }
+            }
+            at += run;
+            continue;
+        }
+        if !emphasis && rest.starts_with(delim) {
+            return Some(at);
         }
         at += rest.chars().next().map_or(1, char::len_utf8);
     }
     None
 }
 
-/// The keys of a chord split on `+`; an empty piece is the `+` key
-/// (`Ctrl++`). An empty chord is not one.
+/// The keys of a chord split on `+`. A `+` where a key is due is the `+`
+/// key, so `Ctrl++`, `Ctrl++Shift` and `+A` each hold one. An empty chord is
+/// not one.
 fn keys(chord: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     for c in chord.chars() {
         if c != '+' {
+            if cur == "+" {
+                out.push(std::mem::take(&mut cur));
+            }
             cur.push(c);
         } else if cur.trim().is_empty() {
             cur = "+".to_string();
@@ -440,6 +565,23 @@ fn keys(chord: &str) -> Option<Vec<String>> {
         out.push(cur.trim().to_string());
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// Every image source in the blocks, list items' included, in order.
+pub fn images(blocks: &[Block]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Image { src, .. } => out.push(src.as_str()),
+            Block::List { items, .. } => {
+                for item in items {
+                    out.extend(images(&item.children));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Every link in the blocks, in order.
@@ -523,7 +665,7 @@ mod tests {
     #[test]
     fn lists_nest_by_indent() {
         let b = parse("- a\n  - a1\n    1. deep\n  - a2\n- b\n\n1. one\n2. two\n* star");
-        let Block::List { ordered, items } = &b[0] else {
+        let Block::List { ordered, items, .. } = &b[0] else {
             panic!("{b:?}")
         };
         assert!(!ordered);
@@ -537,6 +679,7 @@ mod tests {
         let Block::List {
             ordered,
             items: deep,
+            ..
         } = &sub[0].children[0]
         else {
             panic!()
@@ -545,7 +688,7 @@ mod tests {
         assert_eq!(deep[0].text, vec![t("deep")]);
         assert_eq!(items[1].children, vec![]);
         // A numbered list after a blank line, then a `*` item joining it.
-        let Block::List { ordered, items } = &b[1] else {
+        let Block::List { ordered, items, .. } = &b[1] else {
             panic!("{b:?}")
         };
         assert!(ordered);
@@ -722,7 +865,10 @@ mod tests {
         ] {
             let b = parse(src);
             assert_eq!(b.len(), 1, "{b:?}");
-            let Block::List { ordered: o, items } = &b[0] else {
+            let Block::List {
+                ordered: o, items, ..
+            } = &b[0]
+            else {
                 panic!("{b:?}")
             };
             assert_eq!(*o, ordered);
@@ -768,5 +914,140 @@ mod tests {
             parse("| a | b |\n|---|\n| 1 | 2 |")[0],
             Block::Paragraph(_)
         ));
+    }
+
+    fn list(b: &Block) -> (bool, u32, &[ListItem]) {
+        match b {
+            Block::List {
+                ordered,
+                start,
+                items,
+            } => (*ordered, *start, items),
+            _ => panic!("not a list: {b:?}"),
+        }
+    }
+
+    #[test]
+    fn emphasis_needs_flanking_and_skips_a_bold_span() {
+        assert_eq!(
+            inline("*a **b** c*"),
+            vec![Inline::Italic(vec![
+                t("a "),
+                Inline::Bold(vec![t("b")]),
+                t(" c")
+            ])]
+        );
+        assert_eq!(
+            inline("***x***"),
+            vec![Inline::Bold(vec![Inline::Italic(vec![t("x")])])]
+        );
+        assert_eq!(
+            inline("**a *b***"),
+            vec![Inline::Bold(vec![t("a "), Inline::Italic(vec![t("b")])])]
+        );
+        assert_eq!(inline("2 * 3 * 4"), vec![t("2 * 3 * 4")]);
+    }
+
+    #[test]
+    fn a_loose_numbered_list_is_one_list() {
+        let b = parse("1. one\n\n2. two\n\n3. three\n\nafter");
+        assert_eq!(b.len(), 2, "{b:?}");
+        let (ordered, start, items) = list(&b[0]);
+        assert!(ordered);
+        assert_eq!(start, 1);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].text, vec![t("three")]);
+    }
+
+    #[test]
+    fn a_step_keeps_its_indented_screenshot_and_code() {
+        let b = parse(
+            "1. Open the tab.\n\n   ![The tab](images/tab.png)\n\n   ```\n   code\n   ```\n2. Click.",
+        );
+        assert_eq!(b.len(), 1, "{b:?}");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].children,
+            vec![
+                Block::Image {
+                    alt: "The tab".into(),
+                    src: "images/tab.png".into()
+                },
+                Block::Code {
+                    lang: String::new(),
+                    text: "code".into()
+                }
+            ]
+        );
+        assert_eq!(images(&b), ["images/tab.png"]);
+        // An image not indented under the item ends the list.
+        assert_eq!(parse("1. a\n\n![x](y.png)\n2. b").len(), 3);
+    }
+
+    #[test]
+    fn a_list_keeps_its_start_number() {
+        assert_eq!(list(&parse("3. foo\n4. bar")[0]).1, 3);
+        assert_eq!(list(&parse("- foo")[0]).1, 1);
+    }
+
+    #[test]
+    fn a_nested_item_after_a_blank_line_nests() {
+        let b = parse("- a\n\n  - a1\n- b");
+        assert_eq!(b.len(), 1, "{b:?}");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(items.len(), 2);
+        let (_, _, sub) = list(&items[0].children[0]);
+        assert_eq!(sub[0].text, vec![t("a1")]);
+    }
+
+    #[test]
+    fn a_plus_key_between_keys_and_first() {
+        let k = |v: &[&str]| vec![Inline::Keys(v.iter().map(|s| s.to_string()).collect())];
+        assert_eq!(inline("<kbd>Ctrl++Shift</kbd>"), k(&["Ctrl", "+", "Shift"]));
+        assert_eq!(inline("<kbd>+A</kbd>"), k(&["+", "A"]));
+        assert_eq!(inline("<kbd>++A</kbd>"), k(&["+", "A"]));
+    }
+
+    #[test]
+    fn a_fence_closes_only_at_a_bare_fence_line() {
+        let b = parse("```\na\n```rust\nb\n```  \nafter");
+        assert_eq!(
+            b[0],
+            Block::Code {
+                lang: String::new(),
+                text: "a\n```rust\nb".into()
+            }
+        );
+        assert_eq!(b[1], Block::Paragraph(vec![t("after")]));
+    }
+
+    #[test]
+    fn a_link_text_may_hold_a_code_span_with_a_bracket() {
+        assert_eq!(
+            inline("[`]`](keyboard)"),
+            vec![Inline::Link {
+                text: vec![Inline::Code("]".into())],
+                target: Link::Page {
+                    page: "keyboard".into(),
+                    anchor: None
+                }
+            }]
+        );
+    }
+
+    #[test]
+    fn table_pipes_escaped_or_in_code_stay_in_the_cell() {
+        let b = parse("| `a|b` | c \\| d |\n|---|---|\n| x \\| y | `p|q` |");
+        let Block::Table { header, rows, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
+        assert_eq!(header.len(), 2);
+        assert_eq!(header[0], vec![Inline::Code("a|b".into())]);
+        assert_eq!(header[1], vec![t("c | d")]);
+        assert_eq!(
+            rows[0],
+            vec![vec![t("x | y")], vec![Inline::Code("p|q".into())]]
+        );
     }
 }

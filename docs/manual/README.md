@@ -30,7 +30,9 @@ keys: bold, italic, dialog:font   # optional
 - `area`: the area this page belongs to (see Context help below).
 - `keys`: the context ids this page answers, comma-separated.
 
-A ` #` and everything after it in a value is a comment.
+A ` #` and everything after it in a value is a comment. The front matter
+ends at the first line that is exactly `---`; without one it is reported
+and the whole file is read as the body.
 
 ## Markdown subset
 
@@ -38,18 +40,27 @@ Blocks:
 - ATX headings `#` to `####`.
 - Paragraphs.
 - Bullet lists (`-` or `*`) and numbered lists (`1.`), nested by indent.
-- Fenced code blocks, kept literal.
+  A numbered list starts at its first item's number (`3.` starts at 3). A
+  line that is not a block of its own continues the item above it. A list
+  goes on across blank lines while the next item is deeper, or at its indent
+  and of its kind. An image or fenced code block indented under an item
+  belongs to that item (a screenshot under a step).
+- Fenced code blocks, kept literal. A fence closes at a line that is only
+  the fence.
 - GFM pipe tables. A table needs a header row and an alignment row
   (`:---`, `:---:`, `---:`) with one cell per header cell; otherwise the
-  lines are a paragraph. Body rows may have fewer or more cells.
+  lines are a paragraph. Body rows may have fewer or more cells. A `|` in a
+  code span or written `\|` is part of the cell.
 - An image on a line of its own.
 
 Inline (an inline `![alt](src)` is literal text):
-- `**bold**`, `*italic*` and `` `code` ``.
+- `**bold**`, `*italic*` and `` `code` ``. An emphasis opener must be
+  followed by a non-space and a closer preceded by one, so `2 * 3 * 4` is
+  plain text.
 - Links `[text](target)`.
 - Key chords `<kbd>Ctrl+Shift+L</kbd>`. The chord is split on `+`, so a
-  plus key is written `<kbd>Ctrl+Plus</kbd>` or `<kbd>Ctrl++</kbd>` (an
-  empty piece is the `+` key). An empty `<kbd></kbd>` is literal text.
+  plus key is written `<kbd>Ctrl+Plus</kbd>`, or `+` where a key is due
+  (`<kbd>Ctrl++</kbd>`, `<kbd>Ctrl++Shift</kbd>`, `<kbd>+A</kbd>`). An empty `<kbd></kbd>` is literal text.
 
 A link target is one of:
 - another page (`home-font`, or `home-font#effects` for one of its headings);
@@ -107,4 +118,5 @@ A bundle always loads. These are reported (`Manual::problems`):
 - a key claimed by two pages;
 - a broken link;
 - a missing image;
-- a `.md` file in a subdirectory (not loaded).
+- a `.md` file in a subdirectory (not loaded);
+- a page whose front matter is never closed.
