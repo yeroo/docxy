@@ -864,7 +864,7 @@ impl Docxy {
             self.active = previous_active;
             let removed = remove_tab(&mut self.tabs, &mut self.active, i);
             // Its pictures leave gpui's asset cache (#1639).
-            removed.pictures.borrow_mut().release_all(cx);
+            self.release_pictures(Some(&removed), cx);
             // The Info page's result is keyed by tab index (#627).
             self.bs_info_status = None;
             self.drop_grid_state();
@@ -1050,6 +1050,7 @@ impl Docxy {
                 self.mark_clean_exit();
             } else {
                 self.leave_registry(cx);
+                self.release_all_pictures(cx);
             }
             return true;
         }
@@ -1241,6 +1242,7 @@ impl Docxy {
             // most recent survivor and persist it, then remove only this
             // window. The app keeps running.
             self.leave_registry(cx);
+            self.release_all_pictures(cx);
             window.remove_window();
         }
     }

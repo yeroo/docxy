@@ -35,94 +35,127 @@ type PictureKey = (String, String);
 
 /// What a tab has read of its package's pictures, kept across frames so a
 /// frame resolves, copies and hashes each picture once. It is valid for one
-/// [`Package::parts_stamp`]: any change to the package's parts empties it.
+/// [`Package::parts_stamp`]: a change to the package's parts starts a new
+/// map, and an image whose bytes are unchanged is carried into it, so gpui
+/// keeps its decode (#1639).
 #[derive(Default)]
 pub struct Cache {
     stamp: u64,
     images: HashMap<PictureKey, Option<Arc<Image>>>,
-    /// Images dropped by a stamp change, still decoded in gpui's asset cache
-    /// until [`Cache::release_retired`] runs where an `App` is at hand (#1639).
+    /// The map of the stamp before, which a miss may revive by bytes.
+    stale: HashMap<PictureKey, Option<Arc<Image>>>,
+    /// Images no map holds any more, still decoded in gpui's asset cache
+    /// until a host with an `App` releases them ([`Cache::take_released`]).
     retired: Vec<Arc<Image>>,
 }
 
 impl Cache {
-    /// Forget everything read under an older stamp; its images wait in
-    /// `retired` to be released.
+    /// Start the map of `stamp`: what the stamp before that left unrevived
+    /// is retired, and the current map becomes the stale one.
     fn renew(&mut self, stamp: u64) {
         if self.stamp != stamp {
             self.retired
-                .extend(self.images.drain().filter_map(|(_, img)| img));
+                .extend(self.stale.drain().filter_map(|(_, img)| img));
+            self.stale = std::mem::take(&mut self.images);
             self.stamp = stamp;
         }
     }
 
-    /// Take the images to release: the retired ones, and with `all` (the tab
-    /// is closing) every one held.
-    fn take_released(&mut self, all: bool) -> Vec<Arc<Image>> {
+    /// The images to release: the retired ones, and with `all` (the tab or
+    /// its window is going) every one held.
+    pub fn take_released(&mut self, all: bool) -> Vec<Arc<Image>> {
         let mut out = std::mem::take(&mut self.retired);
         if all {
             out.extend(self.images.drain().filter_map(|(_, img)| img));
+            out.extend(self.stale.drain().filter_map(|(_, img)| img));
         }
         out
     }
 
-    /// Release the images a stamp change dropped from gpui's decoded-asset
-    /// cache. The window's atlas tile is not freed (it goes with the window).
-    pub fn release_retired(&mut self, cx: &mut gpui::App) {
-        for img in self.take_released(false) {
-            img.remove_asset(cx);
-        }
+    /// The gpui ids of the images this cache may still draw.
+    pub fn live_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.images
+            .values()
+            .chain(self.stale.values())
+            .flatten()
+            .map(|img| img.id)
     }
+}
 
-    /// Release every image the tab drew: the tab is closing. A picture
-    /// another tab still shows (same bytes, same asset) decodes again there.
-    pub fn release_all(&mut self, cx: &mut gpui::App) {
-        for img in self.take_released(true) {
-            img.remove_asset(cx);
-        }
-    }
+/// The images of `taken` gpui may forget: a gpui image's id is its bytes'
+/// hash, so one another cache still holds (`live`) shares the decode and is
+/// kept. Each id once.
+pub fn releasable(
+    taken: Vec<Arc<Image>>,
+    live: &std::collections::HashSet<u64>,
+) -> Vec<Arc<Image>> {
+    let mut seen = std::collections::HashSet::new();
+    taken
+        .into_iter()
+        .filter(|img| !live.contains(&img.id) && seen.insert(img.id))
+        .collect()
 }
 
 /// The media a copy's inline pictures name, by rid, read from the story part
 /// they were copied from (#1639): what a paste into another story or package
 /// re-adds there. A rid that does not resolve is left out.
-pub type Media = HashMap<String, (&'static str, Vec<u8>)>;
+pub type Media = HashMap<String, (docxcore::image::ImageInfo, Vec<u8>)>;
+
+/// An SVG picture's kind: [`docxcore::image::sniff`] reads raster images
+/// only, and an `asvg:svgBlip` names an SVG part.
+const SVG: docxcore::image::ImageInfo = docxcore::image::ImageInfo {
+    ext: "svg",
+    content_type: "image/svg+xml",
+    width: 0,
+    height: 0,
+};
+
+/// The bytes behind `rid` in `part`'s relationships, whatever they are.
+fn rel_bytes<'p>(pkg: &'p Package, part: &str, rid: &str) -> Option<&'p [u8]> {
+    pkg.part(&pkg.part_rel_target(part, rid)?)
+}
+
+/// What the media of a picture rid is: a raster image, or an SVG.
+fn media_kind(bytes: &[u8]) -> Option<docxcore::image::ImageInfo> {
+    docxcore::image::sniff(bytes).or_else(|| {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
+        head.contains("<svg").then_some(SVG)
+    })
+}
 
 /// The media of `clip`'s pictures as `part` of `pkg` resolves them.
 pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Media {
     clip.inline_embeds()
         .into_iter()
-        .filter_map(|rid| Some((rid.clone(), resolve(pkg, part, &rid)?)))
+        .filter_map(|rid| {
+            let bytes = rel_bytes(pkg, part, &rid)?;
+            Some((rid, (media_kind(bytes)?, bytes.to_vec())))
+        })
         .collect()
 }
 
 /// Make `clip`'s pictures name `media` from `part` of `dst` (#1639): a rid
-/// is kept when it already resolves there to the same bytes, else it takes
-/// an image relationship of the part to identical bytes, else the media is
-/// added ([`Package::add_part_image`], outside any undo step, as Insert
-/// Picture does). A rid with no media, or media the part cannot take, is
-/// kept as it is.
+/// is kept when it already names the same bytes there, else it takes a
+/// relationship of the part to identical bytes, else the media is added
+/// ([`Package::add_part_image`], outside any undo step, as Insert Picture
+/// does). A rid with no media, or media the part cannot take, is kept.
 pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::editor::Clip) {
     let mut map = HashMap::new();
     for rid in clip.inline_embeds() {
-        let Some((_, bytes)) = media.get(&rid) else {
+        let Some((kind, bytes)) = media.get(&rid) else {
             continue;
         };
-        let same = |r: &str| resolve(dst, part, r).is_some_and(|(_, b)| &b == bytes);
-        if same(&rid) {
+        let same = |dst: &Package, r: &str| rel_bytes(dst, part, r) == Some(bytes.as_slice());
+        if same(dst, &rid) {
             continue;
         }
         let found = dst
             .part_rels(part)
             .ids()
             .into_iter()
-            .find(|id| same(id))
+            .find(|id| same(dst, id))
             .map(str::to_string);
-        let new = found.or_else(|| {
-            let kind = docxcore::image::sniff(bytes)?;
-            dst.add_part_image(part, bytes, &kind)
-        });
-        if let Some(new) = new {
+        if let Some(new) = found.or_else(|| dst.add_part_image(part, bytes, kind)) {
             map.insert(rid, new);
         }
     }
@@ -143,16 +176,26 @@ impl<'a> Pictures<'a> {
     }
 
     /// The image of an inline picture run `raw` in `part`, as gpui will
-    /// decode it; `None` keeps the frame. Only a miss reads the package.
+    /// decode it; `None` keeps the frame. Only a miss reads the package, and
+    /// a miss whose bytes the stamp before held takes that image back.
     pub fn image(&self, part: &str, raw: &str) -> Option<Arc<Image>> {
         let rid = docxcore::image::inline_embed(raw)?;
         let key = (part.to_string(), rid);
         if let Some(hit) = self.cache.borrow().images.get(&key) {
             return hit.clone();
         }
-        let found = resolve(self.pkg, part, &key.1)
-            .and_then(|(ext, bytes)| Some(Arc::new(Image::from_bytes(format_of(ext)?, bytes))));
-        self.cache.borrow_mut().images.insert(key, found.clone());
+        let mut cache = self.cache.borrow_mut();
+        let old = cache.stale.remove(&key).flatten();
+        let found = resolve(self.pkg, part, &key.1).and_then(|(ext, bytes)| {
+            if let Some(old) = old.as_ref().filter(|o| o.bytes == bytes) {
+                return Some(old.clone());
+            }
+            Some(Arc::new(Image::from_bytes(format_of(ext)?, bytes)))
+        });
+        if let Some(old) = old.filter(|o| !found.as_ref().is_some_and(|f| Arc::ptr_eq(f, o))) {
+            cache.retired.push(old);
+        }
+        cache.images.insert(key, found.clone());
         found
     }
 }
@@ -416,5 +459,97 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert!(Arc::ptr_eq(&all[0], &second));
         assert!(cache.borrow_mut().take_released(true).is_empty());
+    }
+
+    #[test]
+    fn a_stamp_change_keeps_an_image_whose_bytes_did_not_change() {
+        let (mut pkg, header, body_rid, rid) = package();
+        let run = docxcore::image::inline_picture_run(&rid, 9525, 9525, 1, "a.png");
+        let cache = RefCell::<Cache>::default();
+        let first = Pictures::new(&pkg, &cache).image(&header, &run).unwrap();
+        // Another part changes: the header picture's bytes are the same.
+        add(&mut pkg, "word/document.xml", &png(5));
+        let again = Pictures::new(&pkg, &cache).image(&header, &run).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the decode is kept");
+        assert!(cache.borrow_mut().take_released(false).is_empty());
+        // A picture not drawn after two changes is retired.
+        let body = docxcore::image::inline_picture_run(&body_rid, 9525, 9525, 1, "b.png");
+        let gone = Pictures::new(&pkg, &cache)
+            .image("word/document.xml", &body)
+            .unwrap();
+        add(&mut pkg, "word/document.xml", &png(3));
+        Pictures::new(&pkg, &cache);
+        add(&mut pkg, "word/document.xml", &png(4));
+        Pictures::new(&pkg, &cache);
+        let retired = cache.borrow_mut().take_released(false);
+        assert!(retired.iter().any(|i| Arc::ptr_eq(i, &gone)));
+        assert!(retired.iter().any(|i| Arc::ptr_eq(i, &first)));
+    }
+
+    #[test]
+    fn an_image_another_cache_still_holds_is_not_released() {
+        let a = Arc::new(Image::from_bytes(ImageFormat::Png, png(1)));
+        let b = Arc::new(Image::from_bytes(ImageFormat::Png, png(2)));
+        let a_twin = Arc::new(Image::from_bytes(ImageFormat::Png, png(1)));
+        assert_eq!(a.id, a_twin.id, "gpui ids are the bytes' hash");
+        let live = [b.id].into_iter().collect();
+        let out = releasable(vec![a.clone(), b, a_twin], &live);
+        assert_eq!(out.len(), 1);
+        assert!(Arc::ptr_eq(&out[0], &a));
+    }
+
+    #[test]
+    fn an_svg_picture_brings_its_png_and_svg_media() {
+        let mut src = new_package(Document { body: vec![] });
+        let png_rid = add(&mut src, "word/document.xml", &png(1));
+        let svg_bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
+        let svg_rid = src
+            .add_part_image("word/document.xml", &svg_bytes, &SVG)
+            .expect("svg added");
+        let run = docxcore::image::inline_picture_run(&png_rid, 9525, 9525, 1, "a.png").replace(
+            &format!("<a:blip r:embed=\"{png_rid}\"/>"),
+            &format!("<a:blip r:embed=\"{png_rid}\"><a:extLst><a:ext uri=\"{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}\"><asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{svg_rid}\"/></a:ext></a:extLst></a:blip>"),
+        );
+        let copied = docxcore::editor::Clip {
+            paras: vec![vec![docxcore::model::Inline::Raw(run)]],
+        };
+        let media = capture(&src, "word/document.xml", &copied);
+        assert_eq!(media.len(), 2);
+        let (mut dst, header, _, _) = package();
+        let mut clip = copied.clone();
+        carry(&mut dst, &header, &media, &mut clip);
+        let rids = clip.inline_embeds();
+        assert_eq!(rids.len(), 2);
+        assert_eq!(rel_bytes(&dst, &header, &rids[0]), Some(png(1).as_slice()));
+        assert_eq!(
+            rel_bytes(&dst, &header, &rids[1]),
+            Some(svg_bytes.as_slice())
+        );
+        let ct = dst.part_text("[Content_Types].xml").unwrap();
+        assert!(ct.contains("image/svg+xml"), "{ct}");
+    }
+
+    #[test]
+    fn a_tab_that_saves_no_package_pastes_the_picture_as_it_was() {
+        let (src, _, body_rid, _) = package();
+        let copied = pic(&body_rid);
+        let media = capture(&src, "word/document.xml", &copied);
+        assert!(!media.is_empty());
+        let mut md = crate::blank_docx_tab("notes.md");
+        md.markdown = true;
+        let mut clip = copied.clone();
+        crate::carry_into_tab(&mut md, &media, &mut clip);
+        assert!(md.pkg.is_none());
+        assert_eq!(clip, copied);
+        // A new Word document is given a package holding the media.
+        let mut doc = crate::blank_docx_tab("Document1");
+        let mut clip = copied.clone();
+        crate::carry_into_tab(&mut doc, &media, &mut clip);
+        let pkg = doc.pkg.as_ref().expect("a package");
+        let rid = clip.inline_embeds().pop().unwrap();
+        assert_eq!(
+            resolve(pkg, "word/document.xml", &rid),
+            Some(("png", png(1)))
+        );
     }
 }

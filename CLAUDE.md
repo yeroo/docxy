@@ -1827,27 +1827,31 @@
 - `DocTab::pictures` keeps the `Arc<gpui::Image>`s per (part, rid) across
   frames, so only a miss reads, copies and hashes media. It is valid for one
   `Package::parts_stamp` (a fresh value from a process-wide counter on every
-  mutable access to the parts, equal in an unchanged clone): any package change
-  empties it, so a header edit re-reads that tab's pictures once. Decoded
-  images stay in gpui's asset cache for the process (no `remove_asset`).
-  A run whose rid is missing from its story's relationships (pasted from
-  another story keeps its source rid) keeps its frame.
+  mutable access to the parts, equal in an unchanged clone): a package change
+  starts a new map, and a miss whose bytes the map before held takes that
+  image back, so gpui keeps its decode (#1639). What two changes leave
+  undrawn is retired; `Docxy::render` releases retired images from gpui's
+  asset cache (`Image::remove_asset`), `close_tab_with` all of a closed
+  tab's, and a secondary window's close all of its tabs'. An image's gpui id
+  is its bytes' hash, so one a tab of the window still holds is kept
+  (`pictures::releasable`); a window's close may make another window decode
+  a shared picture again. The window's atlas tile is not freed (it goes with
+  the window). A reload in place hands the old cache to the fresh tab.
 - A document copy keeps its pictures' media (`DocClip::media`,
-  `pictures::capture`, read from the story part `tab_edit_target_part` names,
-  before a cut runs). A paste of the window's own clip runs `pictures::carry`
-  into the part it lands in: a rid that resolves there to the same bytes is
-  kept, else an image relationship of that part to identical bytes is taken,
-  else the media is added (`add_part_image`) and the run's `r:embed` rewritten
-  (`image::replace_inline_embed`, `Clip::remap_embeds`). So a paste in the same
-  story changes nothing and repeated pastes add one part. As Insert Picture,
-  the part is added outside the undo step: an undone paste leaves it. A tab
-  with no package gets one (`ensure_package`); a Markdown/text/RTF tab pastes
-  the rid as it was. Pictures in a tracked change or hyperlink are not carried.
-- `pictures::Cache` retires the images a stamp change drops; `Docxy::render`
-  releases them from gpui's asset cache (`Image::remove_asset`), and
-  `close_tab_with` releases all of a closed tab's. The window's atlas tile is
-  not freed (it goes with the window); a reload in place (`*tab = fresh`)
-  drops its cache unreleased.
+  `pictures::capture`, from the story part `tab_edit_target_part` names): the
+  blip's and any `asvg:svgBlip`'s inside it (`image::inline_embeds`; SVG is
+  added as `image/svg+xml`), in `Inline::Raw` and `Inline::SmartArt` runs at
+  the clip's top level (not inside a tracked change or a hyperlink). A paste
+  of the window's own clip runs `pictures::carry` into the part it lands in:
+  a rid that names the same bytes there is kept, else a relationship of that
+  part to identical bytes is taken, else the media is added
+  (`add_part_image`) and the rid rewritten (`image::replace_inline_embeds`,
+  `Clip::remap_embeds`). So a paste in the same story changes nothing and
+  repeated pastes add one part. As Insert Picture, the part is added outside
+  the undo step: an undone paste leaves it. A document with no package gets
+  one (`carry_into_tab`, `ensure_package`); a tab whose save writes none
+  (`saves_as_word`: Markdown, text, RTF) pastes the rids as they were. An
+  `a:hlinkClick` `r:id` on a picture is not carried (a hyperlink, not media).
 - Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
   the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
   no pictures, so there is no `.uit` case.

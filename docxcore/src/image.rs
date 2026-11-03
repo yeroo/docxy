@@ -148,29 +148,84 @@ fn picture_blip(raw: &str) -> Option<(usize, usize)> {
     Some((at, at + raw[at..].find('>')?))
 }
 
-/// `raw` with the `r:embed` of the blip [`inline_embed`] reads set to
-/// `rid` (#1639); every other attribute, an `r:link` included, is kept.
-/// `None` when `raw` is not such a picture.
-pub fn replace_inline_embed(raw: &str, rid: &str) -> Option<String> {
-    let old = inline_embed(raw)?;
-    let (at, end) = picture_blip(raw)?;
-    let tag = &raw[at..end];
-    for quote in ['"', '\''] {
-        let needle = format!("r:embed={quote}{old}{quote}");
-        if let Some(i) = tag
-            .match_indices(&needle)
-            .map(|(i, _)| i)
-            .find(|&i| i > 0 && tag.as_bytes()[i - 1].is_ascii_whitespace())
+/// Every `r:embed` an inline picture run names (#1639): its blip's
+/// ([`inline_embed`]), then each `asvg:svgBlip` inside that blip (Word's SVG
+/// picture keeps a PNG fallback in the blip and the SVG in the extension),
+/// each once. `a:hlinkClick`'s `r:id` is a hyperlink, not media: not listed.
+pub fn inline_embeds(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (at, end) in embed_tags(raw) {
+        if let Some(rid) =
+            crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|r| !r.is_empty())
         {
-            let start = at + i;
-            return Some(format!(
-                "{}r:embed={quote}{rid}{quote}{}",
-                &raw[..start],
-                &raw[start + needle.len()..]
-            ));
+            if !out.contains(&rid) {
+                out.push(rid);
+            }
         }
     }
-    None
+    out
+}
+
+/// `raw` with each `r:embed` [`inline_embeds`] lists renamed by `map` (a
+/// rid not in it is kept), every other attribute, `r:link` included, as it
+/// was. `None` when `raw` is not an inline picture.
+pub fn replace_inline_embeds(
+    raw: &str,
+    map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let tags = embed_tags(raw);
+    if tags.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut copied = 0;
+    for (at, end) in tags {
+        let tag = &raw[at..end];
+        let Some(old) = crate::load::xml_attr_value(tag, "r:embed") else {
+            continue;
+        };
+        let Some(new) = map.get(&old) else {
+            continue;
+        };
+        for quote in ['"', '\''] {
+            let needle = format!("r:embed={quote}{old}{quote}");
+            if let Some(i) = tag
+                .match_indices(&needle)
+                .map(|(i, _)| i)
+                .find(|&i| i > 0 && tag.as_bytes()[i - 1].is_ascii_whitespace())
+            {
+                out.push_str(&raw[copied..at + i]);
+                out.push_str(&format!("r:embed={quote}{new}{quote}"));
+                copied = at + i + needle.len();
+                break;
+            }
+        }
+    }
+    out.push_str(&raw[copied..]);
+    Some(out)
+}
+
+/// The start tags holding an inline picture's media rids: its blip and the
+/// `asvg:svgBlip`s inside it, in order (`raw[at..end]`, `end` at `>`).
+fn embed_tags(raw: &str) -> Vec<(usize, usize)> {
+    let Some((at, end)) = picture_blip(raw) else {
+        return Vec::new();
+    };
+    let mut tags = vec![(at, end)];
+    if raw[..end].ends_with('/') {
+        return tags;
+    }
+    let close = raw[end..].find("</a:blip>").map_or(raw.len(), |i| end + i);
+    let mut from = end;
+    while let Some(i) = raw[from..close].find("<asvg:svgBlip") {
+        let s = from + i;
+        let Some(e) = raw[s..close].find('>').map(|j| s + j) else {
+            break;
+        };
+        tags.push((s, e));
+        from = e;
+    }
+    tags
 }
 
 fn be16(b: &[u8], at: usize) -> Option<u32> {
@@ -421,9 +476,16 @@ mod tests {
     }
 
     #[test]
-    fn replace_inline_embed_rewrites_only_the_blip_embed() {
+    fn replace_inline_embeds_rewrites_only_the_blip_embeds() {
+        let map = |pairs: &[(&str, &str)]| -> std::collections::HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
         let run = inline_picture_run("rId7", 952_500, 476_250, 3, "a.png");
-        let out = replace_inline_embed(&run, "rId12").expect("a picture");
+        assert_eq!(inline_embeds(&run), vec!["rId7".to_string()]);
+        let out = replace_inline_embeds(&run, &map(&[("rId7", "rId12")])).expect("a picture");
         assert_eq!(inline_embed(&out).as_deref(), Some("rId12"));
         assert_eq!(out.replace("rId12", "rId7"), run);
         // r:link (and a longer attribute ending in r:embed) stay as they are.
@@ -432,12 +494,32 @@ mod tests {
             "r:link=\"rId7\" xr:embed=\"rId7\" r:embed=\"rId7\"",
         );
         assert_ne!(linked, run);
-        let out = replace_inline_embed(&linked, "rId9").expect("a picture");
+        let out = replace_inline_embeds(&linked, &map(&[("rId7", "rId9")])).expect("a picture");
         assert!(
             out.contains("r:link=\"rId7\" xr:embed=\"rId7\" r:embed=\"rId9\""),
             "{out}"
         );
-        assert_eq!(replace_inline_embed("<w:r><w:ptab/></w:r>", "rId1"), None);
+        assert_eq!(
+            replace_inline_embeds("<w:r><w:ptab/></w:r>", &map(&[])),
+            None
+        );
+        // Word's SVG picture: the PNG blip and the svgBlip inside it.
+        let svg = run.replace(
+            "<a:blip r:embed=\"rId7\"/>",
+            "<a:blip r:embed=\"rId7\"><a:extLst><a:ext uri=\"{96DAC541-7B7A-43D3-8B79-37D633B846F1}\"><asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"rId8\"/></a:ext></a:extLst></a:blip>",
+        );
+        assert_ne!(svg, run);
+        assert_eq!(
+            inline_embeds(&svg),
+            vec!["rId7".to_string(), "rId8".to_string()]
+        );
+        let out =
+            replace_inline_embeds(&svg, &map(&[("rId7", "rId20"), ("rId8", "rId21")])).unwrap();
+        assert_eq!(
+            inline_embeds(&out),
+            vec!["rId20".to_string(), "rId21".to_string()]
+        );
+        assert_eq!(out.replace("rId20", "rId7").replace("rId21", "rId8"), svg);
     }
 
     #[test]

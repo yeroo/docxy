@@ -144,6 +144,14 @@ impl RevisionLocation {
     }
 }
 
+/// The run XML of an inline that may be a picture (#1639).
+fn picture_raw(inl: &Inline) -> Option<&str> {
+    match inl {
+        Inline::Raw(raw) | Inline::SmartArt { raw, .. } => Some(raw),
+        _ => None,
+    }
+}
+
 /// Clipboard contents: styled inline content, one entry per (partial) paragraph.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Clip {
@@ -151,34 +159,34 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// The `r:embed` rids of the inline pictures among the clip's top-level
-    /// runs ([`crate::image::inline_embed`]), each once, in order (#1639).
+    /// The media rids of the inline pictures among the clip's top-level
+    /// runs and SmartArt drawings ([`crate::image::inline_embeds`]: blip and
+    /// SVG blip), each once, in order (#1639).
     pub fn inline_embeds(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for inl in self.paras.iter().flatten() {
-            if let Inline::Raw(raw) = inl {
-                if let Some(rid) = crate::image::inline_embed(raw) {
-                    if !out.contains(&rid) {
-                        out.push(rid);
-                    }
+        for raw in self.paras.iter().flatten().filter_map(picture_raw) {
+            for rid in crate::image::inline_embeds(raw) {
+                if !out.contains(&rid) {
+                    out.push(rid);
                 }
             }
         }
         out
     }
 
-    /// The clip with each inline picture's `r:embed` renamed by `map`; a rid
-    /// not in it is kept (#1639).
+    /// The clip with each inline picture's media rids renamed by `map`; a
+    /// rid not in it is kept (#1639).
     pub fn remap_embeds(&mut self, map: &std::collections::HashMap<String, String>) {
+        if map.is_empty() {
+            return;
+        }
         for inl in self.paras.iter_mut().flatten() {
-            if let Inline::Raw(raw) = inl {
-                let Some(new) = crate::image::inline_embed(raw).and_then(|rid| map.get(&rid))
-                else {
-                    continue;
-                };
-                if let Some(out) = crate::image::replace_inline_embed(raw, new) {
-                    *raw = out;
-                }
+            let raw = match inl {
+                Inline::Raw(raw) | Inline::SmartArt { raw, .. } => raw,
+                _ => continue,
+            };
+            if let Some(out) = crate::image::replace_inline_embeds(raw, map) {
+                *raw = out;
             }
         }
     }

@@ -236,6 +236,25 @@ fn tab_edit_target_part(tab: &DocTab) -> &str {
         .map_or("word/document.xml", |hf| hf.part_name.as_str())
 }
 
+/// [`pictures::carry`] `clip`'s pictures into the story `tab` edits
+/// (#1639). A document without a package is given one; a tab whose save
+/// writes none ([`DocTab::saves_as_word`]) is left alone, the clip too.
+fn carry_into_tab(tab: &mut DocTab, media: &pictures::Media, clip: &mut Clip) {
+    if media.is_empty() || !tab.saves_as_word() || tab_edit_target_ref(tab).is_none() {
+        return;
+    }
+    if !clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
+        return;
+    }
+    if tab.ensure_package().is_err() {
+        return;
+    }
+    let part = tab_edit_target_part(tab).to_string();
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pictures::carry(pkg, &part, media, clip);
+    }
+}
+
 /// [`tab_edit_target`], to read.
 fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
     if let Some(hf) = tab.hf_edit.as_ref() {
@@ -24542,20 +24561,6 @@ impl Docxy {
         if cut && self.protected_refused(cx) {
             return self.refocus(window, cx);
         }
-        // The pictures' media is read before a cut runs (#1639); a cut does
-        // not touch the package, but the selection it reads is gone after.
-        let media = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| {
-                let clip = tab_edit_target_ref(t)?.copy()?;
-                Some(pictures::capture(
-                    t.pkg.as_ref()?,
-                    tab_edit_target_part(t),
-                    &clip,
-                ))
-            })
-            .unwrap_or_default();
         let clip = self.edit_target().and_then(|ed| {
             if !cut {
                 return ed.copy();
@@ -24565,6 +24570,18 @@ impl Docxy {
             clip
         });
         if let Some(clip) = clip {
+            // The pictures' media (#1639): a cut leaves the package as it was.
+            let media = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| {
+                    Some(pictures::capture(
+                        t.pkg.as_ref()?,
+                        tab_edit_target_part(t),
+                        &clip,
+                    ))
+                })
+                .unwrap_or_default();
             let pkg = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref());
             let plain = clip.to_text();
             let rtf = (!plain.is_empty())
@@ -24604,7 +24621,8 @@ impl Docxy {
     /// Make a paste of the window's own clip name its pictures' media in
     /// the story it lands in (#1639, [`pictures::carry`]). A tab without a
     /// package gets one first, as Info's fields do; a tab whose save writes
-    /// none (Markdown, text, RTF) pastes the clip as it is.
+    /// none (Markdown, text, RTF: [`DocTab::saves_as_word`]) pastes the clip
+    /// as it is.
     fn carry_pictures(&mut self, clip: &mut Clip) {
         let Some(media) = self.clip.as_ref().map(|c| &c.media) else {
             return;
@@ -24612,15 +24630,44 @@ impl Docxy {
         if media.is_empty() || !clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
             return;
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        if !matches!(tab.surface, Surface::Doc(_)) || tab.ensure_package().is_err() {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            carry_into_tab(tab, media, clip);
+        }
+    }
+
+    /// Release decoded pictures from gpui's asset cache (#1639): every
+    /// tab's retired ones, and all of `going`'s (a closed tab), keeping any
+    /// image a tab of this window may still draw ([`pictures::releasable`]).
+    /// The window's atlas tiles go with the window.
+    fn release_pictures(&mut self, going: Option<&DocTab>, cx: &mut App) {
+        let mut taken =
+            going.map_or_else(Vec::new, |t| t.pictures.borrow_mut().take_released(true));
+        for tab in &self.tabs {
+            taken.extend(tab.pictures.borrow_mut().take_released(false));
+        }
+        if taken.is_empty() {
             return;
         }
-        let part = tab_edit_target_part(tab).to_string();
-        if let Some(pkg) = tab.pkg.as_mut() {
-            pictures::carry(pkg, &part, media, clip);
+        let live = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.pictures.borrow().live_ids().collect::<Vec<_>>())
+            .collect();
+        for img in pictures::releasable(taken, &live) {
+            img.remove_asset(cx);
+        }
+    }
+
+    /// The window is going: every tab's pictures leave gpui's asset cache.
+    /// Another window drawing the same bytes decodes them again.
+    fn release_all_pictures(&mut self, cx: &mut App) {
+        let taken: Vec<_> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.pictures.borrow_mut().take_released(true))
+            .collect();
+        for img in pictures::releasable(taken, &Default::default()) {
+            img.remove_asset(cx);
         }
     }
 
@@ -39734,9 +39781,7 @@ impl Render for Docxy {
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
         // Pictures a package change replaced leave gpui's asset cache (#1639).
-        for tab in &self.tabs {
-            tab.pictures.borrow_mut().release_retired(cx);
-        }
+        self.release_pictures(None, cx);
         land_status(
             &mut self.pending_status,
             self.tabs.get_mut(self.active).map(|t| &mut t.status),
