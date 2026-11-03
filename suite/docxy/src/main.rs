@@ -255,6 +255,17 @@ fn carry_into_tab(tab: &mut DocTab, media: &pictures::Media, clip: &mut Clip) {
     }
 }
 
+impl DocTab {
+    /// Become `fresh`, a reload of this tab's file (Reopen, the reload
+    /// dialog, recovery). The pictures it drew carry over: an unchanged one
+    /// keeps its decode, the rest are retired by the next package change or
+    /// released at close (#1639).
+    pub(crate) fn replace_in_place(&mut self, mut fresh: DocTab) {
+        fresh.pictures = std::mem::take(&mut self.pictures);
+        *self = fresh;
+    }
+}
+
 /// [`tab_edit_target`], to read.
 fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
     if let Some(hf) = tab.hf_edit.as_ref() {
@@ -24279,12 +24290,8 @@ impl Docxy {
         let tab = &self.tabs[i];
         let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
-                let mut fresh = tab_from_path_mode(&path, mode, &trusted)?;
-                // Its pictures carry over: an unchanged one keeps its decode,
-                // the rest are retired by the next package change or
-                // released at close (#1639).
-                fresh.pictures = std::mem::take(&mut self.tabs[i].pictures);
-                self.tabs[i] = fresh;
+                let fresh = tab_from_path_mode(&path, mode, &trusted)?;
+                self.tabs[i].replace_in_place(fresh);
                 // Nor a flyout opened on the document it replaces (#1020).
                 self.ribbon_flyout = None;
                 // A reloaded tab has none of the last Remove All's edits.
@@ -24614,23 +24621,17 @@ impl Docxy {
         let rtf = self.clipboard_read_rtf();
         let clip = doc_paste_clip(self.clip.as_ref(), &now, rtf.as_deref());
         if let Some(mut clip) = clip {
-            if self.clip.as_ref().is_some_and(|ours| ours.clip == clip) {
-                self.carry_pictures(&mut clip);
+            // The window's own clip carries its pictures' media (#1639).
+            let ours = self
+                .clip
+                .as_ref()
+                .filter(|ours| doc_clip_ours(ours, &now, rtf.is_some()));
+            if let (Some(ours), Some(tab)) = (ours, self.tabs.get_mut(self.active)) {
+                carry_into_tab(tab, &ours.media, &mut clip);
             }
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
             self.refocus(window, cx);
-        }
-    }
-
-    /// Make a paste of the window's own clip name its pictures' media in
-    /// the story it lands in (#1639, [`pictures::carry`]). A tab without a
-    /// package gets one first, as Info's fields do; a tab whose save writes
-    /// none (Markdown, text, RTF: [`DocTab::saves_as_word`]) pastes the clip
-    /// as it is.
-    fn carry_pictures(&mut self, clip: &mut Clip) {
-        if let (Some(ours), Some(tab)) = (self.clip.as_ref(), self.tabs.get_mut(self.active)) {
-            carry_into_tab(tab, &ours.media, clip);
         }
     }
 

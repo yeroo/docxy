@@ -1417,6 +1417,25 @@ impl Package {
     /// the package: relative to the folder of `part`, a leading `/` from the
     /// package root, `..` and `.` resolved. `None` for an unknown id, an
     /// external target, one that climbs out of the package or a malformed one.
+    /// Every relationship of `part` with the package part it names, as
+    /// [`Package::part_rel_target`] resolves it (`None` for an external or
+    /// unresolvable target), sorted by id; the rels are read once (#1639).
+    pub fn part_rel_targets(&self, part: &str) -> Vec<(String, Option<String>)> {
+        let rels = self.part_rels(part);
+        let dir = part.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let mut out: Vec<(String, Option<String>)> = rels
+            .iter()
+            .map(|(id, target, external)| {
+                let name = (!external)
+                    .then(|| resolve_relationship_target(dir, target))
+                    .flatten();
+                (id.to_string(), name)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     pub fn part_rel_target(&self, part: &str, rid: &str) -> Option<String> {
         let rels = self.part_rels(part);
         let (_, target, external) = rels.iter().find(|(id, _, _)| *id == rid)?;
@@ -7455,6 +7474,20 @@ mod tests {
         assert_eq!(pkg.part("word/media/image3.jpeg").unwrap(), b"NEXT");
         pkg.add_media_part(b"PNG", "png");
         assert_eq!(pkg.part("word/media/image4.png").unwrap(), b"PNG");
+    }
+
+    #[test]
+    fn part_rel_targets_resolve_each_relationship_once_1639() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let rid = pkg
+            .add_part_media("word/document.xml", b"emf bytes", "emf", "image/x-emf")
+            .unwrap();
+        let all = pkg.part_rel_targets("word/document.xml");
+        let mine = all.iter().find(|(id, _)| *id == rid).expect("listed");
+        assert_eq!(mine.1, pkg.part_rel_target("word/document.xml", &rid));
+        for (id, name) in &all {
+            assert_eq!(*name, pkg.part_rel_target("word/document.xml", id), "{id}");
+        }
     }
 
     #[test]

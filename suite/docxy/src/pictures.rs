@@ -105,18 +105,18 @@ pub struct MediaPart {
     pub bytes: Vec<u8>,
 }
 
-/// Make gpui forget `imgs` (#1639): with the window at hand, each one's
-/// sprite-atlas tile first (gpui gives every decode a fresh `ImageId`, so a
-/// tile left behind is never reused), then the decode in the asset cache.
-/// `get_render_image` returns the decode already cached; every image here
-/// was handed to `img` when it was drawn, so this starts no new decode.
-/// Without a window (it is going) only the decode is dropped: the window's
-/// atlas goes with it.
+/// Make gpui forget `imgs` (#1639). With a window at hand, each one's
+/// sprite-atlas tile goes first, from every window (`App::drop_image`; gpui
+/// gives every decode a fresh `ImageId`, so a tile left behind is never
+/// reused), then the decode in the asset cache. `get_render_image` returns
+/// the decode already cached; every image here was handed to `img` when it
+/// was drawn, so this starts no new decode. Without a window (a closing
+/// window's quit answers) only the decodes are dropped: no tile is.
 pub fn forget(imgs: Vec<Arc<Image>>, mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) {
     for img in imgs {
         if let Some(window) = window.as_deref_mut() {
             if let Some(render) = img.clone().get_render_image(window, cx) {
-                let _ = window.drop_image(render);
+                cx.drop_image(render, Some(window));
             }
         }
         img.remove_asset(cx);
@@ -129,6 +129,7 @@ pub fn forget(imgs: Vec<Arc<Image>>, mut window: Option<&mut gpui::Window>, cx: 
 pub type Media = HashMap<String, MediaPart>;
 
 /// The bytes behind `rid` in `part`'s relationships, whatever they are.
+#[cfg(test)]
 fn rel_bytes<'p>(pkg: &'p Package, part: &str, rid: &str) -> Option<&'p [u8]> {
     pkg.part(&pkg.part_rel_target(part, rid)?)
 }
@@ -171,25 +172,29 @@ pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Medi
 /// ([`Package::add_part_media`], outside any undo step, as Insert Picture
 /// does). A rid with no media, or media the part cannot take, is kept.
 pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::editor::Clip) {
+    // The part's relationships, read once; an added one joins the list.
+    let mut rels = dst.part_rel_targets(part);
     let mut map = HashMap::new();
     for rid in clip.inline_embeds() {
         let Some(m) = media.get(&rid) else {
             continue;
         };
-        let bytes = &m.bytes;
-        let same = |dst: &Package, r: &str| rel_bytes(dst, part, r) == Some(bytes.as_slice());
-        if same(dst, &rid) {
+        let same = |dst: &Package, name: &Option<String>| {
+            name.as_deref().and_then(|n| dst.part(n)) == Some(m.bytes.as_slice())
+        };
+        if rels.iter().any(|(id, name)| *id == rid && same(dst, name)) {
             continue;
         }
-        let found = dst
-            .part_rels(part)
-            .ids()
-            .into_iter()
-            .find(|id| same(dst, id))
-            .map(str::to_string);
-        if let Some(new) =
-            found.or_else(|| dst.add_part_media(part, bytes, &m.ext, &m.content_type))
-        {
+        let found = rels
+            .iter()
+            .find(|(_, name)| same(dst, name))
+            .map(|(id, _)| id.clone());
+        let new = found.or_else(|| {
+            let new = dst.add_part_media(part, &m.bytes, &m.ext, &m.content_type)?;
+            rels.push((new.clone(), dst.part_rel_target(part, &new)));
+            Some(new)
+        });
+        if let Some(new) = new {
             map.insert(rid, new);
         }
     }

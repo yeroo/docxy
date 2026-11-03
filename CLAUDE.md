@@ -1837,10 +1837,11 @@
   window's tab still holds is kept (`pictures::releasable`, the other
   windows read through `windows::entries_snapshot`; the updating window is
   its own `self`). With a window at hand (render, tab close) the image's
-  atlas tile is dropped first (`pictures::forget`: `get_render_image`
-  returns gpui's cached decode, then `Window::drop_image`), as every decode
-  gets a fresh `ImageId` and an orphan tile is never reused; a closing
-  window drops the decodes only, its atlas going with it. A reload in place (Reopen, the reload dialog, recovery) hands
+  atlas tile is dropped first, from every window (`pictures::forget`:
+  `get_render_image` returns gpui's cached decode, then `App::drop_image`),
+  as every decode gets a fresh `ImageId` and an orphan tile is never reused;
+  a closing window's quit answers have no window, so only the decodes are
+  dropped there (no tile), its own atlas going with it. A reload in place (Reopen, the reload dialog, recovery) hands
   the old cache to the fresh tab.
 - A document copy keeps its pictures' media (`DocClip::media`,
   `pictures::capture`, from the story part `tab_edit_target_part` names): the
@@ -1853,7 +1854,8 @@
   the clip's top level (not inside a tracked change or a hyperlink). A paste
   of the window's own clip runs `pictures::carry` into the part it lands in:
   a rid that names the same bytes there is kept, else a relationship of that
-  part to identical bytes is taken, else the media is added
+  part to identical bytes is taken (`Package::part_rel_targets`, the rels
+  read once per paste), else the media is added
   (`add_part_media`) and the rid rewritten (`image::replace_inline_embeds`,
   `Clip::remap_embeds`). So a paste in the same story changes nothing and
   repeated pastes add one part. As Insert Picture, the part is added outside
