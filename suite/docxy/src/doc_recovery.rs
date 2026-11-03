@@ -226,7 +226,8 @@ pub(crate) fn apply(
             }
         }
         fresh.status = ORIGINAL_OPENED.into();
-        // Its pictures carry over, released at the next render (#1639).
+        // Its pictures carry over: an unchanged one keeps its decode, the rest
+        // are retired by the next package change or released at close (#1639).
         fresh.pictures = std::mem::take(&mut tab.pictures);
         *tab = fresh;
         out.replaced.push(*index);

@@ -1832,15 +1832,20 @@
   image back, so gpui keeps its decode (#1639). What two changes leave
   undrawn is retired; `Docxy::render` releases retired images from gpui's
   asset cache (`Image::remove_asset`), `close_tab_with` all of a closed
-  tab's, and a secondary window's close all of its tabs'. An image's gpui id
-  is its bytes' hash, so one a tab of the window still holds is kept
-  (`pictures::releasable`); a window's close may make another window decode
-  a shared picture again. The window's atlas tile is not freed (it goes with
-  the window). A reload in place hands the old cache to the fresh tab.
+  tab's, and a closing window (its quit answers, before Don't Save drops
+  tabs) all of its tabs'. An image's gpui id is its bytes' hash, so one any
+  window's tab still holds is kept (`pictures::releasable`, the other
+  windows read through `windows::entries_snapshot`; the updating window is
+  its own `self`). The window's atlas tile is not freed (it goes with the
+  window). A reload in place (Reopen, the reload dialog, recovery) hands
+  the old cache to the fresh tab.
 - A document copy keeps its pictures' media (`DocClip::media`,
   `pictures::capture`, from the story part `tab_edit_target_part` names): the
-  blip's and any `asvg:svgBlip`'s inside it (`image::inline_embeds`; SVG is
-  added as `image/svg+xml`), in `Inline::Raw` and `Inline::SmartArt` runs at
+  blip's and any `asvg:svgBlip`'s inside it (`image::inline_embeds`), any kind
+  of media (EMF, WMF, TIFF, SVG too: the part name's extension, the content
+  type from the source's `[Content_Types].xml`, else
+  `image::media_content_type`, else the bytes; `Package::add_part_media`
+  writes it), in `Inline::Raw` and `Inline::SmartArt` runs at
   the clip's top level (not inside a tracked change or a hyperlink). A paste
   of the window's own clip runs `pictures::carry` into the part it lands in:
   a rid that names the same bytes there is kept, else a relationship of that

@@ -148,6 +148,22 @@ fn picture_blip(raw: &str) -> Option<(usize, usize)> {
     Some((at, at + raw[at..].find('>')?))
 }
 
+/// The content type of a picture part by its extension (any letter case),
+/// for media whose package declares none (#1639).
+pub fn media_content_type(ext: &str) -> Option<&'static str> {
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" | "jpe" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "emf" => "image/x-emf",
+        "wmf" => "image/x-wmf",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    })
+}
+
 /// Every `r:embed` an inline picture run names (#1639): its blip's
 /// ([`inline_embed`]), then each `asvg:svgBlip` inside that blip (Word's SVG
 /// picture keeps a PNG fallback in the blip and the SVG in the extension),

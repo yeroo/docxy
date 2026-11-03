@@ -1426,6 +1426,29 @@ impl Package {
         resolve_relationship_target(part.rsplit_once('/').map_or("", |(dir, _)| dir), target)
     }
 
+    /// The content type `[Content_Types].xml` gives part `name` (no
+    /// leading `/`): its `Override`, else the `Default` for its extension
+    /// (any letter case) (#1639).
+    pub fn part_content_type(&self, name: &str) -> Option<String> {
+        let ct = decode_xml_part(self.part("[Content_Types].xml")?)?.into_owned();
+        let wanted = format!("/{name}");
+        let over = start_tags(&ct, "Override").into_iter().find_map(|(_, el)| {
+            xml_attr_value(el, "PartName")
+                .is_some_and(|p| p.eq_ignore_ascii_case(&wanted))
+                .then(|| xml_attr_value(el, "ContentType"))
+                .flatten()
+        });
+        over.or_else(|| {
+            let ext = name.rsplit_once('.')?.1;
+            start_tags(&ct, "Default").into_iter().find_map(|(_, el)| {
+                xml_attr_value(el, "Extension")
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+                    .then(|| xml_attr_value(el, "ContentType"))
+                    .flatten()
+            })
+        })
+    }
+
     /// The raw bytes of a part by name.
     pub fn part(&self, name: &str) -> Option<&[u8]> {
         self.parts
@@ -2592,6 +2615,24 @@ impl Package {
         bytes: &[u8],
         kind: &crate::image::ImageInfo,
     ) -> Option<String> {
+        self.add_part_media(part, bytes, kind.ext, kind.content_type)
+    }
+
+    /// [`Package::add_part_image`] for media of any kind (#1639): `ext`
+    /// names the new part (`word/media/imageN.<ext>`) and, when no
+    /// `Default` declares the extension, `content_type` is declared for it.
+    /// `None` also for an `ext` that is empty or not plain ASCII
+    /// alphanumerics.
+    pub fn add_part_media(
+        &mut self,
+        part: &str,
+        bytes: &[u8],
+        ext: &str,
+        content_type: &str,
+    ) -> Option<String> {
+        if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
         const IMAGE_REL: &str =
             "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image";
         self.part(part)?;
@@ -2607,14 +2648,15 @@ impl Package {
         let ct_bytes = self.part("[Content_Types].xml")?;
         let ct = decode_xml_part(ct_bytes)?.into_owned();
         let declared = start_tags(&ct, "Default").into_iter().any(|(_, el)| {
-            xml_attr_value(el, "Extension").is_some_and(|e| e.eq_ignore_ascii_case(kind.ext))
+            xml_attr_value(el, "Extension").is_some_and(|e| e.eq_ignore_ascii_case(ext))
         });
         let ct_updated = if declared {
             None
         } else {
             let default = format!(
                 "<Default Extension=\"{}\" ContentType=\"{}\"/>",
-                kind.ext, kind.content_type
+                esc_xml_attr(ext),
+                esc_xml_attr(content_type)
             );
             Some(encode_like(
                 ct_bytes,
@@ -2623,7 +2665,7 @@ impl Package {
         };
 
         let n = self.unused_media_number();
-        let target = format!("image{n}.{}", kind.ext);
+        let target = format!("image{n}.{ext}");
         // The target is relative to the part's folder; every story part
         // lives in `word/`, beside `media/`.
         let rel_target = match part.strip_prefix("word/") {
@@ -7347,6 +7389,35 @@ mod tests {
     /// #768: a picture in a header is related from the header's own rels,
     /// created when it has none, never from `document.xml.rels`; a JPEG
     /// declares `image/jpeg` once, whatever letter case a Default has.
+    #[test]
+    fn add_part_media_takes_any_extension_and_declares_its_type_1639() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let rid = pkg
+            .add_part_media("word/document.xml", b"   emf", "emf", "image/x-emf")
+            .expect("added");
+        let target = pkg.part_rel_target("word/document.xml", &rid).unwrap();
+        assert!(target.ends_with(".emf"), "{target}");
+        assert_eq!(pkg.part(&target), Some(&b"   emf"[..]));
+        assert_eq!(
+            pkg.part_content_type(&target).as_deref(),
+            Some("image/x-emf")
+        );
+        assert_eq!(
+            pkg.part_content_type("word/document.xml").as_deref(),
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            )
+        );
+        assert_eq!(
+            pkg.add_part_media("word/document.xml", b"x", "", "a/b"),
+            None
+        );
+        assert_eq!(
+            pkg.add_part_media("word/document.xml", b"x", "a\"b", "a/b"),
+            None
+        );
+    }
+
     #[test]
     fn add_part_image_relates_from_the_parts_own_rels() {
         let mut pkg = new_package(Document { body: vec![] });

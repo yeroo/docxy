@@ -24279,7 +24279,12 @@ impl Docxy {
         let tab = &self.tabs[i];
         let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
-                self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
+                let mut fresh = tab_from_path_mode(&path, mode, &trusted)?;
+                // Its pictures carry over: an unchanged one keeps its decode,
+                // the rest are retired by the next package change or
+                // released at close (#1639).
+                fresh.pictures = std::mem::take(&mut self.tabs[i].pictures);
+                self.tabs[i] = fresh;
                 // Nor a flyout opened on the document it replaces (#1020).
                 self.ribbon_flyout = None;
                 // A reloaded tab has none of the last Remove All's edits.
@@ -24624,20 +24629,14 @@ impl Docxy {
     /// none (Markdown, text, RTF: [`DocTab::saves_as_word`]) pastes the clip
     /// as it is.
     fn carry_pictures(&mut self, clip: &mut Clip) {
-        let Some(media) = self.clip.as_ref().map(|c| &c.media) else {
-            return;
-        };
-        if media.is_empty() || !clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
-            return;
-        }
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            carry_into_tab(tab, media, clip);
+        if let (Some(ours), Some(tab)) = (self.clip.as_ref(), self.tabs.get_mut(self.active)) {
+            carry_into_tab(tab, &ours.media, clip);
         }
     }
 
     /// Release decoded pictures from gpui's asset cache (#1639): every
     /// tab's retired ones, and all of `going`'s (a closed tab), keeping any
-    /// image a tab of this window may still draw ([`pictures::releasable`]).
+    /// image a tab of any window may still draw ([`pictures::releasable`]).
     /// The window's atlas tiles go with the window.
     fn release_pictures(&mut self, going: Option<&DocTab>, cx: &mut App) {
         let mut taken =
@@ -24648,27 +24647,48 @@ impl Docxy {
         if taken.is_empty() {
             return;
         }
-        let live = self
-            .tabs
-            .iter()
-            .flat_map(|t| t.pictures.borrow().live_ids().collect::<Vec<_>>())
-            .collect();
+        let mut live = self.other_windows_picture_ids(cx);
+        for tab in &self.tabs {
+            live.extend(tab.pictures.borrow().live_ids());
+        }
         for img in pictures::releasable(taken, &live) {
             img.remove_asset(cx);
         }
     }
 
-    /// The window is going: every tab's pictures leave gpui's asset cache.
-    /// Another window drawing the same bytes decodes them again.
+    /// The window is going: every tab's pictures leave gpui's asset cache,
+    /// except those another window still holds.
     fn release_all_pictures(&mut self, cx: &mut App) {
         let taken: Vec<_> = self
             .tabs
             .iter()
             .flat_map(|t| t.pictures.borrow_mut().take_released(true))
             .collect();
-        for img in pictures::releasable(taken, &Default::default()) {
+        if taken.is_empty() {
+            return;
+        }
+        let live = self.other_windows_picture_ids(cx);
+        for img in pictures::releasable(taken, &live) {
             img.remove_asset(cx);
         }
+    }
+
+    /// The gpui ids of the pictures the other windows' tabs may still draw.
+    /// This window's own entity is being updated and is skipped, as is any
+    /// other that cannot be read now.
+    fn other_windows_picture_ids(&self, cx: &App) -> std::collections::HashSet<u64> {
+        let mut live = std::collections::HashSet::new();
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            if let Some(other) = view.upgrade() {
+                for tab in &other.read(cx).tabs {
+                    live.extend(tab.pictures.borrow().live_ids());
+                }
+            }
+        }
+        live
     }
 
     // ---- find & replace ----------------------------------------------------

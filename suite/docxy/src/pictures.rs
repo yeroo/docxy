@@ -96,30 +96,46 @@ pub fn releasable(
         .collect()
 }
 
+/// One media part a copy's picture names (#1639): its extension, content
+/// type and bytes, as the source package has them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaPart {
+    pub ext: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 /// The media a copy's inline pictures name, by rid, read from the story part
 /// they were copied from (#1639): what a paste into another story or package
 /// re-adds there. A rid that does not resolve is left out.
-pub type Media = HashMap<String, (docxcore::image::ImageInfo, Vec<u8>)>;
-
-/// An SVG picture's kind: [`docxcore::image::sniff`] reads raster images
-/// only, and an `asvg:svgBlip` names an SVG part.
-const SVG: docxcore::image::ImageInfo = docxcore::image::ImageInfo {
-    ext: "svg",
-    content_type: "image/svg+xml",
-    width: 0,
-    height: 0,
-};
+pub type Media = HashMap<String, MediaPart>;
 
 /// The bytes behind `rid` in `part`'s relationships, whatever they are.
 fn rel_bytes<'p>(pkg: &'p Package, part: &str, rid: &str) -> Option<&'p [u8]> {
     pkg.part(&pkg.part_rel_target(part, rid)?)
 }
 
-/// What the media of a picture rid is: a raster image, or an SVG.
-fn media_kind(bytes: &[u8]) -> Option<docxcore::image::ImageInfo> {
-    docxcore::image::sniff(bytes).or_else(|| {
-        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
-        head.contains("<svg").then_some(SVG)
+/// The media part behind `rid` in `part`: any kind (EMF, WMF, TIFF, SVG
+/// as well as what the view draws). The extension is the part name's, the
+/// content type the package's, else by extension, else by the bytes.
+fn media_part(pkg: &Package, part: &str, rid: &str) -> Option<MediaPart> {
+    let target = pkg.part_rel_target(part, rid)?;
+    let bytes = pkg.part(&target)?;
+    let sniffed = docxcore::image::sniff(bytes);
+    let name = target.rsplit('/').next().unwrap_or(&target);
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .or_else(|| sniffed.map(|k| k.ext.to_string()))?;
+    let content_type = pkg
+        .part_content_type(&target)
+        .or_else(|| docxcore::image::media_content_type(&ext).map(str::to_string))
+        .or_else(|| sniffed.map(|k| k.content_type.to_string()))?;
+    Some(MediaPart {
+        ext,
+        content_type,
+        bytes: bytes.to_vec(),
     })
 }
 
@@ -127,10 +143,7 @@ fn media_kind(bytes: &[u8]) -> Option<docxcore::image::ImageInfo> {
 pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Media {
     clip.inline_embeds()
         .into_iter()
-        .filter_map(|rid| {
-            let bytes = rel_bytes(pkg, part, &rid)?;
-            Some((rid, (media_kind(bytes)?, bytes.to_vec())))
-        })
+        .filter_map(|rid| Some((rid.clone(), media_part(pkg, part, &rid)?)))
         .collect()
 }
 
@@ -142,9 +155,10 @@ pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Medi
 pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::editor::Clip) {
     let mut map = HashMap::new();
     for rid in clip.inline_embeds() {
-        let Some((kind, bytes)) = media.get(&rid) else {
+        let Some(m) = media.get(&rid) else {
             continue;
         };
+        let bytes = &m.bytes;
         let same = |dst: &Package, r: &str| rel_bytes(dst, part, r) == Some(bytes.as_slice());
         if same(dst, &rid) {
             continue;
@@ -155,7 +169,9 @@ pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::
             .into_iter()
             .find(|id| same(dst, id))
             .map(str::to_string);
-        if let Some(new) = found.or_else(|| dst.add_part_image(part, bytes, kind)) {
+        if let Some(new) =
+            found.or_else(|| dst.add_part_media(part, bytes, &m.ext, &m.content_type))
+        {
             map.insert(rid, new);
         }
     }
@@ -504,7 +520,7 @@ mod tests {
         let png_rid = add(&mut src, "word/document.xml", &png(1));
         let svg_bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec();
         let svg_rid = src
-            .add_part_image("word/document.xml", &svg_bytes, &SVG)
+            .add_part_media("word/document.xml", &svg_bytes, "svg", "image/svg+xml")
             .expect("svg added");
         let run = docxcore::image::inline_picture_run(&png_rid, 9525, 9525, 1, "a.png").replace(
             &format!("<a:blip r:embed=\"{png_rid}\"/>"),
@@ -550,6 +566,31 @@ mod tests {
         assert_eq!(
             resolve(pkg, "word/document.xml", &rid),
             Some(("png", png(1)))
+        );
+    }
+
+    #[test]
+    fn an_emf_picture_pasted_in_a_header_brings_its_part_and_type() {
+        let mut src = new_package(Document { body: vec![] });
+        let emf = b"\x01\0\0\0 an EMF the view cannot draw".to_vec();
+        let rid = src
+            .add_part_media("word/document.xml", &emf, "emf", "image/x-emf")
+            .expect("added");
+        let copied = pic(&rid);
+        let media = capture(&src, "word/document.xml", &copied);
+        assert_eq!(media[&rid].ext, "emf");
+        assert_eq!(media[&rid].content_type, "image/x-emf");
+        let mut dst = new_package(Document { body: vec![] });
+        let (_, header) = dst.create_hf_part(true, "<w:p/>").unwrap();
+        let mut clip = copied.clone();
+        carry(&mut dst, &header, &media, &mut clip);
+        let new = clip.inline_embeds().pop().unwrap();
+        let target = dst.part_rel_target(&header, &new).expect("related");
+        assert!(target.ends_with(".emf"), "{target}");
+        assert_eq!(dst.part(&target), Some(emf.as_slice()));
+        assert_eq!(
+            dst.part_content_type(&target).as_deref(),
+            Some("image/x-emf")
         );
     }
 }

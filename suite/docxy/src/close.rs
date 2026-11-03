@@ -1138,6 +1138,9 @@ impl Docxy {
                 now,
             );
         }
+        // The window is going: its pictures leave gpui's asset cache before
+        // Don't Save drops the tabs that have no file (#1639).
+        self.release_all_pictures(cx);
         let forget = forget_on_quit(&mut self.tabs, &mut self.active, discards);
         let mode = SessionWrite::Forget(&forget);
         recover::harness_note(self.harness, &root, &format!("persist {}", mode.log_name()));
