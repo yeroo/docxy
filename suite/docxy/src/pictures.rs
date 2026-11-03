@@ -105,6 +105,24 @@ pub struct MediaPart {
     pub bytes: Vec<u8>,
 }
 
+/// Make gpui forget `imgs` (#1639): with the window at hand, each one's
+/// sprite-atlas tile first (gpui gives every decode a fresh `ImageId`, so a
+/// tile left behind is never reused), then the decode in the asset cache.
+/// `get_render_image` returns the decode already cached; every image here
+/// was handed to `img` when it was drawn, so this starts no new decode.
+/// Without a window (it is going) only the decode is dropped: the window's
+/// atlas goes with it.
+pub fn forget(imgs: Vec<Arc<Image>>, mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) {
+    for img in imgs {
+        if let Some(window) = window.as_deref_mut() {
+            if let Some(render) = img.clone().get_render_image(window, cx) {
+                let _ = window.drop_image(render);
+            }
+        }
+        img.remove_asset(cx);
+    }
+}
+
 /// The media a copy's inline pictures name, by rid, read from the story part
 /// they were copied from (#1639): what a paste into another story or package
 /// re-adds there. A rid that does not resolve is left out.
@@ -150,7 +168,7 @@ pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Medi
 /// Make `clip`'s pictures name `media` from `part` of `dst` (#1639): a rid
 /// is kept when it already names the same bytes there, else it takes a
 /// relationship of the part to identical bytes, else the media is added
-/// ([`Package::add_part_image`], outside any undo step, as Insert Picture
+/// ([`Package::add_part_media`], outside any undo step, as Insert Picture
 /// does). A rid with no media, or media the part cannot take, is kept.
 pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::editor::Clip) {
     let mut map = HashMap::new();
@@ -591,6 +609,36 @@ mod tests {
         assert_eq!(
             dst.part_content_type(&target).as_deref(),
             Some("image/x-emf")
+        );
+    }
+
+    #[test]
+    fn an_artistic_effect_brings_its_layer_part() {
+        let mut src = new_package(Document { body: vec![] });
+        let png_rid = add(&mut src, "word/document.xml", &png(1));
+        let wdp = b"II\xbc\x01 a JPEG XR layer".to_vec();
+        let wdp_rid = src
+            .add_part_media("word/document.xml", &wdp, "wdp", "image/vnd.ms-photo")
+            .expect("added");
+        let run = docxcore::image::inline_picture_run(&png_rid, 9525, 9525, 1, "a.png").replace(
+            &format!("<a:blip r:embed=\"{png_rid}\"/>"),
+            &format!("<a:blip r:embed=\"{png_rid}\"><a:extLst><a:ext uri=\"{{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}}\"><a14:imgProps xmlns:a14=\"http://schemas.microsoft.com/office/drawing/2010/main\"><a14:imgLayer r:embed=\"{wdp_rid}\"/></a14:imgProps></a:ext></a:extLst></a:blip>"),
+        );
+        let copied = docxcore::editor::Clip {
+            paras: vec![vec![docxcore::model::Inline::Raw(run)]],
+        };
+        let media = capture(&src, "word/document.xml", &copied);
+        assert_eq!(media[&wdp_rid].content_type, "image/vnd.ms-photo");
+        let (mut dst, header, _, _) = package();
+        let mut clip = copied.clone();
+        carry(&mut dst, &header, &media, &mut clip);
+        let rids = clip.inline_embeds();
+        let target = dst.part_rel_target(&header, &rids[1]).expect("related");
+        assert!(target.ends_with(".wdp"), "{target}");
+        assert_eq!(dst.part(&target), Some(wdp.as_slice()));
+        assert_eq!(
+            dst.part_content_type(&target).as_deref(),
+            Some("image/vnd.ms-photo")
         );
     }
 }

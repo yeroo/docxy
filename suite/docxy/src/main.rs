@@ -24634,11 +24634,11 @@ impl Docxy {
         }
     }
 
-    /// Release decoded pictures from gpui's asset cache (#1639): every
-    /// tab's retired ones, and all of `going`'s (a closed tab), keeping any
-    /// image a tab of any window may still draw ([`pictures::releasable`]).
-    /// The window's atlas tiles go with the window.
-    fn release_pictures(&mut self, going: Option<&DocTab>, cx: &mut App) {
+    /// Release decoded pictures from gpui (#1639): every tab's retired
+    /// ones, and all of `going`'s (a closed tab), keeping any image a tab of
+    /// any window may still draw ([`pictures::releasable`]), each with its
+    /// atlas tile in `window` ([`pictures::forget`]).
+    fn release_pictures(&mut self, going: Option<&DocTab>, window: &mut Window, cx: &mut App) {
         let mut taken =
             going.map_or_else(Vec::new, |t| t.pictures.borrow_mut().take_released(true));
         for tab in &self.tabs {
@@ -24651,13 +24651,12 @@ impl Docxy {
         for tab in &self.tabs {
             live.extend(tab.pictures.borrow().live_ids());
         }
-        for img in pictures::releasable(taken, &live) {
-            img.remove_asset(cx);
-        }
+        pictures::forget(pictures::releasable(taken, &live), Some(window), cx);
     }
 
     /// The window is going: every tab's pictures leave gpui's asset cache,
-    /// except those another window still holds.
+    /// except those another window still holds. The atlas goes with the
+    /// window.
     fn release_all_pictures(&mut self, cx: &mut App) {
         let taken: Vec<_> = self
             .tabs
@@ -24668,14 +24667,12 @@ impl Docxy {
             return;
         }
         let live = self.other_windows_picture_ids(cx);
-        for img in pictures::releasable(taken, &live) {
-            img.remove_asset(cx);
-        }
+        pictures::forget(pictures::releasable(taken, &live), None, cx);
     }
 
     /// The gpui ids of the pictures the other windows' tabs may still draw.
-    /// This window's own entity is being updated and is skipped, as is any
-    /// other that cannot be read now.
+    /// It reads each other window's `Docxy`, so it must not run inside
+    /// another window's update; this window's own is skipped.
     fn other_windows_picture_ids(&self, cx: &App) -> std::collections::HashSet<u64> {
         let mut live = std::collections::HashSet::new();
         for (id, view, _) in windows::entries_snapshot(cx) {
@@ -39801,7 +39798,7 @@ impl Render for Docxy {
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
         // Pictures a package change replaced leave gpui's asset cache (#1639).
-        self.release_pictures(None, cx);
+        self.release_pictures(None, window, cx);
         land_status(
             &mut self.pending_status,
             self.tabs.get_mut(self.active).map(|t| &mut t.status),

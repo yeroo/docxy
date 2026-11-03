@@ -7390,35 +7390,6 @@ mod tests {
     /// created when it has none, never from `document.xml.rels`; a JPEG
     /// declares `image/jpeg` once, whatever letter case a Default has.
     #[test]
-    fn add_part_media_takes_any_extension_and_declares_its_type_1639() {
-        let mut pkg = new_package(Document { body: vec![] });
-        let rid = pkg
-            .add_part_media("word/document.xml", b"   emf", "emf", "image/x-emf")
-            .expect("added");
-        let target = pkg.part_rel_target("word/document.xml", &rid).unwrap();
-        assert!(target.ends_with(".emf"), "{target}");
-        assert_eq!(pkg.part(&target), Some(&b"   emf"[..]));
-        assert_eq!(
-            pkg.part_content_type(&target).as_deref(),
-            Some("image/x-emf")
-        );
-        assert_eq!(
-            pkg.part_content_type("word/document.xml").as_deref(),
-            Some(
-                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
-            )
-        );
-        assert_eq!(
-            pkg.add_part_media("word/document.xml", b"x", "", "a/b"),
-            None
-        );
-        assert_eq!(
-            pkg.add_part_media("word/document.xml", b"x", "a\"b", "a/b"),
-            None
-        );
-    }
-
-    #[test]
     fn add_part_image_relates_from_the_parts_own_rels() {
         let mut pkg = new_package(Document { body: vec![] });
         let (_, header) = pkg.create_hf_part(true, "<w:p/>").unwrap();
@@ -7484,6 +7455,35 @@ mod tests {
         assert_eq!(pkg.part("word/media/image3.jpeg").unwrap(), b"NEXT");
         pkg.add_media_part(b"PNG", "png");
         assert_eq!(pkg.part("word/media/image4.png").unwrap(), b"PNG");
+    }
+
+    #[test]
+    fn add_part_media_takes_any_extension_and_declares_its_type_1639() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let rid = pkg
+            .add_part_media("word/document.xml", b"   emf", "emf", "image/x-emf")
+            .expect("added");
+        let target = pkg.part_rel_target("word/document.xml", &rid).unwrap();
+        assert!(target.ends_with(".emf"), "{target}");
+        assert_eq!(pkg.part(&target), Some(&b"   emf"[..]));
+        assert_eq!(
+            pkg.part_content_type(&target).as_deref(),
+            Some("image/x-emf")
+        );
+        assert_eq!(
+            pkg.part_content_type("word/document.xml").as_deref(),
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+            )
+        );
+        assert_eq!(
+            pkg.add_part_media("word/document.xml", b"x", "", "a/b"),
+            None
+        );
+        assert_eq!(
+            pkg.add_part_media("word/document.xml", b"x", "a\"b", "a/b"),
+            None
+        );
     }
 
     #[test]

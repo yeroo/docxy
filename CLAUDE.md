@@ -1836,12 +1836,16 @@
   tabs) all of its tabs'. An image's gpui id is its bytes' hash, so one any
   window's tab still holds is kept (`pictures::releasable`, the other
   windows read through `windows::entries_snapshot`; the updating window is
-  its own `self`). The window's atlas tile is not freed (it goes with the
-  window). A reload in place (Reopen, the reload dialog, recovery) hands
+  its own `self`). With a window at hand (render, tab close) the image's
+  atlas tile is dropped first (`pictures::forget`: `get_render_image`
+  returns gpui's cached decode, then `Window::drop_image`), as every decode
+  gets a fresh `ImageId` and an orphan tile is never reused; a closing
+  window drops the decodes only, its atlas going with it. A reload in place (Reopen, the reload dialog, recovery) hands
   the old cache to the fresh tab.
 - A document copy keeps its pictures' media (`DocClip::media`,
   `pictures::capture`, from the story part `tab_edit_target_part` names): the
-  blip's and any `asvg:svgBlip`'s inside it (`image::inline_embeds`), any kind
+  blip's and every `r:embed` inside it (`asvg:svgBlip`, `a14:imgLayer`:
+  `image::inline_embeds`), any kind
   of media (EMF, WMF, TIFF, SVG too: the part name's extension, the content
   type from the source's `[Content_Types].xml`, else
   `image::media_content_type`, else the bytes; `Package::add_part_media`
@@ -1850,7 +1854,7 @@
   of the window's own clip runs `pictures::carry` into the part it lands in:
   a rid that names the same bytes there is kept, else a relationship of that
   part to identical bytes is taken, else the media is added
-  (`add_part_image`) and the rid rewritten (`image::replace_inline_embeds`,
+  (`add_part_media`) and the rid rewritten (`image::replace_inline_embeds`,
   `Clip::remap_embeds`). So a paste in the same story changes nothing and
   repeated pastes add one part. As Insert Picture, the part is added outside
   the undo step: an undone paste leaves it. A document with no package gets

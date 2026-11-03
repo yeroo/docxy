@@ -165,9 +165,10 @@ pub fn media_content_type(ext: &str) -> Option<&'static str> {
 }
 
 /// Every `r:embed` an inline picture run names (#1639): its blip's
-/// ([`inline_embed`]), then each `asvg:svgBlip` inside that blip (Word's SVG
-/// picture keeps a PNG fallback in the blip and the SVG in the extension),
-/// each once. `a:hlinkClick`'s `r:id` is a hyperlink, not media: not listed.
+/// ([`inline_embed`]), then each one inside that blip: `asvg:svgBlip`
+/// (Word's SVG picture keeps a PNG fallback in the blip and the SVG in the
+/// extension), `a14:imgLayer` (an artistic effect's original, `.wdp`), and
+/// any other extension's, each once. `a:hlinkClick`'s `r:id` is a hyperlink, not media: not listed.
 pub fn inline_embeds(raw: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (at, end) in embed_tags(raw) {
@@ -222,7 +223,7 @@ pub fn replace_inline_embeds(
 }
 
 /// The start tags holding an inline picture's media rids: its blip and the
-/// `asvg:svgBlip`s inside it, in order (`raw[at..end]`, `end` at `>`).
+/// tags with an `r:embed` inside it, in order (`raw[at..end]`, `end` at `>`).
 fn embed_tags(raw: &str) -> Vec<(usize, usize)> {
     let Some((at, end)) = picture_blip(raw) else {
         return Vec::new();
@@ -232,13 +233,18 @@ fn embed_tags(raw: &str) -> Vec<(usize, usize)> {
         return tags;
     }
     let close = raw[end..].find("</a:blip>").map_or(raw.len(), |i| end + i);
+    // Every start tag inside the blip naming media: `asvg:svgBlip`,
+    // `a14:imgLayer` (Word's artistic effects), and any such extension.
     let mut from = end;
-    while let Some(i) = raw[from..close].find("<asvg:svgBlip") {
+    while let Some(i) = raw[from..close].find('<') {
         let s = from + i;
         let Some(e) = raw[s..close].find('>').map(|j| s + j) else {
             break;
         };
-        tags.push((s, e));
+        let tag = &raw[s..e];
+        if !tag.starts_with("</") && crate::load::xml_attr_value(tag, "r:embed").is_some() {
+            tags.push((s, e));
+        }
         from = e;
     }
     tags
@@ -536,6 +542,18 @@ mod tests {
             vec!["rId20".to_string(), "rId21".to_string()]
         );
         assert_eq!(out.replace("rId20", "rId7").replace("rId21", "rId8"), svg);
+        // An artistic effect keeps the original in an a14:imgLayer.
+        let layer = run.replace(
+            "<a:blip r:embed=\"rId7\"/>",
+            "<a:blip r:embed=\"rId7\"><a:extLst><a:ext uri=\"{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}\"><a14:imgProps xmlns:a14=\"http://schemas.microsoft.com/office/drawing/2010/main\"><a14:imgLayer r:embed=\"rId9\"><a14:imgEffect><a14:artisticPencilSketch/></a14:imgEffect></a14:imgLayer></a14:imgProps></a:ext></a:extLst></a:blip>",
+        );
+        assert_ne!(layer, run);
+        assert_eq!(
+            inline_embeds(&layer),
+            vec!["rId7".to_string(), "rId9".to_string()]
+        );
+        let out = replace_inline_embeds(&layer, &map(&[("rId9", "rId30")])).unwrap();
+        assert_eq!(out, layer.replace("rId9", "rId30"));
     }
 
     #[test]
