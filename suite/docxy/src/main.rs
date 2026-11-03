@@ -5585,7 +5585,8 @@ struct Docxy {
     range_pick: Option<((u32, u32), bool)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
-    /// The letters typed so far of a multi-letter command KeyTip.
+    /// The letters typed so far of a multi-letter KeyTip (a tab's at the Tabs
+    /// level, a command's at the Commands level).
     keytip_prefix: String,
     // The open menu (a right-click's context menu or a split button's
     // drop-down), drawn from the same model the harness reads.
