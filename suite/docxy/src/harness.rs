@@ -7083,6 +7083,7 @@ mod tests {
         let doc = crate::Surface::Doc(editor(ParProps::default(), RunProps::default()));
         let sheet = crate::new_sheet_surface();
         let clip = crate::DocClip {
+            media: Default::default(),
             clip: docxcore::editor::Clip::from_text("one\ntwo"),
             text: "one\ntwo".into(),
         };

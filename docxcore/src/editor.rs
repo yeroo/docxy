@@ -144,6 +144,14 @@ impl RevisionLocation {
     }
 }
 
+/// The run XML of an inline that may be a picture (#1639).
+fn picture_raw(inl: &Inline) -> Option<&str> {
+    match inl {
+        Inline::Raw(raw) | Inline::SmartArt { raw, .. } => Some(raw),
+        _ => None,
+    }
+}
+
 /// Clipboard contents: styled inline content, one entry per (partial) paragraph.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Clip {
@@ -151,6 +159,38 @@ pub struct Clip {
 }
 
 impl Clip {
+    /// The media rids of the inline pictures among the clip's top-level
+    /// runs and SmartArt drawings ([`crate::image::inline_embeds`]: blip and
+    /// SVG blip), each once, in order (#1639).
+    pub fn inline_embeds(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for raw in self.paras.iter().flatten().filter_map(picture_raw) {
+            for rid in crate::image::inline_embeds(raw) {
+                if !out.contains(&rid) {
+                    out.push(rid);
+                }
+            }
+        }
+        out
+    }
+
+    /// The clip with each inline picture's media rids renamed by `map`; a
+    /// rid not in it is kept (#1639).
+    pub fn remap_embeds(&mut self, map: &std::collections::HashMap<String, String>) {
+        if map.is_empty() {
+            return;
+        }
+        for inl in self.paras.iter_mut().flatten() {
+            let raw = match inl {
+                Inline::Raw(raw) | Inline::SmartArt { raw, .. } => raw,
+                _ => continue,
+            };
+            if let Some(out) = crate::image::replace_inline_embeds(raw, map) {
+                *raw = out;
+            }
+        }
+    }
+
     /// The plain text of this clip (paragraphs joined by newlines) — used to put
     /// the selection on the OS clipboard.
     pub fn to_text(&self) -> String {
@@ -6046,6 +6086,31 @@ fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_lists_and_remaps_its_inline_picture_embeds() {
+        let pic =
+            |rid: &str| Inline::Raw(crate::image::inline_picture_run(rid, 10, 10, 1, "a.png"));
+        let mut clip = Clip {
+            paras: vec![
+                vec![pic("rId5"), Inline::Raw("<w:r><w:ptab/></w:r>".into())],
+                vec![pic("rId5"), pic("rId6")],
+            ],
+        };
+        assert_eq!(
+            clip.inline_embeds(),
+            vec!["rId5".to_string(), "rId6".to_string()]
+        );
+        let map = [("rId5".to_string(), "rId20".to_string())]
+            .into_iter()
+            .collect();
+        clip.remap_embeds(&map);
+        assert_eq!(
+            clip.inline_embeds(),
+            vec!["rId20".to_string(), "rId6".to_string()]
+        );
+        assert_eq!(clip.paras[0][1], Inline::Raw("<w:r><w:ptab/></w:r>".into()));
+    }
 
     #[test]
     fn clear_run_formatting_keeps_highlight_622() {

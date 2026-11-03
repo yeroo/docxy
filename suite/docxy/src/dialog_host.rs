@@ -331,7 +331,7 @@ fn reopen_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
         return Some(Err("this tab has no file to reopen".into()));
     };
     let trusted = crate::trusted::TrustStore::load(&crate::config_root());
-    Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| *tab = fresh))
+    Some(crate::tab_from_path_mode(&path, mode, &trusted).map(|fresh| tab.replace_in_place(fresh)))
 }
 
 /// Whether Enter and Escape on a dialog of `owner` press through

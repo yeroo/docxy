@@ -227,6 +227,45 @@ fn tab_edit_target(tab: &mut DocTab) -> Option<&mut Editor> {
     }
 }
 
+/// The story part [`tab_edit_target`] edits: the open header or footer's,
+/// else the body's. A copy's pictures resolve through it, and a paste's are
+/// carried into it (#1639).
+fn tab_edit_target_part(tab: &DocTab) -> &str {
+    tab.hf_edit
+        .as_ref()
+        .map_or("word/document.xml", |hf| hf.part_name.as_str())
+}
+
+/// [`pictures::carry`] `clip`'s pictures into the story `tab` edits
+/// (#1639). A document without a package is given one; a tab whose save
+/// writes none ([`DocTab::saves_as_word`]) is left alone, the clip too.
+fn carry_into_tab(tab: &mut DocTab, media: &pictures::Media, clip: &mut Clip) {
+    if media.is_empty() || !tab.saves_as_word() || tab_edit_target_ref(tab).is_none() {
+        return;
+    }
+    if !clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
+        return;
+    }
+    if tab.ensure_package().is_err() {
+        return;
+    }
+    let part = tab_edit_target_part(tab).to_string();
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pictures::carry(pkg, &part, media, clip);
+    }
+}
+
+impl DocTab {
+    /// Become `fresh`, a reload of this tab's file (Reopen, the reload
+    /// dialog, recovery). The pictures it drew carry over: an unchanged one
+    /// keeps its decode, the rest are retired by the next package change or
+    /// released at close (#1639).
+    pub(crate) fn replace_in_place(&mut self, mut fresh: DocTab) {
+        fresh.pictures = std::mem::take(&mut self.pictures);
+        *self = fresh;
+    }
+}
+
 /// [`tab_edit_target`], to read.
 fn tab_edit_target_ref(tab: &DocTab) -> Option<&Editor> {
     if let Some(hf) = tab.hf_edit.as_ref() {
@@ -2009,6 +2048,9 @@ const CUT_CANCELLED_STATUS: &str =
 struct DocClip {
     clip: Clip,
     text: String,
+    /// The media of the clip's inline pictures, read where they were copied
+    /// from, so a paste into another story or tab carries them (#1639).
+    media: pictures::Media,
 }
 
 /// What a read of the clipboard found (#699).
@@ -24248,7 +24290,8 @@ impl Docxy {
         let tab = &self.tabs[i];
         let loaded = match reopen_step(reopen, tab.dirty, tab.access, mode) {
             ReopenStep::Reload => {
-                self.tabs[i] = tab_from_path_mode(&path, mode, &trusted)?;
+                let fresh = tab_from_path_mode(&path, mode, &trusted)?;
+                self.tabs[i].replace_in_place(fresh);
                 // Nor a flyout opened on the document it replaces (#1020).
                 self.ribbon_flyout = None;
                 // A reloaded tab has none of the last Remove All's edits.
@@ -24539,12 +24582,24 @@ impl Docxy {
             clip
         });
         if let Some(clip) = clip {
+            // The pictures' media (#1639): a cut leaves the package as it was.
+            let media = self
+                .tabs
+                .get(self.active)
+                .and_then(|t| {
+                    Some(pictures::capture(
+                        t.pkg.as_ref()?,
+                        tab_edit_target_part(t),
+                        &clip,
+                    ))
+                })
+                .unwrap_or_default();
             let pkg = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref());
             let plain = clip.to_text();
             let rtf = (!plain.is_empty())
                 .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
             let text = self.clipboard_write_rich(doc_copy_text(&clip), rtf, cx);
-            self.clip = Some(DocClip { clip, text });
+            self.clip = Some(DocClip { clip, text, media });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     t.mark_dirty();
@@ -24565,11 +24620,73 @@ impl Docxy {
         let now = self.clipboard_read(cx);
         let rtf = self.clipboard_read_rtf();
         let clip = doc_paste_clip(self.clip.as_ref(), &now, rtf.as_deref());
-        if let Some(clip) = clip {
+        if let Some(mut clip) = clip {
+            // The window's own clip carries its pictures' media (#1639).
+            let ours = self
+                .clip
+                .as_ref()
+                .filter(|ours| doc_clip_ours(ours, &now, rtf.is_some()));
+            if let (Some(ours), Some(tab)) = (ours, self.tabs.get_mut(self.active)) {
+                carry_into_tab(tab, &ours.media, &mut clip);
+            }
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
             self.refocus(window, cx);
         }
+    }
+
+    /// Release decoded pictures from gpui (#1639): every tab's retired
+    /// ones, and all of `going`'s (a closed tab), keeping any image a tab of
+    /// any window may still draw ([`pictures::releasable`]), each with its
+    /// atlas tile in `window` ([`pictures::forget`]).
+    fn release_pictures(&mut self, going: Option<&DocTab>, window: &mut Window, cx: &mut App) {
+        let mut taken =
+            going.map_or_else(Vec::new, |t| t.pictures.borrow_mut().take_released(true));
+        for tab in &self.tabs {
+            taken.extend(tab.pictures.borrow_mut().take_released(false));
+        }
+        if taken.is_empty() {
+            return;
+        }
+        let mut live = self.other_windows_picture_ids(cx);
+        for tab in &self.tabs {
+            live.extend(tab.pictures.borrow().live_ids());
+        }
+        pictures::forget(pictures::releasable(taken, &live), Some(window), cx);
+    }
+
+    /// The window is going: every tab's pictures leave gpui's asset cache,
+    /// except those another window still holds. The atlas goes with the
+    /// window.
+    fn release_all_pictures(&mut self, cx: &mut App) {
+        let taken: Vec<_> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.pictures.borrow_mut().take_released(true))
+            .collect();
+        if taken.is_empty() {
+            return;
+        }
+        let live = self.other_windows_picture_ids(cx);
+        pictures::forget(pictures::releasable(taken, &live), None, cx);
+    }
+
+    /// The gpui ids of the pictures the other windows' tabs may still draw.
+    /// It reads each other window's `Docxy`, so it must not run inside
+    /// another window's update; this window's own is skipped.
+    fn other_windows_picture_ids(&self, cx: &App) -> std::collections::HashSet<u64> {
+        let mut live = std::collections::HashSet::new();
+        for (id, view, _) in windows::entries_snapshot(cx) {
+            if id == self.win_id {
+                continue;
+            }
+            if let Some(other) = view.upgrade() {
+                for tab in &other.read(cx).tabs {
+                    live.extend(tab.pictures.borrow().live_ids());
+                }
+            }
+        }
+        live
     }
 
     // ---- find & replace ----------------------------------------------------
@@ -28032,6 +28149,7 @@ mod clipboard_tests {
                 .collect()
         };
         let ours = DocClip {
+            media: Default::default(),
             clip: Clip::from_text("mine"),
             text: "mine".into(),
         };
@@ -28049,6 +28167,7 @@ mod clipboard_tests {
         let got = doc_paste_clip(Some(&ours), &ClipRead::Nothing, Some(bold_rtf)).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD");
         let image_only = DocClip {
+            media: Default::default(),
             clip: Clip::default(),
             text: String::new(),
         };
@@ -28088,6 +28207,7 @@ mod clipboard_tests {
         assert_eq!(text, "\u{FFFC}\u{FFFC}");
         let now = ClipRead::Text(text.clone());
         let ours = DocClip {
+            media: Default::default(),
             text: recorded_after_write(text, &now),
             clip: clip.clone(),
         };
@@ -39678,6 +39798,8 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        // Pictures a package change replaced leave gpui's asset cache (#1639).
+        self.release_pictures(None, window, cx);
         land_status(
             &mut self.pending_status,
             self.tabs.get_mut(self.active).map(|t| &mut t.status),

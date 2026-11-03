@@ -138,7 +138,7 @@ impl crate::DocTab {
     /// kept: a Word file name, or an editable-HTML page that has the package
     /// it embeds. Not Markdown, Plain Text, Rich Text, or a page with no
     /// package (`save_doc_tab` writes those without it).
-    fn saves_as_word(&self) -> bool {
+    pub(crate) fn saves_as_word(&self) -> bool {
         use crate::html_bundle::DocTarget;
         if self.markdown {
             return false;

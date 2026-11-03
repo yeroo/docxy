@@ -862,7 +862,9 @@ impl Docxy {
             // the tab the highlighting mode started on (#623).
             self.cancel_pointer_modes();
             self.active = previous_active;
-            remove_tab(&mut self.tabs, &mut self.active, i);
+            let removed = remove_tab(&mut self.tabs, &mut self.active, i);
+            // Its pictures leave gpui's asset cache (#1639).
+            self.release_pictures(Some(&removed), window, cx);
             // The Info page's result is keyed by tab index (#627).
             self.bs_info_status = None;
             self.drop_grid_state();
@@ -1048,6 +1050,7 @@ impl Docxy {
                 self.mark_clean_exit();
             } else {
                 self.leave_registry(cx);
+                self.release_all_pictures(cx);
             }
             return true;
         }
@@ -1135,6 +1138,9 @@ impl Docxy {
                 now,
             );
         }
+        // The window is going: its pictures leave gpui's asset cache before
+        // Don't Save drops the tabs that have no file (#1639).
+        self.release_all_pictures(cx);
         let forget = forget_on_quit(&mut self.tabs, &mut self.active, discards);
         let mode = SessionWrite::Forget(&forget);
         recover::harness_note(self.harness, &root, &format!("persist {}", mode.log_name()));
