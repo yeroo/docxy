@@ -1,0 +1,13 @@
+[package]
+name = "helpdocs"
+description = "The help manual bundles each editor ships (#1022): the markdown subset they are written in, search, and context-id resolution with its fallback. Dependency-free."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
