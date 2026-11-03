@@ -5972,7 +5972,6 @@ mod menu_key_tests {
         let ribbon = ribbon_for(Kind::Project);
         let drawn: Vec<_> = ribbon.tabs.iter().map(|t| t.key_tip).collect();
         assert_eq!(drawn, ["H", "U", "S", "R", "W", "Y"]);
-        assert_eq!(gantt_format_tab().key_tip, GANTT_FORMAT_KEYTIP);
     }
 
     #[test]
@@ -31861,10 +31860,6 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
         ]
     }
 }
-/// The contextual Gantt Chart Format tab's KeyTip: two letters, as Project
-/// 2024 measures it (#1569).
-const GANTT_FORMAT_KEYTIP: &str = "JF";
-
 /// What the KeyTips' Tabs level does with the letters typed so far.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TabPick {

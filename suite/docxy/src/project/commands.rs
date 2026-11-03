@@ -805,6 +805,10 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
     ribbon
 }
 
+/// The contextual Gantt Chart Format tab's KeyTip: two letters, as Project
+/// 2024 measures it (#1569).
+pub(crate) const GANTT_FORMAT_KEYTIP: &str = "JF";
+
 /// Project's contextual Gantt Chart Format tab, shown after Help while a
 /// Project document's Gantt pane is showing (see `RibbonTab::GanttFormat`).
 pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
@@ -814,7 +818,7 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     };
     let mut tab = rs::tab(
         "Gantt Chart Format",
-        "JF",
+        GANTT_FORMAT_KEYTIP,
         vec![rs::group(
             "Bar Styles",
             90,
