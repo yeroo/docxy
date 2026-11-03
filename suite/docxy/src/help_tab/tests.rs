@@ -110,3 +110,110 @@ fn f1_alone_is_help() {
     assert!(!is_help_key(&key("shift-f1")));
     assert!(!is_help_key(&key("f2")));
 }
+
+/// Every command id a ribbon control carries: buttons, toggles, split
+/// primaries and menus, drop-downs and their items, row cells and galleries
+/// (a gallery's items have no id). A group launcher runs an act and carries no
+/// id, so it has nothing to resolve.
+fn control_ids(c: &Control<Act>, out: &mut Vec<&'static str>) {
+    match c {
+        Control::Large(cmd) | Control::Toggle(cmd) => out.push(cmd.id),
+        Control::Column(cmds) => out.extend(cmds.iter().map(|c| c.id)),
+        Control::Split { primary, menu } => {
+            out.push(primary.id);
+            out.extend(menu.iter().map(|c| c.id));
+        }
+        Control::Dropdown { cmd, items } => {
+            out.push(cmd.id);
+            out.extend(items.iter().map(|c| c.id));
+        }
+        Control::Gallery(g) => out.push(g.id),
+        Control::Rows(rows) => {
+            for cell in rows.iter().flatten() {
+                out.push(match cell {
+                    rs::Cell::Btn(cmd) | rs::Cell::Combo { cmd, .. } => cmd.id,
+                });
+            }
+        }
+        Control::Separator => {}
+    }
+}
+
+/// `(command id, tab name)` for every command a kind's ribbon draws: the
+/// document's and the plan's `ribbon_for` tabs, their contextual tabs and the
+/// tabs `active_ribbon_tab_def` builds apart; the sheet's `SHEET_RIBBON`
+/// (`ribbon_for(Xlsx)` names the tabs but draws the document's commands).
+fn ribbon_command_ids(kind: Kind) -> Vec<(&'static str, &'static str)> {
+    let mut out = Vec::new();
+    if kind == Kind::Xlsx {
+        for tab in crate::sheet_ribbon::SHEET_RIBBON {
+            let name = ribbon_tab_name(tab.tab);
+            out.extend(tab.commands().into_iter().map(|c| (c.id, name)));
+        }
+        return out;
+    }
+    let ribbon = ribbon_for(kind);
+    let mut tabs: Vec<(&'static str, Vec<rs::Group<Act>>)> =
+        ribbon.tabs.into_iter().map(|t| (t.name, t.groups)).collect();
+    tabs.extend(ribbon.contextual.into_iter().map(|t| (t.name, t.groups)));
+    let extra = if kind == Kind::Project {
+        vec![crate::gantt_format_tab()]
+    } else {
+        vec![
+            crate::table_tab::table_design_tab(),
+            crate::table_tab::table_layout_tab(),
+            crate::hf_tab::hf_tab(),
+        ]
+    };
+    tabs.extend(extra.into_iter().map(|t| (t.name, t.groups)));
+    for (name, groups) in tabs {
+        let mut ids = Vec::new();
+        for g in &groups {
+            for c in &g.items {
+                control_ids(c, &mut ids);
+            }
+        }
+        out.extend(ids.into_iter().map(|id| (id, name)));
+    }
+    out
+}
+
+/// The fixture manual of a kind's editor, until the spec repos publish the
+/// real ones into `docs/manual/`.
+fn fixture_manual(kind: Kind) -> helpdocs::Manual {
+    let editor = match kind {
+        Kind::Xlsx => "excel",
+        Kind::Project => "project",
+        _ => "word",
+    };
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../helpdocs/tests/fixture")
+        .join(editor);
+    helpdocs::Manual::load(&dir).expect("fixture manual")
+}
+
+/// Every ribbon command resolves to a page, its own or its area's, never an
+/// error (#1022). A report: it fails only where a manual marks an area strict
+/// (the word fixture's `help`), so a Help command added without a page fails.
+#[test]
+fn every_ribbon_command_has_a_help_target() {
+    for (kind, name) in KINDS {
+        let ids = ribbon_command_ids(kind);
+        assert!(ids.len() > 20, "{name}: {} ids", ids.len());
+        let manual = fixture_manual(kind);
+        assert_eq!(manual.problems, vec![], "{name}");
+        let c = helpdocs::coverage(&manual, ids.iter().copied());
+        println!("{name}: {}", c.report());
+        assert!(c.passes(), "{name}: {}", c.report());
+    }
+    // The strict area bites: the document's Help tab is covered command by
+    // command, so its six ids are exact.
+    let ids = ribbon_command_ids(Kind::Docx);
+    let help: Vec<_> = ids.iter().filter(|(_, tab)| *tab == "Help").copied().collect();
+    assert_eq!(help.len(), 6, "{help:?}");
+    let c = helpdocs::coverage(&fixture_manual(Kind::Docx), help);
+    assert_eq!(c.exact.len(), 6);
+    // An unknown Help command would fail.
+    let c = helpdocs::coverage(&fixture_manual(Kind::Docx), [("help-new", "Help")]);
+    assert!(!c.passes());
+}

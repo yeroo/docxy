@@ -2194,3 +2194,23 @@
   `custom_field_oracles` lists both FieldIDs as exclusions and asserts each is
   needed; `custom_fields_round_trip_through_mspdi` covers `.xml` and `.yppx`
   Save As (one `write_mspdi`).
+
+## Help manual bundles (#1022, slice 1)
+
+- `helpdocs` (root workspace, dependency-free like `buildinfo`) reads an
+  editor's manual bundle (`docs/manual/<word|excel|project>/`: `REVISION`,
+  `contents.txt`, `<id>.md` with front matter, `images/`; the format is
+  `docs/manual/README.md`). `Manual::from_files` is the one reader (`load`
+  goes through it; `\` reads as `/`), and a bundle always loads, its faults
+  in `problems`. `md` parses the fixed markdown subset (anything else is
+  literal text), `search` ranks title 10 / heading 5 / body 1 per hit up to
+  5 per term, all terms required, ties in contents order, `resolve` gives
+  the exact `keys` page, else the area's (`slug` of the tab name), else the
+  root, and `coverage` is the report.
+- The suite's `every_ribbon_command_has_a_help_target`
+  (`help_tab/tests.rs`) resolves every command id (all `Control` kinds,
+  contextual tabs, the table/H&F/Gantt Format tabs, the sheet's
+  `SHEET_RIBBON`) against `helpdocs/tests/fixture/<editor>` until real
+  manuals are published. It fails only for a strict area
+  (`# strict: help` in the word fixture). No host shows a manual yet: the
+  viewer, terminal overlays and build pinning are later slices.
