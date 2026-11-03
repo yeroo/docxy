@@ -12,7 +12,7 @@ test project task information: OK writes General, Advanced and Notes as one undo
   click C2
   assert selected_name is B
   assert dirty is false
-  key alt t c
+  key alt h c
   assert dialog is task-information
   call dialog-read {}
   assert reply.tab is General
@@ -56,7 +56,7 @@ test project task information: OK writes General, Advanced and Notes as one undo
   assert reply.fields.Priority.value is 800
   assert reply.fields.Deadline.value is 2026-02-27 17:00
   # The dialog reads back what OK wrote.
-  key alt t c
+  key alt h c
   call field-read {"dialog-field":"percent"}
   assert reply.value is 50
   call pointer-click {"dialog-tab":"Notes"}
@@ -73,7 +73,7 @@ test project task information: OK writes General, Advanced and Notes as one undo
   assert reply.fields.Priority.value is 500
   assert reply.fields.Deadline.value is null
   assert reply.fields.Notes.value is null
-  key alt t c
+  key alt h c
   call field-read {"dialog-field":"percent"}
   assert reply.value is 0
   call real-key {"key":"escape"}
@@ -89,7 +89,7 @@ test project task information: Notes... opens on the Notes page and an unchanged
   assert dialog is none
   assert dirty is false
   assert undo_depth is 0
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.tab is General
   call real-key {"key":"escape"}
@@ -98,7 +98,7 @@ test project task information: Notes... opens on the Notes page and an unchanged
 test project task information: a refused field keeps the dialog open and applies nothing
   open copy:../fixtures/project-clipboard.xml
   click C1
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Renamed"}
@@ -133,7 +133,7 @@ test project task information: a double-click on a task's ID opens it, the entry
 test project task information: the top row is one value on every page, and Estimated is the duration's question mark
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-field":"name"}
   call real-key {"key":"ctrl+a"}
   call real-type {"text":"Build"}
@@ -168,7 +168,7 @@ test project task information: the top row is one value on every page, and Estim
 test project task information: schedule mode, inactive, the timeline, bar and rollup boxes apply as one undo step
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.controls.3.name is mode
   assert reply.controls.3.text is Auto Scheduled
@@ -185,7 +185,7 @@ test project task information: schedule mode, inactive, the timeline, bar and ro
   assert undo_depth is 1
   call task.get {"uid":2,"fields":["Task Mode","Active"]}
   assert reply.fields.Active.value is false
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.controls.3.text is Manually Scheduled
   assert reply.controls.4.value is true
@@ -199,7 +199,7 @@ test project task information: schedule mode, inactive, the timeline, bar and ro
   assert dialog is none
   key ctrl+z
   assert undo_depth is 0
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.controls.3.text is Auto Scheduled
   assert reply.controls.4.value is false
@@ -209,7 +209,7 @@ test project task information: schedule mode, inactive, the timeline, bar and ro
 test project task information: Finish is a date combo, its calendar opens from the button and a day picks
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.calendar_open is false
   call pointer-click {"dialog-calendar":"button:finish"}
@@ -241,7 +241,7 @@ test project task information: Finish is a date combo, its calendar opens from t
 test project task information: Predecessors rows add, edit, delete and a cycle is refused
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-tab":"Predecessors"}
   call dialog-read {}
   assert reply.controls.3.name is predecessors
@@ -268,7 +268,7 @@ test project task information: Predecessors rows add, edit, delete and a cycle i
   assert cell G2 is 1SS+2d
   # A also depending on B would be a cycle: refused, the dialog stays.
   click C1
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-tab":"Predecessors"}
   call pointer-click {"dialog-cell":"predecessors[0].id"}
   call real-type {"text":"2"}
@@ -280,7 +280,7 @@ test project task information: Predecessors rows add, edit, delete and a cycle i
   assert dialog is none
   # Delete removes the selected row.
   click C2
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-tab":"Predecessors"}
   call pointer-click {"dialog-cell":"predecessors[0].id"}
   call real-key {"key":"delete"}
@@ -292,7 +292,7 @@ test project task information: Predecessors rows add, edit, delete and a cycle i
 test project task information: Resources rows add a name, change units and keep owner and cost read-only
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-tab":"Resources"}
   call pointer-click {"dialog-cell":"resources[0].resource name"}
   call real-type {"text":"Ann"}
@@ -315,7 +315,7 @@ test project task information: Resources rows add a name, change units and keep 
 test project task information: Help says what F1 says and leaves the dialog open
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   call dialog-read {}
   assert reply.buttons.0.id is help
   call pointer-click {"dialog-button":"Help"}
@@ -340,7 +340,7 @@ test project task information: Bold in the Notes box is kept as rich notes
   call task.get {"uid":2,"fields":["Notes"]}
   assert reply.fields.Notes.value is word
   assert reply.rich_notes is <p><b>word</b></p>
-  key alt t c
+  key alt h c
   call pointer-click {"dialog-tab":"Notes"}
   call dialog-read {}
   assert reply.tab is Notes

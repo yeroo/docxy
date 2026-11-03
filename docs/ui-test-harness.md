@@ -904,8 +904,9 @@ Predecessors in cells use **displayed IDs** (a cross-project link shows its
 external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
-ribbon KeyTips are File/Task/Resource/Report/Project/View/Help = F/T/U/R/P/W/Y
-after Alt or F10.
+ribbon KeyTips are File/Task/Resource/Report/Project/View/Help = F/H/U/S/R/W/Y
+after Alt or F10, as Project 2024 has them; the contextual Gantt Chart Format
+tab is the two-letter JF (J waits for F, Escape drops the J) (#1569).
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
 moves down, Shift+Enter commits and moves up, Up/Down commit and move one row
@@ -1634,7 +1635,7 @@ other character is swallowed; a modifier chord and any other key close the
 menu and are spent, Tab included. None reaches the document or cell under it.
 A press outside the menu closes it too.
 A split button's KeyTip opens its menu with nothing highlighted, as a
-drop-down's does, and the next letter is the menu's (Alt, P, B, then B or L,
+drop-down's does, and the next letter is the menu's (Alt, R, B, then B or L,
 #1212); a split's item letters are no KeyTips of the tab.
 `project-menus.uit` drives the opening and clicking; `menu-keys.uit` drives
 the keyboard.

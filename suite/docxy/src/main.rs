@@ -556,7 +556,7 @@ fn session_path_in(root: &std::path::Path) -> PathBuf {
 
 // ---- ribbon tabs -----------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RibbonTab {
     Task,
     Resource,
@@ -5948,6 +5948,86 @@ mod menu_key_tests {
             key: key.into(),
             key_char: char.map(String::from),
         }
+    }
+
+    #[test]
+    fn project_tab_key_tips_are_project_2024s() {
+        use crate::*;
+        let tips: Vec<_> = ribbon_tab_set(Kind::Project)
+            .iter()
+            .map(|(_, n, k)| (*n, *k))
+            .collect();
+        assert_eq!(
+            tips,
+            [
+                ("File", "F"),
+                ("Task", "H"),
+                ("Resource", "U"),
+                ("Report", "S"),
+                ("Project", "R"),
+                ("View", "W"),
+                ("Help", "Y"),
+            ]
+        );
+        let ribbon = ribbon_for(Kind::Project);
+        let drawn: Vec<_> = ribbon.tabs.iter().map(|t| t.key_tip).collect();
+        assert_eq!(drawn, ["H", "U", "S", "R", "W", "Y"]);
+        assert_eq!(gantt_format_tab().key_tip, GANTT_FORMAT_KEYTIP);
+    }
+
+    #[test]
+    fn a_two_letter_tab_key_tip_waits_for_its_second_letter() {
+        use crate::*;
+        let gantt = TabKeyCtx {
+            gantt: true,
+            ..TabKeyCtx::default()
+        };
+        let p = |typed| tab_keytip_pick(Kind::Project, typed, gantt);
+        assert_eq!(p("j"), TabPick::Wait);
+        assert_eq!(p("JF"), TabPick::Tab(RibbonTab::GanttFormat));
+        assert_eq!(p("jf"), TabPick::Tab(RibbonTab::GanttFormat));
+        // J then anything else closes the KeyTips; F alone is still File.
+        assert_eq!(p("JX"), TabPick::Off);
+        assert_eq!(p("F"), TabPick::Backstage);
+        assert_eq!(p("O"), TabPick::Off);
+        assert_eq!(p("H"), TabPick::Tab(RibbonTab::Task));
+        assert_eq!(p("S"), TabPick::Tab(RibbonTab::Report));
+        assert_eq!(p("R"), TabPick::Tab(RibbonTab::Project));
+        // No Gantt showing: J reaches nothing.
+        assert_eq!(
+            tab_keytip_pick(Kind::Project, "J", TabKeyCtx::default()),
+            TabPick::Off
+        );
+        // The document's contextual tabs keep their one letter.
+        let table = TabKeyCtx {
+            in_table: true,
+            ..TabKeyCtx::default()
+        };
+        let hf = TabKeyCtx {
+            hf: true,
+            ..TabKeyCtx::default()
+        };
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "J", table),
+            TabPick::Tab(RibbonTab::TableLayout)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "T", table),
+            TabPick::Tab(RibbonTab::TableDesign)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "J", hf),
+            TabPick::Tab(RibbonTab::HeaderFooter)
+        );
+        assert_eq!(tab_keytip_pick(Kind::Docx, "J", gantt), TabPick::Off);
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "P", gantt),
+            TabPick::Tab(RibbonTab::Layout)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Xlsx, "A", gantt),
+            TabPick::Tab(RibbonTab::Data)
+        );
     }
 
     #[test]
@@ -26998,6 +27078,7 @@ impl Docxy {
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
+            self.keytip_prefix.clear();
             self.keytips = if self.keytips == KeyTip::Off {
                 KeyTip::Tabs
             } else {
@@ -27007,6 +27088,11 @@ impl Docxy {
             return;
         }
         if self.keytips != KeyTip::Off {
+            if key == "escape" && !self.keytip_prefix.is_empty() {
+                self.keytip_prefix.clear();
+                cx.notify();
+                return;
+            }
             if key == "escape" {
                 self.keytips = if self.keytips == KeyTip::Commands {
                     KeyTip::Tabs
@@ -31740,10 +31826,10 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
     if kind == Kind::Project {
         &[
             (None, "File", "F"),
-            (Some(Task), "Task", "T"),
+            (Some(Task), "Task", "H"),
             (Some(Resource), "Resource", "U"),
-            (Some(Report), "Report", "R"),
-            (Some(Project), "Project", "P"),
+            (Some(Report), "Report", "S"),
+            (Some(Project), "Project", "R"),
             (Some(View), "View", "W"),
             (Some(Help), "Help", "Y"),
         ]
@@ -31774,6 +31860,54 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Help), "Help", "Y"),
         ]
     }
+}
+/// The contextual Gantt Chart Format tab's KeyTip: two letters, as Project
+/// 2024 measures it (#1569).
+const GANTT_FORMAT_KEYTIP: &str = "JF";
+
+/// What the KeyTips' Tabs level does with the letters typed so far.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabPick {
+    Backstage,
+    Tab(RibbonTab),
+    /// A two-letter tab tip starts with them: wait for the next letter.
+    Wait,
+    Off,
+}
+
+/// The contextual tabs a KeyTip can reach now.
+#[derive(Clone, Copy, Debug, Default)]
+struct TabKeyCtx {
+    in_table: bool,
+    hf: bool,
+    gantt: bool,
+}
+
+/// The Tabs level's choice for `typed` (one letter, or a pending prefix plus
+/// one) on a ribbon of `kind`.
+fn tab_keytip_pick(kind: Kind, typed: &str, ctx: TabKeyCtx) -> TabPick {
+    let mut tips: Vec<(&str, Option<RibbonTab>)> = ribbon_tab_set(kind)
+        .iter()
+        .map(|(t, _, k)| (*k, *t))
+        .collect();
+    if kind == Kind::Docx && ctx.in_table {
+        tips.push(("T", Some(RibbonTab::TableDesign)));
+        tips.push(("J", Some(RibbonTab::TableLayout)));
+    } else if kind == Kind::Docx && ctx.hf {
+        tips.push(("J", Some(RibbonTab::HeaderFooter)));
+    }
+    if kind == Kind::Project && ctx.gantt {
+        tips.push((GANTT_FORMAT_KEYTIP, Some(RibbonTab::GanttFormat)));
+    }
+    if let Some((_, t)) = tips.iter().find(|(k, _)| k.eq_ignore_ascii_case(typed)) {
+        return t.map_or(TabPick::Backstage, TabPick::Tab);
+    }
+    let starts = tips.iter().any(|(k, _)| {
+        k.len() > typed.len()
+            && k.get(..typed.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(typed))
+    });
+    if starts { TabPick::Wait } else { TabPick::Off }
 }
 fn valid_ribbon_tab(
     kind: Kind,
@@ -34906,7 +35040,7 @@ impl Docxy {
                             .font_weight(FontWeight::BOLD)
                     })
                     .child(ribbon_tab_name(RibbonTab::GanttFormat))
-                    .when(show_kt, |d| d.child(keytip_badge("O")))
+                    .when(show_kt, |d| d.child(keytip_badge(GANTT_FORMAT_KEYTIP)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
                     })),
@@ -35866,37 +36000,25 @@ impl Docxy {
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.keytips {
             KeyTip::Tabs => {
+                let typed = format!("{}{c}", self.keytip_prefix);
                 self.keytip_prefix.clear();
-                if c.eq_ignore_ascii_case("F") {
-                    self.keytips = KeyTip::Off;
-                    return self.open_backstage(cx);
-                }
-                let ribbon = ribbon_for(self.ribbon_kind());
-                if let Some(i) = ribbon
-                    .tabs
-                    .iter()
-                    .position(|t| t.key_tip.eq_ignore_ascii_case(c))
-                {
-                    self.select_ribbon_tab(
-                        ribbon_tab_set(self.ribbon_kind())[i + 1].0.unwrap(),
-                        window,
-                        cx,
-                    );
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("T") && self.caret_in_table() {
-                    self.select_ribbon_tab(RibbonTab::TableDesign, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("J") && self.caret_in_table() {
-                    self.select_ribbon_tab(RibbonTab::TableLayout, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("J") && self.hf_active() {
-                    self.select_ribbon_tab(RibbonTab::HeaderFooter, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("O") && self.project_gantt_showing() {
-                    self.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else {
-                    self.keytips = KeyTip::Off;
+                let kind = self.ribbon_kind();
+                let ctx = TabKeyCtx {
+                    in_table: self.caret_in_table(),
+                    hf: self.hf_active(),
+                    gantt: self.project_gantt_showing(),
+                };
+                match tab_keytip_pick(kind, &typed, ctx) {
+                    TabPick::Backstage => {
+                        self.keytips = KeyTip::Off;
+                        return self.open_backstage(cx);
+                    }
+                    TabPick::Tab(t) => {
+                        self.select_ribbon_tab(t, window, cx);
+                        self.keytips = KeyTip::Commands;
+                    }
+                    TabPick::Wait => self.keytip_prefix = typed,
+                    TabPick::Off => self.keytips = KeyTip::Off,
                 }
                 cx.notify();
             }

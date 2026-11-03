@@ -7817,7 +7817,7 @@ mod tests {
             ]
         );
         let tab = on.get("tabs").unwrap().as_array().unwrap().last().unwrap();
-        assert_eq!(tab.get_str("key_tip"), Some("O"));
+        assert_eq!(tab.get_str("key_tip"), Some("JF"));
         let group = &tab.get("groups").unwrap().as_array().unwrap()[0];
         assert_eq!(group.get_str("title"), Some("Bar Styles"));
         let checked = group

@@ -234,22 +234,22 @@ impl ReportMenu {
                 "print-layout",
                 "Dashboards",
                 "D",
-                "Alt, R, D",
+                "Alt, S, D",
             ),
             ReportMenu::Resources => (
                 "pr-report-resources",
                 "mail-recipients",
                 "Resources",
                 "R",
-                "Alt, R, R",
+                "Alt, S, R",
             ),
-            ReportMenu::Costs => ("pr-report-costs", "table", "Costs", "C", "Alt, R, C"),
+            ReportMenu::Costs => ("pr-report-costs", "table", "Costs", "C", "Alt, S, C"),
             ReportMenu::InProgress => (
                 "pr-report-in-progress",
                 "align-left",
                 "In Progress",
                 "I",
-                "Alt, R, I",
+                "Alt, S, I",
             ),
         }
     }
@@ -269,18 +269,18 @@ impl ReportMenu {
 /// A View Reports item's (id, KeyTip in its menu, shortcut).
 fn report_item(kind: ReportKind) -> (&'static str, &'static str, &'static str) {
     match kind {
-        ReportKind::ProjectOverview => ("pr-report-project-overview", "P", "Alt, R, D, P"),
-        ReportKind::ResourceOverview => ("pr-report-resource-overview", "O", "Alt, R, R, O"),
+        ReportKind::ProjectOverview => ("pr-report-project-overview", "P", "Alt, S, D, P"),
+        ReportKind::ResourceOverview => ("pr-report-resource-overview", "O", "Alt, S, R, O"),
         ReportKind::OverallocatedResources => {
-            ("pr-report-overallocated-resources", "A", "Alt, R, R, A")
+            ("pr-report-overallocated-resources", "A", "Alt, S, R, A")
         }
-        ReportKind::TaskCostOverview => ("pr-report-task-cost-overview", "T", "Alt, R, C, T"),
+        ReportKind::TaskCostOverview => ("pr-report-task-cost-overview", "T", "Alt, S, C, T"),
         ReportKind::ResourceCostOverview => {
-            ("pr-report-resource-cost-overview", "R", "Alt, R, C, R")
+            ("pr-report-resource-cost-overview", "R", "Alt, S, C, R")
         }
-        ReportKind::CriticalTasks => ("pr-report-critical-tasks", "C", "Alt, R, I, C"),
-        ReportKind::LateTasks => ("pr-report-late-tasks", "L", "Alt, R, I, L"),
-        ReportKind::MilestoneReport => ("pr-report-milestone-report", "M", "Alt, R, I, M"),
+        ReportKind::CriticalTasks => ("pr-report-critical-tasks", "C", "Alt, S, I, C"),
+        ReportKind::LateTasks => ("pr-report-late-tasks", "L", "Alt, S, I, L"),
+        ReportKind::MilestoneReport => ("pr-report-milestone-report", "M", "Alt, S, I, M"),
     }
 }
 
@@ -349,7 +349,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
     let mut ribbon = rs::Ribbon::new(vec![
         rs::tab(
             "Task",
-            "T",
+            "H",
             vec![
                 // Clipboard leads the Task tab, as in Project: Paste large,
                 // Cut and Copy beside it (#561). It is the last group to
@@ -393,7 +393,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "cut",
                                 "Unlink Tasks",
                                 UnlinkTasks,
-                                "Alt, T, U  (Ctrl+Shift+F2)",
+                                "Alt, H, U  (Ctrl+Shift+F2)",
                                 "U",
                             ),
                         ]),
@@ -403,7 +403,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Link Tasks",
                             "Link the Selected Tasks",
                             AddLink,
-                            "Alt, T, P  (Ctrl+F2)",
+                            "Alt, H, P  (Ctrl+F2)",
                             "P",
                         )),
                         rs::column(vec![cmd(
@@ -411,7 +411,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "strikethrough",
                             "Inactivate",
                             Inactivate,
-                            "Alt, T, E",
+                            "Alt, H, E",
                             "E",
                         )]),
                     ],
@@ -427,7 +427,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "lock",
                                 "Manually Schedule",
                                 ManuallySchedule,
-                                "Alt, T, H",
+                                "Alt, H, H",
                                 "H",
                             ),
                             cmd(
@@ -435,7 +435,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "redo",
                                 "Auto Schedule",
                                 AutoSchedule,
-                                "Alt, T, A",
+                                "Alt, H, A",
                                 "A",
                             ),
                         ]),
@@ -445,7 +445,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Move",
                             "Move Task",
                             MoveTask,
-                            "Alt, T, V",
+                            "Alt, H, V",
                             "V",
                         )),
                     ],
@@ -459,7 +459,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "table-insert-row",
                             "Task",
                             AddTask,
-                            "Alt, T, N",
+                            "Alt, H, N",
                             "N",
                         )),
                         rs::column(vec![
@@ -469,7 +469,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Milestone",
                                 "Insert Milestone",
                                 Milestone,
-                                "Alt, T, M",
+                                "Alt, H, M",
                                 "M",
                             ),
                             cmds(
@@ -494,7 +494,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Information...",
                             "View Task Information",
                             Constraint,
-                            "Alt, T, C",
+                            "Alt, H, C",
                             "C",
                         )),
                         // Project 2024's keytips take "N" for Insert › Task;
@@ -505,7 +505,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Notes...",
                             "Notes",
                             Notes,
-                            "Alt, T, T",
+                            "Alt, H, T",
                             "T",
                         )]),
                     ],
@@ -520,7 +520,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "align-left",
                             "Scroll to Task",
                             ScrollToTask,
-                            "Alt, T, S",
+                            "Alt, H, S",
                             "S",
                         ),
                     ])],
@@ -572,7 +572,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
         // Projects are not here.
         rs::tab(
             "Report",
-            "R",
+            "S",
             vec![rs::group(
                 "View Reports",
                 70,
@@ -581,7 +581,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
         ),
         rs::tab(
             "Project",
-            "P",
+            "R",
             vec![rs::group(
                 "Schedule",
                 90,
@@ -591,7 +591,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         "redo",
                         "Calculate Project",
                         Recalc,
-                        "Alt, P, E",
+                        "Alt, R, E",
                         "E",
                     )),
                     // A split button: the upper half sets the baseline at
@@ -606,7 +606,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "save",
                             "Set Baseline",
                             Baseline,
-                            "Alt, P, B",
+                            "Alt, R, B",
                             "B",
                         ),
                         menu: vec![
@@ -616,7 +616,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Set Baseline...",
                                 "Set Baseline",
                                 Baseline,
-                                "Alt, P, B, B",
+                                "Alt, R, B, B",
                                 "B",
                             ),
                             cmds(
@@ -625,7 +625,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Clear Baseline...",
                                 "Clear Baseline",
                                 ClearBaseline,
-                                "Alt, P, B, L",
+                                "Alt, R, B, L",
                                 "L",
                             ),
                         ],
@@ -814,7 +814,7 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
     };
     let mut tab = rs::tab(
         "Gantt Chart Format",
-        "O",
+        "JF",
         vec![rs::group(
             "Bar Styles",
             90,
@@ -824,7 +824,7 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
                     "highlight",
                     "Critical Tasks",
                     CriticalTasks,
-                    "Alt, O, C",
+                    "Alt, J, F, C",
                     "C",
                 ),
                 cmd(
@@ -832,7 +832,7 @@ pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
                     "rule",
                     "Baseline",
                     BaselineBars,
-                    "Alt, O, B",
+                    "Alt, J, F, B",
                     "B",
                 ),
             ])],

@@ -34,11 +34,11 @@ test project editing keys and prompts
   key tab
   assert cell D2 is 3 days
   assert bar_2 is on-track 0-2
-  key alt t p
+  key alt h p
   type 3
   key enter
   assert bar_2 is critical 4-8
-  key alt t c
+  key alt h c
   call dialog-tab {"tab":"Advanced"}
   call dialog-set {"control":"ctype","value":"Start No Earlier Than"}
   call dialog-set {"control":"cdate","value":"2026-01-19"}
@@ -50,7 +50,7 @@ test project editing keys and prompts
   type Alice
   key enter
   assert status is Assigned Alice
-  key alt p b b
+  key alt r b b
   assert status is Baseline set — baseline bars now show under the current bars
   key ctrl+shift+l
   assert status is Resource leveling ON — bars delayed to fit resource capacity
