@@ -14,7 +14,7 @@ pub mod md;
 pub mod search;
 
 pub use bundle::{Entry, Manual, Page, Problem};
-pub use context::{Target, Via, resolve};
+pub use context::{Target, Via, resolve, resolve_area};
 pub use coverage::{Coverage, coverage};
 pub use search::{Hit, search};
 

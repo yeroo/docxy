@@ -60,6 +60,7 @@ mod font_box;
 mod harness;
 mod help_manual;
 mod help_tab;
+mod help_view;
 mod hf;
 mod hf_insert;
 mod hf_tab;

@@ -34,6 +34,18 @@ pub fn resolve(manual: &Manual, id: &str, area: Option<&str>) -> Option<Target> 
     if let Some(p) = manual.pages.iter().find(|p| p.keys.iter().any(|k| k == id)) {
         return hit(&p.id, Via::Exact);
     }
+    resolve_area(manual, area)
+}
+
+/// The page for `area` itself (F1 with no command: #1855), never a key's: the
+/// area's page, else the root. `None` only for a manual without pages.
+pub fn resolve_area(manual: &Manual, area: Option<&str>) -> Option<Target> {
+    let hit = |page: &str, via| {
+        Some(Target {
+            page: page.to_string(),
+            via,
+        })
+    };
     if let Some(area) = area.map(slug).filter(|a| !a.is_empty()) {
         if let Some(p) = manual.page(&area) {
             return hit(&p.id, Via::Area);
@@ -104,6 +116,28 @@ mod tests {
             resolve(&m, "no-such-cmd", Some("Keys")),
             at("keyboard", Via::Area)
         );
+    }
+
+    #[test]
+    fn an_area_alone_never_matches_a_key() {
+        let mut m = fixture("word");
+        // A page claiming the area's slug as a key does not win over the
+        // area's own page.
+        m.pages
+            .iter_mut()
+            .find(|p| p.id == "keyboard")
+            .unwrap()
+            .keys
+            .push("home".into());
+        assert_eq!(
+            resolve(&m, "home", Some("Home")),
+            at("keyboard", Via::Exact)
+        );
+        assert_eq!(resolve_area(&m, Some("Home")), at("home", Via::Area));
+        assert_eq!(resolve_area(&m, Some("Keys")), at("keyboard", Via::Area));
+        assert_eq!(resolve_area(&m, Some("Mailings")), at("welcome", Via::Root));
+        assert_eq!(resolve_area(&m, None), at("welcome", Via::Root));
+        assert_eq!(resolve_area(&Manual::default(), Some("Home")), None);
     }
 
     #[test]
