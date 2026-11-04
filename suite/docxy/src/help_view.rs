@@ -67,7 +67,8 @@ pub(crate) struct HelpView {
     pub search_focused: bool,
     pub hits: Vec<Hit>,
     pub scroll: ScrollHandle,
-    /// Taken by the next frame, which scrolls the body there.
+    /// Taken by the next frame, which scrolls the body there (gpui places
+    /// an item once that frame has laid the page out).
     pub scroll_to: std::cell::Cell<Option<ScrollTo>>,
     /// Bumped on every change a reader can see (page, query, history).
     pub revision: u64,

@@ -15,7 +15,9 @@
 //! As's file name is not typed into: it is the OS's file dialog. So are
 //! Project's (#1203): the grid's inline cell editor, for
 //! `uiharness/cases/project-inputs-typing.uit`; Task > Information... is the
-//! catalogued Task Information dialog (#1368). The terminal editors' prompts (#1204)
+//! catalogued Task Information dialog (#1368). So is the Help tab's search
+//! box (#1855), typed into by `uiharness/cases/help-docs.uit` with the
+//! fixture manual installed. The terminal editors' prompts (#1204)
 //! are listed too, one id per field: docxy, xlsxy and yppxy are other
 //! programs, so the suite's verbs only name the case that types into each,
 //! `uiharness/cases/terminal-<app>-inputs-typing.uit`, which runs the editor
@@ -39,6 +41,8 @@ pub(crate) enum Surface {
     Project,
     Backstage,
     Terminal,
+    /// The Help tab (#1855).
+    Help,
 }
 
 impl Surface {
@@ -49,6 +53,7 @@ impl Surface {
             Self::Project => "Project",
             Self::Backstage => "Backstage",
             Self::Terminal => "terminal",
+            Self::Help => "Help tab",
         }
     }
 }
@@ -75,6 +80,8 @@ pub(crate) struct Input {
     pub reach: Reach,
 }
 
+/// The Help tab's search box (#1855).
+const HELP: u32 = 1855;
 const SHEET: u32 = 1200;
 const DOC: u32 = 1201;
 const BACKSTAGE: u32 = 1202;
@@ -219,6 +226,12 @@ static REGISTRY: &[Input] = &[
         BACKSTAGE,
     ),
     input(
+        "help-search",
+        "the Help tab's search box",
+        Surface::Help,
+        HELP,
+    ),
+    input(
         "project-cell",
         "the Project grid's inline cell editor",
         Surface::Project,
@@ -339,6 +352,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
         Surface::Project => return press_project(app, i),
         Surface::Terminal => return Err(terminal_case(i)),
         Surface::Backstage => return press_info(app, i),
+        Surface::Help => return press_help(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
@@ -430,6 +444,50 @@ fn read_info(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     )
 }
 
+/// The Help tab's search box, pressed where it is drawn (#1855).
+fn press_help(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
+    app.active_help()
+        .ok_or_else(|| format!("{} is not drawn: the active tab is not a Help tab", i.name))?;
+    let b = app
+        .probes
+        .borrow()
+        .on_screen("help-search")
+        .ok_or_else(|| format!("{} is not drawn", i.name))?;
+    Ok(Press {
+        at: b.center(),
+        double: false,
+    })
+}
+
+/// `field-read {"input":"help-search"}`: the query, its caret while the
+/// box has the keys, and a whole-query selection.
+fn read_help(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
+    let v = app
+        .active_help()
+        .ok_or("the active tab is not a Help tab")?;
+    Ok(help_search_json(i.id, v))
+}
+
+fn help_search_json(id: &str, v: &crate::help_view::HelpView) -> Json {
+    let len = v.query.chars().count();
+    let focused = v.search_focused;
+    field_json(
+        id,
+        Json::Str(v.query.clone()),
+        focused,
+        if focused {
+            Json::Num(v.caret.min(len) as f64)
+        } else {
+            Json::Null
+        },
+        if v.sel && len > 0 {
+            Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+        } else {
+            Json::Null
+        },
+    )
+}
+
 /// A document input, pressed where it is drawn.
 fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     crate::harness::active_doc(app)?;
@@ -482,6 +540,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         Surface::Project => return read_project(app, i),
         Surface::Terminal => return Err(terminal_case(i)),
         Surface::Backstage => return read_info(app, i),
+        Surface::Help => return read_help(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
@@ -817,8 +876,8 @@ mod tests {
         assert_eq!(ids.len(), registry().len(), "an input id repeats");
         for i in registry() {
             assert!(
-                (SHEET..=TERMINAL).contains(&i.covered_by),
-                "{} is covered by #{}, not one of #1200-#1204",
+                (SHEET..=TERMINAL).contains(&i.covered_by) || i.covered_by == HELP,
+                "{} is covered by #{}, not one of #1200-#1204 or #1855",
                 i.id,
                 i.covered_by
             );
@@ -830,6 +889,7 @@ mod tests {
                 Surface::Backstage => BACKSTAGE,
                 Surface::Project => PROJECT,
                 Surface::Terminal => TERMINAL,
+                Surface::Help => HELP,
             };
             assert_eq!(i.covered_by, want, "{}: its surface's slice", i.id);
         }
@@ -970,6 +1030,56 @@ mod tests {
             ..RunProps::default()
         };
         assert_eq!(crate::doc_combo_value("fontsize", Some(whole)), "12");
+    }
+
+    /// #1855: the Help tab's search box is typed into with real keys by
+    /// help-docs.uit, after a real click, and read back.
+    #[test]
+    fn the_help_search_box_is_typed_into_by_its_case() {
+        let case = include_str!("../../../uiharness/cases/help-docs.uit");
+        let help: Vec<&Input> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Help)
+            .collect();
+        assert_eq!(help.len(), 1);
+        for i in help {
+            let click = format!("pointer-click {{\"input\":\"{}\"}}", i.id);
+            let read = format!("field-read {{\"input\":\"{}\"}}", i.id);
+            let at = case
+                .find(&click)
+                .unwrap_or_else(|| panic!("{}: never clicked", i.id));
+            let typed = case[at..]
+                .find("real-type ")
+                .unwrap_or_else(|| panic!("{}: never typed into", i.id));
+            assert!(case[at + typed..].contains(&read), "{}: never read", i.id);
+        }
+    }
+
+    #[test]
+    fn the_help_search_box_reads_its_query_caret_and_selection() {
+        use crate::field_edit::Op;
+        use crate::help_manual::{Editor, tests::fixture_bundle};
+        let mut v = crate::help_view::HelpView::new(
+            std::sync::Arc::new(fixture_bundle(Editor::Word)),
+            crate::help_view::Loc::page("home"),
+            None,
+        );
+        let j = help_search_json("help-search", &v);
+        assert_eq!(j.get_str("value"), Some(""));
+        assert_eq!(j.get("focused"), Some(&Json::Bool(false)));
+        v.search_focused = true;
+        v.edit_query(Op::Insert("bold"));
+        v.edit_query(Op::Left);
+        let j = help_search_json("help-search", &v);
+        assert_eq!(j.get_str("value"), Some("bold"));
+        assert_eq!(j.get_usize("caret"), Some(3));
+        assert_eq!(j.get("selection"), Some(&Json::Null));
+        v.edit_query(Op::SelectAll);
+        let j = help_search_json("help-search", &v);
+        assert_eq!(
+            j.get("selection"),
+            Some(&Json::Arr(vec![Json::Num(0.0), Json::Num(4.0)]))
+        );
     }
 
     /// #1204: every terminal editor's input is typed into by its case, and

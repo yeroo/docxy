@@ -81,6 +81,18 @@ Headings get GitHub-style slugs: the text is lowercased, spaces become `-`,
 and punctuation other than `-` and `_` is dropped. A repeated slug gets `-1`,
 `-2` and so on.
 
+## Where the suite reads a manual (#1855)
+
+The suite's Help tab reads an editor's manual from
+`<config root>/docxy/manual/<editor>/` (an installed bundle, the same layout as
+here), else the one built into the binary from `docs/manual/<editor>/`. The
+config root is `DOCXY_CONFIG_DIR` when set, else the OS's config directory. A
+bundle with no page counts as none: Help and F1 then say the documentation is
+coming. A harness instance reads only its sandbox's config root, where a
+script's `manual <editor> <dir>` line copies a bundle; the built-in manuals
+never reach a `.uit` case. Images are drawn when they are PNG, JPEG, GIF or
+BMP; any other file is a box with its alt text.
+
 ## Context help
 
 F1 resolves a context id to a page:

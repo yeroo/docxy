@@ -195,13 +195,13 @@ pub(crate) fn dialog_takes_help(d: &crate::dialog::Dialog, quitting: bool) -> bo
             d.owner,
             O::Reopen { .. }
                 | O::SaveOnClose { .. }
-                | O::Message { .. }
-                | O::DocumentRecovery { .. }
-                | O::DropReplace { .. }
+                | O::Message
+                | O::DocumentRecovery
+                | O::DropReplace
                 | O::FilterMenu { .. }
                 | O::ProjectFilter { .. }
-                | O::UserName { .. }
-                | O::About { .. }
+                | O::UserName
+                | O::About
         )
 }
 

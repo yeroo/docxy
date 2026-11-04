@@ -41465,6 +41465,8 @@ impl Render for Docxy {
                 "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save"
             } else if self.active_is_project() {
                 "Enter/F2 edit · Tab next cell · Insert blank row · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
+            } else if self.active_is_help() {
+                help_view::host::status_hint(text_input::MACOS)
             } else {
                 doc_status_hint(text_input::MACOS)
             })

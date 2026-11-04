@@ -124,8 +124,10 @@ Help tab, with File closed, and Feedback carry the same build to GitHub.
   the **Manual build** badge and the `commit` row equals `git rev-parse HEAD`.
 - The issue body lists the version, commit, branch, last PR, `dirty: yes`, `kind: local` and
   `manual build`, and **no `host:` line**.
-- F1 and Help › Help say "Help: the documentation is coming soon" on the status line. Show
-  Training and What's New are drawn disabled.
+- F1 and Help › Help say "Help: the documentation is coming soon" on the status line, as
+  long as no manual is installed or built in for that editor (`docs/manual/<editor>/` holds
+  none yet; see `qa/help-docs.md` for a build with one). Show Training and What's New are
+  drawn disabled.
 
 **Fails when:** the Help tab is missing or not last, About refuses with File closed, the badge is
 missing or the SHA is stale, Feedback opens nothing or its body names the build host, or F1 does

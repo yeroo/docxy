@@ -11,6 +11,15 @@ use std::sync::Arc;
 /// The status line after Ctrl+S on a Help tab.
 pub(crate) const HELP_NO_SAVE: &str = "Help pages are not saved; there is nothing to save";
 
+/// The status bar's hint on a Help tab: the Mac's chords on macOS.
+pub(crate) fn status_hint(macos: bool) -> &'static str {
+    if macos {
+        "⌘[ back · ⌘] forward · ⌘F search · F1 contents"
+    } else {
+        "Alt+← back · Alt+→ forward · Ctrl+F search · F1 contents"
+    }
+}
+
 /// The part name a Help tab's pictures are cached under (`DocTab::pictures`).
 pub(crate) fn picture_part(editor: Editor) -> String {
     format!("help:{}", editor.name())
@@ -322,6 +331,33 @@ impl Docxy {
     }
 }
 
+/// The first child of the scrolled body still showing at its top: the
+/// first whose bottom is below the top edge. gpui's `top_item` answers the
+/// child above when a child's top sits exactly on the edge, which is where
+/// an anchor puts its heading.
+pub(crate) fn top_block(handle: &ScrollHandle) -> usize {
+    let top = f32::from(handle.bounds().top() - handle.offset().y);
+    first_below(
+        (0..)
+            .map_while(|i| handle.bounds_for_item(i))
+            .map(|b| f32::from(b.bottom())),
+        top,
+    )
+}
+
+/// The index of the first bottom below `top` (by more than half a pixel),
+/// else the last; 0 for none.
+pub(crate) fn first_below(bottoms: impl Iterator<Item = f32>, top: f32) -> usize {
+    let mut last = 0;
+    for (i, bottom) in bottoms.enumerate() {
+        if bottom > top + 0.5 {
+            return i;
+        }
+        last = i;
+    }
+    last
+}
+
 /// Where a key scrolls the body to, as a distance from the top: a line for
 /// the arrows, a page less a line for Page Up/Down and Space, the ends for
 /// Home and End. `None` for any other key.
@@ -411,6 +447,29 @@ mod tests {
         assert_eq!(scroll_target("home", 300., 500., 1000.), Some(0.));
         assert_eq!(scroll_target("end", 0., 500., -1.), Some(0.));
         assert_eq!(scroll_target("a", 0., 500., 1000.), None);
+    }
+
+    #[test]
+    fn the_top_block_is_the_first_still_showing() {
+        let bottoms = [66., 75., 120., 400.];
+        assert_eq!(first_below(bottoms.into_iter(), 0.), 0);
+        assert_eq!(
+            first_below(bottoms.into_iter(), 66.),
+            1,
+            "a bottom on the edge has gone"
+        );
+        assert_eq!(first_below(bottoms.into_iter(), 75.), 2);
+        assert_eq!(first_below(bottoms.into_iter(), 74.), 1);
+        assert_eq!(first_below(bottoms.into_iter(), 900.), 3);
+        assert_eq!(first_below(std::iter::empty(), 10.), 0);
+    }
+
+    #[test]
+    fn the_status_bar_names_the_help_tabs_keys() {
+        assert!(status_hint(false).contains("Alt+\u{2190}"));
+        assert!(!status_hint(false).contains('\u{2318}'));
+        assert!(status_hint(true).contains("\u{2318}["));
+        assert!(!status_hint(true).contains("Ctrl"));
     }
 
     #[test]

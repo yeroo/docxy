@@ -32,7 +32,8 @@ impl Docxy {
         bg: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // A scroll a navigation asked for lands on this frame's layout.
+        // A scroll a navigation asked for: gpui places an item in this
+        // frame's prepaint, from this frame's layout of the page.
         match v.scroll_to.take() {
             Some(ScrollTo::Top) => v.scroll.set_offset(point(px(0.), px(0.))),
             Some(ScrollTo::Block(i)) => v.scroll.scroll_to_top_of_item(i),
