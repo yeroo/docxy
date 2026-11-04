@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use docxcore::package::Package;
@@ -110,6 +111,53 @@ pub fn releasable(
         .into_iter()
         .filter(|img| !live.contains(&img.id) && seen.insert(img.id))
         .collect()
+}
+
+thread_local! {
+    /// Caches no `Docxy` tab owns (#1873): an extension's embedded document
+    /// views, registered when made and pruned once dropped. The windows'
+    /// release ([`extra_live_ids`]) keeps what they still draw.
+    static EXTRA: RefCell<Vec<Weak<RefCell<Cache>>>> = const { RefCell::new(Vec::new()) };
+    /// Images such a cache gave up ([`queue_release`]), released by the next
+    /// window that renders ([`take_queued`]), which has a window for the atlas
+    /// and knows every tab's live ids. A view never reads `Docxy` itself.
+    static QUEUED: RefCell<Vec<Arc<Image>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Count `cache` among the caches outside the tabs whose images stay.
+pub fn register_extra(cache: &Rc<RefCell<Cache>>) {
+    EXTRA.with(|e| e.borrow_mut().push(Rc::downgrade(cache)));
+}
+
+/// The gpui ids the registered caches may still draw; a dropped cache is
+/// pruned. A cache borrowed at the moment (never, as everything here runs on
+/// the one UI thread outside a draw) is read as holding nothing.
+pub fn extra_live_ids() -> std::collections::HashSet<u64> {
+    EXTRA.with(|e| {
+        let mut caches = e.borrow_mut();
+        caches.retain(|w| w.strong_count() > 0);
+        caches
+            .iter()
+            .filter_map(Weak::upgrade)
+            .flat_map(|c| {
+                c.try_borrow()
+                    .map(|c| c.live_ids().collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect()
+    })
+}
+
+/// Hand images a cache outside the tabs no longer draws to the next release.
+pub fn queue_release(imgs: Vec<Arc<Image>>) {
+    if !imgs.is_empty() {
+        QUEUED.with(|q| q.borrow_mut().extend(imgs));
+    }
+}
+
+/// The images queued for release, emptying the queue.
+pub fn take_queued() -> Vec<Arc<Image>> {
+    QUEUED.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
 /// One media part a copy's picture names (#1639): its extension, content
@@ -685,5 +733,39 @@ mod tests {
             dst.part_content_type(&target).as_deref(),
             Some("image/vnd.ms-photo")
         );
+    }
+
+    /// A cache with one image read: what it holds is live.
+    fn holding() -> (Rc<RefCell<Cache>>, Arc<Image>) {
+        let (pkg, _, rid, _) = package();
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let run = docxcore::image::inline_picture_run(&rid, 9525, 9525, 1, "a.png");
+        let img = Pictures::new(&pkg, &cache).image("word/document.xml", &run);
+        (cache, img.expect("an image"))
+    }
+
+    #[test]
+    fn an_image_an_extra_cache_holds_is_not_releasable_and_a_dropped_one_is_pruned() {
+        let (cache, img) = holding();
+        register_extra(&cache);
+        let live = extra_live_ids();
+        assert!(live.contains(&img.id));
+        assert!(releasable(vec![img.clone()], &live).is_empty());
+        drop(cache);
+        let live = extra_live_ids();
+        assert!(!live.contains(&img.id));
+        assert_eq!(releasable(vec![img.clone()], &live).len(), 1);
+        EXTRA.with(|e| assert!(e.borrow().is_empty(), "the dropped cache is pruned"));
+    }
+
+    #[test]
+    fn a_queued_image_is_taken_once() {
+        let (cache, img) = holding();
+        queue_release(cache.borrow_mut().take_released(true));
+        queue_release(Vec::new());
+        let taken = take_queued();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].id, img.id);
+        assert!(take_queued().is_empty());
     }
 }

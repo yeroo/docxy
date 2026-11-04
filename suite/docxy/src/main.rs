@@ -53,6 +53,7 @@ mod doc_recovery;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
+mod doc_view;
 pub mod ext;
 mod field_edit;
 mod file_keys;
@@ -7966,11 +7967,102 @@ const FIELDS: &[(&str, &str, &str)] = &[
     ("File name", "FILENAME", ""),
 ];
 
+/// Who a drawn document's presses and drags go to (#1873): the suite's own
+/// window (its document tabs, the header/footer editor) or an extension's
+/// read-only [`doc_view::DocView`]. Each operation is what the renderer's
+/// closures did on `Docxy` before; the `Suite` arms forward to exactly those
+/// methods.
+#[derive(Clone)]
+enum DocTarget {
+    Suite(Entity<Docxy>),
+    /// The view, and where its frame's painted pieces are recorded (the
+    /// view is being drawn when they are, so they cannot go through it).
+    Embed(WeakEntity<doc_view::DocView>, doc_view::Words),
+}
+
+impl DocTarget {
+    /// Whether the suite's window draws this: only then are the painted
+    /// pieces recorded in `DOC_WORDS` / `DOC_ROWS`, which the suite's margin
+    /// drag and harness regions read.
+    fn is_suite(&self) -> bool {
+        matches!(self, DocTarget::Suite(_))
+    }
+
+    /// A press that starts a drag-selection at `off` (Shift, in `mods`,
+    /// extends the selection instead).
+    fn begin_select(
+        &self,
+        path: Vec<usize>,
+        off: usize,
+        mods: Modifiers,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match self {
+            DocTarget::Suite(ent) => ent.update(cx, |this, cx| {
+                this.begin_select(path, off, mods.shift, window, cx)
+            }),
+            DocTarget::Embed(view, _) => {
+                let _ = view.update(cx, |this, cx| {
+                    this.begin_select(path, off, mods, window, cx)
+                });
+            }
+        }
+    }
+
+    /// A move while the button is held: extend the drag-selection to `off`
+    /// when a drag is under way and there is a point (`None`: nothing beside
+    /// the pointer, which moves nothing). Whether a drag is under way.
+    fn extend_select(&self, path: Vec<usize>, off: Option<usize>, cx: &mut App) -> bool {
+        match self {
+            DocTarget::Suite(ent) => ent.update(cx, move |this, cx| {
+                if let (true, Some(off)) = (this.selecting, off) {
+                    this.extend_select(path, off, cx);
+                }
+                this.selecting
+            }),
+            DocTarget::Embed(view, _) => view
+                .update(cx, move |this, cx| this.extend_select(path, off, cx))
+                .unwrap_or(false),
+        }
+    }
+
+    /// A press that places the caret at `off` and starts no drag.
+    fn set_caret(
+        &self,
+        path: Vec<usize>,
+        off: usize,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        match self {
+            DocTarget::Suite(ent) => {
+                ent.update(cx, |this, cx| this.set_caret(path, off, extend, window, cx))
+            }
+            DocTarget::Embed(view, _) => {
+                let _ = view.update(cx, |this, cx| this.set_caret(path, off, extend, window, cx));
+            }
+        }
+    }
+
+    /// A press on a table's selection zone. The embedded view has no cell
+    /// selection, so it takes none.
+    fn table_click(&self, path: &[usize], what: TableClick, window: &mut Window, cx: &mut App) {
+        match self {
+            DocTarget::Suite(ent) => {
+                ent.update(cx, |this, cx| this.table_click(path, what, window, cx))
+            }
+            DocTarget::Embed(..) => {}
+        }
+    }
+}
+
 /// Everything a rendered word/atom needs to turn a click into a caret move: the
 /// view handle to update and the paragraph's block path. Cheap to copy (borrows).
 #[derive(Clone, Copy)]
 struct Click<'a> {
-    ent: &'a Entity<Docxy>,
+    ent: &'a DocTarget,
     path: &'a [usize],
     /// The paragraph's painted words, for a press or drag in the blank area
     /// beside its lines (#1472).
@@ -8477,22 +8569,13 @@ fn unit_drag(d: Div, c: Click, cell: UnitCell, pos: usize) -> Div {
             let (ent, path, cell) = (ent.clone(), path.clone(), cell.clone());
             move |ev, window, cx| {
                 cx.stop_propagation();
-                let extend = ev.modifiers.shift;
                 let off = unit_offset(cell.get(), pos, ev.position);
-                ent.update(cx, |this, cx| {
-                    this.begin_select(path.clone(), off, extend, window, cx)
-                });
+                ent.begin_select(path.clone(), off, ev.modifiers, window, cx);
             }
         })
         .on_mouse_move(move |ev, _window, cx| {
             let off = unit_offset(cell.get(), pos, ev.position);
-            let path = path.clone();
-            let selecting = ent.update(cx, move |this, cx| {
-                if this.selecting {
-                    this.extend_select(path, off, cx);
-                }
-                this.selecting
-            });
+            let selecting = ent.extend_select(path.clone(), Some(off), cx);
             if selecting {
                 cx.stop_propagation();
             }
@@ -8518,7 +8601,7 @@ struct RenderCtx<'a> {
     caret_path: &'a [usize],
     caret_off: usize,
     spans: &'a [(Vec<usize>, usize, usize)],
-    ent: &'a Entity<Docxy>,
+    ent: &'a DocTarget,
     pal: Pal,
     marks: bool,
     zoom: f32,
@@ -24842,6 +24925,8 @@ impl Docxy {
         for tab in &self.tabs {
             taken.extend(tab.pictures.borrow_mut().take_released(false));
         }
+        // What an extension's embedded document view gave up (#1873).
+        taken.extend(pictures::take_queued());
         if taken.is_empty() {
             return;
         }
@@ -24860,6 +24945,7 @@ impl Docxy {
             .tabs
             .iter()
             .flat_map(|t| t.pictures.borrow_mut().take_released(true))
+            .chain(pictures::take_queued())
             .collect();
         if taken.is_empty() {
             return;
@@ -24872,7 +24958,9 @@ impl Docxy {
     /// It reads each other window's `Docxy`, so it must not run inside
     /// another window's update; this window's own is skipped.
     fn other_windows_picture_ids(&self, cx: &App) -> std::collections::HashSet<u64> {
-        let mut live = std::collections::HashSet::new();
+        // An extension's embedded document views count wherever they are
+        // (#1873): they are no window's tabs.
+        let mut live = pictures::extra_live_ids();
         for (id, view, _) in windows::entries_snapshot(cx) {
             if id == self.win_id {
                 continue;
@@ -33098,22 +33186,13 @@ fn emit_words(
                             let off_at = off_at.clone();
                             move |ev, window, cx| {
                                 cx.stop_propagation();
-                                let extend = ev.modifiers.shift;
                                 let off = off_at(ev.position);
-                                ent.update(cx, |this, cx| {
-                                    this.begin_select(path.clone(), off, extend, window, cx)
-                                });
+                                ent.begin_select(path.clone(), off, ev.modifiers, window, cx);
                             }
                         })
                         .on_mouse_move(move |ev, _window, cx| {
                             let off = off_at(ev.position);
-                            let path = path.clone();
-                            let selecting = ent.update(cx, move |this, cx| {
-                                if this.selecting {
-                                    this.extend_select(path, off, cx);
-                                }
-                                this.selecting
-                            });
+                            let selecting = ent.extend_select(path.clone(), Some(off), cx);
                             // The word owns the drag: the paragraph's own move
                             // handler, for the blank area, stays out (#1472).
                             if selecting {
@@ -34548,23 +34627,24 @@ fn paragraph_el(
                 .on_mouse_down(MouseButton::Left, {
                     let (ent, path, words) = (ent.clone(), path.clone(), words.clone());
                     move |ev, window, cx| {
-                        let extend = ev.modifiers.shift;
                         let hit = words_line_end_hit(&words, ev.position, para_end);
-                        ent.update(cx, |this, cx| match hit {
-                            Some(off) => this.begin_select(path.clone(), off, extend, window, cx),
-                            None => this.set_caret(path.clone(), para_end, extend, window, cx),
-                        });
+                        match hit {
+                            Some(off) => {
+                                ent.begin_select(path.clone(), off, ev.modifiers, window, cx)
+                            }
+                            None => ent.set_caret(
+                                path.clone(),
+                                para_end,
+                                ev.modifiers.shift,
+                                window,
+                                cx,
+                            ),
+                        }
                     }
                 })
                 .on_mouse_move(move |ev, _window, cx| {
                     let hit = words_line_end_hit(&words, ev.position, para_end);
-                    let path = path.clone();
-                    let selecting = ent.update(cx, move |this, cx| {
-                        if let (true, Some(off)) = (this.selecting, hit) {
-                            this.extend_select(path, off, cx);
-                        }
-                        this.selecting
-                    });
+                    let selecting = ent.extend_select(path.clone(), hit, cx);
                     // A paragraph under the pointer owns the drag; the window's
                     // handler for a pointer on no paragraph stays out.
                     if selecting {
@@ -34670,12 +34750,12 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         let path = path.to_vec();
         move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
             cx.stop_propagation();
-            ent.update(cx, |this, cx| this.table_click(&path, what, window, cx));
+            ent.table_click(&path, what, window, cx);
         }
     };
     // A top-level table's painted cells, for a drag in the margin beside it
     // (#1477).
-    let margin_rows = ctx.active && !hf && path.len() == 1;
+    let margin_rows = ctx.active && !hf && path.len() == 1 && ctx.ent.is_suite();
     let mut rows = Vec::new();
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
@@ -34959,7 +35039,15 @@ fn block_el_numbered(
                 .flatten();
             let words = WordSpans::default();
             if ctx.active && ctx.hf_width.is_none() {
-                DOC_WORDS.with(|d| d.borrow_mut().push((path.clone(), words.clone())));
+                match ctx.ent {
+                    DocTarget::Suite(_) => {
+                        DOC_WORDS.with(|d| d.borrow_mut().push((path.clone(), words.clone())))
+                    }
+                    // The embedded view keeps its own (#1873).
+                    DocTarget::Embed(_, drawn) => {
+                        drawn.borrow_mut().push((path.clone(), words.clone()))
+                    }
+                }
             }
             let click = ctx.active.then_some(Click {
                 ent: ctx.ent,
@@ -40685,7 +40773,8 @@ impl Render for Docxy {
                         Vec::new()
                     };
                     let markers = list_markers(&shown.body);
-                    let ent = cx.entity();
+                    let doc_ent = cx.entity();
+                    let ent = DocTarget::Suite(doc_ent.clone());
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
                     // surface; its ink comes from `design_tab::page_ink`.
@@ -41146,7 +41235,7 @@ impl Render for Docxy {
                                 // open, a double-click in the body returns to it (PAG-066);
                                 // a single click does nothing, as in Word.
                                 let dbl = |area: PageArea| {
-                                    let ent = ent.clone();
+                                    let ent = doc_ent.clone();
                                     move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                                         if ev.click_count >= 2 {
                                             ent.update(cx, |this, cx| {
