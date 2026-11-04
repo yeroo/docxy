@@ -1042,8 +1042,9 @@
   and the renderer read the same command. A plugin swatch gallery
   (`plugin_ui::is_swatch_gallery`, one predicate for `Docxy::swatch_gallery`
   and `ribbon_fit::gallery_geom`) draws bare tiles, so its estimate has no
-  well `frame`: `n * w + (n - 1) * gap`. It is never capped, so a wide gallery
-  collapses honestly; `fit_with` keeps no state, so a group collapsed at a
+  well `frame`: `n * w + (n - 1) * gap`. In place it is bounded to
+  `IN_PLACE_TILES` tiles plus the More button's gap and `MORE_W` (#1823), so a
+  long gallery no longer collapses its group by width alone; `fit_with` keeps no state, so a group collapsed at a
   narrow width is full again at a wide one (`plugin_ui` tests pin both).
 - `fit_with` ends with a back-fill (#1763): once the collapse passes fit, groups
   they took too early (a wider group's collapse can free more than the small
@@ -1696,7 +1697,7 @@
   colours; proportions are by estimate, no capture of Project's tile is in
   this repository), `gallery_layout` (a header row per run of equal non-empty
   sections, every section on a new row) and `span_of`/`gallery_span` (in a
-  flyout the longest section run, in place every tile: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
+  flyout the longest section run, in place at most `IN_PLACE_TILES`, #1823: what `ribbon_fit::model_control_w` and `Docxy::swatch_gallery`
   both wrap by, so the estimate is the width drawn). Height is
   `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
   A palette tile shows no label, its label is the tooltip. Sections show in
@@ -1711,7 +1712,8 @@
 
 - An in-place swatch gallery is bounded (#1823): it shows at most
   `plugin_ui::IN_PLACE_TILES` (6, an estimate: no capture of Project's) tiles,
-  `in_place_window` (the first six, or the six ending on the checked swatch),
+  `in_place_window` (the first six, or the six ending on the checked swatch;
+  `gallery_rows(.., None, .., checked)` is that one strip),
   and, when it has more, a `MORE_W` (16 px) More button after a gap (probe
   `gallery-more-<id>`) that opens `FlyoutTarget::Gallery`, the whole gallery
   with its sections. `gallery_span(.., None)` and `more_w` are what
@@ -1720,8 +1722,9 @@
   Some) wraps every tile and has no More button. No scroll arrows: the
   flyout shows the rest. The Styles and Table Styles wells are unchanged.
   `ribbon-read` adds `shown`, `first_shown` and `more` to each `galleries`
-  entry. The fixture's `fixture.wide` (nine swatches, group "Fixture Wide"
-  before "Fixture Styles" on the View tab) is the bounded one in
+  entry; `gallery-more:<id>` is the More button's region. The fixture's
+  `fixture.wide` (nine swatches, group "Fixture Wide" on the Report tab,
+  which has room) is the bounded one in
   `project-plugin-ui.uit`.
 
 - A gallery has a KeyTip (#1762): `ribbonspec::Gallery::key_tip` (`""` for every

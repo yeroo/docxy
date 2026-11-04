@@ -920,6 +920,11 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or("'ribbon-launch' needs a group title, e.g. ribbon-launch:Number")?;
             Ok(full.clone())
         }
+        "gallery-more" => {
+            arg.filter(|a| !a.is_empty())
+                .ok_or("'gallery-more' needs a gallery id, e.g. gallery-more:fixture.wide")?;
+            Ok(full.clone())
+        }
         "filter-button" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -1731,6 +1736,8 @@ test Smoke-Case
         assert!(validate_region("ribbon-group").is_err());
         assert!(validate_region("ribbon-group:x").is_err());
         assert!(validate_region("ribbon-launch").is_err());
+        assert!(validate_region("gallery-more").is_err());
+        assert!(validate_region("gallery-more:fixture.wide").is_ok());
     }
 
     #[test]

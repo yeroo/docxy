@@ -2295,7 +2295,7 @@ fn a_gallery_in_place_is_one_strip_and_its_flyout_shows_the_sections() {
     // In place: one row of every tile (five, under the bound of #1823), no
     // headers, 62 px high.
     assert_eq!(gallery_span(&gal, None), n);
-    let rows = gallery_rows(&gal, None, n);
+    let rows = gallery_rows(&gal, None, n, None);
     assert_eq!(rows, [Row::Tiles(0, n)]);
     assert_eq!(layout_height(&rows, t.h, t.gap), t.h);
     let control = Control::Gallery(gal);
@@ -2317,7 +2317,7 @@ fn a_gallery_in_place_is_one_strip_and_its_flyout_shows_the_sections() {
         Some(140.),
     );
     assert_eq!((k, w), (2, 2. * t.w + t.gap));
-    let rows = gallery_rows(gal, Some(140.), k);
+    let rows = gallery_rows(gal, Some(140.), k, None);
     // 2 headers, 2 tile rows of Scheduling (3 -> 2 + 1), 1 of Presentation.
     assert_eq!(rows.len(), 2 + 2 + 1);
     let expect = 3. * t.h + 2. * HEADER_H + 4. * t.gap;
@@ -2427,7 +2427,7 @@ fn a_flyout_swatch_gallery_still_wraps_every_tile() {
     let (k, w) = ribbon_fit::gallery_row(ribbon_fit::gallery_geom(gal), 11, Some(400.));
     let est = ribbon_fit::model_control_w(font_control(&tab, 0), false, Some(400.), &tw);
     assert_eq!(est, w);
-    let rows = gallery_rows(gal, Some(400.), k);
+    let rows = gallery_rows(gal, Some(400.), k, None);
     let shown: usize = rows
         .iter()
         .map(|r| match r {
@@ -2436,6 +2436,13 @@ fn a_flyout_swatch_gallery_still_wraps_every_tile() {
         })
         .sum();
     assert_eq!(shown, 11);
+    // In place the rows are the bounded window, the checked tile kept in it.
+    let k = IN_PLACE_TILES;
+    assert_eq!(gallery_rows(gal, None, k, None), [Row::Tiles(0, k)]);
+    assert_eq!(
+        gallery_rows(gal, None, k, Some(9)),
+        [Row::Tiles(10 - k, 10)]
+    );
 }
 
 #[test]

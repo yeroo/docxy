@@ -164,18 +164,21 @@ pub(crate) fn more_w<A>(gal: &rs::Gallery<A>, max_w: Option<f32>, gap: f32) -> f
     }
 }
 
-/// The rows `gal` is laid out in at `per_row` tiles a row: sections with their
-/// headers in a flyout, one plain wrap in place (`max_w` None).
+/// The rows `gal` is laid out in: in a flyout (`max_w` given) every tile at
+/// `per_row` a row, sections under their headers; in place (`max_w` None) one
+/// strip of the [`in_place_window`] tiles, the `checked` one among them, no
+/// headers (#1823).
 pub(crate) fn gallery_rows<A>(
     gal: &rs::Gallery<A>,
     max_w: Option<f32>,
     per_row: usize,
+    checked: Option<usize>,
 ) -> Vec<Row> {
-    let sections: Vec<&str> = gal
-        .items
-        .iter()
-        .map(|it| if max_w.is_some() { it.section } else { "" })
-        .collect();
+    if max_w.is_none() {
+        let w = in_place_window(gal.items.len(), checked);
+        return vec![Row::Tiles(w.start, w.end)];
+    }
+    let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
     gallery_layout(&sections, per_row)
 }
 

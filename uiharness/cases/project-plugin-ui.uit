@@ -366,26 +366,27 @@ test a swatch gallery draws palette tiles under section headers
   call window-size {"w":1180,"h":800}
 
 test a long swatch gallery is bounded in place and its More button opens it whole
-  # #1823: "Fixture Wide" holds nine swatches. In place it draws six and a More button, and the
-  # estimate is the width drawn; the six-tile "Fixture Styles" has no More button. More opens
-  # the whole gallery as a flyout.
+  # #1823: "Fixture Wide" (on the Report tab, which has room) holds nine swatches. In place it
+  # draws six and a More button, and the estimate is the width drawn; the six-tile "Fixture
+  # Styles" has no More button. More opens the whole gallery as a flyout.
   open copy:../fixtures/project-clipboard.xml
-  call window-size {"w":1400,"h":800}
   call ribbon-read {}
-  assert reply.tabs.5.groups.-2.title is Fixture Wide
-  assert reply.tabs.5.groups.-2.galleries.0.id is fixture.wide
-  assert reply.tabs.5.groups.-2.galleries.0.shown is 6
-  assert reply.tabs.5.groups.-2.galleries.0.first_shown is 0
-  assert reply.tabs.5.groups.-2.galleries.0.more is true
+  assert reply.tabs.3.name is Report
+  assert reply.tabs.3.groups.-1.title is Fixture Wide
+  assert reply.tabs.3.groups.-1.galleries.0.id is fixture.wide
+  assert reply.tabs.3.groups.-1.galleries.0.shown is 6
+  assert reply.tabs.3.groups.-1.galleries.0.first_shown is 0
+  assert reply.tabs.3.groups.-1.galleries.0.more is true
   assert reply.tabs.5.groups.-1.galleries.0.shown is 6
   assert reply.tabs.5.groups.-1.galleries.0.more is false
-  call ribbon-layout {"tab":"View"}
+  call ribbon-layout {"tab":"Report"}
   shot window
-  call ribbon-layout {"tab":"View"}
+  call ribbon-layout {"tab":"Report"}
   assert reply.settled is true
   assert reply.estimates_ok is true
-  assert reply.groups.-2.title is Fixture Wide
-  assert reply.groups.-2.state is full
+  assert reply.any_clipped is false
+  assert reply.groups.-1.title is Fixture Wide
+  assert reply.groups.-1.state is full
   call ribbon-flyout {"action":"read"}
   assert reply.open is false
   call pointer-click {"region":"gallery-more:fixture.wide"}
@@ -394,7 +395,6 @@ test a long swatch gallery is bounded in place and its More button opens it whol
   assert reply.gallery is fixture.wide
   shot ribbon-flyout
   call ribbon-flyout {"action":"close"}
-  call window-size {"w":1180,"h":800}
 
 test a contributed gallery's KeyTip is drawn and opens its flyout
   # #1762: "Fixture Styles" declares the KeyTip XG. With Alt then the View tab (W) up, typing X waits

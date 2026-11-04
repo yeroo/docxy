@@ -37924,12 +37924,7 @@ impl Docxy {
         // In place a long gallery shows a window of its tiles, the checked one
         // in it, and a More button for the rest (#1823).
         let more = plugin_ui::more_w(gal, max_w, g.gap);
-        let layout = if max_w.is_none() {
-            let w = plugin_ui::in_place_window(gal.items.len(), self.gallery_checked_index(gal));
-            vec![plugin_ui::Row::Tiles(w.start, w.end)]
-        } else {
-            plugin_ui::gallery_rows(gal, max_w, per_row)
-        };
+        let layout = plugin_ui::gallery_rows(gal, max_w, per_row, self.gallery_checked_index(gal));
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);

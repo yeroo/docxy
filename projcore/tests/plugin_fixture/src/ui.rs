@@ -14,9 +14,9 @@
 //!   On the Gantt Chart Format tab a second group "Fixture Percent" after
 //!   "Fixture Format" declares `priority` 120 and holds five small labelled
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
-//! - On the View tab a group "Fixture Wide" (priority 1) before "Fixture
-//!   Styles" holds `fixture.wide`, nine colour swatches: in place a window of
-//!   six and a More button (#1823). Its swatches are not commands.
+//! - On the Report tab a group "Fixture Wide" holds `fixture.wide`, nine
+//!   colour swatches: in place a window of six and a More button (#1823). Its
+//!   swatches are not commands.
 //! - Menus: a row-menu item `fixture.rename` after "Notes...", and
 //!   `fixture.mark` after it (#1667).
 //! - Dialogs: a Task Information page "Fixture" with a multiline, a grid and
@@ -108,7 +108,7 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
     {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]},
-    {"tab":"View","groups":[{"title":"Fixture Wide","priority":1,"controls":[
+    {"tab":"Report","groups":[{"title":"Fixture Wide","priority":1,"controls":[
     {"id":"fixture.wide","kind":"gallery","label":"Wide","tip":"Nine colour swatches: in place a window of six and a More button (#1823)","swatches":[
       {"id":"fixture.wide.0","label":"Wide 0","color":"#3366CC"},
       {"id":"fixture.wide.1","label":"Wide 1","color":"#CC3333"},
@@ -118,8 +118,8 @@ const MANIFEST: &str = r##"{
       {"id":"fixture.wide.5","label":"Wide 5","color":"#33AAAA"},
       {"id":"fixture.wide.6","label":"Wide 6","color":"#AA3388"},
       {"id":"fixture.wide.7","label":"Wide 7","color":"#555555"},
-      {"id":"fixture.wide.8","label":"Wide 8","color":"#88AA22"}]}]},
-    {"title":"Fixture Styles","priority":0,"controls":[
+      {"id":"fixture.wide.8","label":"Wide 8","color":"#88AA22"}]}]}]},
+    {"tab":"View","groups":[{"title":"Fixture Styles","priority":0,"controls":[
     {"id":"fixture.styles","kind":"gallery","label":"Styles","keytip":"XG","tip":"Two sections of palette tiles (#1761)","swatches":[
       {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
       {"id":"fixture.styles.1","label":"Red one","section":"Scheduling Styles","preview":"fixture.red","color":"#CC3333"},
