@@ -420,12 +420,15 @@ pub(crate) fn model_control_w<A: 'static>(
             })
             .fold(0.0, f32::max),
         Control::Gallery(gal) => {
-            gallery_row(
-                gallery_geom(gal),
-                crate::plugin_ui::gallery_span(gal, max_w),
-                max_w,
-            )
-            .1
+            let geom = gallery_geom(gal);
+            // A swatch gallery in place is bounded, with a More button
+            // (#1823); the Styles and Table Styles wells show every tile.
+            if crate::plugin_ui::is_swatch_gallery(gal) {
+                let span = crate::plugin_ui::gallery_span(gal, max_w);
+                gallery_row(geom, span, max_w).1 + crate::plugin_ui::more_w(gal, max_w, geom.gap)
+            } else {
+                gallery_row(geom, gal.items.len(), max_w).1
+            }
         }
         // A 1px rule with `mx_1`.
         Control::Separator => 9.0,

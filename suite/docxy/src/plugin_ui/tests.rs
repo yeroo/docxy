@@ -1409,9 +1409,11 @@ fn a_swatch_gallerys_estimate_is_the_width_it_draws() {
     };
     assert!(is_swatch_gallery(gal));
     let t = crate::style_gallery::TILE;
-    let n = gal.items.len() as f32;
-    // `Docxy::swatch_gallery` draws `per_row * w + (per_row - 1) * gap`.
-    let drawn = n * t.w + (n - 1.0) * t.gap;
+    // `Docxy::swatch_gallery` draws `per_row * w + (per_row - 1) * gap`, in
+    // place at most `IN_PLACE_TILES` tiles, then a gap and the More button
+    // (#1823).
+    let n = IN_PLACE_TILES as f32;
+    let drawn = n * t.w + (n - 1.0) * t.gap + t.gap + MORE_W;
     let tw = ribbon_fit::approx_tw;
     let control = &task.groups.last().unwrap().items[0];
     assert_eq!(
@@ -2290,7 +2292,8 @@ fn a_gallery_in_place_is_one_strip_and_its_flyout_shows_the_sections() {
     let t = crate::style_gallery::TILE;
     let tw = ribbon_fit::approx_tw;
     let n = gal.items.len();
-    // In place: every tile on one row, no headers, 62 px high.
+    // In place: one row of every tile (five, under the bound of #1823), no
+    // headers, 62 px high.
     assert_eq!(gallery_span(&gal, None), n);
     let rows = gallery_rows(&gal, None, n);
     assert_eq!(rows, [Row::Tiles(0, n)]);
@@ -2343,4 +2346,133 @@ fn a_palette_tiles_link_leaves_the_on_track_bar_under_the_diamond() {
     for m in &marks {
         assert!(m.x >= 0. && m.x + m.w <= w && m.y + m.h <= h, "{m:?}");
     }
+}
+
+// ---- a bounded in-place swatch gallery (#1823) ----
+
+/// A Task tab with a "Font" group of one gallery per entry of `counts`, each of
+/// that many colour swatches.
+fn galleries_tab(counts: &[usize], priority: u8) -> rs::Tab<Act> {
+    let galleries: Vec<String> = counts
+        .iter()
+        .enumerate()
+        .map(|(g, n)| {
+            let sw: Vec<String> = (0..*n)
+                .map(|i| format!(r##"{{"id":"g{g}.{i}","label":"S{i}","color":"#3366CC"}}"##))
+                .collect();
+            format!(
+                r#"{{"id":"g{g}","kind":"gallery","label":"G{g}","swatches":[{}]}}"#,
+                sw.join(",")
+            )
+        })
+        .collect();
+    extended(&format!(
+        r#"{{"ribbon":[{{"tab":"Task","groups":[{{"title":"Font","priority":{priority},"controls":[{}]}}]}}]}}"#,
+        galleries.join(",")
+    ))
+}
+
+fn font_control(tab: &rs::Tab<Act>, i: usize) -> &Control<Act> {
+    &tab.groups.iter().find(|g| g.title == "Font").unwrap().items[i]
+}
+
+fn font_gallery(tab: &rs::Tab<Act>, i: usize) -> &rs::Gallery<Act> {
+    let Control::Gallery(gal) = font_control(tab, i) else {
+        panic!("a gallery");
+    };
+    gal
+}
+
+#[test]
+fn an_in_place_swatch_gallery_is_bounded() {
+    let t = crate::style_gallery::TILE;
+    let tw = ribbon_fit::approx_tw;
+    let tab = galleries_tab(&[11, 24], 50);
+    let k = IN_PLACE_TILES as f32;
+    let bounded = k * t.w + (k - 1.) * t.gap + t.gap + MORE_W;
+    for i in 0..2 {
+        let gal = font_gallery(&tab, i);
+        assert!(is_swatch_gallery(gal));
+        assert_eq!(gallery_span(gal, None), IN_PLACE_TILES);
+        let w = ribbon_fit::model_control_w(font_control(&tab, i), false, None, &tw);
+        assert_eq!(w, bounded, "gallery {i}: six tiles and the More button");
+    }
+}
+
+#[test]
+fn a_short_swatch_gallery_has_no_more_button() {
+    let t = crate::style_gallery::TILE;
+    let tw = ribbon_fit::approx_tw;
+    for n in [1, IN_PLACE_TILES] {
+        let tab = galleries_tab(&[n], 50);
+        let gal = font_gallery(&tab, 0);
+        assert!(!in_place_more(n));
+        assert_eq!(more_w(gal, None, t.gap), 0.0);
+        let k = n as f32;
+        let w = ribbon_fit::model_control_w(font_control(&tab, 0), false, None, &tw);
+        assert_eq!(w, k * t.w + (k - 1.) * t.gap);
+    }
+    assert!(in_place_more(IN_PLACE_TILES + 1));
+}
+
+#[test]
+fn a_flyout_swatch_gallery_still_wraps_every_tile() {
+    let t = crate::style_gallery::TILE;
+    let tw = ribbon_fit::approx_tw;
+    let tab = galleries_tab(&[11], 50);
+    let gal = font_gallery(&tab, 0);
+    // A flyout shows all eleven, wrapped, with no More button.
+    assert_eq!(gallery_span(gal, Some(400.)), 11);
+    assert_eq!(more_w(gal, Some(400.), t.gap), 0.0);
+    let (k, w) = ribbon_fit::gallery_row(ribbon_fit::gallery_geom(gal), 11, Some(400.));
+    let est = ribbon_fit::model_control_w(font_control(&tab, 0), false, Some(400.), &tw);
+    assert_eq!(est, w);
+    let rows = gallery_rows(gal, Some(400.), k);
+    let shown: usize = rows
+        .iter()
+        .map(|r| match r {
+            Row::Tiles(a, b) => b - a,
+            Row::Header(_) => 0,
+        })
+        .sum();
+    assert_eq!(shown, 11);
+}
+
+#[test]
+fn two_eleven_tile_galleries_fit_a_1600_px_ribbon() {
+    let tab = galleries_tab(&[11, 11], 255);
+    let specs: Vec<ribbon_fit::Spec> = tab
+        .groups
+        .iter()
+        .map(|g| ribbon_fit::model_spec(g, &ribbon_fit::approx_tw))
+        .collect();
+    let font = tab.groups.iter().position(|g| g.title == "Font").unwrap();
+    assert!(
+        specs[font].full < 1600.,
+        "the group is {} px",
+        specs[font].full
+    );
+    for back_fill in [true, false] {
+        let fit = ribbon_fit::fit_passes(&specs, 1600., ribbon_fit::Policy::WholeGroups, back_fill);
+        assert_eq!(
+            fit.states[font],
+            ribbon_fit::State::Full,
+            "back-fill {back_fill}"
+        );
+    }
+}
+
+#[test]
+fn the_in_place_window_keeps_the_checked_tile_shown() {
+    let k = IN_PLACE_TILES;
+    let n = 11;
+    assert_eq!(in_place_window(n, None), 0..k);
+    assert_eq!(in_place_window(n, Some(0)), 0..k);
+    assert_eq!(in_place_window(n, Some(k - 1)), 0..k);
+    assert_eq!(in_place_window(n, Some(k)), 1..k + 1);
+    assert_eq!(in_place_window(n, Some(n - 1)), n - k..n);
+    // Out of range is no checked tile; a short gallery shows every tile.
+    assert_eq!(in_place_window(n, Some(n)), 0..k);
+    assert_eq!(in_place_window(3, Some(2)), 0..3);
+    assert_eq!(in_place_window(0, None), 0..0);
 }

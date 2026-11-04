@@ -923,6 +923,8 @@ pub enum Region {
     /// place on the tab shown (#1164; any ribbon's group, a plugin's
     /// included, #1669).
     RibbonLaunch(&'static str),
+    /// A bounded in-place swatch gallery's More button, by gallery id (#1823).
+    GalleryMore(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -1023,6 +1025,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             // matched against the shown tab's groups when the region is
             // measured (`launch_title`).
             Ok(Region::RibbonLaunch(crate::plugin_ui::intern(a)))
+        }
+        "gallery-more" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'gallery-more' needs a gallery id, e.g. gallery-more:fixture.wide")?;
+            Ok(Region::GalleryMore(crate::plugin_ui::intern(a)))
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
@@ -1175,6 +1183,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonFlyout => "ribbon-flyout".into(),
         Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
         Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
+        Region::GalleryMore(id) => format!("gallery-more:{id}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
@@ -2881,9 +2890,24 @@ fn tab_json(
             for control in &group.items {
                 control_commands(control, &mut commands);
                 if let crate::Control::Gallery(g) = control {
+                    // A swatch gallery in place shows a window of its tiles,
+                    // the checked one in it, and a More button (#1823).
+                    let swatch = crate::plugin_ui::is_swatch_gallery(g);
+                    let mut tiles = Vec::new();
+                    control_commands(control, &mut tiles);
+                    let checked_at = tiles.iter().position(|c| checked(c));
+                    let window = if swatch {
+                        crate::plugin_ui::in_place_window(g.items.len(), checked_at)
+                    } else {
+                        0..g.items.len()
+                    };
+                    let more = swatch && crate::plugin_ui::in_place_more(g.items.len());
                     galleries.push(Json::obj(vec![
                         ("id", Json::Str(g.id.into())),
                         ("key_tip", Json::Str(g.key_tip.into())),
+                        ("shown", Json::Num(window.len() as f64)),
+                        ("first_shown", Json::Num(window.start as f64)),
+                        ("more", Json::Bool(more)),
                         (
                             "items",
                             Json::Arr(g.items.iter().map(|i| Json::Str(i.label.into())).collect()),
@@ -9756,6 +9780,7 @@ mod tests {
             Region::RibbonGroup(6),
             Region::RibbonLaunch("Number"),
             Region::RibbonLaunch("Page Setup"),
+            Region::GalleryMore("fixture.wide"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),

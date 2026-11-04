@@ -17528,6 +17528,8 @@ impl Docxy {
                 lookup(&self.probes.borrow(), &format!("ribbon-launch:{title}"))
                     .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn"))
             }
+            Region::GalleryMore(id) => lookup(&self.probes.borrow(), &format!("gallery-more-{id}"))
+                .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -37919,7 +37921,15 @@ impl Docxy {
         let geom = ribbon_fit::gallery_geom(gal);
         let (per_row, _) =
             ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal, max_w), max_w);
-        let layout = plugin_ui::gallery_rows(gal, max_w, per_row);
+        // In place a long gallery shows a window of its tiles, the checked one
+        // in it, and a More button for the rest (#1823).
+        let more = plugin_ui::more_w(gal, max_w, g.gap);
+        let layout = if max_w.is_none() {
+            let w = plugin_ui::in_place_window(gal.items.len(), self.gallery_checked_index(gal));
+            vec![plugin_ui::Row::Tiles(w.start, w.end)]
+        } else {
+            plugin_ui::gallery_rows(gal, max_w, per_row)
+        };
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);
@@ -38021,7 +38031,7 @@ impl Docxy {
         let keytip =
             (self.keytips == KeyTip::Commands && max_w.is_none() && !gal.key_tip.is_empty())
                 .then_some(gal.key_tip);
-        div()
+        let tiles = div()
             .id(gal.id)
             .relative()
             .flex()
@@ -38034,7 +38044,50 @@ impl Docxy {
             })
             .children(rows)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+            .into_any_element();
+        if more == 0.0 {
+            return tiles;
+        }
+        let id = gal.id;
+        let more_btn = div()
+            .id(SharedString::from(format!("gallery-more-{id}")))
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(plugin_ui::MORE_W))
+            .h(px(g.h))
+            .rounded(px(g.radius))
+            .border(px(g.border))
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .text_size(px(g.name_size))
+            .text_color(pal.fg)
+            .cursor_pointer()
+            .hover(move |d| d.bg(pal.hover))
+            .child("▾")
+            .child(probe(&self.probes, format!("gallery-more-{id}")))
+            .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_ribbon_flyout(FlyoutTarget::Gallery(id));
+                cx.notify();
+            }));
+        h_flex()
+            .flex_none()
+            .items_start()
+            .gap(px(g.gap))
+            .child(tiles)
+            .child(more_btn)
             .into_any_element()
+    }
+
+    /// The index of `gal`'s checked tile, when one is (#1823: the in-place
+    /// window keeps it shown).
+    fn gallery_checked_index(&self, gal: &rs::Gallery<Act>) -> Option<usize> {
+        gal.items
+            .iter()
+            .position(|it| self.gallery_item_selected(it.act))
     }
 
     /// The Styles gallery: a well of fixed-size tiles, each a live "AaBbCc" in
