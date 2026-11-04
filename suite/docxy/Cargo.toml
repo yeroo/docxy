@@ -1,5 +1,5 @@
 [package]
-name = "docxy"
+name = "docxy-suite"
 description = "docxy — the doc-centric desktop suite: docs / sheets / mail in tabs, on GPUI."
 version.workspace = true
 edition.workspace = true
@@ -7,13 +7,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
+# src/main.rs is the library's root, not a binary (see [lib] below).
+autobins = false
 
 # The app is branded "docxy" (shown in the UI), but the produced executable is
 # `suite.exe` so it never collides with the existing terminal `docxy` binary in
 # the root workspace.
+# The suite is a library (`run`, rooted at src/main.rs, where it has always
+# lived) so a build that links an extension can start it; the public binary
+# below passes none.
+[lib]
+name = "docxy_suite"
+path = "src/main.rs"
+
 [[bin]]
 name = "suite"
-path = "src/main.rs"
+path = "src/bin/suite.rs"
 
 [lints]
 workspace = true
