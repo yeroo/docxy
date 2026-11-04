@@ -888,6 +888,24 @@ impl<'a> Html<'a> {
         }
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
+        let kind = Kind::of(name);
+        // Omitted table end tags (#1872 r3): a cell ends the open cell of its
+        // row, a row the open cell and row of its table, a row group both
+        // and the open row group; never across a nested table.
+        const ROW_GROUPS: [&str; 3] = ["thead", "tbody", "tfoot"];
+        match name {
+            "td" | "th" => {
+                self.close_open(&["td", "th"], &["tr", "table", "thead", "tbody", "tfoot"])
+            }
+            "tr" | "thead" | "tbody" | "tfoot" => {
+                self.close_open(&["td", "th"], &["tr", "table", "thead", "tbody", "tfoot"]);
+                self.close_open(&["tr"], &["table", "thead", "tbody", "tfoot"]);
+                if ROW_GROUPS.contains(&name) {
+                    self.close_open(&ROW_GROUPS, &["table"]);
+                }
+            }
+            _ => {}
+        }
         // Malformed input (#1872 13): a block closes an open `p`, an `li` an
         // open `li` of the same list, a `dt` / `dd` an open `dt` / `dd`.
         if matches!(
@@ -914,11 +932,11 @@ impl<'a> Html<'a> {
                 | "dd"
                 | "listing"
                 | "xmp"
-        ) || CONTAINERS.contains(&name)
+        ) || kind == Kind::Container
         {
             self.implicit_close(&["p"]);
         }
-        if CONTAINERS.contains(&name) {
+        if kind == Kind::Container {
             self.end_para_if_any();
         }
         match name {
@@ -926,7 +944,6 @@ impl<'a> Html<'a> {
             "dt" | "dd" => self.implicit_close(&["dt", "dd"]),
             _ => {}
         }
-        let kind = Kind::of(name);
         let key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
         if name == "span"
             && attrs
@@ -1117,7 +1134,7 @@ impl<'a> Html<'a> {
                 found = Some(i);
                 break;
             }
-            if matches!(e.kind, Kind::Cell | Kind::Table) || (list_bound && e.kind == Kind::List) {
+            if e.kind.table() || (list_bound && e.kind == Kind::List) {
                 break;
             }
         }
@@ -1126,7 +1143,9 @@ impl<'a> Html<'a> {
         };
         self.end_para_if_any();
         let tag = self.elems[i].key.tag.clone();
+        let lists_at = self.elems[i].lists_at;
         self.truncate_elems(i);
+        self.lists.truncate(lists_at);
         if let Some(j) = self.blocks.iter().rposition(|(n, _)| *n == tag) {
             if !self.blocks[j + 1..]
                 .iter()
@@ -1241,21 +1260,43 @@ impl<'a> Html<'a> {
         }
         if kind == Kind::Container || (kind == Kind::Other && over_structure) {
             self.end_para_if_any();
-            let (blocks_at, lists_at) = (self.elems[i].blocks_at, self.elems[i].lists_at);
-            self.blocks.truncate(blocks_at);
-            self.lists.truncate(lists_at);
-            self.recount_pre();
         }
+        // The blocks and lists opened inside it end with it (#1872 r3: a
+        // `</div>` or `</td>` over an unclosed `ul` ended no list).
+        let (blocks_at, lists_at) = (self.elems[i].blocks_at, self.elems[i].lists_at);
+        self.blocks.truncate(blocks_at);
+        self.lists.truncate(lists_at);
+        self.recount_pre();
         self.truncate_elems(i);
+    }
+
+    /// Close the innermost open element named in `tags` (through
+    /// [`Self::close_tag`], so the cell or row ends in the document too),
+    /// unless one named in `bounds` is open above it.
+    fn close_open(&mut self, tags: &[&str], bounds: &[&str]) {
+        if !self.budget.work(self.elems.len() / 16 + 1) {
+            return;
+        }
+        let mut found = None;
+        for e in self.elems.iter().rev() {
+            let t = e.key.tag.as_str();
+            if tags.contains(&t) {
+                found = Some(t.to_string());
+                break;
+            }
+            if bounds.contains(&t) {
+                break;
+            }
+        }
+        if let Some(tag) = found {
+            self.close_tag(&tag);
+        }
     }
 
     /// Whether closing `name` would reach across an open table or cell (a
     /// browser ignores such a close): `</ul>` in a cell of a table in an `li`.
     fn out_of_scope(&self, name: &str) -> bool {
-        if matches!(
-            name,
-            "td" | "th" | "tr" | "table" | "thead" | "tbody" | "tfoot"
-        ) {
+        if Kind::of(name).table() {
             return false;
         }
         self.elems
@@ -2436,6 +2477,84 @@ mod tests {
             .collect();
         assert!(in_cell.iter().any(|t| t == "cell"), "{in_cell:?}");
         assert_eq!(para_of(&d, "x").props.num_id, Some(1));
+    }
+
+    /// The cells of the first table of `d`, row by row, as their text.
+    fn table_texts(d: &Document) -> Vec<Vec<String>> {
+        let Some(DocBlock::Table(t)) = d.body.iter().find(|b| matches!(b, DocBlock::Table(_)))
+        else {
+            panic!("no table: {:?}", d.body)
+        };
+        t.rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .map(|c| {
+                        c.blocks
+                            .iter()
+                            .filter_map(|b| match b {
+                                DocBlock::Paragraph(p) => Some(p.plain_text()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_omitted_cell_or_row_end_is_implied() {
+        // FIX r3 M1: the next cell is not inside the previous one.
+        let d = doc("<table><tr><td style='color:#fff;background:#003'>Name<td>Value</tr></table>");
+        assert_eq!(table_texts(&d), [["Name", "Value"]]);
+        assert_eq!(run_of(&d, "Name").props.color.as_deref(), Some("FFFFFF"));
+        assert_eq!(run_of(&d, "Value").props.color, None);
+        let d = doc("<table><tr><td>a<tr><td>b</table>");
+        assert_eq!(table_texts(&d), [["a"], ["b"]]);
+        let d = doc("<table><thead><tr><th>h<tbody><tr><td>b<tfoot><tr><td>f</table>");
+        assert_eq!(table_texts(&d), [["h"], ["b"], ["f"]]);
+        // 300 cells without their ends: the stack does not fill up.
+        let mut page = String::from("<table><tr>");
+        for k in 0..300 {
+            page.push_str(&format!("<td>c{k}"));
+        }
+        page.push_str("<td><b>bold</b></table>");
+        let budget = Budget::standard();
+        let mut h = Html::new(&page, &budget, StyleSheet::default());
+        h.run();
+        assert!(h.elems.len() <= 1, "{}", h.elems.len());
+        let d = doc(&page);
+        assert!(run_of(&d, "bold").props.bold);
+        let rows = table_texts(&d);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), crate::import::MAX_COLUMNS);
+        // A nested table without its `</td>` stays in the outer cell.
+        let d = doc(
+            "<table><tr><td>outer<table><tr><td>in1<td>in2</table>more</td><td>next</td></tr></table>",
+        );
+        let rows = table_texts(&d);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].len(), 2, "{rows:?}");
+        assert!(rows[0][0].contains("more"), "{rows:?}");
+        assert_eq!(rows[0][1], "next");
+    }
+
+    #[test]
+    fn a_close_ends_the_lists_and_blocks_opened_in_it() {
+        // FIX r3 m2: a container's.
+        let d = doc("<section><h1>T</section><p>body</p>");
+        assert_eq!(para_of(&d, "body").props.style_id, None);
+        let d = doc("<section><ul><li>a</section><ul><li>b</li></ul>");
+        assert_eq!(para_of(&d, "b").props.ilvl, 0);
+        // FIX r3: a block's and a cell's (pre-existing: `lists` stayed).
+        let d = doc("<div><ul><li>a</div><p>after</p><ul><li>b</li></ul>");
+        assert_eq!(para_of(&d, "after").props.num_id, None);
+        assert_eq!(para_of(&d, "b").props.ilvl, 0);
+        let d = doc("<table><tr><td><ul><li>a</td></tr></table><ul><li>b</li></ul>");
+        assert_eq!(para_of(&d, "b").props.ilvl, 0);
     }
 
     #[test]

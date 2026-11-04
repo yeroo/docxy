@@ -777,35 +777,14 @@ pub(crate) fn background(value: &str) -> Option<String> {
         .find_map(|t| rgb(&t.to_ascii_lowercase()))
 }
 
-/// The 17 values of ST_HighlightColor, in Word's case.
-const HIGHLIGHTS: [&str; 17] = [
-    "black",
-    "blue",
-    "cyan",
-    "green",
-    "magenta",
-    "red",
-    "yellow",
-    "white",
-    "darkBlue",
-    "darkCyan",
-    "darkGreen",
-    "darkMagenta",
-    "darkRed",
-    "darkYellow",
-    "darkGray",
-    "lightGray",
-    "none",
-];
-
 /// An `mso-highlight` value as Word's highlight name; anything else is
 /// none (a `w:highlight` outside the list is a file Word refuses).
 pub(crate) fn highlight(value: &str) -> Option<&'static str> {
     let v = value.trim();
-    HIGHLIGHTS
-        .iter()
-        .copied()
-        .find(|h| h.eq_ignore_ascii_case(v))
+    if v.eq_ignore_ascii_case("none") {
+        return Some("none");
+    }
+    crate::highlight::canonical_name(v)
 }
 
 /// A length's unit.

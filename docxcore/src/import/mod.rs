@@ -49,6 +49,7 @@
 //! | `css::Selector::matches` | reach sets, one per compound | work (depth/4 + 1) a compound: O(compounds × depth), no backtracking |
 //! | html element look | parent's look cloned, the cascade | per open: work (1 + key/16) + the matching; inline `style` parsed once |
 //! | html implicit close | the element stack, searched once | work (depth/16 + 1) per block open |
+//! | html omitted table end (`close_open`) | the element stack, searched once | work (depth/16 + 1), ≤ 4 searches per `td th tr thead tbody tfoot` open |
 //! | html `restyle` | looks above a closed element computed again | per element: its attributes scanned again (work attrs/16 + 1) + the matching; ≤ depth elements a close |
 //! | html formatting reopened after a truncation | elements kept, looks restyled | ≤ depth, at most three alike counting those open below (work below/16 + 1 each); as `restyle` |
 //! | html `out_of_scope` | the element stack, searched once | per close tag, ≤ 256 |

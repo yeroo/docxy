@@ -2384,8 +2384,9 @@
   (first non-generic; generics map to Times New Roman / Arial / Courier New),
   size (half-points, 1..1638 pt), weight, style, decoration, vertical align,
   an inline element's background as run `w:shd`, `mso-highlight` (Word's 17
-  names only), `display:none` / `mso-hide:all` as `vanish`. Under a heading
-  an explicit not-bold is `<w:b w:val="0"/>`. Paragraphs: alignment, line
+  names only, `highlight::canonical_name`), `display:none` /
+  `mso-hide:all` as `vanish`. Under a heading an explicit not-bold is
+  `<w:b w:val="0"/>`. Paragraphs: alignment, line
   height (multiple → `auto`, length → `atLeast`, `exact` with
   `mso-line-height-rule:exactly`), the innermost block's own top/bottom box
   as spacing, every enclosing block's left/right box summed as indent
@@ -2400,11 +2401,15 @@
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
   across a cell or table, ending the paragraph only if it has content; a
-  list's end ends its open `li`. HTML5 containers (`section article main
+  list's end ends its open `li`, and any close ends the blocks and lists
+  opened inside the element (`Elem::blocks_at`/`lists_at`). Omitted table
+  end tags are implied (`close_open`, through `close_tag` so the cell or row
+  ends in the document): a `td`/`th` ends the open cell of its row, a `tr`
+  the open cell and row, a `thead`/`tbody`/`tfoot` those and the open row
+  group, never across a nested table. HTML5 containers (`section article main
   header footer nav aside figure form …`, `Kind::Container`) and `hr` close
   an open `p` too; a container (or a custom tag over an open paragraph)
-  ends the paragraph, blocks and lists opened inside it when it closes
-  (`Elem::blocks_at`/`lists_at`). `html`/`body` never close, and no close
+  ends the paragraph when it closes. `html`/`body` never close, and no close
   reaches across an open table or cell (`out_of_scope`: `</ul>` or
   `</div>` in a cell is ignored, as in a browser). An `Elem` keeps where its
   attributes are in the page, so looks can be computed again (`restyle`):

@@ -27,6 +27,16 @@ pub fn highlight_rgb(name: &str) -> Option<(u8, u8, u8)> {
     HIGHLIGHTS.iter().find(|(n, _)| *n == name).map(|&(_, c)| c)
 }
 
+/// Word's own spelling of highlight `name`, matched ASCII
+/// case-insensitively (`darkblue` → `darkBlue`); `None` for `none` or a name
+/// Word does not define.
+pub(crate) fn canonical_name(name: &str) -> Option<&'static str> {
+    HIGHLIGHTS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|&(n, _)| n)
+}
+
 /// The highlight name nearest `rgb`, by hue and brightness rather than RGB
 /// distance: another app's pale highlight (Pages' `FFFC9E`) is yellow, not
 /// the white or light gray it is nearest in RGB. A colour with little
@@ -67,6 +77,15 @@ pub fn nearest_highlight((r, g, b): (u8, u8, u8)) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_names_are_word_s_spelling() {
+        assert_eq!(canonical_name("darkblue"), Some("darkBlue"));
+        assert_eq!(canonical_name("YELLOW"), Some("yellow"));
+        assert_eq!(canonical_name("LightGray"), Some("lightGray"));
+        assert_eq!(canonical_name("none"), None);
+        assert_eq!(canonical_name("fuchsia"), None);
+    }
 
     #[test]
     fn every_highlight_is_its_own_nearest() {
