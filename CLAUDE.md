@@ -488,6 +488,34 @@
   export.rs does, so `w:start="2"` makes the first page even. No harness verb
   reads drawn header text, so there is no `.uit` case.
 
+## Extension surfaces and torn-off tabs
+
+- The suite is a library (package `docxy-suite`, lib `docxy_suite`, still
+  rooted at `suite/docxy/src/main.rs`) with `run(ext::Extensions)`; the
+  `suite` binary (`src/bin/suite.rs`) passes `Extensions::default()`, so the public build is
+  unchanged. A build that links an extension calls `run` itself; no
+  extension, edition or private repository is named here.
+- `ext::Extensions::mail` is a factory (`Rc<dyn Fn(&mut App) ->
+  Result<Box<dyn TabSurface>, String>>`) for Mail tabs. `Surface::Ext` holds
+  the `TabSurface` (`view`, `focus_handle`, `title`, `set_dark`); a Mail tab
+  still drawn as the placeholder gets it in `attach_ext_surfaces` (render, and
+  File > New > Mail), and a refusal stays on the tab's status line
+  (`Mail: ...`), not asked again. It saves as nothing (`hot_bytes`, the
+  session's placeholder rule). While the tab is active the suite draws no
+  ribbon row (the view draws its own), its root focus goes on to the view
+  (`focus_ext_surface`), keys the view does not stop bubble to `route_key`,
+  and `ext::ShowBackstage` opens File. The theme's light/dark reaches it in
+  `apply_theme`.
+- Tearing a tab off (`tab_tear.rs`): a chip's drag (#545) noted by
+  `on_drag_move` and let go away from the strip (more than `MARGIN` above or
+  below the chip, or out of the window) moves the tab through
+  `new_window_at` (New Window, #587, with the new window's top-left near the
+  release); a release on the strip row still reorders. The window's mouse-up
+  listener (`tab_tear_release`, registered with the gesture listeners) takes
+  that release. One tab cannot tear (New Window's refusal on the status
+  line). Not done: dropping a tab onto another window's strip (gpui drags do
+  not cross windows), a harness verb for it.
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
