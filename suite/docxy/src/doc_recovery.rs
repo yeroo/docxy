@@ -226,7 +226,7 @@ pub(crate) fn apply(
             }
         }
         fresh.status = ORIGINAL_OPENED.into();
-        *tab = fresh;
+        tab.replace_in_place(fresh);
         out.replaced.push(*index);
     }
     out

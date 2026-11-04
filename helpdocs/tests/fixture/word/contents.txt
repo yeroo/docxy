@@ -1,0 +1,10 @@
+# The fixture manual for helpdocs and the suite's coverage test (#1022).
+# strict: help
+welcome
+home
+  home-font
+insert
+  tables
+  images
+keyboard
+help

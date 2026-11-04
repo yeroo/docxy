@@ -120,6 +120,15 @@ fn picture_drawing_xml(rid_png: &str, rid_svg: &str, w: i64, h: i64, source: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_diagram_picture_lists_both_its_media_rids_1639() {
+        let raw = picture_drawing_xml("rId4", "rId5", 10, 10, "graph TD");
+        assert_eq!(
+            crate::image::inline_embeds(&raw),
+            vec!["rId4".to_string(), "rId5".to_string()]
+        );
+    }
     use crate::markdown::{from_markdown, to_markdown};
     use crate::package::{load_package, new_markdown_package, save_package};
 

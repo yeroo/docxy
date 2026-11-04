@@ -30,6 +30,10 @@ pub enum LoadError {
     NotUtf8,
     /// A ZIP entry could not be decompressed.
     CorruptPart,
+    /// The parts would unpack to `total` bytes, over the `budget`
+    /// ([`crate::package::MAX_PACKAGE_UNCOMPRESSED`]): refused before any
+    /// part is extracted (#851).
+    TooLarge { total: u64, budget: u64 },
 }
 
 impl fmt::Display for LoadError {
@@ -42,12 +46,26 @@ impl fmt::Display for LoadError {
             LoadError::MissingDocument => "missing word/document.xml",
             LoadError::NotUtf8 => "word/document.xml is not valid UTF-8",
             LoadError::CorruptPart => "a ZIP entry could not be decompressed",
+            LoadError::TooLarge { total, budget } => {
+                return write!(f, "{}", too_large(*total, *budget));
+            }
         };
         f.write_str(s)
     }
 }
 
 impl std::error::Error for LoadError {}
+
+/// The words for a package over its size budget, in MiB (rounded up, so a
+/// package just over the limit never reads as equal to it).
+fn too_large(total: u64, budget: u64) -> String {
+    let mib = |n: u64| n.div_ceil(1024 * 1024);
+    format!(
+        "document too large: its parts unpack to {} MiB, over the {} MiB limit",
+        mib(total),
+        budget / (1024 * 1024)
+    )
+}
 
 /// `rId` -> (target, is_external) from a `.rels` part, plus SmartArt node text
 /// keyed by the diagram-data relationship id (`<dgm:relIds r:dm>`), resolved from

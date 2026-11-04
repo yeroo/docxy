@@ -140,6 +140,8 @@ impl std::error::Error for OpenError {}
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 const ODS_MIMETYPE: &str = "application/vnd.oasis.opendocument.spreadsheet";
+/// The most bytes a `mimetype` entry may declare to be read as the ODS mark.
+const MAX_MIMETYPE: u64 = 256;
 
 /// Open a workbook of any supported format, chosen by its bytes (never by a
 /// file extension): an OLE2 file with a `Workbook` stream is `.xls`, a ZIP
@@ -257,7 +259,12 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
         if zip.find("xl/workbook.bin").is_some() {
             return Ok(opened(xlsb::read(&zip)?.build(), SourceFormat::Xlsb));
         }
-        if let Some(mime) = zip.read("mimetype") {
+        // The `mimetype` entry is a few dozen bytes; one declaring more is
+        // not read here, before `load_xlsx`'s size budget (#851).
+        let mime_entry = zip
+            .find("mimetype")
+            .filter(|e| e.uncomp_size <= MAX_MIMETYPE);
+        if let Some(mime) = mime_entry.and_then(|e| zip.extract(e)) {
             if String::from_utf8_lossy(&mime).trim() == ODS_MIMETYPE {
                 return Ok(opened(ods::read(&zip)?.build(), SourceFormat::Ods));
             }
@@ -1112,6 +1119,24 @@ pub(crate) fn builtin_format(id: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #851: a `mimetype` entry declaring more than [`MAX_MIMETYPE`] is not
+    /// read for the ODS sniff (ahead of `load_xlsx`'s budget), even when its
+    /// text would match: the workbook opens as the `.xlsx` it is.
+    #[test]
+    fn a_long_mimetype_entry_is_not_sniffed() {
+        let book = crate::xlsx::save_xlsx(&crate::xlsx::new_xlsx());
+        let zip = opccore::zip::ZipArchive::open(&book).unwrap();
+        let mime = format!("{ODS_MIMETYPE}{}", " ".repeat(MAX_MIMETYPE as usize));
+        let mut parts = vec![("mimetype".to_string(), mime.into_bytes())];
+        parts.extend(
+            zip.entries()
+                .iter()
+                .map(|e| (e.name.clone(), zip.extract(e).unwrap())),
+        );
+        let opened = open_workbook_ex(&opccore::zipwrite::write_zip(&parts)).unwrap();
+        assert_eq!(opened.format, SourceFormat::Xlsx);
+    }
 
     #[test]
     fn arrays_need_an_upright_range_on_the_grid() {

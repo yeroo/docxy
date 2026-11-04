@@ -3065,6 +3065,31 @@ mod tests {
     use super::*;
     use projcore::editor::parse_duration;
 
+    #[test]
+    fn a_plan_with_a_current_date_draws_its_line_by_default() {
+        // Project 2024 draws a Current Date line by default (#1688).
+        let start = projcore::datetime::DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let mut proj = Project {
+            start_date: Some(start),
+            ..Project::default()
+        };
+        let day = projcore::datetime::DateTime::from_ymd_hm(2026, 3, 4, 8, 0);
+        proj.set_option("CurrentDate", Some(&day.to_mspdi()));
+        let origin = start.day_number();
+        let ed = Editor::new(proj.clone());
+        let marks = gridline_marks(&ed, origin);
+        let current: Vec<_> = marks.iter().filter(|m| m.day == 2).collect();
+        assert_eq!(current.len(), 1, "{marks:?}");
+        assert!(!current[0].broken);
+        // Turned off, it is not drawn.
+        proj.formatting.gridlines.set(
+            projcore::formatting::gridlines::Line::CurrentDate,
+            projcore::formatting::gridlines::Gridline::default(),
+        );
+        let ed = Editor::new(proj);
+        assert!(gridline_marks(&ed, origin).iter().all(|m| m.day != 2));
+    }
+
     fn unnamed_summary_fixture(title: &str) -> Project {
         Project {
             title: title.into(),

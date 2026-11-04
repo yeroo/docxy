@@ -22,6 +22,8 @@ workspace = true
 opccore = { version = "0.1.0", path = "../../opccore" }
 # Commit / last merged PR / build kind, for --version, File > Account, app-info and the crash log.
 buildinfo = { path = "../../buildinfo" }
+# The help manual bundles: markdown subset, search, context help (#1022).
+helpdocs = { path = "../../helpdocs" }
 projctl = { path = "../../projctl" }
 gpui.workspace = true
 gpui_platform.workspace = true

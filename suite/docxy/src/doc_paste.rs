@@ -174,6 +174,7 @@ mod tests {
 
     fn ours(s: &str) -> DocClip {
         DocClip {
+            media: Default::default(),
             clip: Clip::from_text(s),
             text: s.into(),
         }
@@ -245,6 +246,7 @@ mod tests {
     #[test]
     fn an_image_only_copy_offers_only_formatted_text_753() {
         let image_only = DocClip {
+            media: Default::default(),
             clip: Clip::default(),
             text: String::new(),
         };

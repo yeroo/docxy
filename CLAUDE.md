@@ -269,6 +269,20 @@
   placed, and the result must be shorter, or the set is left as it was; a set
   that begins mid-paragraph (spilled from the page before) is not balanced.
 
+## Document save-as names (#807)
+
+- The harness's `save-as` on a document (`save_as_target`) refuses, before
+  anything is resolved or written, a name whose last piece (after `/` or `\`,
+  on every platform) holds `: * ? " < > |`, with `DOC_BAD_NAME` ("file name is
+  not valid"); a relative `a:name` is refused, not read as a drive, as is a
+  Windows drive-relative `c:sub\x.docx` (which would replace the folder). A
+  path that resolves to no name (`..`) gets no extension appended. On Unix a
+  resolved name holding `\` is refused too. A `format` that the name's own
+  extension does not save as (or that names none) appends the format's
+  extension, as Word does: `notes.txt` + docx is `notes.txt.docx`, html
+  appends `.html`. Workbooks and plans still refuse a mismatch. The native
+  dialog is unchanged.
+
 ## Start screen (#806)
 
 - A suite launch with nothing to restore and no file on the command line has
@@ -1512,8 +1526,14 @@
   row and column lines an interval with its own type and colour) and
   `Gridlines` (only lines set away from `Line::default_style` are stored:
   solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
-  Columns, Title Vertical and Title Horizontal, none for the rest, which is
-  what the hosts drew before). `Formatting::gridlines` replaces the old
+  Columns, Title Vertical and Title Horizontal, what the hosts drew before,
+  and Current Date, solid as Project 2024 draws it (#1688; its green is not
+  measured, so Automatic; the hosts draw it only where the plan's
+  `CurrentDate` option is set, and a new docxy plan sets none); none for the
+  rest, so a Current Date set to none is stored). The default moved without
+  a format marker: a solid Automatic Current Date an older build stored is
+  now the default and is dropped on the next save, and a plugin's `null` on
+  Current Date now means solid; it sends `{"type":"none"}` to turn it off). `Formatting::gridlines` replaces the old
   opaque string; `formatting.xml` carries `<gridline>` children (an older
   root `gridlines` attribute is ignored). A plugin command's `view.gridlines`
   is an object of line name to `{type, color, interval, interval_type,
@@ -1834,11 +1854,42 @@
 - `DocTab::pictures` keeps the `Arc<gpui::Image>`s per (part, rid) across
   frames, so only a miss reads, copies and hashes media. It is valid for one
   `Package::parts_stamp` (a fresh value from a process-wide counter on every
-  mutable access to the parts, equal in an unchanged clone): any package change
-  empties it, so a header edit re-reads that tab's pictures once. Decoded
-  images stay in gpui's asset cache for the process (no `remove_asset`).
-  A run whose rid is missing from its story's relationships (pasted from
-  another story keeps its source rid) keeps its frame.
+  mutable access to the parts, equal in an unchanged clone): a package change
+  starts a new map, and a miss whose bytes the map before held takes that
+  image back, so gpui keeps its decode (#1639). What two changes leave
+  undrawn is retired; `Docxy::render` releases retired images from gpui's
+  asset cache (`Image::remove_asset`), `close_tab_with` all of a closed
+  tab's, and a closing window (its quit answers, before Don't Save drops
+  tabs) all of its tabs'. An image's gpui id is its bytes' hash, so one any
+  window's tab still holds is kept (`pictures::releasable`, the other
+  windows read through `windows::entries_snapshot`; the updating window is
+  its own `self`). With a window at hand (render, tab close) the image's
+  atlas tile is dropped first, from every window (`pictures::forget`:
+  `get_render_image` returns gpui's cached decode, then `App::drop_image`),
+  as every decode gets a fresh `ImageId` and an orphan tile is never reused;
+  a closing window's quit answers have no window, so only the decodes are
+  dropped there (no tile), its own atlas going with it. A reload in place (Reopen, the reload dialog, recovery) hands
+  the old cache to the fresh tab.
+- A document copy keeps its pictures' media (`DocClip::media`,
+  `pictures::capture`, from the story part `tab_edit_target_part` names): the
+  blip's and every `r:embed` inside it (`asvg:svgBlip`, `a14:imgLayer`:
+  `image::inline_embeds`), any kind
+  of media (EMF, WMF, TIFF, SVG too: the part name's extension, the content
+  type from the source's `[Content_Types].xml`, else
+  `image::media_content_type`, else the bytes; `Package::add_part_media`
+  writes it), in `Inline::Raw` and `Inline::SmartArt` runs at
+  the clip's top level (not inside a tracked change or a hyperlink). A paste
+  of the window's own clip runs `pictures::carry` into the part it lands in:
+  a rid that names the same bytes there is kept, else a relationship of that
+  part to identical bytes is taken (`Package::part_rel_targets`, the rels
+  read once per paste), else the media is added
+  (`add_part_media`) and the rid rewritten (`image::replace_inline_embeds`,
+  `Clip::remap_embeds`). So a paste in the same story changes nothing and
+  repeated pastes add one part. As Insert Picture, the part is added outside
+  the undo step: an undone paste leaves it. A document with no package gets
+  one (`carry_into_tab`, `ensure_package`); a tab whose save writes none
+  (`saves_as_word`: Markdown, text, RTF) pastes the rids as they were. An
+  `a:hlinkClick` `r:id` on a picture is not carried (a hyperlink, not media).
 - Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
   the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
   no pictures, so there is no `.uit` case.
@@ -2201,3 +2252,25 @@
   `custom_field_oracles` lists both FieldIDs as exclusions and asserts each is
   needed; `custom_fields_round_trip_through_mspdi` covers `.xml` and `.yppx`
   Save As (one `write_mspdi`).
+
+## Help manual bundles (#1022, slice 1)
+
+- `helpdocs` (root workspace, dependency-free like `buildinfo`) reads an
+  editor's manual bundle (`docs/manual/<word|excel|project>/`: `REVISION`,
+  `contents.txt`, `<id>.md` with front matter, `images/`; the format is
+  `docs/manual/README.md`). `Manual::from_files` is the one reader (`load`
+  goes through it; `\` reads as `/`), and a bundle always loads, its faults
+  in `problems`. `md` parses the fixed markdown subset (anything else is
+  literal text), `search` ranks title 10 / heading 5 / body 1 per hit up to
+  5 per term, all terms required, ties in contents order, `resolve` gives
+  the exact `keys` page, else the area's (`slug` of the tab name), else the
+  root, and `coverage` is the report.
+- The suite's `every_ribbon_command_has_a_help_target`
+  (`help_tab/tests.rs`) resolves every command id (all `Control` kinds,
+  contextual tabs, the table/H&F/Gantt Format tabs, the sheet's
+  `SHEET_RIBBON`) against `helpdocs/tests/fixture/<editor>` until real
+  manuals are published. It fails only for a strict area
+  (`# strict: help` in the word fixture). Group launchers are not in the
+  walk: a launcher runs an act and carries no id. Their dialogs resolve as
+  `dialog:<id>` in #1855. No host shows a manual yet: the
+  viewer, terminal overlays and build pinning are later slices.
