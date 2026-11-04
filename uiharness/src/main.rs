@@ -76,7 +76,8 @@ starts it on the file, and real-key, real-type and pointer-click write real
 key and mouse bytes into its terminal (#1204). A suite script may start with
 `plugin <name>` lines: each format plugin named (yppx_fixture, the test
 fixture) is copied from beside uiharness into the sandbox's docxy/plugins
-before the suite starts.
+before the suite starts. An `ext fixture` line has its Mail tabs drawn by
+the suite's test extension, an embedded document view (#1873).
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -85,6 +86,7 @@ regions:
   project-hbar-table  project-hbar-chart  project-vbar  project-timeline
   project-split  gallery  ribbon  ribbon-flyout  ribbon-group:0
   ribbon-launch:Number  gallery-more:fixture.wide  filter-button:B
+  ext-doc-view  ext-doc-link:0  ext-doc-word:Alpha:start
 ";
 
 fn main() -> ExitCode {

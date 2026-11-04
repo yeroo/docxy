@@ -411,8 +411,12 @@ impl DocView {
             ("links", Json::Arr(links)),
             ("selection", Json::Str(self.selected_text())),
             (
+                "selected_paragraphs",
+                Json::Num(self.editor.selection_spans().len() as f64),
+            ),
+            (
                 "zoom",
-                Json::Num(f64::from((self.zoom * 100.).round() / 100.)),
+                Json::Num((f64::from(self.zoom) * 100.).round() / 100.),
             ),
             ("scroll_y", Json::Num(f64::from(self.scroll_y().round()))),
             (
@@ -457,8 +461,9 @@ impl DocView {
         merge_link_spans(pieces)
     }
 
-    /// The bounds of the first painted word whose text, trimmed, is `text`.
-    pub(crate) fn word_bounds(&self, text: &str) -> Option<Bounds<Pixels>> {
+    /// The first painted word whose text, trimmed, is `text`: its bounds,
+    /// and the x just after its last character (before any trailing space).
+    pub(crate) fn word_bounds(&self, text: &str) -> Option<(Bounds<Pixels>, Pixels)> {
         let words = self.words.borrow();
         words.iter().find_map(|(path, spans)| {
             let para = docxcore::editor::resolve_para(&self.editor.doc.body, path)?;
@@ -466,7 +471,17 @@ impl DocView {
             spans.borrow().iter().find_map(|w| {
                 let end = (w.off + w.len).min(chars.len());
                 let word: String = chars.get(w.off..end)?.iter().collect();
-                (w.len > 0 && word.trim() == text).then(|| w.bounds())
+                if w.len == 0 || word.trim() != text {
+                    return None;
+                }
+                let bounds = w.bounds();
+                let text_end = match &w.shape {
+                    SpanShape::Text(layout) => layout
+                        .position_for_index(word.trim_end().len())
+                        .map_or(bounds.right(), |p| p.x),
+                    SpanShape::Unit(_) => bounds.right(),
+                };
+                Some((bounds, text_end))
             })
         })
     }

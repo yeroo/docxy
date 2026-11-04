@@ -1615,8 +1615,9 @@ fn ext_fixture_view(
 
 /// A point of the test extension's document view: `view` (its middle),
 /// `link:<n>` (the n-th painted link span's middle) or `word:<text>` (the
-/// first painted word whose text, trimmed, is `<text>`; `:start` or `:end`
-/// after it is one pixel inside that edge, at mid-height).
+/// first painted word whose text, trimmed, is `<text>`; `:start` after it is
+/// one pixel inside its left edge, `:end` one pixel past its last character,
+/// at mid-height).
 fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixels>, String> {
     let fixture = ext_fixture_view(app)?;
     let view = fixture.read(cx).doc.read(cx);
@@ -1642,13 +1643,16 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             Some((t, e @ ("start" | "end"))) => (t, Some(e)),
             _ => (word, None),
         };
-        let b = view
+        let (b, text_end) = view
             .word_bounds(text.trim())
             .ok_or_else(|| format!("no painted word '{}'", text.trim()))?;
         let y = b.center().y;
+        // A press resolves to the character under it, so the end is a pixel
+        // past the last character: in the word's trailing space, or beside
+        // the line (its end) for a word with none.
         return Ok(match edge {
             Some("start") => point(b.left() + px(1.), y),
-            Some(_) => point(b.right() - px(1.), y),
+            Some(_) => point(text_end + px(1.), y),
             None => b.center(),
         });
     }
@@ -5131,11 +5135,12 @@ fn dispatch_verb(
                 .borrow()
                 .iter()
                 .map(|u| Json::Str(u.clone()))
-                .collect();
+                .collect::<Vec<_>>();
             let mut reply = match f.doc.read(cx).harness_json(window) {
                 Json::Obj(fields) => fields,
                 _ => Vec::new(),
             };
+            reply.push(("links_followed".into(), Json::Num(calls.len() as f64)));
             reply.push(("link_calls".into(), Json::Arr(calls)));
             Done::ok(Json::Obj(reply))
         }

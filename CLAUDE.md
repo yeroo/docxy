@@ -516,6 +516,64 @@
   line). Not done: dropping a tab onto another window's strip (gpui drags do
   not cross windows), a harness verb for it.
 
+## Embedded document view (#1873)
+
+- `ext::DocView` (`suite/docxy/src/doc_view.rs`, with `ext::LinkClick`) is a
+  public gpui entity an extension's view embeds: `cx.new(|cx|
+  DocView::new(doc, Some(pkg), cx))`, `set_document`, `set_link_click`,
+  `on_link`, `set_content_dark`, `zoom`/`set_zoom`, `selected_text`,
+  `focus_handle` (give it as the tab's `TabSurface::focus_handle`). It fills
+  its parent and draws the document with the suite's own renderer in the
+  flow (Web Layout) style: `block_el` with `RenderCtx::ent` a `DocTarget`,
+  `Suite(Entity<Docxy>)` for every suite story (each arm forwards to exactly
+  the `Docxy` method the closures called before; only it fills `DOC_WORDS`
+  and `DOC_ROWS`) or `Embed(view, words)`, whose painted pieces go to the
+  view's own `Words`. The shared renderer records no links: the view
+  derives its link spans from its words (`link_at`, `resolve_para`).
+- Read-only: no caret is drawn (`caret_path` empty), nothing edits.
+  Press, drag and Shift+press select (`place_click_caret`); Ctrl+A selects
+  all; Ctrl+C writes the text and RTF as a document copy does
+  (`copy_payload`, then the `rtf_follows` gate), to the run's private
+  clipboard in a harness instance (`doc_view::set_harness`, set in `run()`).
+  Arrows, Page Up/Down and (Ctrl+)Home/End scroll; Ctrl+=, Ctrl+-, Ctrl+0
+  and Ctrl+wheel zoom by a tenth within 50%..300% (`step_zoom`, rounded to a
+  tenth; `wheel_step`: a whole line steps, pixels sum to 40). gpui's scroll
+  area has already moved by a Ctrl+wheel, so the offset of the last render
+  is put back (as the Project chart does). Table selection zones do
+  nothing. Every other key bubbles to the suite; Tab and Shift+Tab (global
+  actions) do nothing on an extension tab.
+- Hyperlinks: a secondary press (Ctrl, ⌘ on macOS) on a link calls
+  `on_link` with the URL (or `#bookmark`) and selects nothing, in either
+  mode; in `LinkClick::Click` mode a plain press released without a drag
+  does too. The callback runs deferred (`window.defer`), outside the view's
+  update. The view never opens a link.
+- Colours: the chrome (scroll bar, selection) is the theme's; the document
+  is a white page in Print Layout's ink (`content_look`) unless
+  `set_content_dark(true)` on a dark theme, which draws the theme's own.
+- Pictures: the view's `pictures::Cache` is registered with
+  `pictures::register_extra` and never reads `Docxy`: `set_document` and
+  its release queue what it gave up (`queue_release`), the windows'
+  `release_pictures` / `release_all_pictures` drain the queue, and
+  `other_windows_picture_ids` counts every registered cache's live ids, so
+  neither side drops a decode the other still draws.
+- Harness: a script's `ext fixture` line (`uiharness::launch::request_ext_fixture`,
+  marker `<root>/docxy/ext-fixture`, read under `--harness` only) installs
+  `ext_fixture` as Mail when the build links none: a header over a DocView
+  of a document built in code (`fixture_document`), recording each link.
+  `ext-doc-read` (blocks, tables, pictures, links, selection,
+  selected_paragraphs, zoom, scroll_y, max_scroll_y, link_click,
+  content_dark, focused, links_followed, link_calls), `ext-doc-set
+  {link_click, content_dark}`, the regions `ext-doc-view`,
+  `ext-doc-link:<n>` and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
+  past the last character), and `pointer-click`'s `ctrl`.
+  `uiharness/cases/ext-doc-view.uit` drives it (run on Linux under
+  `scripts/ui-linux.py`). `suite/docxy/tests/ext_doc_view_api.rs` holds the
+  public API to what an extension crate needs, from outside the crate.
+- Out of scope: Find (#1887), Print Layout (#1888), a caret and keyboard
+  selection, table selection zones, a context menu, anchor links scrolling
+  inside the view (they reach the callback as `#name`), macOS ⌘-key
+  routing for the view (untested).
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
