@@ -42,8 +42,8 @@ pub enum Block {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListItem {
     pub text: Vec<Inline>,
-    /// What sits under the item, in order: images and fenced code indented
-    /// under it, and nested lists.
+    /// What sits under the item, in the order written: the images, fenced
+    /// code and paragraphs indented under it, and its nested lists.
     pub children: Vec<Block>,
 }
 
@@ -188,7 +188,7 @@ pub fn parse(src: &str) -> Vec<Block> {
             let items = list_items(&lines, &mut i);
             // Every item is at the first one's indent or deeper: one list.
             let mut at = 0;
-            blocks.push(build_list(&items, &mut at, items[0].indent));
+            blocks.push(build_list(&items, &mut at, items[0].indent, items.len()));
             debug_assert_eq!(at, items.len());
         } else {
             para.push(line);
@@ -236,9 +236,12 @@ fn fence(lines: &[&str], i: &mut usize) -> Block {
     }
 }
 
-/// The items of a list starting at `lines[*i]`, with their wrapped lines and
-/// the images and fences indented under them. The list goes on across blank
-/// lines while the next item is at its first item's indent or deeper.
+/// The items of a list starting at `lines[*i]`, with their wrapped lines.
+/// An image, fence or paragraph indented under the list goes to the nearest
+/// earlier item with a smaller indent, tagged with the number of items read
+/// so far (`build_list` places it by that). The list goes on across blank
+/// lines while the next item is deeper, or at the first item's indent and
+/// of its kind.
 fn list_items(lines: &[&str], i: &mut usize) -> Vec<RawItem> {
     let mut items: Vec<RawItem> = Vec::new();
     let Some((base, ordered)) = list_item(lines[*i]).map(|it| (it.indent, it.ordered)) else {
@@ -371,7 +374,8 @@ fn cells(row: &str) -> Vec<String> {
             cell.push('|');
             at += 2;
         } else if let Some(n) = span_len(rest) {
-            cell.push_str(&rest[..n]);
+            // `\|` is a pipe in a span too.
+            cell.push_str(&rest[..n].replace("\\|", "|"));
             at += n;
         } else if rest.starts_with('|') {
             out.push(std::mem::take(&mut cell).trim().to_string());
@@ -457,10 +461,12 @@ fn list_item(line: &str) -> Option<RawItem> {
     })
 }
 
-/// One list from `items[*at]` on: the items at `base` or deeper, a deeper
-/// item nesting under the item before it. An item's children are its own
-/// blocks and its nested lists, in the order they were written.
-fn build_list(items: &[RawItem], at: &mut usize, base: usize) -> Block {
+/// One list from `items[*at]` on, up to (not including) `items[stop]`: the
+/// items at `base` or deeper, a deeper item nesting under the item before
+/// it. An item's children are its own blocks and its nested lists, in the
+/// order they were written: a nested list stops where a block of its parent
+/// was written, and the next nested list starts after it.
+fn build_list(items: &[RawItem], at: &mut usize, base: usize, stop: usize) -> Block {
     let ordered = items[*at].ordered;
     let start = items[*at].number;
     let mut out: Vec<ListItem> = Vec::new();
@@ -471,14 +477,15 @@ fn build_list(items: &[RawItem], at: &mut usize, base: usize) -> Block {
             item.children.extend(blocks.iter().map(|(_, b)| b.clone()));
         }
     };
-    while *at < items.len() && items[*at].indent >= base {
+    while *at < stop && items[*at].indent >= base {
         let indent = items[*at].indent;
         if indent > base && !out.is_empty() {
             // The blocks written before this nested list go first.
             let n = pending.iter().take_while(|(seq, _)| *seq <= *at).count();
             place(out.last_mut(), &pending[..n]);
             pending = &pending[n..];
-            let child = build_list(items, at, indent);
+            let until = pending.first().map_or(stop, |(seq, _)| (*seq).min(stop));
+            let child = build_list(items, at, indent, until);
             if let Some(last) = out.last_mut() {
                 last.children.push(child);
             }
@@ -1212,5 +1219,59 @@ mod tests {
             inline("*a **b***"),
             vec![Inline::Italic(vec![t("a "), Inline::Bold(vec![t("b")])])]
         );
+    }
+
+    fn shape(children: &[Block]) -> Vec<String> {
+        children
+            .iter()
+            .map(|b| match b {
+                Block::List { items, .. } => format!(
+                    "List[{}]",
+                    items
+                        .iter()
+                        .map(|i| plain(&i.text))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Block::Image { src, .. } => format!("Image {src}"),
+                Block::Paragraph(p) => format!("Para {}", plain(p)),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_block_between_sub_items_stays_between_them() {
+        let b = parse("1. Step\n   - a\n\n   ![s](s.png)\n   - b\n2. Next");
+        assert_eq!(b.len(), 1, "{b:?}");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            shape(&items[0].children),
+            ["List[a]", "Image s.png", "List[b]"]
+        );
+        let b = parse("1. Step\n   - a\n\n   Some text.\n   - b\n2. Next");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(
+            shape(&items[0].children),
+            ["List[a]", "Para Some text.", "List[b]"]
+        );
+    }
+
+    #[test]
+    fn a_block_before_the_sub_items_comes_first() {
+        let b = parse("1. Step\n\n   ![s](s.png)\n   - note\n2. Next");
+        let (_, _, items) = list(&b[0]);
+        assert_eq!(shape(&items[0].children), ["Image s.png", "List[note]"]);
+    }
+
+    #[test]
+    fn an_escaped_pipe_in_a_code_span_is_a_pipe() {
+        let b = parse("| `a\\|b` | c |\n|---|---|");
+        let Block::Table { header, .. } = &b[0] else {
+            panic!("{b:?}")
+        };
+        assert_eq!(header[0], vec![Inline::Code("a|b".into())]);
+        assert_eq!(header[1], vec![t("c")]);
     }
 }

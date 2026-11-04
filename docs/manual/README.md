@@ -53,8 +53,9 @@ Blocks:
   whose info string holds a backtick is not a fence.
 - GFM pipe tables. A table needs a header row and an alignment row
   (`:---`, `:---:`, `---:`) with one cell per header cell; otherwise the
-  lines are a paragraph. Body rows may have fewer or more cells. A `|` in a
-  code span or written `\|` is part of the cell.
+  lines are a paragraph. Body rows may have fewer or more cells. `\|` is a
+  pipe everywhere in a table row, code spans included, and a `|` inside a
+  code span or a `<kbd>` chord never splits a cell.
 - An image on a line of its own.
 
 Inline (an inline `![alt](src)` is literal text):
