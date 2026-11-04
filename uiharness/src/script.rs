@@ -86,6 +86,13 @@
 //! runner puts a marker in the sandbox before it launches
 //! ([`crate::launch::request_start_screen`]).
 //!
+//! ## Test extension
+//!
+//! A suite script may start with an `ext fixture` line (before its first
+//! case): the suite then draws Mail tabs with its built-in test extension, an
+//! embedded read-only document view (#1873). The runner puts a marker in the
+//! sandbox before it launches ([`crate::launch::request_ext_fixture`]).
+//!
 //! ## Assertions
 //!
 //! | Assertion | Reads |
@@ -120,6 +127,8 @@ pub struct Script {
     pub plugins: Vec<String>,
     /// A `start screen` line: the suite starts with no tab (#806).
     pub start_screen: bool,
+    /// An `ext fixture` line: Mail tabs are the test extension's (#1873).
+    pub ext_fixture: bool,
     /// `manual <editor> <dir>` lines: the help manuals the suite starts with
     /// (#1855), `dir` relative to the script ([`crate::launch::install_manuals`]).
     pub manuals: Vec<Manual>,
@@ -314,6 +323,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut terminal: Option<TerminalSpec> = None;
     let mut plugins: Vec<String> = Vec::new();
     let mut start_screen = false;
+    let mut ext_fixture = false;
     let mut manuals: Vec<Manual> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
@@ -391,6 +401,20 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             continue;
         }
 
+        if head.eq_ignore_ascii_case("ext") {
+            if !rest.eq_ignore_ascii_case("fixture") {
+                return Err(err(line, "the only 'ext' line is 'ext fixture'"));
+            }
+            if !cases.is_empty() {
+                return Err(err(line, "'ext fixture' comes before the first case"));
+            }
+            if ext_fixture {
+                return Err(err(line, "'ext fixture' is named twice"));
+            }
+            ext_fixture = true;
+            continue;
+        }
+
         if head.eq_ignore_ascii_case("test") {
             let name = rest.trim();
             if name.is_empty() {
@@ -449,6 +473,12 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             "'manual' installs a help manual for the suite; a terminal script has none",
         ));
     }
+    if terminal.is_some() && ext_fixture {
+        return Err(err(
+            0,
+            "'ext fixture' is the suite's; a terminal script has none",
+        ));
+    }
     if terminal.is_some() && start_screen {
         return Err(err(
             0,
@@ -472,6 +502,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         terminal,
         plugins,
         start_screen,
+        ext_fixture,
         manuals,
         cases,
     })
@@ -1928,6 +1959,21 @@ test t
         assert!(e.contains("before the first case"), "{e}");
         let e = refused("terminal docxy\nmanual word a\ntest t\n  key f1\n".into());
         assert!(e.contains("a terminal script has none"), "{e}");
+    }
+
+    #[test]
+    fn an_ext_fixture_line_asks_for_the_test_extension() {
+        let s = parse_script(&format!("ext fixture\n{VALID}")).unwrap();
+        assert!(s.ext_fixture);
+        assert!(!parse_script(VALID).unwrap().ext_fixture);
+        let e = parse_script(&format!("{VALID}\next fixture")).unwrap_err();
+        assert!(e.to_string().contains("before the first case"), "{e}");
+        let e = parse_script(&format!("ext fixture\next fixture\n{VALID}")).unwrap_err();
+        assert!(e.to_string().contains("twice"), "{e}");
+        let e = parse_script(&format!("ext mail\n{VALID}")).unwrap_err();
+        assert!(e.to_string().contains("ext fixture"), "{e}");
+        let e = parse_script("terminal docxy\next fixture\ntest t\n  key f1\n").unwrap_err();
+        assert!(e.to_string().contains("a terminal script has none"), "{e}");
     }
 
     #[test]

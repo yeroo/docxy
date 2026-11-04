@@ -55,6 +55,7 @@ mod doc_templates;
 mod doc_templates_tests;
 mod doc_view;
 pub mod ext;
+mod ext_fixture;
 mod field_edit;
 mod file_keys;
 mod font_box;
@@ -26964,6 +26965,11 @@ impl Docxy {
         if self.active_is_help() {
             return self.help_search_release(cx);
         }
+        // An extension's tab (#1873): Tab is the extension's to use; the suite
+        // edits nothing under it.
+        if self.active_is_ext() {
+            return;
+        }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
             if self.keytips == KeyTip::Off {
@@ -27096,6 +27102,11 @@ impl Docxy {
         // open behind it and must not move.
         if self.active_is_help() {
             return self.help_search_release(cx);
+        }
+        // An extension's tab (#1873): Tab is the extension's to use; the suite
+        // edits nothing under it.
+        if self.active_is_ext() {
+            return;
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
@@ -46246,7 +46257,13 @@ pub fn run(extensions: ext::Extensions) {
         .with_quit_mode(quit_mode());
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
-        if let Some(extensions) = extensions.take() {
+        doc_view::set_harness(want_harness);
+        if let Some(mut extensions) = extensions.take() {
+            // A harness case that asks for the test extension (#1873) gets it
+            // as Mail, unless the build links a Mail of its own.
+            if want_harness && extensions.mail.is_none() && harness::ext_fixture_requested() {
+                extensions.mail = Some(ext_fixture::factory());
+            }
             ext::install(cx, extensions);
         }
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to

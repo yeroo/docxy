@@ -752,6 +752,7 @@ fn merge_link_spans(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
     use docxcore::model::{Hyperlink, Run};
 
     fn run(text: &str) -> Inline {

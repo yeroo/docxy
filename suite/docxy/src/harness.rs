@@ -338,6 +338,19 @@ pub fn start_screen_requested() -> bool {
     start_screen_marker(&crate::config_root()).is_file()
 }
 
+/// The marker a script's `ext fixture` line has the runner put in the
+/// sandbox's config root (#1873): `<root>/docxy/ext-fixture`.
+pub fn ext_fixture_marker(root: &Path) -> PathBuf {
+    root.join("docxy").join("ext-fixture")
+}
+
+/// Whether this harness instance draws Mail tabs with the test extension
+/// (`ext_fixture`). Asked only under `--harness`, and only of the sandboxed
+/// config root, as [`start_screen_requested`] is.
+pub fn ext_fixture_requested() -> bool {
+    ext_fixture_marker(&crate::config_root()).is_file()
+}
+
 /// Start the control server for a config root at `root`, named for the mode
 /// it serves (see [`instance_name`]).
 pub fn start(
@@ -1400,6 +1413,18 @@ fn button_up(p: Point<Pixels>, n: usize, button: MouseButton) -> PlatformInput {
     })
 }
 
+/// Hold Control over `events`' presses, releases and moves.
+fn with_control(events: &mut [PlatformInput]) {
+    for e in events {
+        match e {
+            PlatformInput::MouseDown(e) => e.modifiers.control = true,
+            PlatformInput::MouseUp(e) => e.modifiers.control = true,
+            PlatformInput::MouseMove(e) => e.modifiers.control = true,
+            _ => {}
+        }
+    }
+}
+
 /// The hover-press-release a `pointer-click` dispatches at `p`.
 fn click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
     click_events_with(p, MouseButton::Left)
@@ -1557,12 +1582,77 @@ fn dialog_probe_point(app: &crate::Docxy, key: &str, name: &str) -> Result<Point
 /// presses or releases. Errors name the region. Probe-backed regions read
 /// the frame that is on screen now (see `Docxy::region_bounds_live`), the
 /// one dispatched input hit-tests against.
-fn region_point(app: &crate::Docxy, name: &str, window: &Window) -> Result<Point<Pixels>, String> {
+fn region_point(
+    app: &crate::Docxy,
+    name: &str,
+    window: &Window,
+    cx: &App,
+) -> Result<Point<Pixels>, String> {
+    // The test extension's embedded document view (#1873): read from the
+    // view itself, which the suite's probes do not see.
+    if let Some(part) = name.trim().strip_prefix("ext-doc-") {
+        return ext_doc_point(app, part, cx).map_err(|e| format!("{name}: {e}"));
+    }
     let region = parse_region(name)?;
     let bounds = app
         .region_bounds_live(region, window)
         .map_err(|e| format!("{name}: {e}"))?;
     Ok(bounds.center())
+}
+
+/// The test extension's view on the active tab (#1873): refused unless the
+/// tab is a Mail tab the harness's test extension draws.
+fn ext_fixture_view(
+    app: &crate::Docxy,
+) -> Result<gpui::Entity<crate::ext_fixture::FixtureView>, String> {
+    let Some(crate::Surface::Ext(e)) = app.tabs.get(app.active).map(|t| &t.surface) else {
+        return Err("the active tab is not an extension's (open File > New > Mail in a case that starts with 'ext fixture')".into());
+    };
+    e.view()
+        .downcast::<crate::ext_fixture::FixtureView>()
+        .map_err(|_| "the active tab is not the test extension's".to_string())
+}
+
+/// A point of the test extension's document view: `view` (its middle),
+/// `link:<n>` (the n-th painted link span's middle) or `word:<text>` (the
+/// first painted word whose text, trimmed, is `<text>`; `:start` or `:end`
+/// after it is one pixel inside that edge, at mid-height).
+fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixels>, String> {
+    let fixture = ext_fixture_view(app)?;
+    let view = fixture.read(cx).doc.read(cx);
+    if part == "view" {
+        return view
+            .viewport()
+            .map(|b| b.center())
+            .ok_or_else(|| "the view is not drawn yet".to_string());
+    }
+    if let Some(n) = part.strip_prefix("link:") {
+        let n: usize = n
+            .trim()
+            .parse()
+            .map_err(|_| "'ext-doc-link' needs a numeric index".to_string())?;
+        let spans = view.link_spans();
+        return spans
+            .get(n)
+            .map(|(_, b)| b.center())
+            .ok_or_else(|| format!("no link {n}; {} drawn", spans.len()));
+    }
+    if let Some(word) = part.strip_prefix("word:") {
+        let (text, edge) = match word.rsplit_once(':') {
+            Some((t, e @ ("start" | "end"))) => (t, Some(e)),
+            _ => (word, None),
+        };
+        let b = view
+            .word_bounds(text.trim())
+            .ok_or_else(|| format!("no painted word '{}'", text.trim()))?;
+        let y = b.center().y;
+        return Ok(match edge {
+            Some("start") => point(b.left() + px(1.), y),
+            Some(_) => point(b.right() - px(1.), y),
+            None => b.center(),
+        });
+    }
+    Err("the test extension's regions are ext-doc-view, ext-doc-link:<n> and ext-doc-word:<text>[:start|:end]".into())
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its
@@ -5031,6 +5121,54 @@ fn dispatch_verb(
             Done::ok(help_read_json(app))
         }
         "help-read" => Done::ok(help_read_json(app)),
+        // The test extension's embedded document view (#1873), on a Mail tab
+        // of a case that starts with `ext fixture`.
+        "ext-doc-read" => {
+            let fixture = ext_fixture_view(app)?;
+            let f = fixture.read(cx);
+            let calls = f
+                .link_calls
+                .borrow()
+                .iter()
+                .map(|u| Json::Str(u.clone()))
+                .collect();
+            let mut reply = match f.doc.read(cx).harness_json(window) {
+                Json::Obj(fields) => fields,
+                _ => Vec::new(),
+            };
+            reply.push(("link_calls".into(), Json::Arr(calls)));
+            Done::ok(Json::Obj(reply))
+        }
+        "ext-doc-set" => {
+            let fixture = ext_fixture_view(app)?;
+            let mode = match args.get("link_click") {
+                None => None,
+                Some(v) => Some(match v.as_str() {
+                    Some("click") => crate::ext::LinkClick::Click,
+                    Some("ctrl-click") => crate::ext::LinkClick::CtrlClick,
+                    _ => return Err(r#"'link_click' must be "click" or "ctrl-click""#.into()),
+                }),
+            };
+            let dark = match args.get("content_dark") {
+                None => None,
+                Some(Json::Bool(b)) => Some(*b),
+                Some(_) => return Err("'content_dark' must be true or false".into()),
+            };
+            if mode.is_none() && dark.is_none() {
+                return Err("ext-doc-set takes 'link_click' and/or 'content_dark'".into());
+            }
+            let doc = fixture.read(cx).doc.clone();
+            doc.update(cx, |v, cx| {
+                if let Some(mode) = mode {
+                    v.set_link_click(mode, cx);
+                }
+                if let Some(dark) = dark {
+                    v.set_content_dark(dark, cx);
+                }
+            });
+            let reply = doc.read(cx).harness_json(window);
+            Done::ok(reply)
+        }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
             Done::ok(status_json(&crate::status_items(
@@ -5868,7 +6006,7 @@ fn dispatch_verb(
             let p = match (args.get("region"), args.get("at")) {
                 (Some(region), None) => {
                     let name = region.as_str().ok_or("'region' must be a region name")?;
-                    region_point(app, name, window)?
+                    region_point(app, name, window, cx)?
                 }
                 (None, Some(at)) => match at.as_str() {
                     Some("fill-handle") => fill_handle_point(app)?,
@@ -5948,6 +6086,11 @@ fn dispatch_verb(
             } else {
                 click_events_with(p, button)
             };
+            // `"ctrl": true` holds Control over the press and release (#1873:
+            // Ctrl+click on a hyperlink).
+            if arg_flag(args, "ctrl")? {
+                with_control(&mut done.input);
+            }
             Ok(done)
         }
         // Select the cell whose fill-handle point lies inside a probe's drawn
@@ -6103,7 +6246,7 @@ fn dispatch_verb(
                 .get("dy")
                 .and_then(Json::as_f64)
                 .ok_or("'dy' must be a number of logical pixels")? as f32;
-            let p = region_point(app, name, window)?;
+            let p = region_point(app, name, window, cx)?;
             let mut done = Done::ok(Json::obj(vec![
                 ("x", Json::Num(f64::from(p.x))),
                 ("y", Json::Num(f64::from(p.y))),
@@ -6181,8 +6324,8 @@ fn dispatch_verb(
             app.refuse_under_dialog()?;
             let from_name = arg_str(args, "from")?;
             let to_name = arg_str(args, "to")?;
-            let from = region_point(app, from_name, window)?;
-            let to = region_point(app, to_name, window)?;
+            let from = region_point(app, from_name, window, cx)?;
+            let to = region_point(app, to_name, window, cx)?;
             let to = match drag_offset(args)? {
                 Some((dx, dy)) => point(px(f32::from(to.x) + dx), px(f32::from(to.y) + dy)),
                 None => to,
@@ -6211,7 +6354,7 @@ fn dispatch_verb(
         // a held left button and never plain hover (a Project range extends
         // on a drag's move, not on a hover).
         "pointer-move" => {
-            let to = region_point(app, arg_str(args, "to")?, window)?;
+            let to = region_point(app, arg_str(args, "to")?, window, cx)?;
             let mut done = Done::ok(Json::obj(vec![(
                 "to",
                 Json::Arr(vec![Json::Num(f64::from(to.x)), Json::Num(f64::from(to.y))]),
