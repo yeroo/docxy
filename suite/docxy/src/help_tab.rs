@@ -2,18 +2,25 @@
 //! end theirs: a Help group (Help, Contact Support, Feedback, Show Training,
 //! What's New) and our About group.
 //!
-//! Help and F1 say the in-app documentation is coming (it is #1022). Contact
+//! Help and F1 open the editor's manual in a Help tab (#1855,
+//! `help_view`) when one is installed (`help_manual`), else say the
+//! documentation is coming: Help on its own page (the `help` key), F1 on the
+//! active ribbon tab's area page, or on the page of the open dialog
+//! (`dialog:<id>`). Contact
 //! Support and Feedback open the docxy GitHub new-issue page with the build
 //! pre-filled ([`buildinfo::BuildInfo::feedback_url`]); under the harness the
 //! URL is recorded, not opened, and `last-url` reads it. About docxy suite opens
 //! the File › Account About dialog (#1023). Show Training and What's New have
 //! nothing to show yet: they are drawn disabled.
 use super::*;
+use crate::help_manual::Editor as HelpEditor;
 
 /// A Help tab command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelpAct {
-    /// Help (F1): the documentation, once it lands.
+    /// Help: the manual's page for the `help` command in a Help tab (#1855),
+    /// or the documentation is coming when no manual is installed. F1 opens
+    /// the page for where the person is instead (`help_f1`).
     Help,
     ContactSupport,
     Feedback,
@@ -25,7 +32,7 @@ pub(crate) enum HelpAct {
     About,
 }
 
-/// What Help and F1 say until the documentation lands.
+/// What Help and F1 say when no manual is installed for the editor.
 pub(crate) const DOCS_COMING: &str = "Help: the documentation is coming soon";
 
 /// The status line after Contact Support or Feedback.
@@ -108,10 +115,98 @@ pub(crate) fn help_tab() -> rs::Tab<Act> {
     )
 }
 
-/// F1, with no modifier: Help › Help.
+/// F1, with no modifier: the manual's page for the ribbon tab shown, the
+/// open dialog, or a Help tab's root (#1855; see [`f1_ask`]).
 pub(crate) fn is_help_key(k: &Keystroke) -> bool {
-    let m = &k.modifiers;
-    k.key == "f1" && !(m.control || m.platform || m.alt || m.shift || m.function)
+    is_help_stroke(&k.key, k.modifiers)
+}
+
+/// [`is_help_key`] for a key already split into its name and modifiers.
+pub(crate) fn is_help_stroke(key: &str, m: Modifiers) -> bool {
+    key == "f1" && !(m.control || m.platform || m.alt || m.shift || m.function)
+}
+
+/// What a Help command or F1 asks the manual for (#1855).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HelpAsk {
+    pub editor: HelpEditor,
+    /// A command or dialog id (`bold`, `dialog:font`); `None` asks for the
+    /// area's own page, never a key's.
+    pub id: Option<String>,
+    /// The ribbon tab's name (`Home`), or `None`: the manual's root.
+    pub area: Option<String>,
+}
+
+impl HelpAsk {
+    /// The page of `self` in `manual`, and how it was found.
+    pub(crate) fn resolve(&self, manual: &helpdocs::Manual) -> Option<helpdocs::Target> {
+        match &self.id {
+            Some(id) => helpdocs::resolve(manual, id, self.area.as_deref()),
+            None => helpdocs::resolve_area(manual, self.area.as_deref()),
+        }
+    }
+}
+
+/// F1 with no dialog: on a Help tab its manual's root page, else the area
+/// page of the ribbon tab shown (`area`) in the manual of the tab's kind.
+pub(crate) fn f1_ask(kind: Option<Kind>, area: &str, help_tab: Option<HelpEditor>) -> HelpAsk {
+    match help_tab {
+        Some(editor) => HelpAsk {
+            editor,
+            id: None,
+            area: None,
+        },
+        None => HelpAsk {
+            editor: help_view::host::editor_for(kind),
+            id: None,
+            area: Some(area.to_string()),
+        },
+    }
+}
+
+/// Help › Help (the ribbon's, the sheet's, the macOS menu's): the `help`
+/// command's page, in the manual of the tab's kind, or on a Help tab
+/// (`help_tab`: the macOS menu bar reaches one) in that tab's manual.
+pub(crate) fn help_command_ask(kind: Option<Kind>, help_tab: Option<HelpEditor>) -> HelpAsk {
+    HelpAsk {
+        editor: help_tab.unwrap_or_else(|| help_view::host::editor_for(kind)),
+        id: Some("help".into()),
+        area: Some("Help".into()),
+    }
+}
+
+/// F1, or a Help button, on the dialog `id` over a tab of `kind`, with the
+/// ribbon tab `area` shown.
+pub(crate) fn dialog_ask(kind: Option<Kind>, id: &str, area: &str) -> HelpAsk {
+    HelpAsk {
+        editor: help_view::host::editor_for(kind),
+        id: Some(format!("dialog:{id}")),
+        area: Some(area.to_string()),
+    }
+}
+
+/// Whether F1 over the dialog `d` opens its Help page (#1855): only over a
+/// plain form, never a message box, a popup (the AutoFilter's menu), a
+/// reload or recovery prompt, or the close and quit prompts (`quitting`:
+/// a window close is asking about unsaved tabs), which a tab switch would
+/// strand. F1 over any other is swallowed, as before.
+pub(crate) fn dialog_takes_help(d: &crate::dialog::Dialog, quitting: bool) -> bool {
+    use crate::dialog::DialogOwner as O;
+    !quitting
+        && d.text.is_none()
+        && d.popup.is_none()
+        && !matches!(
+            d.owner,
+            O::Reopen { .. }
+                | O::SaveOnClose { .. }
+                | O::Message
+                | O::DocumentRecovery
+                | O::DropReplace
+                | O::FilterMenu { .. }
+                | O::ProjectFilter { .. }
+                | O::UserName
+                | O::About
+        )
 }
 
 impl Docxy {
@@ -123,7 +218,14 @@ impl Docxy {
             return self.refocus(window, cx);
         }
         match act {
-            HelpAct::Help => self.set_status(DOCS_COMING),
+            HelpAct::Help => {
+                let kind = self.tabs.get(self.active).map(|t| t.kind);
+                let help_tab = self.active_help().map(help_view::HelpView::editor);
+                if self.open_help(help_command_ask(kind, help_tab), window, cx) {
+                    return;
+                }
+                self.set_status(DOCS_COMING);
+            }
             HelpAct::ContactSupport | HelpAct::Feedback => {
                 let url = about::info().feedback_url("suite");
                 self.open_help_url(url, cx);
@@ -137,6 +239,92 @@ impl Docxy {
             }
         }
         self.refocus(window, cx);
+    }
+
+    /// Open the page `ask` resolves to in a Help tab. `false` (nothing done)
+    /// when no manual is installed for its editor.
+    pub(crate) fn open_help(
+        &mut self,
+        ask: HelpAsk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(bundle) = self.help_bundle(ask.editor) else {
+            return false;
+        };
+        let Some(target) = ask.resolve(&bundle.manual) else {
+            return false;
+        };
+        let at = help_view::Loc::page(&target.page);
+        self.open_help_at(bundle, at, Some(target.via), window, cx);
+        true
+    }
+
+    /// F1 with no dialog and no entry owning the keys: the area page of the
+    /// ribbon tab shown, or the root of the Help tab's manual; with no manual
+    /// installed the status line says the documentation is coming.
+    pub(crate) fn help_f1(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.keytips = KeyTip::Off;
+        let kind = self.tabs.get(self.active).map(|t| t.kind);
+        let ask = f1_ask(
+            kind,
+            crate::ribbon_tab_name(self.ribbon_tab),
+            self.active_help().map(help_view::HelpView::editor),
+        );
+        if !self.open_help(ask, window, cx) {
+            self.set_status(DOCS_COMING);
+            self.refocus(window, cx);
+        }
+    }
+
+    /// F1 over the active tab's dialog: its page in a Help tab, when the
+    /// dialog is a plain form ([`dialog_takes_help`]) and a manual is
+    /// installed. `false` leaves the key to the dialog, which swallows it.
+    /// The dialog stays open on its tab.
+    pub(crate) fn dialog_f1(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(ask) = self.open_dialog_ask() else {
+            return false;
+        };
+        self.open_help(ask, window, cx)
+    }
+
+    /// What F1 over the active tab's top dialog asks for, when it may.
+    fn open_dialog_ask(&self) -> Option<HelpAsk> {
+        if self.app_dialogs.is_open() {
+            return None;
+        }
+        let tab = self.tabs.get(self.active)?;
+        let d = tab.dialogs.top()?;
+        let quitting = self.quitting || crate::close::quit_prompt_live(&self.tabs);
+        dialog_takes_help(d, quitting).then(|| {
+            dialog_ask(
+                Some(tab.kind),
+                d.id.as_str(),
+                crate::ribbon_tab_name(self.ribbon_tab),
+            )
+        })
+    }
+
+    /// A dialog's own Help button (Task Information's, a plugin dialog's
+    /// without a `help` URL): its page in a Help tab. `false` with no manual
+    /// installed, which leaves the press to say the documentation is coming.
+    pub(crate) fn dialog_help_button(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let Some(d) = tab.dialogs.top() else {
+            return false;
+        };
+        let ask = dialog_ask(
+            Some(tab.kind),
+            d.id.as_str(),
+            crate::ribbon_tab_name(self.ribbon_tab),
+        );
+        self.open_help(ask, window, cx)
     }
 
     /// Open `url` in the browser and record it for `last-url`. A harness run

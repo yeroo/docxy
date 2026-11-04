@@ -1,7 +1,7 @@
 ---
 title: Tables
 area: insert
-keys: table
+keys: table, dialog:insert-table
 ---
 # Tables
 

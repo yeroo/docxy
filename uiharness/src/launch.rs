@@ -681,6 +681,51 @@ pub fn request_start_screen(sandbox: &Path) -> Result<(), String> {
     std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))
 }
 
+/// Where the suite started in `sandbox` reads `editor`'s help manual from
+/// (#1855): its config root's `docxy/manual/<editor>`. A harness instance
+/// reads a manual from nowhere else.
+pub fn manual_dir(sandbox: &Path, editor: &str) -> PathBuf {
+    sandbox.join("docxy").join("manual").join(editor)
+}
+
+/// Copy each `manual <editor> <dir>` bundle (`dir` relative to `base`, the
+/// script's directory) into [`manual_dir`], the whole tree.
+pub fn install_manuals(
+    sandbox: &Path,
+    manuals: &[crate::script::Manual],
+    base: &Path,
+) -> Result<(), String> {
+    for m in manuals {
+        let from = base.join(&m.dir);
+        if !from.is_dir() {
+            return Err(format!(
+                "manual {}: {} is not a directory",
+                m.editor,
+                from.display()
+            ));
+        }
+        copy_tree(&from, &manual_dir(sandbox, &m.editor))?;
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let entries = std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {e}", from.display()))?;
+        let path = entry.path();
+        let target = to.join(entry.file_name());
+        if path.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)
+                .map_err(|e| format!("{} -> {}: {e}", path.display(), target.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Where the suite started in `sandbox` loads format plugins from: its
 /// config root's `docxy/plugins`.
 pub fn plugins_dir(sandbox: &Path) -> PathBuf {
@@ -966,6 +1011,46 @@ mod tests {
         request_start_screen(&sandbox).unwrap();
         assert!(sandbox.join("docxy").join("start-screen").is_file());
         let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// #1855: a script's `manual` lines copy the bundle's whole tree into the
+    /// sandbox's `docxy/manual/<editor>`; a missing directory is named.
+    #[test]
+    fn manuals_are_copied_into_the_sandboxs_config_root() {
+        let base = std::env::temp_dir().join(format!(
+            "uiharness-manuals-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let (cases, sandbox) = (base.join("cases"), base.join("sandbox"));
+        let bundle = base.join("fixture").join("word");
+        std::fs::create_dir_all(bundle.join("images")).unwrap();
+        std::fs::create_dir_all(&cases).unwrap();
+        std::fs::write(bundle.join("contents.txt"), b"home\n").unwrap();
+        std::fs::write(bundle.join("images").join("a.png"), b"png").unwrap();
+        let word = crate::script::Manual {
+            editor: "word".into(),
+            dir: "../fixture/word".into(),
+        };
+        install_manuals(&sandbox, std::slice::from_ref(&word), &cases).unwrap();
+        let dir = manual_dir(&sandbox, "word");
+        assert_eq!(dir, sandbox.join("docxy").join("manual").join("word"));
+        assert_eq!(std::fs::read(dir.join("contents.txt")).unwrap(), b"home\n");
+        assert_eq!(
+            std::fs::read(dir.join("images").join("a.png")).unwrap(),
+            b"png"
+        );
+        let missing = crate::script::Manual {
+            editor: "excel".into(),
+            dir: "nowhere".into(),
+        };
+        let e = install_manuals(&sandbox, &[missing], &cases).unwrap_err();
+        assert!(
+            e.contains("manual excel") && e.contains("not a directory"),
+            "{e}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A script's `plugin` lines copy the built libraries into the sandbox's

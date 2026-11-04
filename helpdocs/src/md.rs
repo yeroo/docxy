@@ -643,13 +643,19 @@ fn keys(chord: &str) -> Option<Vec<String>> {
 
 /// Every image source in the blocks, list items' included, in order.
 pub fn images(blocks: &[Block]) -> Vec<&str> {
+    image_alts(blocks).into_iter().map(|(src, _)| src).collect()
+}
+
+/// Every image's source and alt text, list items' included, in order (the
+/// order of [`images`]).
+pub fn image_alts(blocks: &[Block]) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     for b in blocks {
         match b {
-            Block::Image { src, .. } => out.push(src.as_str()),
+            Block::Image { src, alt } => out.push((src.as_str(), alt.as_str())),
             Block::List { items, .. } => {
                 for item in items {
-                    out.extend(images(&item.children));
+                    out.extend(image_alts(&item.children));
                 }
             }
             _ => {}
@@ -660,16 +666,22 @@ pub fn images(blocks: &[Block]) -> Vec<&str> {
 
 /// Every link in the blocks, in order.
 pub fn links(blocks: &[Block]) -> Vec<&Link> {
+    link_texts(blocks).into_iter().map(|(l, _)| l).collect()
+}
+
+/// Every link in the blocks with its text ([`plain`]), in the order of
+/// [`links`]: a host numbers them so.
+pub fn link_texts(blocks: &[Block]) -> Vec<(&Link, String)> {
     let mut out = Vec::new();
     for_inlines(blocks, &mut |inl| collect_links(inl, &mut out));
     out
 }
 
-fn collect_links<'a>(inlines: &'a [Inline], out: &mut Vec<&'a Link>) {
+fn collect_links<'a>(inlines: &'a [Inline], out: &mut Vec<(&'a Link, String)>) {
     for i in inlines {
         match i {
             Inline::Link { text, target } => {
-                out.push(target);
+                out.push((target, plain(text)));
                 collect_links(text, out);
             }
             Inline::Bold(x) | Inline::Italic(x) => collect_links(x, out),
@@ -702,6 +714,30 @@ pub fn for_inlines<'a>(blocks: &'a [Block], f: &mut impl FnMut(&'a [Inline])) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_and_images_come_with_their_text() {
+        let b = parse(
+            "See [**a** b](a) and [c](#c).\n\n- item\n\n  ![shot](images/s.png)\n\n![top](images/t.png)\n",
+        );
+        let got: Vec<(Link, String)> = link_texts(&b)
+            .into_iter()
+            .map(|(l, t)| (l.clone(), t))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (Link::classify("a"), "a b".to_string()),
+                (Link::classify("#c"), "c".to_string()),
+            ]
+        );
+        assert_eq!(links(&b), got.iter().map(|(l, _)| l).collect::<Vec<_>>());
+        assert_eq!(
+            image_alts(&b),
+            [("images/s.png", "shot"), ("images/t.png", "top")]
+        );
+        assert_eq!(images(&b), ["images/s.png", "images/t.png"]);
+    }
 
     fn t(s: &str) -> Inline {
         Inline::Text(s.to_string())

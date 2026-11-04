@@ -72,6 +72,22 @@ impl Cache {
         out
     }
 
+    /// The image of a file that is not a package part: a help manual's
+    /// picture (#1855), under `part` (`help:<editor>`) and its bundle path.
+    /// A Help tab has no package, so its map never renews: the image is
+    /// read once and kept until the tab or its window goes. `None` (kept
+    /// too) when the bytes are no picture gpui draws.
+    pub fn file_image(&mut self, part: &str, path: &str, bytes: &[u8]) -> Option<Arc<Image>> {
+        let key = (part.to_string(), path.to_string());
+        self.images
+            .entry(key)
+            .or_insert_with(|| {
+                let ext = docxcore::image::sniff(bytes)?.ext;
+                Some(Arc::new(Image::from_bytes(format_of(ext)?, bytes.to_vec())))
+            })
+            .clone()
+    }
+
     /// The gpui ids of the images this cache may still draw.
     pub fn live_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.images
@@ -523,6 +539,30 @@ mod tests {
         let retired = cache.borrow_mut().take_released(false);
         assert!(retired.iter().any(|i| Arc::ptr_eq(i, &gone)));
         assert!(retired.iter().any(|i| Arc::ptr_eq(i, &first)));
+    }
+
+    /// #1855: a Help tab's manual picture is kept by its bundle path, counts
+    /// as live while the tab holds it, and is released with the tab.
+    #[test]
+    fn a_manual_picture_is_held_live_until_its_tab_goes() {
+        let mut cache = Cache::default();
+        let a = cache
+            .file_image("help:word", "images/a.png", &png(1))
+            .unwrap();
+        let again = cache
+            .file_image("help:word", "images/a.png", &png(9))
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &again), "read once");
+        assert!(
+            cache
+                .file_image("help:word", "images/bad.png", b"junk")
+                .is_none()
+        );
+        assert_eq!(cache.live_ids().collect::<Vec<_>>(), [a.id]);
+        assert!(cache.take_released(false).is_empty());
+        let gone = cache.take_released(true);
+        assert!(gone.iter().any(|i| Arc::ptr_eq(i, &a)));
+        assert_eq!(cache.live_ids().count(), 0);
     }
 
     #[test]

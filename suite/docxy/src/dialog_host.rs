@@ -755,9 +755,15 @@ impl Docxy {
         if let Some(done) = self.user_name_click(button, cx) {
             return done;
         }
+        // Task Information's Help (#1536) opens its page in a Help tab when
+        // a manual is installed (#1855); the dialog stays.
+        if self.task_info_help_pressed(button) && self.dialog_help_button(window, cx) {
+            return Ok(());
+        }
         // A plugin dialog's Help is the host's (#1609): it opens the spec's
-        // help page, or says the documentation is coming; the dialog stays.
-        if let Some(done) = self.plugin_help_click(button, cx) {
+        // help page, else its page in a Help tab (#1855), or says the
+        // documentation is coming; the dialog stays.
+        if let Some(done) = self.plugin_help_click(button, window, cx) {
             return done;
         }
         // So is Document Recovery, which replaces tabs (#1225).
@@ -831,6 +837,12 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // F1 over a plain form opens its Help page (#1855); the dialog stays
+        // on its tab. With no manual, or over any other dialog, it is
+        // swallowed below as before.
+        if crate::help_tab::is_help_stroke(key, m) && self.dialog_f1(window, cx) {
+            return true;
+        }
         // Enter or Escape on a dialog the app applies (the user name, About,
         // AutoCorrect, the close prompt, the fill, paste and drop dialogs)
         // presses through the app, as its drawn buttons do; so do Go To and
@@ -912,6 +924,7 @@ impl Docxy {
     fn plugin_help_click(
         &mut self,
         button: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Result<(), String>> {
         let dialogs = self.active_dialogs()?;
@@ -928,9 +941,21 @@ impl Docxy {
         }
         match crate::plugin_ui::help_url(spec) {
             Some(url) => self.open_help_url(url, cx),
+            None if self.dialog_help_button(window, cx) => {}
             None => self.set_status(crate::help_tab::DOCS_COMING.to_string()),
         }
         Some(Ok(()))
+    }
+
+    /// Whether `button` is the Help of a Task Information dialog on top of
+    /// the active tab (`project::help_click`'s test, read only).
+    fn task_info_help_pressed(&self, button: &str) -> bool {
+        !self.app_dialogs.is_open()
+            && self
+                .tabs
+                .get(self.active)
+                .and_then(|t| t.dialogs.top())
+                .is_some_and(|d| crate::project::is_help_press(d, button))
     }
 
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].

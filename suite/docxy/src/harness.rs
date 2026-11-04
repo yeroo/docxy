@@ -585,7 +585,7 @@ fn save_as_target(
             .into_iter()
             .map(|(_, ext)| ext)
             .collect(),
-        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
     };
     if let Some(f) = format {
         if !kind_formats.contains(&f) {
@@ -683,7 +683,7 @@ fn save_types(
             .into_iter()
             .map(|(label, ext)| (label, vec![ext]))
             .collect(),
-        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
     })
 }
 
@@ -1617,7 +1617,7 @@ fn to_field_arg(args: &Json) -> Result<Option<&str>, String> {
 }
 
 /// The targets `pointer-click` takes; a call names exactly one (#1029).
-const POINTER_TARGETS: [&str; 10] = [
+const POINTER_TARGETS: [&str; 11] = [
     "region",
     "at",
     "dialog-field",
@@ -1628,6 +1628,8 @@ const POINTER_TARGETS: [&str; 10] = [
     "dialog-cell",
     "dialog-richtool",
     "input",
+    // A part of the Help tab (#1855).
+    "help",
 ];
 
 fn one_pointer_target(args: &Json) -> Result<(), String> {
@@ -3734,7 +3736,106 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "dialog-click"
             | "enable-editing"
             | "edit-anyway"
+            | "help-open"
     )
+}
+
+/// `help-read`: the active Help tab's page, history, search and contents
+/// ([`crate::help_view::HelpView::read_json`]), else `{"open":false}`.
+fn help_read_json(app: &crate::Docxy) -> Json {
+    match app.active_help() {
+        Some(v) => {
+            let mut j = v.read_json(crate::help_view::host::top_block(&v.scroll));
+            if let Json::Obj(pairs) = &mut j {
+                let y = -f32::from(v.scroll.offset().y);
+                pairs.push(("scroll_y".into(), Json::Num(f64::from(y.round()))));
+            }
+            j
+        }
+        None => Json::obj(vec![("open", Json::Bool(false))]),
+    }
+}
+
+/// `help-open`: one of `{"page", "anchor"?}`, `{"command", "area"?}`,
+/// `{"dialog", "area"?}` or none (the manual's root), in the manual of
+/// `"editor"` (`word`, `excel`, `project`), else of the active tab's kind
+/// (a Help tab's own); `area` defaults to the ribbon tab shown. Refused
+/// under a dialog, without a manual for the editor, and for a page the
+/// manual lacks.
+fn help_open(
+    app: &mut crate::Docxy,
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<(), String> {
+    use crate::help_manual::Editor;
+    use crate::help_tab::HelpAsk;
+    use crate::help_view::Loc;
+    app.refuse_under_dialog()?;
+    let editor = match args.get("editor") {
+        Some(e) => {
+            let name = e
+                .as_str()
+                .ok_or("'editor' must be word, excel or project")?;
+            Editor::from_name(name).ok_or_else(|| {
+                format!("'{name}' has no manual: the editors are word, excel and project")
+            })?
+        }
+        None => match app.active_help() {
+            Some(v) => v.editor(),
+            None => crate::help_view::host::editor_for(app.tabs.get(app.active).map(|t| t.kind)),
+        },
+    };
+    let bundle = app
+        .help_bundle(editor)
+        .ok_or_else(|| format!("no help manual is installed for {}", editor.name()))?;
+    let given: Vec<&str> = ["page", "command", "dialog"]
+        .into_iter()
+        .filter(|k| args.get(k).is_some())
+        .collect();
+    if given.len() > 1 {
+        return Err(format!(
+            "help-open takes one of page, command or dialog, not {}",
+            given.join(" and ")
+        ));
+    }
+    let text = |key: &str| -> Result<Option<String>, String> {
+        args.get(key)
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("'{key}' must be a string"))
+            })
+            .transpose()
+    };
+    let area = match text("area")? {
+        Some(a) => a,
+        None => crate::ribbon_tab_name(app.ribbon_tab).to_string(),
+    };
+    let (at, via) = if let Some(page) = text("page")? {
+        if bundle.manual.page(&page).is_none() {
+            return Err(format!("the {} manual has no page '{page}'", editor.name()));
+        }
+        let anchor = text("anchor")?;
+        (Loc { page, anchor }, None)
+    } else {
+        let id = match (text("command")?, text("dialog")?) {
+            (Some(c), _) => Some(c),
+            (None, Some(d)) => Some(format!("dialog:{d}")),
+            (None, None) => None,
+        };
+        let ask = HelpAsk {
+            editor,
+            area: id.as_ref().map(|_| area),
+            id,
+        };
+        let t = ask
+            .resolve(&bundle.manual)
+            .ok_or_else(|| format!("the {} manual has no page", editor.name()))?;
+        (Loc::page(&t.page), Some(t.via))
+    };
+    app.open_help_at(bundle, at, via, window, cx);
+    Ok(())
 }
 
 /// `menu-click`'s `{label}` or `{path}`, as the labels to walk.
@@ -4286,6 +4387,7 @@ fn kind_name(kind: crate::Kind) -> &'static str {
         crate::Kind::Xlsx => "xlsx",
         crate::Kind::Project => "project",
         crate::Kind::Look => "mail",
+        crate::Kind::Help => "help",
     }
 }
 
@@ -4326,6 +4428,7 @@ fn tab_list(
     drawn_accent: u32,
 ) -> Json {
     let kind = tabs.get(active).map(|t| t.kind);
+    let count = tabs.len();
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
         .iter()
@@ -4351,6 +4454,9 @@ fn tab_list(
         .collect();
     Json::obj(vec![
         ("active", Json::Num(active as f64)),
+        // How many tabs the strip holds (#1855: a case can see that F1
+        // reused the Help tab rather than opening another).
+        ("count", Json::Num(count as f64)),
         ("window_title", Json::Str(window_title)),
         // The title bar's one-word type label and the selected tab's accent
         // (#1473). `accent` is computed from the tab; `drawn_accent` is what
@@ -4919,6 +5025,12 @@ fn dispatch_verb(
         // The page Help › Feedback or Contact Support last opened (#1021); a
         // harness run records it instead of starting a browser.
         "last-url" => Done::ok(last_url_json(app.last_opened_url.as_deref())),
+        // The Help tab (#1855): open a page of a manual, read the one shown.
+        "help-open" => {
+            help_open(app, args, window, cx)?;
+            Done::ok(help_read_json(app))
+        }
+        "help-read" => Done::ok(help_read_json(app)),
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
             Done::ok(status_json(&crate::status_items(
@@ -5714,6 +5826,29 @@ fn dispatch_verb(
                 } else {
                     click_events(p)
                 };
+                return Ok(done);
+            }
+            // A part of the Help tab (#1855): `back`, `forward`,
+            // `contents:<page>`, `hit:<n>` or `link:<n>` (`help-read`'s
+            // numbering).
+            if let Some(part) = args.get("help") {
+                let part = part
+                    .as_str()
+                    .ok_or("'help' must be back, forward, contents:<page>, hit:<n> or link:<n>")?;
+                app.refuse_under_dialog()?;
+                app.active_help()
+                    .ok_or("the active tab is not a Help tab")?;
+                let p = app
+                    .probes
+                    .borrow()
+                    .on_screen(&format!("help-{part}"))
+                    .ok_or_else(|| format!("the Help tab draws no '{part}'"))?
+                    .center();
+                let mut done = Done::ok(Json::obj(vec![
+                    ("x", Json::Num(f64::from(p.x))),
+                    ("y", Json::Num(f64::from(p.y))),
+                ]))?;
+                done.input = click_events(p);
                 return Ok(done);
             }
             if let Some(field) = args.get("dialog-field") {
@@ -8194,6 +8329,7 @@ mod tests {
             "close-window",
             "window-new",
             "window-select",
+            "help-open",
             "recent-open",
             "selection-set",
             "doc-click",
@@ -8225,6 +8361,7 @@ mod tests {
             "dialog-catalog-check",
             "status-read",
             "last-url",
+            "help-read",
             "doc",
             "rows",
             "cell",

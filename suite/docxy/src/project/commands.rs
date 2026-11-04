@@ -2034,7 +2034,7 @@ pub(crate) fn tab_app_state(tab: &DocTab, app_dialog: bool) -> Option<AppState> 
         Surface::Project(v) => project_app_state(v),
         Surface::Sheet(v) => crate::sheet_app_state(v),
         Surface::Doc(_) => AppState::Ready,
-        Surface::Placeholder | Surface::Ext(_) => return None,
+        Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) => return None,
     };
     Some(match state {
         AppState::Ready if app_dialog || tab.dialogs.is_open() => AppState::Edit,

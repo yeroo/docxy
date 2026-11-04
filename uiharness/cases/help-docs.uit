@@ -1,0 +1,274 @@
+# The Help tab (#1855): Help and F1 open the editor's manual inside the
+# suite. The runner installs the helpdocs word fixture as this instance's
+# Word manual (a harness instance reads a manual from its sandbox only, never
+# the one built into the binary), so the pages, keys and links here are the
+# fixture's: welcome, home, home-font (keys bold, dialog:font), insert,
+# tables (keys table, dialog:insert-table), images, keyboard, help. No Excel
+# or Project manual is installed. Each test closes the Help tab it opened
+# (Ctrl+W on it), so the next one starts without it.
+manual word ../../helpdocs/tests/fixture/word
+
+test F1 on Home opens the Home page in a Help tab, and F1 there its root
+  open copy:../fixtures/basic.docx
+  call ribbon-layout {"tab":"Home"}
+  assert view.zoom is 1
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is word
+  assert reply.page is home
+  assert reply.title is Home tab
+  assert reply.via is area
+  assert reply.problems is 0
+  call tab-list {}
+  # The sample document, basic.docx, then the Help tab right after it.
+  assert reply.active is 2
+  assert reply.tabs.2.kind is help
+  assert reply.tabs.2.title is Help: Home tab
+  assert reply.tabs.2.dirty is false
+  assert reply.title_label is help
+  assert reply.count is 3
+  # A second F1 on the Help tab opens its manual's root, in the same tab.
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is welcome
+  assert reply.via is root
+  assert reply.back is 1
+  call tab-list {}
+  assert reply.active is 2
+  assert reply.count is 3
+  # The document zoom keys do not reach the documents from a Help tab (its
+  # status bar draws no zoom controls either).
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+-"}
+  call real-key {"key":"ctrl+-"}
+  shot window
+  # From the document again, F1 reuses that tab: a history step.
+  call real-key {"key":"ctrl+shift+tab"}
+  assert view.zoom is 1
+  call ribbon-layout {"tab":"Insert"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is insert
+  assert reply.back is 2
+  call tab-list {}
+  assert reply.active is 2
+  assert reply.count is 3
+  # No ribbon: File alone. Ctrl+S has nothing to write.
+  call real-key {"key":"ctrl+s"}
+  call status-read {}
+  assert reply.items.0.text is Help pages are not saved; there is nothing to save
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 2
+
+test the ribbon tab shown behind a Help tab is there on return
+  open copy:../fixtures/basic.docx
+  call ribbon-layout {"tab":"Layout"}
+  assert ribbon_tab is Layout
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  # Frames drawn with the Help tab in front leave the ribbon tab alone.
+  shot window
+  assert ribbon_tab is Layout
+  call real-key {"key":"ctrl+shift+tab"}
+  shot window
+  assert ribbon_tab is Layout
+  call real-key {"key":"ctrl+tab"}
+  call real-key {"key":"ctrl+w"}
+  # A plan's Resource tab too (no Project manual: a Word Help tab opens).
+  open ../fixtures/gantt-summary.xml
+  call ribbon-layout {"tab":"Resource"}
+  assert ribbon_tab is Resource
+  call help-open {"editor":"word","page":"welcome"}
+  shot window
+  call real-key {"key":"ctrl+shift+tab"}
+  shot window
+  assert ribbon_tab is Resource
+  call real-key {"key":"ctrl+tab"}
+  call real-key {"key":"ctrl+w"}
+
+test Help > Help opens the Help command's page
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"Help"}
+  call help-read {}
+  assert reply.page is help
+  assert reply.via is exact
+  assert reply.tab_title is Help: Help tab
+  call real-key {"key":"ctrl+w"}
+  call help-read {}
+  assert reply.open is false
+
+test help-open resolves a command, a dialog, a page and refuses what it cannot
+  open copy:../fixtures/basic.docx
+  call help-open {"command":"bold"}
+  assert reply.page is home-font
+  assert reply.via is exact
+  call help-open {"command":"no-such-command","area":"Insert"}
+  assert reply.page is insert
+  assert reply.via is area
+  call help-open {"dialog":"insert-table"}
+  assert reply.page is tables
+  call help-open {"page":"keyboard","anchor":"shortcuts"}
+  assert reply.page is keyboard
+  assert reply.anchor is shortcuts
+  assert reply.via is nothing
+  call-error help-open {"page":"nowhere"} => the word manual has no page 'nowhere'
+  call-error help-open {"editor":"excel"} => no help manual is installed for excel
+  call-error help-open {"page":"home","command":"bold"} => help-open takes one of page, command or dialog, not page and command
+  call real-key {"key":"ctrl+w"}
+
+test F1 over Insert Table opens its page; the dialog waits on its tab
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call menu-click {"label":"Insert Table..."}
+  call dialog-read {}
+  assert reply.id is insert-table
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is tables
+  assert reply.via is exact
+  call tab-list {}
+  assert reply.title_label is help
+  # Back on the document, the dialog is still open.
+  call real-key {"key":"ctrl+shift+tab"}
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is insert-table
+  call real-key {"key":"escape"}
+  call dialog-read {}
+  assert reply.open is false
+  call real-key {"key":"ctrl+tab"}
+  call help-read {}
+  assert reply.page is tables
+  call real-key {"key":"ctrl+w"}
+
+test the search box finds a page as it is typed, and Enter opens it
+  open copy:../fixtures/basic.docx
+  call help-open {"page":"welcome"}
+  call pointer-click {"input":"help-search"}
+  call real-type {"text":"strikethrough"}
+  call field-read {"input":"help-search"}
+  assert reply.value is strikethrough
+  assert reply.focused is true
+  assert reply.caret is 13
+  call help-read {}
+  assert reply.query is strikethrough
+  assert reply.hits.0.page is home-font
+  shot window
+  call real-key {"key":"enter"}
+  call help-read {}
+  assert reply.page is home-font
+  assert reply.back is 1
+  # Escape in the box clears the query; the contents come back.
+  call pointer-click {"input":"help-search"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"help-search"}
+  assert reply.value is ""
+  call help-read {}
+  assert reply.query is ""
+  call real-key {"key":"ctrl+w"}
+
+test Tab gives the search box's keys back, and a document's Find bar stays put
+  open copy:../fixtures/basic.docx
+  call real-key {"key":"ctrl+f"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call help-open {"page":"welcome"}
+  call pointer-click {"input":"help-search"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is true
+  call real-key {"key":"tab"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is false
+  call pointer-click {"input":"help-search"}
+  call real-key {"key":"shift+tab"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is false
+  # Neither Tab reached the document's Find bar behind the Help tab.
+  call real-key {"key":"ctrl+shift+tab"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+tab"}
+  call help-read {}
+  assert reply.open is true
+  call real-key {"key":"ctrl+w"}
+
+test a link navigates, Back and Forward return, and an anchor scrolls
+  open copy:../fixtures/basic.docx
+  call help-open {"page":"welcome"}
+  call help-read {}
+  assert reply.links.0.target is home
+  assert reply.links.1.target is "keyboard#shortcuts"
+  assert reply.links.2.kind is external
+  call pointer-click {"help":"link:0"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.back is 1
+  assert reply.forward is 0
+  call pointer-click {"help":"back"}
+  call help-read {}
+  assert reply.page is welcome
+  assert reply.forward is 1
+  call pointer-click {"help":"forward"}
+  call help-read {}
+  assert reply.page is home
+  call real-key {"key":"alt+left"}
+  call help-read {}
+  assert reply.page is welcome
+  call real-key {"key":"alt+right"}
+  call help-read {}
+  assert reply.page is home
+  call pointer-click {"help":"contents:welcome"}
+  call help-read {}
+  assert reply.page is welcome
+  # keyboard#shortcuts: the page, scrolled to its second heading. The scroll
+  # lands when the page is laid out: the shot waits for drawn frames.
+  call pointer-click {"help":"link:1"}
+  shot window
+  call help-read {}
+  assert reply.page is keyboard
+  assert reply.anchor is shortcuts
+  assert reply.top_block is 1
+  assert reply.top_heading is shortcuts
+  call real-key {"key":"home"}
+  shot window
+  call help-read {}
+  assert reply.top_block is 0
+  call real-key {"key":"alt+left"}
+  # An external link leaves the manual: the browser (recorded here).
+  call pointer-click {"help":"link:2"}
+  call last-url {}
+  assert reply.url is https://github.com/yeroo/docxy
+  call help-read {}
+  assert reply.page is welcome
+  call real-key {"key":"ctrl+w"}
+
+test the pages draw lists, tables, code, key chords and pictures, light and dark
+  open copy:../fixtures/basic.docx
+  call theme-set {"theme":"light"}
+  call help-open {"page":"tables"}
+  shot window
+  call help-open {"page":"images"}
+  call help-read {}
+  assert reply.images.0.src is images/ribbon.png
+  assert reply.images.0.found is true
+  shot window
+  call theme-set {"theme":"dark"}
+  call help-open {"page":"home"}
+  shot window
+  call help-open {"page":"keyboard"}
+  shot window
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+
+test without a manual for the editor, Help and F1 still say it is coming
+  open ../fixtures/basic.xlsx
+  call ribbon-click {"tab":"Help","command":"Help"}
+  call status-read {}
+  assert reply.items.1.text is Help: the documentation is coming soon
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is false

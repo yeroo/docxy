@@ -483,6 +483,12 @@ fn run_scripts(a: &Args) -> Result<String, String> {
             out.push_str(&format!("  ERROR {e}\n"));
             break;
         }
+        // A harness instance reads its help manuals from the sandbox only.
+        if let Err(e) = uiharness::launch::install_manuals(&sandbox, &script.manuals, base) {
+            all_passed = false;
+            out.push_str(&format!("  ERROR {e}\n"));
+            break;
+        }
         if script.start_screen
             && let Err(e) = uiharness::launch::request_start_screen(&sandbox)
         {
