@@ -163,8 +163,10 @@ impl Line {
 
     /// What the hosts drew before the model (#1575): the table's row and
     /// column rules, the chart's row rules and bottom-tier (day) lines and the
-    /// timescale's cell borders, all solid in the host's own colour; nothing
-    /// else.
+    /// timescale's cell borders, all solid in the host's own colour; and, as
+    /// Project 2024 draws on a new plan, a solid Current Date line in the
+    /// host's colour (#1688; Project's green is not measured). Nothing else:
+    /// Status Date, Project Start and Finish are none.
     pub fn default_style(self) -> Gridline {
         match self {
             Line::GanttRows
@@ -172,7 +174,8 @@ impl Line {
             | Line::SheetRows
             | Line::SheetColumns
             | Line::TitleVertical
-            | Line::TitleHorizontal => Gridline::solid(),
+            | Line::TitleHorizontal
+            | Line::CurrentDate => Gridline::solid(),
             _ => Gridline::default(),
         }
     }
@@ -462,6 +465,7 @@ mod tests {
                     | Line::SheetColumns
                     | Line::TitleVertical
                     | Line::TitleHorizontal
+                    | Line::CurrentDate
             );
             assert_eq!(g.get(l).line_type == LineType::Solid, solid, "{}", l.name());
             assert_eq!(g.get(l).color, None, "{} is automatic", l.name());
@@ -499,7 +503,7 @@ mod tests {
         g.set(
             Line::CurrentDate,
             Gridline {
-                line_type: LineType::Solid,
+                line_type: LineType::Dotted,
                 interval: 3,
                 interval_type: LineType::Dotted,
                 ..Gridline::default()
@@ -524,6 +528,36 @@ mod tests {
         assert_eq!(g.set_lines().count(), 1);
         assert!(g.get(Line::CurrentDate).draws());
         assert!(!g.get(Line::StatusDate).draws());
+    }
+
+    #[test]
+    fn the_current_date_line_draws_by_default_and_none_is_stored() {
+        // Project 2024 draws a Current Date line on a new plan (#1688).
+        assert_eq!(Line::CurrentDate.default_style(), Gridline::solid());
+        assert_eq!(Line::StatusDate.default_style(), Gridline::default());
+        assert_eq!(Line::ProjectStart.default_style(), Gridline::default());
+        assert_eq!(Line::ProjectFinish.default_style(), Gridline::default());
+        let g = Gridlines::default();
+        assert!(g.get(Line::CurrentDate).draws());
+        assert_eq!(g.set_lines().count(), 0);
+        let json = g.to_json().to_string();
+        assert!(json.contains(r#""Current Date":{"type":"solid""#), "{json}");
+        // Turning it off is a real setting, kept through formatting.xml.
+        let mut g = Gridlines::default();
+        g.apply(
+            &Json::parse(r#"{"Current Date":{"type":"none"}}"#).unwrap(),
+            "view.gridlines",
+        )
+        .unwrap();
+        assert_eq!(g.set_lines().count(), 1);
+        assert!(!g.get(Line::CurrentDate).draws());
+        let mut f = crate::formatting::Formatting::default();
+        f.gridlines = g;
+        let back = crate::formatting::Formatting::from_xml(&f.to_xml()).unwrap();
+        assert_eq!(
+            back.gridlines.get(Line::CurrentDate).line_type,
+            LineType::None
+        );
     }
 
     #[test]

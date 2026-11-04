@@ -1525,8 +1525,10 @@
   row and column lines an interval with its own type and colour) and
   `Gridlines` (only lines set away from `Line::default_style` are stored:
   solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
-  Columns, Title Vertical and Title Horizontal, none for the rest, which is
-  what the hosts drew before). `Formatting::gridlines` replaces the old
+  Columns, Title Vertical and Title Horizontal, what the hosts drew before,
+  and Current Date, which Project 2024 draws on a new plan (#1688; its green
+  is not measured, so Automatic); none for the rest, so a Current Date set
+  to none is stored). `Formatting::gridlines` replaces the old
   opaque string; `formatting.xml` carries `<gridline>` children (an older
   root `gridlines` attribute is ignored). A plugin command's `view.gridlines`
   is an object of line name to `{type, color, interval, interval_type,
