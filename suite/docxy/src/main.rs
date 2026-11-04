@@ -2182,6 +2182,16 @@ fn doc_clip_ours(ours: &DocClip, now: &ClipRead, rich: bool) -> bool {
     !rich_only && clip_still_ours(&ours.text, now)
 }
 
+/// What a document copy of `clip` puts on the clipboard (#1074): its plain
+/// text ([`doc_copy_text`]) and, when it has text, its RTF, the runs' styles
+/// resolved as `pkg` defines them. The document tabs' copy and the embedded
+/// view's (#1873).
+fn clip_payload(clip: &Clip, pkg: Option<&Package>) -> (String, Option<String>) {
+    let rtf = (!clip.to_text().is_empty())
+        .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
+    (doc_copy_text(clip), rtf)
+}
+
 /// The plain text a document copy of `clip` writes: its text, or, for a
 /// clip of pictures alone (no text, #1242), one U+FFFC per picture (a
 /// linked one too: with no text, every offset left is a picture), so the
@@ -2268,6 +2278,28 @@ impl ClipboardStore {
         } else {
             os(text);
         }
+    }
+
+    /// A document copy's write (#1074), shared by the document tabs and the
+    /// embedded view (#1873): `text`, read back, and `rtf` beside it only when
+    /// the read-back shows the text write took ([`rtf_follows`]). The RTF is
+    /// made before, so as little as possible runs between the two writes. The
+    /// text to record: [`recorded_after_write`].
+    fn write_rich(
+        &mut self,
+        harness: bool,
+        text: String,
+        rtf: Option<String>,
+        cx: &mut App,
+    ) -> String {
+        self.write(harness, text.clone(), |t| {
+            cx.write_to_clipboard(ClipboardItem::new_string(t))
+        });
+        let now = self.read(harness, || cx.read_from_clipboard().map(|item| item.text()));
+        if let Some(rtf) = rtf.filter(|_| rtf_follows(&text, &now)) {
+            self.write_rtf(harness, rtf, |rtf| rich_clip::write_rtf(rtf, &text));
+        }
+        recorded_after_write(text, &now)
     }
 
     /// Add `rtf` to the copy [`Self::write`] just made: never on its own.
@@ -8710,6 +8742,25 @@ impl Pal {
             hover: Hsla { a: 0.12, ..fg },
             sel: t.selection,
         }
+    }
+}
+
+/// The palette a document draws in on a page of colour `sheet` (Print
+/// Layout's sheet, the embedded view's white page, #1873): ink that reads on
+/// it ([`design_tab::page_ink`]), light chrome, and the theme's selection
+/// `sel`.
+fn page_pal(sheet: u32, sel: Hsla) -> Pal {
+    let (fg, dim) = design_tab::page_ink(sheet);
+    Pal {
+        fg: hsla_u(fg),
+        dim: hsla_u(dim),
+        border: hsla_u(0xcccccc),
+        panel: hsla_u(0xf0f0f0),
+        hover: Hsla {
+            a: 0.08,
+            ..hsla_u(0x000000)
+        },
+        sel,
     }
 }
 
@@ -19754,12 +19805,10 @@ impl Docxy {
     /// the text is written, so as little as possible runs between the two
     /// writes. The text to record: [`recorded_after_write`].
     fn clipboard_write_rich(&mut self, text: String, rtf: Option<String>, cx: &mut App) -> String {
-        self.clipboard_write(text.clone(), cx);
-        let now = self.clipboard_read(cx);
-        if let Some(rtf) = rtf.filter(|_| rtf_follows(&text, &now)) {
-            self.clipboard_write_rtf(rtf, &text);
-        }
-        recorded_after_write(text, &now)
+        // The whole-rows clip goes, as with any write ([`Self::clipboard_write`]).
+        self.project_rows_clip = None;
+        let harness = self.harness;
+        self.clipboard.write_rich(harness, text, rtf, cx)
     }
 
     /// Add `rtf` to the copy of `text` on the clipboard (#1074): the
@@ -24879,10 +24928,8 @@ impl Docxy {
                 })
                 .unwrap_or_default();
             let pkg = self.tabs.get(self.active).and_then(|t| t.pkg.as_ref());
-            let plain = clip.to_text();
-            let rtf = (!plain.is_empty())
-                .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
-            let text = self.clipboard_write_rich(doc_copy_text(&clip), rtf, cx);
+            let (text, rtf) = clip_payload(&clip, pkg);
+            let text = self.clipboard_write_rich(text, rtf, cx);
             self.clip = Some(DocClip { clip, text, media });
             if cut {
                 if let Some(t) = self.tabs.get_mut(self.active) {
@@ -40794,18 +40841,7 @@ impl Render for Docxy {
                     // surface; its ink comes from `design_tab::page_ink`.
                     let doc_pal = if self.page_view {
                         // Automatic text stays readable on a dark page colour.
-                        let (fg, dim) = design_tab::page_ink(design_tab::page_sheet_color(tab));
-                        Pal {
-                            fg: hsla_u(fg),
-                            dim: hsla_u(dim),
-                            border: hsla_u(0xcccccc),
-                            panel: hsla_u(0xf0f0f0),
-                            hover: Hsla {
-                                a: 0.08,
-                                ..hsla_u(0x000000)
-                            },
-                            sel: pal.sel,
-                        }
+                        page_pal(design_tab::page_sheet_color(tab), pal.sel)
                     } else {
                         pal
                     };

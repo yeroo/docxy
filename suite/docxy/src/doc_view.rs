@@ -370,17 +370,7 @@ impl DocView {
         let Some((text, rtf)) = copy_payload(&self.editor, self.pkg.as_ref()) else {
             return;
         };
-        let harness = harness();
-        self.clipboard.write(harness, text.clone(), |t| {
-            cx.write_to_clipboard(ClipboardItem::new_string(t))
-        });
-        let now = self
-            .clipboard
-            .read(harness, || cx.read_from_clipboard().map(|item| item.text()));
-        if let Some(rtf) = rtf.filter(|_| rtf_follows(&text, &now)) {
-            self.clipboard
-                .write_rtf(harness, rtf, |rtf| rich_clip::write_rtf(rtf, &text));
-        }
+        self.clipboard.write_rich(harness(), text, rtf, cx);
     }
 
     // ---- what the harness reads -------------------------------------------
@@ -621,11 +611,7 @@ pub(crate) fn copy_payload(
     editor: &Editor,
     pkg: Option<&Package>,
 ) -> Option<(String, Option<String>)> {
-    let clip = editor.copy()?;
-    let plain = clip.to_text();
-    let rtf = (!plain.is_empty())
-        .then(|| clip.to_rtf(&docxcore::export_context::ExportContext::for_package(pkg)));
-    Some((doc_copy_text(&clip), rtf))
+    Some(clip_payload(&editor.copy()?, pkg))
 }
 
 /// The page the document draws on and its palette. A light page (white, in
@@ -641,21 +627,7 @@ pub(crate) fn content_look(
     if content_dark && theme_dark {
         return (theme_bg, theme);
     }
-    let (fg, dim) = design_tab::page_ink(0xffffff);
-    (
-        hsla_u(0xffffff),
-        Pal {
-            fg: hsla_u(fg),
-            dim: hsla_u(dim),
-            border: hsla_u(0xcccccc),
-            panel: hsla_u(0xf0f0f0),
-            hover: Hsla {
-                a: 0.08,
-                ..hsla_u(0x000000)
-            },
-            sel: theme.sel,
-        },
-    )
+    (hsla_u(0xffffff), page_pal(0xffffff, theme.sel))
 }
 
 /// One zoom step from `zoom`: in (`dir` > 0), out (< 0) or back to 100%
