@@ -585,7 +585,7 @@ fn save_as_target(
             .into_iter()
             .map(|(_, ext)| ext)
             .collect(),
-        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
     };
     if let Some(f) = format {
         if !kind_formats.contains(&f) {
@@ -683,7 +683,7 @@ fn save_types(
             .into_iter()
             .map(|(label, ext)| (label, vec![ext]))
             .collect(),
-        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
     })
 }
 
@@ -4218,6 +4218,7 @@ fn kind_name(kind: crate::Kind) -> &'static str {
         crate::Kind::Xlsx => "xlsx",
         crate::Kind::Project => "project",
         crate::Kind::Look => "mail",
+        crate::Kind::Help => "help",
     }
 }
 

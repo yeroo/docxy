@@ -331,6 +331,9 @@ enum Kind {
     Docx,
     Xlsx,
     Look,
+    /// An editor's manual (#1855). Never written to the session: a Help tab
+    /// is gone after a restart.
+    Help,
 }
 
 /// Whether the Open-page backstage offers Recover Unsaved Workbooks (#1077).
@@ -348,6 +351,7 @@ impl Kind {
             Kind::Docx => "\u{1F4C4}",
             Kind::Xlsx => "\u{1F4CA}",
             Kind::Look => "\u{2709}",
+            Kind::Help => "\u{2753}",
         }
     }
 }
@@ -748,6 +752,8 @@ enum Surface {
     /// A tab body an extension draws (`ext`): a Mail tab when a build links
     /// a Mail surface. Saved as nothing, like the placeholder it replaces.
     Ext(Box<dyn ext::TabSurface>),
+    /// An editor's manual (#1855). Saves as nothing.
+    Help(Box<help_view::HelpView>),
 }
 
 /// The typing a revert set aside, with the editor state that went with it.
@@ -12974,6 +12980,15 @@ fn write_session_with(
         extra,
         hot_seq,
     );
+    // A Help tab (#1855) is never written: it is gone after a restart.
+    let kinds: Vec<Kind> = tabs.iter().map(|t| t.kind).collect();
+    let active = session_active(&kinds, active);
+    let own: Vec<PersistTab> = own
+        .into_iter()
+        .zip(&kinds)
+        .filter(|(_, k)| **k != Kind::Help)
+        .map(|(p, _)| p)
+        .collect();
     let session = Session {
         tabs: own.iter().cloned().chain(extra.iter().cloned()).collect(),
         active,
@@ -13000,6 +13015,21 @@ fn write_session_with(
         write_session_json(root, &session);
     }
     own
+}
+
+/// The session's active index once Help tabs (#1855), which are not
+/// written, are left out: the active tab's place among the written ones, or
+/// that of the written tab before it when the active one is a Help tab.
+fn session_active(kinds: &[Kind], active: usize) -> usize {
+    let before = kinds
+        .iter()
+        .take(active.min(kinds.len()))
+        .filter(|k| **k != Kind::Help)
+        .count();
+    match kinds.get(active) {
+        Some(Kind::Help) | None => before.saturating_sub(1),
+        Some(_) => before,
+    }
 }
 
 /// The tabs of the session on disk under `root`: none when there is no
@@ -13228,7 +13258,7 @@ fn reopens_from_file(t: &DocTab) -> bool {
         Kind::Project => path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("yppx")),
-        Kind::Look => false,
+        Kind::Look | Kind::Help => false,
     }
 }
 
@@ -13275,6 +13305,42 @@ mod session_union_tests {
 
     fn session_json(root: &std::path::Path) -> Session {
         serde_json::from_slice(&std::fs::read(session_path_in(root)).unwrap()).unwrap()
+    }
+
+    /// #1855: a Help tab is never written, and the active index names the
+    /// active tab among those written (the one before a Help tab).
+    #[test]
+    fn help_tabs_are_left_out_of_the_session() {
+        use super::{help_manual, help_view, session_active};
+        let root = fresh_root("help");
+        let word = std::sync::Arc::new(help_manual::tests::fixture_bundle(
+            help_manual::Editor::Word,
+        ));
+        let help = || {
+            help_view::host::new_help_tab(help_view::HelpView::new(
+                word.clone(),
+                help_view::Loc::page("home"),
+                None,
+            ))
+        };
+        let tabs = vec![doc_tab("a.docx", true), help(), doc_tab("b.docx", false)];
+        let own = write_session_with(&root, &tabs, 2, prefs(), SessionWrite::All, &[], 0);
+        let session = session_json(&root);
+        let titles: Vec<_> = session.tabs.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["a.docx", "b.docx"]);
+        assert_eq!(own.len(), 2, "the window's snapshot leaves it out too");
+        assert_eq!(session.active, 1);
+        write_session_with(&root, &tabs, 1, prefs(), SessionWrite::All, &[], 0);
+        assert_eq!(session_json(&root).active, 0);
+
+        let (d, h) = (Kind::Docx, Kind::Help);
+        assert_eq!(session_active(&[d, h, d], 0), 0);
+        assert_eq!(session_active(&[d, h, d], 1), 0);
+        assert_eq!(session_active(&[d, h, d], 2), 1);
+        assert_eq!(session_active(&[h, d], 0), 0);
+        assert_eq!(session_active(&[h, h, d, h], 3), 0);
+        assert_eq!(session_active(&[], 0), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #587 decision 6: one session.json holds every window's tabs. Each
@@ -14463,7 +14529,7 @@ fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
                 .ok()
                 .map(|bytes| ("yppx", bytes))
         }
-        Surface::Placeholder | Surface::Ext(_) => None,
+        Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) => None,
     }
 }
 
@@ -15871,6 +15937,8 @@ impl Docxy {
             ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
+            // Not a File > New card: a Help tab opens from Help or F1.
+            Kind::Help => return,
         });
         // A build with a Mail extension draws the new tab at once.
         self.attach_ext_surfaces(cx);
@@ -23947,6 +24015,11 @@ impl Docxy {
         if self.tabs.is_empty() {
             return self.refocus(window, cx);
         }
+        // Nor on a Help tab (#1855).
+        if self.active_is_help() {
+            self.set_status(help_view::host::HELP_NO_SAVE);
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
@@ -24126,8 +24199,12 @@ impl Docxy {
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.info_edit_apply(cx);
-        // No file dialog for nothing to write (#806).
+        // No file dialog for nothing to write (#806), or a Help tab (#1855).
         if self.tabs.is_empty() {
+            return self.refocus(window, cx);
+        }
+        if self.active_is_help() {
+            self.set_status(help_view::host::HELP_NO_SAVE);
             return self.refocus(window, cx);
         }
         if self.active_is_project() {
@@ -26943,6 +27020,11 @@ impl Docxy {
         if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
             self.keytips = KeyTip::Off;
             return self.dispatch(Act::Help(help_tab::HelpAct::Help), window, cx);
+        }
+        // A Help tab (#1855) has no ribbon and no KeyTips: its own keys.
+        if self.active_is_help() {
+            self.keytips = KeyTip::Off;
+            return self.help_key(ev, window, cx);
         }
         if self.project_edit_open() {
             return self.project_key(ev, window, cx);
@@ -34798,7 +34880,12 @@ impl Docxy {
     }
 
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        let names = ribbon_tab_set(self.ribbon_kind());
+        // A Help tab (#1855) has no ribbon; File stays, the one way to
+        // Backstage's Settings (the Theme row) there.
+        let names = match ribbon_tab_set(self.ribbon_kind()) {
+            set if self.active_is_help() => &set[..1],
+            set => set,
+        };
         let mut strip = h_flex()
             .w_full()
             .items_end()
@@ -41232,6 +41319,7 @@ impl Render for Docxy {
                     .size_full()
                     .child(e.view())
                     .into_any_element(),
+                Surface::Help(v) => self.help_body(tab, v, pal, bg, cx),
             },
             None => v_flex()
                 .flex_1()
@@ -45470,7 +45558,7 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
             "lookxy",
             "mail list + reading pane (mailcore) lands here next",
         ),
-        Kind::Docx => ("docxy", ""),
+        Kind::Docx | Kind::Help => ("docxy", ""),
         Kind::Project => (
             "Project",
             "The schedule could not be loaded; see the status below.",

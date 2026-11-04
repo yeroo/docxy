@@ -47,7 +47,7 @@ fn a_view_opens_on_its_page_or_the_root() {
     assert_eq!(at(&v), ("home", None));
     assert_eq!(v.title(), "Help: Home tab");
     assert_eq!((v.back.len(), v.forward.len()), (0, 0));
-    assert_eq!(v.scroll_to, Some(ScrollTo::Top));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Top));
     let v = view("nowhere");
     assert_eq!(at(&v), ("welcome", None));
     assert_eq!(v.title(), "Help: Welcome to docxy");
@@ -79,12 +79,12 @@ fn back_and_forward_walk_the_history() {
 fn the_place_shown_is_no_history_step() {
     let mut v = view("home");
     let rev = v.revision;
-    v.scroll_to = None;
+    v.scroll_to.set(None);
     v.navigate(Loc::page("home"), Some(Via::Area));
     assert!(v.back.is_empty());
     assert_eq!(v.via, Some(Via::Area));
     // It scrolls again, and readers see a change.
-    assert_eq!(v.scroll_to, Some(ScrollTo::Top));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Top));
     assert!(v.revision > rev);
     // An unknown page opens the root, as a step.
     v.navigate(Loc::page("nowhere"), None);
@@ -105,10 +105,10 @@ fn an_anchor_scrolls_to_its_heading_block() {
     assert_eq!(at(&v), ("keyboard", Some("shortcuts")));
     // `# Keyboard` is block 0, `## Shortcuts` block 1.
     assert_eq!(v.anchor_block("shortcuts"), Some(1));
-    assert_eq!(v.scroll_to, Some(ScrollTo::Block(1)));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Block(1)));
     // Back returns to the top of the page before.
     v.go_back();
-    assert_eq!(v.scroll_to, Some(ScrollTo::Top));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Top));
     // An anchor the page lacks scrolls to the top.
     v.navigate(
         Loc {
@@ -117,7 +117,7 @@ fn an_anchor_scrolls_to_its_heading_block() {
         },
         None,
     );
-    assert_eq!(v.scroll_to, Some(ScrollTo::Top));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Top));
 }
 
 // ---- links ------------------------------------------------------------------
@@ -172,7 +172,7 @@ fn following_a_link_by_its_number_navigates_or_scrolls() {
     v.navigate(Loc::page("images"), None);
     assert_eq!(v.follow_link(0), Some(Follow::Scroll("pictures".into())));
     assert_eq!(at(&v), ("images", Some("pictures")));
-    assert_eq!(v.scroll_to, Some(ScrollTo::Block(0)));
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Block(0)));
     assert_eq!(v.back.last(), Some(&Loc::page("images")));
 }
 

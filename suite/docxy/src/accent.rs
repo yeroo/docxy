@@ -31,6 +31,7 @@ pub(crate) fn label(kind: Option<Kind>) -> &'static str {
         Some(Kind::Xlsx) => "sheet",
         Some(Kind::Project) => "project",
         Some(Kind::Look) => "mail",
+        Some(Kind::Help) => "help",
         Some(Kind::Docx) | None => "doc",
     }
 }

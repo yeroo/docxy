@@ -10,7 +10,9 @@ use helpdocs::md::{self, Block, Link};
 use helpdocs::{Hit, Page, Via};
 use std::sync::Arc;
 
+pub(crate) mod host;
 pub(crate) mod lay;
+pub(crate) mod render;
 
 /// A place in the manual: a page, maybe at one of its headings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +67,8 @@ pub(crate) struct HelpView {
     pub search_focused: bool,
     pub hits: Vec<Hit>,
     pub scroll: ScrollHandle,
-    pub scroll_to: Option<ScrollTo>,
+    /// Taken by the next frame, which scrolls the body there.
+    pub scroll_to: std::cell::Cell<Option<ScrollTo>>,
     /// Bumped on every change a reader can see (page, query, history).
     pub revision: u64,
 }
@@ -85,7 +88,7 @@ impl HelpView {
             search_focused: false,
             hits: Vec::new(),
             scroll: ScrollHandle::new(),
-            scroll_to: None,
+            scroll_to: std::cell::Cell::new(None),
             revision: 0,
         };
         let at = v.known(at);
@@ -137,13 +140,13 @@ impl HelpView {
     /// Show `at` with no history step, scrolling to its heading or the top.
     fn show(&mut self, at: Loc) {
         self.at = at;
-        self.scroll_to = Some(
+        self.scroll_to.set(Some(
             self.at
                 .anchor
                 .as_deref()
                 .and_then(|a| self.anchor_block(a))
                 .map_or(ScrollTo::Top, ScrollTo::Block),
-        );
+        ));
         self.revision += 1;
     }
 
