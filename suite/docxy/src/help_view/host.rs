@@ -155,14 +155,7 @@ impl Docxy {
             _ => None,
         };
         if let Some(forward) = history {
-            self.with_help(cx, |v| {
-                if forward {
-                    v.go_forward();
-                } else {
-                    v.go_back();
-                }
-            });
-            return;
+            return self.help_history(forward, cx);
         }
         let focused = self.active_help().is_some_and(|v| v.search_focused);
         // Ctrl+F (⌘F) goes to the search box, its text selected.
@@ -255,10 +248,6 @@ impl Docxy {
                 });
                 return;
             }
-            "tab" => {
-                self.with_help(cx, |v| v.search_focused = false);
-                return;
-            }
             "backspace" => Op::Backspace,
             "delete" => Op::Delete,
             "left" => Op::Left,
@@ -286,6 +275,14 @@ impl Docxy {
                 v.go_back();
             }
         });
+    }
+
+    /// Tab or Shift+Tab on a Help tab (they are actions, never keys
+    /// `on_key` sees): the search box gives the keys back to the page.
+    pub(crate) fn help_tab_press(&mut self, cx: &mut Context<Self>) {
+        if self.active_help().is_some_and(|v| v.search_focused) {
+            self.with_help(cx, |v| v.search_focused = false);
+        }
     }
 
     /// A press on the search box: it takes the keyboard.

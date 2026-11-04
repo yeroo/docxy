@@ -569,13 +569,17 @@ pub(crate) fn apply_task_info_in(
     })()
 }
 
+/// Whether `button` pressed on `top` is Task Information's Help: the one
+/// test the tab's press ([`help_click`]) and the window's (which opens the
+/// manual, #1855) share.
+pub(crate) fn is_help_press(top: &crate::dialog::Dialog, button: &str) -> bool {
+    matches!(top.owner, DialogOwner::TaskInfo { .. }) && crate::dialog::fold_label(button) == "help"
+}
+
 /// Task Information's Help button (#1536): what F1 says, the documentation
 /// being #1022, and the dialog stays as it is. `None` for any other press.
 pub(crate) fn help_click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>> {
-    let top = tab.dialogs.top()?;
-    if !matches!(top.owner, DialogOwner::TaskInfo { .. })
-        || crate::dialog::fold_label(button) != "help"
-    {
+    if !is_help_press(tab.dialogs.top()?, button) {
         return None;
     }
     tab.status = crate::help_tab::DOCS_COMING.into();

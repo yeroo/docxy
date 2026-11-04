@@ -70,40 +70,16 @@ impl Bundle {
     }
 
     /// The bundle in `dir` (an editor's directory), `None` when it is missing
-    /// or has no page.
+    /// or has no page. Read as `helpdocs` reads one (`bundle::files`): a
+    /// link is never followed, so it cannot take the walk out of the bundle
+    /// or round in a loop.
     pub(crate) fn read_dir(editor: Editor, dir: &Path) -> Option<Bundle> {
-        if !dir.is_dir() {
-            return None;
-        }
-        let mut files = Vec::new();
-        collect(dir, dir, &mut files);
-        Bundle::from_files(editor, files)
+        Bundle::from_files(editor, helpdocs::bundle::files(dir).ok()?)
     }
 
     /// The image `src` names (a bundle path such as `images/x.png`).
     pub(crate) fn image(&self, src: &str) -> Option<&Arc<[u8]>> {
         self.files.get(src.trim_start_matches("./"))
-    }
-}
-
-/// Every file under `dir`, paths relative to `root` with `/`. Unreadable
-/// files and directories count as absent, as `helpdocs::Manual::load` does.
-fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(root, &path, out);
-        } else if let (Ok(rel), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path)) {
-            let rel = rel
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            out.push((rel, bytes));
-        }
     }
 }
 
@@ -304,6 +280,34 @@ pub(crate) mod tests {
         let png = b.image("images/ribbon.png").unwrap();
         assert!(png.starts_with(b"\x89PNG"));
         assert!(b.image("images/none.png").is_none());
+    }
+
+    /// An installed manual is read as helpdocs reads one: a link, to a
+    /// directory outside the bundle or back up to its own root, is not
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn an_installed_manual_never_follows_a_link() {
+        let root = temp_root("links");
+        install(&root, Editor::Word, "installed");
+        let dir = installed_dir(&root, Editor::Word);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(outside.join("images")).unwrap();
+        std::fs::write(outside.join("images").join("secret.png"), b"png").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("images").join("loop")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("images").join("secret.png"),
+            dir.join("images").join("link.png"),
+        )
+        .unwrap();
+        let b = find(Editor::Word, &root, true, Vec::new).unwrap();
+        let mut images: Vec<&String> = b.files.keys().collect();
+        images.sort();
+        assert_eq!(images, ["images/a.png"]);
+        assert_eq!(b.manual.images, ["images/a.png"]);
+        assert!(b.manual.problems.is_empty(), "{:?}", b.manual.problems);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

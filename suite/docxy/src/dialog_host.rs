@@ -955,10 +955,7 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .and_then(|t| t.dialogs.top())
-                .is_some_and(|d| {
-                    matches!(d.owner, DialogOwner::TaskInfo { .. })
-                        && crate::dialog::fold_label(button) == "help"
-                })
+                .is_some_and(|d| crate::project::is_help_press(d, button))
     }
 
     /// A press on one of the top dialog's widgets: see [`Dialog::click_control`].

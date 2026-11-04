@@ -79,8 +79,10 @@ the anchor does not scroll, or Back/Forward lose the place.
 
 **Expect:**
 - The table has a shaded header row and its columns are left, centred and right
-  aligned. The Pictures page draws its (tiny) picture. Lists nest with their own
-  bullets; inline code and the code block use a monospaced font on a panel.
+  aligned, and its code block (under the table) uses a monospaced font on a
+  panel. The Pictures page draws its (tiny) picture. On the Home tab page the
+  lists nest with their own bullets, and `Heading 1` (the last line) is inline
+  code: monospaced, on a panel.
 - Every part follows the theme: no white page left in Dark.
 - Ctrl+S says Help pages are not saved. After the restart no Help tab comes back.
 

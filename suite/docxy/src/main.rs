@@ -26779,6 +26779,12 @@ impl Docxy {
         if self.project_prompt_open() {
             return;
         }
+        // A Help tab (#1855): Tab and Shift+Tab take the keys from its search
+        // box. Before the find bar's branch: a document's Find bar may stay
+        // open behind it and must not move.
+        if self.active_is_help() {
+            return self.help_tab_press(cx);
+        }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
             if self.keytips == KeyTip::Off {
@@ -26906,6 +26912,12 @@ impl Docxy {
         if self.project_prompt_open() {
             return;
         }
+        // A Help tab (#1855): Tab and Shift+Tab take the keys from its search
+        // box. Before the find bar's branch: a document's Find bar may stay
+        // open behind it and must not move.
+        if self.active_is_help() {
+            return self.help_tab_press(cx);
+        }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
             if self.keytips == KeyTip::Off {
@@ -27015,8 +27027,10 @@ impl Docxy {
         if let Some(done) = self.document_key(ev, window, cx) {
             return done;
         }
-        // F1 is Help › Help on every surface (#1021), unless an entry owns
-        // the keyboard.
+        // F1 on every surface (#1021), unless an entry owns the keyboard:
+        // the manual's page for the ribbon tab shown, or its root on a Help
+        // tab (#1855); with no manual installed, the status line says the
+        // documentation is coming.
         if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
             self.close_menu();
             self.ribbon_flyout = None;

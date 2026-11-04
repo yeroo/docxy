@@ -292,7 +292,29 @@ fn help_read_reports_the_heading_at_the_top() {
     assert_eq!(v.read_json(0).get_str("top_heading"), Some("keyboard"));
     assert_eq!(v.read_json(1).get_str("top_heading"), Some("shortcuts"));
     assert_eq!(v.read_json(2).get_str("top_heading"), Some("shortcuts"));
-    assert_eq!(v.read_json(99).get_usize("top_block"), Some(99));
+    // The room below the last block reads as the last block.
+    assert_eq!(v.read_json(99).get_usize("top_block"), Some(2));
+}
+
+/// A page of front matter only has no blocks: the read still answers.
+#[test]
+fn help_read_answers_on_a_page_without_blocks() {
+    let b = Bundle::from_files(
+        Editor::Word,
+        vec![
+            ("contents.txt".into(), b"empty\n".to_vec()),
+            ("empty.md".into(), b"---\ntitle: Empty\n---\n".to_vec()),
+        ],
+    )
+    .unwrap();
+    assert!(b.manual.pages[0].blocks.is_empty());
+    let v = HelpView::new(Arc::new(b), Loc::page("empty"), None);
+    for top in [0, 1, 5] {
+        let j = v.read_json(top);
+        assert_eq!(j.get("top_heading"), Some(&Json::Null));
+        assert_eq!(j.get_usize("top_block"), Some(0));
+    }
+    assert_eq!(v.title(), "Help: Empty");
 }
 
 #[test]

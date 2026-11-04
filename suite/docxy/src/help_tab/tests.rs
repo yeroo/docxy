@@ -274,9 +274,20 @@ fn f1_opens_the_area_page_of_the_ribbon_tab_shown() {
 #[test]
 fn help_opens_the_help_commands_page() {
     use helpdocs::Via;
-    let ask = help_command_ask(Some(Kind::Docx));
+    let ask = help_command_ask(Some(Kind::Docx), None);
     assert_eq!(page_of(&ask, &word()), ("help".into(), Via::Exact));
-    assert_eq!(help_command_ask(Some(Kind::Xlsx)).editor, HelpEditor::Excel);
+    assert_eq!(
+        help_command_ask(Some(Kind::Xlsx), None).editor,
+        HelpEditor::Excel
+    );
+    // On an Excel or Project Help tab (the macOS menu bar's Help reaches
+    // one), that tab's manual, not Word's.
+    for editor in [HelpEditor::Excel, HelpEditor::Project, HelpEditor::Word] {
+        assert_eq!(
+            help_command_ask(Some(Kind::Help), Some(editor)).editor,
+            editor
+        );
+    }
 }
 
 #[test]
@@ -366,9 +377,14 @@ fn every_dialog_has_a_help_target() {
         assert!(c.strict_failures.is_empty(), "{name}: {}", c.report());
         assert!(c.unresolved.is_empty(), "{name}: {:?}", c.unresolved);
     }
-    let c = helpdocs::coverage(
-        &fixture_manual(Kind::Docx),
-        [("dialog:insert-table", ""), ("dialog:font", "")],
+    // Insert Table is catalogued, walked above, and keyed by the fixture.
+    let insert_table = format!("dialog:{}", crate::dialog::catalog::INSERT_TABLE.as_str());
+    assert!(
+        catalog()
+            .iter()
+            .any(|e| format!("dialog:{}", e.dialog.as_str()) == insert_table),
+        "{insert_table} is catalogued"
     );
-    assert_eq!(c.exact.len(), 2, "{}", c.report());
+    let c = helpdocs::coverage(&fixture_manual(Kind::Docx), [(insert_table.as_str(), "")]);
+    assert_eq!(c.exact.len(), 1, "{}", c.report());
 }

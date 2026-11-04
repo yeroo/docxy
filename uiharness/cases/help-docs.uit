@@ -135,6 +135,32 @@ test the search box finds a page as it is typed, and Enter opens it
   assert reply.query is ""
   call real-key {"key":"ctrl+w"}
 
+test Tab gives the search box's keys back, and a document's Find bar stays put
+  open copy:../fixtures/basic.docx
+  call real-key {"key":"ctrl+f"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call help-open {"page":"welcome"}
+  call pointer-click {"input":"help-search"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is true
+  call real-key {"key":"tab"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is false
+  call pointer-click {"input":"help-search"}
+  call real-key {"key":"shift+tab"}
+  call field-read {"input":"help-search"}
+  assert reply.focused is false
+  # Neither Tab reached the document's Find bar behind the Help tab.
+  call real-key {"key":"ctrl+shift+tab"}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+tab"}
+  call help-read {}
+  assert reply.open is true
+  call real-key {"key":"ctrl+w"}
+
 test a link navigates, Back and Forward return, and an anchor scrolls
   open copy:../fixtures/basic.docx
   call help-open {"page":"welcome"}

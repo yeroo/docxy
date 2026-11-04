@@ -87,9 +87,7 @@ impl Manual {
     /// Load the bundle in `dir` (one editor's directory). Unreadable files
     /// count as absent.
     pub fn load(dir: &Path) -> std::io::Result<Manual> {
-        let mut files = Vec::new();
-        collect(dir, dir, &mut files)?;
-        Ok(Manual::from_files(files))
+        Ok(Manual::from_files(files(dir)?))
     }
 
     /// Build a manual from `(path, bytes)` pairs, paths relative to the
@@ -322,6 +320,19 @@ fn page(id: &str, src: &str, problems: &mut Vec<Problem>) -> Page {
         keys,
         blocks: md::parse(body),
     }
+}
+
+/// The files of the bundle in `dir` as `(path, bytes)`, paths relative to
+/// it with `/` (`images/x.png`): what [`Manual::load`] reads, for a host
+/// that also needs the image bytes (#1855). Only the root's listing can
+/// fail; links are not followed (see [`collect`]).
+pub fn files(dir: &Path) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    collect(dir, dir, &mut out)?;
+    for (path, _) in &mut out {
+        *path = bundle_path(path);
+    }
+    Ok(out)
 }
 
 /// The files under `dir`. Only the root's listing can fail the load: a
@@ -646,6 +657,14 @@ pub(crate) mod tests {
         std::fs::write(outside.join("x.md"), "# X\n").unwrap();
         let linked = link_dir(&outside, &bundle.join("linked"));
         let m = Manual::load(&bundle).expect("the root lists");
+        // What a host reads for the image bytes skips the link too.
+        let mut listed: Vec<String> = super::files(&bundle)
+            .expect("the root lists")
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["a.md", "contents.txt"], "linked: {linked}");
         // Remove the link before its target, so nothing is deleted through it.
         let _ = std::fs::remove_dir(bundle.join("linked"));
         let _ = std::fs::remove_dir_all(&base);
@@ -653,6 +672,26 @@ pub(crate) mod tests {
         assert_eq!(m.pages.len(), 1);
         // A root that cannot be listed fails the load.
         assert!(Manual::load(&base.join("missing")).is_err());
+    }
+
+    /// `files` gives bundle paths with `/` on every platform.
+    #[test]
+    fn files_are_listed_by_their_bundle_path() {
+        let base = std::env::temp_dir().join(format!("helpdocs-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("images")).unwrap();
+        std::fs::write(base.join("contents.txt"), "a\n").unwrap();
+        std::fs::write(base.join("images").join("x.png"), b"png").unwrap();
+        let mut got = super::files(&base).unwrap();
+        got.sort();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            got,
+            [
+                ("contents.txt".to_string(), b"a\n".to_vec()),
+                ("images/x.png".to_string(), b"png".to_vec()),
+            ]
+        );
     }
 
     #[test]

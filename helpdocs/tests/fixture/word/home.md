@@ -14,3 +14,5 @@ The Home tab holds the commands you use most:
 ## Clipboard
 
 Press <kbd>Ctrl+C</kbd> to copy and <kbd>Ctrl+V</kbd> to paste.
+
+In the Styles box, type a style name such as `Heading 1`.

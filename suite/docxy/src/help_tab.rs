@@ -18,7 +18,9 @@ use crate::help_manual::Editor as HelpEditor;
 /// A Help tab command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HelpAct {
-    /// Help (F1): the documentation, once it lands.
+    /// Help: the manual's page for the `help` command in a Help tab (#1855),
+    /// or the documentation is coming when no manual is installed. F1 opens
+    /// the page for where the person is instead (`help_f1`).
     Help,
     ContactSupport,
     Feedback,
@@ -113,7 +115,8 @@ pub(crate) fn help_tab() -> rs::Tab<Act> {
     )
 }
 
-/// F1, with no modifier: Help › Help.
+/// F1, with no modifier: the manual's page for the ribbon tab shown, the
+/// open dialog, or a Help tab's root (#1855; see [`f1_ask`]).
 pub(crate) fn is_help_key(k: &Keystroke) -> bool {
     is_help_stroke(&k.key, k.modifiers)
 }
@@ -162,10 +165,11 @@ pub(crate) fn f1_ask(kind: Option<Kind>, area: &str, help_tab: Option<HelpEditor
 }
 
 /// Help › Help (the ribbon's, the sheet's, the macOS menu's): the `help`
-/// command's page.
-pub(crate) fn help_command_ask(kind: Option<Kind>) -> HelpAsk {
+/// command's page, in the manual of the tab's kind, or on a Help tab
+/// (`help_tab`: the macOS menu bar reaches one) in that tab's manual.
+pub(crate) fn help_command_ask(kind: Option<Kind>, help_tab: Option<HelpEditor>) -> HelpAsk {
     HelpAsk {
-        editor: help_view::host::editor_for(kind),
+        editor: help_tab.unwrap_or_else(|| help_view::host::editor_for(kind)),
         id: Some("help".into()),
         area: Some("Help".into()),
     }
@@ -216,7 +220,8 @@ impl Docxy {
         match act {
             HelpAct::Help => {
                 let kind = self.tabs.get(self.active).map(|t| t.kind);
-                if self.open_help(help_command_ask(kind), window, cx) {
+                let help_tab = self.active_help().map(help_view::HelpView::editor);
+                if self.open_help(help_command_ask(kind, help_tab), window, cx) {
                     return;
                 }
                 self.set_status(DOCS_COMING);

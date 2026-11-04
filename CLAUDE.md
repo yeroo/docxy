@@ -2289,7 +2289,8 @@
 - `help_manual` finds an editor's manual (`Editor`: word for documents, Mail
   and no tab; excel; project): `<config root>/docxy/manual/<editor>/`, else
   the one built in from `docs/manual/<editor>/` (rust-embed), read once per
-  process. A harness instance reads only its sandbox (a script's `manual
+  process; an installed one through `helpdocs::bundle::files`, the walker
+  `Manual::load` uses (no link is followed). A harness instance reads only its sandbox (a script's `manual
   <editor> <dir>` line copies a bundle there, `launch::install_manuals`), so
   no case depends on `docs/manual`; unit tests set `help_manual::tests::Override`
   (none by default). A bundle with no page is none, and then Help and F1 say
@@ -2316,9 +2317,13 @@
   and ⌘[ / ⌘] walk the history; Ctrl+F or a click focuses the search box
   (`field_edit`, Ctrl+A/C/X/V, Enter opens the first hit, Escape clears, then
   gives the keys back); the arrows, Page Up/Down, Space, Home and End scroll.
-  The box is not in `entry_owns_keys`, so F1 still acts there.
+  Tab and Shift+Tab are actions (`tab_key`/`shift_tab_key`), so they take the
+  keys from the box there (`help_tab_press`), before the find bar's branch: a
+  document's Find bar left open behind the Help tab never moves. The box is
+  not in `entry_owns_keys`, so F1 still acts there.
 - F1 (`help_tab::help_f1`): the area page of `ribbon_tab_name(ribbon_tab)`, or
-  on a Help tab its manual's root. Help › Help asks for `help`/`Help`. F1 over
+  on a Help tab its manual's root. Help › Help asks for `help`/`Help`, in
+  the Help tab's own manual when one is active (the macOS menu bar). F1 over
   a tab dialog (`dialog_f1`, first in `dialog_takes_key`) opens `dialog:<id>`
   only over a plain form (`dialog_takes_help`: not a message box, popup,
   reload/recovery/close/quit prompt, User name or About, no quit asking) and

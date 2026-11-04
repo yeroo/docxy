@@ -260,7 +260,7 @@ impl HelpView {
     }
 
     /// The `help-read` reply; `top_block` is the first top-level block
-    /// drawn at the top of the body.
+    /// drawn at the top of the body (clamped to the page's blocks).
     pub(crate) fn read_json(&self, top_block: usize) -> Json {
         let page = self.page();
         let m = &self.bundle.manual;
@@ -278,12 +278,8 @@ impl HelpView {
                 _ => None,
             })
             .collect();
-        let mut texts = Vec::new();
-        link_texts(&page.blocks, &mut texts);
-        let links = self
-            .links()
+        let links = md::link_texts(&page.blocks)
             .into_iter()
-            .zip(texts)
             .enumerate()
             .map(|(i, (link, text))| {
                 let (kind, target) = link_kind(link);
@@ -295,7 +291,7 @@ impl HelpView {
                 ])
             })
             .collect();
-        let images = image_alts(&page.blocks)
+        let images = md::image_alts(&page.blocks)
             .into_iter()
             .map(|(src, alt)| {
                 let found = self.bundle.image(src).is_some_and(|b| lay::drawable(b));
@@ -329,8 +325,13 @@ impl HelpView {
                 ])
             })
             .collect();
-        let top_heading = page.blocks[..=top_block.min(page.blocks.len().saturating_sub(1))]
+        // The body's last child is room below the page, not a block: a top
+        // past the blocks is the last one (none on a page without any).
+        let top_block = top_block.min(page.blocks.len().saturating_sub(1));
+        let top_heading = page
+            .blocks
             .iter()
+            .take(top_block + 1)
             .rev()
             .find_map(|b| match b {
                 Block::Heading { slug, .. } => Some(s(slug)),
@@ -391,41 +392,6 @@ pub(crate) fn link_kind(link: &Link) -> (&'static str, String) {
         Link::External(u) => ("external", u.clone()),
         Link::Other(t) => ("other", t.clone()),
     }
-}
-
-/// The text of every link, in [`md::links`] order.
-fn link_texts(blocks: &[Block], out: &mut Vec<String>) {
-    md::for_inlines(blocks, &mut |inl| inline_link_texts(inl, out));
-}
-
-fn inline_link_texts(inlines: &[md::Inline], out: &mut Vec<String>) {
-    for i in inlines {
-        match i {
-            md::Inline::Link { text, .. } => {
-                out.push(md::plain(text));
-                inline_link_texts(text, out);
-            }
-            md::Inline::Bold(x) | md::Inline::Italic(x) => inline_link_texts(x, out),
-            _ => {}
-        }
-    }
-}
-
-/// Every image's source and alt text, list items' included, in order.
-fn image_alts(blocks: &[Block]) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
-    for b in blocks {
-        match b {
-            Block::Image { src, alt } => out.push((src.as_str(), alt.as_str())),
-            Block::List { items, .. } => {
-                for item in items {
-                    out.extend(image_alts(&item.children));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 #[cfg(test)]
