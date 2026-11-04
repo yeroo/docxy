@@ -1709,6 +1709,21 @@
   View tab) has two sections; `project-plugin-ui.uit` reads it and shoots it
   (a `shot` is evidence, not a comparison with the plugin repo's capture).
 
+- An in-place swatch gallery is bounded (#1823): it shows at most
+  `plugin_ui::IN_PLACE_TILES` (6, an estimate: no capture of Project's) tiles,
+  `in_place_window` (the first six, or the six ending on the checked swatch),
+  and, when it has more, a `MORE_W` (16 px) More button after a gap (probe
+  `gallery-more-<id>`) that opens `FlyoutTarget::Gallery`, the whole gallery
+  with its sections. `gallery_span(.., None)` and `more_w` are what
+  `ribbon_fit::model_control_w` and `swatch_gallery` both read, so the
+  estimate is the width drawn. A flyout copy (a collapsed group's, `max_w`
+  Some) wraps every tile and has no More button. No scroll arrows: the
+  flyout shows the rest. The Styles and Table Styles wells are unchanged.
+  `ribbon-read` adds `shown`, `first_shown` and `more` to each `galleries`
+  entry. The fixture's `fixture.wide` (nine swatches, group "Fixture Wide"
+  before "Fixture Styles" on the View tab) is the bounded one in
+  `project-plugin-ui.uit`.
+
 - A gallery has a KeyTip (#1762): `ribbonspec::Gallery::key_tip` (`""` for every
   built-in), filled from a manifest gallery's `keytip`. With the key tips up
   `swatch_gallery` draws the badge on the one in the ribbon (not a flyout's
