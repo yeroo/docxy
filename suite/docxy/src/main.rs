@@ -37908,8 +37908,12 @@ impl Docxy {
     /// A UI plugin's gallery (#1532): a tile per swatch, filled with the
     /// swatch's colour (its preview, `#RRGGBB`) over its label, or, when the
     /// preview names a palette, that palette's miniature chart with the label
-    /// as its tooltip (#1761). Swatches of one section sit under a header
-    /// row; the checked tile is framed in the accent.
+    /// as its tooltip (#1761). In a flyout every tile shows, swatches of one
+    /// section under a header row. In place (#1823) it is one strip of at most
+    /// `IN_PLACE_TILES` tiles (`in_place_window`: the first ones, or those
+    /// ending on the checked swatch) and, when it has more, a More button that
+    /// opens or shuts the whole gallery's flyout. The checked tile is framed in
+    /// the accent.
     fn swatch_gallery(
         &self,
         gal: &rs::Gallery<Act>,
@@ -38064,10 +38068,12 @@ impl Docxy {
             .child("▾")
             .child(probe(&self.probes, format!("gallery-more-{id}")))
             .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_ribbon_flyout(FlyoutTarget::Gallery(id));
-                cx.notify();
-            }));
+            // A press opens the gallery's flyout or shuts it, as a collapsed
+            // group's button does (the backdrop may close it first).
+            .on_mouse_down(
+                MouseButton::Left,
+                flyout_toggle(FlyoutTarget::Gallery(id), cx),
+            );
         h_flex()
             .flex_none()
             .items_start()

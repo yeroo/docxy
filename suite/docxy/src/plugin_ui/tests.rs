@@ -2436,13 +2436,6 @@ fn a_flyout_swatch_gallery_still_wraps_every_tile() {
         })
         .sum();
     assert_eq!(shown, 11);
-    // In place the rows are the bounded window, the checked tile kept in it.
-    let k = IN_PLACE_TILES;
-    assert_eq!(gallery_rows(gal, None, k, None), [Row::Tiles(0, k)]);
-    assert_eq!(
-        gallery_rows(gal, None, k, Some(9)),
-        [Row::Tiles(10 - k, 10)]
-    );
 }
 
 #[test]
@@ -2482,4 +2475,12 @@ fn the_in_place_window_keeps_the_checked_tile_shown() {
     assert_eq!(in_place_window(n, Some(n)), 0..k);
     assert_eq!(in_place_window(3, Some(2)), 0..3);
     assert_eq!(in_place_window(0, None), 0..0);
+    // In place an 11-tile gallery's rows are that window, one strip.
+    let tab = galleries_tab(&[n], 50);
+    let gal = font_gallery(&tab, 0);
+    assert_eq!(gallery_rows(gal, None, k, None), [Row::Tiles(0, k)]);
+    assert_eq!(
+        gallery_rows(gal, None, k, Some(9)),
+        [Row::Tiles(10 - k, 10)]
+    );
 }

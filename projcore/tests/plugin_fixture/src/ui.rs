@@ -16,7 +16,8 @@
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
 //! - On the Report tab a group "Fixture Wide" holds `fixture.wide`, nine
 //!   colour swatches: in place a window of six and a More button (#1823). Its
-//!   swatches are not commands.
+//!   swatches are not commands; the state checks the eighth
+//!   (`fixture.wide.7`), so the window shows tiles 2 to 7.
 //! - Menus: a row-menu item `fixture.rename` after "Notes...", and
 //!   `fixture.mark` after it (#1667).
 //! - Dialogs: a Task Information page "Fixture" with a multiline, a grid and
@@ -341,7 +342,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{},"fixture.styles":"fixture.styles.1"}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{},"fixture.styles":"fixture.styles.1","fixture.wide":"fixture.wide.7"}}"#,
         flag(&req),
         switch_on(&req, "fixture.plain"),
         switch_on(&req, "fixture.flat"),

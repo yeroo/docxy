@@ -1702,8 +1702,8 @@
   `layout_height` (tiles plus `HEADER_H` headers plus gaps), drawn only.
   A palette tile shows no label, its label is the tooltip. Sections show in
   the flyout (expanded) copy only: in place (`max_w` None) a group is one
-  fixed-height strip, so `gallery_span`/`gallery_rows` give every tile on one
-  row with no headers, exactly as before sections; a header is clipped to the
+  fixed-height strip, so `gallery_span`/`gallery_rows` give one row with no
+  headers: the `in_place_window` strip (#1823); a header is clipped to the
   gallery's width.
 - `ribbon-read` adds `section` and, on a palette tile, `palette` and `marks`.
   The fixture's `fixture.styles` gallery (group "Fixture Styles", last on the
@@ -1715,7 +1715,8 @@
   `in_place_window` (the first six, or the six ending on the checked swatch;
   `gallery_rows(.., None, .., checked)` is that one strip),
   and, when it has more, a `MORE_W` (16 px) More button after a gap (probe
-  `gallery-more-<id>`) that opens `FlyoutTarget::Gallery`, the whole gallery
+  `gallery-more-<id>`) whose press is `flyout_toggle(FlyoutTarget::Gallery)`
+  (a second press shuts it), the whole gallery
   with its sections. `gallery_span(.., None)` and `more_w` are what
   `ribbon_fit::model_control_w` and `swatch_gallery` both read, so the
   estimate is the width drawn. A flyout copy (a collapsed group's, `max_w`
