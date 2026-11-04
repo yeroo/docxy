@@ -6,7 +6,7 @@ test a View Report runs by its KeyTips and writes beside the plan
   open copy:../fixtures/gantt-summary.xml
   assert title is gantt-summary.xml
   assert exported is none
-  key alt r i
+  key alt s i
   assert menu.target.ribbon.0 is Report
   assert menu.target.ribbon.1 is View Reports
   assert menu.target.ribbon.2 is In Progress
@@ -23,7 +23,7 @@ test a View Report runs by its KeyTips and writes beside the plan
   assert exported is gantt-summary-late-tasks.md
   assert title is gantt-summary.xml
   assert dirty is false
-  key alt r d p
+  key alt s d p
   assert exported is gantt-summary-project-overview.md
   assert dirty is false
 
@@ -45,9 +45,9 @@ test every View Reports menu lists its reports
 
 test a dirty plan's report leaves it dirty with its history
   open copy:../fixtures/gantt-summary.xml
-  key alt p b b
+  key alt r b b
   assert dirty is true
-  key alt r c r
+  key alt s c r
   assert exported is gantt-summary-resource-cost-overview.md
   assert dirty is true
   key ctrl+z

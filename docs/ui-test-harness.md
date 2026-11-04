@@ -330,7 +330,13 @@ reported like the built-ins, marked `"plugin": true`: `ribbon-read`'s
 commands and gallery tiles (a contributed control with a built-in's id
 replaces it in place, so the built-in's slot then reads `plugin: true`; a
 group with a contributed dialog launcher reads `launcher: true` and, when the
-plugin names them, `launcher_tip` and `launcher_key_tip`, #1669),
+plugin names them, `launcher_tip` and `launcher_key_tip`, #1669; each
+`galleries` entry reads `shown`, `first_shown` and `more`, the model's
+in-place window of a swatch gallery whatever its group's fit state: the tile
+count, the first tile and whether a More button follows, and `drawn_shown`,
+`drawn_first` and `drawn_more`, what the last frame drew in place, null when
+the gallery was not drawn in place then (another tab, a collapsed group),
+#1823),
 `menu-read`'s items (the row, bar, column and chart menus; `menu-open
 {"target":"chart"}` opens the chart's own menu beside the bars: Timescale... and
 Zoom... are live and open their dialogs, the rest of Project's items are drawn greyed), and `dialog-read`'s controls (a dialog a
@@ -904,8 +910,9 @@ Predecessors in cells use **displayed IDs** (a cross-project link shows its
 external reference). Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
-ribbon KeyTips are File/Task/Resource/Report/Project/View/Help = F/T/U/R/P/W/Y
-after Alt or F10.
+ribbon KeyTips are File/Task/Resource/Report/Project/View/Help = F/H/U/S/R/W/Y
+after Alt or F10, as Project 2024 has them; the contextual Gantt Chart Format
+tab is the two-letter JF (J waits for F, Escape drops the J) (#1569).
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
 moves down, Shift+Enter commits and moves up, Up/Down commit and move one row
@@ -1634,7 +1641,7 @@ other character is swallowed; a modifier chord and any other key close the
 menu and are spent, Tab included. None reaches the document or cell under it.
 A press outside the menu closes it too.
 A split button's KeyTip opens its menu with nothing highlighted, as a
-drop-down's does, and the next letter is the menu's (Alt, P, B, then B or L,
+drop-down's does, and the next letter is the menu's (Alt, R, B, then B or L,
 #1212); a split's item letters are no KeyTips of the tab.
 `project-menus.uit` drives the opening and clicking; `menu-keys.uit` drives
 the keyboard.
@@ -1666,7 +1673,8 @@ have. `word-header-footer.uit` drives these over a three-section document.
 clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-timeline-box-left`,
 `project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
-`ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`, `title-tabs`,
+`ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`,
+`gallery-more:<gallery id>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
 absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
@@ -1691,6 +1699,10 @@ title on the tab shown, while the group is drawn in place (#1164): a sheet
 group's (↘), a document or Project group's (⤢), a UI plugin's group's
 included (#1669). It is an error when the group draws no launcher, and when the
 group is not drawn in place (collapsed into a flyout, or on another tab).
+`gallery-more:<gallery id>` (for example `gallery-more:fixture.wide`) is the
+More button of a UI plugin's swatch gallery drawn in place with more tiles
+than it shows (#1823); a click opens the whole gallery as a flyout. It is an
+error when the gallery draws no More button in place.
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is

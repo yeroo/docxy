@@ -79,7 +79,7 @@ test a contributed group's dialog launcher runs its command by click and by KeyT
   shot window
   call real-key {"key":"alt"}
   assert keytips_up is true
-  call real-key {"key":"t"}
+  call real-key {"key":"h"}
   call real-key {"key":"z"}
   assert keytips_up is true
   call real-key {"key":"n"}
@@ -364,6 +364,52 @@ test a swatch gallery draws palette tiles under section headers
   shot ribbon-flyout
   call ribbon-flyout {"action":"close"}
   call window-size {"w":1180,"h":800}
+
+test a long swatch gallery is bounded in place and its More button opens it whole
+  # #1823: "Fixture Wide" (on the Report tab, which has room) holds nine swatches. In place it
+  # draws six (ending on the checked one) and a More button, and the estimate is the width drawn; the six-tile "Fixture
+  # Styles" has no More button. More opens the whole gallery as a flyout.
+  open copy:../fixtures/project-clipboard.xml
+  call ribbon-read {}
+  assert reply.tabs.3.name is Report
+  assert reply.tabs.3.groups.-1.title is Fixture Wide
+  assert reply.tabs.3.groups.-1.galleries.0.id is fixture.wide
+  # The fixture's state checks the eighth swatch, so the window ends on it.
+  assert reply.tabs.3.groups.-1.galleries.0.shown is 6
+  assert reply.tabs.3.groups.-1.galleries.0.first_shown is 2
+  assert reply.tabs.3.groups.-1.commands.7.checked is true
+  assert reply.tabs.3.groups.-1.galleries.0.more is true
+  assert reply.tabs.5.groups.-1.galleries.0.shown is 6
+  assert reply.tabs.5.groups.-1.galleries.0.more is false
+  call ribbon-layout {"tab":"Report"}
+  shot window
+  call ribbon-layout {"tab":"Report"}
+  assert reply.settled is true
+  assert reply.estimates_ok is true
+  assert reply.any_clipped is false
+  assert reply.groups.-1.title is Fixture Wide
+  assert reply.groups.-1.state is full
+  # What the frame drew in place matches the model's window.
+  call ribbon-read {}
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_first is 2
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_shown is 6
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_more is true
+  assert reply.tabs.5.groups.-1.galleries.0.drawn_shown is null
+  call ribbon-flyout {"action":"read"}
+  assert reply.open is false
+  call pointer-click {"region":"gallery-more:fixture.wide"}
+  call ribbon-flyout {"action":"read"}
+  assert reply.open is true
+  assert reply.gallery is fixture.wide
+  shot ribbon-flyout
+  # A second press on More shuts it, as a collapsed group's button does.
+  call pointer-click {"region":"gallery-more:fixture.wide"}
+  call ribbon-flyout {"action":"read"}
+  assert reply.open is false
+  call pointer-click {"region":"gallery-more:fixture.wide"}
+  call ribbon-flyout {"action":"read"}
+  assert reply.open is true
+  call ribbon-flyout {"action":"close"}
 
 test a contributed gallery's KeyTip is drawn and opens its flyout
   # #1762: "Fixture Styles" declares the KeyTip XG. With Alt then the View tab (W) up, typing X waits
@@ -695,7 +741,7 @@ test the chart menu opens beside the bars with Project's unbuilt items greyed
 test Task Information gains the plugin's page, prefilled, with a multiline and a grid
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   assert dialog is task-information
   # The spec's header control draws above every page (#1609).
   call dialog-read {}

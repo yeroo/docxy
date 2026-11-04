@@ -562,7 +562,7 @@ fn session_path_in(root: &std::path::Path) -> PathBuf {
 
 // ---- ribbon tabs -----------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RibbonTab {
     Task,
     Resource,
@@ -5596,7 +5596,8 @@ struct Docxy {
     range_pick: Option<((u32, u32), bool)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
-    /// The letters typed so far of a multi-letter command KeyTip.
+    /// The letters typed so far of a multi-letter KeyTip (a tab's at the Tabs
+    /// level, a command's at the Commands level).
     keytip_prefix: String,
     // The open menu (a right-click's context menu or a split button's
     // drop-down), drawn from the same model the harness reads.
@@ -5701,7 +5702,15 @@ struct Docxy {
     last_window_title: Option<String>,
     /// The accent this window's last render set (#1473), for the harness.
     drawn_accent: u32,
+    /// What the last render drew of each swatch gallery in place (#1823), for
+    /// the harness's `ribbon-read`.
+    drawn_galleries: std::cell::RefCell<DrawnGalleries>,
 }
+
+/// Per gallery id, the tiles a swatch gallery drew in place and whether a
+/// More button followed them (#1823).
+pub(crate) type DrawnGalleries =
+    std::collections::HashMap<&'static str, (std::ops::Range<usize>, bool)>;
 
 /// Where the regions a harness test can name actually landed, as gpui measured
 /// them: window-relative, logical pixels.
@@ -5959,6 +5968,85 @@ mod menu_key_tests {
             key: key.into(),
             key_char: char.map(String::from),
         }
+    }
+
+    #[test]
+    fn project_tab_key_tips_are_project_2024s() {
+        use crate::*;
+        let tips: Vec<_> = ribbon_tab_set(Kind::Project)
+            .iter()
+            .map(|(_, n, k)| (*n, *k))
+            .collect();
+        assert_eq!(
+            tips,
+            [
+                ("File", "F"),
+                ("Task", "H"),
+                ("Resource", "U"),
+                ("Report", "S"),
+                ("Project", "R"),
+                ("View", "W"),
+                ("Help", "Y"),
+            ]
+        );
+        let ribbon = ribbon_for(Kind::Project);
+        let drawn: Vec<_> = ribbon.tabs.iter().map(|t| t.key_tip).collect();
+        assert_eq!(drawn, ["H", "U", "S", "R", "W", "Y"]);
+    }
+
+    #[test]
+    fn a_two_letter_tab_key_tip_waits_for_its_second_letter() {
+        use crate::*;
+        let gantt = TabKeyCtx {
+            gantt: true,
+            ..TabKeyCtx::default()
+        };
+        let p = |typed| tab_keytip_pick(Kind::Project, typed, gantt);
+        assert_eq!(p("j"), TabPick::Wait);
+        assert_eq!(p("JF"), TabPick::Tab(RibbonTab::GanttFormat));
+        assert_eq!(p("jf"), TabPick::Tab(RibbonTab::GanttFormat));
+        // J then anything else closes the KeyTips; F alone is still File.
+        assert_eq!(p("JX"), TabPick::Off);
+        assert_eq!(p("F"), TabPick::Backstage);
+        assert_eq!(p("O"), TabPick::Off);
+        assert_eq!(p("H"), TabPick::Tab(RibbonTab::Task));
+        assert_eq!(p("S"), TabPick::Tab(RibbonTab::Report));
+        assert_eq!(p("R"), TabPick::Tab(RibbonTab::Project));
+        // No Gantt showing: J reaches nothing.
+        assert_eq!(
+            tab_keytip_pick(Kind::Project, "J", TabKeyCtx::default()),
+            TabPick::Off
+        );
+        // The document's contextual tabs keep their one letter.
+        let table = TabKeyCtx {
+            in_table: true,
+            ..TabKeyCtx::default()
+        };
+        let hf = TabKeyCtx {
+            hf: true,
+            ..TabKeyCtx::default()
+        };
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "J", table),
+            TabPick::Tab(RibbonTab::TableLayout)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "T", table),
+            TabPick::Tab(RibbonTab::TableDesign)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "J", hf),
+            TabPick::Tab(RibbonTab::HeaderFooter)
+        );
+        assert_eq!(tab_keytip_pick(Kind::Docx, "J", gantt), TabPick::Off);
+        assert_eq!(
+            tab_keytip_pick(Kind::Docx, "P", gantt),
+            TabPick::Tab(RibbonTab::Layout)
+        );
+        assert_eq!(
+            tab_keytip_pick(Kind::Xlsx, "A", gantt),
+            TabPick::Tab(RibbonTab::Data)
+        );
     }
 
     #[test]
@@ -15064,6 +15152,7 @@ impl Docxy {
             frame: 0,
             last_window_title: None,
             drawn_accent: BRAND,
+            drawn_galleries: Default::default(),
         }
     }
 
@@ -17683,6 +17772,8 @@ impl Docxy {
                 lookup(&self.probes.borrow(), &format!("ribbon-launch:{title}"))
                     .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn"))
             }
+            Region::GalleryMore(id) => lookup(&self.probes.borrow(), &format!("gallery-more-{id}"))
+                .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -27124,6 +27215,7 @@ impl Docxy {
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
+            self.keytip_prefix.clear();
             self.keytips = if self.keytips == KeyTip::Off {
                 KeyTip::Tabs
             } else {
@@ -27133,6 +27225,11 @@ impl Docxy {
             return;
         }
         if self.keytips != KeyTip::Off {
+            if key == "escape" && !self.keytip_prefix.is_empty() {
+                self.keytip_prefix.clear();
+                cx.notify();
+                return;
+            }
             if key == "escape" {
                 self.keytips = if self.keytips == KeyTip::Commands {
                     KeyTip::Tabs
@@ -31866,10 +31963,10 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
     if kind == Kind::Project {
         &[
             (None, "File", "F"),
-            (Some(Task), "Task", "T"),
+            (Some(Task), "Task", "H"),
             (Some(Resource), "Resource", "U"),
-            (Some(Report), "Report", "R"),
-            (Some(Project), "Project", "P"),
+            (Some(Report), "Report", "S"),
+            (Some(Project), "Project", "R"),
             (Some(View), "View", "W"),
             (Some(Help), "Help", "Y"),
         ]
@@ -31900,6 +31997,50 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
             (Some(Help), "Help", "Y"),
         ]
     }
+}
+/// What the KeyTips' Tabs level does with the letters typed so far.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TabPick {
+    Backstage,
+    Tab(RibbonTab),
+    /// A two-letter tab tip starts with them: wait for the next letter.
+    Wait,
+    Off,
+}
+
+/// The contextual tabs a KeyTip can reach now.
+#[derive(Clone, Copy, Debug, Default)]
+struct TabKeyCtx {
+    in_table: bool,
+    hf: bool,
+    gantt: bool,
+}
+
+/// The Tabs level's choice for `typed` (one letter, or a pending prefix plus
+/// one) on a ribbon of `kind`.
+fn tab_keytip_pick(kind: Kind, typed: &str, ctx: TabKeyCtx) -> TabPick {
+    let mut tips: Vec<(&str, Option<RibbonTab>)> = ribbon_tab_set(kind)
+        .iter()
+        .map(|(t, _, k)| (*k, *t))
+        .collect();
+    if kind == Kind::Docx && ctx.in_table {
+        tips.push(("T", Some(RibbonTab::TableDesign)));
+        tips.push(("J", Some(RibbonTab::TableLayout)));
+    } else if kind == Kind::Docx && ctx.hf {
+        tips.push(("J", Some(RibbonTab::HeaderFooter)));
+    }
+    if kind == Kind::Project && ctx.gantt {
+        tips.push((GANTT_FORMAT_KEYTIP, Some(RibbonTab::GanttFormat)));
+    }
+    if let Some((_, t)) = tips.iter().find(|(k, _)| k.eq_ignore_ascii_case(typed)) {
+        return t.map_or(TabPick::Backstage, TabPick::Tab);
+    }
+    let starts = tips.iter().any(|(k, _)| {
+        k.len() > typed.len()
+            && k.get(..typed.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(typed))
+    });
+    if starts { TabPick::Wait } else { TabPick::Off }
 }
 /// The ribbon tab shown for a tab of `kind`: `tab` while it is one of the
 /// kind's (a contextual one only in its context), else the kind's default. A
@@ -35042,7 +35183,7 @@ impl Docxy {
                             .font_weight(FontWeight::BOLD)
                     })
                     .child(ribbon_tab_name(RibbonTab::GanttFormat))
-                    .when(show_kt, |d| d.child(keytip_badge("O")))
+                    .when(show_kt, |d| d.child(keytip_badge(GANTT_FORMAT_KEYTIP)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
                     })),
@@ -36002,37 +36143,25 @@ impl Docxy {
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.keytips {
             KeyTip::Tabs => {
+                let typed = format!("{}{c}", self.keytip_prefix);
                 self.keytip_prefix.clear();
-                if c.eq_ignore_ascii_case("F") {
-                    self.keytips = KeyTip::Off;
-                    return self.open_backstage(cx);
-                }
-                let ribbon = ribbon_for(self.ribbon_kind());
-                if let Some(i) = ribbon
-                    .tabs
-                    .iter()
-                    .position(|t| t.key_tip.eq_ignore_ascii_case(c))
-                {
-                    self.select_ribbon_tab(
-                        ribbon_tab_set(self.ribbon_kind())[i + 1].0.unwrap(),
-                        window,
-                        cx,
-                    );
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("T") && self.caret_in_table() {
-                    self.select_ribbon_tab(RibbonTab::TableDesign, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("J") && self.caret_in_table() {
-                    self.select_ribbon_tab(RibbonTab::TableLayout, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("J") && self.hf_active() {
-                    self.select_ribbon_tab(RibbonTab::HeaderFooter, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else if c.eq_ignore_ascii_case("O") && self.project_gantt_showing() {
-                    self.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
-                    self.keytips = KeyTip::Commands;
-                } else {
-                    self.keytips = KeyTip::Off;
+                let kind = self.ribbon_kind();
+                let ctx = TabKeyCtx {
+                    in_table: self.caret_in_table(),
+                    hf: self.hf_active(),
+                    gantt: self.project_gantt_showing(),
+                };
+                match tab_keytip_pick(kind, &typed, ctx) {
+                    TabPick::Backstage => {
+                        self.keytips = KeyTip::Off;
+                        return self.open_backstage(cx);
+                    }
+                    TabPick::Tab(t) => {
+                        self.select_ribbon_tab(t, window, cx);
+                        self.keytips = KeyTip::Commands;
+                    }
+                    TabPick::Wait => self.keytip_prefix = typed,
+                    TabPick::Off => self.keytips = KeyTip::Off,
                 }
                 cx.notify();
             }
@@ -38178,8 +38307,12 @@ impl Docxy {
     /// A UI plugin's gallery (#1532): a tile per swatch, filled with the
     /// swatch's colour (its preview, `#RRGGBB`) over its label, or, when the
     /// preview names a palette, that palette's miniature chart with the label
-    /// as its tooltip (#1761). Swatches of one section sit under a header
-    /// row; the checked tile is framed in the accent.
+    /// as its tooltip (#1761). In a flyout every tile shows, swatches of one
+    /// section under a header row. In place (#1823) it is one strip of at most
+    /// `IN_PLACE_TILES` tiles (`in_place_window`: the first ones, or those
+    /// ending on the checked swatch) and, when it has more, a More button that
+    /// opens or shuts the whole gallery's flyout. The checked tile is framed in
+    /// the accent.
     fn swatch_gallery(
         &self,
         gal: &rs::Gallery<Act>,
@@ -38191,7 +38324,17 @@ impl Docxy {
         let geom = ribbon_fit::gallery_geom(gal);
         let (per_row, _) =
             ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal, max_w), max_w);
-        let layout = plugin_ui::gallery_rows(gal, max_w, per_row);
+        // In place a long gallery shows a window of its tiles, the checked one
+        // in it, and a More button for the rest (#1823).
+        let more = plugin_ui::more_w(gal, max_w, g.gap);
+        let layout = plugin_ui::gallery_rows(gal, max_w, per_row, self.gallery_checked_index(gal));
+        if max_w.is_none()
+            && let Some(plugin_ui::Row::Tiles(a, b)) = layout.first()
+        {
+            self.drawn_galleries
+                .borrow_mut()
+                .insert(gal.id, (*a..*b, more > 0.0));
+        }
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);
@@ -38293,7 +38436,7 @@ impl Docxy {
         let keytip =
             (self.keytips == KeyTip::Commands && max_w.is_none() && !gal.key_tip.is_empty())
                 .then_some(gal.key_tip);
-        div()
+        let tiles = div()
             .id(gal.id)
             .relative()
             .flex()
@@ -38306,7 +38449,52 @@ impl Docxy {
             })
             .children(rows)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+            .into_any_element();
+        if more == 0.0 {
+            return tiles;
+        }
+        let id = gal.id;
+        let more_btn = div()
+            .id(SharedString::from(format!("gallery-more-{id}")))
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(plugin_ui::MORE_W))
+            .h(px(g.h))
+            .rounded(px(g.radius))
+            .border(px(g.border))
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .text_size(px(g.name_size))
+            .text_color(pal.fg)
+            .cursor_pointer()
+            .hover(move |d| d.bg(pal.hover))
+            .child("▾")
+            .child(probe(&self.probes, format!("gallery-more-{id}")))
+            .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
+            // A press opens the gallery's flyout or shuts it, as a collapsed
+            // group's button does (the backdrop may close it first).
+            .on_mouse_down(
+                MouseButton::Left,
+                flyout_toggle(FlyoutTarget::Gallery(id), cx),
+            );
+        h_flex()
+            .flex_none()
+            .items_start()
+            .gap(px(g.gap))
+            .child(tiles)
+            .child(more_btn)
             .into_any_element()
+    }
+
+    /// The index of `gal`'s checked tile, when one is (#1823: the in-place
+    /// window keeps it shown).
+    fn gallery_checked_index(&self, gal: &rs::Gallery<Act>) -> Option<usize> {
+        gal.items
+            .iter()
+            .position(|it| self.gallery_item_selected(it.act))
     }
 
     /// The Styles gallery: a well of fixed-size tiles, each a live "AaBbCc" in
@@ -39938,6 +40126,7 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        self.drawn_galleries.borrow_mut().clear();
         // Pictures a package change replaced leave gpui's asset cache (#1639).
         self.release_pictures(None, window, cx);
         land_status(

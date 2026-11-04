@@ -1,6 +1,6 @@
 test ribbon tabs follow the active document kind
   open ../fixtures/gantt-summary.xml
-  key alt t escape escape
+  key alt h escape escape
   assert ribbon_tab is Task
   open ../fixtures/basic.xlsx
   assert ribbon_tab is Home
