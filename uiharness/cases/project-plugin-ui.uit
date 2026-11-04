@@ -389,6 +389,12 @@ test a long swatch gallery is bounded in place and its More button opens it whol
   assert reply.any_clipped is false
   assert reply.groups.-1.title is Fixture Wide
   assert reply.groups.-1.state is full
+  # What the frame drew in place matches the model's window.
+  call ribbon-read {}
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_first is 2
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_shown is 6
+  assert reply.tabs.3.groups.-1.galleries.0.drawn_more is true
+  assert reply.tabs.5.groups.-1.galleries.0.drawn_shown is null
   call ribbon-flyout {"action":"read"}
   assert reply.open is false
   call pointer-click {"region":"gallery-more:fixture.wide"}

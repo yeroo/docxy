@@ -331,8 +331,12 @@ commands and gallery tiles (a contributed control with a built-in's id
 replaces it in place, so the built-in's slot then reads `plugin: true`; a
 group with a contributed dialog launcher reads `launcher: true` and, when the
 plugin names them, `launcher_tip` and `launcher_key_tip`, #1669; each
-`galleries` entry reads `shown`, the tiles drawn in place, `first_shown`, the
-first of them, and `more`, whether a More button follows them, #1823),
+`galleries` entry reads `shown`, `first_shown` and `more`, the model's
+in-place window of a swatch gallery whatever its group's fit state: the tile
+count, the first tile and whether a More button follows, and `drawn_shown`,
+`drawn_first` and `drawn_more`, what the last frame drew in place, null when
+the gallery was not drawn in place then (another tab, a collapsed group),
+#1823),
 `menu-read`'s items (the row, bar, column and chart menus; `menu-open
 {"target":"chart"}` opens the chart's own menu beside the bars: Timescale... and
 Zoom... are live and open their dialogs, the rest of Project's items are drawn greyed), and `dialog-read`'s controls (a dialog a

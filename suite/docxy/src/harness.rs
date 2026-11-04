@@ -2888,14 +2888,13 @@ fn tab_json(
             let mut commands = Vec::new();
             let mut galleries = Vec::new();
             for control in &group.items {
+                let first = commands.len();
                 control_commands(control, &mut commands);
                 if let crate::Control::Gallery(g) = control {
                     // A swatch gallery in place shows a window of its tiles,
                     // the checked one in it, and a More button (#1823).
                     let swatch = crate::plugin_ui::is_swatch_gallery(g);
-                    let mut tiles = Vec::new();
-                    control_commands(control, &mut tiles);
-                    let checked_at = tiles.iter().position(|c| checked(c));
+                    let checked_at = commands[first..].iter().position(|c| checked(c));
                     let window = if swatch {
                         crate::plugin_ui::in_place_window(g.items.len(), checked_at)
                     } else {
@@ -3067,7 +3066,52 @@ fn ribbon_json(app: &crate::Docxy) -> Json {
     );
     add_combo_values(&mut json, app);
     set_live_qat(&mut json, app.qat_state());
+    add_drawn_galleries(&mut json, &app.drawn_galleries.borrow());
     json
+}
+
+/// What the last frame drew of each swatch gallery in place (#1823):
+/// `drawn_first`, `drawn_shown` and `drawn_more` beside the model's window,
+/// null for a gallery not drawn in place then (another tab, a collapsed group).
+fn add_drawn_galleries(json: &mut Json, drawn: &crate::DrawnGalleries) {
+    let Json::Obj(top) = json else { return };
+    let Some((_, Json::Arr(tabs))) = top.iter_mut().find(|(k, _)| k == "tabs") else {
+        return;
+    };
+    for tab in tabs {
+        let Json::Obj(tab) = tab else { continue };
+        let Some((_, Json::Arr(groups))) = tab.iter_mut().find(|(k, _)| k == "groups") else {
+            continue;
+        };
+        for group in groups {
+            let Json::Obj(group) = group else { continue };
+            let Some((_, Json::Arr(gals))) = group.iter_mut().find(|(k, _)| k == "galleries")
+            else {
+                continue;
+            };
+            for gal in gals {
+                let Json::Obj(gal) = gal else { continue };
+                let id = gal.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                    ("id", Json::Str(id)) => Some(id.clone()),
+                    _ => None,
+                });
+                let seen = id.and_then(|id| drawn.get(id.as_str()).cloned());
+                let num = |n: usize| Json::Num(n as f64);
+                gal.push((
+                    "drawn_first".into(),
+                    seen.as_ref().map_or(Json::Null, |(w, _)| num(w.start)),
+                ));
+                gal.push((
+                    "drawn_shown".into(),
+                    seen.as_ref().map_or(Json::Null, |(w, _)| num(w.len())),
+                ));
+                gal.push((
+                    "drawn_more".into(),
+                    seen.as_ref().map_or(Json::Null, |(_, m)| Json::Bool(*m)),
+                ));
+            }
+        }
+    }
 }
 
 /// Give the Header from Top / Footer from Bottom boxes the value they show

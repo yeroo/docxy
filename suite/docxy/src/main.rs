@@ -5648,7 +5648,15 @@ struct Docxy {
     last_window_title: Option<String>,
     /// The accent this window's last render set (#1473), for the harness.
     drawn_accent: u32,
+    /// What the last render drew of each swatch gallery in place (#1823), for
+    /// the harness's `ribbon-read`.
+    drawn_galleries: std::cell::RefCell<DrawnGalleries>,
 }
+
+/// Per gallery id, the tiles a swatch gallery drew in place and whether a
+/// More button followed them (#1823).
+pub(crate) type DrawnGalleries =
+    std::collections::HashMap<&'static str, (std::ops::Range<usize>, bool)>;
 
 /// Where the regions a harness test can name actually landed, as gpui measured
 /// them: window-relative, logical pixels.
@@ -14935,6 +14943,7 @@ impl Docxy {
             frame: 0,
             last_window_title: None,
             drawn_accent: BRAND,
+            drawn_galleries: Default::default(),
         }
     }
 
@@ -37929,6 +37938,13 @@ impl Docxy {
         // in it, and a More button for the rest (#1823).
         let more = plugin_ui::more_w(gal, max_w, g.gap);
         let layout = plugin_ui::gallery_rows(gal, max_w, per_row, self.gallery_checked_index(gal));
+        if max_w.is_none()
+            && let Some(plugin_ui::Row::Tiles(a, b)) = layout.first()
+        {
+            self.drawn_galleries
+                .borrow_mut()
+                .insert(gal.id, (*a..*b, more > 0.0));
+        }
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);
@@ -39716,6 +39732,7 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        self.drawn_galleries.borrow_mut().clear();
         land_status(
             &mut self.pending_status,
             self.tabs.get_mut(self.active).map(|t| &mut t.status),

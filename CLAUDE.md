@@ -1722,8 +1722,10 @@
   estimate is the width drawn. A flyout copy (a collapsed group's, `max_w`
   Some) wraps every tile and has no More button. No scroll arrows: the
   flyout shows the rest. The Styles and Table Styles wells are unchanged.
-  `ribbon-read` adds `shown`, `first_shown` and `more` to each `galleries`
-  entry; `gallery-more:<id>` is the More button's region. The fixture's
+  `ribbon-read` adds `shown`, `first_shown` and `more` (the model's window)
+  and `drawn_shown`, `drawn_first` and `drawn_more` (what the last frame drew
+  in place, `Docxy::drawn_galleries`; null when not drawn in place) to each
+  `galleries` entry; `gallery-more:<id>` is the More button's region. The fixture's
   `fixture.wide` (nine swatches, group "Fixture Wide" on the Report tab,
   which has room) is the bounded one in
   `project-plugin-ui.uit`.
