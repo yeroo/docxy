@@ -7,8 +7,6 @@
 //! Theming (Auto/Light/Dark) follows gpui-component's theme; session hot-exit
 //! persists open tabs/files + the theme choice to `<config>/docxy/session.json`.
 
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
-
 // ⚠️ `harness-capture` must never apply off macOS, and must never do so
 // silently. It turns on gpui's test-support, which also makes gpui draw every
 // dirty window on each effect flush WITHOUT presenting it. On Windows that
@@ -55,6 +53,7 @@ mod doc_recovery;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
+pub mod ext;
 mod field_edit;
 mod file_keys;
 mod font_box;
@@ -111,6 +110,7 @@ mod sheet_clip_tests;
 mod sheet_complete;
 mod sheet_consolidate;
 mod sheet_drag;
+mod tab_tear;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
 /// and still far below what the quadratic version they guard took (minutes).
@@ -743,6 +743,9 @@ enum Surface {
     Doc(Editor),
     Sheet(SheetView),
     Placeholder,
+    /// A tab body an extension draws (`ext`): a Mail tab when a build links
+    /// a Mail surface. Saved as nothing, like the placeholder it replaces.
+    Ext(Box<dyn ext::TabSurface>),
 }
 
 /// The typing a revert set aside, with the editor state that went with it.
@@ -13112,8 +13115,8 @@ fn write_sidecars(
             }
             let mut persisted = persist_tab_avoiding(&hd, &taken, hot_seq, i, t);
             // A placeholder holds nothing of its own, clean or not: its last
-            // copy is all there is of it.
-            let placeholder = matches!(t.surface, Surface::Placeholder);
+            // copy is all there is of it. An extension's tab (Mail) neither.
+            let placeholder = matches!(t.surface, Surface::Placeholder | Surface::Ext(_));
             if persisted.hot.is_none() && (t.dirty || placeholder) {
                 // No new copy (a full disk, a placeholder): the last one is
                 // still the unsaved work, so the session goes on naming it,
@@ -14458,7 +14461,7 @@ fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
                 .ok()
                 .map(|bytes| ("yppx", bytes))
         }
-        Surface::Placeholder => None,
+        Surface::Placeholder | Surface::Ext(_) => None,
     }
 }
 
@@ -15442,6 +15445,12 @@ impl Docxy {
         if self.applied != Some(desired) {
             Theme::change(desired, Some(window), cx);
             self.applied = Some(desired);
+            let dark = desired.is_dark();
+            for t in &self.tabs {
+                if let Surface::Ext(e) = &t.surface {
+                    e.set_dark(dark, cx);
+                }
+            }
         }
     }
 
@@ -15861,6 +15870,8 @@ impl Docxy {
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
         });
+        // A build with a Mail extension draws the new tab at once.
+        self.attach_ext_surfaces(cx);
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -15908,6 +15919,18 @@ impl Docxy {
     pub(crate) fn new_window(
         &mut self,
         tab: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<u64, String> {
+        self.new_window_at(tab, None, window, cx)
+    }
+
+    /// [`Self::new_window`], the new window's top-left at `at` (screen
+    /// pixels) when given: a torn-off tab opens where it was let go.
+    pub(crate) fn new_window_at(
+        &mut self,
+        tab: Option<usize>,
+        at: Option<Point<Pixels>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<u64, String> {
@@ -15974,10 +15997,14 @@ impl Docxy {
             restore = Some((i.min(self.tabs.len()), previous_active));
             tabs.push(moved);
         }
-        let options = window_options(
-            windows::cascade(window.bounds(), display_of(window, cx)),
-            self.harness,
-        );
+        let bounds = match at {
+            Some(origin) => Bounds {
+                origin,
+                size: window.bounds().size,
+            },
+            None => windows::cascade(window.bounds(), display_of(window, cx)),
+        };
+        let options = window_options(bounds, self.harness);
         let init = WindowInit::Moved {
             tabs,
             prefs: MovedPrefs::from_docxy(self),
@@ -39794,6 +39821,10 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Extension tabs (a Mail surface) get their view, and the keys while
+        // active, before anything is drawn.
+        self.attach_ext_surfaces(cx);
+        self.focus_ext_surface(window, cx);
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
@@ -40035,6 +40066,9 @@ impl Render for Docxy {
                         },
                         |d, _, _, cx| cx.new(|_| d.clone()),
                     )
+                    .on_drag_move::<TabDrag>(|ev: &DragMoveEvent<TabDrag>, window, cx| {
+                        tab_tear::moved(ev.drag(cx), ev.event.position, window);
+                    })
                     .drag_over::<TabDrag>(move |s, _, _, _| s.bg(border))
                     .on_drop(cx.listener(move |this, d: &TabDrag, window, cx| {
                         let title = this.tabs.get(d.ix).map(|t| t.title.as_str());
@@ -41190,6 +41224,12 @@ impl Render for Docxy {
                     project_el(v, self.active, pal, &self.probes, cx).into_any_element()
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
+                Surface::Ext(e) => div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .size_full()
+                    .child(e.view())
+                    .into_any_element(),
             },
             None => v_flex()
                 .flex_1()
@@ -41423,9 +41463,25 @@ impl Render for Docxy {
         let sized = cx.entity();
         let pressed = cx.entity();
         let pen = cx.entity();
+        let tear = cx.entity();
         let gesture_listeners = canvas(
             |_b, _w, _a| {},
             move |_b, _s, window: &mut Window, _cx: &mut App| {
+                // A tab dragged off the strip (or out of the window) and let
+                // go there tears off into a window of its own, as a browser
+                // tab does. The release is the window's: there is no drop
+                // target where it lands.
+                let tear = tear.clone();
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture
+                        && ev.button == MouseButton::Left
+                        && tear.update(cx, |this, cx| {
+                            this.tab_tear_release(ev.position, window, cx)
+                        })
+                    {
+                        cx.stop_propagation();
+                    }
+                });
                 // A table pen (#763) takes a press on the page before anything
                 // under it does (no selection, no cell or row strip), and the
                 // moves and the release of the gesture it starts.
@@ -41613,7 +41669,11 @@ impl Render for Docxy {
                 self.tab_more_open,
             ))
             .child(title_bar)
-            .child(ribbon_tabs)
+            // An extension's tab draws its own ribbon below the strip; its
+            // File reaches the suite's backstage through `ext::ShowBackstage`.
+            .when(!self.active_is_ext() || self.backstage, |d| {
+                d.child(ribbon_tabs)
+            })
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(protected_bar, |d, b| d.child(b))
             .when_some(find_bar, |d, f| d.child(f))
@@ -41690,6 +41750,9 @@ impl KeyRouting for Div {
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
+            .on_action(cx.listener(|this, _: &ext::ShowBackstage, _window, cx| {
+                this.open_backstage(cx);
+            }))
             .on_action(
                 cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
             )
@@ -45707,7 +45770,10 @@ fn open_docxy_window(
     }
 }
 
-fn main() {
+/// Runs the suite: the public `suite` binary passes no extensions; a build
+/// that links an extension (a Mail surface) passes it here.
+pub fn run(extensions: ext::Extensions) {
+    let mut extensions = Some(extensions);
     // A converting child (#633): the importer and nothing else, no window.
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(code);
@@ -45786,6 +45852,9 @@ fn main() {
         .with_quit_mode(quit_mode());
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        if let Some(extensions) = extensions.take() {
+            ext::install(cx, extensions);
+        }
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
         // actions so the document can insert a tab / outdent instead.
         cx.bind_keys([
@@ -51288,5 +51357,98 @@ mod cycle_tab_key_tests {
         assert_eq!(cycle_tab_key("f5", false, 0, 3, false), None);
         assert_eq!(cycle_tab_key("f6", false, 0, 0, false), None);
         assert_eq!(cycle_tab_key("f6", false, 0, 1, false), Some(0));
+    }
+}
+
+// ---- extension surfaces and torn-off tabs -----------------------------------
+
+impl Docxy {
+    /// Gives every Mail tab still drawn as the placeholder the extension's
+    /// surface, when a build links one. A tab the extension refused keeps the
+    /// placeholder, its reason on its status line, and is not asked again.
+    fn attach_ext_surfaces(&mut self, cx: &mut Context<Self>) {
+        const REFUSED: &str = "Mail: ";
+        let mut dark = None;
+        for i in 0..self.tabs.len() {
+            let t = &self.tabs[i];
+            if t.kind != Kind::Look
+                || !matches!(t.surface, Surface::Placeholder)
+                || t.load_failed
+                || t.status.starts_with(REFUSED)
+            {
+                continue;
+            }
+            match ext::new_mail(cx) {
+                None => return,
+                Some(Ok(surface)) => {
+                    let dark = *dark.get_or_insert_with(|| {
+                        self.applied
+                            .unwrap_or_else(|| self.theme_pref.resolve(self.os_appearance))
+                            .is_dark()
+                    });
+                    surface.set_dark(dark, cx);
+                    if let Some(title) = surface.title(cx) {
+                        self.tabs[i].title = title.into();
+                    }
+                    self.tabs[i].surface = Surface::Ext(surface);
+                }
+                Some(Err(e)) => self.tabs[i].status = format!("{REFUSED}{e}").into(),
+            }
+        }
+    }
+
+    /// Whether the active tab's body is an extension's.
+    fn active_is_ext(&self) -> bool {
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Ext(_))
+        )
+    }
+
+    /// While an extension tab is the active one, it has the keys: a focus
+    /// the suite gave its own root (`refocus`) goes on to the surface, which
+    /// hands back the keys it does not use (they bubble to `route_key`).
+    fn focus_ext_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backstage || self.menu.is_some() {
+            return;
+        }
+        let Some(Surface::Ext(e)) = self.tabs.get(self.active).map(|t| &t.surface) else {
+            return;
+        };
+        if self.focus.is_focused(window) {
+            let handle = e.focus_handle(cx);
+            window.focus(&handle, cx);
+        }
+    }
+
+    /// The window's mouse-up during a tab drag: tears the tab off into a new
+    /// window when it was let go away from the strip. Returns whether the
+    /// release was taken.
+    fn tab_tear_release(
+        &mut self,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(t) = tab_tear::take(window) else {
+            return false;
+        };
+        let title = self.tabs.get(t.ix).map(|x| x.title.as_str());
+        if !tabstrip::drag_applies(t.len, self.tabs.len(), title, t.title.as_str()) {
+            return false;
+        }
+        let Some(chip) = self.probes.borrow().current(&format!("tab-chip:{}", t.ix)) else {
+            return false;
+        };
+        if !tab_tear::torn(at, chip, window.viewport_size()) {
+            return false;
+        }
+        let origin = tab_tear::origin(window.bounds().origin, at);
+        match self.new_window_at(Some(t.ix), Some(origin), window, cx) {
+            Ok(_) => self.set_status("Moved the tab to a new window"),
+            Err(e) => self.set_status(e),
+        }
+        cx.notify();
+        true
     }
 }
