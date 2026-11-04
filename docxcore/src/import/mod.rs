@@ -49,6 +49,8 @@
 //! | `css::Selector::matches` | reach sets, one per compound | work (depth/4 + 1) a compound: O(compounds × depth), no backtracking |
 //! | html element look | parent's look cloned, the cascade | per open: work (1 + key/16) + the matching; inline `style` parsed once |
 //! | html implicit close | the element stack, searched once | work (depth/16 + 1) per block open |
+//! | html `restyle` | looks above a closed element computed again | per element: its attributes scanned again (work attrs/16 + 1) + the matching; ≤ depth elements a close |
+//! | html formatting reopened at a block end | elements kept, looks restyled | ≤ depth, at most three alike; as `restyle` |
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
 //! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |

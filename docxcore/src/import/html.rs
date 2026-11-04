@@ -22,7 +22,9 @@
 //! bottom box as spacing, every enclosing block's left and right box as
 //! indent, `text-indent`, and a block's background as shading. A table cell
 //! starts a fresh block look; an HTML list item keeps its level's hanging
-//! indent. White space collapses as a browser collapses it, except in
+//! indent. A mis-nested inline close ends the element at once (the looks
+//! above it are computed again) and a block's end reopens the formatting
+//! elements left open in it, as a browser does. White space collapses as a browser collapses it, except in
 //! `pre`. Images, links' targets and forms are not converted.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
@@ -190,8 +192,8 @@ impl Kind {
         }
     }
 
-    /// Whether the structural stacks also hold it (a close of an inline
-    /// element never pops one, #1872 13a).
+    /// Whether the structural stacks also hold it (an inline element closed
+    /// under one is taken out alone, [`Html::close_elem`]).
     fn structural(self) -> bool {
         matches!(self, Kind::Block | Kind::Cell | Kind::List | Kind::Table)
     }
@@ -235,6 +237,33 @@ struct Elem {
     key: ElemKey,
     kind: Kind,
     look: Look,
+    /// Where its attribute text is in the page: what its look is computed
+    /// from again when an element below it closes (#1872 r1).
+    attrs: (usize, usize),
+}
+
+/// The HTML formatting elements: a block end reopens those left open in it
+/// (as a browser's list of active formatting elements does).
+const FORMATTING: [&str; 14] = [
+    "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u",
+];
+
+/// Elements whose content is not markup: skipped by the tokenizer and by
+/// the `<style>` scan (whose own `style` is the one it reads).
+const RAW_TEXT: [&str; 11] = [
+    "style", "script", "title", "xml", "noscript", "template", "object", "svg", "iframe", "select",
+    "textarea",
+];
+
+/// Whether `key` starts a heading: `h1`-`h6`, or Word's `MsoHeadingN`.
+fn starts_heading(key: &ElemKey) -> bool {
+    key.tag
+        .strip_prefix('h')
+        .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6"))
+        || key.classes.first().is_some_and(|c| {
+            c.strip_prefix("msoheading")
+                .is_some_and(|n| n.parse::<u8>().is_ok())
+        })
 }
 
 /// An element about to open, below its open ancestors: what selectors
@@ -340,9 +369,15 @@ impl Cascade {
         self.look.bold_off = !bold;
     }
 
-    /// The user agent's look of `tag`: tag semantics (`b`, `i`, …), the
-    /// `center` alignment, the blockquote margins.
-    fn user_agent(&mut self, tag: &str) {
+    /// The user agent's look of `key`: tag semantics (`b`, `i`, …), the
+    /// `center` alignment, the blockquote margins. A heading starts with no
+    /// explicit not-bold: only a declaration on it or inside it makes one
+    /// (an ancestor's `font:` shorthand must not, #1872 r1).
+    fn user_agent(&mut self, key: &ElemKey) {
+        if starts_heading(key) {
+            self.look.bold_off = false;
+        }
+        let tag = key.tag.as_str();
         let run = &mut self.look.run;
         match tag {
             "b" | "strong" => self.set_bold(true),
@@ -545,8 +580,9 @@ impl Cascade {
         };
         match self.kind {
             Kind::Block => {
-                look.before = sum(self.margin[0], self.padding[0]);
-                look.after = sum(self.margin[2], self.padding[2]);
+                // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
+                look.before = sum(self.margin[0], self.padding[0]).map(|t| t.max(0));
+                look.after = sum(self.margin[2], self.padding[2]).map(|t| t.max(0));
                 if let Some(l) = sum(self.margin[3], self.padding[3]) {
                     look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
                 }
@@ -569,6 +605,49 @@ impl Cascade {
     }
 }
 
+/// What computing a look reads besides the element stack.
+#[derive(Clone, Copy)]
+struct Ctx<'c> {
+    sheet: &'c StyleSheet,
+    budget: &'c Budget,
+}
+
+/// The look of an element opening on top of `below`: its parent's, then the
+/// user agent's, the presentational attributes, the matched rules, the
+/// inline style, the important rules and the important inline style.
+fn look_of(ctx: Ctx, below: &[Elem], key: &ElemKey, kind: Kind, attrs: &Attrs) -> Look {
+    let mut c = Cascade::new(below.last().map(|e| &e.look), kind);
+    c.user_agent(key);
+    c.presentational(&key.tag, attrs);
+    let hits = ctx.sheet.matching(
+        &Ancestry {
+            elems: below,
+            subject: key,
+        },
+        ctx.budget,
+    );
+    let inline = attrs
+        .style
+        .as_deref()
+        .map(css::parse_declarations)
+        .unwrap_or_default();
+    for important in [false, true] {
+        for &hit in &hits {
+            for d in ctx.sheet.decls(hit) {
+                if d.important == important {
+                    c.apply(d);
+                }
+            }
+        }
+        for d in &inline {
+            if d.important == important {
+                c.apply(d);
+            }
+        }
+    }
+    c.finish()
+}
+
 /// The CSS text of every `<style>` element of the page, in order: one
 /// forward scan, skipping comments and the contents of elements whose text
 /// is not markup (a `<style>` inside a comment or a script does not apply).
@@ -589,21 +668,7 @@ fn collect_styles(s: &str) -> String {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len() - 1);
         let name = rest[1..1 + name_len.min(MAX_TAG)].to_ascii_lowercase();
-        let raw = matches!(
-            name.as_str(),
-            "style"
-                | "script"
-                | "title"
-                | "xml"
-                | "noscript"
-                | "template"
-                | "object"
-                | "svg"
-                | "iframe"
-                | "select"
-                | "textarea"
-        );
-        if !raw {
+        if !RAW_TEXT.contains(&name.as_str()) {
             i = at + 1;
             continue;
         }
@@ -745,20 +810,21 @@ impl<'a> Html<'a> {
             Some(end) => (end, end - 1),
             None => (rest.len(), rest.len()),
         };
-        let attrs = &rest[name_start + name_len..attrs_end.max(name_start + name_len)];
+        let attrs = (
+            self.pos + name_start + name_len,
+            self.pos + attrs_end.max(name_start + name_len),
+        );
         self.pos += end;
         if close {
             self.close_tag(&name);
         } else {
-            let attrs = attrs.to_string();
-            self.open_tag(&name, &attrs);
+            self.open_tag(&name, attrs);
         }
     }
 
-    fn open_tag(&mut self, name: &str, attrs_text: &str) {
+    fn open_tag(&mut self, name: &str, attrs_at: (usize, usize)) {
         match name {
-            "head" | "style" | "script" | "title" | "xml" | "noscript" | "template" | "object"
-            | "svg" | "iframe" | "select" | "textarea" => {
+            _ if name == "head" || RAW_TEXT.contains(&name) => {
                 let end = format!("</{name}");
                 self.skip_past(&end);
                 self.skip_past(">");
@@ -778,7 +844,8 @@ impl<'a> Html<'a> {
             | "source" | "param" | "embed" | "track" => return,
             _ => {}
         }
-        let attrs = attrs_of(attrs_text);
+        let s = self.s;
+        let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
         // Malformed input (#1872 13): a block closes an open `p`, an `li` an
         // open `li` of the same list, a `dt` / `dd` an open `dt` / `dd`.
         if matches!(
@@ -821,7 +888,7 @@ impl<'a> Html<'a> {
         {
             // Word's tab: the spaces inside stand for it.
             if self.visible() {
-                let props = self.look_for(&key, kind, &attrs).run;
+                let props = look_of(self.ctx(), &self.elems, &key, kind, &attrs).run;
                 self.out.tab(&props);
                 self.space = None;
                 self.para_start = false;
@@ -882,45 +949,81 @@ impl<'a> Html<'a> {
             _ => {}
         }
         if self.elems.len() < MAX_DEPTH && self.budget.work(1 + key.heap() / 16) {
-            let look = self.look_for(&key, kind, &attrs);
-            self.elems.push(Elem { key, kind, look });
+            let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs);
+            self.elems.push(Elem {
+                key,
+                kind,
+                look,
+                attrs: attrs_at,
+            });
         }
     }
 
-    /// The look of an element about to open: its parent's, then the user
-    /// agent's, the presentational attributes, the matched rules, the
-    /// inline style, the important rules and the important inline style.
-    fn look_for(&self, key: &ElemKey, kind: Kind, attrs: &Attrs) -> Look {
-        let mut c = Cascade::new(self.elems.last().map(|e| &e.look), kind);
-        c.user_agent(&key.tag);
-        c.presentational(&key.tag, attrs);
-        let hits = self.sheet.matching(
-            &Ancestry {
-                elems: &self.elems,
-                subject: key,
-            },
-            self.budget,
-        );
-        let inline = attrs
-            .style
-            .as_deref()
-            .map(css::parse_declarations)
-            .unwrap_or_default();
-        for important in [false, true] {
-            for &hit in &hits {
-                for d in self.sheet.decls(hit) {
-                    if d.important == important {
-                        c.apply(d);
-                    }
-                }
+    fn ctx(&self) -> Ctx<'_> {
+        Ctx {
+            sheet: &self.sheet,
+            budget: self.budget,
+        }
+    }
+
+    /// Compute again the looks of `elems[from..]`, each from the element
+    /// below it and its own tag, classes, id and attributes, after an element
+    /// under them closed or the stack under them changed. Each costs the
+    /// scan of its attributes and its matching.
+    fn restyle(&mut self, from: usize) {
+        let s = self.s;
+        for j in from..self.elems.len() {
+            let (below, rest) = self.elems.split_at_mut(j);
+            let e = &mut rest[0];
+            let (a0, a1) = e.attrs;
+            if !self.budget.scanned(a1 - a0) {
+                return;
             }
-            for d in &inline {
-                if d.important == important {
-                    c.apply(d);
+            let attrs = attrs_of(&s[a0..a1]);
+            e.look = look_of(
+                Ctx {
+                    sheet: &self.sheet,
+                    budget: self.budget,
+                },
+                below,
+                &e.key,
+                e.kind,
+                &attrs,
+            );
+        }
+    }
+
+    /// Truncate the element stack at `i`. When `elems[i]` is a block, the
+    /// formatting elements left open inside it (outside any table in it)
+    /// are opened again on top of what remains, as a browser reconstructs
+    /// them: `<p><b>a</p><p>b` keeps `b` bold. At most three alike (same
+    /// tag and attributes), as a browser's Noah's Ark clause.
+    fn truncate_elems(&mut self, i: usize) {
+        if i >= self.elems.len() {
+            return;
+        }
+        let mut reopen: Vec<Elem> = Vec::new();
+        if self.elems[i].kind == Kind::Block {
+            let s = self.s;
+            for e in self.elems.drain(i + 1..) {
+                if matches!(e.kind, Kind::Cell | Kind::Table) {
+                    break;
+                }
+                if !FORMATTING.contains(&e.key.tag.as_str()) {
+                    continue;
+                }
+                let same = |o: &&Elem| {
+                    o.key.tag == e.key.tag && s[o.attrs.0..o.attrs.1] == s[e.attrs.0..e.attrs.1]
+                };
+                if reopen.iter().filter(same).count() < 3 {
+                    reopen.push(e);
                 }
             }
         }
-        c.finish()
+        self.elems.truncate(i);
+        let from = self.elems.len();
+        self.elems.extend(reopen);
+        self.restyle(from);
     }
 
     /// Close the innermost open element named in `tags` that the element
@@ -946,8 +1049,8 @@ impl<'a> Html<'a> {
             return;
         };
         self.end_para_if_any();
-        let tag = std::mem::take(&mut self.elems[i].key.tag);
-        self.elems.truncate(i);
+        let tag = self.elems[i].key.tag.clone();
+        self.truncate_elems(i);
         if let Some(j) = self.blocks.iter().rposition(|(n, _)| *n == tag) {
             if !self.blocks[j + 1..]
                 .iter()
@@ -1015,6 +1118,16 @@ impl<'a> Html<'a> {
             }
             "ul" | "ol" | "dir" | "menu" => {
                 self.end_para_if_any();
+                // An `li` of this list left open ends with it, never one
+                // across a cell.
+                let level = self.lists.len() as i32 - 1;
+                let open_item = self.blocks.iter().rposition(|(n, b)| {
+                    n == "td" || n == "th" || (n == "li" && b.item.is_some_and(|(_, l)| l == level))
+                });
+                if let Some(j) = open_item.filter(|&j| self.blocks[j].0 == "li") {
+                    self.blocks.truncate(j);
+                    self.recount_pre();
+                }
                 self.lists.pop();
             }
             _ => {}
@@ -1022,19 +1135,24 @@ impl<'a> Html<'a> {
         self.close_elem(name);
     }
 
-    /// Pop `name` and what is inside it off the element stack. A close of a
-    /// non-structural element that would pop a structural one still open
-    /// is ignored (#1872 13a): `<b><p>x</b>y</p>` keeps the `p`.
+    /// Pop `name` and what is inside it off the element stack. An inline
+    /// element closed under a structural one still open is taken out alone
+    /// and what is above it restyled (#1872 r1): `<b><p>x</b>y</p>` makes
+    /// `y` plain and keeps the `p`'s own look. Any other element that would
+    /// pop a structural one (`</body>` under an open `p`) is ignored.
     fn close_elem(&mut self, name: &str) {
         let Some(i) = self.elems.iter().rposition(|e| e.key.tag == name) else {
             return;
         };
-        if !self.elems[i].kind.structural()
-            && self.elems[i + 1..].iter().any(|e| e.kind.structural())
-        {
+        let kind = self.elems[i].kind;
+        if !kind.structural() && self.elems[i + 1..].iter().any(|e| e.kind.structural()) {
+            if kind == Kind::Inline {
+                self.elems.remove(i);
+                self.restyle(i);
+            }
             return;
         }
-        self.elems.truncate(i);
+        self.truncate_elems(i);
     }
 
     fn visible(&self) -> bool {
@@ -2026,16 +2144,124 @@ mod tests {
     }
 
     #[test]
-    fn a_mis_nested_inline_close_keeps_the_block_look() {
+    fn a_mis_nested_inline_close_ends_at_once() {
+        // FIX r1 M2: the `b` ends at `</b>` (as on main and in a browser);
+        // the `p` keeps its own look, nothing leaks past it.
         let d = doc("<b><p style='margin-bottom:10pt;color:red'>x</b>y</p><p>z</p>");
         let p = para_of(&d, "xy");
         assert_eq!(p.props.spacing.after, Some(200));
-        assert_eq!(run_of(&d, "y").props.color.as_deref(), Some("FF0000"));
+        let x = run_of(&d, "x");
+        assert!(x.props.bold);
+        assert_eq!(x.props.color.as_deref(), Some("FF0000"));
+        let y = run_of(&d, "y");
+        assert!(!y.props.bold);
+        assert_eq!(y.props.color.as_deref(), Some("FF0000"));
+        let z = run_of(&d, "z");
+        assert!(!z.props.bold);
+        assert_eq!(z.props.color, None);
+        assert_eq!(para_of(&d, "z").props.spacing.after, None);
+        let d = doc("<span style='color:red'><p>a</span>b</p><p>c</p>");
+        assert_eq!(run_of(&d, "a").props.color.as_deref(), Some("FF0000"));
+        assert_eq!(run_of(&d, "b").props.color, None);
+        assert_eq!(run_of(&d, "c").props.color, None);
+        // A `<style>` rule on the element above is matched again without
+        // the closed one: `b p` no longer applies once the `b` is gone.
+        let d = doc("<style>b p {font-size:20pt}</style><b><p>in</b>out</p>");
+        assert_eq!(run_of(&d, "in").props.size_half_pts, Some(40));
+        assert_eq!(run_of(&d, "out").props.size_half_pts, None);
         // `</table>` drops an unclosed cell's look.
         let d = doc(
             "<table><tr><td><span style='color:red'>in<td style='color:blue'>two</table><p>after</p>",
         );
         assert_eq!(run_of(&d, "after").props.color, None);
+    }
+
+    #[test]
+    fn a_block_end_reopens_its_formatting_elements() {
+        // FIX r1 m3: as on main and in a browser.
+        let d = doc("<p><b>Title<p>body</b>");
+        assert!(run_of(&d, "Title").props.bold);
+        assert!(run_of(&d, "body").props.bold);
+        let d = doc("<p><b>a</p><p>b</b>");
+        assert!(run_of(&d, "b").props.bold);
+        let d = doc("<ul><li><b>one<li>two</ul>");
+        assert!(run_of(&d, "two").props.bold);
+        let d = doc("<div><font color=red>red</div><p>still red</p>");
+        assert_eq!(
+            run_of(&d, "still red").props.color.as_deref(),
+            Some("FF0000")
+        );
+        // A span is not a formatting element; a cell keeps its own.
+        let d = doc("<p><span style='color:red'>a</p><p>plain</p>");
+        assert_eq!(run_of(&d, "plain").props.color, None);
+        let d = doc("<div><table><tr><td><b>cell</td></tr></table></div><p>after</p>");
+        assert!(!run_of(&d, "after").props.bold);
+        // At most three alike are reopened.
+        let page = format!("<p>{}x</p><p>y", "<b>".repeat(10));
+        let budget = Budget::standard();
+        let mut h = Html::new(&page, &budget, StyleSheet::default());
+        h.run();
+        assert_eq!(h.elems.iter().filter(|e| e.key.tag == "b").count(), 3);
+        assert!(run_of(&doc(&page), "y").props.bold);
+    }
+
+    #[test]
+    fn an_ancestor_s_not_bold_is_no_explicit_off_on_a_heading() {
+        // FIX r1 M1.
+        let off = "<w:b w:val=\"0\"/>".to_string();
+        let d = doc("<div style='font:12px Arial'><h1>Title</h1></div>");
+        assert!(run_of(&d, "Title").props.raw_props.is_empty());
+        let d = doc("<style>body{font:14px/1.5 Arial}</style><h2>x</h2><p class=MsoHeading3>y</p>");
+        assert!(run_of(&d, "x").props.raw_props.is_empty());
+        assert!(run_of(&d, "y").props.raw_props.is_empty());
+        let d = doc(
+            "<div style='font-weight:normal'><h1 style='font-weight:normal'>own</h1><h2><span style='font-weight:400'>inner</span></h2></div>",
+        );
+        assert_eq!(
+            run_of(&d, "own").props.raw_props,
+            std::slice::from_ref(&off)
+        );
+        assert_eq!(run_of(&d, "inner").props.raw_props, [off]);
+    }
+
+    #[test]
+    fn negative_spacing_and_line_height_are_not_written() {
+        // FIX r1 M3: ST_TwipsMeasure is unsigned.
+        let d = doc(
+            "<p style='margin-top:-10px;margin-bottom:-1pt;padding-bottom:0'>neg</p>\
+             <p style='margin-top:-10px;padding-top:15px'>sum</p>\
+             <p style='line-height:-5px'>line</p><p style='line-height:0'>zero</p>",
+        );
+        let neg = para_of(&d, "neg");
+        assert_eq!(
+            (neg.props.spacing.before, neg.props.spacing.after),
+            (Some(0), Some(0))
+        );
+        assert_eq!(para_of(&d, "sum").props.spacing.before, Some(75));
+        assert_eq!(para_of(&d, "line").props.spacing.line, None);
+        assert_eq!(para_of(&d, "zero").props.spacing.line, None);
+    }
+
+    #[test]
+    fn a_font_size_attribute_never_overflows() {
+        // FIX r1 m1.
+        let d = doc(
+            "<p><font size=\"+9223372036854775807\">big</font> <font size=\"-999999999999999999999\">small</font></p>",
+        );
+        assert_eq!(run_of(&d, "big").props.size_half_pts, Some(72));
+        assert_eq!(run_of(&d, "small").props.size_half_pts, Some(15));
+    }
+
+    #[test]
+    fn a_list_end_ends_its_open_item() {
+        // FIX r1: the unclosed `li` no longer makes what follows a bullet.
+        let d = doc("<ul><li>a<li>b</ul><p>after</p>");
+        assert_eq!(para_of(&d, "after").props.num_id, None);
+        let d = doc("<ol><li>a<ol></ol>still</li></ol><p>after</p>");
+        assert_eq!(para_of(&d, "still").props.num_id, Some(2));
+        assert_eq!(para_of(&d, "after").props.num_id, None);
+        let d = doc("<ul><li><table><tr><td><ul></ul>cell</td></tr></table>x</li></ul>");
+        assert_eq!(para_of(&d, "x").props.num_id, Some(1));
     }
 
     #[test]

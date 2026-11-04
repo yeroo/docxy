@@ -2399,9 +2399,16 @@
   −360, else no indent. A `MsoList…` paragraph keeps its own CSS.
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
-  across a cell or table, ending the paragraph only if it has content. A
-  close of an inline element that would pop an open structural one is
-  ignored on the element stack. Known limits: quirks mode's table-font reset
+  across a cell or table, ending the paragraph only if it has content; a
+  list's end ends its open `li`. An `Elem` keeps where its attributes are in
+  the page, so looks can be computed again (`restyle`): an inline element
+  closed under an open block (`<b><p>x</b>y`) is taken out alone and what
+  is above it restyled, so it ends at once; a block's end reopens the HTML
+  formatting elements left open in it (`a b big code em font i nobr s small
+  strike strong tt u`, outside a table in it, at most three alike), as a
+  browser does. Under a heading only a not-bold declared on it or inside it
+  is the explicit off (an ancestor's `font:` shorthand is not), and
+  negative top/bottom boxes write 0. Known limits: quirks mode's table-font reset
   (browsers do not inherit font size/weight/style into a `table` there; we
   do), no borders, no `dir`/`letter-spacing`/`text-transform`, no `+ ~
   [attr] :pseudo`. The suite does not draw run shading yet.

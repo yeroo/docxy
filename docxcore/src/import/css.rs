@@ -231,6 +231,7 @@ pub(crate) trait Path {
     fn key(&self, i: usize) -> &ElemKey;
 }
 
+#[cfg(test)]
 impl Path for [ElemKey] {
     fn len(&self) -> usize {
         <[ElemKey]>::len(self)
@@ -409,7 +410,8 @@ impl Selector {
     /// combinator keeps the elements whose child is in the set, and a
     /// descendant combinator every element before the set's last one. Each
     /// step looks at each element once: O(compounds × depth), no
-    /// backtracking. One unit of work per element looked at.
+    /// backtracking. Each step costs `hi / 4 + 1` units of work (`hi` the
+    /// last element still in the set): a unit per four elements looked at.
     pub(crate) fn matches<P: Path + ?Sized>(&self, path: &P, budget: &Budget) -> bool {
         let d = path.len();
         let k = self.parts.len();
@@ -948,11 +950,20 @@ const FONT_ATTR_PT: [f64; 7] = [7.5, 10.0, 12.0, 13.5, 18.0, 24.0, 36.0];
 /// A `<font size>` attribute (`1`..`7`, or `+n` / `-n` from 3) in points.
 pub(crate) fn font_attr_size(value: &str) -> Option<f64> {
     let v = value.trim();
-    let n: i64 = v.strip_prefix('+').unwrap_or(v).parse().ok()?;
-    let level = if v.starts_with('+') || v.starts_with('-') {
-        3 + n
-    } else {
-        n
+    let (sign, digits) = match v.as_bytes().first() {
+        Some(b'+') => (1, &v[1..]),
+        Some(b'-') => (-1, &v[1..]),
+        _ => (0, v),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // All digits, so a failed parse is an overflow: as large as it gets.
+    let n = digits.parse::<i64>().unwrap_or(i64::MAX);
+    let level = match sign {
+        0 => n,
+        1 => 3i64.saturating_add(n),
+        _ => 3i64.saturating_sub(n),
     };
     Some(FONT_ATTR_PT[(level.clamp(1, 7) - 1) as usize])
 }
@@ -1473,6 +1484,10 @@ mod tests {
         assert_eq!(attr("-2"), Some(7.5));
         assert_eq!(attr("+9"), Some(36.0));
         assert_eq!(attr("x"), None);
+        assert_eq!(attr("+9223372036854775807"), Some(36.0));
+        assert_eq!(attr("-999999999999999999999"), Some(7.5));
+        assert_eq!(attr("99999999999999999999999"), Some(36.0));
+        assert_eq!(attr("+"), None);
     }
 
     #[test]
