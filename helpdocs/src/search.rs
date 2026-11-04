@@ -59,25 +59,25 @@ fn body_lines(blocks: &[Block]) -> Vec<String> {
 /// to hold the first query term it finds.
 fn snippet(line: &str, terms: &[String]) -> String {
     let chars: Vec<char> = line.chars().collect();
-    // Lowercased char by char, so indexes stay those of `line`.
-    let lower: Vec<char> = chars
-        .iter()
-        .map(|c| c.to_lowercase().next().unwrap_or(*c))
-        .collect();
-    let end = terms
-        .iter()
-        .filter_map(|t| {
-            let t: Vec<char> = t.chars().collect();
-            // A whole token only: no letter or digit on either side.
-            let word = |i: usize| lower.get(i).is_some_and(|c| c.is_alphanumeric());
-            (0..=lower.len().saturating_sub(t.len()))
-                .find(|&at| {
-                    lower[at..].starts_with(&t) && (at == 0 || !word(at - 1)) && !word(at + t.len())
-                })
-                .map(|at| at + t.len())
-        })
-        .min()
-        .unwrap_or(0);
+    // The first alphanumeric run that `tokens` would read as a term, by
+    // `tokens`' own rule (whole-run lowercasing), so the two never disagree.
+    let mut end = 0;
+    let mut at = 0;
+    while at < chars.len() {
+        if !chars[at].is_alphanumeric() {
+            at += 1;
+            continue;
+        }
+        let run_end = (at..chars.len())
+            .find(|&i| !chars[i].is_alphanumeric())
+            .unwrap_or(chars.len());
+        let run: String = chars[at..run_end].iter().collect::<String>().to_lowercase();
+        if terms.contains(&run) {
+            end = run_end;
+            break;
+        }
+        at = run_end;
+    }
     let start = end.saturating_sub(SNIPPET_CHARS);
     chars[start..].iter().take(SNIPPET_CHARS).collect()
 }
@@ -207,6 +207,15 @@ mod tests {
         assert_eq!(snippet("b"), "Table too");
         assert_eq!(snippet("c").chars().count(), SNIPPET_CHARS);
         assert!(snippet("c").ends_with("table"), "{}", snippet("c"));
+    }
+
+    #[test]
+    fn the_snippet_finds_a_final_sigma_word_by_the_token_rule() {
+        let line = format!("{}ΟΔΟΣ", "x ".repeat(100));
+        let m = manual(&[("a", &line)]);
+        let hits = search(&m, "ΟΔΟΣ");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].snippet.ends_with("ΟΔΟΣ"), "{}", hits[0].snippet);
     }
 
     #[test]

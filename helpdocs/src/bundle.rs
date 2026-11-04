@@ -324,13 +324,20 @@ fn page(id: &str, src: &str, problems: &mut Vec<Problem>) -> Page {
     }
 }
 
+/// The files under `dir`. Only the root's listing can fail the load: a
+/// subdirectory that cannot be listed, an entry that cannot be read and a
+/// symbolic link (to a directory or not; a junction too) count as absent, so
+/// a link never takes the walk outside the bundle or round in a loop.
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect(root, &path, out)?;
-        } else if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok(rel) = path.strip_prefix(root) {
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if kind.is_dir() {
+            let _ = collect(root, &path, out);
+        } else if kind.is_file() {
+            if let (Ok(bytes), Ok(rel)) = (std::fs::read(&path), path.strip_prefix(root)) {
                 out.push((rel.to_string_lossy().into_owned(), bytes));
             }
         }
@@ -601,6 +608,51 @@ pub(crate) mod tests {
             page: "a".into(),
             src: "images/gone.png".into()
         }));
+    }
+
+    /// Link `link` to the directory `target`: a symbolic link on Unix, a
+    /// junction on Windows (no privilege needed). False if it cannot be made.
+    fn link_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
+    }
+
+    #[test]
+    fn a_linked_directory_is_not_followed_and_only_the_root_can_fail() {
+        let base = std::env::temp_dir().join(format!("helpdocs-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let bundle = base.join("word");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(bundle.join("contents.txt"), "a\n").unwrap();
+        std::fs::write(bundle.join("a.md"), "# A\n").unwrap();
+        std::fs::write(outside.join("x.md"), "# X\n").unwrap();
+        let linked = link_dir(&outside, &bundle.join("linked"));
+        let m = Manual::load(&bundle).expect("the root lists");
+        // Remove the link before its target, so nothing is deleted through it.
+        let _ = std::fs::remove_dir(bundle.join("linked"));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(m.problems, vec![], "linked: {linked}");
+        assert_eq!(m.pages.len(), 1);
+        // A root that cannot be listed fails the load.
+        assert!(Manual::load(&base.join("missing")).is_err());
     }
 
     #[test]
