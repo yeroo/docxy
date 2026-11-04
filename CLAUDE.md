@@ -2363,3 +2363,45 @@
   `tab-list` reports `count`. `uiharness/cases/help-docs.uit` drives it;
   `qa/help-docs.md` is the offline manual case. F1 on a hovered ribbon
   command and on panes is #1869.
+
+## HTML import CSS (#1872)
+
+- `docxcore::import::html` reads inline `style`, `<font color face size>` and
+  every `<style>` block of the page (a pre-pass, `collect_styles`, outside
+  comments and raw-text elements, so a style in `<!--[if mso]>` or a script
+  does not apply). `import/css.rs` (dependency-free) parses declarations,
+  sheets of simple selectors (type, `*`, `.class`, `#id`, compounds,
+  descendant and child; anything else drops that selector alone, every
+  at-rule is skipped with its block) and the values. Names compare ASCII
+  case-insensitively. A sheet keeps at most 10 000 rules, a selector 32
+  compounds; matching is right to left over reach sets, O(compounds ×
+  depth), all charged to the import `Budget`.
+- One stack of open elements (`Elem`: key, `Kind`, computed `Look`) beside
+  the structural `blocks`/`lists`; a look is computed once, at open, in CSS
+  order: parent, user agent (`b`, `center`, blockquote's 40 px), presentational
+  attributes, rules by specificity then order, inline, important rules,
+  inline important. Runs: colour (`windowtext`/`auto` reset it), font family
+  (first non-generic; generics map to Times New Roman / Arial / Courier New),
+  size (half-points, 1..1638 pt), weight, style, decoration, vertical align,
+  an inline element's background as run `w:shd`, `mso-highlight` (Word's 17
+  names only), `display:none` / `mso-hide:all` as `vanish`. Under a heading
+  an explicit not-bold is `<w:b w:val="0"/>`. Paragraphs: alignment, line
+  height (multiple → `auto`, length → `atLeast`, `exact` with
+  `mso-line-height-rule:exactly`), the innermost block's own top/bottom box
+  as spacing, every enclosing block's left/right box summed as indent
+  (negative clamps at 0), `text-indent`, a block's background as `w:shd`.
+- Boundaries: `html`/`body` box and background are the page's, never read; a
+  `td`/`th` starts a fresh indent, right indent, first line and shading (its
+  padding is the cell's, #1878), while inherited run properties and line
+  height pass in; `ul`/`ol` and `table` boxes are not counted (the level
+  indent stands for the list's). An HTML `li` keeps the level's hanging
+  indent: with an enclosing box it writes `720*(lvl+1) + box`, first line
+  −360, else no indent. A `MsoList…` paragraph keeps its own CSS.
+- Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
+  `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
+  across a cell or table, ending the paragraph only if it has content. A
+  close of an inline element that would pop an open structural one is
+  ignored on the element stack. Known limits: quirks mode's table-font reset
+  (browsers do not inherit font size/weight/style into a `table` there; we
+  do), no borders, no `dir`/`letter-spacing`/`text-transform`, no `+ ~
+  [attr] :pseudo`. The suite does not draw run shading yet.
