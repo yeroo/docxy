@@ -962,6 +962,9 @@ impl<'a> Html<'a> {
             self.skip_past(">");
             return;
         }
+        // The stacks as they are below this element (#1872 r4: a list's own
+        // entry is above its `lists_at`, so its close ends it).
+        let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
         match name {
             "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "blockquote" | "pre"
             | "address" | "dt" | "dd" | "center" | "td" | "th" | "caption" => {
@@ -1020,8 +1023,8 @@ impl<'a> Html<'a> {
                 kind,
                 look,
                 attrs: attrs_at,
-                blocks_at: self.blocks.len(),
-                lists_at: self.lists.len(),
+                blocks_at,
+                lists_at,
             });
         }
     }
@@ -1166,6 +1169,31 @@ impl<'a> Html<'a> {
             return;
         }
         match name {
+            // A `</li>` whose `li` is below an open list is not in list-item
+            // scope: a browser ignores it (#1872 r4).
+            "li" => {
+                let under_list = self
+                    .elems
+                    .iter()
+                    .rposition(|e| e.key.tag == "li")
+                    .is_some_and(|i| {
+                        self.elems[i + 1..]
+                            .iter()
+                            .any(|e| matches!(e.key.tag.as_str(), "ul" | "ol" | "dir" | "menu"))
+                    });
+                if under_list {
+                    return;
+                }
+            }
+            // A row group's end ends its open cell and row first, as its
+            // start does.
+            "thead" | "tbody" | "tfoot" => {
+                self.close_open(&["td", "th"], &["tr", "table", "thead", "tbody", "tfoot"]);
+                self.close_open(&["tr"], &["table", "thead", "tbody", "tfoot"]);
+            }
+            _ => {}
+        }
+        match name {
             "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "blockquote" | "pre"
             | "address" | "dt" | "dd" | "center" | "caption" => {
                 if let Some(i) = self.blocks.iter().rposition(|(n, _)| n == name) {
@@ -1215,18 +1243,11 @@ impl<'a> Html<'a> {
                 }
             }
             "ul" | "ol" | "dir" | "menu" => {
+                // `close_elem` cuts `lists` and `blocks` back to where the
+                // list element opened: an `li` left open in it ends, and so
+                // does a list opened in it and left open (`</ol>` over an
+                // open `ul`).
                 self.end_para_if_any();
-                // An `li` of this list left open ends with it, never one
-                // across a cell.
-                let level = self.lists.len() as i32 - 1;
-                let open_item = self.blocks.iter().rposition(|(n, b)| {
-                    n == "td" || n == "th" || (n == "li" && b.item.is_some_and(|(_, l)| l == level))
-                });
-                if let Some(j) = open_item.filter(|&j| self.blocks[j].0 == "li") {
-                    self.blocks.truncate(j);
-                    self.recount_pre();
-                }
-                self.lists.pop();
             }
             _ => {}
         }
@@ -2555,6 +2576,47 @@ mod tests {
         assert_eq!(para_of(&d, "b").props.ilvl, 0);
         let d = doc("<table><tr><td><ul><li>a</td></tr></table><ul><li>b</li></ul>");
         assert_eq!(para_of(&d, "b").props.ilvl, 0);
+    }
+
+    #[test]
+    fn list_ends_follow_list_item_scope() {
+        // FIX r4 m1: a stray `</li>` under an open list is ignored.
+        let d = doc("<ul><li>a<ul><li>b</li></li><li>c</li></ul><li>d</li></ul>");
+        assert_eq!(para_of(&d, "c").props.ilvl, 1);
+        assert_eq!(para_of(&d, "d").props.ilvl, 0);
+        // FIX r4 p1: a list's end ends the lists left open inside it.
+        let d = doc("<ol><li>a<ul><li>b</ol><p>after</p><ul><li>c</li></ul>");
+        assert_eq!(para_of(&d, "after").props.num_id, None);
+        assert_eq!(para_of(&d, "c").props.ilvl, 0);
+        let d = doc("<ul><li>a<ol><li>b</ul><p>x</p><ul><li>c</li></ul>");
+        assert_eq!(para_of(&d, "x").props.num_id, None);
+        assert_eq!(para_of(&d, "c").props.ilvl, 0);
+        // Well-formed nesting is unchanged.
+        let d = doc("<ul><li>a<ol><li>b</li></ol></li><li>c</li></ul><ol><li>d</li></ol>");
+        let p = all_paras(&d);
+        let got: Vec<(Option<i32>, i32)> =
+            p.iter().map(|p| (p.props.num_id, p.props.ilvl)).collect();
+        assert_eq!(
+            got,
+            [(Some(1), 0), (Some(2), 1), (Some(1), 0), (Some(2), 0)]
+        );
+    }
+
+    #[test]
+    fn a_row_group_end_ends_its_cell_and_row() {
+        // FIX r4 p2.
+        let d = doc("<table><thead><tr><th>h</thead><tbody><tr><td>b</td></tr></tbody></table>");
+        assert_eq!(table_texts(&d), [["h"], ["b"]]);
+    }
+
+    #[test]
+    fn mso_highlight_none_clears_it() {
+        // FIX r4 m2.
+        let d = doc(
+            "<p><span style='mso-highlight:yellow'>a<span style='mso-highlight:none'>b</span></span></p>",
+        );
+        assert_eq!(run_of(&d, "a").props.highlight.as_deref(), Some("yellow"));
+        assert_eq!(run_of(&d, "b").props.highlight, None);
     }
 
     #[test]

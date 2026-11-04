@@ -1416,6 +1416,8 @@ mod tests {
         assert_eq!(highlight("darkblue"), Some("darkBlue"));
         assert_eq!(highlight("LIGHTGRAY"), Some("lightGray"));
         assert_eq!(highlight("fuchsia"), None);
+        assert_eq!(highlight("none"), Some("none"));
+        assert_eq!(highlight(" NONE "), Some("none"));
         assert_eq!(highlight("#ffff00"), None);
     }
 

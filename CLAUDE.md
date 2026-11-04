@@ -2401,8 +2401,11 @@
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
   across a cell or table, ending the paragraph only if it has content; a
-  list's end ends its open `li`, and any close ends the blocks and lists
-  opened inside the element (`Elem::blocks_at`/`lists_at`). Omitted table
+  list's end ends its open `li` and any list left open in it (`</ol>` over
+  an open `ul`), a `</li>` under an open list is ignored (list-item scope),
+  and any close ends the blocks and lists opened inside the element
+  (`Elem::blocks_at`/`lists_at`, the stacks below it). A row group's end,
+  like its start, ends the open cell and row. Omitted table
   end tags are implied (`close_open`, through `close_tag` so the cell or row
   ends in the document): a `td`/`th` ends the open cell of its row, a `tr`
   the open cell and row, a `thead`/`tbody`/`tfoot` those and the open row
