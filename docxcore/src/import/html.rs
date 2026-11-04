@@ -23,8 +23,9 @@
 //! indent, `text-indent`, and a block's background as shading. A table cell
 //! starts a fresh block look; an HTML list item keeps its level's hanging
 //! indent. A mis-nested inline close ends the element at once (the looks
-//! above it are computed again) and a block's end reopens the formatting
-//! elements left open in it, as a browser does. White space collapses as a browser collapses it, except in
+//! above it are computed again), an end reopens the formatting elements
+//! left open inside (three alike at most), and no close reaches across a
+//! table, as in a browser. White space collapses as a browser collapses it, except in
 //! `pre`. Images, links' targets and forms are not converted.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
@@ -173,9 +174,33 @@ enum Kind {
     Table,
     /// A known inline element: its background is run shading.
     Inline,
+    /// An HTML5 block-level container (`section`, `article`, …): it ends
+    /// paragraphs and closes an open `p` like a `div`, but its box and
+    /// background are not read.
+    Container,
     /// Anything else (`html`, `body`, a custom tag): only what is inherited.
     Other,
 }
+
+/// The HTML5 containers that are [`Kind::Container`].
+const CONTAINERS: [&str; 16] = [
+    "article",
+    "aside",
+    "details",
+    "dialog",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "header",
+    "hgroup",
+    "main",
+    "nav",
+    "search",
+    "section",
+    "summary",
+];
 
 impl Kind {
     fn of(tag: &str) -> Kind {
@@ -188,14 +213,23 @@ impl Kind {
             "b" | "strong" | "i" | "em" | "cite" | "dfn" | "var" | "u" | "ins" | "s" | "strike"
             | "del" | "sup" | "sub" | "span" | "font" | "a" | "small" | "big" | "code" | "tt"
             | "kbd" | "samp" | "abbr" | "acronym" | "label" | "q" | "mark" | "o:p" => Kind::Inline,
+            _ if CONTAINERS.contains(&tag) => Kind::Container,
             _ => Kind::Other,
         }
     }
 
-    /// Whether the structural stacks also hold it (an inline element closed
-    /// under one is taken out alone, [`Html::close_elem`]).
+    /// Whether it bounds paragraphs (an inline element closed under one is
+    /// taken out alone, [`Html::close_elem`]).
     fn structural(self) -> bool {
-        matches!(self, Kind::Block | Kind::Cell | Kind::List | Kind::Table)
+        matches!(
+            self,
+            Kind::Block | Kind::Cell | Kind::List | Kind::Table | Kind::Container
+        )
+    }
+
+    /// A table or a cell: what a close never reaches across.
+    fn table(self) -> bool {
+        matches!(self, Kind::Cell | Kind::Table)
     }
 }
 
@@ -240,6 +274,10 @@ struct Elem {
     /// Where its attribute text is in the page: what its look is computed
     /// from again when an element below it closes (#1872 r1).
     attrs: (usize, usize),
+    /// `blocks` and `lists` when it opened: what its close truncates them to
+    /// when it is not on them itself (#1872 r2).
+    blocks_at: usize,
+    lists_at: usize,
 }
 
 /// The HTML formatting elements: a block end reopens those left open in it
@@ -599,7 +637,7 @@ impl Cascade {
                     look.run.raw_props.push(shd(&fill));
                 }
             }
-            Kind::Cell | Kind::List | Kind::Table | Kind::Other => {}
+            Kind::Cell | Kind::List | Kind::Table | Kind::Container | Kind::Other => {}
         }
         self.look
     }
@@ -839,9 +877,13 @@ impl<'a> Html<'a> {
                 }
                 return;
             }
+            "hr" => {
+                self.implicit_close(&["p"]);
+                return;
+            }
             // Void elements: nothing opens.
-            "img" | "hr" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base"
-            | "source" | "param" | "embed" | "track" => return,
+            "img" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source"
+            | "param" | "embed" | "track" => return,
             _ => {}
         }
         let s = self.s;
@@ -870,8 +912,14 @@ impl<'a> Html<'a> {
                 | "center"
                 | "dt"
                 | "dd"
-        ) {
+                | "listing"
+                | "xmp"
+        ) || CONTAINERS.contains(&name)
+        {
             self.implicit_close(&["p"]);
+        }
+        if CONTAINERS.contains(&name) {
+            self.end_para_if_any();
         }
         match name {
             "li" => self.implicit_close(&["li"]),
@@ -955,6 +1003,8 @@ impl<'a> Html<'a> {
                 kind,
                 look,
                 attrs: attrs_at,
+                blocks_at: self.blocks.len(),
+                lists_at: self.lists.len(),
             });
         }
     }
@@ -993,34 +1043,60 @@ impl<'a> Html<'a> {
         }
     }
 
-    /// Truncate the element stack at `i`. When `elems[i]` is a block, the
-    /// formatting elements left open inside it (outside any table in it)
-    /// are opened again on top of what remains, as a browser reconstructs
-    /// them: `<p><b>a</p><p>b` keeps `b` bold. At most three alike (same
-    /// tag and attributes), as a browser's Noah's Ark clause.
+    /// Truncate the element stack at `i`. The formatting elements left open
+    /// above it (outside any table there) are opened again on top of what
+    /// remains, as a browser reconstructs its active formatting elements:
+    /// `<p><b>a</p><p>b` keeps `b` bold. Not when `elems[i]` is a table or a
+    /// cell, whose formatting never leaves it. One is not reopened when three
+    /// alike (same tag and attributes) are already open below, back to the
+    /// nearest table or cell, or reopened: a browser's Noah's Ark clause,
+    /// which keeps an unclosed `<b>` per paragraph from piling up.
     fn truncate_elems(&mut self, i: usize) {
         if i >= self.elems.len() {
             return;
         }
         let mut reopen: Vec<Elem> = Vec::new();
-        if self.elems[i].kind == Kind::Block {
+        if !self.elems[i].kind.table() {
             let s = self.s;
-            for e in self.elems.drain(i + 1..) {
-                if matches!(e.kind, Kind::Cell | Kind::Table) {
+            let (below, above) = self.elems.split_at_mut(i + 1);
+            // Below the closed element, back to the nearest table or cell.
+            let scope = below[..i]
+                .iter()
+                .rposition(|e| e.kind.table())
+                .map_or(0, |t| t + 1);
+            let below = &below[scope..i];
+            for e in above.iter_mut() {
+                // A guard: a close never reaches across a table
+                // (`out_of_scope`), and a table's own close reopens nothing.
+                if e.kind.table() {
                     break;
                 }
-                if !FORMATTING.contains(&e.key.tag.as_str()) {
+                if !FORMATTING.contains(&e.key.tag.as_str())
+                    || !self.budget.work(below.len() / 16 + 1)
+                {
                     continue;
                 }
-                let same = |o: &&Elem| {
+                let alike = |o: &&Elem| {
                     o.key.tag == e.key.tag && s[o.attrs.0..o.attrs.1] == s[e.attrs.0..e.attrs.1]
                 };
-                if reopen.iter().filter(same).count() < 3 {
-                    reopen.push(e);
+                if below.iter().filter(alike).count() + reopen.iter().filter(alike).count() < 3 {
+                    reopen.push(Elem {
+                        key: std::mem::take(&mut e.key),
+                        kind: e.kind,
+                        look: Look::default(),
+                        attrs: e.attrs,
+                        blocks_at: 0,
+                        lists_at: 0,
+                    });
                 }
             }
         }
         self.elems.truncate(i);
+        let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
+        for e in &mut reopen {
+            e.blocks_at = blocks_at;
+            e.lists_at = lists_at;
+        }
         let from = self.elems.len();
         self.elems.extend(reopen);
         self.restyle(from);
@@ -1067,6 +1143,9 @@ impl<'a> Html<'a> {
     }
 
     fn close_tag(&mut self, name: &str) {
+        if self.out_of_scope(name) {
+            return;
+        }
         match name {
             "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "blockquote" | "pre"
             | "address" | "dt" | "dd" | "center" | "caption" => {
@@ -1135,24 +1214,54 @@ impl<'a> Html<'a> {
         self.close_elem(name);
     }
 
-    /// Pop `name` and what is inside it off the element stack. An inline
-    /// element closed under a structural one still open is taken out alone
-    /// and what is above it restyled (#1872 r1): `<b><p>x</b>y</p>` makes
-    /// `y` plain and keeps the `p`'s own look. Any other element that would
-    /// pop a structural one (`</body>` under an open `p`) is ignored.
+    /// Pop `name` and what is inside it off the element stack.
+    ///
+    /// - `html` and `body` never close (text after them is still the page's).
+    /// - An inline element closed under an open block (`<b><p>x</b>y`) is
+    ///   taken out alone and what is above it restyled (#1872 r1), so `y` and
+    ///   what follows are not bold.
+    /// - A container or other element closed over an open paragraph ends it
+    ///   and the blocks and lists opened inside it (#1872 r2).
+    /// - What is left open inside is reopened ([`Self::truncate_elems`]).
+    ///
+    /// A close never reaches across a table or cell ([`Self::out_of_scope`]).
     fn close_elem(&mut self, name: &str) {
+        if name == "html" || name == "body" {
+            return;
+        }
         let Some(i) = self.elems.iter().rposition(|e| e.key.tag == name) else {
             return;
         };
         let kind = self.elems[i].kind;
-        if !kind.structural() && self.elems[i + 1..].iter().any(|e| e.kind.structural()) {
-            if kind == Kind::Inline {
-                self.elems.remove(i);
-                self.restyle(i);
-            }
+        let over_structure = self.elems[i + 1..].iter().any(|e| e.kind.structural());
+        if kind == Kind::Inline && over_structure {
+            self.elems.remove(i);
+            self.restyle(i);
             return;
         }
+        if kind == Kind::Container || (kind == Kind::Other && over_structure) {
+            self.end_para_if_any();
+            let (blocks_at, lists_at) = (self.elems[i].blocks_at, self.elems[i].lists_at);
+            self.blocks.truncate(blocks_at);
+            self.lists.truncate(lists_at);
+            self.recount_pre();
+        }
         self.truncate_elems(i);
+    }
+
+    /// Whether closing `name` would reach across an open table or cell (a
+    /// browser ignores such a close): `</ul>` in a cell of a table in an `li`.
+    fn out_of_scope(&self, name: &str) -> bool {
+        if matches!(
+            name,
+            "td" | "th" | "tr" | "table" | "thead" | "tbody" | "tfoot"
+        ) {
+            return false;
+        }
+        self.elems
+            .iter()
+            .rposition(|e| e.key.tag == name)
+            .is_some_and(|i| self.elems[i + 1..].iter().any(|e| e.kind.table()))
     }
 
     fn visible(&self) -> bool {
@@ -2203,6 +2312,130 @@ mod tests {
         h.run();
         assert_eq!(h.elems.iter().filter(|e| e.key.tag == "b").count(), 3);
         assert!(run_of(&doc(&page), "y").props.bold);
+    }
+
+    #[test]
+    fn a_container_close_ends_what_is_open_in_it() {
+        // FIX r2 M1.
+        let d = doc("<section style='color:red'><p>one</section><p>two</p><p>three</p>");
+        assert_eq!(run_of(&d, "one").props.color.as_deref(), Some("FF0000"));
+        assert_eq!(run_of(&d, "two").props.color, None);
+        assert_eq!(run_of(&d, "three").props.color, None);
+        // A container closes an open `p` as it opens, so the inner `p` does
+        // not drain it.
+        let d = doc("<p>intro<section style='color:red'><p>inside</p>");
+        assert_eq!(paragraph_texts(&d), ["intro", "inside"]);
+        assert_eq!(run_of(&d, "inside").props.color.as_deref(), Some("FF0000"));
+        let d =
+            doc("<style>.post p {color:red}</style><article class=post><p>in</article><p>out</p>");
+        assert_eq!(run_of(&d, "in").props.color.as_deref(), Some("FF0000"));
+        assert_eq!(run_of(&d, "out").props.color, None);
+        // A custom tag over an open paragraph, and containers as paragraph
+        // bounds.
+        let d = doc("<x-box style='color:red'><p>a</x-box><p>b</p>");
+        assert_eq!(run_of(&d, "b").props.color, None);
+        let d = doc("<section>one</section><section>two</section><p>a<hr>b");
+        assert_eq!(paragraph_texts(&d), ["one", "two", "a", "b"]);
+        // `</body>` never ends the page's look.
+        let d = doc("<body style='color:red'><p>a</body>b");
+        assert_eq!(run_of(&d, "b").props.color.as_deref(), Some("FF0000"));
+    }
+
+    #[test]
+    fn reopened_formatting_elements_do_not_pile_up() {
+        // FIX r2 M2: three alike at most, those still open below counted.
+        // A browser nests at most four `small`s here (three reconstructed,
+        // one new): 9.6, 7.5, 6, then 4.8pt each time.
+        let mut page = String::from("<style>small{font-size:80%}</style>");
+        for k in 0..6 {
+            page.push_str(&format!("<p><small>s{k}</p>"));
+        }
+        let d = doc(&page);
+        let sizes: Vec<Option<u32>> = (0..6)
+            .map(|k| run_of(&d, &format!("s{k}")).props.size_half_pts)
+            .collect();
+        assert_eq!(
+            sizes,
+            [Some(19), Some(15), Some(12), Some(10), Some(10), Some(10)]
+        );
+        let mut page = String::new();
+        for k in 0..300 {
+            page.push_str(&format!("<p><b>b{k}</p>"));
+        }
+        page.push_str("<p style='color:red'>last <span style='font-size:30pt'>big</span></p>");
+        let budget = Budget::standard();
+        let mut h = Html::new(&page, &budget, StyleSheet::default());
+        h.run();
+        assert!(h.elems.len() <= 4, "{}", h.elems.len());
+        let d = doc(&page);
+        let big = run_of(&d, "big");
+        assert_eq!(big.props.size_half_pts, Some(60));
+        assert!(big.props.bold, "the <b>s were never closed");
+        assert_eq!(big.props.color.as_deref(), Some("FF0000"));
+    }
+
+    #[test]
+    fn an_inline_close_reopens_what_it_ended() {
+        // As a browser's adoption agency: `</span>` pops the `b`, which
+        // comes back without the span's colour; `</b>` pops the `i`.
+        let d = doc("<p><span style='color:red'><b>a</span>b</b> <b><i>x</b>y</i>z</p>");
+        let b = run_of(&d, "b");
+        assert!(b.props.bold);
+        assert_eq!(b.props.color, None);
+        let y = run_of(&d, "y");
+        assert!(y.props.italic && !y.props.bold);
+        let z = run_of(&d, "z");
+        assert!(!z.props.italic && !z.props.bold);
+    }
+
+    #[test]
+    fn closes_never_reach_across_a_table() {
+        // FIX r2 m1: an unclosed cell's `b` does not leave the table.
+        let d = doc("<div><table><tr><td><b>cell</table><p>after</p></div><p>out</p>");
+        assert!(run_of(&d, "cell").props.bold);
+        assert!(!run_of(&d, "after").props.bold);
+        assert!(!run_of(&d, "out").props.bold);
+        // `</div>` in a cell is ignored, as in a browser: `after` is still in
+        // the cell, in its `b`.
+        let d = doc("<div><table><tr><td><b>cell</div><p>after</p>");
+        let DocBlock::Table(t) = &d.body[0] else {
+            panic!("{:?}", d.body[0])
+        };
+        let cells: Vec<String> = t
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .flat_map(|c| &c.blocks)
+            .filter_map(|b| match b {
+                DocBlock::Paragraph(p) => Some(p.plain_text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cells, ["cell", "after"]);
+        assert!(run_of(&d, "after").props.bold);
+        // FIX r2 m2: `</ul>` in a cell is ignored; the item goes on after
+        // the table.
+        let d = doc("<ul><li>a<table><tr><td></ul>cell</td></tr></table>x</li></ul>");
+        let DocBlock::Table(t) = d
+            .body
+            .iter()
+            .find(|b| matches!(b, DocBlock::Table(_)))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        let in_cell: Vec<String> = t
+            .rows
+            .iter()
+            .flat_map(|r| &r.cells)
+            .flat_map(|c| &c.blocks)
+            .filter_map(|b| match b {
+                DocBlock::Paragraph(p) => Some(p.plain_text()),
+                _ => None,
+            })
+            .collect();
+        assert!(in_cell.iter().any(|t| t == "cell"), "{in_cell:?}");
+        assert_eq!(para_of(&d, "x").props.num_id, Some(1));
     }
 
     #[test]

@@ -2400,13 +2400,23 @@
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
   across a cell or table, ending the paragraph only if it has content; a
-  list's end ends its open `li`. An `Elem` keeps where its attributes are in
-  the page, so looks can be computed again (`restyle`): an inline element
-  closed under an open block (`<b><p>x</b>y`) is taken out alone and what
-  is above it restyled, so it ends at once; a block's end reopens the HTML
-  formatting elements left open in it (`a b big code em font i nobr s small
-  strike strong tt u`, outside a table in it, at most three alike), as a
-  browser does. Under a heading only a not-bold declared on it or inside it
+  list's end ends its open `li`. HTML5 containers (`section article main
+  header footer nav aside figure form …`, `Kind::Container`) and `hr` close
+  an open `p` too; a container (or a custom tag over an open paragraph)
+  ends the paragraph, blocks and lists opened inside it when it closes
+  (`Elem::blocks_at`/`lists_at`). `html`/`body` never close, and no close
+  reaches across an open table or cell (`out_of_scope`: `</ul>` or
+  `</div>` in a cell is ignored, as in a browser). An `Elem` keeps where its
+  attributes are in the page, so looks can be computed again (`restyle`):
+  an inline element closed under an open block (`<b><p>x</b>y`) is taken
+  out alone and what is above it restyled, so it ends at once. Any other
+  truncation (not of a table or cell) reopens the HTML formatting elements
+  left open above it (`a b big code em font i nobr s small strike strong tt
+  u`), as a browser's active formatting elements: `<p><b>a</p><p>b` keeps
+  `b` bold, `<b><i>x</b>y` keeps `y` italic. None is reopened when three
+  alike (tag and attributes) are already open below, back to the nearest
+  table or cell (Noah's Ark), so an unclosed `<b>` per paragraph does not
+  pile up. Under a heading only a not-bold declared on it or inside it
   is the explicit off (an ancestor's `font:` shorthand is not), and
   negative top/bottom boxes write 0. Known limits: quirks mode's table-font reset
   (browsers do not inherit font size/weight/style into a `table` there; we
