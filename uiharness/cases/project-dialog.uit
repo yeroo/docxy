@@ -55,13 +55,13 @@ test the keyboard answers the message box and nothing under it sees a key
   open ../fixtures/gantt-summary.xml
   click A1
   key delete
-  # Typing, Tab, a chord and KeyTips all stop at the dialog: Alt O would
-  # switch to Gantt Chart Format, Alt P B would open Set Baseline's menu.
+  # Typing, Tab, a chord and KeyTips all stop at the dialog: Alt J F would
+  # switch to Gantt Chart Format, Alt R B would open Set Baseline's menu.
   type x
   key tab
   key ctrl+z
-  key alt o
-  key alt p b
+  key alt j f
+  key alt r b
   assert menu is nothing
   assert ribbon_tab is not Gantt Chart Format
   assert undo_depth is 0

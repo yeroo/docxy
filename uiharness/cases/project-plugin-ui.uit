@@ -79,7 +79,7 @@ test a contributed group's dialog launcher runs its command by click and by KeyT
   shot window
   call real-key {"key":"alt"}
   assert keytips_up is true
-  call real-key {"key":"t"}
+  call real-key {"key":"h"}
   call real-key {"key":"z"}
   assert keytips_up is true
   call real-key {"key":"n"}
@@ -695,7 +695,7 @@ test the chart menu opens beside the bars with Project's unbuilt items greyed
 test Task Information gains the plugin's page, prefilled, with a multiline and a grid
   open copy:../fixtures/project-clipboard.xml
   click C2
-  key alt t c
+  key alt h c
   assert dialog is task-information
   # The spec's header control draws above every page (#1609).
   call dialog-read {}

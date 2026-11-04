@@ -2,30 +2,30 @@ test gantt chart format bar styles toggle critical and baseline drawing
   open ../fixtures/gantt-critical.xml
   assert bar_2 is critical 1-2
   assert baseline_2 is none
-  key alt o
+  key alt j f
   assert ribbon_tab is Gantt Chart Format
   key c
   assert bar_2 is on-track 1-2
   assert border bar:2 solid teal
   shot gantt
-  key alt o c
+  key alt j f c
   assert bar_2 is critical 1-2
   assert border bar:2 solid amber
   assert dirty is false
   assert undo_depth is 0
-  key alt p b b
+  key alt r b b
   assert baseline_2 is 1-2
   assert status is Baseline set — baseline bars now show under the current bars
   assert undo_depth is 1
-  key alt o b
+  key alt j f b
   assert baseline_2 is none
   assert bar_2 is critical 1-2
   assert undo_depth is 1
-  key alt p b b
+  key alt r b b
   assert status is Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)
   assert baseline_2 is none
   assert undo_depth is 2
-  key alt o b
+  key alt j f b
   assert baseline_2 is 1-2
   assert undo_depth is 2
   call ribbon-click {"tab":"Gantt Chart Format","command":"Critical Tasks"}
@@ -33,3 +33,28 @@ test gantt chart format bar styles toggle critical and baseline drawing
   assert ribbon_tab is Gantt Chart Format
   assert undo_depth is 2
   shot window
+
+test gantt chart format's two-letter KeyTip waits for its second letter (#1569)
+  open ../fixtures/gantt-critical.xml
+  # The selected tab outlives the test before, which ends on Gantt Chart Format.
+  key alt h escape escape
+  assert ribbon_tab is Task
+  key alt j
+  assert keytips_up is true
+  assert ribbon_tab is Task
+  key escape
+  assert keytips_up is true
+  assert ribbon_tab is Task
+  key j f
+  assert ribbon_tab is Gantt Chart Format
+  assert keytips_up is true
+  key escape escape
+  assert keytips_up is false
+  key alt h escape escape
+  assert ribbon_tab is Task
+  key alt j x
+  assert keytips_up is false
+  assert ribbon_tab is Task
+  key alt o
+  assert keytips_up is false
+  assert ribbon_tab is Task

@@ -1632,7 +1632,7 @@ dialogs! {
         surface: Surface::Project,
         file: "project",
         fixture: PROJECT_DOC,
-        open: &["click C1", "key alt t c"],
+        open: &["click C1", "key alt h c"],
         fields: &[
             Field::text("name").applied(&["assert selected_name is Ab1"]).kept("Ab1"),
             Field::duration("duration", "3d", "x").kept("3d"),

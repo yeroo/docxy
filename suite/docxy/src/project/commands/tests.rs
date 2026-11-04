@@ -278,7 +278,7 @@ fn ribbon_context_survives_valid_switches_only() {
             .iter()
             .map(|x| x.2)
             .collect::<Vec<_>>(),
-        ["F", "T", "U", "R", "P", "W", "Y"]
+        ["F", "H", "U", "S", "R", "W", "Y"]
     );
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false, false) == RibbonTab::View);
     assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false, false) == RibbonTab::Home);
@@ -623,10 +623,10 @@ fn project_instruction_paths_exist() {
     assert_eq!(
         menus,
         [
-            ("Dashboards", "D", "Alt, R, D"),
-            ("Resources", "R", "Alt, R, R"),
-            ("Costs", "C", "Alt, R, C"),
-            ("In Progress", "I", "Alt, R, I"),
+            ("Dashboards", "D", "Alt, S, D"),
+            ("Resources", "R", "Alt, S, R"),
+            ("Costs", "C", "Alt, S, C"),
+            ("In Progress", "I", "Alt, S, I"),
         ]
     );
 }
@@ -2747,7 +2747,7 @@ fn ribbon_insert_shortcut_is_on_blank_row_not_task() {
             .shortcut
     };
     assert_eq!(shortcut("pr-blank-row"), "Insert");
-    assert_eq!(shortcut("pr-add"), "Alt, T, N");
+    assert_eq!(shortcut("pr-add"), "Alt, H, N");
 }
 
 fn ctrl_shift() -> Modifiers {
@@ -2883,11 +2883,11 @@ fn ribbon_link_hints_name_the_chords_the_keys_run() {
             .unwrap()
     };
     for (id, act, hint, m) in [
-        ("pr-link", AddLink, "Alt, T, P  (Ctrl+F2)", ctrl()),
+        ("pr-link", AddLink, "Alt, H, P  (Ctrl+F2)", ctrl()),
         (
             "pr-unlink",
             UnlinkTasks,
-            "Alt, T, U  (Ctrl+Shift+F2)",
+            "Alt, H, U  (Ctrl+Shift+F2)",
             ctrl_shift(),
         ),
     ] {
@@ -4030,7 +4030,7 @@ fn delete_after_an_id_click_on_a_summary_asks() {
 
 /// #397: Set Baseline is a split button: the primary sets the baseline, its
 /// menu offers Set Baseline... and Clear Baseline.... From the keyboard,
-/// Alt, P, B opens the menu, and its letters B and L pick the item (#1212).
+/// Alt, R, B opens the menu, and its letters B and L pick the item (#1212).
 #[test]
 fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
     let r = project_ribbon();
@@ -4070,8 +4070,8 @@ fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
     assert!(tab_keytip_cmd(project, "L").is_none());
     assert!(!tab_keytip_starts(project, "L"));
     let shortcuts: Vec<_> = menu.iter().map(|c| c.tip.shortcut).collect();
-    assert_eq!(shortcuts, ["Alt, P, B, B", "Alt, P, B, L"]);
-    assert_eq!(primary.tip.shortcut, "Alt, P, B");
+    assert_eq!(shortcuts, ["Alt, R, B, B", "Alt, R, B, L"]);
+    assert_eq!(primary.tip.shortcut, "Alt, R, B");
 }
 
 // ---- Range Link / Unlink (#558, over a #560 selection) ----------------------

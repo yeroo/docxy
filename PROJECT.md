@@ -677,7 +677,7 @@ milestone, indent/outdent, clear resources, the task prompts) do nothing on the
 entry row; Insert inserts a blank row just above it, and Find searches from the
 first task.
 
-Task › Insert › Blank Row (keytip Alt, T, B) and the Insert key insert an empty
+Task › Insert › Blank Row (keytip Alt, H, B) and the Insert key insert an empty
 row above the selected row, or just above the entry row, as one undo step, and
 select it, keeping the column, as Project's Insert Task › Blank Row does. The
 row is outside the outline and the schedule until something is typed into it;
@@ -704,7 +704,7 @@ task's Start and Finish are pinned dates that cannot be blank, so they report
 `<column> can't be cleared`, as does ID; an auto summary's is refused as its
 Duration is. Ctrl+Delete never deletes the task, and it leaves a blank row and
 the entry row alone. A task added with Task › Insert
-› Task (keytip Alt, T, N; here, in yppxy and through projctl's `task.add`) is 1
+› Task (the suite's keytip Alt, H, N; here, in yppxy and through projctl's `task.add`) is 1
 day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it
 splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
@@ -729,7 +729,7 @@ Insert Blank Row; View › Timeline is Timeline View. The harness's
 `ribbon-click` finds a command by either name. Project › Schedule › Set
 Baseline is a split button (#397): its upper half sets the baseline at once,
 and its lower half opens Set Baseline... and Clear Baseline.... From the
-keyboard Alt, P, B opens that menu, and B or L picks the item (#1212). Project
+keyboard Alt, R, B opens that menu, and B or L picks the item (#1212). Project
 2024 draws a menu button there, with no one-press half; the mouse keeps the
 one press.
 
@@ -770,8 +770,8 @@ The Report tab's View Reports group has Project's four menus (#1123), each
 listing only the reports projcore backs with the plan's own data: Dashboards ›
 Project Overview; Resources › Resource Overview and Overallocated Resources;
 Costs › Task Cost Overview and Resource Cost Overview; In Progress › Critical
-Tasks, Late Tasks and Milestone Report. Alt, R opens the tab, D / R / C / I a
-menu, and the item's letter runs it (Alt, R, I, L is Late Tasks). Project
+Tasks, Late Tasks and Milestone Report. Alt, S opens the tab, D / R / C / I a
+menu, and the item's letter runs it (Alt, S, I, L is Late Tasks). Project
 draws a report on a canvas; docxy writes it as Markdown beside the plan, as
 `<stem>-<slug>.md` (`plan-late-tasks.md`) by Export's rules: an unsaved plan
 asks for a name (a harness instance refuses), the plan itself is never the
@@ -818,7 +818,7 @@ removed`, or no status when there was none) and a set reports
 `Hyperlink SubAddress` read them for every `FieldReader` consumer; the Entry
 table has no Hyperlink column or indicator yet (follow-ups).
 
-Task › Properties › Notes... (keytip Alt, T, T; "N" is Insert › Task) and a
+Task › Properties › Notes... (keytip Alt, H, T; "N" is Insert › Task) and a
 task row's menu › Notes... open one prompt on the selected task's notes:
 prefilled from the stored notes with `\n` standing for a newline, committed
 with Enter (`Notes set`, or `Notes removed` on an empty buffer, no status
@@ -837,7 +837,7 @@ cells selected: line i goes to the i-th shown row below, field j to the j-th
 column right, ID fields are ignored, and lines past the last task append
 tasks; no row is inserted. The whole paste is one undo step, and a field that
 cannot apply cancels it, naming the cell. The Task tab's Clipboard group
-(Paste, Cut, Copy; key tips Alt, T, W / X / Y) runs the same three acts, and
+(Paste, Cut, Copy; key tips Alt, H, W / X / Y) runs the same three acts, and
 while a cell editor is open they act on the buffer instead of the table:
 Ctrl+C and Ctrl+X take the whole buffer (cut leaves it empty), Ctrl+V inserts
 at the caret with a CRLF pair counting as one break, trailing line breaks

@@ -11,13 +11,13 @@ test project invalid prompts preserve the schedule
   assert bar_2 is on-track 0-0
   key escape
   assert cell_edit is none
-  key alt t p
+  key alt h p
   type 999
   key enter
   assert status is No other task with ID 999
   assert dirty is false
   assert bar_2 is on-track 0-0
-  key alt t c
+  key alt h c
   assert dialog is task-information
   call dialog-tab {"tab":"Advanced"}
   call dialog-set {"control":"ctype","value":"Must Start On"}
@@ -30,7 +30,7 @@ test project invalid prompts preserve the schedule
   key ctrl+alt+z alt+down ctrl+n
   assert selected_task is 1
   assert tasks is 3
-  key alt t c
+  key alt h c
   call dialog-tab {"tab":"Advanced"}
   call dialog-set {"control":"ctype","value":"Must Start On"}
   key ctrl+alt+z alt+down ctrl+n f10
