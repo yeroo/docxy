@@ -532,12 +532,14 @@
   derives its link spans from its words (`link_at`, `resolve_para`).
 - Read-only: no caret is drawn (`caret_path` empty), nothing edits.
   Press, drag and Shift+press select (`place_click_caret`); Ctrl+A selects
-  all; Ctrl+C writes the text and RTF as a document copy does
-  (`copy_payload`, then the `rtf_follows` gate), to the run's private
-  clipboard in a harness instance (`doc_view::set_harness`, set in `run()`).
+  all; Ctrl+C writes the text and RTF through the document tabs' own path
+  (`clip_payload`, `ClipboardStore::write_rich` with its `rtf_follows`
+  gate), to the run's private clipboard in a harness instance
+  (`doc_view::set_harness`, set in `run()`).
   Arrows, Page Up/Down and (Ctrl+)Home/End scroll; Ctrl+=, Ctrl+-, Ctrl+0
   and Ctrl+wheel zoom by a tenth within 50%..300% (`step_zoom`, rounded to a
-  tenth; `wheel_step`: a whole line steps, pixels sum to 40). gpui's scroll
+  tenth; the Project chart's `project::wheel_px` / `wheel_step`: a whole
+  line steps, a fractional line counts as its pixels, pixels sum to 40). gpui's scroll
   area has already moved by a Ctrl+wheel, so the offset of the last render
   is put back (as the Project chart does). Table selection zones do
   nothing. Every other key bubbles to the suite; Tab and Shift+Tab (global
@@ -545,10 +547,12 @@
 - Hyperlinks: a secondary press (Ctrl, ⌘ on macOS) on a link calls
   `on_link` with the URL (or `#bookmark`) and selects nothing, in either
   mode; in `LinkClick::Click` mode a plain press released without a drag
-  does too. The callback runs deferred (`window.defer`), outside the view's
+  does too. Only a press on a painted word or unit is on a link
+  (`DocTarget::begin_select`'s `on_piece`): a press beside a row lands on
+  the row's nearest stop, never a link. The callback runs deferred (`window.defer`), outside the view's
   update. The view never opens a link.
 - Colours: the chrome (scroll bar, selection) is the theme's; the document
-  is a white page in Print Layout's ink (`content_look`) unless
+  is a white page in Print Layout's palette (`content_look`, `page_pal`) unless
   `set_content_dark(true)` on a dark theme, which draws the theme's own.
 - Pictures: the view's `pictures::Cache` is registered with
   `pictures::register_extra` and never reads `Docxy`: `set_document` and
