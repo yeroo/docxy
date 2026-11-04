@@ -41370,6 +41370,7 @@ impl Render for Docxy {
             }
         }
 
+        let help_active = self.active_is_help();
         let zoom_btn =
             |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
                 div()
@@ -41489,26 +41490,29 @@ impl Render for Docxy {
             } else {
                 doc_status_hint(text_input::MACOS)
             })
-            // Zoom controls (Word's bottom-right zoom).
-            .child(zoom_btn(cx, "zoom-out", "\u{2212}", -0.1))
-            .child(
-                div()
-                    .id("zoom-pct")
-                    .min_w(px(34.))
-                    .flex()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|d| d.text_color(fg))
-                    .child(SharedString::from(format!(
-                        "{}%",
-                        (self.zoom * 100.0).round() as i32
-                    )))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.zoom = 1.0;
-                        this.refocus(window, cx);
-                    })),
-            )
-            .child(zoom_btn(cx, "zoom-in", "+", 0.1));
+            // Zoom controls (Word's bottom-right zoom). Not on a Help tab
+            // (#1855): they zoom the documents, which it does not show.
+            .when(!help_active, |d| {
+                d.child(zoom_btn(cx, "zoom-out", "\u{2212}", -0.1))
+                .child(
+                    div()
+                        .id("zoom-pct")
+                        .min_w(px(34.))
+                        .flex()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(fg))
+                        .child(SharedString::from(format!(
+                            "{}%",
+                            (self.zoom * 100.0).round() as i32
+                        )))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.zoom = 1.0;
+                            this.refocus(window, cx);
+                        })),
+                )
+                .child(zoom_btn(cx, "zoom-in", "+", 0.1))
+            });
 
         // The body is the document, flanked by the navigation and comments panes.
         let nav_panel = (is_doc && self.show_nav).then(|| self.nav_panel(pal, cx));

@@ -11,6 +11,7 @@ manual word ../../helpdocs/tests/fixture/word
 test F1 on Home opens the Home page in a Help tab, and F1 there its root
   open copy:../fixtures/basic.docx
   call ribbon-layout {"tab":"Home"}
+  assert view.zoom is 1
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.open is true
@@ -36,8 +37,15 @@ test F1 on Home opens the Home page in a Help tab, and F1 there its root
   call tab-list {}
   assert reply.active is 2
   assert reply.count is 3
+  # The document zoom keys do not reach the documents from a Help tab (its
+  # status bar draws no zoom controls either).
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+-"}
+  call real-key {"key":"ctrl+-"}
+  shot window
   # From the document again, F1 reuses that tab: a history step.
   call real-key {"key":"ctrl+shift+tab"}
+  assert view.zoom is 1
   call ribbon-layout {"tab":"Insert"}
   call real-key {"key":"f1"}
   call help-read {}
