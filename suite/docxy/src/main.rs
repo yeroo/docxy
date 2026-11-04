@@ -58,6 +58,7 @@ mod field_edit;
 mod file_keys;
 mod font_box;
 mod harness;
+mod help_manual;
 mod help_tab;
 mod hf;
 mod hf_insert;

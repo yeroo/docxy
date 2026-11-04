@@ -69,6 +69,15 @@
 //! into the sandbox's `docxy/plugins/` before it launches the suite, which
 //! loads the format plugins there at start ([`crate::launch::install_plugins`]).
 //!
+//! ## Help manuals
+//!
+//! A suite script may start with `manual <editor> <dir>` lines (before its
+//! first case; `editor` is `word`, `excel` or `project`, `dir` a manual
+//! bundle relative to the script, e.g. `../../helpdocs/tests/fixture/word`):
+//! the runner copies the bundle into the sandbox's `docxy/manual/<editor>/`
+//! before it launches the suite (#1855), the only place a harness instance
+//! reads a manual from ([`crate::launch::install_manuals`]).
+//!
 //! ## Start screen
 //!
 //! A suite script may start with a `start screen` line (before its first
@@ -111,8 +120,23 @@ pub struct Script {
     pub plugins: Vec<String>,
     /// A `start screen` line: the suite starts with no tab (#806).
     pub start_screen: bool,
+    /// `manual <editor> <dir>` lines: the help manuals the suite starts with
+    /// (#1855), `dir` relative to the script ([`crate::launch::install_manuals`]).
+    pub manuals: Vec<Manual>,
     pub cases: Vec<Case>,
 }
+
+/// A `manual <editor> <dir>` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Manual {
+    /// `word`, `excel` or `project`.
+    pub editor: String,
+    /// The bundle's directory, relative to the script.
+    pub dir: String,
+}
+
+/// The editors a help manual is published for (#1022).
+pub const MANUAL_EDITORS: [&str; 3] = ["word", "excel", "project"];
 
 /// One test case: a name and the steps under it.
 #[derive(Debug, Clone, PartialEq)]
@@ -290,6 +314,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut terminal: Option<TerminalSpec> = None;
     let mut plugins: Vec<String> = Vec::new();
     let mut start_screen = false;
+    let mut manuals: Vec<Manual> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
@@ -337,6 +362,18 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
                 return Err(err(line, format!("the plugin '{name}' is named twice")));
             }
             plugins.push(name);
+            continue;
+        }
+
+        if head.eq_ignore_ascii_case("manual") {
+            if !cases.is_empty() {
+                return Err(err(line, "'manual' lines come before the first case"));
+            }
+            let m = parse_manual(&rest, line)?;
+            if manuals.iter().any(|o| o.editor == m.editor) {
+                return Err(err(line, format!("the {} manual is named twice", m.editor)));
+            }
+            manuals.push(m);
             continue;
         }
 
@@ -406,6 +443,12 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
             "'plugin' installs a format plugin for the suite; a terminal script has none",
         ));
     }
+    if terminal.is_some() && !manuals.is_empty() {
+        return Err(err(
+            0,
+            "'manual' installs a help manual for the suite; a terminal script has none",
+        ));
+    }
     if terminal.is_some() && start_screen {
         return Err(err(
             0,
@@ -429,7 +472,45 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         terminal,
         plugins,
         start_screen,
+        manuals,
         cases,
+    })
+}
+
+/// `manual <editor> <dir>`: one of [`MANUAL_EDITORS`] and a directory, which
+/// may be quoted when it holds spaces.
+fn parse_manual(rest: &str, line: usize) -> Result<Manual, ScriptError> {
+    const USAGE: &str = "'manual' needs an editor and a directory, e.g. 'manual word ../../helpdocs/tests/fixture/word'";
+    let (editor, dir) = split_word(rest.trim());
+    if editor.is_empty() {
+        return Err(err(line, USAGE));
+    }
+    let editor = editor.to_ascii_lowercase();
+    if !MANUAL_EDITORS.contains(&editor.as_str()) {
+        return Err(err(
+            line,
+            format!("'{editor}' has no manual: the editors are word, excel and project"),
+        ));
+    }
+    let dir = dir.trim();
+    let dir = match dir.strip_prefix('"') {
+        Some(q) => q
+            .strip_suffix('"')
+            .ok_or_else(|| err(line, "the manual's directory has no closing quote"))?,
+        None if dir.contains(char::is_whitespace) => {
+            return Err(err(
+                line,
+                "'manual' takes one directory; quote one that holds spaces",
+            ));
+        }
+        None => dir,
+    };
+    if dir.is_empty() {
+        return Err(err(line, USAGE));
+    }
+    Ok(Manual {
+        editor,
+        dir: dir.to_string(),
     })
 }
 
@@ -1801,6 +1882,45 @@ test t
             ));
             assert!(e.contains("needs the suite"), "{step}: {e}");
         }
+    }
+
+    #[test]
+    fn manual_lines_name_the_help_manuals_a_suite_script_starts_with() {
+        let s = parse_script(&format!(
+            "manual word ../../helpdocs/tests/fixture/word\nmanual Excel \"my manuals/excel\"\n{VALID}"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.manuals,
+            [
+                Manual {
+                    editor: "word".into(),
+                    dir: "../../helpdocs/tests/fixture/word".into()
+                },
+                Manual {
+                    editor: "excel".into(),
+                    dir: "my manuals/excel".into()
+                },
+            ]
+        );
+        assert!(parse_script(VALID).unwrap().manuals.is_empty());
+        let refused = |text: String| parse_script(&text).unwrap_err().to_string();
+        for (line, why) in [
+            ("manual", "needs an editor and a directory"),
+            ("manual word", "needs an editor and a directory"),
+            ("manual mail x", "has no manual"),
+            ("manual word a b", "quote one that holds spaces"),
+            ("manual word \"a b", "no closing quote"),
+        ] {
+            let e = refused(format!("{line}\n{VALID}"));
+            assert!(e.contains(why), "{line}: {e}");
+        }
+        let e = refused(format!("manual word a\nmanual word b\n{VALID}"));
+        assert!(e.contains("named twice"), "{e}");
+        let e = refused(format!("{VALID}\nmanual word a"));
+        assert!(e.contains("before the first case"), "{e}");
+        let e = refused("terminal docxy\nmanual word a\ntest t\n  key f1\n".into());
+        assert!(e.contains("a terminal script has none"), "{e}");
     }
 
     #[test]
