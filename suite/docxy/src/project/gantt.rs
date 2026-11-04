@@ -651,7 +651,8 @@ fn backdrop(
 pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
     let cal = view.ed.project().project_shading_calendar();
     // The plan's gridlines (#1575): each line's type, colour and interval;
-    // the defaults are the rules drawn before the model.
+    // the defaults are the rules drawn before the model, and Current Date
+    // solid Automatic as Project 2024 draws it (#1688).
     let grid = view.ed.project().formatting.gridlines.clone();
     let dates = date_lines(
         &view.ed,

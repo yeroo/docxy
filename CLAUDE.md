@@ -1525,8 +1525,14 @@
   row and column lines an interval with its own type and colour) and
   `Gridlines` (only lines set away from `Line::default_style` are stored:
   solid Automatic for Gantt Rows, Bottom Tier Column, Sheet Rows, Sheet
-  Columns, Title Vertical and Title Horizontal, none for the rest, which is
-  what the hosts drew before). `Formatting::gridlines` replaces the old
+  Columns, Title Vertical and Title Horizontal, what the hosts drew before,
+  and Current Date, solid as Project 2024 draws it (#1688; its green is not
+  measured, so Automatic; the hosts draw it only where the plan's
+  `CurrentDate` option is set, and a new docxy plan sets none); none for the
+  rest, so a Current Date set to none is stored). The default moved without
+  a format marker: a solid Automatic Current Date an older build stored is
+  now the default and is dropped on the next save, and a plugin's `null` on
+  Current Date now means solid; it sends `{"type":"none"}` to turn it off). `Formatting::gridlines` replaces the old
   opaque string; `formatting.xml` carries `<gridline>` children (an older
   root `gridlines` attribute is ignored). A plugin command's `view.gridlines`
   is an object of line name to `{type, color, interval, interval_type,

@@ -787,6 +787,30 @@ fn a_status_date_line_needs_a_status_date() {
 }
 
 #[test]
+fn a_plan_with_a_current_date_draws_its_line_by_default() {
+    use projcore::formatting::gridlines::{Gridline, Gridlines, Line};
+    // Project 2024 draws a Current Date line by default (#1688).
+    let mut p = untitled_project();
+    let start = p.start_date.unwrap();
+    p.tasks = vec![task(1, 1, 1)];
+    let day = projcore::DateTime::from_minutes(start.minutes() + 2 * 1440).to_mspdi();
+    p.set_option("CurrentDate", Some(&day));
+    let mut v = ProjectView::new(p, false);
+    v.layout(2000.);
+    let scale = v.chart_scale();
+    let lines = |grid: &Gridlines| -> Vec<Line> {
+        date_lines(&v.ed, grid, scale, 0., scale.width())
+            .into_iter()
+            .map(|(line, _, _)| line)
+            .collect()
+    };
+    let mut grid = Gridlines::default();
+    assert_eq!(lines(&grid), vec![Line::CurrentDate]);
+    grid.set(Line::CurrentDate, Gridline::default());
+    assert!(lines(&grid).is_empty());
+}
+
+#[test]
 fn filler_rows_count_the_ruled_space_below_the_last_task() {
     assert_eq!(filler_rows_of(280., 0., 0, ROW_H), 10);
     assert_eq!(filler_rows_of(280., 0., 3, ROW_H), 7);
