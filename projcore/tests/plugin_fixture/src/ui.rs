@@ -14,6 +14,10 @@
 //!   On the Gantt Chart Format tab a second group "Fixture Percent" after
 //!   "Fixture Format" declares `priority` 120 and holds five small labelled
 //!   buttons (`fixture.pct0` to `fixture.pct100`, #1685).
+//! - On the Report tab a group "Fixture Wide" holds `fixture.wide`, nine
+//!   colour swatches: in place a window of six and a More button (#1823). Its
+//!   swatches are not commands; the state checks the eighth
+//!   (`fixture.wide.7`), so the window shows tiles 2 to 7.
 //! - Menus: a row-menu item `fixture.rename` after "Notes...", and
 //!   `fixture.mark` after it (#1667).
 //! - Dialogs: a Task Information page "Fixture" with a multiline, a grid and
@@ -105,6 +109,17 @@ const MANIFEST: &str = r##"{
     {"id":"fixture.pct50","kind":"button","label":"50%"},
     {"id":"fixture.pct75","kind":"button","label":"75%"},
     {"id":"fixture.pct100","kind":"button","label":"100% Complete"}]}]},
+    {"tab":"Report","groups":[{"title":"Fixture Wide","priority":1,"controls":[
+    {"id":"fixture.wide","kind":"gallery","label":"Wide","tip":"Nine colour swatches: in place a window of six and a More button (#1823)","swatches":[
+      {"id":"fixture.wide.0","label":"Wide 0","color":"#3366CC"},
+      {"id":"fixture.wide.1","label":"Wide 1","color":"#CC3333"},
+      {"id":"fixture.wide.2","label":"Wide 2","color":"#44AA66"},
+      {"id":"fixture.wide.3","label":"Wide 3","color":"#AA8833"},
+      {"id":"fixture.wide.4","label":"Wide 4","color":"#7744AA"},
+      {"id":"fixture.wide.5","label":"Wide 5","color":"#33AAAA"},
+      {"id":"fixture.wide.6","label":"Wide 6","color":"#AA3388"},
+      {"id":"fixture.wide.7","label":"Wide 7","color":"#555555"},
+      {"id":"fixture.wide.8","label":"Wide 8","color":"#88AA22"}]}]}]},
     {"tab":"View","groups":[{"title":"Fixture Styles","priority":0,"controls":[
     {"id":"fixture.styles","kind":"gallery","label":"Styles","keytip":"XG","tip":"Two sections of palette tiles (#1761)","swatches":[
       {"id":"fixture.styles.0","label":"Blue one","section":"Scheduling Styles","preview":"fixture.blue","color":"#3366CC"},
@@ -327,7 +342,7 @@ pub unsafe extern "C" fn yppx_ui_state(input: *const u8, len: usize, out: *mut Y
     };
     let selected = first_uid(&req).is_some();
     let mut reply = format!(
-        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{},"fixture.styles":"fixture.styles.1"}}"#,
+        r#"{{"controls":{{"fixture.flag":{{"enabled":true,"checked":{}}},"fixture.plain":{{"enabled":true,"checked":{}}},"fixture.flat":{{"enabled":true,"checked":{}}},"fixture.bold":{{"enabled":{selected},"checked":{}}},"fixture.rename":{{"enabled":{selected}}},"fixture.mark":{{"enabled":{selected}}}}},"gallery":{{"fixture.palette":{},"fixture.styles":"fixture.styles.1","fixture.wide":"fixture.wide.7"}}"#,
         flag(&req),
         switch_on(&req, "fixture.plain"),
         switch_on(&req, "fixture.flat"),

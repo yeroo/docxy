@@ -5694,7 +5694,15 @@ struct Docxy {
     last_window_title: Option<String>,
     /// The accent this window's last render set (#1473), for the harness.
     drawn_accent: u32,
+    /// What the last render drew of each swatch gallery in place (#1823), for
+    /// the harness's `ribbon-read`.
+    drawn_galleries: std::cell::RefCell<DrawnGalleries>,
 }
+
+/// Per gallery id, the tiles a swatch gallery drew in place and whether a
+/// More button followed them (#1823).
+pub(crate) type DrawnGalleries =
+    std::collections::HashMap<&'static str, (std::ops::Range<usize>, bool)>;
 
 /// Where the regions a harness test can name actually landed, as gpui measured
 /// them: window-relative, logical pixels.
@@ -15076,6 +15084,7 @@ impl Docxy {
             frame: 0,
             last_window_title: None,
             drawn_accent: BRAND,
+            drawn_galleries: Default::default(),
         }
     }
 
@@ -17693,6 +17702,8 @@ impl Docxy {
                 lookup(&self.probes.borrow(), &format!("ribbon-launch:{title}"))
                     .ok_or_else(|| format!("the ribbon group {title}'s launcher is not drawn"))
             }
+            Region::GalleryMore(id) => lookup(&self.probes.borrow(), &format!("gallery-more-{id}"))
+                .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -38187,8 +38198,12 @@ impl Docxy {
     /// A UI plugin's gallery (#1532): a tile per swatch, filled with the
     /// swatch's colour (its preview, `#RRGGBB`) over its label, or, when the
     /// preview names a palette, that palette's miniature chart with the label
-    /// as its tooltip (#1761). Swatches of one section sit under a header
-    /// row; the checked tile is framed in the accent.
+    /// as its tooltip (#1761). In a flyout every tile shows, swatches of one
+    /// section under a header row. In place (#1823) it is one strip of at most
+    /// `IN_PLACE_TILES` tiles (`in_place_window`: the first ones, or those
+    /// ending on the checked swatch) and, when it has more, a More button that
+    /// opens or shuts the whole gallery's flyout. The checked tile is framed in
+    /// the accent.
     fn swatch_gallery(
         &self,
         gal: &rs::Gallery<Act>,
@@ -38200,7 +38215,17 @@ impl Docxy {
         let geom = ribbon_fit::gallery_geom(gal);
         let (per_row, _) =
             ribbon_fit::gallery_row(geom, plugin_ui::gallery_span(gal, max_w), max_w);
-        let layout = plugin_ui::gallery_rows(gal, max_w, per_row);
+        // In place a long gallery shows a window of its tiles, the checked one
+        // in it, and a More button for the rest (#1823).
+        let more = plugin_ui::more_w(gal, max_w, g.gap);
+        let layout = plugin_ui::gallery_rows(gal, max_w, per_row, self.gallery_checked_index(gal));
+        if max_w.is_none()
+            && let Some(plugin_ui::Row::Tiles(a, b)) = layout.first()
+        {
+            self.drawn_galleries
+                .borrow_mut()
+                .insert(gal.id, (*a..*b, more > 0.0));
+        }
         let tile = |it: &rs::GalleryItem<Act>, cx: &mut Context<Self>| -> AnyElement {
             let act = it.act;
             let selected = self.gallery_item_selected(act);
@@ -38302,7 +38327,7 @@ impl Docxy {
         let keytip =
             (self.keytips == KeyTip::Commands && max_w.is_none() && !gal.key_tip.is_empty())
                 .then_some(gal.key_tip);
-        div()
+        let tiles = div()
             .id(gal.id)
             .relative()
             .flex()
@@ -38315,7 +38340,52 @@ impl Docxy {
             })
             .children(rows)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+            .into_any_element();
+        if more == 0.0 {
+            return tiles;
+        }
+        let id = gal.id;
+        let more_btn = div()
+            .id(SharedString::from(format!("gallery-more-{id}")))
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(plugin_ui::MORE_W))
+            .h(px(g.h))
+            .rounded(px(g.radius))
+            .border(px(g.border))
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .text_size(px(g.name_size))
+            .text_color(pal.fg)
+            .cursor_pointer()
+            .hover(move |d| d.bg(pal.hover))
+            .child("▾")
+            .child(probe(&self.probes, format!("gallery-more-{id}")))
+            .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
+            // A press opens the gallery's flyout or shuts it, as a collapsed
+            // group's button does (the backdrop may close it first).
+            .on_mouse_down(
+                MouseButton::Left,
+                flyout_toggle(FlyoutTarget::Gallery(id), cx),
+            );
+        h_flex()
+            .flex_none()
+            .items_start()
+            .gap(px(g.gap))
+            .child(tiles)
+            .child(more_btn)
             .into_any_element()
+    }
+
+    /// The index of `gal`'s checked tile, when one is (#1823: the in-place
+    /// window keeps it shown).
+    fn gallery_checked_index(&self, gal: &rs::Gallery<Act>) -> Option<usize> {
+        gal.items
+            .iter()
+            .position(|it| self.gallery_item_selected(it.act))
     }
 
     /// The Styles gallery: a well of fixed-size tiles, each a live "AaBbCc" in
@@ -39947,6 +40017,7 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
         accent::set(self.drawn_accent);
+        self.drawn_galleries.borrow_mut().clear();
         // Pictures a package change replaced leave gpui's asset cache (#1639).
         self.release_pictures(None, window, cx);
         land_status(

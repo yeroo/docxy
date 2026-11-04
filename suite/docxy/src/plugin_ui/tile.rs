@@ -171,3 +171,30 @@ pub(crate) fn layout_height(rows: &[Row], tile_h: f32, gap: f32) -> f32 {
         .sum();
     sum + gap * (rows.len() as f32 - 1.).max(0.)
 }
+
+/// The most tiles a swatch gallery shows in place, in the ribbon (#1823): a
+/// longer one shows a window of this many and a More button that opens the
+/// whole gallery as a flyout. Project's in-ribbon galleries show a handful;
+/// the count is an estimate, no capture is in this repository.
+pub(crate) const IN_PLACE_TILES: usize = 6;
+
+/// The More button's width beside a bounded in-place gallery (#1823), drawn
+/// one tile high, a gap after the last tile.
+pub(crate) const MORE_W: f32 = 16.0;
+
+/// The tiles of an `n`-tile gallery shown in place (#1823): every tile up to
+/// [`IN_PLACE_TILES`], else that many, starting at 0 unless the checked tile
+/// would fall past them, when the window ends on it.
+pub(crate) fn in_place_window(n: usize, checked: Option<usize>) -> std::ops::Range<usize> {
+    let k = n.min(IN_PLACE_TILES);
+    let start = match checked {
+        Some(c) if c < n && c >= k => c + 1 - k,
+        _ => 0,
+    };
+    start..start + k
+}
+
+/// Whether an `n`-tile gallery drawn in place carries a More button.
+pub(crate) fn in_place_more(n: usize) -> bool {
+    n > IN_PLACE_TILES
+}

@@ -91,7 +91,8 @@ pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
 
 mod tile;
 pub(crate) use tile::{
-    HEADER_H, MarkShape, Row, gallery_layout, layout_height, palette_tile_marks, tile_body,
+    HEADER_H, IN_PLACE_TILES, MORE_W, MarkShape, Row, gallery_layout, in_place_more,
+    in_place_window, layout_height, palette_tile_marks, tile_body,
 };
 
 // ---- the ribbon --------------------------------------------------------------
@@ -138,31 +139,46 @@ pub(crate) fn tile_palette(preview: &str) -> Option<Palette> {
 }
 
 /// How many tiles one row of the swatch gallery `gal` must have room for.
-/// Drawn in place (`max_w` None) a group is a single strip: one row of every
-/// tile, no section headers, as before sections existed. In a flyout (`max_w`
-/// given) the sections show, so a row needs the longest run of equal
-/// sections. `ribbon_fit` and `Docxy::swatch_gallery` both ask it, so the
-/// estimate is the width drawn (#1761).
+/// Drawn in place (`max_w` None) a group is a single strip with no section
+/// headers: at most [`IN_PLACE_TILES`] tiles (#1823), the rest behind the More
+/// button ([`more_w`]). In a flyout (`max_w` given) every tile shows, with the
+/// sections, so a row needs the longest run of equal sections. `ribbon_fit`
+/// and `Docxy::swatch_gallery` both ask it, so the estimate is the width
+/// drawn (#1761).
 pub(crate) fn gallery_span<A>(gal: &rs::Gallery<A>, max_w: Option<f32>) -> usize {
     if max_w.is_none() {
-        return gal.items.len();
+        return gal.items.len().min(IN_PLACE_TILES);
     }
     let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
     tile::span_of(&sections)
 }
 
-/// The rows `gal` is laid out in at `per_row` tiles a row: sections with their
-/// headers in a flyout, one plain wrap in place (`max_w` None).
+/// The width the More button adds beside the swatch gallery `gal` drawn in
+/// place (#1823): its gap and [`MORE_W`] when the gallery has more tiles than
+/// it shows, else nothing; nothing in a flyout, which shows every tile.
+pub(crate) fn more_w<A>(gal: &rs::Gallery<A>, max_w: Option<f32>, gap: f32) -> f32 {
+    if max_w.is_none() && in_place_more(gal.items.len()) {
+        gap + MORE_W
+    } else {
+        0.0
+    }
+}
+
+/// The rows `gal` is laid out in: in a flyout (`max_w` given) every tile at
+/// `per_row` a row, sections under their headers; in place (`max_w` None) one
+/// strip of the [`in_place_window`] tiles, the `checked` one among them, no
+/// headers (#1823).
 pub(crate) fn gallery_rows<A>(
     gal: &rs::Gallery<A>,
     max_w: Option<f32>,
     per_row: usize,
+    checked: Option<usize>,
 ) -> Vec<Row> {
-    let sections: Vec<&str> = gal
-        .items
-        .iter()
-        .map(|it| if max_w.is_some() { it.section } else { "" })
-        .collect();
+    if max_w.is_none() {
+        let w = in_place_window(gal.items.len(), checked);
+        return vec![Row::Tiles(w.start, w.end)];
+    }
+    let sections: Vec<&str> = gal.items.iter().map(|it| it.section).collect();
     gallery_layout(&sections, per_row)
 }
 
