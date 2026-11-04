@@ -2301,7 +2301,8 @@
   say `HELP_NO_SAVE`), is left out of `session.json` (`session_active`
   remaps the active index) and moves with New Window/tear-off like any tab.
   The ribbon strip shows File only (Backstage's Theme row stays reachable);
-  there are no KeyTips. `tab-list` kind `help`, title label `help`, title
+  there are no KeyTips. `valid_ribbon_tab` keeps `ribbon_tab` as it is for
+  `Kind::Help`, so the tab behind (Layout, Resource, ...) is there on return. `tab-list` kind `help`, title label `help`, title
   `Help: <page title>`.
 - `help_view::lay` lays a page out as one row per top-level block (so an
   anchor's row index is its block's): list markers, padded tables, images
@@ -2318,7 +2319,7 @@
   (`field_edit`, Ctrl+A/C/X/V, Enter opens the first hit, Escape clears, then
   gives the keys back); the arrows, Page Up/Down, Space, Home and End scroll.
   Tab and Shift+Tab are actions (`tab_key`/`shift_tab_key`), so they take the
-  keys from the box there (`help_tab_press`), before the find bar's branch: a
+  keys from the box there (`help_search_release`), before the find bar's branch: a
   document's Find bar left open behind the Help tab never moves. The box is
   not in `entry_owns_keys`, so F1 still acts there.
 - F1 (`help_tab::help_f1`): the area page of `ribbon_tab_name(ribbon_tab)`, or

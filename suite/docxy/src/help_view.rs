@@ -70,8 +70,6 @@ pub(crate) struct HelpView {
     /// Taken by the next frame, which scrolls the body there (gpui places
     /// an item once that frame has laid the page out).
     pub scroll_to: std::cell::Cell<Option<ScrollTo>>,
-    /// Bumped on every change a reader can see (page, query, history).
-    pub revision: u64,
 }
 
 impl HelpView {
@@ -90,7 +88,6 @@ impl HelpView {
             hits: Vec::new(),
             scroll: ScrollHandle::new(),
             scroll_to: std::cell::Cell::new(None),
-            revision: 0,
         };
         let at = v.known(at);
         v.show(at);
@@ -148,7 +145,6 @@ impl HelpView {
                 .and_then(|a| self.anchor_block(a))
                 .map_or(ScrollTo::Top, ScrollTo::Block),
         ));
-        self.revision += 1;
     }
 
     /// Open `at` (the root when the manual has no such page) as a history
@@ -232,7 +228,6 @@ impl HelpView {
         } else {
             helpdocs::search(&self.bundle.manual, &self.query)
         };
-        self.revision += 1;
     }
 
     /// Edit the search box and search again.

@@ -277,9 +277,9 @@ impl Docxy {
         });
     }
 
-    /// Tab or Shift+Tab on a Help tab (they are actions, never keys
-    /// `on_key` sees): the search box gives the keys back to the page.
-    pub(crate) fn help_tab_press(&mut self, cx: &mut Context<Self>) {
+    /// The search box gives the keys back to the page: Tab or Shift+Tab on
+    /// a Help tab (actions, never keys `on_key` sees), or a press on the page.
+    pub(crate) fn help_search_release(&mut self, cx: &mut Context<Self>) {
         if self.active_help().is_some_and(|v| v.search_focused) {
             self.with_help(cx, |v| v.search_focused = false);
         }
@@ -292,13 +292,6 @@ impl Docxy {
             v.sel = false;
             v.caret = v.query.chars().count();
         });
-    }
-
-    /// A press on the page body: the search box gives the keys back.
-    pub(crate) fn help_body_press(&mut self, cx: &mut Context<Self>) {
-        if self.active_help().is_some_and(|v| v.search_focused) {
-            self.with_help(cx, |v| v.search_focused = false);
-        }
     }
 
     /// A contents entry pressed.

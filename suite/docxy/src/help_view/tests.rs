@@ -78,18 +78,41 @@ fn back_and_forward_walk_the_history() {
 #[test]
 fn the_place_shown_is_no_history_step() {
     let mut v = view("home");
-    let rev = v.revision;
     v.scroll_to.set(None);
     v.navigate(Loc::page("home"), Some(Via::Area));
     assert!(v.back.is_empty());
     assert_eq!(v.via, Some(Via::Area));
-    // It scrolls again, and readers see a change.
+    // It scrolls the page again: to its top, or to the heading asked for.
     assert_eq!(v.scroll_to.get(), Some(ScrollTo::Top));
-    assert!(v.revision > rev);
+    v.scroll_to.set(None);
+    v.navigate(
+        Loc {
+            page: "home".into(),
+            anchor: Some("clipboard".into()),
+        },
+        None,
+    );
+    assert_eq!(v.back, [Loc::page("home")], "another heading is a step");
+    v.scroll_to.set(None);
+    v.navigate(
+        Loc {
+            page: "home".into(),
+            anchor: Some("clipboard".into()),
+        },
+        None,
+    );
+    assert_eq!(v.back, [Loc::page("home")], "the same heading is not");
+    assert_eq!(v.scroll_to.get(), Some(ScrollTo::Block(3)));
     // An unknown page opens the root, as a step.
     v.navigate(Loc::page("nowhere"), None);
     assert_eq!(at(&v), ("welcome", None));
-    assert_eq!(v.back, [Loc::page("home")]);
+    assert_eq!(
+        v.back.last(),
+        Some(&Loc {
+            page: "home".into(),
+            anchor: Some("clipboard".into())
+        })
+    );
 }
 
 #[test]

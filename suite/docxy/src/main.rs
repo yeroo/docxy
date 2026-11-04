@@ -26783,7 +26783,7 @@ impl Docxy {
         // box. Before the find bar's branch: a document's Find bar may stay
         // open behind it and must not move.
         if self.active_is_help() {
-            return self.help_tab_press(cx);
+            return self.help_search_release(cx);
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
@@ -26916,7 +26916,7 @@ impl Docxy {
         // box. Before the find bar's branch: a document's Find bar may stay
         // open behind it and must not move.
         if self.active_is_help() {
-            return self.help_tab_press(cx);
+            return self.help_search_release(cx);
         }
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
@@ -31901,6 +31901,10 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
         ]
     }
 }
+/// The ribbon tab shown for a tab of `kind`: `tab` while it is one of the
+/// kind's (a contextual one only in its context), else the kind's default. A
+/// Help tab (#1855) draws no ribbon, so it keeps the tab the document, sheet
+/// or plan behind it showed: going back finds Layout or Resource as it was.
 fn valid_ribbon_tab(
     kind: Kind,
     tab: RibbonTab,
@@ -31908,7 +31912,8 @@ fn valid_ribbon_tab(
     in_gantt: bool,
     in_hf: bool,
 ) -> RibbonTab {
-    if ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
+    if kind == Kind::Help
+        || ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
         || (kind == Kind::Docx
             && matches!(tab, RibbonTab::TableDesign | RibbonTab::TableLayout)
             && in_table)

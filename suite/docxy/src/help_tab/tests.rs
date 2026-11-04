@@ -388,3 +388,30 @@ fn every_dialog_has_a_help_target() {
     let c = helpdocs::coverage(&fixture_manual(Kind::Docx), [(insert_table.as_str(), "")]);
     assert_eq!(c.exact.len(), 1, "{}", c.report());
 }
+
+/// #1855: a Help tab draws no ribbon, so the ribbon tab the document, sheet
+/// or plan showed is kept while it is active, never reset to the default.
+#[test]
+fn a_help_tab_keeps_the_ribbon_tab_shown_behind_it() {
+    for tab in [
+        RibbonTab::Layout,
+        RibbonTab::Design,
+        RibbonTab::Mailings,
+        RibbonTab::HeaderFooter,
+        RibbonTab::TableDesign,
+        RibbonTab::Resource,
+        RibbonTab::GanttFormat,
+        RibbonTab::Formulas,
+    ] {
+        assert!(
+            crate::valid_ribbon_tab(Kind::Help, tab, false, false, false) == tab,
+            "{}",
+            ribbon_tab_name(tab)
+        );
+    }
+    // A document still resets a tab that is not its own.
+    assert!(
+        crate::valid_ribbon_tab(Kind::Docx, RibbonTab::Resource, false, false, false)
+            == RibbonTab::Home
+    );
+}

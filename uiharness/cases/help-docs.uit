@@ -54,6 +54,33 @@ test F1 on Home opens the Home page in a Help tab, and F1 there its root
   call tab-list {}
   assert reply.count is 2
 
+test the ribbon tab shown behind a Help tab is there on return
+  open copy:../fixtures/basic.docx
+  call ribbon-layout {"tab":"Layout"}
+  assert ribbon_tab is Layout
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  # Frames drawn with the Help tab in front leave the ribbon tab alone.
+  shot window
+  assert ribbon_tab is Layout
+  call real-key {"key":"ctrl+shift+tab"}
+  shot window
+  assert ribbon_tab is Layout
+  call real-key {"key":"ctrl+tab"}
+  call real-key {"key":"ctrl+w"}
+  # A plan's Resource tab too (no Project manual: a Word Help tab opens).
+  open ../fixtures/gantt-summary.xml
+  call ribbon-layout {"tab":"Resource"}
+  assert ribbon_tab is Resource
+  call help-open {"editor":"word","page":"welcome"}
+  shot window
+  call real-key {"key":"ctrl+shift+tab"}
+  shot window
+  assert ribbon_tab is Resource
+  call real-key {"key":"ctrl+tab"}
+  call real-key {"key":"ctrl+w"}
+
 test Help > Help opens the Help command's page
   open copy:../fixtures/basic.docx
   call ribbon-click {"tab":"Help","command":"Help"}

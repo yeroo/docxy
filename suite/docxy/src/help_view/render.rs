@@ -290,7 +290,7 @@ impl Docxy {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _w, cx| this.help_body_press(cx)),
+                cx.listener(|this, _: &MouseDownEvent, _w, cx| this.help_search_release(cx)),
             )
             .into_any_element()
     }
