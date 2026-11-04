@@ -2,7 +2,8 @@
 //! line Project's "Line to change" list names has a normal type and colour
 //! and, for the row and column lines, an interval that draws every Nth line
 //! differently. The default of every line is what the hosts drew before the
-//! model existed, so a plan without gridlines looks as it did; a plan stores
+//! model existed, so a plan without gridlines looks as it did, except Current
+//! Date, which is solid Automatic as Project 2024 draws it (#1688); a plan stores
 //! only the lines that differ from their default. A UI plugin command's
 //! `view.gridlines` reply edits them ([`Gridlines::apply`]); the hosts' table
 //! and chart draw from them.
@@ -163,10 +164,12 @@ impl Line {
 
     /// What the hosts drew before the model (#1575): the table's row and
     /// column rules, the chart's row rules and bottom-tier (day) lines and the
-    /// timescale's cell borders, all solid in the host's own colour; and, as
-    /// Project 2024 draws on a new plan, a solid Current Date line in the
-    /// host's colour (#1688; Project's green is not measured). Nothing else:
-    /// Status Date, Project Start and Finish are none.
+    /// timescale's cell borders, all solid in the host's own colour.
+    ///
+    /// Current Date is not one of those: it is solid Automatic, as Project
+    /// 2024 draws it (#1688; Project's green is not measured). The hosts draw
+    /// it only where the plan's `CurrentDate` option is set, and a new docxy
+    /// plan sets none. Status Date, Project Start and Finish are none.
     pub fn default_style(self) -> Gridline {
         match self {
             Line::GanttRows
@@ -453,7 +456,7 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_what_the_hosts_drew() {
+    fn the_defaults_are_the_hosts_rules_and_projects_current_date() {
         let g = Gridlines::default();
         assert!(g.is_empty());
         for l in Line::ALL {
@@ -532,7 +535,7 @@ mod tests {
 
     #[test]
     fn the_current_date_line_draws_by_default_and_none_is_stored() {
-        // Project 2024 draws a Current Date line on a new plan (#1688).
+        // Current Date draws by default, as in Project 2024 (#1688).
         assert_eq!(Line::CurrentDate.default_style(), Gridline::solid());
         assert_eq!(Line::StatusDate.default_style(), Gridline::default());
         assert_eq!(Line::ProjectStart.default_style(), Gridline::default());

@@ -3066,8 +3066,8 @@ mod tests {
     use projcore::editor::parse_duration;
 
     #[test]
-    fn a_default_plan_draws_its_current_date_line() {
-        // Project 2024 draws a Current Date line on a new plan (#1688).
+    fn a_plan_with_a_current_date_draws_its_line_by_default() {
+        // Project 2024 draws a Current Date line by default (#1688).
         let start = projcore::datetime::DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
         let mut proj = Project {
             start_date: Some(start),
@@ -3079,7 +3079,7 @@ mod tests {
         let ed = Editor::new(proj.clone());
         let marks = gridline_marks(&ed, origin);
         let current: Vec<_> = marks.iter().filter(|m| m.day == 2).collect();
-        assert_eq!(current.len(), 1, "{:?}", marks.len());
+        assert_eq!(current.len(), 1, "{marks:?}");
         assert!(!current[0].broken);
         // Turned off, it is not drawn.
         proj.formatting.gridlines.set(

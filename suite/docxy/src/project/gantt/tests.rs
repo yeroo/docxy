@@ -787,9 +787,9 @@ fn a_status_date_line_needs_a_status_date() {
 }
 
 #[test]
-fn a_default_plan_draws_its_current_date_line() {
+fn a_plan_with_a_current_date_draws_its_line_by_default() {
     use projcore::formatting::gridlines::{Gridline, Gridlines, Line};
-    // Project 2024 draws a Current Date line on a new plan (#1688).
+    // Project 2024 draws a Current Date line by default (#1688).
     let mut p = untitled_project();
     let start = p.start_date.unwrap();
     p.tasks = vec![task(1, 1, 1)];
