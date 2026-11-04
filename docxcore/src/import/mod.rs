@@ -27,25 +27,36 @@
 //! | Where | Loop or allocation | Bound / charged to |
 //! |---|---|---|
 //! | `sniff` | first 1 KB, first 4 KB | constant |
-//! | `Builder::text` | a run's text appended | work (len/16) + built (len); a new run built (`size_of::<Inline>`) |
-//! | `Builder::tab`, `line_break`, `page_break` | one inline | work + built |
+//! | `Builder::text` | a run's text appended | work (len/16) + built (len); a new run built (`size_of::<Inline>` + its props' strings) |
+//! | `Builder::tab`, `line_break`, `page_break` | one inline | work + built (with its props' strings) |
 //! | `Builder::end_para` / `end_cell` / `end_row` | a paragraph / cell / row | work + built (`size_of` each) |
 //! | `Builder::end_cell`, `end_table` | cells past `MAX_COLUMNS` | join the last cell (no new cell) |
 //! | `Builder::end_table` | padding a short row | ≤ 62 cells a row, each work + built |
 //! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one `drain` |
 //! | `Builder::para_text` | the paragraph in progress | O(paragraph), once per paragraph end |
-//! | run props cloned per inline | `RunProps` | importers set only flags (no strings): O(1) |
+//! | run props cloned per inline | `RunProps` | flags, and strings of ≤ 64 bytes (font, colour, highlight) plus ≤ 2 kept elements (HTML's shading, bold off): O(1), charged as built |
 //! | `inflate_within` | inflate output | decoded, capped inside each block at the room; room 0 fails |
 //! | `rtf::import_rtf` | the input, once | work (input/16), up front |
 //! | rtf groups | the group stack | ≤ `MAX_DEPTH`; deeper ones counted, not kept |
 //! | rtf control word | its letters copied | O(word), within the one pass |
 //! | rtf `\listtext`, stylesheet names | text kept | ≤ 64 bytes each (`MAX_NAME`) |
 //! | rtf font table, heading styles | map entries | built per new entry |
-//! | `html::import_html` | decoding, tokenizing | work (2 × input/16), up front |
+//! | `html::import_html` | decoding, the `<style>` scan, tokenizing | work (3 × input/16), up front |
+//! | html `collect_styles` | the `<style>` texts joined | ≤ input; forward only (comments and raw-text elements skipped by one search each) |
+//! | `css::StyleSheet::parse` | the CSS, once; rules, declaration blocks | work (css/16); each rule and block built; ≤ `MAX_RULES` (10 000) rules, more ignored; brace nesting counted, never recursed |
+//! | css selector | compounds | ≤ `MAX_COMPOUNDS` (32), longer dropped; names ≤ 64 bytes |
+//! | `css::StyleSheet::matching` | rules examined per element opened | work per rule examined (only those indexed by the element's id, classes, tag, or universal) |
+//! | `css::Selector::matches` | reach sets, one per compound | work (depth/4 + 1) a compound: O(compounds × depth), no backtracking |
+//! | html element look | parent's look cloned, the cascade | per open: work (1 + key/16) + the matching; inline `style` parsed once |
+//! | html implicit close | the element stack, searched once | work (depth/16 + 1) per block open |
+//! | html omitted table end (`close_open`) | the element stack, searched once | work (depth/16 + 1), ≤ 4 searches per `td th tr thead tbody tfoot` open |
+//! | html `restyle` | looks above a closed element computed again | per element: its attributes scanned again (work attrs/16 + 1) + the matching; ≤ depth elements a close |
+//! | html formatting reopened after a truncation | elements kept, looks restyled | ≤ depth, at most three alike counting those open below (work below/16 + 1 each); as `restyle` |
+//! | html `out_of_scope` | the element stack, searched once | per close tag, ≤ 256 |
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
-//! | html element stacks | inline / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256 |
+//! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | each lookup scans the tag | ≤ 5 scans a tag, within the one pass |
+//! | html attributes | one scan a tag | the seven read (`style class id align color face size`) copied, first of a name only |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |
 //! | `recover::document_xml` | the header scan | work (input/16), up front; forward only |
@@ -81,6 +92,7 @@
 //! | pdf `make_lines` | per glyph, trailing trim | O(glyphs) |
 //! | pdf `layout` | per line, per piece, tabs split once | O(glyphs); paragraphs via `Builder` |
 
+pub(crate) mod css;
 pub mod html;
 pub mod pdf;
 pub mod recover;
@@ -337,6 +349,16 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric()))
 }
 
+/// The heap bytes of the run properties an importer sets: font, colour,
+/// highlight and style names, kept elements.
+fn props_heap(p: &RunProps) -> usize {
+    p.font.as_ref().map_or(0, String::len)
+        + p.color.as_ref().map_or(0, String::len)
+        + p.highlight.as_ref().map_or(0, String::len)
+        + p.style_id.as_ref().map_or(0, String::len)
+        + p.raw_props.iter().map(String::len).sum::<usize>()
+}
+
 /// Builds a [`Document`] from a stream of text, breaks, paragraph ends and
 /// table cells, the shape all the importers produce. Everything it makes is
 /// charged to the import's [`Budget`]; once that is out it makes nothing
@@ -380,7 +402,7 @@ impl<'b> Builder<'b> {
                 return;
             }
         }
-        if !self.budget.keep::<Inline>(0) {
+        if !self.budget.keep::<Inline>(props_heap(props)) {
             return;
         }
         self.para.push(Inline::Run(Run {
@@ -390,20 +412,20 @@ impl<'b> Builder<'b> {
     }
 
     pub(crate) fn tab(&mut self, props: &RunProps) {
-        if self.budget.keep::<Inline>(0) {
+        if self.budget.keep::<Inline>(props_heap(props)) {
             self.para.push(Inline::Tab(props.clone()));
         }
     }
 
     pub(crate) fn line_break(&mut self, props: &RunProps) {
-        if self.budget.keep::<Inline>(0) {
+        if self.budget.keep::<Inline>(props_heap(props)) {
             self.para
                 .push(Inline::Break(BreakKind::Line, props.clone()));
         }
     }
 
     pub(crate) fn page_break(&mut self, props: &RunProps) {
-        if self.budget.keep::<Inline>(0) {
+        if self.budget.keep::<Inline>(props_heap(props)) {
             self.para
                 .push(Inline::Break(BreakKind::Page, props.clone()));
         }

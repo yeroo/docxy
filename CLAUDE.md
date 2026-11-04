@@ -2363,3 +2363,70 @@
   `tab-list` reports `count`. `uiharness/cases/help-docs.uit` drives it;
   `qa/help-docs.md` is the offline manual case. F1 on a hovered ribbon
   command and on panes is #1869.
+
+## HTML import CSS (#1872)
+
+- `docxcore::import::html` reads inline `style`, `<font color face size>` and
+  every `<style>` block of the page (a pre-pass, `collect_styles`, outside
+  comments and raw-text elements, so a style in `<!--[if mso]>` or a script
+  does not apply). `import/css.rs` (dependency-free) parses declarations,
+  sheets of simple selectors (type, `*`, `.class`, `#id`, compounds,
+  descendant and child; anything else drops that selector alone, every
+  at-rule is skipped with its block) and the values. Names compare ASCII
+  case-insensitively. A sheet keeps at most 10 000 rules, a selector 32
+  compounds; matching is right to left over reach sets, O(compounds ×
+  depth), all charged to the import `Budget`.
+- One stack of open elements (`Elem`: key, `Kind`, computed `Look`) beside
+  the structural `blocks`/`lists`; a look is computed once, at open, in CSS
+  order: parent, user agent (`b`, `center`, blockquote's 40 px), presentational
+  attributes, rules by specificity then order, inline, important rules,
+  inline important. Runs: colour (`windowtext`/`auto` reset it), font family
+  (first non-generic; generics map to Times New Roman / Arial / Courier New),
+  size (half-points, 1..1638 pt), weight, style, decoration, vertical align,
+  an inline element's background as run `w:shd`, `mso-highlight` (Word's 17
+  names only, `highlight::canonical_name`), `display:none` /
+  `mso-hide:all` as `vanish`. Under a heading an explicit not-bold is
+  `<w:b w:val="0"/>`. Paragraphs: alignment, line
+  height (multiple → `auto`, length → `atLeast`, `exact` with
+  `mso-line-height-rule:exactly`), the innermost block's own top/bottom box
+  as spacing, every enclosing block's left/right box summed as indent
+  (negative clamps at 0), `text-indent`, a block's background as `w:shd`.
+- Boundaries: `html`/`body` box and background are the page's, never read; a
+  `td`/`th` starts a fresh indent, right indent, first line and shading (its
+  padding is the cell's, #1878), while inherited run properties and line
+  height pass in; `ul`/`ol` and `table` boxes are not counted (the level
+  indent stands for the list's). An HTML `li` keeps the level's hanging
+  indent: with an enclosing box it writes `720*(lvl+1) + box`, first line
+  −360, else no indent. A `MsoList…` paragraph keeps its own CSS.
+- Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
+  `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
+  across a cell or table, ending the paragraph only if it has content; a
+  list's end ends its open `li` and any list left open in it (`</ol>` over
+  an open `ul`), a `</li>` under an open list is ignored (list-item scope),
+  and any close ends the blocks and lists opened inside the element
+  (`Elem::blocks_at`/`lists_at`, the stacks below it). A row group's end,
+  like its start, ends the open cell and row. Omitted table
+  end tags are implied (`close_open`, through `close_tag` so the cell or row
+  ends in the document): a `td`/`th` ends the open cell of its row, a `tr`
+  the open cell and row, a `thead`/`tbody`/`tfoot` those and the open row
+  group, never across a nested table. HTML5 containers (`section article main
+  header footer nav aside figure form …`, `Kind::Container`) and `hr` close
+  an open `p` too; a container (or a custom tag over an open paragraph)
+  ends the paragraph when it closes. `html`/`body` never close, and no close
+  reaches across an open table or cell (`out_of_scope`: `</ul>` or
+  `</div>` in a cell is ignored, as in a browser). An `Elem` keeps where its
+  attributes are in the page, so looks can be computed again (`restyle`):
+  an inline element closed under an open block (`<b><p>x</b>y`) is taken
+  out alone and what is above it restyled, so it ends at once. Any other
+  truncation (not of a table or cell) reopens the HTML formatting elements
+  left open above it (`a b big code em font i nobr s small strike strong tt
+  u`), as a browser's active formatting elements: `<p><b>a</p><p>b` keeps
+  `b` bold, `<b><i>x</b>y` keeps `y` italic. None is reopened when three
+  alike (tag and attributes) are already open below, back to the nearest
+  table or cell (Noah's Ark), so an unclosed `<b>` per paragraph does not
+  pile up. Under a heading only a not-bold declared on it or inside it
+  is the explicit off (an ancestor's `font:` shorthand is not), and
+  negative top/bottom boxes write 0. Known limits: quirks mode's table-font reset
+  (browsers do not inherit font size/weight/style into a `table` there; we
+  do), no borders, no `dir`/`letter-spacing`/`text-transform`, no `+ ~
+  [attr] :pseudo`. The suite does not draw run shading yet.

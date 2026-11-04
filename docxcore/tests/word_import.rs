@@ -142,6 +142,92 @@ fn word_web_page_matches_word_docx() {
     assert_eq!(nums, [1, 1, 1, 2, 2], "bullets then decimals");
 }
 
+/// #1872: the Web Page's `<style>` block is Word's own description of its
+/// styles, so what it says reaches the runs and paragraphs.
+#[test]
+fn word_web_page_css_reaches_runs_and_paragraphs() {
+    let got = import::import_html(&fixture("source.htm")).expect("HTML imports");
+    let paras = paragraphs(&got);
+    let runs = |p: &Paragraph| -> Vec<docxcore::model::Run> {
+        p.content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Run(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let headings: Vec<&&Paragraph> = paras
+        .iter()
+        .filter(|p| p.props.style_id.is_some())
+        .collect();
+    assert_eq!(headings.len(), 4);
+    for h in &headings {
+        let size = if h.props.style_id.as_deref() == Some("Heading1") {
+            40
+        } else {
+            32
+        };
+        for r in runs(h) {
+            assert_eq!(r.props.color.as_deref(), Some("2F5496"), "{:?}", r.text);
+            assert_eq!(r.props.font.as_deref(), Some("Calibri Light"));
+            assert_eq!(r.props.size_half_pts, Some(size));
+            // `font-weight: normal` over a bold heading style: an explicit
+            // off, as source.docx's headings are not bold.
+            assert!(!r.props.bold);
+            assert!(
+                r.props
+                    .raw_props
+                    .contains(&"<w:b w:val=\"0\"/>".to_string()),
+                "{:?}",
+                r.props.raw_props
+            );
+        }
+    }
+    let h1 = &headings[0].props.spacing;
+    assert_eq!((h1.before, h1.after), (Some(360), Some(80)));
+
+    let body: Vec<&&Paragraph> = paras
+        .iter()
+        .filter(|p| p.props.style_id.is_none())
+        .collect();
+    for p in &body {
+        for r in runs(p) {
+            assert_eq!(r.props.font.as_deref(), Some("Calibri"), "{:?}", r.text);
+            assert_eq!(r.props.size_half_pts, Some(24), "{:?}", r.text);
+            assert!(r.props.raw_props.is_empty(), "{:?}", r.props.raw_props);
+        }
+        assert_eq!(p.props.spacing.line, Some(276), "{:?}", p.plain_text());
+        assert_eq!(p.props.spacing.line_rule.as_deref(), Some("auto"));
+        assert_eq!(p.props.indent_right, 0);
+    }
+    let normal = body
+        .iter()
+        .find(|p| p.plain_text().starts_with("Plain text"))
+        .unwrap();
+    assert_eq!(normal.props.spacing.after, Some(160));
+    assert_eq!((normal.props.indent, normal.props.first_line), (0, 0));
+    // The list paragraphs: `margin-left:.5in`, `text-indent:-.25in`.
+    let items: Vec<&&&Paragraph> = body.iter().filter(|p| p.props.num_id.is_some()).collect();
+    assert_eq!(items.len(), 5);
+    for p in items {
+        assert_eq!((p.props.indent, p.props.first_line), (720, -360));
+    }
+    // Table cells: their `padding:0in 5.4pt` is the cell's, not the
+    // paragraph's indent.
+    let Some(Block::Table(t)) = got.body.iter().find(|b| matches!(b, Block::Table(_))) else {
+        panic!("the Web Page has a table")
+    };
+    for cell in t.rows.iter().flat_map(|r| &r.cells) {
+        for b in &cell.blocks {
+            if let Block::Paragraph(p) = b {
+                assert_eq!((p.props.indent, p.props.indent_right), (0, 0));
+                assert_eq!(p.props.spacing.after, Some(160));
+            }
+        }
+    }
+}
+
 #[test]
 fn word_pdf_text_matches_word_docx_in_reading_order() {
     let want = oracle();
