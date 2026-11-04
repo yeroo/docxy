@@ -836,7 +836,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, bool, String)
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, gallery-more:fixture.wide, filter-button:B";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).

@@ -2951,7 +2951,7 @@ fn tab_json(
                     // A swatch gallery in place shows a window of its tiles,
                     // the checked one in it, and a More button (#1823).
                     let swatch = crate::plugin_ui::is_swatch_gallery(g);
-                    let checked_at = commands[first..].iter().position(|c| checked(c));
+                    let checked_at = commands[first..].iter().position(checked);
                     let window = if swatch {
                         crate::plugin_ui::in_place_window(g.items.len(), checked_at)
                     } else {
