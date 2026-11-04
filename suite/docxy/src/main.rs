@@ -27018,8 +27018,9 @@ impl Docxy {
         // F1 is Help › Help on every surface (#1021), unless an entry owns
         // the keyboard.
         if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
-            self.keytips = KeyTip::Off;
-            return self.dispatch(Act::Help(help_tab::HelpAct::Help), window, cx);
+            self.close_menu();
+            self.ribbon_flyout = None;
+            return self.help_f1(window, cx);
         }
         // A Help tab (#1855) has no ribbon and no KeyTips: its own keys.
         if self.active_is_help() {

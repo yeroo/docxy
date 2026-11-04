@@ -224,3 +224,151 @@ fn every_ribbon_command_has_a_help_target() {
     let c = helpdocs::coverage(&fixture_manual(Kind::Docx), [("help-new", "Help")]);
     assert!(!c.passes());
 }
+
+// ---- F1 and Help open the manual (#1855) -----------------------------------
+
+fn word() -> helpdocs::Manual {
+    crate::help_manual::tests::fixture_bundle(HelpEditor::Word).manual
+}
+
+fn page_of(ask: &HelpAsk, m: &helpdocs::Manual) -> (String, helpdocs::Via) {
+    let t = ask.resolve(m).expect("a page");
+    (t.page, t.via)
+}
+
+#[test]
+fn f1_opens_the_area_page_of_the_ribbon_tab_shown() {
+    use helpdocs::Via;
+    let m = word();
+    let ask = f1_ask(Some(Kind::Docx), "Home", None);
+    assert_eq!(ask.editor, HelpEditor::Word);
+    assert_eq!(page_of(&ask, &m), ("home".into(), Via::Area));
+    let ask = f1_ask(Some(Kind::Docx), "Insert", None);
+    assert_eq!(page_of(&ask, &m), ("insert".into(), Via::Area));
+    // An area the manual has no page for: its root.
+    let ask = f1_ask(Some(Kind::Docx), "Mailings", None);
+    assert_eq!(page_of(&ask, &m), ("welcome".into(), Via::Root));
+    // Each tab kind reads its own editor's manual.
+    assert_eq!(
+        f1_ask(Some(Kind::Xlsx), "Home", None).editor,
+        HelpEditor::Excel
+    );
+    assert_eq!(
+        f1_ask(Some(Kind::Project), "Task", None).editor,
+        HelpEditor::Project
+    );
+    assert_eq!(f1_ask(None, "Home", None).editor, HelpEditor::Word);
+    // On a Help tab, that manual's root, whatever ribbon tab was shown.
+    let ask = f1_ask(Some(Kind::Help), "Home", Some(HelpEditor::Excel));
+    assert_eq!((ask.editor, ask.area.as_deref()), (HelpEditor::Excel, None));
+    assert_eq!(
+        page_of(
+            &f1_ask(Some(Kind::Help), "Home", Some(HelpEditor::Word)),
+            &m
+        )
+        .0,
+        "welcome"
+    );
+}
+
+#[test]
+fn help_opens_the_help_commands_page() {
+    use helpdocs::Via;
+    let ask = help_command_ask(Some(Kind::Docx));
+    assert_eq!(page_of(&ask, &word()), ("help".into(), Via::Exact));
+    assert_eq!(help_command_ask(Some(Kind::Xlsx)).editor, HelpEditor::Excel);
+}
+
+#[test]
+fn f1_over_a_dialog_opens_its_page() {
+    use helpdocs::Via;
+    let m = word();
+    let ask = dialog_ask(Some(Kind::Docx), "insert-table", "Insert");
+    assert_eq!(ask.id.as_deref(), Some("dialog:insert-table"));
+    assert_eq!(page_of(&ask, &m), ("tables".into(), Via::Exact));
+    // A dialog no page names: the ribbon tab's area page.
+    let ask = dialog_ask(Some(Kind::Docx), "page-setup", "Home");
+    assert_eq!(page_of(&ask, &m), ("home".into(), Via::Area));
+}
+
+#[test]
+fn f1_opens_help_only_over_a_plain_form() {
+    use crate::dialog::{ButtonRole, Dialog, DialogOwner, Popup};
+    let ed = Editor::new(empty_doc());
+    let form = crate::table_dialogs::insert_table_dialog(&ed).unwrap();
+    assert!(dialog_takes_help(&form, false));
+    assert!(!dialog_takes_help(&form, true), "a window close is asking");
+    let mut popup = form.clone();
+    popup.popup = Some(Popup {
+        x: 0.,
+        y: 0.,
+        width: 1.,
+        list_h: 1.,
+    });
+    assert!(!dialog_takes_help(&popup, false));
+    let message = Dialog::message(
+        crate::dialog::catalog::INSERT_TABLE,
+        "Note",
+        "Something happened".into(),
+        &[("OK", ButtonRole::Accept)],
+        DialogOwner::Test,
+    );
+    assert!(!dialog_takes_help(&message, false), "a message box");
+    for owner in [
+        DialogOwner::SaveOnClose { quit: false },
+        DialogOwner::Message,
+        DialogOwner::About,
+    ] {
+        let mut d = form.clone();
+        d.owner = owner;
+        assert!(!dialog_takes_help(&d, false), "{:?}", d.owner);
+    }
+}
+
+#[test]
+fn f1_is_a_plain_f1_only() {
+    let plain = Modifiers::default();
+    assert!(is_help_stroke("f1", plain));
+    assert!(!is_help_stroke(
+        "f1",
+        Modifiers {
+            shift: true,
+            ..plain
+        }
+    ));
+    assert!(!is_help_stroke("f2", plain));
+}
+
+/// Every catalogued dialog's `dialog:<id>` resolves to a page, its own or
+/// the manual's root, never an error (#1855: F1 over a dialog and its Help
+/// button ask for it). A report, like the commands' (no dialog area is
+/// strict): the ids the fixtures key exactly are pinned.
+#[test]
+fn every_dialog_has_a_help_target() {
+    use crate::dialog::catalog::{Surface as DSurface, catalog};
+    for (kind, name) in KINDS {
+        let surface = match kind {
+            Kind::Xlsx => DSurface::Sheet,
+            Kind::Project => DSurface::Project,
+            _ => DSurface::Doc,
+        };
+        let ids: Vec<String> = catalog()
+            .iter()
+            .filter(|e| e.surface == surface)
+            .map(|e| format!("dialog:{}", e.dialog.as_str()))
+            .collect();
+        assert!(!ids.is_empty(), "{name}");
+        let manual = fixture_manual(kind);
+        let c = helpdocs::coverage(&manual, ids.iter().map(|id| (id.as_str(), "")));
+        println!("{name} dialogs: {}", c.report());
+        // Not `passes`: the strict areas are ribbon tabs, which no dialog
+        // id names, so they read as unused here.
+        assert!(c.strict_failures.is_empty(), "{name}: {}", c.report());
+        assert!(c.unresolved.is_empty(), "{name}: {:?}", c.unresolved);
+    }
+    let c = helpdocs::coverage(
+        &fixture_manual(Kind::Docx),
+        [("dialog:insert-table", ""), ("dialog:font", "")],
+    );
+    assert_eq!(c.exact.len(), 2, "{}", c.report());
+}
