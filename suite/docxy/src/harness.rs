@@ -1614,7 +1614,8 @@ fn ext_fixture_view(
 }
 
 /// A point of the test extension's document view: `view` (its middle),
-/// `link:<n>` (the n-th painted link span's middle) or `word:<text>` (the
+/// `link:<n>` (the n-th painted link span's middle; `link:<n>:left` 8 px left
+/// of it) or `word:<text>` (the
 /// first painted word whose text, trimmed, is `<text>`; `:start` after it is
 /// one pixel inside its left edge, `:end` one pixel past its last character,
 /// at mid-height).
@@ -1628,15 +1629,25 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             .ok_or_else(|| "the view is not drawn yet".to_string());
     }
     if let Some(n) = part.strip_prefix("link:") {
+        // `:left`: 8 px left of the span, at mid-height (the blank beside a
+        // row that starts with the link).
+        let (n, left) = match n.rsplit_once(':') {
+            Some((n, "left")) => (n, true),
+            _ => (n, false),
+        };
         let n: usize = n
             .trim()
             .parse()
             .map_err(|_| "'ext-doc-link' needs a numeric index".to_string())?;
         let spans = view.link_spans();
-        return spans
+        let (_, b) = spans
             .get(n)
-            .map(|(_, b)| b.center())
-            .ok_or_else(|| format!("no link {n}; {} drawn", spans.len()));
+            .ok_or_else(|| format!("no link {n}; {} drawn", spans.len()))?;
+        return Ok(if left {
+            point(b.left() - px(8.), b.center().y)
+        } else {
+            b.center()
+        });
     }
     if let Some(word) = part.strip_prefix("word:") {
         let (text, edge) = match word.rsplit_once(':') {
@@ -1656,7 +1667,7 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             None => b.center(),
         });
     }
-    Err("the test extension's regions are ext-doc-view, ext-doc-link:<n> and ext-doc-word:<text>[:start|:end]".into())
+    Err("the test extension's regions are ext-doc-view, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its

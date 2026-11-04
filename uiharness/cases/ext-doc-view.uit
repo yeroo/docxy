@@ -2,8 +2,9 @@
 # `ext fixture` line has this instance draw Mail tabs with the suite's test
 # extension: a header line over a DocView of a document built in code
 # (heading "Embedded view", "Alpha Beta Gamma" with Beta bold, a paragraph
-# holding the hyperlink "docxy link" to https://example.com/docxy, a picture,
-# a 2x2 table, then Line 1..Line 80). The extension records every link the
+# holding the hyperlink "docxy link" to https://example.com/docxy, an
+# indented paragraph that starts with the link "Indented link" to
+# https://example.com/indented, a picture, a 2x2 table, then Line 1..Line 80). The extension records every link the
 # view hands it (`ext-doc-read` link_calls). Keys go through `real-key`: the
 # `key` verb presses the suite's own handler and never reaches the view.
 # Each test opens its own Mail tab and closes it at the end.
@@ -18,10 +19,11 @@ test issue 1873 the test extension's Mail tab draws the document in the embedded
   assert reply.tabs.1.kind is mail
   assert reply.active is 1
   call ext-doc-read {}
-  assert reply.blocks is 85
+  assert reply.blocks is 86
   assert reply.tables is 1
   assert reply.pictures is 1
   assert reply.links.0.url is https://example.com/docxy
+  assert reply.links.1.url is https://example.com/indented
   assert reply.zoom is 1
   assert reply.scroll_y is 0
   assert reply.max_scroll_y is not 0
@@ -61,7 +63,7 @@ test issue 1873 a drag selects in the view and Ctrl+C copies its text and RTF, C
   assert reply.focused is true
   call real-key {"key":"ctrl+a"}
   call ext-doc-read {}
-  assert reply.selected_paragraphs is 88
+  assert reply.selected_paragraphs is 89
   shot window
   call real-key {"key":"ctrl+w"}
   call tab-list {}
@@ -130,10 +132,24 @@ test issue 1873 a hyperlink press reaches the extension's callback, by Ctrl+clic
   call ext-doc-read {}
   assert reply.links_followed is 2
   assert reply.link_calls.1 is https://example.com/docxy
+  # A press in the blank indent beside a row that starts with a link is not
+  # on the link: neither a plain press there (in click mode) nor a Ctrl+press
+  # follows it, though the row's nearest stop is the link's first character.
+  call pointer-click {"region":"ext-doc-link:1:left"}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  call pointer-click {"region":"ext-doc-link:1:left","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  # On the link itself it does.
+  call pointer-click {"region":"ext-doc-link:1","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 3
+  assert reply.link_calls.2 is https://example.com/indented
   # A drag that starts on the link selects and follows nothing.
   call pointer-drag {"from":"ext-doc-link:0","to":"ext-doc-word:here.:end"}
   call ext-doc-read {}
-  assert reply.links_followed is 2
+  assert reply.links_followed is 3
   assert reply.selection is not empty
   call real-key {"key":"ctrl+w"}
   call tab-list {}

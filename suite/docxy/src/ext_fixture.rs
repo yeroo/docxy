@@ -19,6 +19,8 @@ use std::rc::Rc;
 
 /// The target of the fixture document's hyperlink.
 pub(crate) const LINK_URL: &str = "https://example.com/docxy";
+/// The target of its indented paragraph's link.
+pub(crate) const INDENTED_URL: &str = "https://example.com/indented";
 
 /// The fixture's view: what the harness downcasts the Mail tab's body to.
 pub(crate) struct FixtureView {
@@ -97,8 +99,10 @@ fn cell(text: &str) -> String {
 
 /// The fixture document and its package, built here (no binary fixture): a
 /// heading, `Alpha Beta Gamma` (Beta bold), a hyperlink `docxy link` to
-/// [`LINK_URL`], an inline picture (`uiharness/fixtures/logo.png`), a 2x2
-/// table `A1 B1 / A2 B2`, then `Line 1`..`Line 80` so it scrolls.
+/// [`LINK_URL`], an indented paragraph that starts with a link
+/// (`Indented link`, to [`INDENTED_URL`]), an inline picture
+/// (`uiharness/fixtures/logo.png`), a 2x2 table `A1 B1 / A2 B2`, then
+/// `Line 1`..`Line 80` so it scrolls.
 pub(crate) fn fixture_document() -> (Document, Package) {
     let mut pkg = new_package(Document { body: vec![] });
     let png: &[u8] = include_bytes!("../../../uiharness/fixtures/logo.png");
@@ -110,7 +114,8 @@ pub(crate) fn fixture_document() -> (Document, Package) {
     let rels = pkg.part_text(rels_name).expect("document rels").replace(
         "</Relationships>",
         &format!(
-            "<Relationship Id=\"rIdLink1\" Type=\"{R}/hyperlink\" Target=\"{LINK_URL}\" TargetMode=\"External\"/></Relationships>"
+            "<Relationship Id=\"rIdLink1\" Type=\"{R}/hyperlink\" Target=\"{LINK_URL}\" TargetMode=\"External\"/>\
+             <Relationship Id=\"rIdLink2\" Type=\"{R}/hyperlink\" Target=\"{INDENTED_URL}\" TargetMode=\"External\"/></Relationships>"
         ),
     );
     assert!(pkg.set_part(rels_name, rels.into_bytes()));
@@ -135,6 +140,13 @@ pub(crate) fn fixture_document() -> (Document, Package) {
         run("Follow the "),
         run("docxy link"),
         run(" here.")
+    ));
+    // A row that starts with a link, indented: a press in its indent is
+    // beside the row, never on the link (#1873 r1).
+    body += &para(&format!(
+        "<w:pPr><w:ind w:left=\"1440\"/></w:pPr><w:hyperlink r:id=\"rIdLink2\">{}</w:hyperlink>{}",
+        run("Indented link"),
+        run(" after it")
     ));
     body += &para(&docxcore::image::inline_picture_run(
         &rid, 609600, 304800, 1, "logo.png",
@@ -170,9 +182,17 @@ mod tests {
     #[test]
     fn the_fixture_document_has_a_link_a_table_and_a_resolving_picture() {
         let (doc, pkg) = fixture_document();
-        // Heading, Alpha..., link, picture, table, 80 lines.
-        assert_eq!(doc.body.len(), 85);
-        assert!(matches!(doc.body[4], Block::Table(_)));
+        // Heading, Alpha..., link, indented link, picture, table, 80 lines.
+        assert_eq!(doc.body.len(), 86);
+        assert!(matches!(doc.body[5], Block::Table(_)));
+        let Block::Paragraph(indented) = &doc.body[3] else {
+            panic!("a paragraph");
+        };
+        assert_eq!(
+            crate::doc_view::link_at(indented, 0).as_deref(),
+            Some(INDENTED_URL)
+        );
+        assert_eq!(indented.props.indent, 1440);
         let Block::Paragraph(link) = &doc.body[2] else {
             panic!("a paragraph");
         };
@@ -180,7 +200,7 @@ mod tests {
             crate::doc_view::link_at(link, "Follow the ".len()).as_deref(),
             Some(LINK_URL)
         );
-        let Block::Paragraph(pic) = &doc.body[3] else {
+        let Block::Paragraph(pic) = &doc.body[4] else {
             panic!("a paragraph");
         };
         let raw = pic
@@ -195,7 +215,7 @@ mod tests {
         let (ext, _) = crate::pictures::resolve(&pkg, "word/document.xml", &rid).expect("resolves");
         assert_eq!(ext, "png");
         // A table cell's paragraph is reached by its path.
-        let a2 = docxcore::editor::resolve_para(&doc.body, &[4, 1, 0, 0]).expect("A2");
+        let a2 = docxcore::editor::resolve_para(&doc.body, &[5, 1, 0, 0]).expect("A2");
         assert_eq!(a2.plain_text(), "A2");
     }
 

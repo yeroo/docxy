@@ -31,6 +31,7 @@ mod zoom;
 mod zoom_dialogs;
 pub(super) use timeline::*;
 pub(super) use zoom::{WheelZoom, available as timescale_available};
+pub(crate) use zoom::{wheel_px, wheel_step};
 pub(super) use zoom_dialogs::{apply_timescale, apply_zoom};
 mod rows;
 pub(super) use rows::*;

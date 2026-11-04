@@ -7990,12 +7990,15 @@ impl DocTarget {
     }
 
     /// A press that starts a drag-selection at `off` (Shift, in `mods`,
-    /// extends the selection instead).
+    /// extends the selection instead). `on_piece`: the press is on a painted
+    /// word or unit, not the blank beside a row (whose `off` is only the row's
+    /// nearest stop): only such a press may follow the link under it.
     fn begin_select(
         &self,
         path: Vec<usize>,
         off: usize,
         mods: Modifiers,
+        on_piece: bool,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -8005,7 +8008,7 @@ impl DocTarget {
             }),
             DocTarget::Embed(view, _) => {
                 let _ = view.update(cx, |this, cx| {
-                    this.begin_select(path, off, mods, window, cx)
+                    this.begin_select(path, off, mods, on_piece, window, cx)
                 });
             }
         }
@@ -8571,7 +8574,7 @@ fn unit_drag(d: Div, c: Click, cell: UnitCell, pos: usize) -> Div {
             move |ev, window, cx| {
                 cx.stop_propagation();
                 let off = unit_offset(cell.get(), pos, ev.position);
-                ent.begin_select(path.clone(), off, ev.modifiers, window, cx);
+                ent.begin_select(path.clone(), off, ev.modifiers, true, window, cx);
             }
         })
         .on_mouse_move(move |ev, _window, cx| {
@@ -33198,7 +33201,7 @@ fn emit_words(
                             move |ev, window, cx| {
                                 cx.stop_propagation();
                                 let off = off_at(ev.position);
-                                ent.begin_select(path.clone(), off, ev.modifiers, window, cx);
+                                ent.begin_select(path.clone(), off, ev.modifiers, true, window, cx);
                             }
                         })
                         .on_mouse_move(move |ev, _window, cx| {
@@ -34641,7 +34644,7 @@ fn paragraph_el(
                         let hit = words_line_end_hit(&words, ev.position, para_end);
                         match hit {
                             Some(off) => {
-                                ent.begin_select(path.clone(), off, ev.modifiers, window, cx)
+                                ent.begin_select(path.clone(), off, ev.modifiers, false, window, cx)
                             }
                             None => ent.set_caret(
                                 path.clone(),

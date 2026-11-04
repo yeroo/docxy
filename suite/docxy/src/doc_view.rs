@@ -33,10 +33,6 @@ const BODY_PART: &str = "word/document.xml";
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 3.0;
 
-/// The pixel deltas of a smooth wheel that make one zoom step (the Project
-/// chart's rule, #1535).
-const WHEEL_STEP: f32 = 40.;
-
 /// A line's scroll by the arrow keys, at zoom 1.
 const LINE_PX: f32 = 24.;
 
@@ -195,11 +191,17 @@ impl DocView {
         path: Vec<usize>,
         off: usize,
         mods: Modifiers,
+        on_piece: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
-        let link = docxcore::editor::resolve_para(&self.editor.doc.body, &path)
+        // Only a press on a painted piece is on a link: beside a row the
+        // offset is the row's nearest stop, which may be a link's first or
+        // last character the person never pressed.
+        let link = on_piece
+            .then(|| docxcore::editor::resolve_para(&self.editor.doc.body, &path))
+            .flatten()
             .and_then(|p| link_at(p, off));
         // Ctrl+click (⌘ on macOS) follows a link at once, in either mode, and
         // selects nothing.
@@ -339,23 +341,21 @@ impl DocView {
         self.scroll_to(self.scroll_y() + dy)
     }
 
-    /// Ctrl+wheel zooms one step per notch, or per [`WHEEL_STEP`] px of a
-    /// smooth wheel; the scroll area has already scrolled by the same turn,
-    /// so the offset is put back.
-    fn wheel(&mut self, ev: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    /// Ctrl+wheel zooms one step per notch, or per 40 px of a smooth wheel
+    /// (the Project chart's rule, [`project::wheel_step`]; a fractional line
+    /// counts as its pixels); the scroll area has already scrolled by the
+    /// same turn, so the offset is put back.
+    fn wheel(&mut self, ev: &ScrollWheelEvent, window: &Window, cx: &mut Context<Self>) {
         if !ev.modifiers.control {
             return;
         }
         cx.stop_propagation();
         self.scroll.set_offset(self.held_scroll);
-        let (dy, notch) = match ev.delta {
-            ScrollDelta::Lines(l) => (l.y, l.y.abs() >= 1.),
-            ScrollDelta::Pixels(p) => (f32::from(p.y), false),
-        };
+        let (dy, notch) = project::wheel_px(&ev.delta, window.line_height());
         if ev.touch_phase == TouchPhase::Started {
             self.wheel_acc = 0.;
         }
-        if let Some(dir) = wheel_step(&mut self.wheel_acc, dy, notch) {
+        if let Some(dir) = project::wheel_step(&mut self.wheel_acc, dy, notch) {
             self.zoom_step(dir);
         }
         if ev.touch_phase == TouchPhase::Ended {
@@ -554,7 +554,9 @@ impl Render for DocView {
             .min_h(px(0.))
             .bg(bg)
             .on_key_down(cx.listener(Self::key))
-            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| this.wheel(ev, cx)))
+            .on_scroll_wheel(
+                cx.listener(|this, ev: &ScrollWheelEvent, window, cx| this.wheel(ev, window, cx)),
+            )
             // A press beside the paragraphs (the padding) still gives the
             // view the keys.
             .on_mouse_down(
@@ -664,31 +666,6 @@ pub(crate) fn step_zoom(zoom: f32, dir: i32) -> f32 {
     }
     let tenths = (zoom * 10.).round() as i32 + dir.signum();
     (tenths as f32 / 10.).clamp(ZOOM_MIN, ZOOM_MAX)
-}
-
-/// A Ctrl+wheel turn of `dy` px (up positive): `Some(1)` to zoom in or
-/// `Some(-1)` out when it makes a step. A whole-line `notch` steps at once;
-/// smooth deltas add into `acc` and step per [`WHEEL_STEP`], a change of
-/// direction starting the sum afresh.
-pub(crate) fn wheel_step(acc: &mut f32, dy: f32, notch: bool) -> Option<i32> {
-    if dy == 0. {
-        return None;
-    }
-    let dir = if dy > 0. { 1 } else { -1 };
-    if notch {
-        *acc = 0.;
-        return Some(dir);
-    }
-    if *acc * dy < 0. {
-        *acc = 0.;
-    }
-    *acc += dy;
-    if acc.abs() >= WHEEL_STEP {
-        *acc = 0.;
-        Some(dir)
-    } else {
-        None
-    }
 }
 
 /// The target of the hyperlink holding caret offset `off` of `p`: its URL,
@@ -833,17 +810,38 @@ mod tests {
 
     #[test]
     fn wheel_zoom_accumulates_pixels_and_steps_on_a_notch() {
+        let step = project::wheel_step;
         let mut acc = 0.;
-        assert_eq!(wheel_step(&mut acc, 1., true), Some(1));
-        assert_eq!(wheel_step(&mut acc, -1., true), Some(-1));
-        assert_eq!(wheel_step(&mut acc, 25., false), None);
-        assert_eq!(wheel_step(&mut acc, 20., false), Some(1));
+        assert_eq!(step(&mut acc, 1., true), Some(1));
+        assert_eq!(step(&mut acc, -1., true), Some(-1));
+        assert_eq!(step(&mut acc, 25., false), None);
+        assert_eq!(step(&mut acc, 20., false), Some(1));
         assert_eq!(acc, 0.);
         // A change of direction starts the sum afresh.
-        assert_eq!(wheel_step(&mut acc, 30., false), None);
-        assert_eq!(wheel_step(&mut acc, -30., false), None);
-        assert_eq!(wheel_step(&mut acc, -15., false), Some(-1));
-        assert_eq!(wheel_step(&mut acc, 0., false), None);
+        assert_eq!(step(&mut acc, 30., false), None);
+        assert_eq!(step(&mut acc, -30., false), None);
+        assert_eq!(step(&mut acc, -15., false), Some(-1));
+        assert_eq!(step(&mut acc, 0., false), None);
+    }
+
+    #[test]
+    fn a_fractional_line_counts_as_its_pixels_toward_a_step() {
+        // A hi-res wheel's half line at a 20 px line: 10 px, not a notch, so
+        // the fourth such turn makes the step (not the 80th, as raw lines
+        // against 40 px would).
+        let half = ScrollDelta::Lines(point(0., 0.5));
+        let (dy, notch) = project::wheel_px(&half, px(20.));
+        assert_eq!((dy, notch), (10., false));
+        let mut acc = 0.;
+        for _ in 0..3 {
+            assert_eq!(project::wheel_step(&mut acc, dy, notch), None);
+        }
+        assert_eq!(project::wheel_step(&mut acc, dy, notch), Some(1));
+        // A whole line is a notch and steps at once; pixels are never one.
+        let line = ScrollDelta::Lines(point(0., -1.));
+        assert_eq!(project::wheel_px(&line, px(20.)), (-20., true));
+        let smooth = ScrollDelta::Pixels(point(px(0.), px(-60.)));
+        assert_eq!(project::wheel_px(&smooth, px(20.)), (-60., false));
     }
 
     fn pal(fg: u32) -> Pal {
