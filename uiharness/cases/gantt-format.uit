@@ -36,6 +36,9 @@ test gantt chart format bar styles toggle critical and baseline drawing
 
 test gantt chart format's two-letter KeyTip waits for its second letter (#1569)
   open ../fixtures/gantt-critical.xml
+  # The selected tab outlives the test before, which ends on Gantt Chart Format.
+  key alt h escape escape
+  assert ribbon_tab is Task
   key alt j
   assert keytips_up is true
   assert ribbon_tab is Task
@@ -47,6 +50,8 @@ test gantt chart format's two-letter KeyTip waits for its second letter (#1569)
   assert keytips_up is true
   key escape escape
   assert keytips_up is false
+  key alt h escape escape
+  assert ribbon_tab is Task
   key alt j x
   assert keytips_up is false
   assert ribbon_tab is Task
