@@ -7,7 +7,6 @@
 //! Theming (Auto/Light/Dark) follows gpui-component's theme; session hot-exit
 //! persists open tabs/files + the theme choice to `<config>/docxy/session.json`.
 
-
 // ⚠️ `harness-capture` must never apply off macOS, and must never do so
 // silently. It turns on gpui's test-support, which also makes gpui draw every
 // dirty window on each effect flush WITHOUT presenting it. On Windows that
@@ -23,8 +22,6 @@ compile_error!(
 
 mod about;
 mod accent;
-pub mod ext;
-mod tab_tear;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -56,6 +53,7 @@ mod doc_recovery;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
+pub mod ext;
 mod field_edit;
 mod file_keys;
 mod font_box;
@@ -112,6 +110,7 @@ mod sheet_clip_tests;
 mod sheet_complete;
 mod sheet_consolidate;
 mod sheet_drag;
+mod tab_tear;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
 /// and still far below what the quadratic version they guard took (minutes).
@@ -41476,7 +41475,9 @@ impl Render for Docxy {
                 window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
                     if phase == DispatchPhase::Capture
                         && ev.button == MouseButton::Left
-                        && tear.update(cx, |this, cx| this.tab_tear_release(ev.position, window, cx))
+                        && tear.update(cx, |this, cx| {
+                            this.tab_tear_release(ev.position, window, cx)
+                        })
                     {
                         cx.stop_propagation();
                     }
@@ -41670,7 +41671,9 @@ impl Render for Docxy {
             .child(title_bar)
             // An extension's tab draws its own ribbon below the strip; its
             // File reaches the suite's backstage through `ext::ShowBackstage`.
-            .when(!self.active_is_ext() || self.backstage, |d| d.child(ribbon_tabs))
+            .when(!self.active_is_ext() || self.backstage, |d| {
+                d.child(ribbon_tabs)
+            })
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(protected_bar, |d, b| d.child(b))
             .when_some(find_bar, |d, f| d.child(f))
@@ -51396,7 +51399,10 @@ impl Docxy {
 
     /// Whether the active tab's body is an extension's.
     fn active_is_ext(&self) -> bool {
-        matches!(self.tabs.get(self.active).map(|t| &t.surface), Some(Surface::Ext(_)))
+        matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Ext(_))
+        )
     }
 
     /// While an extension tab is the active one, it has the keys: a focus
