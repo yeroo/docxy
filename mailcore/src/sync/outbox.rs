@@ -53,43 +53,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             }
         }
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
-        OutboxOp::SendDraft { id } => {
-            let graph_id = ensure_draft_on_graph(client, store, id)?;
-            // Upload each pending attachment to the (now-on-Graph) draft before
-            // sending. A file-read or upload error returns here, so the drain's
-            // failure policy applies (a 5xx retries; anything else returns the
-            // draft to Drafts, #1874) and the attachments are NOT cleared — the
-            // send hasn't happened. Each one uploaded is marked `uploaded` at
-            // once, and one already marked (by an earlier send that then
-            // failed) is skipped, so a retry or a resend never attaches a file
-            // to the Graph draft twice.
-            for att in store
-                .outbound_attachments(&graph_id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?
-            {
-                if att.uploaded {
-                    continue;
-                }
-                let bytes = std::fs::read(&att.path).map_err(|e| {
-                    GraphError::Parse(format!("cannot read attachment {}: {e}", att.path))
-                })?;
-                client.add_attachment(
-                    &graph_id,
-                    &att.name,
-                    &content_type_for(&att.name),
-                    &bytes,
-                )?;
-                store
-                    .mark_outbound_attachment_uploaded(&graph_id, &att.path)
-                    .map_err(|e| GraphError::Parse(e.to_string()))?;
-            }
-            client.send_draft(&graph_id)?;
-            // The send happened: from here nothing may read as a failed send,
-            // which would return a delivered message to Drafts (#1874). A
-            // store error leaves the attachment rows behind, which is harmless.
-            let _ = store.clear_outbound_attachments(&graph_id);
-            Ok(())
-        }
+        OutboxOp::SendDraft { id } => apply_send(client, store, id, None),
         OutboxOp::RespondEvent {
             id,
             kind,
@@ -132,6 +96,87 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             }
         }
     }
+}
+
+/// Sends the draft `id`: `SaveDraft`'s create or PATCH, then each pending
+/// attachment, then the `/send` POST. `seq` is the queued op's outbox row
+/// (`None` for a call outside the outbox, which tracks nothing).
+///
+/// With a `seq`, `outbox.send_posted` is set right before the POST (#1874),
+/// so a lost answer (a 500 or 504 Graph may still have delivered, a dropped
+/// connection, a crash) counts; a POST Graph answered with a refusal (a 4xx,
+/// a 404, a 401, a 429/503 throttle) clears it, as nothing went out. A later attempt of a posted op first asks
+/// whether it went out, before any PATCH or upload: the local row gone (a
+/// Drafts delta's `@removed`), or Graph saying the draft id is gone (404) or
+/// no draft any more, is a delivered send (`Ok`, the attachment rows
+/// cleared). Graph saying it is still a draft clears the flag and sends it
+/// again. A failure of that check is returned as is: the drain keeps a
+/// retryable one queued and never returns a posted op to Drafts.
+///
+/// A file-read or upload error returns before the POST, so the drain's
+/// failure policy applies (a 5xx retries; anything else returns the draft
+/// to Drafts) and the attachments are NOT cleared. Each upload Graph
+/// confirmed is marked `uploaded` at once, and one already marked is
+/// skipped, so a confirmed upload is never repeated. An upload whose answer
+/// was lost (a 5xx or a dropped connection after Graph stored it), or whose
+/// marker could not be written, is uploaded again by the next attempt.
+pub(crate) fn apply_send(
+    client: &GraphClient,
+    store: &Store,
+    id: &str,
+    seq: Option<i64>,
+) -> Result<(), GraphError> {
+    let store_err = |e: crate::store::StoreError| GraphError::Parse(e.to_string());
+    if let Some(seq) = seq
+        && store.send_posted(seq).map_err(store_err)?
+    {
+        let Some((row, _)) = store.draft(id).map_err(store_err)? else {
+            return Ok(());
+        };
+        if !client.is_draft(&row.id)? {
+            let _ = store.clear_outbound_attachments(&row.id);
+            return Ok(());
+        }
+        store.set_send_posted(seq, false).map_err(store_err)?;
+    }
+    let graph_id = ensure_draft_on_graph(client, store, id)?;
+    for att in store.outbound_attachments(&graph_id).map_err(store_err)? {
+        if att.uploaded {
+            continue;
+        }
+        let bytes = std::fs::read(&att.path)
+            .map_err(|e| GraphError::Parse(format!("cannot read attachment {}: {e}", att.path)))?;
+        client.add_attachment(&graph_id, &att.name, &content_type_for(&att.name), &bytes)?;
+        store
+            .mark_outbound_attachment_uploaded(&graph_id, &att.path)
+            .map_err(store_err)?;
+    }
+    if let Some(seq) = seq {
+        store.set_send_posted(seq, true).map_err(store_err)?;
+    }
+    if let Err(e) = client.send_draft(&graph_id) {
+        // Graph answered and refused it (a 4xx, a 404, a 401, a 429/503
+        // throttle, which Graph never processed): it was not sent, so the
+        // failure is the send's own. Any other 5xx (a 500 or 504 may still
+        // deliver) or a lost answer leaves the flag for the next attempt's
+        // check.
+        let refused = matches!(
+            e,
+            GraphError::Http { status, .. } if status < 500
+        ) || matches!(
+            e,
+            GraphError::NotFound | GraphError::Unauthorized | GraphError::Throttled { .. }
+        );
+        if let (Some(seq), true) = (seq, refused) {
+            let _ = store.set_send_posted(seq, false);
+        }
+        return Err(e);
+    }
+    // The send happened: from here nothing may read as a failed send, which
+    // would return a delivered message to Drafts (#1874). A store error
+    // leaves the attachment rows behind, which is harmless.
+    let _ = store.clear_outbound_attachments(&graph_id);
+    Ok(())
 }
 
 /// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's

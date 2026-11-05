@@ -186,27 +186,47 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   write (`mark_sent`, and the move into Sent Items once that has synced),
   emits `SyncEvent::Sending { id }` and drains. A send left queued by an
   earlier run gets no `Sending`.
+- The drain applies a `SendDraft` through `outbox::apply_send` with the
+  op's `seq`. `outbox.send_posted` (migrated in `Store::init`) is set right
+  before the `/send` POST, so a lost answer or a crash counts. A refusal
+  Graph answered (a 4xx, a 404, a 401, a 429/503 throttle) clears it, as
+  nothing went out. A 500, a 504 or a dropped connection leaves it set:
+  Graph may still have delivered.
+- The next attempt of a posted op first checks delivery, before any PATCH
+  or upload. The local row gone (a Drafts delta's `@removed`), or
+  `GraphClient::is_draft` (`GET /me/messages/{id}?$select=isDraft`)
+  answering 404 or `false`, means delivered: `Sent`, and the id joins the
+  drain's `sent` list for `sync_after_send`. `true` clears the flag and
+  sends again. A failure of the check is never a failed send: a retryable
+  one keeps the op queued, any other keeps the attempts and quarantine
+  policy, and the row stays under Sent Items.
 - In `drain_outbox`, a 5xx still defers the op, and 401, 429/503 and
-  transport still stop the drain. Any other failure of a `SendDraft` (a 4xx,
-  a 404, a `Parse`: an attachment file that cannot be read, a store error)
-  is final on the first attempt. `Engine::fail_send` drops the op,
-  `Store::return_to_drafts` makes the row a draft again in the Drafts
-  folder (or the local sentinel), in one `draft_row_sql!` statement, emits
-  `SendFailed { id, error }` (`id` as the command carried it, `error` from
-  `outbox::send_error_text`: Graph's `error.message`, else `HTTP {status}`
-  or the failure's own text), then `MessagesUpdated` for Drafts and Sent
-  Items, and the drain goes on. A send is never quarantined: there is no
-  `Error` and no delta reconverge. After a 404 (the Graph draft is gone)
-  the Drafts delta may then remove the reverted row.
+  transport still stop the drain. Any other failure of a `SendDraft` whose
+  `/send` never went out (a 4xx, a 404, a `Parse`: an attachment file that
+  cannot be read, a store error) is final on the first attempt.
+  `Engine::fail_send` drops the op, and `Store::return_to_drafts` makes the
+  row a draft again in the Drafts folder (or the local sentinel), in one
+  `draft_row_sql!` statement. It emits `SendFailed { id, error }` (`id` as
+  the command carried it, `error` from `outbox::send_error_text`: Graph's
+  `error.message`, else `HTTP {status}` or the failure's own text), then
+  `MessagesUpdated` for Drafts and Sent Items, and the drain goes on. There
+  is no `Error` and no delta reconverge. A 404 here (the Graph draft is
+  gone, the send never posted) is a failed send, and the Drafts delta may
+  then remove the reverted row. After a posted send, a 404 means delivered
+  (above).
 - Once `/send` succeeded nothing may read as a failure: the clear of the
   attachment rows after it ignores a store error.
 - `outbound_attachments.uploaded` (migrated in `Store::init`) is set on a
-  row right after its upload, and `SendDraft` skips a row already set. A
-  resend after a failed send, or a retry after a 5xx, never attaches a
-  file twice. The rows stay until the send succeeds, so compose still lists
-  them. lookxy's Ctrl+R refuses to remove an uploaded one (a notice says it
-  is already on the server draft), as removing the row would not take it
-  off the Graph draft.
+  row right after Graph confirms its upload, and `apply_send` skips a row
+  already set. An upload Graph confirmed is never repeated, by a resend
+  after a failed send or a retry after a 5xx. An upload whose answer was
+  lost (a 5xx or a dropped connection after Graph stored it), or whose
+  marker could not be written, is uploaded again. The rows stay until the
+  send succeeds, so compose still lists them. lookxy keeps an uploaded row:
+  Ctrl+R refuses to remove one (a notice says it is already on the server
+  draft), and Discard removes only the rows not uploaded
+  (`Store::discard_pending_outbound_attachments`), since removing the row
+  would not take the file off the Graph draft.
 - lookxy shows a `SendFailed` as `Send failed: <error>` in `App::send_failure`,
   which no sync event clears: the engine settles to `State(Idle)` right after
   it, and that clears `error_notice`. The next key press clears it.

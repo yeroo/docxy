@@ -123,9 +123,11 @@ pub struct OutboundAttachment {
     pub path: String,
     pub name: String,
     pub size: i64,
-    /// Already on the Graph draft (#1874): a send uploaded it and then
-    /// failed, so a resend skips it rather than attaching it twice. Removing
-    /// it locally would not remove it from the Graph draft.
+    /// Already on the Graph draft (#1874): a send uploaded it, Graph
+    /// confirmed it, and the send then failed, so a resend skips it: a
+    /// confirmed upload is never repeated. An upload whose answer was lost,
+    /// or whose marker could not be written, is not marked and is uploaded
+    /// again. Removing it locally would not remove it from the Graph draft.
     pub uploaded: bool,
 }
 
@@ -642,6 +644,13 @@ impl Store {
         // (#1874: the file is already on the Graph draft).
         let _ = conn.execute(
             "ALTER TABLE outbound_attachments ADD COLUMN uploaded INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
+        // a `SendDraft` op's `/send` POST went out). An op from before it
+        // reads as never posted.
+        let _ = conn.execute(
+            "ALTER TABLE outbox ADD COLUMN send_posted INTEGER NOT NULL DEFAULT 0",
             [],
         );
         conn.execute(
@@ -1437,7 +1446,7 @@ impl Store {
 
     /// Marks the file `path` of `draft_id` as already on the Graph draft
     /// (#1874), right after `SendDraft` uploaded it, so a resend after a
-    /// failed send does not attach it twice. No-op if absent.
+    /// failed send does not upload it again. No-op if absent.
     pub fn mark_outbound_attachment_uploaded(
         &self,
         draft_id: &str,
@@ -1454,7 +1463,21 @@ impl Store {
         Ok(())
     }
 
-    /// Removes every attached file from `draft_id` (after a send, or on discard).
+    /// Removes the files attached to `draft_id` that are not on the Graph
+    /// draft yet (`uploaded = 0`): compose's Discard (#1874). An uploaded
+    /// one stays listed, as Send would still deliver it.
+    pub fn discard_pending_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "DELETE FROM outbound_attachments WHERE uploaded = 0 AND draft_id = ",
+                current_id_sql!()
+            ),
+            params![draft_id],
+        )?;
+        Ok(())
+    }
+
+    /// Removes every attached file from `draft_id` (after a send).
     pub fn clear_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
@@ -1733,6 +1756,38 @@ impl Store {
                 Ok(OutboxRow { seq, op, attempts })
             })
             .collect()
+    }
+
+    /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
+    /// (#1874). Set right before the POST, so a lost answer or a crash
+    /// counts; cleared once Graph says the message is still a draft. A
+    /// missing `seq` changes nothing.
+    pub fn set_send_posted(&self, seq: i64, posted: bool) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE outbox SET send_posted = ?2 WHERE seq = ?1",
+            params![seq, posted],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the `/send` POST of the op `seq` may have gone out
+    /// (`set_send_posted`). A missing `seq` is `false`.
+    pub fn send_posted(&self, seq: i64) -> Result<bool, StoreError> {
+        let posted = self
+            .conn
+            .query_row(
+                "SELECT send_posted FROM outbox WHERE seq = ?1",
+                params![seq],
+                |row| row.get::<_, bool>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(posted)
     }
 
     /// Removes a queued op by `seq` — called once it's been applied
@@ -4349,7 +4404,44 @@ mod draft_tests {
     }
 
     #[test]
-    fn init_adds_the_uploaded_column_to_an_old_outbound_attachments_table() {
+    fn send_posted_is_set_and_cleared_per_op() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G1".into() })
+            .unwrap();
+        let b = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G2".into() })
+            .unwrap();
+        assert!(!s.send_posted(a).unwrap());
+        s.set_send_posted(a, true).unwrap();
+        assert!(s.send_posted(a).unwrap());
+        assert!(!s.send_posted(b).unwrap(), "only that op");
+        s.set_send_posted(a, false).unwrap();
+        assert!(!s.send_posted(a).unwrap());
+        assert!(!s.send_posted(9999).unwrap(), "a missing op is not posted");
+    }
+
+    #[test]
+    fn discard_keeps_only_the_uploaded_attachments() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/up.pdf", "up.pdf", 1)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/new.pdf", "new.pdf", 1)
+            .unwrap();
+        s.reconcile_id(&id, "G").unwrap();
+        s.mark_outbound_attachment_uploaded(&id, "/tmp/up.pdf")
+            .unwrap();
+        s.discard_pending_outbound_attachments(&id).unwrap();
+        let left = s.outbound_attachments("G").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "up.pdf");
+        s.clear_outbound_attachments(&id).unwrap();
+        assert!(s.outbound_attachments("G").unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_adds_the_uploaded_and_send_posted_columns_to_old_tables() {
         let dir = std::env::temp_dir().join(format!(
             "mailcore-uploaded-migration-{}-{}",
             std::process::id(),
@@ -4366,7 +4458,13 @@ mod draft_tests {
                 "CREATE TABLE outbound_attachments (
                      draft_id TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
                      size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (draft_id, path));
-                 INSERT INTO outbound_attachments VALUES ('local:d', '/tmp/a.pdf', 'a.pdf', 1);",
+                 INSERT INTO outbound_attachments VALUES ('local:d', '/tmp/a.pdf', 'a.pdf', 1);
+                 CREATE TABLE outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, message_id TEXT,
+                     payload TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT);
+                 INSERT INTO outbox (seq, op, payload) VALUES
+                     (7, 'SendDraft', '{\"op\":\"SendDraft\",\"id\":\"G\"}');",
             )
             .unwrap();
         }
@@ -4374,6 +4472,12 @@ mod draft_tests {
         let got = s.outbound_attachments("local:d").unwrap();
         assert_eq!(got.len(), 1);
         assert!(!got[0].uploaded, "an old row is not on any Graph draft");
+        assert!(
+            !s.send_posted(7).unwrap(),
+            "an old op reads as never posted"
+        );
+        s.set_send_posted(7, true).unwrap();
+        assert!(s.send_posted(7).unwrap());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
