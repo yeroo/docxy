@@ -189,6 +189,25 @@ fn a_plain_message_and_its_gmail_quote() {
     assert_eq!(run(&d, "the notes").props.color, None);
     let attr = para(&d, "wrote:");
     assert_eq!(attr.props.indent, 0);
+    // The quote header's address is a mailto link (#1879).
+    let mailto: Vec<_> = attr
+        .content
+        .iter()
+        .filter_map(|i| match i {
+            Inline::Hyperlink(h) => Some((
+                h.target.as_deref(),
+                h.runs.iter().map(|r| r.text.as_str()).collect::<String>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        mailto,
+        [(
+            Some("mailto:sam@example.com"),
+            "sam@example.com".to_string()
+        )]
+    );
     // `margin:0 0 0 0.8ex; padding-left:1ex`: 1.8ex at 12pt is 216 twips,
     // and the right margin of 0 replaces the blockquote's default.
     let quoted = para(&d, "free for lunch");
@@ -204,6 +223,7 @@ fn every_prefix_of_every_fixture_imports_without_panicking() {
         "newsletter-tables.html",
         "outlook-reply.html",
         "plain-message.html",
+        "links.html",
     ] {
         let bytes = fixture(name);
         for i in 0..=bytes.len() {
