@@ -3935,6 +3935,29 @@ mod image_tests {
         );
     }
 
+    /// FIX r2b: an uncapped side over an extreme aspect overflowed u64 in
+    /// `picture_twips`.
+    #[test]
+    fn an_extreme_aspect_never_overflows() {
+        let page = format!(
+            "<p><img width=99999999999 src=\"data:image/png;base64,{}\">\
+             <img height=99999999999 src=\"data:image/png;base64,{}\"></p>",
+            b64(&png(1, 1_000_000)),
+            b64(&png(1_000_000, 1))
+        );
+        let mut none = |_: &str, _: usize| None;
+        let (d, _) =
+            import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut none)).unwrap();
+        let got = sizes(&d);
+        assert_eq!(got.len(), 2);
+        for (cx, cy) in got {
+            for side in [cx, cy] {
+                assert!((1..=crate::image::MAX_EMU).contains(&side), "{side}");
+            }
+            assert_eq!(cx, 624 * PX, "scaled to the body");
+        }
+    }
+
     #[test]
     fn height_still_means_nothing_on_a_table() {
         let page =

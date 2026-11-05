@@ -336,24 +336,29 @@ pub(crate) fn picture_twips(
     height: Option<u32>,
     pixels: Option<(u32, u32)>,
 ) -> Option<(u64, u64)> {
-    let (w, h) = match (width, height, pixels) {
-        (Some(w), Some(h), _) => (u64::from(w), u64::from(h)),
+    // In u128: a side may be any u32 (an `<img>`'s is not capped at a
+    // page) and the pixels any u32, so `w * ph` and then `h * body` can pass
+    // u64 (#1880 r2b).
+    let (w, h): (u128, u128) = match (width, height, pixels) {
+        (Some(w), Some(h), _) => (w.into(), h.into()),
         (Some(w), None, Some((pw, ph))) => {
-            (u64::from(w), u64::from(w) * u64::from(ph) / u64::from(pw))
+            (w.into(), u128::from(w) * u128::from(ph) / u128::from(pw))
         }
         (None, Some(h), Some((pw, ph))) => {
-            (u64::from(h) * u64::from(pw) / u64::from(ph), u64::from(h))
+            (u128::from(h) * u128::from(pw) / u128::from(ph), h.into())
         }
-        (Some(s), None, None) | (None, Some(s), None) => (u64::from(s), u64::from(s)),
-        (None, None, Some((pw, ph))) => (u64::from(pw) * 15, u64::from(ph) * 15),
+        (Some(s), None, None) | (None, Some(s), None) => (s.into(), s.into()),
+        (None, None, Some((pw, ph))) => (u128::from(pw) * 15, u128::from(ph) * 15),
         (None, None, None) => return None,
     };
-    let body = u64::from(BODY_TWIPS);
-    Some(if w > body {
+    let body = u128::from(BODY_TWIPS);
+    let (w, h) = if w > body {
         (body, h * body / w)
     } else {
         (w, h)
-    })
+    };
+    let side = |t: u128| u64::try_from(t).unwrap_or(u64::MAX);
+    Some((side(w), side(h)))
 }
 
 /// A box in twips as DrawingML's EMUs (635 a twip), each side within
