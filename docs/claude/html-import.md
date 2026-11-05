@@ -1,6 +1,6 @@
 # HTML import
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS and images. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## HTML import tables (#1878)
 
@@ -167,3 +167,56 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Out of scope: `<base href>`, MHTML, `<a>` around images, `srcset`,
   `<picture>`, background images, SVG/WebP (placeholders), `max-width`,
   float/align, the suite drawing a placeholder's alt text.
+
+## HTML import links (#1879)
+
+- `<a href>` is an `Inline::Hyperlink` (`raw: None`, no `rel_id`): an
+  absolute `http`, `https`, `ftp` or `mailto` URL as `target`, `#name` as
+  `anchor` (percent-decoded; `#` alone is no link). `link_of` reads the
+  `href` (references already decoded by `attrs_of`) as a browser's URL
+  parser does: leading and trailing controls and spaces trimmed, tabs and
+  line breaks inside removed (`java&#9;script:` is `javascript:`), then an
+  allow-list (`LINK_SCHEMES`), so any other scheme however spelled
+  (`javascript:`, `vbscript:`, `data:`, `file:`, `about:`), a relative
+  `href` (`page.html`, `/x`, `//host/x`, `?q`), an empty one or one holding
+  any other control character leaves plain text, as before. The scheme is
+  lowercased; space, `"`, `<`, `>` and `` ` `` are percent-encoded (the RTF
+  export quotes the target in `HYPERLINK "…"`). Over `MAX_HREF` (4096 bytes,
+  encoded) is no link; past twice that the `href` is refused unread.
+- The link is part of the computed `Look` (`link: Option<Rc<Link>>`, shared
+  so a clone is O(1)), set by `Cascade::presentational` for an `a` (none
+  for an `a` that is no link) and inherited, so `restyle`, mis-nesting and
+  the formatting-element reopen (`a` is in `FORMATTING`) carry it: a link
+  across `<p>` boundaries is a link in each paragraph. An `a` closes the
+  open `a` first (`close_tag("a")`, a no-op with none open or across a
+  table or cell), and the formatting open inside it is reopened under the
+  new one, as the adoption agency does.
+- `Builder::link_text` writes text in a link: it joins the last inline when
+  that is a link the importer made to the same place (`Link::made`), so two
+  adjacent `<a>`s to one target are one link; a different target never
+  joins. The owed space keeps the link it was owed in. A break (`br`, a
+  `pre` line), tab (`pre` or Word's `mso-tab-count` span) or picture inside
+  a link is written outside it: the link goes on after it as another link
+  to the same place, so every imported link is a runs-only one. An
+  unresolved, unsized image's `alt` text is the link's text.
+- A link has the user-agent look (`underline`, `LINK_COLOR` `0563C1`, Word's
+  Hyperlink colour) as direct formatting, set before the page's rules, which
+  override it (Word's own `a:link` rule is a pseudo-class `css.rs` drops; a
+  page's plain `a` rule applies). `color: inherit` / `currentcolor`
+  (`Color::Keep`) now gives back the parent's colour
+  (`Cascade::parent_color`) over a user-agent or presentational one.
+- For the empty-paragraph rule a link counts by its text (`is_object`
+  excludes `Inline::Hyperlink`: `<p><a href=u>&nbsp;</a></p>` is an empty
+  paragraph), and `take_leading_marker` never cuts into a link.
+- Relationships: none are made at import. `save_package` mints an external
+  relationship for every target-only link (`collect_external_links`, cells
+  too), so the Markdown package `HtmlImport::package` builds, the suite's
+  converting child and an `import_html` caller's save all keep the URLs.
+- Known limits: CSS text decorations propagate in a browser (a
+  `text-decoration:none` span inside a link still shows the link's
+  underline), but here underline is an inherited run property, so that
+  span's text loses it. No bookmarks for `<a name>`/`id` (an anchor link
+  has nowhere to jump yet), no `Hyperlink` character style (`w:rStyle`; the
+  Markdown package defines none), no `<base href>` or relative links, no
+  hyperlinked pictures, no `title` (`w:tooltip`) or `target`
+  (`w:tgtFrame`).
