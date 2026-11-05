@@ -96,6 +96,8 @@ impl DocView {
     /// A view of `doc`, its pictures read from `pkg` (`None`: each picture
     /// draws as its frame).
     pub fn new(doc: Document, pkg: Option<Package>, cx: &mut Context<Self>) -> Self {
+        // The host may not run the suite's `run` (#1900).
+        crate::font_subst::init(cx);
         let pictures = Rc::new(RefCell::new(pictures::Cache::default()));
         pictures::register_extra(&pictures);
         cx.on_release(|this: &mut Self, _cx| {
@@ -501,6 +503,10 @@ impl Render for DocView {
             theme_dark,
             self.content_dark,
         );
+        // The document's inherited font: the host's (whatever its ancestors
+        // set), made loadable without touching the host's theme (#1900). The
+        // same family `Measurer::new` measures in, so measured = drawn.
+        let ui_font = crate::font_subst::ui_family(&window.text_style().font().family);
         let measurer = Measurer::new(window);
         let sheet = self.run_styles.borrow_mut().current(self.pkg.as_ref()).1;
         let tbl = TableCtx::new(self.pkg.as_ref(), sheet, false);
@@ -540,6 +546,7 @@ impl Render for DocView {
         let viewport = self.viewport.clone();
         div()
             .id("ext-doc-view")
+            .font_family(ui_font)
             .track_focus(&self.focus)
             .relative()
             .size_full()

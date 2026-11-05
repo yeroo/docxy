@@ -11,7 +11,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the PDF export (
   only), writes the Type0/CIDFontType2/`/W`/ToUnicode objects
   (`export/cid.rs`) and Flate-compresses with its own `deflate`. Parsing fonts
   and finding them is `pdffont` (ttf-parser, system directories, Office
-  aliases, script fallbacks). A face is indexed under both its legacy (ID 1)
+  substitutes from `docxcore::fonts::substitutes`, shared with the suite's
+  screen fonts (#1900), script fallbacks). A face is indexed under both its legacy (ID 1)
   and typographic (ID 16) family; Macintosh Roman names follow the Windows
   ones, so an English name kept only on the Mac platform still matches. Italic
   is macStyle, OS/2 fsSelection, `post` angle or the style name. A request

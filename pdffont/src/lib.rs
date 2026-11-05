@@ -105,22 +105,6 @@ const DEFAULT_FAMILIES: &[&str] = &[
     "FreeSans",
 ];
 
-/// Metric-compatible or look-alike families for the usual Office fonts.
-fn aliases(family: &str) -> &'static [&'static str] {
-    match family {
-        "arial" | "arial narrow" => &["Liberation Sans", "Arimo", "Helvetica"],
-        "calibri" | "calibri light" => &["Carlito", "Liberation Sans"],
-        "cambria" => &["Caladea", "Liberation Serif"],
-        "times new roman" | "times" => &["Liberation Serif", "Tinos", "Times", "DejaVu Serif"],
-        "courier new" | "courier" | "consolas" => {
-            &["Liberation Mono", "Cousine", "Menlo", "DejaVu Sans Mono"]
-        }
-        "georgia" | "garamond" | "book antiqua" => &["DejaVu Serif", "Liberation Serif"],
-        "verdana" | "tahoma" | "trebuchet ms" | "segoe ui" => &["DejaVu Sans", "Liberation Sans"],
-        _ => &[],
-    }
-}
-
 // ---- reading font files ----
 
 #[derive(Clone, Copy)]
@@ -651,7 +635,7 @@ impl PdfFontProvider for FontSet {
         let mut tries: Vec<&str> = Vec::new();
         if !wanted.is_empty() {
             tries.push(wanted);
-            tries.extend(aliases(&key.0));
+            tries.extend(docxcore::fonts::substitutes(&key.0));
         }
         tries.extend(DEFAULT_FAMILIES);
         let found = tries.into_iter().find_map(|f| self.best(f, bold, italic));

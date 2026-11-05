@@ -38,6 +38,7 @@ pub mod export_rtf;
 pub mod export_text;
 pub mod field;
 pub mod final_mark;
+pub mod fonts;
 pub mod frame;
 pub mod hf;
 pub mod highlight;

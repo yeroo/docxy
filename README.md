@@ -425,6 +425,16 @@ Or grab prebuilt binaries (Linux / Windows / macOS) from the
 ship with every release, each checksummed, cosign-signed, and carrying a
 build-provenance attestation.
 
+On Linux, install the fonts metric-compatible with Office's (Calibri, Cambria,
+Arial, Times New Roman, Courier New), so documents and mail break lines where
+Word and Outlook do:
+
+```sh
+sudo apt install fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation
+```
+
+Without them the suite and PDF export draw in the nearest installed family.
+
 ## Image support
 
 Real image pixels need a graphics-capable terminal:

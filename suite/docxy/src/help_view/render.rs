@@ -330,7 +330,9 @@ impl Docxy {
                     .bg(pal.panel)
                     .border_1()
                     .border_color(pal.border)
-                    .font_family(CODE_FONT)
+                    .when_some(crate::font_subst::family(CODE_FONT), |d, f| {
+                        d.font_family(f)
+                    })
                     .text_size(px(13.));
                 for l in lines {
                     // An empty line keeps its height.
@@ -472,10 +474,12 @@ impl Docxy {
                             .when(*bold, |d| d.font_weight(FontWeight::BOLD))
                             .when(*italic, |d| d.italic())
                             .when(*code, |d| {
-                                d.font_family(CODE_FONT)
-                                    .bg(pal.panel)
-                                    .px(px(2.))
-                                    .rounded_sm()
+                                d.when_some(crate::font_subst::family(CODE_FONT), |d, f| {
+                                    d.font_family(f)
+                                })
+                                .bg(pal.panel)
+                                .px(px(2.))
+                                .rounded_sm()
                             })
                             .into_any_element()
                     })

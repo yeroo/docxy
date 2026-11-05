@@ -1177,7 +1177,8 @@ pub(crate) fn gantt_overlay(view: &ProjectView, pal: Pal) -> Option<impl IntoEle
     let scroll = view.scroll.clone();
     let (table_w, gantt_w, gantt_x) = (view.table_w, view.gantt_w, view.gantt_x.get());
     let font = Font {
-        family: "Segoe UI".into(),
+        family: crate::font_subst::family("Segoe UI")
+            .unwrap_or_else(|| crate::font_subst::ui_family(&Font::default().family)),
         ..Default::default()
     };
     let _ = pal;
@@ -1378,8 +1379,8 @@ fn overlay_text_run(
     strikethrough: Option<bool>,
 ) -> TextRun {
     let mut font = base.clone();
-    if let Some(family) = family {
-        font.family = family.to_string().into();
+    if let Some(family) = family.and_then(crate::font_subst::family) {
+        font.family = family;
     }
     match bold {
         Some(true) => font.weight = FontWeight::BOLD,

@@ -59,6 +59,7 @@ mod ext_fixture;
 mod field_edit;
 mod file_keys;
 mod font_box;
+mod font_subst;
 mod harness;
 mod help_manual;
 mod help_tab;
@@ -15739,6 +15740,7 @@ impl Docxy {
         let desired = self.theme_pref.resolve(self.os_appearance);
         if self.applied != Some(desired) {
             Theme::change(desired, Some(window), cx);
+            font_subst::apply_to_theme(cx);
             self.applied = Some(desired);
             let dark = desired.is_dark();
             for t in &self.tabs {
@@ -33061,9 +33063,13 @@ struct Measurer {
 
 impl Measurer {
     fn new(window: &Window) -> Self {
+        // The inherited font is the theme's; an embedding host's may not
+        // load (#1900), and DocView's root draws in its resolved family.
+        let mut base = window.text_style().font();
+        base.family = font_subst::ui_family(&base.family);
         Measurer {
             ts: window.text_system().clone(),
-            base: window.text_style().font(),
+            base,
         }
     }
     /// Rendered pixel width of `text` at `size` px in the base font (bold/italic
@@ -33086,8 +33092,9 @@ impl Measurer {
             return 0.0;
         }
         let mut font = self.base.clone();
-        if let Some(family) = family {
-            font.family = SharedString::from(family.to_string());
+        // Measured in the family drawn (#1900).
+        if let Some(family) = family.and_then(font_subst::family) {
+            font.family = family;
         }
         if bold {
             font.weight = FontWeight::BOLD;
@@ -33152,6 +33159,8 @@ fn emit_words(
     pal: Pal,
     zoom: f32,
 ) {
+    // Resolved once per run, not per word (#1900).
+    let family = props.font.as_deref().and_then(font_subst::family);
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
@@ -33201,7 +33210,7 @@ fn emit_words(
                 .child(styled)
                 .text_size(px(size))
                 .text_color(color)
-                .when_some(props.font.clone(), |d, family| d.font_family(family))
+                .when_some(family.clone(), |d, f| d.font_family(f))
                 .when(props.bold, |d| d.font_weight(FontWeight::BOLD))
                 .when(props.italic, |d| d.italic())
                 .when(props.underline || is_link, |d| d.underline())
@@ -38701,7 +38710,9 @@ impl Docxy {
                     .when(!selected, |d| d.hover(move |d| d.bg(hover)))
                     .child(
                         div()
-                            .font_family(sg::SAMPLE_FAMILY)
+                            .when_some(font_subst::family(sg::SAMPLE_FAMILY), |d, f| {
+                                d.font_family(f)
+                            })
                             .text_size(px(look.size))
                             .font_weight(FontWeight(look.weight as f32))
                             .text_color(Hsla::from(sg::ink_rgba(look.ink, fg)))
@@ -46296,6 +46307,11 @@ pub fn run(extensions: ext::Extensions) {
         .with_quit_mode(quit_mode());
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // Fonts resolved once, and the theme's families made loadable: on
+        // Linux `.SystemUIFont` is IBM Plex Sans, which the suite does not
+        // embed (#1900).
+        font_subst::init(cx);
+        font_subst::apply_to_theme(cx);
         doc_view::set_harness(want_harness);
         if let Some(mut extensions) = extensions.take() {
             // A harness case that asks for the test extension (#1873) gets it
