@@ -41877,7 +41877,7 @@ impl Render for Docxy {
                             .gap_1()
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
-                            // Keep it last so scroll_to_item(b) still indexes block b.
+                            // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.
                             // A percent width resolves against the scroll area,
                             // not its scrolled extent: it is the text width.
                             // Its prepaint comes after the scroll area has

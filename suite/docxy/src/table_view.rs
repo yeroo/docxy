@@ -225,7 +225,7 @@ fn wants(t: &Table) -> Wants {
                     .parse::<f64>()
                     .ok()
                     .filter(|v| v.is_finite() && *v > 0.)
-                    .map(|v| (v * 50.).round().min(MAX_FIT_PCT as f64) as u64),
+                    .map(|v| (v * 50.).round() as u64),
                 None => w.parse::<u64>().ok(),
             };
             fiftieths
