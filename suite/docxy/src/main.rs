@@ -7095,6 +7095,19 @@ mod link_colour_tests {
     }
 
     #[test]
+    fn the_theme_palette_takes_the_link_colour_of_its_ground_1906() {
+        use gpui_component::ThemeColor;
+        assert_eq!(
+            Pal::from_theme(&ThemeColor::dark(), true).link,
+            hsla_u(LINK_DARK)
+        );
+        assert_eq!(
+            Pal::from_theme(&ThemeColor::light(), false).link,
+            hsla_u(LINK)
+        );
+    }
+
+    #[test]
     fn the_theme_link_colour_reads_on_the_theme_1906() {
         for dark in [false, true] {
             let theme = if dark {
@@ -7431,13 +7444,8 @@ mod ruler_geom_tests {
                 gpui_component::ThemeColor::light()
             };
             let pal = Pal {
-                fg: theme.foreground,
-                dim: theme.muted_foreground,
-                border: theme.border,
-                panel: theme.secondary,
                 hover: theme.foreground,
-                sel: theme.selection,
-                link: theme.foreground,
+                ..Pal::from_theme(&theme, dark)
             };
             let colors = ruler_colors(pal, dark);
             assert!(colors.content.l - colors.ground.l >= 0.30);
@@ -9025,6 +9033,11 @@ impl Pal {
     /// having it threaded through every signature.
     fn of(cx: &App) -> Pal {
         let t = cx.theme();
+        Pal::from_theme(t, t.mode.is_dark())
+    }
+
+    /// The palette of theme colours `t`, whose ground is dark when `dark`.
+    fn from_theme(t: &gpui_component::ThemeColor, dark: bool) -> Pal {
         let fg = t.foreground;
         Pal {
             fg,
@@ -9035,7 +9048,7 @@ impl Pal {
             // clearly visible on both light and dark grounds.
             hover: Hsla { a: 0.12, ..fg },
             sel: t.selection,
-            link: hsla_u(theme_link(t.mode.is_dark())),
+            link: hsla_u(theme_link(dark)),
         }
     }
 }

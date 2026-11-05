@@ -930,29 +930,33 @@ mod tests {
     #[test]
     fn an_uncoloured_link_reads_on_the_light_and_the_dark_content_page_1906() {
         use crate::style_gallery::contrast;
-        // The palette `Pal::of` reads off gpui-component's stock dark theme.
-        let dark = gpui_component::ThemeColor::dark();
-        let theme = Pal {
-            link: hsla_u(crate::theme_link(true)),
-            ..pal(0xeeeeee)
-        };
-        for (theme_dark, content_dark) in [(false, false), (true, false), (true, true)] {
-            let (bg, p) = content_look(theme, dark.background, theme_dark, content_dark);
-            let r = contrast(p.link.to_rgb(), bg.to_rgb());
-            assert!(
-                r >= 4.5,
-                "theme {theme_dark} content {content_dark}: {r:.2}"
-            );
+        use gpui_component::ThemeColor;
+        // The palettes `Pal::of` builds from gpui-component's stock themes,
+        // and each theme's background.
+        for theme_dark in [false, true] {
+            let t = if theme_dark {
+                ThemeColor::dark()
+            } else {
+                ThemeColor::light()
+            };
+            let theme = Pal::from_theme(&t, theme_dark);
+            for content_dark in [false, true] {
+                let (bg, p) = content_look(theme, t.background, theme_dark, content_dark);
+                let r = contrast(p.link.to_rgb(), bg.to_rgb());
+                assert!(
+                    r >= 4.5,
+                    "theme dark {theme_dark}, content dark {content_dark}: {r:.2}"
+                );
+                // The dark page draws the theme's light link blue, the white
+                // page the usual one.
+                let want = if theme_dark && content_dark {
+                    crate::LINK_DARK
+                } else {
+                    crate::LINK
+                };
+                assert_eq!(p.link, hsla_u(want));
+            }
         }
-        // The dark page is the theme's; on the white page the usual blue.
-        assert_eq!(
-            content_look(theme, dark.background, true, true).1.link,
-            theme.link
-        );
-        assert_eq!(
-            content_look(theme, dark.background, true, false).1.link,
-            hsla_u(crate::LINK)
-        );
     }
 
     fn b(x: f32) -> Bounds<Pixels> {
