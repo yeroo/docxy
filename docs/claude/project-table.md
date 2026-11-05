@@ -1,6 +1,6 @@
 # Project table
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Entry table: columns, AutoFilter, the summary row, the prompt bar, selection and the row menu. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Entry table (columns, AutoFilter, the summary row, the prompt bar, selection and the row menu) or the `Editor`'s sort, filters and displayed rows. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Project table: resizable columns and AutoFilter (#1533)
 

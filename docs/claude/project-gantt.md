@@ -1,6 +1,6 @@
 # Project Gantt chart
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Gantt chart drawing: timescale, Timeline pane, gridlines, bar styles, layout, palette. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Gantt chart drawing: timescale and zoom, Timeline pane, gridlines, bar styles, layout, palette. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Timescale tier text styles (#1666)
 

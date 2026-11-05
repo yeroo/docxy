@@ -1,6 +1,6 @@
 # Project scheduling
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's scheduling: leveling and elapsed durations. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's scheduling (leveling, elapsed durations) or how MSPDI and `.mpp` carry the scheduled dates. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Project leveling as a plan edit (#1594)
 

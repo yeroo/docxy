@@ -1,6 +1,6 @@
 # Terminal editors
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing the terminal editors (`docxy`, `xlsxy`, `yppxy`): the Layout tab and line editing in their prompts. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing the terminal editors (`docxy`, `xlsxy`, `yppxy`): the Layout tab and line editing in their prompts and in `backstagecore`'s Save As name. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Terminal docxy Layout tab (#1274)
 

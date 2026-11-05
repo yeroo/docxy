@@ -1,6 +1,6 @@
 # Sheet file model
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `gridcore`'s comments, slicers, data validation and hyperlinks on load and save. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes, slicers, data validation or hyperlinks in `gridcore`, and the dialogs and Undo over them. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Sheet notes follow row/column insert and delete (#1335)
 

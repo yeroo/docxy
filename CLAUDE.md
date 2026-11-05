@@ -24,10 +24,11 @@ Each file holds the notes of one area, moved here from this file in #1903. Grep 
 issue number to find its notes.
 
 - `docs/claude/docx-editing.md`: before changing the document editor's lists, indents,
-  hyphenation, sections or headers/footers: lists, numId 0 and indents (#1653, #1728),
-  manual hyphenation (#1266), Page Setup / Columns Apply to Selected text (#1272), Layout
-  settings.xml undo steps (#1273), Header & Footer leftovers (#1433), live page fields
-  (#1437).
+  hyphenation, sections, settings.xml or headers/footers: lists, numId 0 and indents
+  (#1653, #1728, #1792, #1814, #1815), manual hyphenation (#1266), Page Setup / Columns
+  Apply to Selected text (#1272), Layout settings.xml undo steps (#1273), Header & Footer
+  leftovers: `w:ptab`, bound Company/Manager properties, Date & Time (#1433), live page
+  fields (#1437).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427).
@@ -40,44 +41,52 @@ issue number to find its notes.
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
-  screen (#806), the title label and accent per tab type (#1473).
-- `docs/claude/suite-extensions.md`: before changing extension surfaces (Mail tabs),
-  tab tear-off or the embedded `ext::DocView` (#1873).
+  screen (#806), the title label and accent per tab type, and where the theme button
+  lives (#1473).
+- `docs/claude/suite-extensions.md`: before changing the suite as a library
+  (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
+  `ext::DocView` (#1873).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
   a help target (`every_ribbon_command_has_a_help_target`: `docs/claude/help.md`).
 - `docs/claude/help.md`: before changing the help manuals or the Documentation tab:
   manual bundles (#1022), the Help tab and F1 (#1855).
-- `docs/claude/ui-plugins.md`: before changing the UI plugin ABI or the plugin dialogs:
-  UI plugins (#1532), dialog values that follow (#1670), overlay text style (#1668),
-  the rich-text control (#1557), grid `cell` columns (#1558).
+- `docs/claude/ui-plugins.md`: before changing the UI plugin ABI, the plan's formatting
+  model (`projcore::formatting`, `formatting.xml`) or the plugin dialogs and their layout:
+  UI plugins (#1532, #1553, #1572, #1609), dialog values that follow (#1670), overlay text
+  style (#1668), the rich-text control (#1557), grid `cell` columns (#1558).
 - `docs/claude/project-formats.md`: before changing Project file reading or writing:
   format plugins (#1702, #1801), MPX import (#309, #1805), `.mpp` custom fields (#292).
-- `docs/claude/project-text-styles.md`: before changing Project's text styles:
-  strikethrough and pattern (#1664), categories the host computes (#1665), categories that
-  need a model feature (#1667). The timescale tier styles (#1666) are in
-  `docs/claude/project-gantt.md`.
-- `docs/claude/project-gantt.md`: before changing Project's Gantt chart drawing:
+- `docs/claude/project-text-styles.md`: before changing Project's text styles or the
+  task facts they style: strikethrough and pattern (#1664), categories the host computes
+  (#1665), categories that need a model feature: Marked, Highlight, changed cells (#1667).
+  The timescale tier styles (#1666) are in `docs/claude/project-gantt.md`.
+- `docs/claude/project-gantt.md`: before changing Project's Gantt chart drawing or zoom:
   timescale tier text styles (#1666), gridlines (#1575, #1688, #1759), bar style rows
-  (#1696), layout fields (#1695), palette manual and inactive bars (#1760), timescale and
-  Timeline pane (#1535).
-- `docs/claude/project-table.md`: before changing Project's Entry table: resizable
-  columns and AutoFilter (#1533, #1607), the summary row (#1511), the prompt bar (#1370),
-  the selection look (#1534), the row menu and mini toolbar (#1537).
+  (#1696), layout fields (#1695), palette manual and inactive bars (#1760), timescale,
+  zoom, the Zoom and Timescale dialogs and the Timeline pane (#1535).
+- `docs/claude/project-table.md`: before changing Project's Entry table, or the
+  `Editor`'s sort, filters and displayed rows (yppxy's too): resizable columns and
+  AutoFilter (#1533, #1607), the summary row (#1511), the prompt bar (#1370), the
+  selection look (#1534), the row menu and mini toolbar (#1537).
 - `docs/claude/project-task-info.md`: before changing Task Information or task notes:
   rich task notes (#1801, #1803), the dialog (#1368), its top row, grids and date combos
   (#1536, #1682).
-- `docs/claude/project-scheduling.md`: before changing Project scheduling: leveling as a
-  plan edit (#1594), elapsed durations and Must Start On before opening (#484).
+- `docs/claude/project-scheduling.md`: before changing Project scheduling, or how MSPDI
+  and `.mpp` carry scheduled dates: leveling as a plan edit (#1594), elapsed durations and
+  Must Start On before opening (#484).
 - `docs/claude/sheet-ui.md`: before changing the sheet's tab rename (#1365), Home Font /
   Font Size boxes (#1344) or Save As names (#804, #1807).
-- `docs/claude/sheet-file.md`: before changing `gridcore`'s load and save of notes
-  (#1335), table slicers (#1694, #1741), x14 data validation (#1817, #1734), pivot slicer
-  and timeline caches (#1797), `.xls` hyperlinks and file URIs (#1726).
+- `docs/claude/sheet-file.md`: before changing a sheet's notes, slicers, data validation
+  or hyperlinks in `gridcore` (and the dialogs and Undo over them): notes that follow
+  row/column insert and delete (#1335), table slicers on save and Undo of a table step
+  (#1694, #1741), x14 rules in the Data Validation dialog (#1817, #1734), pivot slicer and
+  timeline caches on save (#1797), `.xls` hyperlinks and file URIs (#1726).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
-  `yppxy`: docxy's Layout tab (#1274), prompts editing at a caret (#1372, #1373, #1374,
-  #1375, #1379), Ctrl+C/X/V (#1377, #1378), Ctrl+A (#1376).
+  `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
+  editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
+  Ctrl+A (#1376).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
   id (#1884, #1881), the body format (#1901).
 

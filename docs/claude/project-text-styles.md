@@ -1,6 +1,6 @@
 # Project text styles
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's text styles and the row categories they apply to. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's text styles and the row categories they apply to, including the model's Marked, Highlight and changed cells. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Text style strikethrough and pattern (#1664)
 

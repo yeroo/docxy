@@ -1,6 +1,6 @@
 # Suite shell
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's window chrome: the start screen, the title bar label and the accent. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's window chrome: the start screen, the title bar label, the accent and the theme command. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## Start screen (#806)
 
