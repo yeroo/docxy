@@ -25,6 +25,12 @@ jobs:
       DOCXY_BUILD_KIND: ci
     steps:
       - uses: actions/checkout@v7
+      # CLAUDE.md under budget, its sections only the kept ones, every
+      # docs/claude/ area file in its index (#1903). Before the toolchain, so
+      # a docs failure shows in seconds; one leg is enough.
+      - name: CLAUDE.md budget and area-note index
+        if: runner.os == 'Linux'
+        run: python3 scripts/check-claude-md.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
