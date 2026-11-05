@@ -52,9 +52,10 @@ pub enum ComposeAction {
 }
 
 /// The compose view's state: the three header fields, the rich-text body
-/// editor, which field has focus, and the id of the draft being edited (a
-/// `local:<uuid>` id for a brand-new message, or the Graph id once a save
-/// has reconciled it — opaque to this module either way).
+/// editor, which field has focus, and the id the draft was opened under (a
+/// `local:<uuid>` id for a brand-new message stays so after a save
+/// reconciles the draft to its Graph id: the store still resolves it,
+/// #1884) — opaque to this module either way.
 pub struct Compose {
     pub to: String,
     pub cc: String,

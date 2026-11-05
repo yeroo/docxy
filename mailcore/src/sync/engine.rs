@@ -124,9 +124,10 @@ pub enum SyncCommand {
     /// Push a draft's currently-stored fields to Graph (optimistic write
     /// already applied by the caller — compose autosaves via
     /// `Store::update_draft_fields` directly): enqueue
-    /// [`crate::store::OutboxOp::SaveDraft`] and drain. A `local:` id is
-    /// created on Graph and reconciled (see `sync::outbox::apply_op`); an
-    /// already-synced id is patched in place.
+    /// [`crate::store::OutboxOp::SaveDraft`] and drain. A `local:` id not yet
+    /// on Graph is created there and reconciled (see `sync::outbox::apply_op`);
+    /// a Graph id, or a `local:` id already reconciled to one (#1884), is
+    /// patched in place.
     SaveDraft { id: String },
     /// Hand a draft to Graph for delivery: optimistically mark it sent and
     /// (if the Sent folder has synced) move it there locally, then enqueue
