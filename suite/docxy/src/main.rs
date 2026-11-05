@@ -6983,6 +6983,145 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 }
 
 #[cfg(test)]
+mod link_colour_tests {
+    use super::*;
+    use crate::style_gallery::contrast;
+    use core::prelude::v1::test;
+
+    /// A light (theme ink, LINK) and a dark (light ink, LINK_DARK) palette.
+    fn link_pals() -> [Pal; 2] {
+        [0xffffff, 0x000000].map(|sheet| page_pal(sheet, hsla_u(0x123456)))
+    }
+
+    #[test]
+    fn link_run_paints_in_its_own_colour_1906() {
+        let grey = RunProps {
+            color: Some("7F7F7F".into()),
+            ..Default::default()
+        };
+        for pal in link_pals() {
+            assert_eq!(run_ink(&grey, true, &pal), hsla_u(0x7f7f7f));
+            // As any other run does.
+            assert_eq!(run_ink(&grey, false, &pal), hsla_u(0x7f7f7f));
+        }
+    }
+
+    #[test]
+    fn uncoloured_link_takes_the_palette_link_colour_1906() {
+        for pal in link_pals() {
+            for color in [None, Some("auto".to_string()), Some("12345".to_string())] {
+                let props = RunProps {
+                    color,
+                    ..Default::default()
+                };
+                assert_eq!(run_ink(&props, true, &pal), pal.link);
+                // Other text keeps the palette's ink.
+                assert_eq!(run_ink(&props, false, &pal), pal.fg);
+            }
+        }
+    }
+
+    #[test]
+    fn the_link_colour_follows_the_page_1906() {
+        let sel = hsla_u(0x123456);
+        assert_eq!(design_tab::page_link(0xffffff), LINK);
+        assert_eq!(page_pal(0xffffff, sel).link, hsla_u(LINK));
+        let r = contrast(rgb(LINK), rgb(0xffffff));
+        assert!(r >= 4.5, "white: {r:.2}");
+        // Light page colours keep the usual blue (4.25:1 on #F2F2F2, as
+        // before #1906), dark ones take the light one, which reads on them.
+        for sheet in [0xf2f2f2, 0xfff2cc] {
+            assert_eq!(page_pal(sheet, sel).link, hsla_u(LINK), "{sheet:06x}");
+        }
+        for sheet in [0x000000, 0x0a0a0a, 0x1f1f1f, 0x262626] {
+            assert_eq!(design_tab::page_link(sheet), LINK_DARK, "{sheet:06x}");
+            assert_eq!(page_pal(sheet, sel).link, hsla_u(LINK_DARK));
+            let r = contrast(rgb(LINK_DARK), rgb(sheet));
+            assert!(r >= 4.5, "{sheet:06x}: {r:.2}");
+        }
+    }
+
+    #[test]
+    fn a_cell_fill_picks_the_link_colour_its_ink_takes_1906() {
+        for pal in link_pals() {
+            assert_eq!(cell_pal(pal, Some(0x000000)).link, hsla_u(LINK_DARK));
+            assert_eq!(cell_pal(pal, Some(0x1f1f1f)).link, hsla_u(LINK_DARK));
+            assert_eq!(cell_pal(pal, Some(0xffffff)).link, hsla_u(LINK));
+            // No fill: the surrounding page's.
+            assert_eq!(cell_pal(pal, None).link, pal.link);
+        }
+    }
+
+    #[test]
+    fn a_tracked_change_in_a_link_draws_as_link_text_1906() {
+        use docxcore::model::{Hyperlink, RevisionKind, RevisionMetadata, Run};
+        let run = |t: &str| Run {
+            text: t.into(),
+            props: RunProps::default(),
+        };
+        let ins = |content: Vec<Inline>| Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content,
+            content_changed: false,
+        };
+        let flags = |content: &[Inline], in_link: bool| -> Vec<(String, bool)> {
+            revision_runs(content, in_link)
+                .into_iter()
+                .map(|(r, l)| (r.text.clone(), l))
+                .collect()
+        };
+        let own = |t: &str, l: bool| (t.to_string(), l);
+        // A change in a link's content: every run in it is link text, nested
+        // changes too.
+        let change = vec![Inline::Run(run("a")), ins(vec![Inline::Run(run("b"))])];
+        assert_eq!(flags(&change, true), vec![own("a", true), own("b", true)]);
+        // Outside a link only a hyperlink within the change is.
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://example.com".into()),
+            anchor: None,
+            rel_id: None,
+            runs: vec![run("c")],
+            content: vec![ins(vec![Inline::Run(run("d"))])],
+            raw: None,
+            content_changed: false,
+        });
+        let change = vec![Inline::Run(run("a")), link];
+        assert_eq!(
+            flags(&change, false),
+            vec![own("a", false), own("c", true), own("d", true)]
+        );
+    }
+
+    #[test]
+    fn the_theme_palette_takes_the_link_colour_of_its_ground_1906() {
+        use gpui_component::ThemeColor;
+        assert_eq!(
+            Pal::from_theme(&ThemeColor::dark(), true).link,
+            hsla_u(LINK_DARK)
+        );
+        assert_eq!(
+            Pal::from_theme(&ThemeColor::light(), false).link,
+            hsla_u(LINK)
+        );
+    }
+
+    #[test]
+    fn the_theme_link_colour_reads_on_the_theme_1906() {
+        for dark in [false, true] {
+            let theme = if dark {
+                gpui_component::ThemeColor::dark()
+            } else {
+                gpui_component::ThemeColor::light()
+            };
+            let r = contrast(rgb(theme_link(dark)), theme.background.to_rgb());
+            assert!(r >= 4.5, "dark={dark}: {r:.2}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod ruler_geom_tests {
     use super::{
         BandProbe, Block, DocTab, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal,
@@ -7305,12 +7444,8 @@ mod ruler_geom_tests {
                 gpui_component::ThemeColor::light()
             };
             let pal = Pal {
-                fg: theme.foreground,
-                dim: theme.muted_foreground,
-                border: theme.border,
-                panel: theme.secondary,
                 hover: theme.foreground,
-                sel: theme.selection,
+                ..Pal::from_theme(&theme, dark)
             };
             let colors = ruler_colors(pal, dark);
             assert!(colors.content.l - colors.ground.l >= 0.30);
@@ -8887,6 +9022,9 @@ struct Pal {
     panel: Hsla,
     hover: Hsla,
     sel: Hsla,
+    /// The colour of a link run with no colour of its own (#1906): one that
+    /// reads on the ground this palette draws on.
+    link: Hsla,
 }
 
 impl Pal {
@@ -8895,6 +9033,11 @@ impl Pal {
     /// having it threaded through every signature.
     fn of(cx: &App) -> Pal {
         let t = cx.theme();
+        Pal::from_theme(t, t.mode.is_dark())
+    }
+
+    /// The palette of theme colours `t`, whose ground is dark when `dark`.
+    fn from_theme(t: &gpui_component::ThemeColor, dark: bool) -> Pal {
         let fg = t.foreground;
         Pal {
             fg,
@@ -8905,8 +9048,15 @@ impl Pal {
             // clearly visible on both light and dark grounds.
             hover: Hsla { a: 0.12, ..fg },
             sel: t.selection,
+            link: hsla_u(theme_link(dark)),
         }
     }
+}
+
+/// The link colour on a theme's own ground (#1906): the light blue on a dark
+/// theme, as on a dark page ([`design_tab::page_link`]).
+fn theme_link(dark: bool) -> u32 {
+    if dark { LINK_DARK } else { LINK }
 }
 
 /// The palette a document draws in on a page of colour `sheet` (Print
@@ -8925,6 +9075,7 @@ fn page_pal(sheet: u32, sel: Hsla) -> Pal {
             ..hsla_u(0x000000)
         },
         sel,
+        link: hsla_u(design_tab::page_link(sheet)),
     }
 }
 
@@ -8936,7 +9087,11 @@ const GANTT_SUMMARY: u32 = 0x96A0AC;
 // manual parent's).
 const GANTT_WARNING: u32 = 0xDC322F;
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
+/// A link with no colour of its own, on a light ground (4.75:1 on white).
 const LINK: u32 = 0x2f6fdb;
+/// The same on a dark ground (#1906): 7.5:1 on gpui-component's dark
+/// background `#0A0A0A`, 6.2:1 on `#1F1F1F`.
+const LINK_DARK: u32 = 0x6ca0f0;
 const FILE_FG: u32 = 0xffffff;
 
 /// Put the caret where a click landed. With `extend` (Shift) the click keeps
@@ -33317,6 +33472,18 @@ impl TextWidth for Measurer {
     }
 }
 
+/// The colour a run's text draws in: its own (direct, else its styles'), as
+/// Word draws it, links included (#1906); without one, the palette's link
+/// colour for a link and its ink for other text.
+fn run_ink(props: &RunProps, is_link: bool, pal: &Pal) -> Hsla {
+    props
+        .color
+        .as_deref()
+        .and_then(hex_rgb)
+        .map(hsla_u)
+        .unwrap_or(if is_link { pal.link } else { pal.fg })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_words(
     out: &mut Vec<AnyElement>,
@@ -33352,16 +33519,7 @@ fn emit_words(
             }
             VertAlign::Baseline => None,
         };
-        let color: Hsla = if is_link {
-            hsla_u(LINK)
-        } else {
-            props
-                .color
-                .as_deref()
-                .and_then(hex_rgb)
-                .map(hsla_u)
-                .unwrap_or(pal.fg)
-        };
+        let color = run_ink(props, is_link, &pal);
         // Render each word as a StyledText so its TextLayout gives pixel-exact
         // hit-testing (index_for_position), for a true click-anywhere caret.
         let word_str = word.to_string();
@@ -34260,11 +34418,40 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, in order, each flagged when it sits in a
+/// link: inside a hyperlink, or the whole change when `in_link` (a change
+/// within a link's `content`, #1906).
+fn revision_runs(content: &[Inline], in_link: bool) -> Vec<(&docxcore::model::Run, bool)> {
+    fn push<'a>(
+        content: &'a [Inline],
+        in_link: bool,
+        out: &mut Vec<(&'a docxcore::model::Run, bool)>,
+    ) {
+        for inline in content {
+            match inline {
+                Inline::Run(r) => out.push((r, in_link)),
+                Inline::Hyperlink(h) => {
+                    out.extend(h.runs.iter().map(|r| (r, true)));
+                    push(&h.content, true, out);
+                }
+                Inline::Revision { content, .. } => push(content, in_link, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    push(content, in_link, &mut out);
+    out
+}
+
 /// The runs under a tracked change, drawn as plain text with no caret mapping;
-/// in a table cell, over its style's run formatting (#765).
+/// in a table cell, over its style's run formatting (#765). A run in a link
+/// draws as one (`in_link`, [`revision_runs`]).
+#[allow(clippy::too_many_arguments)]
 fn emit_revision_text(
     out: &mut Vec<AnyElement>,
     content: &[Inline],
+    in_link: bool,
     base: f32,
     pal: Pal,
     styler: run_look::RunStyler,
@@ -34279,52 +34466,24 @@ fn emit_revision_text(
         probe_only: true,
         ..c
     });
-    for inline in content {
-        match inline {
-            Inline::Run(r) => {
-                let (mut idx, mut caret) = (anchor, None);
-                // The caret never lands in revision text (caret is None), so
-                // the bar height is unused; 19 keeps the signature honest.
-                emit_run(
-                    out,
-                    &r.text,
-                    &styler.shown(r),
-                    base,
-                    false,
-                    &mut idx,
-                    &mut caret,
-                    None,
-                    click,
-                    pal,
-                    19.0,
-                    zoom,
-                );
-            }
-            Inline::Hyperlink(h) => {
-                for r in &h.runs {
-                    let (mut idx, mut caret) = (anchor, None);
-                    emit_run(
-                        out,
-                        &r.text,
-                        &styler.shown(r),
-                        base,
-                        true,
-                        &mut idx,
-                        &mut caret,
-                        None,
-                        click,
-                        pal,
-                        19.0,
-                        zoom,
-                    );
-                }
-                emit_revision_text(out, &h.content, base, pal, styler, zoom, click, anchor);
-            }
-            Inline::Revision { content, .. } => {
-                emit_revision_text(out, content, base, pal, styler, zoom, click, anchor)
-            }
-            _ => {}
-        }
+    for (r, link) in revision_runs(content, in_link) {
+        let (mut idx, mut caret) = (anchor, None);
+        // The caret never lands in revision text (caret is None), so the bar
+        // height is unused; 19 keeps the signature honest.
+        emit_run(
+            out,
+            &r.text,
+            &styler.shown(r),
+            base,
+            link,
+            &mut idx,
+            &mut caret,
+            None,
+            click,
+            pal,
+            19.0,
+            zoom,
+        );
     }
 }
 
@@ -34604,7 +34763,9 @@ fn paragraph_el(
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
-                emit_revision_text(&mut spans, content, base, pal, styler, zoom, click, idx);
+                emit_revision_text(
+                    &mut spans, content, in_link, base, pal, styler, zoom, click, idx,
+                );
             }
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the
@@ -34931,6 +35092,7 @@ fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
                 dim: hsla_u(ink.dim),
                 panel: chip,
                 hover: chip,
+                link: hsla_u(ink.link),
                 ..pal
             }
         }

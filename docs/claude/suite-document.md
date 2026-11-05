@@ -244,3 +244,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - Not done: a real platform-match tier (fontconfig `FcFontMatch`, CoreText,
   DirectWrite fallback) for unknown families; the generic serif/mono lists
   stand in.
+
+## Link colours (#1906)
+
+- `emit_words` draws a link run in its shown colour (`run_ink`: direct over
+  character style over paragraph/table style), as Word does; only a link run
+  without one (or one `hex_rgb` rejects) takes `Pal::link`. The underline
+  stays.
+- A tracked change inside a link (`<w:hyperlink><w:ins>`) draws as link
+  text too: `emit_revision_text` takes the item's `in_link`, and
+  `revision_runs` flags each run under the change.
+- `Pal::link` follows the ground the palette draws on: `Pal::of` takes
+  `theme_link(t.mode.is_dark())`; `page_pal` and `cell_ink` (a filled cell)
+  take `design_tab::page_link`, which uses `page_ink`'s light/dark cutoff
+  (`dark_ground`): `LINK` `#2F6FDB` on a light ground, `LINK_DARK` `#6CA0F0`
+  on a dark one.
+- Only clearly light or dark grounds read: `LINK` is 4.75:1 on white but 4.25:1
+  on `#F2F2F2`, and on a mid grey near the cutoff neither blue (nor either
+  ink) reaches 4.5:1. Not claimed for every page colour or fill.
+- Not done: the Help manuals' links (`help_view/render.rs`, `LINK` on the
+  theme ground) and the sheet's hyperlink cells (`0x0563c1`).

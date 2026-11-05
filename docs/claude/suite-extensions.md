@@ -68,6 +68,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Colours: the chrome (scroll bar, selection) is the theme's; the document
   is a white page in Print Layout's palette (`content_look`, `page_pal`) unless
   `set_content_dark(true)` on a dark theme, which draws the theme's own.
+  A link draws in its run's colour (#1906); only a link without one takes
+  the palette's `Pal::link`: `LINK` `#2F6FDB` on the white page, `LINK_DARK`
+  `#6CA0F0` on the dark one (7.5:1 on the stock `#0A0A0A`). HTML import
+  colours every link `0563C1` and Word's Hyperlink style does too, so with
+  dark mode for content and no adaptation by the embedder such a link draws
+  `0563C1`, about 3.4:1 on `#0A0A0A`, like any dark authored ink there.
 - Pictures: the view's `pictures::Cache` is registered with
   `pictures::register_extra` and never reads `Docxy`: `set_document` and
   its release queue what it gave up (`queue_release`), the windows'
