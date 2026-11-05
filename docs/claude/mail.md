@@ -188,15 +188,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   earlier run gets no `Sending`.
 - The drain applies a `SendDraft` through `outbox::apply_send` with the
   op's `seq`. `outbox.send_posted` (migrated in `Store::init`) is set right
-  before the `/send` POST, so a lost answer or a crash counts. A refusal
-  Graph answered (a 4xx, a 404, a 401, a 429/503 throttle) clears it, as
-  nothing went out. A 500, a 504 or a dropped connection leaves it set:
-  Graph may still have delivered.
+  before the `/send` POST, so a lost answer or a crash counts. Only a
+  refusal Graph answered (a 4xx, a 404, a 401) clears it, as nothing went
+  out. Any 5xx, a 429/503 throttle (a gateway 503 can follow a send the
+  back end accepted) or a dropped connection leaves it set: Graph may
+  still have delivered, and the retry costs one GET.
 - The next attempt of a posted op first checks delivery, before any PATCH
   or upload. The local row gone (a Drafts delta's `@removed`), or
   `GraphClient::is_draft` (`GET /me/messages/{id}?$select=isDraft`)
   answering 404 or `false`, means delivered: `Sent`, and the id joins the
-  drain's `sent` list for `sync_after_send`. `true` clears the flag and
+  drain's `sent` list for `sync_after_send`. The attachment rows are
+  cleared when Graph answered; when the row is gone they stay behind,
+  keyed by a Graph id nothing resolves to any more (harmless). `true` clears the flag and
   sends again. A failure of the check is never a failed send: a retryable
   one keeps the op queued, any other keeps the attempts and quarantine
   policy, and the row stays under Sent Items.

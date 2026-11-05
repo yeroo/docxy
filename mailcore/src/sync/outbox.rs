@@ -103,19 +103,24 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
 /// (`None` for a call outside the outbox, which tracks nothing).
 ///
 /// With a `seq`, `outbox.send_posted` is set right before the POST (#1874),
-/// so a lost answer (a 500 or 504 Graph may still have delivered, a dropped
-/// connection, a crash) counts; a POST Graph answered with a refusal (a 4xx,
-/// a 404, a 401, a 429/503 throttle) clears it, as nothing went out. A later attempt of a posted op first asks
-/// whether it went out, before any PATCH or upload: the local row gone (a
-/// Drafts delta's `@removed`), or Graph saying the draft id is gone (404) or
-/// no draft any more, is a delivered send (`Ok`, the attachment rows
-/// cleared). Graph saying it is still a draft clears the flag and sends it
-/// again. A failure of that check is returned as is: the drain keeps a
-/// retryable one queued and never returns a posted op to Drafts.
+/// so an answer that may follow a delivery (any 5xx, a 429/503 throttle
+/// included: a gateway 503 can follow a send the back end accepted), a
+/// dropped connection or a crash counts; only a refusal Graph answered (a
+/// 4xx, a 404, a 401) clears it, as nothing went out. A later attempt of a
+/// posted op first asks whether it went out, before any PATCH or upload:
+/// the local row gone (a Drafts delta's `@removed`), or Graph saying the
+/// draft id is gone (404) or no draft any more, is a delivered send (`Ok`).
+/// When Graph answered, the attachment rows are cleared; when the row is
+/// gone they stay behind (a `local:` id no longer resolves to the Graph id
+/// they are keyed by), which is harmless: nothing reads them. Graph saying
+/// it is still a draft clears the flag and sends it again. A failure of
+/// that check is returned as is: the drain keeps a retryable one queued and
+/// never returns a posted op to Drafts.
 ///
 /// A file-read or upload error returns before the POST, so the drain's
-/// failure policy applies (a 5xx retries; anything else returns the draft
-/// to Drafts) and the attachments are NOT cleared. Each upload Graph
+/// failure policy applies (a 5xx defers the op; a 401, a 429/503 throttle
+/// or a transport failure keeps it queued; any other failure returns the
+/// draft to Drafts) and the attachments are NOT cleared. Each upload Graph
 /// confirmed is marked `uploaded` at once, and one already marked is
 /// skipped, so a confirmed upload is never repeated. An upload whose answer
 /// was lost (a 5xx or a dropped connection after Graph stored it), or whose
@@ -155,18 +160,15 @@ pub(crate) fn apply_send(
         store.set_send_posted(seq, true).map_err(store_err)?;
     }
     if let Err(e) = client.send_draft(&graph_id) {
-        // Graph answered and refused it (a 4xx, a 404, a 401, a 429/503
-        // throttle, which Graph never processed): it was not sent, so the
-        // failure is the send's own. Any other 5xx (a 500 or 504 may still
-        // deliver) or a lost answer leaves the flag for the next attempt's
-        // check.
+        // Graph answered and refused it (a 4xx, a 404, a 401): it was not
+        // sent, so the failure is the send's own. A 5xx, a 429/503 throttle
+        // (a gateway 503 can follow a send the back end accepted) or a lost
+        // answer leaves the flag: the next attempt checks delivery first,
+        // at the cost of one GET.
         let refused = matches!(
             e,
             GraphError::Http { status, .. } if status < 500
-        ) || matches!(
-            e,
-            GraphError::NotFound | GraphError::Unauthorized | GraphError::Throttled { .. }
-        );
+        ) || matches!(e, GraphError::NotFound | GraphError::Unauthorized);
         if let (Some(seq), true) = (seq, refused) {
             let _ = store.set_send_posted(seq, false);
         }

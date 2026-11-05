@@ -5900,7 +5900,8 @@ mod tests {
     /// The routes a draft's create, patch and send need (most specific
     /// first: the fake server answers with the first route whose method and
     /// prefix match and that has uses left), then the Sent Items routes the
-    /// startup pass syncs. With `send_fails_once`, the first send answers 503.
+    /// startup pass syncs. With `send_fails_once`, the first send answers 503,
+    /// and the delivery check then made says it is still a draft.
     fn draft_routes(send_fails_once: bool) -> Vec<(Route, Option<usize>)> {
         let route = |method: &str, path: String, status: u16, body: &str| Route {
             method: method.into(),
@@ -5922,6 +5923,17 @@ mod tests {
         ));
         routes.push((
             route("PATCH", format!("/me/messages/{DRAFT_G}"), 200, "{}"),
+            None,
+        ));
+        // The delivery check a send whose `/send` may have gone out makes
+        // first (#1874): Graph still holds it as a draft.
+        routes.push((
+            route(
+                "GET",
+                format!("/me/messages/{DRAFT_G}?$select=isDraft"),
+                200,
+                &format!(r#"{{"id":"{DRAFT_G}","isDraft":true}}"#),
+            ),
             None,
         ));
         let created = format!(
@@ -6181,6 +6193,16 @@ mod tests {
         assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
         assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
         assert_eq!(hits(&srv, "POST", &send_path()), 2);
+        // A 503 may follow a send the back end accepted (#1874): the retry
+        // asked first, and Graph still had the draft.
+        assert_eq!(
+            hits(
+                &srv,
+                "GET",
+                &format!("/me/messages/{DRAFT_G}?$select=isDraft")
+            ),
+            1
+        );
         let store = Store::open(&store_path).unwrap();
         assert!(store.pending_ops().unwrap().is_empty());
         no_quarantine(&seen);
@@ -7539,10 +7561,10 @@ mod tests {
         (get_route("/me/messages/GRAPH-42?", status, body), None)
     }
 
-    /// Sends the local draft, whose `/send` answers 500 first, then
+    /// Sends the local draft, whose `/send` fails first (a 5xx or a 503), then
     /// `between` runs, then a Refresh resends the deferred op at once; waits
     /// for the `Sent`. Returns the events seen.
-    fn send_500_then_refresh(
+    fn send_failing_then_refresh(
         handle: &SyncHandle,
         local: &str,
         between: impl FnOnce(),
@@ -7586,7 +7608,7 @@ mod tests {
             None,
             seed_draft_with(&mut local, file.to_str().unwrap()),
         );
-        let seen = send_500_then_refresh(
+        let seen = send_failing_then_refresh(
             &handle,
             &local,
             || {},
@@ -7643,7 +7665,64 @@ mod tests {
                 .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
                 .unwrap();
         });
-        let mut seen = send_500_then_refresh(
+        let mut seen = send_failing_then_refresh(
+            &handle,
+            &local,
+            || {},
+            |e| matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. }),
+        );
+        wait_idle(&handle, &mut seen);
+
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SendFailed { .. }))
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 1);
+        assert_eq!(hits(&srv, "PATCH", "/me/messages/GRAPH-42"), 0);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        let (row, _) = store.draft(&local).unwrap().unwrap();
+        assert_eq!(row.folder_id, "SENT1", "not returned to Drafts");
+        assert!(!row.is_draft);
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_503_send_graph_delivered_is_sent_not_returned_to_drafts() {
+        // FIX r2: a gateway 503 can follow a send the back end accepted.
+        // The 503 is `Throttled`, yet the retry must still check delivery.
+        let srv = FakeServer::start_limited(send_routes(vec![
+            (
+                post_route("/me/messages/GRAPH-42/send", 503, "busy"),
+                Some(1),
+            ),
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/GRAPH-42".into(),
+                    status: 404,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                None,
+            ),
+            draft_check_route(404, ""),
+        ]));
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-503-delivered", HOUR, None, |s| {
+            local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+        });
+        let mut seen = send_failing_then_refresh(
             &handle,
             &local,
             || {},
@@ -7689,7 +7768,7 @@ mod tests {
         });
         let ui_path = store_path.clone();
         let removed = local.clone();
-        let seen = send_500_then_refresh(
+        let seen = send_failing_then_refresh(
             &handle,
             &local,
             move || {
@@ -7739,7 +7818,7 @@ mod tests {
                 .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
                 .unwrap();
         });
-        let mut seen = send_500_then_refresh(
+        let mut seen = send_failing_then_refresh(
             &handle,
             &local,
             || {},
