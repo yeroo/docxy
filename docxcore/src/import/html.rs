@@ -531,6 +531,31 @@ fn clears_background(v: &str) -> bool {
 
 /// A `width` attribute: digits as px, `N%`, `Npx`; anything else none.
 fn width_attr(v: &str) -> Option<Width> {
+    let (n, pct) = attr_length(v)?;
+    Some(if pct {
+        Width::Pct(n)
+    } else {
+        Width::Twips((n * 15.0).round().min(f64::from(html_table::MAX_TWIPS)) as u32)
+    })
+}
+
+/// An `<img>`'s `width` / `height` attribute in twips (digits as px,
+/// `Npx`; a percentage is none), not capped at a page's width as a table's
+/// is: the picture is scaled to the body as a whole box, so its aspect
+/// must be the declared one (#1880 r2).
+fn img_attr_twips(v: &str) -> Option<u32> {
+    let (n, pct) = attr_length(v)?;
+    (!pct).then(|| saturating_twips(n * 15.0))
+}
+
+/// Twips as a `u32`, rounded, saturating at its range.
+fn saturating_twips(t: f64) -> u32 {
+    t.round().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// A length attribute's number and whether it is a percentage: digits as
+/// px, `N%`, `Npx`; anything else none.
+fn attr_length(v: &str) -> Option<(f64, bool)> {
     let v = v.trim();
     let (num, pct) = match v.strip_suffix('%') {
         Some(n) => (n, true),
@@ -541,11 +566,7 @@ fn width_attr(v: &str) -> Option<Width> {
         return None;
     }
     let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite())?;
-    Some(if pct {
-        Width::Pct(n)
-    } else {
-        Width::Twips((n * 15.0).round().min(f64::from(html_table::MAX_TWIPS)) as u32)
-    })
+    Some((n, pct))
 }
 
 /// HTML's rules for a non-negative integer: leading white space, an
@@ -701,10 +722,7 @@ impl Cascade {
         if tag == "img" {
             // An image's box is in pixels; a percentage has no container
             // width to resolve against.
-            let px = |v: Option<&str>| {
-                v.and_then(width_attr)
-                    .filter(|w| matches!(w, Width::Twips(_)))
-            };
+            let px = |v: Option<&str>| v.and_then(img_attr_twips).map(Width::Twips);
             self.look.own_width = px(attrs.width.as_deref());
             self.look.own_height = px(attrs.height.as_deref());
         }
@@ -760,8 +778,11 @@ impl Cascade {
                     // A percentage leaves the attribute's size (an e-mail's
                     // `width="600" style="width:100%"`).
                     if len.unit != css::Unit::Percent {
-                        if let Some(t) = len.twips(pt).filter(|&t| t >= 0) {
-                            *side = Some(Width::Twips(t.min(html_table::MAX_TWIPS as i32) as u32));
+                        // Not capped at a page's width (#1880 r2): the
+                        // box is scaled to the body as a whole.
+                        let twips = len.points(pt).map(|p| (p * 20.0).round());
+                        if let Some(t) = twips.filter(|&t| t >= 0.0) {
+                            *side = Some(Width::Twips(saturating_twips(t)));
                         }
                     }
                 }
@@ -3892,6 +3913,26 @@ mod image_tests {
     fn a_wide_picture_is_scaled_to_the_body() {
         let (d, _, _) = with_images("<p><img src=a.png width=1248 height=100></p>");
         assert_eq!(sizes(&d), [(624 * PX, 50 * PX)]);
+        // FIX r2 m1: sides past a page's 2112 px keep their aspect.
+        let (d, _, _) = with_images(
+            "<p><img src=a.png width=3000 height=1000>\
+             <img src=a.png style='width:2400px;height:600px'>\
+             <img src=a.png width=4000>\
+             <img src=a.png style='height:3000px'>\
+             <img src=missing.png width=99999999999 height=1></p>",
+        );
+        assert_eq!(
+            sizes(&d),
+            [
+                (624 * PX, 208 * PX),
+                (624 * PX, 156 * PX),
+                // One side: the 40 x 20 pixels' aspect.
+                (624 * PX, 312 * PX),
+                (624 * PX, 312 * PX),
+                // Saturating, then scaled: a height under a twip is one EMU.
+                (624 * PX, 1),
+            ]
+        );
     }
 
     #[test]

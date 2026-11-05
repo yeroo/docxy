@@ -220,9 +220,10 @@ pub(crate) fn convert_bytes(
                     .and_then(|dir| read_local_image(dir, src, limit))
             };
             let imported = import::import_html_with(bytes, &mut resolve)?;
-            let pkg = imported.package();
+            let mut pkg = imported.package();
+            let doc = std::mem::take(&mut pkg.document);
             Ok(Some(ConvertedDoc {
-                doc: pkg.document.clone(),
+                doc,
                 base: Some(pkg),
             }))
         }
@@ -918,7 +919,7 @@ pub(crate) mod tests {
     fn a_page_without_a_path_takes_only_its_data_images() {
         let page = b"<p>x<img src=\"data:image/gif;base64,R0lGODlhAQABAAAAACw=\"><img src=a.png width=5 height=5></p>";
         let c = convert_bytes(What::Html, page, None).unwrap().unwrap();
-        let base = c.base.as_ref().unwrap();
+        assert!(c.base.is_some(), "the media's package");
         let pkg = docxcore::package::load_package(&c.docx()).unwrap();
         let media: Vec<&str> = pkg
             .part_names()
@@ -927,6 +928,7 @@ pub(crate) mod tests {
             .collect();
         // The GIF and the placeholder.
         assert_eq!(media.len(), 2, "{media:?}");
-        assert_eq!(base.document, pkg.document);
+        // The document was moved out of the package, not cloned.
+        assert_eq!(c.doc, pkg.document);
     }
 }
