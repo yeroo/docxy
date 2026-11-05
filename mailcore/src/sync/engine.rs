@@ -520,8 +520,12 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::Move { id, dest });
             }
             SyncCommand::Delete { id } => {
-                let _ = self.store.delete_message(&id);
-                self.enqueue_and_drain(OutboxOp::Delete { id });
+                // Resolve before the local delete: a reconciled draft's
+                // `local:` id leads to its Graph id only while the row exists
+                // (#1884), so the queued op carries the resolved id.
+                let target = self.store.current_id(&id).unwrap_or(id);
+                let _ = self.store.delete_message(&target);
+                self.enqueue_and_drain(OutboxOp::Delete { id: target });
             }
             SyncCommand::FetchBody { id } => self.fetch_body(&id),
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
@@ -3744,7 +3748,12 @@ mod tests {
         );
 
         let store = Store::open(&store_path).unwrap();
-        assert!(store.draft(&local_id).unwrap().is_none());
+        // The local id still reaches the sent row, now stored under its
+        // Graph id (#1884).
+        let (row, _) = store.draft(&local_id).unwrap().unwrap();
+        assert_eq!(row.id, "GRAPH-42");
+        assert_eq!(row.folder_id, "SENT1");
+        assert!(!row.is_draft);
         let sent_rows = store.messages_in_folder("SENT1", 50, 0).unwrap();
         assert_eq!(sent_rows.len(), 1);
         assert_eq!(sent_rows[0].id, "GRAPH-42");
@@ -4490,5 +4499,359 @@ mod tests {
         assert!(wait_until(ENGINE_WAIT, || dir.join("done").exists()));
         slow.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- A draft stays addressable by its local: id (#1884, #1881) --------
+
+    const DRAFT_G: &str = "GRAPH-77";
+
+    /// The routes a draft's create, patch and send need (most specific
+    /// first: the fake server answers with the first route whose method and
+    /// prefix match and that has uses left), then the Sent Items routes the
+    /// startup pass syncs. With `send_fails_once`, the first send answers 503.
+    fn draft_routes(send_fails_once: bool) -> Vec<(Route, Option<usize>)> {
+        let route = |method: &str, path: String, status: u16, body: &str| Route {
+            method: method.into(),
+            path_prefix: path,
+            status,
+            headers: vec![],
+            body: body.into(),
+        };
+        let mut routes = Vec::new();
+        if send_fails_once {
+            routes.push((
+                route("POST", format!("/me/messages/{DRAFT_G}/send"), 503, "busy"),
+                Some(1),
+            ));
+        }
+        routes.push((
+            route("POST", format!("/me/messages/{DRAFT_G}/send"), 202, ""),
+            None,
+        ));
+        routes.push((
+            route("PATCH", format!("/me/messages/{DRAFT_G}"), 200, "{}"),
+            None,
+        ));
+        let created = format!(
+            r#"{{"id":"{DRAFT_G}","conversationId":"C","subject":"Hi","from":{{"emailAddress":{{"name":"","address":""}}}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}}"#
+        );
+        routes.push((route("POST", "/me/messages".into(), 201, &created), None));
+        routes.extend(sent_folder_routes().into_iter().map(|r| (r, None)));
+        routes
+    }
+
+    /// How many recorded requests had exactly this method and path.
+    fn hits(srv: &FakeServer, method: &str, path: &str) -> usize {
+        srv.requests()
+            .iter()
+            .filter(|r| r.method == method && r.path == path)
+            .count()
+    }
+
+    fn send_path() -> String {
+        format!("/me/messages/{DRAFT_G}/send")
+    }
+
+    fn patch_path() -> String {
+        format!("/me/messages/{DRAFT_G}")
+    }
+
+    /// A temp store holding one local draft (seeded before the engine
+    /// starts, as `send_draft_of_a_local_draft_…` does), plus `ops` queued
+    /// for it. Returns `(dir, store path, token path, local id)`.
+    fn seeded_draft(
+        tag: &str,
+        ops: impl Fn(&str) -> Vec<OutboxOp>,
+    ) -> (PathBuf, PathBuf, PathBuf, String) {
+        let dir = unique_dir(tag);
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let store = Store::open(&store_path).unwrap();
+        let local = store
+            .create_local_draft("Hi", "bob@x", "", "<p>first</p>")
+            .unwrap();
+        for op in ops(&local) {
+            store.enqueue_op(&op).unwrap();
+        }
+        (dir, store_path, token_path, local)
+    }
+
+    fn spawn_on(srv: &FakeServer, store_path: &std::path::Path, token_path: PathBuf) -> SyncHandle {
+        spawn_with_bases(
+            store_path.to_path_buf(),
+            token_path,
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        )
+    }
+
+    /// Waits until the engine has settled at `Idle` (after a startup pass or
+    /// a command's drain), collecting every event on the way.
+    fn wait_idle(handle: &SyncHandle, seen: &mut Vec<SyncEvent>) {
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Idle))
+        }));
+    }
+
+    /// Edits the draft by its local id through a second connection, as the
+    /// UI does with its own `Store`.
+    fn edit_draft_as_the_ui(store_path: &std::path::Path, local: &str) {
+        let ui = Store::open(store_path).unwrap();
+        ui.update_draft_fields(local, "Edited", "bob@x", "", "", "<p>second</p>")
+            .unwrap();
+    }
+
+    /// Asserts the one PATCH carried the edits.
+    fn assert_patch_carries_the_edits(srv: &FakeServer) {
+        let patch = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PATCH" && r.path == patch_path())
+            .expect("a PATCH of the Graph draft");
+        let sent = crate::json::parse(&patch.body).unwrap();
+        assert_eq!(
+            sent.get("subject").and_then(crate::json::Value::as_str),
+            Some("Edited")
+        );
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(crate::json::Value::as_str),
+            Some("<p>second</p>")
+        );
+    }
+
+    fn no_quarantine(seen: &[SyncEvent]) {
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn save_edit_send_by_the_local_id_patches_and_sends_the_graph_draft() {
+        let srv = FakeServer::start_limited(draft_routes(false));
+        let (dir, store_path, token_path, local) = seeded_draft("draft-save-send", |_| vec![]);
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+
+        // The compose window stayed open: the UI still holds the local id.
+        edit_draft_as_the_ui(&store_path, &local);
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Sent { .. })
+        }));
+
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, SyncEvent::Sent { id } if id == &local))
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
+        assert_eq!(hits(&srv, "POST", &send_path()), 1);
+        assert_patch_carries_the_edits(&srv);
+        let store = Store::open(&store_path).unwrap();
+        let (row, body) = store.draft(DRAFT_G).unwrap().unwrap();
+        assert_eq!(row.subject, "Edited");
+        assert_eq!(body.content, "<p>second</p>");
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_edit_save_by_the_local_id_patches_and_leaves_nothing_queued() {
+        let srv = FakeServer::start_limited(draft_routes(false));
+        let (dir, store_path, token_path, local) = seeded_draft("draft-save-save", |_| vec![]);
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+
+        edit_draft_as_the_ui(&store_path, &local);
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
+        assert_patch_carries_the_edits(&srv);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_queued_saves_of_a_local_draft_create_once_then_patch() {
+        // Offline: both SaveDrafts were queued before the engine got online.
+        let srv = FakeServer::start_limited(draft_routes(false));
+        let (dir, store_path, token_path, _local) =
+            seeded_draft("draft-two-saves", |local: &str| {
+                vec![
+                    OutboxOp::SaveDraft { id: local.into() },
+                    OutboxOp::SaveDraft { id: local.into() },
+                ]
+            });
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_send_that_failed_after_the_create_is_retried_without_a_second_create() {
+        // #1881: the first send answers 503 after the draft was created.
+        let srv = FakeServer::start_limited(draft_routes(true));
+        let (dir, store_path, token_path, local) = seeded_draft("draft-send-503", |_| vec![]);
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        assert!(wait_until(ENGINE_WAIT, || hits(&srv, "POST", &send_path()) == 1));
+        // The 503 leaves the op queued (`PendingOps(1)`), nothing sent.
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
+        }));
+        assert!(!seen.iter().any(|e| matches!(e, SyncEvent::Sent { .. })));
+
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Sent { .. })
+        }));
+        wait_idle(&handle, &mut seen);
+
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, SyncEvent::Sent { id } if id == &local))
+                .count(),
+            1
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
+        assert_eq!(hits(&srv, "POST", &send_path()), 2);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_save_then_send_of_a_local_draft_sends_it() {
+        // #1881's second case: the SaveDraft reconciles first, the SendDraft
+        // behind it must still find the draft.
+        let srv = FakeServer::start_limited(draft_routes(false));
+        let (dir, store_path, token_path, local) =
+            seeded_draft("draft-save-then-send", |local: &str| {
+                vec![
+                    OutboxOp::SaveDraft { id: local.into() },
+                    OutboxOp::SendDraft { id: local.into() },
+                ]
+            });
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Sent { .. }));
+        wait_idle(&handle, &mut seen);
+
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, SyncEvent::Sent { id } if id == &local))
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", &patch_path()), 1);
+        assert_eq!(hits(&srv, "POST", &send_path()), 1);
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_by_a_reconciled_local_id_deletes_the_graph_draft() {
+        let mut routes = draft_routes(false);
+        routes.insert(
+            0,
+            (
+                Route {
+                    method: "DELETE".into(),
+                    path_prefix: "/me/messages/".into(),
+                    status: 204,
+                    headers: vec![],
+                    body: String::new(),
+                },
+                None,
+            ),
+        );
+        let srv = FakeServer::start_limited(routes);
+        let (dir, store_path, token_path, local) = seeded_draft("draft-delete", |local: &str| {
+            vec![OutboxOp::SaveDraft { id: local.into() }]
+        });
+        let handle = spawn_on(&srv, &store_path, token_path);
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::Delete { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+
+        assert_eq!(hits(&srv, "DELETE", &patch_path()), 1);
+        let deletes: Vec<String> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "DELETE")
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(deletes, vec![patch_path()]);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.draft(DRAFT_G).unwrap().is_none());
+        assert!(store.pending_ops().unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
