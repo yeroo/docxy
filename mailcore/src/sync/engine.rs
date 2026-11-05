@@ -307,9 +307,9 @@ enum Drain {
     /// Every queued op was tried: applied, or bumped/quarantined on a 4xx.
     Done,
     /// An op got a 5xx: it stays queued (attempts bumped) and the drain
-    /// stopped there, keeping the order. A sync pass carries on, and the op
-    /// waits for the next drain; a command's drain backs off
-    /// (`enqueue_and_drain`).
+    /// stopped there, keeping the order, under the outbox's own back-off
+    /// (`op_retry`); or that back-off is still running and nothing was
+    /// sent. The caller's sync carries on.
     Deferred,
     /// Auth, throttle or transport, or the post-send sync stopping: the
     /// caller stops too and keeps the back-off.
@@ -496,6 +496,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         next_full: Instant::now(),
         next_fast: Instant::now(),
         hold_full: false,
+        op_retry: None,
+        op_backoff: BACKOFF_MIN,
     };
     engine.startup();
     engine.main_loop(cmd_rx);
@@ -540,6 +542,12 @@ struct Engine {
     /// not repeat it before `next_full`; a quarantine since
     /// (`reconverge_pending`) still promotes one.
     hold_full: bool,
+    /// When set, a drain sends no op before this instant: the first queued
+    /// op got a 5xx (#1885). Only the outbox waits; the folders still sync.
+    op_retry: Option<Instant>,
+    /// The outbox's own back-off after a 5xx, doubled per consecutive 5xx
+    /// (`BACKOFF_MIN`..`BACKOFF_MAX`), reset when an op goes through.
+    op_backoff: Duration,
 }
 
 impl Engine {
@@ -570,8 +578,8 @@ impl Engine {
     /// times out (or a back-off deadline elapses). Returns when a `Shutdown`
     /// arrives or the command channel is dropped.
     fn main_loop(&mut self, cmd_rx: Receiver<SyncCommand>) {
-        self.reset_deadlines();
-        self.hold_full = self.full_pass_held();
+        // The startup pass schedules the deadlines like any other.
+        self.after_pass_if_fast();
         loop {
             match cmd_rx.recv_timeout(self.recv_timeout()) {
                 Ok(SyncCommand::Shutdown) => return,
@@ -608,13 +616,11 @@ impl Engine {
         self.config.options.fast_tick.filter(|d| !d.is_zero())
     }
 
-    /// With a fast tick: the next normal pass a whole tick away, the next
-    /// fast tick a fast interval away (after startup and a `Refresh`).
-    fn reset_deadlines(&mut self) {
+    /// With a fast tick, `after_full_pass` for a full pass that ran outside
+    /// the schedule: startup, `Refresh`, a sign-in. Without one, nothing.
+    fn after_pass_if_fast(&mut self) {
         if let Some(fast) = self.fast_tick() {
-            let now = Instant::now();
-            self.next_full = now + self.config.tick;
-            self.next_fast = now + fast;
+            self.after_full_pass(fast);
         }
     }
 
@@ -658,8 +664,10 @@ impl Engine {
         }
     }
 
-    /// With a fast tick: schedules both deadlines after a normal pass. A
-    /// pass a throttle or back-off cut short is due again at its deadline.
+    /// With a fast tick: schedules both deadlines after a full pass (a normal
+    /// one, the startup one, `Refresh`'s, a sign-in's) and decides
+    /// `hold_full`. A pass a throttle or back-off cut short is due again at
+    /// its deadline.
     fn after_full_pass(&mut self, fast: Duration) {
         let now = Instant::now();
         self.next_fast = now + fast;
@@ -709,9 +717,7 @@ impl Engine {
         match cmd {
             SyncCommand::Refresh => {
                 self.sync_pass(true);
-                if let Some(fast) = self.fast_tick() {
-                    self.after_full_pass(fast);
-                }
+                self.after_pass_if_fast();
             }
             SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
             SyncCommand::SetFastFolders { ids } => {
@@ -1277,10 +1283,10 @@ impl Engine {
             return;
         }
         self.set_state(SyncState::PendingOps(self.pending_count()));
-        // A command's op deferred by a 5xx backs off, as it always did: the
-        // pass at the back-off deadline retries it (and carries on past it).
-        if self.token.is_some() && self.drain_outbox() == Drain::Deferred {
-            self.go_offline();
+        // A 5xx defers the op under the outbox's own back-off (`op_retry`),
+        // not an engine-wide Offline: the folders keep syncing.
+        if self.token.is_some() {
+            self.drain_outbox();
         }
         self.settle_state();
     }
@@ -1291,7 +1297,10 @@ impl Engine {
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
     /// the rest of the queue proceeds; a 5xx keeps the op and stops the
     /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
-    /// it must not stop the caller's sync either.
+    /// it must not stop the caller's sync either. It arms the outbox's own
+    /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
+    /// through or the queue is empty): until then a drain sends nothing and
+    /// is `Deferred` too.
     ///
     /// After a drain that sent a draft, Drafts and then Sent Items are
     /// synced at once (`sync_after_send`, #1885). Returns
@@ -1317,16 +1326,24 @@ impl Engine {
                 return Drain::Done;
             }
         };
+        if ops.is_empty() {
+            self.clear_op_backoff();
+            return Drain::Done;
+        }
+        if self.op_retry.is_some_and(|t| Instant::now() < t) {
+            return Drain::Deferred;
+        }
 
-        let mut sent = false;
+        let mut sent = Vec::new();
         let mut deferred = false;
         for row in ops {
             match self.apply_op_with_retry(&row.op) {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
+                    self.clear_op_backoff();
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
-                        sent = true;
+                        sent.push(id.clone());
                     }
                 }
                 Err(GraphError::Unauthorized) => {
@@ -1351,6 +1368,8 @@ impl Engine {
                         matches!(&other, GraphError::Http { status, .. } if *status >= 500);
                     if retryable_5xx {
                         self.store.bump_op_attempts(row.seq, &other.to_string());
+                        self.op_retry = Some(Instant::now() + self.op_backoff);
+                        self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
                         deferred = true;
                         break;
                     }
@@ -1396,7 +1415,7 @@ impl Engine {
                 }
             }
         }
-        if sent && !self.sync_after_send() {
+        if !sent.is_empty() && !self.sync_after_send(&sent) {
             return Drain::Aborted;
         }
         if deferred {
@@ -1406,25 +1425,45 @@ impl Engine {
         }
     }
 
-    /// Right after a drain sent a draft (#1885): sync Drafts, then Sent
-    /// Items, each only when stored with a delta link (this never
-    /// backfills). Drafts first: Graph gives a sent message a new id in Sent
-    /// Items, so the Drafts delta's `@removed` of the draft's id removes the
-    /// row `SendDraft` re-filed under Sent, and Sent never shows it twice.
-    /// Graph files the Sent copy asynchronously, so it may only come with a
-    /// later delta. Returns `false` when a sync must stop (`refresh_folder`).
-    fn sync_after_send(&mut self) -> bool {
+    /// Right after a drain sent the drafts `sent` (the ids their ops
+    /// carried) (#1885): sync Drafts, then Sent Items, each only when stored
+    /// with a delta link (this never backfills). Drafts first: Graph gives a
+    /// sent message a new id in Sent Items, so the Drafts delta's `@removed`
+    /// of the draft's id removes the row `SendDraft` re-filed under Sent,
+    /// and Sent never shows it twice. Graph moves the draft and files the
+    /// Sent copy asynchronously, so either may only come with a later delta:
+    /// a Drafts delta that still reports a sent draft (an upsert, which
+    /// re-files the row) is undone by re-filing it under Sent Items again,
+    /// until the `@removed` deletes it whatever its folder. Returns `false`
+    /// when a sync must stop (`refresh_folder`).
+    fn sync_after_send(&mut self, sent: &[String]) -> bool {
         let Ok(folders) = self.store.folders() else {
             return true;
         };
-        for well_known in ["drafts", "sentitems"] {
-            let Some(f) = folders
+        let find = |well_known: &str| {
+            folders
                 .iter()
                 .find(|f| f.well_known_name.as_deref() == Some(well_known))
-            else {
-                continue;
-            };
-            if f.delta_link.is_some() && !self.refresh_folder(&f.id) {
+        };
+        let (drafts, sent_items) = (find("drafts"), find("sentitems"));
+        if let Some(d) = drafts.filter(|d| d.delta_link.is_some()) {
+            if !self.refresh_folder(&d.id) {
+                return false;
+            }
+            if let Some(s) = sent_items {
+                for id in sent {
+                    let in_drafts = matches!(
+                        self.store.draft(id),
+                        Ok(Some((row, _))) if row.folder_id == d.id
+                    );
+                    if in_drafts {
+                        let _ = self.store.move_message(id, &s.id);
+                    }
+                }
+            }
+        }
+        if let Some(s) = sent_items.filter(|s| s.delta_link.is_some()) {
+            if !self.refresh_folder(&s.id) {
                 return false;
             }
         }
@@ -1965,6 +2004,7 @@ impl Engine {
                 // succeeded, rather than staying stuck if the first sync fails.
                 self.set_state(SyncState::Syncing);
                 self.sync_pass(true);
+                self.after_pass_if_fast();
             }
             Err(e) => {
                 self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
@@ -2020,6 +2060,13 @@ impl Engine {
         self.next_retry = Some(Instant::now() + self.backoff);
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         self.set_state(SyncState::Offline);
+    }
+
+    /// An op went through, or none is queued: the outbox's own 5xx back-off
+    /// (`op_retry`) is over.
+    fn clear_op_backoff(&mut self) {
+        self.op_retry = None;
+        self.op_backoff = BACKOFF_MIN;
     }
 
     /// A clean pass resets the back-off and clears any pending retry deadline.
@@ -4984,6 +5031,45 @@ mod tests {
         drop(client);
     }
 
+    /// Sends `SignIn` and plays the browser: lands on the `redirect_uri` of
+    /// `SignInStarted` with a code and its `state`. Returns that
+    /// `redirect_uri` and the loopback listener's response.
+    fn sign_in_through_loopback(handle: &SyncHandle) -> (String, String) {
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInStarted { .. })
+        });
+        let authorize_url = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
+                _ => None,
+            })
+            .expect("SignInStarted carries the authorize_url");
+        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let param = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("authorize_url carries {name}"))
+        };
+        let (redirect_uri, state) = (param("redirect_uri"), param("state"));
+        let port: u16 = redirect_uri
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("redirect_uri ends with the loopback port");
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
+        let request =
+            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        (redirect_uri, response)
+    }
+
     #[test]
     fn sign_in_completes_via_loopback_redirect_and_caches_token() {
         // End-to-end proof of the port/redirect wiring: `begin_auth` must be
@@ -5024,26 +5110,7 @@ mod tests {
 
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
 
-        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
-
-        let events = wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::SignInStarted { .. })
-        });
-        let authorize_url = events
-            .iter()
-            .find_map(|e| match e {
-                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
-                _ => None,
-            })
-            .expect("SignInStarted carries the authorize_url");
-
-        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let params = parse_query(query);
-        let redirect_uri = params
-            .iter()
-            .find(|(k, _)| k == "redirect_uri")
-            .map(|(_, v)| v.clone())
-            .expect("authorize_url carries redirect_uri");
+        let (redirect_uri, response) = sign_in_through_loopback(&handle);
         // Entra matches the loopback redirect host literally and the Graph CLI
         // client registers `http://localhost` (not `http://127.0.0.1`), so the
         // redirect we send MUST use the `localhost` host or sign-in fails with
@@ -5052,24 +5119,6 @@ mod tests {
             redirect_uri.starts_with("http://localhost:"),
             "redirect_uri must use the localhost host, got {redirect_uri}"
         );
-        let state = params
-            .iter()
-            .find(|(k, _)| k == "state")
-            .map(|(_, v)| v.clone())
-            .expect("authorize_url carries state");
-        let port: u16 = redirect_uri
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .expect("redirect_uri ends with the loopback port");
-
-        // Simulate the browser landing on the loopback redirect.
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
-        let request =
-            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        client.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.to_lowercase().contains("close this tab"));
 
@@ -6709,7 +6758,8 @@ mod tests {
     fn a_5xx_op_does_not_stall_the_normal_tick() {
         // A 5xx op is never quarantined: if it stopped the pass, the
         // calendar would never refresh again and the engine would sit
-        // Offline under a growing back-off.
+        // Offline under a growing back-off. The op waits under the outbox's
+        // own back-off (5 s first) instead, and is not resent every tick.
         let srv = FakeServer::start_limited(failing_5xx_op_routes());
         let (handle, store_path, dir) = spawn_fast(
             &srv,
@@ -6719,17 +6769,19 @@ mod tests {
             seed_mark_read,
         );
         assert!(
-            wait_until(Duration::from_secs(4), || count(&srv, is_calendar) >= 2
-                && patch_count(&srv) >= 3),
+            wait_until(Duration::from_secs(3), || count(&srv, is_calendar) >= 3),
             "ticks go on past the 5xx op: {:?}",
             paths_from(&srv, 0)
         );
+        assert_eq!(patch_count(&srv), 1, "the op waits for its back-off");
         // The pass settles at PendingOps, not Offline.
         wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
         });
         let store = Store::open(&store_path).unwrap();
         assert_eq!(store.pending_ops().unwrap().len(), 1, "the op stays queued");
+        // After the back-off a tick sends it again.
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2));
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6746,16 +6798,34 @@ mod tests {
                 ids: vec!["F1".into()],
             })
             .unwrap();
-        // Fast ticks keep syncing F1 (and retrying the op) every fast
-        // interval, well inside the first offline back-off (5 s).
+        // Fast ticks keep syncing F1 every fast interval, while the op waits
+        // for its own back-off (5 s) rather than being resent each time.
         assert!(
             wait_until(Duration::from_secs(3), || count(&srv, |p| is_delta(
                 p, "F1"
-            )) >= 4
-                && patch_count(&srv) >= 3),
+            )) >= 6),
             "fast ticks go on past the 5xx op: {:?}",
             paths_from(&srv, 0)
         );
+        assert!(
+            patch_count(&srv) <= 2,
+            "the op is not resent at every fast tick: {}",
+            patch_count(&srv)
+        );
+        // A command's op goes into the same queue behind it: no engine-wide
+        // Offline, and the folders still sync.
+        handle
+            .cmd_tx
+            .send(SyncCommand::MarkRead {
+                id: "M2".into(),
+                read: true,
+            })
+            .unwrap();
+        let before = count(&srv, |p| is_delta(p, "F1"));
+        assert!(wait_until(Duration::from_secs(3), || count(&srv, |p| {
+            is_delta(p, "F1")
+        }) >= before + 3));
+        assert!(patch_count(&srv) <= 2, "{}", patch_count(&srv));
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6819,6 +6889,179 @@ mod tests {
             1,
             "the startup list only: {:?}",
             paths_from(&srv, 0)
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1/F2 routes where F2's first (initial) delta is throttled once for
+    /// 2 s, so a full pass is cut short after the folder list and F1.
+    fn f2_initial_delta_throttled_routes() -> Vec<(Route, Option<usize>)> {
+        let mut routes = vec![(
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F2/messages/delta?$select".into(),
+                status: 429,
+                headers: vec![("Retry-After".into(), "2".into())],
+                body: "{}".into(),
+            },
+            Some(1),
+        )];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        routes
+    }
+
+    fn f2_delta_link(store_path: &std::path::Path) -> Option<String> {
+        Store::open(store_path)
+            .unwrap()
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "F2")
+            .and_then(|f| f.delta_link)
+    }
+
+    #[test]
+    fn a_throttled_startup_pass_is_retried_at_its_deadline_in_fast_mode() {
+        let srv = FakeServer::start_limited(f2_initial_delta_throttled_routes());
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "fast-startup-retry", HOUR, Some(FAST), |_| {});
+        // The startup pass stops at F2's 429; at the deadline the normal
+        // pass runs again (not a fast tick that only clears the back-off),
+        // so F2 gets its delta well before the hour-long tick.
+        assert!(
+            wait_until(Duration::from_secs(10), || count(&srv, |p| is_delta(
+                p, "F2"
+            )) >= 2),
+            "F2's delta retried: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(wait_until(ENGINE_WAIT, || f2_delta_link(&store_path).is_some()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_throttled_sign_in_pass_is_retried_at_its_deadline_in_fast_mode() {
+        let mut routes = vec![(
+            Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+            },
+            None,
+        )];
+        routes.extend(f2_initial_delta_throttled_routes());
+        let srv = FakeServer::start_limited(routes);
+        let dir = unique_dir("fast-signin-retry");
+        let store_path = dir.join("mail.db");
+        let handle = spawn_with_bases_and_options(
+            store_path.clone(),
+            dir.join("token.bin"), // no seed_token: starts signed out
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            HOUR,
+            EngineOptions {
+                fast_tick: Some(FAST),
+                ..Default::default()
+            },
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let (_, response) = sign_in_through_loopback(&handle);
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(
+            wait_until(Duration::from_secs(10), || count(&srv, |p| is_delta(
+                p, "F2"
+            )) >= 2),
+            "F2's delta retried after the sign-in pass: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(wait_until(ENGINE_WAIT, || f2_delta_link(&store_path).is_some()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sent_draft_the_drafts_delta_still_reports_stays_in_sent_items() {
+        let folders: &[(&str, &str, Option<&str>)] = &[
+            ("DRAFTS1", "Drafts", Some("drafts")),
+            ("SENT1", "Sent Items", Some("sentitems")),
+        ];
+        // Graph has not moved the draft yet: the Drafts delta right after the
+        // send reports it as changed (an upsert into Drafts), and Sent Items
+        // has nothing new.
+        let drafts_next = delta_page(
+            &[full_message_json("GRAPH-42", "Hi", "2026-07-16T10:00:00Z")],
+            "/me/mailFolders/DRAFTS1/messages/delta?token=D-DRAFTS1",
+        );
+        let mut routes = vec![
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-42/send".into(),
+                    status: 202,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: r#"{"id":"GRAPH-42","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+                },
+                None,
+            ),
+        ];
+        routes.extend(folder_routes(folders, &[("DRAFTS1", &drafts_next)], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-upsert", HOUR, None, |s| {
+            local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+        });
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        assert!(
+            srv.requests().iter().any(|r| r
+                .path
+                .starts_with("/me/mailFolders/DRAFTS1/messages/delta?token=")),
+            "the post-send Drafts delta ran"
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, _) = store.draft(&local).unwrap().expect("the sent row");
+        assert_eq!(row.id, "GRAPH-42");
+        assert_eq!(
+            row.folder_id, "SENT1",
+            "the sent row stays under Sent Items"
+        );
+        assert!(
+            store
+                .messages_in_folder("DRAFTS1", 50, 0)
+                .unwrap()
+                .is_empty()
         );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
