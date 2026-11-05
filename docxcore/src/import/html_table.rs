@@ -61,7 +61,10 @@ pub(crate) struct TableSpec {
     /// `cellpadding` / `cellspacing`, in px.
     pub cellpadding: Option<u32>,
     pub cellspacing: Option<u32>,
-    /// `align`: `center` or `right` (`w:jc`); `None` is the left default.
+    /// `w:jc`, `center` or `right`; `None` is the left default (#1922):
+    /// a float `align=right` (`align=left` is none), else the table's auto
+    /// side margins (`<table align=center>` is that hint), else its
+    /// container's `-webkit-` alignment.
     pub jc: Option<&'static str>,
 }
 

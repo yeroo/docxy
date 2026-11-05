@@ -296,6 +296,12 @@ struct Block {
     mso_list: bool,
     /// Inside an `li`: (numbered, level).
     item: Option<(bool, i32)>,
+    /// On an `li`'s own entry (#1922): the item has ended a numbered
+    /// paragraph, and a block image split its text, so its paragraphs past
+    /// the numbered one are continuations. Per item, so a nested list's
+    /// items leave their parent's alone.
+    item_numbered: bool,
+    item_split: bool,
 }
 
 /// How an element takes part in the page, for its look.
@@ -565,9 +571,9 @@ fn font_pt(run: &RunProps) -> f64 {
 fn align_value(v: &str) -> Option<Align> {
     match v.trim().to_ascii_lowercase().as_str() {
         "center" | "-webkit-center" | "-moz-center" => Some(Align::Center),
-        "right" | "end" | "-webkit-right" => Some(Align::Right),
+        "right" | "end" | "-webkit-right" | "-moz-right" => Some(Align::Right),
         "justify" => Some(Align::Justify),
-        "left" | "start" | "-webkit-left" => Some(Align::Left),
+        "left" | "start" | "-webkit-left" | "-moz-left" => Some(Align::Left),
         _ => None,
     }
 }
@@ -955,9 +961,16 @@ impl Cascade {
                 }
             }
             "width" if self.kind == Kind::Block => {
-                // An absolute width only (#1922): a percentage or `auto`
-                // leaves the block as wide as its container.
-                self.block_width = css::length(v.trim()).filter(|l| l.unit != css::Unit::Percent);
+                // An absolute, non-negative width only (#1922): `auto` or a
+                // percentage leaves the block as wide as its container; an
+                // invalid value (a negative one, `600` without a unit)
+                // leaves the width as it was.
+                let w = v.trim();
+                if w.eq_ignore_ascii_case("auto") {
+                    self.block_width = None;
+                } else if let Some(len) = css::length(w).filter(|l| l.v >= 0.0) {
+                    self.block_width = (len.unit != css::Unit::Percent).then_some(len);
+                }
             }
             "font-family" => {
                 if let Some(f) = css::font_family(v) {
@@ -1281,11 +1294,10 @@ struct Html<'a> {
     in_not_vml: bool,
     /// The page's images, when the import converts them.
     images: Option<Images<'a>>,
-    /// The open list item has ended a numbered paragraph (#1922).
-    item_numbered: bool,
-    /// A block image split the open list item's text: its paragraphs past
-    /// the numbered one are continuations (#1922).
-    item_split: bool,
+    /// A block image ended the paragraph (#1922): a `</p>` then ends only
+    /// one with content, so `<p><img style="display:block"></p>` makes no
+    /// empty paragraph after the picture's.
+    after_block_object: bool,
 }
 
 impl<'a> Html<'a> {
@@ -1308,8 +1320,7 @@ impl<'a> Html<'a> {
             in_downlevel: false,
             in_not_vml: false,
             images: None,
-            item_numbered: false,
-            item_split: false,
+            after_block_object: false,
         }
     }
 
@@ -1529,6 +1540,7 @@ impl<'a> Html<'a> {
             "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "li" | "blockquote" | "pre"
             | "address" | "dt" | "dd" | "center" | "td" | "th" | "caption" => {
                 self.end_para_if_any();
+                self.after_block_object = false;
                 let mut block = self
                     .blocks
                     .last()
@@ -1548,8 +1560,8 @@ impl<'a> Html<'a> {
                     block.mso_list = class.starts_with("msolist");
                 }
                 if name == "li" {
-                    self.item_numbered = false;
-                    self.item_split = false;
+                    block.item_numbered = false;
+                    block.item_split = false;
                     let numbered = self.lists.last().copied().unwrap_or(false);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
@@ -1838,12 +1850,14 @@ impl<'a> Html<'a> {
             | "address" | "dt" | "dd" | "center" | "caption" => {
                 if let Some(i) = self.blocks.iter().rposition(|(n, _)| n == name) {
                     // A `p` always makes a paragraph, empty or not: Word writes
-                    // its empty paragraphs as `<p>&nbsp;</p>`.
-                    if name == "p" {
+                    // its empty paragraphs as `<p>&nbsp;</p>`. Not after a
+                    // block image, whose paragraph it was (#1922).
+                    if name == "p" && !self.after_block_object {
                         self.end_para();
                     } else {
                         self.end_para_if_any();
                     }
+                    self.after_block_object = false;
                     self.blocks.truncate(i);
                     self.recount_pre();
                 }
@@ -2055,8 +2069,20 @@ impl<'a> Html<'a> {
         if block.is_some() {
             self.end_para_if_any();
             self.space = None;
-            self.item_split = true;
+            if let Some(item) = self.open_item() {
+                item.item_split = true;
+            }
         }
+    }
+
+    /// The open list item's own entry on `blocks`, not across a cell.
+    fn open_item(&mut self) -> Option<&mut Block> {
+        self.blocks
+            .iter_mut()
+            .rev()
+            .take_while(|(n, _)| n != "td" && n != "th")
+            .find(|(n, _)| n == "li")
+            .map(|(_, b)| b)
     }
 
     /// After a block image's content: end its paragraph, aligned to its
@@ -2064,6 +2090,7 @@ impl<'a> Html<'a> {
     fn end_block_object(&mut self, block: Option<Align>) {
         if let Some(align) = block {
             self.end_para_with(Some(align));
+            self.after_block_object = true;
         }
     }
 
@@ -2234,6 +2261,7 @@ impl<'a> Html<'a> {
             .last()
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
+        self.after_block_object = false;
         let mut props = self.par_props();
         if let Some(a) = align {
             props.align = a;
@@ -2246,7 +2274,10 @@ impl<'a> Html<'a> {
             if let Some(m) = &marker {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
             } else if let Some((numbered, level)) = block.item {
-                if self.item_split && self.item_numbered && !block.mso_list {
+                let (done, split) = self
+                    .open_item()
+                    .map_or((false, false), |i| (i.item_numbered, i.item_split));
+                if split && done && !block.mso_list {
                     // Past a block image, the item's text goes on in
                     // unnumbered paragraphs at its level's indent (#1922).
                     let boxes = self.para_look().map_or(0, |l| l.indent);
@@ -2255,7 +2286,9 @@ impl<'a> Html<'a> {
                 } else {
                     props.num_id = Some(if numbered { 2 } else { 1 });
                     props.ilvl = level;
-                    self.item_numbered = true;
+                    if let Some(item) = self.open_item() {
+                        item.item_numbered = true;
+                    }
                 }
             }
         }
@@ -5047,6 +5080,7 @@ mod centering_tests {
         for wrap in [
             "<div align=right>{T}</div>",
             "<div style='text-align:-webkit-right'>{T}</div>",
+            "<div style='text-align:-moz-right'>{T}</div>",
             "<table><tr><td align=right>{T}</td></tr></table>",
         ] {
             let html = wrap.replace("{T}", T);
@@ -5268,6 +5302,83 @@ mod centering_tests {
     }
 
     #[test]
+    fn a_block_image_ending_a_p_leaves_no_empty_paragraph() {
+        let img = "<img src=a.png style='display:block;margin:0 auto'>";
+        let pic = (String::new(), true, Align::Center);
+        for (html, want) in [
+            (format!("<p>{img}</p><p>z</p>"), vec![pic.clone()]),
+            (
+                format!("<p>t{img}</p><p>z</p>"),
+                vec![("t".to_string(), false, Align::Left), pic.clone()],
+            ),
+            (format!("<p>{img} </p><p>z</p>"), vec![pic.clone()]),
+            (
+                format!("<p>{img}u</p><p>z</p>"),
+                vec![pic.clone(), ("u".to_string(), false, Align::Left)],
+            ),
+        ] {
+            let mut want = want;
+            want.push(("z".to_string(), false, Align::Left));
+            assert_eq!(sketch(&with_images(&html)), want, "{html}");
+            // In a cell too.
+            let cell = format!("<table><tr><td>{html}</td></tr></table>");
+            assert_eq!(sketch(&with_images(&cell)), want, "{cell}");
+        }
+        // An empty `p` is still an empty paragraph, after a block image's
+        // paragraph too.
+        let d = with_images(&format!(
+            "<p></p><p>{img}</p><p></p><div>{img}</div><p></p>"
+        ));
+        assert_eq!(
+            sketch(&d),
+            [
+                (String::new(), false, Align::Left),
+                pic.clone(),
+                (String::new(), false, Align::Left),
+                pic.clone(),
+                (String::new(), false, Align::Left),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_list_keeps_its_parent_items_numbering() {
+        let num = |d: &Document| -> Vec<(String, Option<i32>, i32)> {
+            all_paras(d)
+                .into_iter()
+                .map(|p| (p.plain_text(), p.props.num_id, p.props.ilvl))
+                .collect()
+        };
+        let img = "<img src=a.png style='display:block'>";
+        // A nested item does not take the outer item's number: the picture
+        // is the outer item's first paragraph.
+        let d = with_images(&format!(
+            "<ol><li><ul><li>b</li></ul>{img}c</li><li>d</li></ol>"
+        ));
+        assert_eq!(
+            num(&d),
+            [
+                ("b".to_string(), Some(1), 1),
+                (String::new(), Some(2), 0),
+                ("c".to_string(), None, 0),
+                ("d".to_string(), Some(2), 0),
+            ]
+        );
+        // Nor does it clear the outer item's split: `d` goes on unnumbered.
+        let d = with_images(&format!("<ul><li>a{img}b<ul><li>c</li></ul>d</li></ul>"));
+        assert_eq!(
+            num(&d),
+            [
+                ("a".to_string(), Some(1), 0),
+                (String::new(), None, 0),
+                ("b".to_string(), None, 0),
+                ("c".to_string(), Some(1), 1),
+                ("d".to_string(), None, 0),
+            ]
+        );
+    }
+
+    #[test]
     fn fixed_width_block_with_auto_margins_is_indented_evenly() {
         let indents = |html: &str| -> Vec<(String, i32, i32)> {
             all_paras(&doc(html))
@@ -5296,6 +5407,18 @@ mod centering_tests {
         // Wider than the room: no extra indent, never negative.
         assert_eq!(
             indents("<div style='width:9in;margin:0 auto'>x</div>"),
+            [("x".into(), 0, 0)]
+        );
+        // An invalid width (negative, no unit) leaves the valid one before
+        // it; `auto` clears it.
+        for w in ["-1px", "600", "red"] {
+            let html = format!("<div style='width:300px;width:{w};margin:0 auto'>x</div>");
+            assert_eq!(indents(&html), [("x".into(), 2430, 2430)], "{html}");
+            let html = format!("<div style='width:{w};margin:0 auto'>x</div>");
+            assert_eq!(indents(&html), [("x".into(), 0, 0)], "{html}");
+        }
+        assert_eq!(
+            indents("<div style='width:300px;width:auto;margin:0 auto'>x</div>"),
             [("x".into(), 0, 0)]
         );
         // Not without a width, a percentage, both auto sides, or in a cell.
