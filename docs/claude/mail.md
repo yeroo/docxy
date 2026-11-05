@@ -74,7 +74,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
   old single tick, whose wait restarts on every command). With it the engine
   keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
-  not move them, `Refresh` resets both. The normal pass runs when its
+  not move them, except `Refresh` and `SignIn`, whose full pass reschedules
+  both. The normal pass runs when its
   deadline passed or `needs_full_pass()` (no enumeration yet, or no folders:
   a quarantine or an offline start recovers at the next fast deadline). When
   the last pass ran to its end and its folder list still failed non-fatally
@@ -106,6 +107,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   300 s, cleared when an op goes through or the queue is empty): until then
   every drain, a command's included, sends nothing and is `Deferred`, so the
   op is not resent at every fast tick and no engine-wide Offline is set.
+  Without `fast_tick`, `recv_timeout` also wakes at a future `op_retry`
+  (signed in only), so the tick there resends it as a back-off deadline
+  did; `Refresh` clears `op_retry` (not `op_backoff`) to resend at once.
 - After a drain that sent a draft, `sync_after_send` refreshes Drafts, then
   Sent Items, each only when it has a delta link. Drafts first: without
   `ImmutableId` Graph gives the sent message a new id in Sent Items, and the

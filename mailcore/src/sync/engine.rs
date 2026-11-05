@@ -378,7 +378,8 @@ pub struct EngineOptions {
     /// normal pass (every folder's delta and the calendar) every `tick`,
     /// and between them a fast tick every `fast_tick` that drains the
     /// outbox and syncs only the [`SyncCommand::SetFastFolders`] folders.
-    /// Commands do not move either deadline (`Refresh` resets both). A fast
+    /// Commands do not move either deadline, except `Refresh` and `SignIn`,
+    /// whose full pass reschedules both. A fast
     /// tick never runs while the normal pass is due, nor inside a
     /// throttle/back-off window.
     pub fast_tick: Option<Duration>,
@@ -536,7 +537,8 @@ struct Engine {
     next_full: Instant,
     /// With a fast tick only: when the next fast tick is due.
     next_fast: Instant,
-    /// With a fast tick only: the last normal pass ran to its end and still
+    /// With a fast tick only: the full pass that last ran (normal, startup,
+    /// `Refresh`, sign-in) ran to its end and still
     /// left the folders to re-enumerate (the folder list failed
     /// non-fatally: a 403, a 5xx, a parse error), so the fast deadlines do
     /// not repeat it before `next_full`; a quarantine since
@@ -595,8 +597,9 @@ impl Engine {
     }
 
     /// How long to block for the next command: until the back-off deadline if
-    /// one is pending, otherwise the configured tick. With a fast tick: until
-    /// the nearer of the two deadlines, but never before a back-off deadline.
+    /// one is pending, otherwise the configured tick, and no later than a
+    /// deferred op's `op_retry`. With a fast tick: until the nearer of the
+    /// two deadlines, but never before a back-off deadline.
     fn recv_timeout(&self) -> Duration {
         if self.fast_tick().is_some() {
             let mut at = self.next_full.min(self.next_fast);
@@ -605,9 +608,18 @@ impl Engine {
             }
             return at.saturating_duration_since(Instant::now());
         }
-        match self.next_retry {
-            Some(t) => t.saturating_duration_since(Instant::now()),
+        let now = Instant::now();
+        let wait = match self.next_retry {
+            Some(t) => t.saturating_duration_since(now),
             None => self.config.tick,
+        };
+        // Also wake for an op deferred by a 5xx (`op_retry`): the tick at
+        // that instant drains it, as a back-off deadline did before #1885.
+        // Only a future one while signed in, so a passed `op_retry` never
+        // makes a zero wait.
+        match self.op_retry {
+            Some(t) if self.token.is_some() && t > now => wait.min(t - now),
+            _ => wait,
         }
     }
 
@@ -631,9 +643,10 @@ impl Engine {
         !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true)
     }
 
-    /// Whether the pass that just ran (startup, or a normal pass) ran to its
-    /// end and still left the folders to re-enumerate: not cut short by a
-    /// sign-in or a back-off, so its folder list failed non-fatally.
+    /// Whether the full pass that just ran (normal, startup, `Refresh`,
+    /// sign-in) ran to its end and still left the folders to re-enumerate:
+    /// not cut short by a lost sign-in or a back-off, so its folder list
+    /// failed non-fatally.
     fn full_pass_held(&self) -> bool {
         let cut_short = self.token.is_none() || self.next_retry.is_some_and(|t| t > Instant::now());
         !cut_short && self.needs_full_pass()
@@ -716,6 +729,9 @@ impl Engine {
     fn handle_command(&mut self, cmd: SyncCommand) {
         match cmd {
             SyncCommand::Refresh => {
+                // F9 resends a deferred op now; its back-off keeps growing
+                // if it fails again.
+                self.op_retry = None;
                 self.sync_pass(true);
                 self.after_pass_if_fast();
             }
@@ -7062,6 +7078,62 @@ mod tests {
                 .messages_in_folder("DRAFTS1", 50, 0)
                 .unwrap()
                 .is_empty()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queued MarkRead of M1 whose first PATCH gets a 500 and every later
+    /// one succeeds.
+    fn one_5xx_then_ok_routes() -> Vec<(Route, Option<usize>)> {
+        let patch = |status: u16| Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let mut routes = vec![(patch(500), Some(1)), (patch(200), None)];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        routes
+    }
+
+    #[test]
+    fn a_deferred_op_is_resent_at_its_back_off_without_a_fast_tick() {
+        // An hour-long tick: only the op's own back-off (5 s) can bring the
+        // second PATCH within the wait.
+        let srv = FakeServer::start_limited(one_5xx_then_ok_routes());
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "op-retry-legacy", HOUR, None, seed_mark_read);
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 1));
+        assert!(
+            wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2),
+            "the op is resent at its back-off, not after the tick"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || store
+            .pending_ops()
+            .unwrap()
+            .is_empty()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_resends_a_deferred_op_at_once() {
+        let srv = FakeServer::start_limited(one_5xx_then_ok_routes());
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "op-retry-refresh", HOUR, None, seed_mark_read);
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 1));
+        let sent_at = Instant::now();
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2));
+        assert!(
+            sent_at.elapsed() < Duration::from_secs(4),
+            "Refresh resent it before its 5 s back-off: {:?}",
+            sent_at.elapsed()
         );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
