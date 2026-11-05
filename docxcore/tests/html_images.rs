@@ -181,6 +181,11 @@ fn an_unsized_refused_image_is_its_alt_text_and_a_hidden_one_is_nothing() {
 
 #[test]
 fn the_data_image_is_embedded_as_decoded() {
+    // The fixture wraps it as mail does (`-text` in .gitattributes keeps the
+    // CRLF).
+    let page = String::from_utf8(fixture("cid-message.html")).unwrap();
+    let uri = &page[page.find("data:image/png").unwrap()..];
+    assert!(uri[..uri.find('"').unwrap()].contains("\r\n"));
     let (got, _) = import_message();
     let pics = pictures(&got.document.body);
     let rid = inline_embed(pics[2]).unwrap();
