@@ -96,6 +96,8 @@ impl DocView {
     /// A view of `doc`, its pictures read from `pkg` (`None`: each picture
     /// draws as its frame).
     pub fn new(doc: Document, pkg: Option<Package>, cx: &mut Context<Self>) -> Self {
+        // The host may not run the suite's `run` (#1900).
+        crate::font_subst::init(cx);
         let pictures = Rc::new(RefCell::new(pictures::Cache::default()));
         pictures::register_extra(&pictures);
         cx.on_release(|this: &mut Self, _cx| {
@@ -538,8 +540,12 @@ impl Render for DocView {
             .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
             .collect();
         let viewport = self.viewport.clone();
+        // The document's inherited font: the host's theme font, made loadable
+        // without touching the host's theme (#1900).
+        let ui_font = crate::font_subst::ui_family(&cx.theme().font_family);
         div()
             .id("ext-doc-view")
+            .font_family(ui_font)
             .track_focus(&self.focus)
             .relative()
             .size_full()

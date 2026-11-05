@@ -2307,8 +2307,8 @@ pub(crate) fn keep_inactive_strike<E: gpui::Styled>(el: E, inactive: bool) -> E 
 pub(crate) fn styled<E: gpui::Styled>(el: E, style: &TextStyle) -> E {
     use gpui::{FontWeight, px};
     let mut el = el;
-    if let Some(font) = &style.font {
-        el = el.font_family(font.clone());
+    if let Some(font) = style.font.as_deref().and_then(crate::font_subst::family) {
+        el = el.font_family(font);
     }
     if let Some(size) = style.size {
         el = el.text_size(px(size * 96. / 72.));
