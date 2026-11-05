@@ -31,7 +31,7 @@ use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Message, Sche
 use crate::store::{
     LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, Store, StoreError,
 };
-use crate::sync::outbox::apply_op;
+use crate::sync::outbox::{apply_op, send_error_text};
 use crate::tokencache;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -157,10 +157,14 @@ pub enum SyncCommand {
     /// a Graph id, or a `local:` id already reconciled to one (#1884), is
     /// patched in place.
     SaveDraft { id: String },
-    /// Hand a draft to Graph for delivery: optimistically mark it sent and
-    /// (if the Sent folder has synced) move it there locally, then enqueue
-    /// [`crate::store::OutboxOp::SendDraft`] and drain. Emits
-    /// [`SyncEvent::Sent`] once the drain actually delivers it.
+    /// Hand a draft to Graph for delivery: enqueue
+    /// [`crate::store::OutboxOp::SendDraft`], optimistically mark it sent and
+    /// (if the Sent folder has synced) move it there locally, emit
+    /// [`SyncEvent::Sending`], and drain. Emits [`SyncEvent::Sent`] once the
+    /// drain actually delivers it, or [`SyncEvent::SendFailed`] when the send
+    /// fails for good (any failure but a 5xx, 401, 429/503 or transport
+    /// error, which keep the op queued): the message is then back in Drafts
+    /// as a draft (#1874). A send is never quarantined.
     SendDraft { id: String },
     /// Fetch a pre-quoted reply draft for `id` (`createReply`/
     /// `createReplyAll` depending on `all`), store it, and emit
@@ -266,6 +270,25 @@ pub enum SyncEvent {
     /// still a `local:` id when send started) was successfully handed to
     /// Graph for delivery.
     Sent { id: String },
+    /// The send of draft `id` was queued (#1874): the
+    /// [`SyncCommand::SendDraft`] arm emits it once the op is in the outbox
+    /// and before the drain, so it precedes that send's [`SyncEvent::Sent`]
+    /// or [`SyncEvent::SendFailed`]. `id` is the id the command carried.
+    /// Signed out, inside a back-off or behind a 5xx, neither may follow
+    /// until a later drain runs. A send left queued by an earlier run gets
+    /// no `Sending`.
+    Sending { id: String },
+    /// The send of draft `id` failed for good (#1874): a 4xx (a 403 when the
+    /// token lacks `Mail.Send`, a 400 on the PATCH), a 404 (the Graph draft
+    /// is gone; the Drafts delta may then remove the row), or a failure
+    /// before Graph (an attachment file that cannot be read, a store
+    /// error). The op is dropped, and the message is back in Drafts as a
+    /// draft with its fields and attachments. `id` is the id the
+    /// [`SyncCommand::SendDraft`] carried, as for [`SyncEvent::Sent`]: the
+    /// draft is still reachable by it (#1884). `error` is Graph's
+    /// `error.message` when the response has one, else the status or the
+    /// failure's own text.
+    SendFailed { id: String, error: String },
     /// The events store changed (a `RefreshCalendar`/`RespondEvent` just
     /// landed); re-read `Store::events_in_window`/`Store::event_attendees`.
     CalendarUpdated,
@@ -293,7 +316,9 @@ pub struct SyncHandle {
 /// Refresh the access token when it's within this window of expiring.
 const EXPIRY_SKEW_SECS: u64 = 300;
 /// Quarantine an outbox op after this many failed attempts on a non-retryable
-/// (4xx other than 401/429) error, so one bad op can't block the queue.
+/// (4xx other than 401/429) error, so one bad op can't block the queue. A
+/// `SendDraft` is never quarantined: its first such failure returns the
+/// message to Drafts (`Engine::fail_send`, #1874).
 const MAX_OP_ATTEMPTS: i64 = 5;
 /// At most this many header-less rows of a folder are fetched from Graph per
 /// sync pass (`Engine::repair_headerless`, #1899); the rest wait for the next.
@@ -840,6 +865,19 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::SaveDraft { id });
             }
             SyncCommand::SendDraft { id } => {
+                // Queue it first: a send that cannot be queued is a failed
+                // send (#1874), reported before anything optimistic touched
+                // the row, so the message simply stays a draft.
+                if let Err(e) = self
+                    .store
+                    .enqueue_op(&OutboxOp::SendDraft { id: id.clone() })
+                {
+                    self.emit(SyncEvent::SendFailed {
+                        id,
+                        error: e.to_string(),
+                    });
+                    return;
+                }
                 // Optimistic local write, same spirit as MarkRead/SetFlag/
                 // Move/Delete: mark the row no longer a draft, and — if the
                 // Sent folder has synced — re-file it there right away so
@@ -847,12 +885,14 @@ impl Engine {
                 // reaches Graph. `id` is whatever the caller currently
                 // addresses this draft by (a `local:` id if it was never
                 // pushed, else its Graph id); `apply_op` resolves/reconciles
-                // the Graph side, this only touches the local row.
+                // the Graph side, this only touches the local row. A send
+                // that fails for good undoes it (`fail_send`).
                 self.store.mark_sent(&id);
                 if let Some(sent_id) = self.sent_items_folder_id() {
                     let _ = self.store.move_message(&id, &sent_id);
                 }
-                self.enqueue_and_drain(OutboxOp::SendDraft { id });
+                self.emit(SyncEvent::Sending { id });
+                self.drain_queued();
             }
             SyncCommand::ComposeReply { id, all } => self.compose_reply(&id, all),
             SyncCommand::ComposeForward { id } => self.compose_forward(&id),
@@ -1376,6 +1416,12 @@ impl Engine {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
         }
+        self.drain_queued();
+    }
+
+    /// The half of `enqueue_and_drain` after the op is queued: reflect the
+    /// pending count, and (if signed in) try to push it now.
+    fn drain_queued(&mut self) {
         self.set_state(SyncState::PendingOps(self.pending_count()));
         // A 5xx defers the op under the outbox's own back-off (`op_retry`),
         // not an engine-wide Offline: the folders keep syncing.
@@ -1389,7 +1435,9 @@ impl Engine {
     /// the op; auth/throttle/transport stop the drain (handled centrally);
     /// a non-retryable 4xx/parse bumps the attempt count and, past
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
-    /// the rest of the queue proceeds; a 5xx keeps the op and stops the
+    /// the rest of the queue proceeds, except a `SendDraft`, whose first
+    /// such failure returns the message to Drafts (`fail_send`, #1874) and
+    /// the queue proceeds too; a 5xx keeps the op and stops the
     /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
     /// it must not stop the caller's sync either. It arms the outbox's own
     /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
@@ -1467,6 +1515,12 @@ impl Engine {
                         deferred = true;
                         break;
                     }
+                    if let OutboxOp::SendDraft { id } = &row.op {
+                        // Retrying a 403 changes nothing: the first such
+                        // failure is final for a send.
+                        self.fail_send(row.seq, id, &other);
+                        continue;
+                    }
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
                         self.store.drop_op(row.seq);
@@ -1516,6 +1570,37 @@ impl Engine {
             Drain::Deferred
         } else {
             Drain::Done
+        }
+    }
+
+    /// A send failed for good (#1874): every failure reaching it is final,
+    /// whatever the op's attempt count. That is an `Http` 4xx (401 and 429
+    /// never get here), `NotFound` (the Graph draft is gone; the Drafts delta
+    /// may then remove the row this returns to Drafts) and any `Parse`,
+    /// which includes an attachment file that cannot be read and a store
+    /// error `apply_op` maps to `Parse`. Drops the op, undoes the
+    /// `SendDraft` arm's optimistic write (`Store::return_to_drafts`: a draft
+    /// again, in the Drafts folder, or the local sentinel before Drafts has
+    /// synced; nothing else of the message changes), emits `SendFailed`, and
+    /// reloads Drafts and Sent Items. The revert is exact, so unlike a
+    /// quarantine there is no delta reconverge and no `Error`.
+    fn fail_send(&mut self, seq: i64, id: &str, err: &GraphError) {
+        self.store.drop_op(seq);
+        // The sync thread resolves the sentinel itself, so `retain_folders`
+        // cannot remove it in between (#1886).
+        let drafts = self.store.drafts_folder_id().ok();
+        if let Some(drafts) = &drafts {
+            let _ = self.store.return_to_drafts(id, drafts);
+        }
+        self.emit(SyncEvent::SendFailed {
+            id: id.to_string(),
+            error: send_error_text(err),
+        });
+        if let Some(folder_id) = drafts {
+            self.emit(SyncEvent::MessagesUpdated { folder_id });
+        }
+        if let Some(folder_id) = self.sent_items_folder_id() {
+            self.emit(SyncEvent::MessagesUpdated { folder_id });
         }
     }
 
@@ -7155,12 +7240,470 @@ mod tests {
             row.folder_id, "SENT1",
             "the sent row stays under Sent Items"
         );
+        assert!(!row.is_draft, "and is no draft");
+        let at = |want: &SyncEvent| seen.iter().position(|e| e == want);
+        assert!(
+            at(&SyncEvent::Sending { id: local.clone() })
+                < at(&SyncEvent::Sent { id: local.clone() }),
+            "Sending precedes Sent: {seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SendFailed { .. }))
+        );
         assert!(
             store
                 .messages_in_folder("DRAFTS1", 50, 0)
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A send that fails goes back to Drafts (#1874) --------------------
+
+    const DRAFTS_SENT: &[(&str, &str, Option<&str>)] = &[
+        ("DRAFTS1", "Drafts", Some("drafts")),
+        ("SENT1", "Sent Items", Some("sentitems")),
+    ];
+
+    const ACCESS_DENIED: &str = "Access is denied. Check credentials and try again.";
+
+    fn post_route(path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    fn access_denied_body() -> String {
+        format!(r#"{{"error":{{"code":"ErrorAccessDenied","message":"{ACCESS_DENIED}"}}}}"#)
+    }
+
+    /// The routes a send of the local draft created as `GRAPH-42` needs, most
+    /// specific first: `sends` answer `/send` in order (each with its use
+    /// limit), then the attachment upload, the PATCH, the create, and the
+    /// Drafts and Sent Items folders (an empty delta each).
+    fn send_routes(sends: Vec<(Route, Option<usize>)>) -> Vec<(Route, Option<usize>)> {
+        let mut routes = sends;
+        routes.push((
+            post_route("/me/messages/GRAPH-42/attachments", 201, "{}"),
+            None,
+        ));
+        routes.push((
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/GRAPH-42".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            None,
+        ));
+        routes.push((
+            post_route(
+                "/me/messages",
+                201,
+                r#"{"id":"GRAPH-42","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#,
+            ),
+            None,
+        ));
+        routes.extend(folder_routes(DRAFTS_SENT, &[], &[]));
+        routes
+    }
+
+    /// Seeds a local draft with `attachment` (a path) as its pending file,
+    /// and returns the local id through `local`.
+    fn seed_draft_with<'a>(local: &'a mut String, attachment: &str) -> impl FnOnce(&Store) + 'a {
+        let attachment = attachment.to_string();
+        move |s: &Store| {
+            *local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+            s.add_outbound_attachment(local, &attachment, "note.txt", 5)
+                .unwrap();
+        }
+    }
+
+    /// Sends a `FetchBody` of an unknown id and waits for its error: commands
+    /// run in order, so everything before it has been handled.
+    fn barrier(handle: &SyncHandle, seen: &mut Vec<SyncEvent>) {
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchBody {
+                id: "barrier".into(),
+            })
+            .unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Error(_))
+        }));
+    }
+
+    fn position(seen: &[SyncEvent], pred: impl Fn(&SyncEvent) -> bool) -> Option<usize> {
+        seen.iter().position(pred)
+    }
+
+    #[test]
+    fn a_403_send_returns_the_draft_to_drafts_with_send_failed() {
+        let dir = unique_dir("send-403-file");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let srv = FakeServer::start_limited(send_routes(vec![
+            (
+                post_route("/me/messages/GRAPH-42/send", 403, &access_denied_body()),
+                Some(1),
+            ),
+            (post_route("/me/messages/GRAPH-42/send", 202, ""), None),
+        ]));
+        let mut local = String::new();
+        let (handle, store_path, store_dir) = spawn_fast(
+            &srv,
+            "send-403",
+            HOUR,
+            None,
+            seed_draft_with(&mut local, file.to_str().unwrap()),
+        );
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+        let startup = seen.len();
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        let send = &seen[startup..];
+
+        let failed = SyncEvent::SendFailed {
+            id: local.clone(),
+            error: ACCESS_DENIED.into(),
+        };
+        let at_failed = position(send, |e| e == &failed).expect("SendFailed");
+        let at_sending =
+            position(send, |e| e == &SyncEvent::Sending { id: local.clone() }).expect("Sending");
+        assert!(at_sending < at_failed, "{send:?}");
+        // The tail lookxy's `a_failed_send_stays_shown_after_the_engine_settles`
+        // replays: the settle to `Idle` comes after `SendFailed`.
+        assert_eq!(
+            send[at_failed..],
+            [
+                failed.clone(),
+                SyncEvent::MessagesUpdated {
+                    folder_id: "DRAFTS1".into()
+                },
+                SyncEvent::MessagesUpdated {
+                    folder_id: "SENT1".into()
+                },
+                SyncEvent::State(SyncState::Idle),
+            ],
+            "{send:?}"
+        );
+        assert!(
+            !send
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Sent { .. } | SyncEvent::Error(_))),
+            "{send:?}"
+        );
+        assert!(send.contains(&SyncEvent::MessagesUpdated {
+            folder_id: "DRAFTS1".into()
+        }));
+        no_quarantine(&seen);
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 1);
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/attachments"), 1);
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, body) = store.draft(&local).unwrap().expect("the draft");
+        assert_eq!(row.id, "GRAPH-42");
+        assert_eq!(row.folder_id, "DRAFTS1", "back in Drafts");
+        assert!(row.is_draft);
+        assert_eq!(row.subject, "Hi");
+        assert_eq!(row.to_recipients, "bob@x");
+        assert_eq!(body.content, "<p>hello</p>");
+        let atts = store.outbound_attachments(&local).unwrap();
+        assert_eq!(atts.len(), 1, "the pending attachment is kept");
+        assert!(atts[0].uploaded, "and known to be on the Graph draft");
+        assert!(
+            store.pending_ops().unwrap().is_empty(),
+            "the send is dropped"
+        );
+        assert!(
+            store.get_delta_link("DRAFTS1").unwrap().is_some(),
+            "no delta reconverge"
+        );
+
+        // #1874 1b: the resend PATCHes and sends, uploading nothing again.
+        let resend = seen.len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        assert!(
+            seen[resend..].contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 1);
+        assert_eq!(hits(&srv, "PATCH", "/me/messages/GRAPH-42"), 1);
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 2);
+        assert_eq!(
+            hits(&srv, "POST", "/me/messages/GRAPH-42/attachments"),
+            1,
+            "the file is attached once over both sends"
+        );
+        assert!(store.outbound_attachments(&local).unwrap().is_empty());
+        let (row, _) = store.draft(&local).unwrap().unwrap();
+        assert_eq!(row.folder_id, "SENT1");
+        assert!(!row.is_draft);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_500_send_stays_queued_and_unchanged() {
+        let srv = FakeServer::start_limited(send_routes(vec![(
+            post_route("/me/messages/GRAPH-42/send", 500, "boom"),
+            None,
+        )]));
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-500", HOUR, None, |s| {
+            local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+        });
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        barrier(&handle, &mut seen);
+
+        assert!(hits(&srv, "POST", "/me/messages/GRAPH-42/send") >= 1);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SendFailed { .. } | SyncEvent::Sent { .. })),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        let queued = store.pending_ops().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(&queued[0].op, OutboxOp::SendDraft { id } if id == &local));
+        assert!(queued[0].attempts >= 1, "attempts bumped");
+        let (row, _) = store.draft(&local).unwrap().unwrap();
+        assert_eq!(row.folder_id, "SENT1", "the optimistic write stays");
+        assert!(!row.is_draft);
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_5xx_send_then_a_202_uploads_each_attachment_once() {
+        let dir = unique_dir("send-5xx-file");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let srv = FakeServer::start_limited(send_routes(vec![
+            (
+                post_route("/me/messages/GRAPH-42/send", 500, "boom"),
+                Some(1),
+            ),
+            (post_route("/me/messages/GRAPH-42/send", 202, ""), None),
+        ]));
+        let mut local = String::new();
+        let (handle, _store_path, store_dir) = spawn_fast(
+            &srv,
+            "send-5xx-once",
+            HOUR,
+            None,
+            seed_draft_with(&mut local, file.to_str().unwrap()),
+        );
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        barrier(&handle, &mut seen);
+        // Refresh resends the deferred op at once.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Sent { .. })
+        }));
+
+        assert!(seen.contains(&SyncEvent::Sent { id: local.clone() }));
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 2);
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/attachments"), 1);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_send_with_a_missing_attachment_file_returns_to_drafts() {
+        let srv = FakeServer::start_limited(send_routes(vec![(
+            post_route("/me/messages/GRAPH-42/send", 202, ""),
+            None,
+        )]));
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(
+            &srv,
+            "send-missing-file",
+            HOUR,
+            None,
+            seed_draft_with(&mut local, "/does/not/exist/missing.pdf"),
+        );
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+
+        let error = seen
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::SendFailed { id, error } if id == &local => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no SendFailed: {seen:?}"));
+        assert!(
+            error.starts_with("cannot read attachment /does/not/exist/missing.pdf"),
+            "{error}"
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 0);
+        let store = Store::open(&store_path).unwrap();
+        let (row, _) = store.draft(&local).unwrap().unwrap();
+        assert_eq!(row.folder_id, "DRAFTS1");
+        assert!(row.is_draft);
+        let atts = store.outbound_attachments(&local).unwrap();
+        assert_eq!(atts.len(), 1);
+        assert!(!atts[0].uploaded);
+        assert!(store.pending_ops().unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_drain_sends_a_and_returns_b_to_drafts() {
+        // Both sends and a MarkRead behind them were queued while offline,
+        // after the `SendDraft` arm's optimistic write (filed under Sent
+        // Items, not a draft). Graph has moved neither draft yet: the Drafts
+        // delta right after the send reports both, so only an id in the
+        // drain's `sent` list is re-filed under Sent Items (#1885).
+        let drafts_next = delta_page(
+            &[
+                full_message_json("GRAPH-A", "A", "2026-07-16T10:00:00Z"),
+                full_message_json("GRAPH-B", "B", "2026-07-16T10:00:00Z"),
+            ],
+            "/me/mailFolders/DRAFTS1/messages/delta?token=D-DRAFTS1",
+        );
+        let patch = |path: &str| Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let mut routes = vec![
+            (post_route("/me/messages/GRAPH-A/send", 202, ""), None),
+            (
+                post_route("/me/messages/GRAPH-B/send", 403, &access_denied_body()),
+                None,
+            ),
+            (patch("/me/messages/GRAPH-A"), None),
+            (patch("/me/messages/GRAPH-B"), None),
+            (patch("/me/messages/M1"), None),
+        ];
+        routes.extend(folder_routes(
+            DRAFTS_SENT,
+            &[("DRAFTS1", &drafts_next)],
+            &[],
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (mut a, mut b) = (String::new(), String::new());
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-a-b", HOUR, None, |s| {
+            for (id, wk, name) in [
+                ("DRAFTS1", "drafts", "Drafts"),
+                ("SENT1", "sentitems", "Sent Items"),
+            ] {
+                s.upsert_folder(&MailFolder {
+                    id: id.into(),
+                    display_name: name.into(),
+                    parent_id: None,
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: Some(wk.into()),
+                })
+                .unwrap();
+            }
+            for (local, subject, graph) in [(&mut a, "A", "GRAPH-A"), (&mut b, "B", "GRAPH-B")] {
+                *local = s
+                    .create_local_draft(subject, "bob@x", "", "<p>x</p>")
+                    .unwrap();
+                s.reconcile_id(local, graph).unwrap();
+                s.mark_sent(local);
+                s.move_message(local, "SENT1").unwrap();
+                s.enqueue_op(&OutboxOp::SendDraft { id: local.clone() })
+                    .unwrap();
+            }
+            s.enqueue_op(&OutboxOp::MarkRead {
+                id: "M1".into(),
+                read: true,
+            })
+            .unwrap();
+        });
+        let mut seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SendFailed { .. })
+        });
+        wait_idle(&handle, &mut seen);
+
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: a.clone() }),
+            "{seen:?}"
+        );
+        assert!(seen.contains(&SyncEvent::SendFailed {
+            id: b.clone(),
+            error: ACCESS_DENIED.into(),
+        }));
+        assert!(!seen.contains(&SyncEvent::Sent { id: b.clone() }));
+        assert_eq!(
+            hits(&srv, "PATCH", "/me/messages/M1"),
+            1,
+            "the drain went on"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert!(
+            srv.requests().iter().any(|r| r
+                .path
+                .starts_with("/me/mailFolders/DRAFTS1/messages/delta?token=")),
+            "the post-send Drafts delta ran"
+        );
+        let (row_a, _) = store.draft(&a).unwrap().unwrap();
+        assert_eq!(row_a.folder_id, "SENT1", "A was sent");
+        let (row_b, _) = store.draft(&b).unwrap().unwrap();
+        assert_eq!(
+            row_b.folder_id, "DRAFTS1",
+            "B is not in the post-send sync's sent list"
+        );
+        no_quarantine(&seen);
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

@@ -57,12 +57,19 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             let graph_id = ensure_draft_on_graph(client, store, id)?;
             // Upload each pending attachment to the (now-on-Graph) draft before
             // sending. A file-read or upload error returns here, so the drain's
-            // retry/quarantine policy applies and the attachments are NOT
-            // cleared — the send hasn't happened, so a retry is clean.
+            // failure policy applies (a 5xx retries; anything else returns the
+            // draft to Drafts, #1874) and the attachments are NOT cleared — the
+            // send hasn't happened. Each one uploaded is marked `uploaded` at
+            // once, and one already marked (by an earlier send that then
+            // failed) is skipped, so a retry or a resend never attaches a file
+            // to the Graph draft twice.
             for att in store
                 .outbound_attachments(&graph_id)
                 .map_err(|e| GraphError::Parse(e.to_string()))?
             {
+                if att.uploaded {
+                    continue;
+                }
                 let bytes = std::fs::read(&att.path).map_err(|e| {
                     GraphError::Parse(format!("cannot read attachment {}: {e}", att.path))
                 })?;
@@ -72,11 +79,15 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                     &content_type_for(&att.name),
                     &bytes,
                 )?;
+                store
+                    .mark_outbound_attachment_uploaded(&graph_id, &att.path)
+                    .map_err(|e| GraphError::Parse(e.to_string()))?;
             }
             client.send_draft(&graph_id)?;
-            store
-                .clear_outbound_attachments(&graph_id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            // The send happened: from here nothing may read as a failed send,
+            // which would return a delivered message to Drafts (#1874). A
+            // store error leaves the attachment rows behind, which is harmless.
+            let _ = store.clear_outbound_attachments(&graph_id);
             Ok(())
         }
         OutboxOp::RespondEvent {
@@ -120,6 +131,27 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 client.delete_event(id)
             }
         }
+    }
+}
+
+/// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's
+/// own `error.message` for an HTTP error whose body carries a non-empty one,
+/// else `HTTP {status}`; a `Parse` failure's message as is (a missing
+/// attachment file, a store error); any other error's `Display`.
+pub(crate) fn send_error_text(err: &GraphError) -> String {
+    match err {
+        GraphError::Http { status, body } => crate::json::parse(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")?
+                    .get("message")?
+                    .as_str()
+                    .map(|m| m.trim().to_string())
+            })
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| format!("HTTP {status}")),
+        GraphError::Parse(m) => m.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -809,9 +841,100 @@ mod tests {
         // once the file is back). The draft is reconciled to GRAPH-2 by
         // `ensure_draft_on_graph` before the upload loop runs, so that's
         // where the pending row now lives.
-        assert!(!store.outbound_attachments("GRAPH-2").unwrap().is_empty());
+        let kept = store.outbound_attachments("GRAPH-2").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].uploaded, "a file never uploaded is not marked");
         // And send was never reached.
         assert!(!srv.requests().iter().any(|r| r.path.ends_with("/send")));
+    }
+
+    #[test]
+    fn send_draft_skips_an_attachment_already_uploaded() {
+        // #1874: a failed send uploaded it; the resend must not attach it twice.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-3/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-3/attachments".into(),
+                status: 201,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/GRAPH-3".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "bob@x", "", "body").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-3").unwrap();
+        // The file is gone too: an uploaded row is never read again.
+        store
+            .add_outbound_attachment(&local_id, "/does/not/exist/a.pdf", "a.pdf", 1)
+            .unwrap();
+        store
+            .mark_outbound_attachment_uploaded(&local_id, "/does/not/exist/a.pdf")
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.contains("/attachments"))
+        );
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me/messages/GRAPH-3/send")
+        );
+        assert!(store.outbound_attachments(&local_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_error_text_prefers_graphs_own_message() {
+        let http = |status: u16, body: &str| GraphError::Http {
+            status,
+            body: body.into(),
+        };
+        assert_eq!(
+            send_error_text(&http(
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied","message":"Access is denied."}}"#
+            )),
+            "Access is denied."
+        );
+        assert_eq!(send_error_text(&http(403, "<html>nope</html>")), "HTTP 403");
+        assert_eq!(
+            send_error_text(&http(400, r#"{"error":{"code":"X","message":"  "}}"#)),
+            "HTTP 400"
+        );
+        assert_eq!(
+            send_error_text(&http(400, r#"{"error":{"code":"X"}}"#)),
+            "HTTP 400"
+        );
+        assert_eq!(send_error_text(&GraphError::NotFound), "not found (404)");
+        assert_eq!(
+            send_error_text(&GraphError::Parse("cannot read attachment /x: gone".into())),
+            "cannot read attachment /x: gone"
+        );
     }
 
     /// A Graph event JSON body shaped like `create_event`'s response —
