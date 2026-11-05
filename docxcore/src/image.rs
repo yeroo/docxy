@@ -84,12 +84,39 @@ pub fn next_drawing_id<'a>(xmls: impl IntoIterator<Item = &'a str>) -> u32 {
 /// EMUs, drawing object `id`. Every DrawingML namespace it uses is declared
 /// on it, so it reads in a part whose root declares only `w` and `r`.
 pub fn inline_picture_run(rid: &str, cx: i64, cy: i64, id: u32, file_name: &str) -> String {
+    inline_picture_run_described(rid, cx, cy, id, file_name, "", None)
+}
+
+/// [`inline_picture_run`] with Alt Text (`wp:docPr`'s `descr`, left out
+/// when empty; line breaks and tabs kept as character references, other
+/// control characters dropped) and, when `outline` names an `RRGGBB`
+/// colour, a 1 px line of it round the picture (#1880's placeholder).
+pub fn inline_picture_run_described(
+    rid: &str,
+    cx: i64,
+    cy: i64,
+    id: u32,
+    file_name: &str,
+    descr: &str,
+    outline: Option<&str>,
+) -> String {
     let name = crate::mermaid::xml_escape_attr(file_name);
+    let descr = if descr.is_empty() {
+        String::new()
+    } else {
+        format!(" descr=\"{}\"", escape_descr(descr))
+    };
+    let line = outline.map_or(String::new(), |c| {
+        format!(
+            "<a:ln w=\"9525\"><a:solidFill><a:srgbClr val=\"{}\"/></a:solidFill></a:ln>",
+            crate::mermaid::xml_escape_attr(c)
+        )
+    });
     format!(
         "<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" \
          xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">\
          <wp:extent cx=\"{cx}\" cy=\"{cy}\"/><wp:effectExtent l=\"0\" t=\"0\" r=\"0\" b=\"0\"/>\
-         <wp:docPr id=\"{id}\" name=\"Picture {id}\"/>\
+         <wp:docPr id=\"{id}\" name=\"Picture {id}\"{descr}/>\
          <wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" noChangeAspect=\"1\"/></wp:cNvGraphicFramePr>\
          <a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
          <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
@@ -97,9 +124,31 @@ pub fn inline_picture_run(rid: &str, cx: i64, cy: i64, id: u32, file_name: &str)
          <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"{name}\"/><pic:cNvPicPr/></pic:nvPicPr>\
          <pic:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
          <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>\
+         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>{line}</pic:spPr>\
          </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
     )
+}
+
+/// Alt Text as an attribute value: XML's specials escaped, a line break or
+/// tab as a character reference (an attribute's white space is otherwise
+/// normalised to spaces on read), any other control character dropped (XML
+/// 1.0 cannot hold it).
+fn escape_descr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\n' => out.push_str("&#10;"),
+            '\t' => out.push_str("&#9;"),
+            '\r' => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// An inline picture run's size in EMUs, from its `wp:inline`'s
@@ -431,6 +480,38 @@ mod tests {
         // FIX r1 M1: the largest id in use is not followed by an overflow.
         let full = r#"<wp:docPr id="4294967295"/><wp:docPr id="1"/><wp:docPr id="2"/>"#;
         assert_eq!(next_drawing_id([full]), 3);
+    }
+
+    #[test]
+    fn a_described_picture_run_carries_its_alt_text_and_outline() {
+        // The plain run is byte-for-byte what it was.
+        let plain = inline_picture_run("rId5", 10, 20, 3, "a.png");
+        assert_eq!(
+            plain,
+            inline_picture_run_described("rId5", 10, 20, 3, "a.png", "", None)
+        );
+        assert!(!plain.contains("descr="));
+        assert!(!plain.contains("<a:ln"));
+        let run = inline_picture_run_described(
+            "rId5",
+            10,
+            20,
+            3,
+            "a.png",
+            "Logo \"A&B\" <x>\nline\ttab\u{1}\r",
+            Some("A6A6A6"),
+        );
+        assert!(
+            run.contains(
+                r#"<wp:docPr id="3" name="Picture 3" descr="Logo &quot;A&amp;B&quot; &lt;x&gt;&#10;line&#9;tab"/>"#
+            ),
+            "{run}"
+        );
+        assert!(run.contains(
+            r#"<a:avLst/></a:prstGeom><a:ln w="9525"><a:solidFill><a:srgbClr val="A6A6A6"/></a:solidFill></a:ln></pic:spPr>"#
+        ));
+        assert_eq!(inline_extent(&run), Some((10, 20)));
+        assert_eq!(inline_embed(&run).as_deref(), Some("rId5"));
     }
 
     #[test]

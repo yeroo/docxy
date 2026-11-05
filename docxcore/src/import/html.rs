@@ -26,7 +26,17 @@
 //! above it are computed again), an end reopens the formatting elements
 //! left open inside (three alike at most), and no close reaches across a
 //! table, as in a browser. White space collapses as a browser collapses it, except in
-//! `pre`. Images, links' targets and forms are not converted.
+//! `pre`. Links' targets and forms are not converted.
+//!
+//! Images (#1880) only through [`import_html_with`] ([`html_image`]): an
+//! `<img>` is an inline picture sized by its `width` / `height` (attributes,
+//! CSS lengths over them; `auto` clears a side, a percentage leaves the
+//! attribute's) and its pixels, scaled down to the body width. A `data:`
+//! src is decoded, any other goes to the caller's resolver; one that gives
+//! no PNG, JPEG, GIF or BMP is a grey placeholder of the declared size with
+//! its `alt` as Alt Text, or, unsized, the `alt` text itself. Word's
+//! `<![if !vml]>` image is read (its VML twin in a comment is not); a
+//! hidden one, a zero-sized one and one in a list marker make nothing.
 //!
 //! Tables (#1878) are laid out by [`html_table`]: `colspan` / `rowspan`,
 //! the table's and cells' `width` (attribute or CSS), cell shading from the
@@ -37,25 +47,108 @@
 //! nested, to [`MAX_TABLE_NESTING`] levels.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
+use super::html_image::{self, ImageResolver, Images, ImportedMedia, Source};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
-use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
+use crate::model::{Align, Block as DocBlock, Document, Inline, ParProps, RunProps, VertAlign};
+use crate::package::Package;
 
 /// The longest tag name or list marker kept, in bytes.
 const MAX_TAG: usize = 32;
 
 /// Read an HTML page. `Err` when it holds no text, or would cost more
 /// than an import may ([`TOO_BIG`]).
+/// Images are not converted: a [`Document`] alone cannot hold their media
+/// ([`import_html_with`] does).
 pub fn import_html(bytes: &[u8]) -> Result<Document, String> {
-    import_html_within(bytes, &Budget::standard())
+    import_html_within(bytes, &Budget::standard(), None).map(|(doc, _)| doc)
 }
 
-/// [`import_html`] against `budget`. Decoding, the `<style>` scan and the
-/// tokenizer are each one forward pass over the input (charged once here);
-/// the style sheet is charged as it is parsed and matched; the element
-/// stacks are at most [`MAX_DEPTH`] deep, so a closing tag's search is
-/// bounded; the document is charged as it is built.
-pub(crate) fn import_html_within(bytes: &[u8], budget: &Budget) -> Result<Document, String> {
+/// An HTML page read with its images (#1880): the document, whose pictures
+/// name import-local rids, and the media they name.
+#[derive(Debug)]
+pub struct HtmlImport {
+    pub document: Document,
+    pub media: Vec<ImportedMedia>,
+}
+
+impl HtmlImport {
+    /// The document in a fresh Markdown package (the styles and lists an
+    /// import uses, as [`crate::package::new_markdown_package`]) holding its
+    /// media: each medium a `word/media/imageN.<ext>` part of
+    /// `word/document.xml`, its pictures renamed to the relationship's id.
+    /// Each medium's bytes are dropped as soon as the package holds them.
+    pub fn package(self) -> Package {
+        let HtmlImport {
+            mut document,
+            media,
+        } = self;
+        let mut pkg = crate::package::new_markdown_package(Document::default());
+        let mut rids = std::collections::HashMap::new();
+        for m in media {
+            if let Some(rid) = pkg.add_part_media(
+                "word/document.xml",
+                &m.bytes,
+                m.info.ext,
+                m.info.content_type,
+            ) {
+                rids.insert(m.rid, rid);
+            }
+        }
+        rename_embeds(&mut document.body, &rids);
+        pkg.document = document;
+        pkg
+    }
+}
+
+/// Every picture run in `blocks` (table cells included) with its rid
+/// renamed by `map`.
+fn rename_embeds(blocks: &mut [DocBlock], map: &std::collections::HashMap<String, String>) {
+    for b in blocks {
+        match b {
+            DocBlock::Paragraph(p) => {
+                for inline in &mut p.content {
+                    if let Inline::Raw(raw) = inline {
+                        if let Some(new) = crate::image::replace_inline_embeds(raw, map) {
+                            *raw = new;
+                        }
+                    }
+                }
+            }
+            DocBlock::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        rename_embeds(&mut cell.blocks, map);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Read an HTML page with its images (#1880): a `data:` src is decoded,
+/// any other is asked of `resolve` ([`ImageResolver`]). `Err` as
+/// [`import_html`]'s.
+pub fn import_html_with(
+    bytes: &[u8],
+    resolve: &mut ImageResolver<'_>,
+) -> Result<HtmlImport, String> {
+    let (document, media) = import_html_within(bytes, &Budget::standard(), Some(resolve))?;
+    Ok(HtmlImport { document, media })
+}
+
+/// [`import_html`] against `budget`, with images when `images` gives a
+/// resolver. Decoding, the `<style>` scan and the tokenizer are each one
+/// forward pass over the input (charged once here); the style sheet is
+/// charged as it is parsed and matched; the element stacks are at most
+/// [`MAX_DEPTH`] deep, so a closing tag's search is bounded; the document is
+/// charged as it is built, and images as [`html_image`] says.
+pub(crate) fn import_html_within(
+    bytes: &[u8],
+    budget: &Budget,
+    images: Option<&mut ImageResolver<'_>>,
+) -> Result<(Document, Vec<ImportedMedia>), String> {
     // Three passes: decoding, the `<style>` scan, then the tokenizer.
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
@@ -63,6 +156,9 @@ pub(crate) fn import_html_within(bytes: &[u8], budget: &Budget) -> Result<Docume
     let text = decode(bytes);
     let sheet = StyleSheet::parse(&collect_styles(&text), budget);
     let mut h = Html::new(&text, budget, sheet);
+    if let Some(resolve) = images {
+        h.images = Some(Images::new(resolve));
+    }
     h.run();
     if budget.exhausted() {
         return Err(TOO_BIG.into());
@@ -70,12 +166,13 @@ pub(crate) fn import_html_within(bytes: &[u8], budget: &Budget) -> Result<Docume
     if h.out.is_empty() {
         return Err("the HTML file holds no text".into());
     }
+    let media = h.images.take().map(Images::into_media).unwrap_or_default();
     let props = h.par_props();
     let doc = h.out.finish(props);
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
-    Ok(doc)
+    Ok((doc, media))
 }
 
 /// The page's text, in the encoding it declares.
@@ -276,8 +373,10 @@ struct Look {
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
-    /// A table's or cell's own `width` (not inherited).
+    /// A table's, cell's or image's own `width` (not inherited).
     own_width: Option<Width>,
+    /// An image's own `height` (not inherited; only `img` reads one).
+    own_height: Option<Width>,
     /// A cell's own `padding`, in twips, top, right, bottom, left (not
     /// inherited): its `tcMar`.
     own_padding: [Option<i32>; 4],
@@ -369,6 +468,9 @@ struct Attrs {
     colspan: Option<String>,
     rowspan: Option<String>,
     valign: Option<String>,
+    src: Option<String>,
+    alt: Option<String>,
+    height: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -384,6 +486,8 @@ struct Cascade {
     background: Option<String>,
     /// The element is a `table` (not a row or row group).
     is_table: bool,
+    /// The element is an `img`: what reads `width` and `height` as its size.
+    is_img: bool,
 }
 
 /// A twips sum kept in Word's range.
@@ -427,6 +531,31 @@ fn clears_background(v: &str) -> bool {
 
 /// A `width` attribute: digits as px, `N%`, `Npx`; anything else none.
 fn width_attr(v: &str) -> Option<Width> {
+    let (n, pct) = attr_length(v)?;
+    Some(if pct {
+        Width::Pct(n)
+    } else {
+        Width::Twips((n * 15.0).round().min(f64::from(html_table::MAX_TWIPS)) as u32)
+    })
+}
+
+/// An `<img>`'s `width` / `height` attribute in twips (digits as px,
+/// `Npx`; a percentage is none), not capped at a page's width as a table's
+/// is: the picture is scaled to the body as a whole box, so its aspect
+/// must be the declared one (#1880 r2).
+fn img_attr_twips(v: &str) -> Option<u32> {
+    let (n, pct) = attr_length(v)?;
+    (!pct).then(|| saturating_twips(n * 15.0))
+}
+
+/// Twips as a `u32`, rounded, saturating at its range.
+fn saturating_twips(t: f64) -> u32 {
+    t.round().clamp(0.0, f64::from(u32::MAX)) as u32
+}
+
+/// A length attribute's number and whether it is a percentage: digits as
+/// px, `N%`, `Npx`; anything else none.
+fn attr_length(v: &str) -> Option<(f64, bool)> {
     let v = v.trim();
     let (num, pct) = match v.strip_suffix('%') {
         Some(n) => (n, true),
@@ -437,11 +566,7 @@ fn width_attr(v: &str) -> Option<Width> {
         return None;
     }
     let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite())?;
-    Some(if pct {
-        Width::Pct(n)
-    } else {
-        Width::Twips((n * 15.0).round().min(f64::from(html_table::MAX_TWIPS)) as u32)
-    })
+    Some((n, pct))
 }
 
 /// HTML's rules for a non-negative integer: leading white space, an
@@ -498,6 +623,7 @@ impl Cascade {
         look.after = None;
         look.own_fill = None;
         look.own_width = None;
+        look.own_height = None;
         look.own_padding = [None; 4];
         if kind == Kind::Cell {
             // A cell starts a fresh block look; what is inherited (the runs,
@@ -518,6 +644,7 @@ impl Cascade {
             line: None,
             background: None,
             is_table: false,
+            is_img: false,
         }
     }
 
@@ -546,6 +673,7 @@ impl Cascade {
             self.is_table = true;
             self.look.valign = None;
         }
+        self.is_img = tag == "img";
         let run = &mut self.look.run;
         match tag {
             "b" | "strong" => self.set_bold(true),
@@ -591,6 +719,13 @@ impl Cascade {
                 self.look.own_width = Some(w);
             }
         }
+        if tag == "img" {
+            // An image's box is in pixels; a percentage has no container
+            // width to resolve against.
+            let px = |v: Option<&str>| v.and_then(img_attr_twips).map(Width::Twips);
+            self.look.own_width = px(attrs.width.as_deref());
+            self.look.own_height = px(attrs.height.as_deref());
+        }
         if tag == "font" {
             if let Some(c) = attrs.color.as_deref().and_then(css::attr_color) {
                 self.look.run.color = Some(c);
@@ -627,6 +762,29 @@ impl Cascade {
                 } else if self.kind.table() && clears_background(v) {
                     // A cell's `none` shows its row's or table's (#1878).
                     self.background = None;
+                }
+            }
+            "width" | "height" if self.is_img => {
+                let w = v.trim();
+                let pt = font_pt(&self.look.run);
+                let side = if d.name == "width" {
+                    &mut self.look.own_width
+                } else {
+                    &mut self.look.own_height
+                };
+                if w.eq_ignore_ascii_case("auto") {
+                    *side = None;
+                } else if let Some(len) = css::length(w) {
+                    // A percentage leaves the attribute's size (an e-mail's
+                    // `width="600" style="width:100%"`).
+                    if len.unit != css::Unit::Percent {
+                        // Not capped at a page's width (#1880 r2): the
+                        // box is scaled to the body as a whole.
+                        let twips = len.points(pt).map(|p| (p * 20.0).round());
+                        if let Some(t) = twips.filter(|&t| t >= 0.0) {
+                            *side = Some(Width::Twips(saturating_twips(t)));
+                        }
+                    }
                 }
             }
             "width" if self.kind == Kind::Cell || is_table => {
@@ -931,6 +1089,11 @@ struct Html<'a> {
     marker: Option<String>,
     /// Inside another `<![if …]>` block, dropped.
     in_downlevel: bool,
+    /// That block is `<![if !vml]>`: Word's `<img>` for readers without
+    /// VML, the one image of it read (#1880).
+    in_not_vml: bool,
+    /// The page's images, when the import converts them.
+    images: Option<Images<'a>>,
 }
 
 impl<'a> Html<'a> {
@@ -951,6 +1114,8 @@ impl<'a> Html<'a> {
             in_marker: false,
             marker: None,
             in_downlevel: false,
+            in_not_vml: false,
+            images: None,
         }
     }
 
@@ -993,16 +1158,23 @@ impl<'a> Html<'a> {
             let end = cond.find("]>").map(|i| i + 2).unwrap_or(cond.len());
             let what = cond[..end].to_ascii_lowercase();
             self.pos += 3 + end;
-            if what.starts_with("if") {
+            if let Some(condition) = what.strip_prefix("if") {
                 if what.contains("supportlists") {
                     self.in_marker = true;
                     self.marker = Some(String::new());
                 } else {
                     self.in_downlevel = true;
+                    let cond: String = condition
+                        .trim_end_matches("]>")
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    self.in_not_vml = cond == "!vml";
                 }
             } else if what.starts_with("endif") {
                 self.in_marker = false;
                 self.in_downlevel = false;
+                self.in_not_vml = false;
             }
             return;
         }
@@ -1062,9 +1234,13 @@ impl<'a> Html<'a> {
                 self.implicit_close(&["p"]);
                 return;
             }
+            "img" => {
+                self.image(attrs_at);
+                return;
+            }
             // Void elements: nothing opens.
-            "img" | "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source"
-            | "param" | "embed" | "track" => return,
+            "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source" | "param"
+            | "embed" | "track" => return,
             _ => {}
         }
         let s = self.s;
@@ -1599,6 +1775,73 @@ impl<'a> Html<'a> {
         !self.in_downlevel && !self.in_marker
     }
 
+    /// An `<img>` (#1880), with images on: an inline picture, a sized
+    /// placeholder, its `alt` text, or nothing (out of view, hidden, a side
+    /// of 0, or unsized and unresolved with no `alt`).
+    fn image(&mut self, attrs_at: (usize, usize)) {
+        let in_view = !self.in_marker && (!self.in_downlevel || self.in_not_vml);
+        if self.images.is_none() || !in_view {
+            return;
+        }
+        let s = self.s;
+        let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
+        let key = ElemKey::new("img", attrs.id.as_deref(), attrs.class.as_deref());
+        if !self.budget.work(1 + key.heap() / 16) {
+            return;
+        }
+        let look = look_of(self.ctx(), &self.elems, &key, Kind::Other, &attrs);
+        if look.run.vanish {
+            return;
+        }
+        let side = |w: Option<Width>| match w {
+            Some(Width::Twips(t)) => Some(t),
+            _ => None,
+        };
+        let (width, height) = (side(look.own_width), side(look.own_height));
+        if width == Some(0) || height == Some(0) {
+            return;
+        }
+        let src = attrs.src.as_deref().unwrap_or("").trim();
+        let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
+        let props = self.run_props();
+        let budget = self.budget;
+        let Some(images) = self.images.as_mut() else {
+            return;
+        };
+        let (rid, pixels) = match images.source(src, budget) {
+            Source::Media { rid, width, height } => (Some(rid), Some((width, height))),
+            Source::Unresolved => (None, None),
+        };
+        let Some(box_twips) = html_image::picture_twips(width, height, pixels) else {
+            if !alt.is_empty() {
+                self.pay_space();
+                self.out.text(&alt, &props);
+                self.para_start = false;
+            }
+            return;
+        };
+        let outline = rid.is_none().then_some(html_image::PLACEHOLDER_OUTLINE);
+        let Some(rid) = rid.or_else(|| images.placeholder_rid(budget)) else {
+            return;
+        };
+        let id = images.next_id();
+        let (cx, cy) = html_image::twips_emu(box_twips);
+        let name = html_image::picture_name(src, id);
+        let raw =
+            crate::image::inline_picture_run_described(&rid, cx, cy, id, &name, &alt, outline);
+        self.pay_space();
+        let heap = raw.len();
+        self.out.object(Inline::Raw(raw), heap);
+        self.para_start = false;
+    }
+
+    /// Write the space owed before what comes next, in its own properties.
+    fn pay_space(&mut self) {
+        if let Some(sp) = self.space.take() {
+            self.out.text(" ", &sp);
+        }
+    }
+
     fn run_props(&self) -> RunProps {
         let Some(e) = self.elems.last() else {
             return RunProps::default();
@@ -1730,7 +1973,7 @@ impl<'a> Html<'a> {
     }
 
     fn end_para_if_any(&mut self) {
-        if !self.out.para_text().is_empty() || self.marker.is_some() {
+        if !self.out.para_text().is_empty() || self.out.has_object() || self.marker.is_some() {
             self.end_para();
         }
     }
@@ -1754,8 +1997,9 @@ impl<'a> Html<'a> {
                 props.ilvl = level;
             }
         }
-        // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty.
-        if self.out.para_text().chars().all(|c| c.is_whitespace()) {
+        // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty; a
+        // picture is content (#1880).
+        if !self.out.has_object() && self.out.para_text().chars().all(|c| c.is_whitespace()) {
             self.out.clear_para();
         }
         self.out.end_para(props, self.table_depth > 0);
@@ -1846,6 +2090,9 @@ fn attrs_of(attrs: &str) -> Attrs {
             "colspan" => Some(&mut out.colspan),
             "rowspan" => Some(&mut out.rowspan),
             "valign" => Some(&mut out.valign),
+            "src" => Some(&mut out.src),
+            "alt" => Some(&mut out.alt),
+            "height" => Some(&mut out.height),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
@@ -2246,7 +2493,7 @@ mod tests {
         );
         let small = Budget::new(1 << 20, 2_000);
         assert_eq!(
-            import_html_within(page.as_bytes(), &small).unwrap_err(),
+            import_html_within(page.as_bytes(), &small, None).unwrap_err(),
             TOO_BIG
         );
     }
@@ -3053,7 +3300,7 @@ mod tests {
         );
         let small = Budget::new(1 << 20, 2_000_000);
         assert_eq!(
-            import_html_within(page.as_bytes(), &small).unwrap_err(),
+            import_html_within(page.as_bytes(), &small, None).unwrap_err(),
             TOO_BIG
         );
     }
@@ -3488,5 +3735,338 @@ mod tests {
         assert_eq!(nested(b, 1, 0).len(), 1);
         assert_eq!(nested(a, 1, 0)[0].grid, nested(b, 1, 0)[0].grid);
         assert_eq!(paragraph_texts(&d), paragraph_texts(&back));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    //! `<img>` with images on (#1880).
+    use super::*;
+    use crate::image::{inline_embed, inline_extent};
+    use crate::import::paragraph_texts;
+    use crate::model::Paragraph;
+
+    /// A PNG header `image::sniff` reads as `w` x `h`.
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        out.extend(w.to_be_bytes());
+        out.extend(h.to_be_bytes());
+        out.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        out
+    }
+
+    /// `html` imported with a resolver giving a 40 x 20 PNG for any src
+    /// but `missing…`, and the srcs it was asked for.
+    fn with_images(html: &str) -> (Document, Vec<ImportedMedia>, Vec<String>) {
+        let mut asked = Vec::new();
+        let mut resolve = |src: &str, _: usize| {
+            asked.push(src.to_string());
+            (!src.starts_with("missing")).then(|| png(40, 20))
+        };
+        let (doc, media) =
+            import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
+        (doc, media, asked)
+    }
+
+    fn paras(d: &Document) -> Vec<&Paragraph> {
+        d.body
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pictures(p: &Paragraph) -> Vec<&str> {
+        p.content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Raw(r) if inline_embed(r).is_some() => Some(r.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn all_pictures(d: &Document) -> Vec<&str> {
+        paras(d).into_iter().flat_map(pictures).collect()
+    }
+
+    fn sizes(d: &Document) -> Vec<(i64, i64)> {
+        all_pictures(d)
+            .iter()
+            .map(|r| inline_extent(r).unwrap())
+            .collect()
+    }
+
+    /// `bytes` in base64, by hand (the module's decoder is under test).
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = c.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - c.len()));
+            for k in 0..=c.len() {
+                out.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
+            }
+            out.push_str(&"=".repeat(3 - c.len()));
+        }
+        out
+    }
+
+    const PX: i64 = 9525;
+
+    #[test]
+    fn words_not_vml_image_is_read_and_its_vml_twin_is_not() {
+        let (d, media, asked) = with_images(
+            "<p>a<!--[if gte vml 1]><v:shape><v:imagedata src=\"x_files/image001.png\"/></v:shape><![endif]--><![if !vml]><img width=96 height=48 src=\"x_files/image002.png\" v:shapes=\"_x0000_i1025\"><![endif]>b<![if !supportLineBreakNewLine]><br><![endif]>c</p>",
+        );
+        assert_eq!(asked, ["x_files/image002.png"]);
+        assert_eq!(sizes(&d), [(96 * PX, 48 * PX)]);
+        assert_eq!(media.len(), 1);
+        // Everything else in a downlevel block stays out.
+        assert_eq!(paragraph_texts(&d), ["abc"]);
+        // `<![if !vml]>` only: another condition's image is not read.
+        let (d, _, asked) = with_images("<p><![if !mso]><img src=a.png><![endif]>x</p>");
+        assert!(asked.is_empty());
+        assert!(all_pictures(&d).is_empty());
+        let (d, _, _) = with_images("<p><![if ! VML ]><img src=a.png><![endif]>x</p>");
+        assert_eq!(all_pictures(&d).len(), 1);
+    }
+
+    #[test]
+    fn a_picture_bullet_is_no_picture_and_stays_a_bullet() {
+        let (d, _, asked) = with_images(
+            "<p class=MsoListParagraph><![if !supportLists]><img width=11 height=11 src=\"x_files/image003.gif\" alt=\"*\"><span>&nbsp; </span><![endif]>Apples</p>",
+        );
+        assert!(asked.is_empty());
+        assert!(all_pictures(&d).is_empty());
+        assert_eq!(paragraph_texts(&d), ["Apples"]);
+        assert_eq!(paras(&d)[0].props.num_id, Some(1));
+    }
+
+    #[test]
+    fn a_typed_marker_never_takes_a_picture_with_it() {
+        // Filtered HTML's marker, then a picture.
+        let (d, _, _) = with_images(
+            "<p class=MsoListParagraph>\u{b7}&nbsp;<img src=a.png width=10 height=10>text</p>",
+        );
+        let p = paras(&d)[0];
+        assert_eq!(pictures(p).len(), 1, "{:?}", p.content);
+        assert_eq!(p.plain_text(), "text");
+        assert_eq!(p.props.num_id, Some(1));
+        // A picture before the marker: no marker taken.
+        let (d, _, _) =
+            with_images("<p class=MsoListParagraph><img src=a.png>\u{b7}&nbsp;text</p>");
+        let p = paras(&d)[0];
+        assert_eq!(pictures(p).len(), 1);
+        assert_eq!(p.props.num_id, None);
+        assert_eq!(p.plain_text(), "\u{b7}\u{a0}text");
+    }
+
+    #[test]
+    fn a_picture_is_content_of_its_paragraph() {
+        let (d, _, _) = with_images("<p><img src=a.png></p><p>&nbsp;</p>");
+        assert_eq!(paras(&d).len(), 2);
+        assert_eq!(pictures(paras(&d)[0]).len(), 1);
+        assert!(paras(&d)[1].content.is_empty());
+        let (d, _, _) = with_images("<div><img src=a.png></div><div>x</div>");
+        let p = paras(&d);
+        assert_eq!(p.len(), 2, "{:?}", d.body);
+        assert_eq!(pictures(p[0]).len(), 1);
+        assert_eq!(p[1].plain_text(), "x");
+        // Spaces round a picture collapse as round a word.
+        let (d, _, _) = with_images("<p>  a <img src=a.png>  b </p>");
+        assert_eq!(paragraph_texts(&d), ["a  b"]);
+        let (d, _, _) = with_images("<p><img src=a.png> b</p>");
+        assert_eq!(paragraph_texts(&d), [" b"]);
+    }
+
+    #[test]
+    fn css_lengths_beat_the_attributes_and_auto_and_percent_do_not() {
+        let (d, _, _) = with_images(
+            "<style>img.w { width: 80px }</style>\
+             <p><img src=a.png width=200 style='width:100px'>\
+             <img src=a.png width=200 height=50 style='height:auto'>\
+             <img src=a.png width=200 style='width:auto'>\
+             <img src=a.png width=200 style='width:50%'>\
+             <img src=a.png width=50%>\
+             <img class=w src=a.png height=10>\
+             <img src=a.png style='width:1in;height:0.5in'></p>",
+        );
+        assert_eq!(
+            sizes(&d),
+            [
+                (100 * PX, 50 * PX),
+                (200 * PX, 100 * PX),
+                // `auto` clears the attribute: the pixels.
+                (40 * PX, 20 * PX),
+                (200 * PX, 100 * PX),
+                (40 * PX, 20 * PX),
+                // The rule's width beats the attribute's height's aspect.
+                (80 * PX, 10 * PX),
+                (96 * PX, 48 * PX),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wide_picture_is_scaled_to_the_body() {
+        let (d, _, _) = with_images("<p><img src=a.png width=1248 height=100></p>");
+        assert_eq!(sizes(&d), [(624 * PX, 50 * PX)]);
+        // FIX r2 m1: sides past a page's 2112 px keep their aspect.
+        let (d, _, _) = with_images(
+            "<p><img src=a.png width=3000 height=1000>\
+             <img src=a.png style='width:2400px;height:600px'>\
+             <img src=a.png width=4000>\
+             <img src=a.png style='height:3000px'>\
+             <img src=missing.png width=99999999999 height=1></p>",
+        );
+        assert_eq!(
+            sizes(&d),
+            [
+                (624 * PX, 208 * PX),
+                (624 * PX, 156 * PX),
+                // One side: the 40 x 20 pixels' aspect.
+                (624 * PX, 312 * PX),
+                (624 * PX, 312 * PX),
+                // Saturating, then scaled: a height under a twip is one EMU.
+                (624 * PX, 1),
+            ]
+        );
+    }
+
+    /// FIX r2b: an uncapped side over an extreme aspect overflowed u64 in
+    /// `picture_twips`.
+    #[test]
+    fn an_extreme_aspect_never_overflows() {
+        let page = format!(
+            "<p><img width=99999999999 src=\"data:image/png;base64,{}\">\
+             <img height=99999999999 src=\"data:image/png;base64,{}\"></p>",
+            b64(&png(1, 1_000_000)),
+            b64(&png(1_000_000, 1))
+        );
+        let mut none = |_: &str, _: usize| None;
+        let (d, _) =
+            import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut none)).unwrap();
+        let got = sizes(&d);
+        assert_eq!(got.len(), 2);
+        for (cx, cy) in got {
+            for side in [cx, cy] {
+                assert!((1..=crate::image::MAX_EMU).contains(&side), "{side}");
+            }
+            assert_eq!(cx, 624 * PX, "scaled to the body");
+        }
+    }
+
+    #[test]
+    fn height_still_means_nothing_on_a_table() {
+        let page =
+            "<table height=40><tr height=30><td height=20 style='height:9px'>x</td></tr></table>";
+        let (with, _, _) = with_images(page);
+        let plain = import_html(page.replace("height", "data-h").as_bytes()).unwrap();
+        assert_eq!(with, plain);
+    }
+
+    #[test]
+    fn hidden_zero_sized_and_unresolved_images() {
+        let (d, media, asked) = with_images(
+            "<p>a<img src=hid.png style='display:none'><span style='mso-hide:all'><img src=hid2.png></span>\
+             <img src=zero.png width=0 height=1><img src=zero2.png style='height:0'>b</p>\
+             <p><img src=missing.png width=30 height=20 alt='A &amp; B'><img src=missing.png width=30>\
+             <img src=missing.png alt=' Shop '><img src=missing.png></p>",
+        );
+        assert_eq!(asked, ["missing.png"]);
+        let p = paras(&d);
+        assert_eq!(p[0].plain_text(), "ab");
+        assert!(pictures(p[0]).is_empty());
+        let pics = pictures(p[1]);
+        assert_eq!(
+            pics.iter()
+                .map(|r| inline_extent(r).unwrap())
+                .collect::<Vec<_>>(),
+            [(30 * PX, 20 * PX), (30 * PX, 30 * PX)]
+        );
+        assert!(pics[0].contains("descr=\"A &amp; B\""));
+        assert!(pics[0].contains("<a:ln w=\"9525\">"));
+        assert!(!pics[1].contains("descr="));
+        assert_eq!(p[1].plain_text(), "Shop");
+        // One placeholder medium for both.
+        assert_eq!(inline_embed(pics[0]), inline_embed(pics[1]));
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].bytes, html_image::PLACEHOLDER_PNG);
+    }
+
+    #[test]
+    fn alt_text_is_capped() {
+        let alt = "x".repeat(5000);
+        let (d, _, _) = with_images(&format!(
+            "<p><img src=missing.png width=1 height=1 alt='{alt}'></p>"
+        ));
+        let raw = all_pictures(&d)[0];
+        assert!(raw.contains(&format!("descr=\"{}\"", "x".repeat(html_image::MAX_ALT))));
+        assert!(!raw.contains(&"x".repeat(html_image::MAX_ALT + 1)));
+    }
+
+    #[test]
+    fn a_data_image_over_the_room_is_a_placeholder_and_the_import_goes_on() {
+        let png = png(4, 2);
+        let page = format!(
+            "<p>x<img src=\"data:image/png;base64,{}\" width=10 height=5 alt=big></p>",
+            b64(&png)
+        );
+        let mut none = |_: &str, _: usize| None;
+        let roomy = Budget::standard();
+        let (d, media) = import_html_within(page.as_bytes(), &roomy, Some(&mut none)).unwrap();
+        assert_eq!(media[0].bytes, png);
+        assert!(!all_pictures(&d)[0].contains("<a:ln"));
+        // Room for less than the image: a placeholder, not a failure.
+        let tight = Budget::new(png.len() - 1, crate::import::MAX_WORK);
+        let (d, media) = import_html_within(page.as_bytes(), &tight, Some(&mut none)).unwrap();
+        assert_eq!(media[0].bytes, html_image::PLACEHOLDER_PNG);
+        assert!(all_pictures(&d)[0].contains("descr=\"big\""));
+        assert_eq!(paragraph_texts(&d), ["x"]);
+    }
+
+    /// FIX r1 m2: a work budget that covers the up-front passes and runs out
+    /// among the images fails the import, though the same page and budget
+    /// with images off fit: decoding is charged, and running out is not
+    /// swallowed by the image path.
+    #[test]
+    fn images_spend_the_imports_work_and_running_out_fails_it() {
+        // Distinct lengths: no two media are compared byte for byte.
+        let page: String = (0..200)
+            .map(|i| {
+                let mut b = png(4, 2);
+                b.resize(4000 + i, 0);
+                format!(
+                    "<p>{i}<img src=\"data:image/png;base64,{}\" width=10 height=5></p>",
+                    b64(&b)
+                )
+            })
+            .collect();
+        let mut none = |_: &str, _: usize| None;
+        let full = Budget::standard();
+        let (_, media) = import_html_within(page.as_bytes(), &full, Some(&mut none)).unwrap();
+        assert_eq!(media.len(), 200);
+        let upfront = 3 * (page.len() / 16 + 1);
+        let spent = crate::import::MAX_WORK - full.work.get();
+        let half = || Budget::new(crate::import::MAX_DECODED, upfront + (spent - upfront) / 2);
+        assert!(import_html_within(page.as_bytes(), &half(), None).is_ok());
+        assert_eq!(
+            import_html_within(page.as_bytes(), &half(), Some(&mut none)).unwrap_err(),
+            TOO_BIG
+        );
+    }
+
+    #[test]
+    fn the_resolver_is_told_the_room() {
+        let mut limits = Vec::new();
+        let mut resolve = |_: &str, limit: usize| {
+            limits.push(limit);
+            None
+        };
+        let b = Budget::new(1000, crate::import::MAX_WORK);
+        import_html_within(b"<p>x<img src=a.png></p>", &b, Some(&mut resolve)).unwrap();
+        assert_eq!(limits, [1000]);
     }
 }

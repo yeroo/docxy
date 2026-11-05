@@ -15,5 +15,7 @@ tools/wordshim/docxy-word.tlb binary
 
 # Word-written import fixtures: keep the bytes Word wrote (CRLF in .rtf/.htm).
 corpus/word-import/** -text
+# A mail's base64 wrapped at 76 columns with CRLF, as mail clients wrap it (#1880).
+docxcore/tests/fixtures/html/cid-message.html -text
 # MPXJ-written MPX fixtures (#309): keep the CRLF records MPXJ wrote.
 corpus/mpx/**/*.mpx -text

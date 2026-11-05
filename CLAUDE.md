@@ -2574,3 +2574,52 @@
   (browsers do not inherit font size/weight/style into a `table` there; we
   do), no borders, no `dir`/`letter-spacing`/`text-transform`, no `+ ~
   [attr] :pseudo`. The suite does not draw run shading yet.
+
+## HTML import images (#1880)
+
+- `import::import_html_with(bytes, &mut resolver)` converts `<img>`;
+  `import_html` is unchanged (no images: a `Document` alone holds no media).
+  `HtmlImport { document, media }`: pictures name import-local rids
+  (`rIdHtmlImage<n>`), and `HtmlImport::package` puts each medium in a
+  Markdown package as `word/media/imageN.<ext>` and renames them.
+- `html_image`: a `data:` src is decoded in house (percent, then base64
+  when the header ends `;base64`, white space skipped); any other src goes
+  to `ImageResolver` (`FnMut(&str, usize) -> Option<Vec<u8>>`), once per
+  distinct src, at most `MAX_IMAGES` (1000) calls, told the most bytes it
+  may return (budget room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES`
+  128 MiB leaves); a longer answer is dropped. Kind and extension come from
+  `image::sniff` only (PNG/JPEG/GIF/BMP); equal bytes are one medium.
+- Size (twips, ×635 to EMU): CSS `width`/`height` lengths over the
+  attributes, `auto` clears a side, a CSS percentage leaves the attribute's,
+  an attribute percentage is ignored; one side gives the other by the
+  pixels' aspect, none the pixels; scaled down to the body (9360 twips).
+  Only `img` reads `height`.
+- Unresolved (refused, no room, not an image): sized, a picture over one
+  shared 1×1 `#F2F2F2` PNG with an `A6A6A6` 1 px line and the `alt` as
+  `wp:docPr descr` (colours by estimate, unmeasured); unsized, the `alt`
+  text as a run; neither, nothing. Hidden (`display:none`, `mso-hide:all`),
+  zero-sized and list-marker (`<![if !supportLists]>`) images make nothing
+  and are not resolved. Word's `<![if !vml]>` `<img>` is read (its VML
+  twin sits in a comment); nothing else in a downlevel block is.
+- A picture is paragraph content (`Builder::has_object`: not cleared as
+  white space, ends its paragraph before a block), and
+  `take_leading_marker` never drains an object.
+- The suite's converting child (`convert_child::convert_bytes`, which now
+  takes the page's path) resolves only a relative src under the page's
+  folder, as Word, Outlook and Save Page write them (`page_files/…`;
+  `image_src_parts`, #1880 r1, a deliberate tightening of the plan's
+  absolute and `file:` paths): no URI scheme (`file:` included), no
+  absolute, rooted, drive, UNC or device path, no `:`, `?`, `*`, NUL (or
+  `<>|"`) once escapes are decoded, no `..` out of the folder, no name
+  ending in a dot or space. An absolute path is refused because looking at
+  one can reach the network (autofs or macOS's default `/net/<host>`,
+  `/afs`), as Windows' `\??\UNC\…` does. The page folder is made absolute
+  (`std::path::absolute`), and `read_local_image` walks each step below it
+  with `symlink_metadata`, refusing a symbolic link or (Windows) any
+  reparse point, then reads a regular file within the limit, its size
+  checked first. The page folder itself may be on a share or behind a link.
+  So opening a page never reaches the network. The child writes the
+  package with its media (`ConvertedDoc::docx`).
+- Out of scope: `<base href>`, MHTML, `<a>` around images, `srcset`,
+  `<picture>`, background images, SVG/WebP (placeholders), `max-width`,
+  float/align, the suite drawing a placeholder's alt text.

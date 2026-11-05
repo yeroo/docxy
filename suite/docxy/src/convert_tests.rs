@@ -64,6 +64,102 @@ fn a_word_web_page_in_windows_1252_opens_converted_from_html() {
     assert_eq!(texts(&tab), ["Title", "Caf\u{e9} \u{20ac}"]);
 }
 
+/// A PNG header `image::sniff` reads as `w` x `h`.
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    out.extend(w.to_be_bytes());
+    out.extend(h.to_be_bytes());
+    out.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    out
+}
+
+/// A Word Web Page beside its `page_files` folder (#1880): Word's VML image
+/// with its `<![if !vml]>` twin, a plain `<img>` there, a `data:` image and
+/// a remote one.
+fn web_page_with_images(dir: &Scratch) -> PathBuf {
+    std::fs::create_dir_all(dir.path("page_files")).unwrap();
+    write(dir, "page_files/image001.png", &png(800, 400));
+    write(dir, "page_files/image002.png", &png(64, 32));
+    write(dir, "page_files/image003.png", &png(20, 10));
+    write(
+        dir,
+        "page.htm",
+        b"<html><body><p class=MsoNormal>Before \
+          <!--[if gte vml 1]><v:shape style='width:48pt;height:24pt'><v:imagedata src=\"page_files/image001.png\" o:title=\"\"/></v:shape><![endif]--><![if !vml]><img width=64 height=32 src=\"page_files/image002.png\" v:shapes=\"_x0000_i1025\"><![endif]> after</p>\
+          <p><img src=\"page_files/image003.png\" alt=Chart></p>\
+          <p><img src=\"data:image/gif;base64,R0lGODlhAwACAAAAACw=\"></p>\
+          <p><img src=\"http://example.com/logo.png\" width=40 height=20 alt=Logo></p></body></html>",
+    )
+}
+
+/// Each picture of `tab`'s body and the bytes its rid names in the tab's
+/// package.
+fn tab_pictures(tab: &DocTab) -> Vec<((i64, i64), Vec<u8>)> {
+    let Surface::Doc(ed) = &tab.surface else {
+        panic!("not a document tab")
+    };
+    let pkg = tab.pkg.as_ref().expect("a converted tab has its package");
+    let mut out = Vec::new();
+    for b in &ed.doc.body {
+        let Block::Paragraph(p) = b else { continue };
+        for i in &p.content {
+            let docxcore::model::Inline::Raw(raw) = i else {
+                continue;
+            };
+            let Some(rid) = docxcore::image::inline_embed(raw) else {
+                continue;
+            };
+            let part = pkg
+                .part_rel_target("word/document.xml", &rid)
+                .unwrap_or_else(|| panic!("{rid} resolves in the tab's package"));
+            out.push((
+                docxcore::image::inline_extent(raw).unwrap(),
+                pkg.part(&part).unwrap().to_vec(),
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn a_web_pages_images_open_with_it_and_the_network_is_never_reached() {
+    let dir = Scratch::new();
+    let path = web_page_with_images(&dir);
+    let tab = tab_from_path(&path);
+    assert_eq!(tab.access.converted, Some(Converted::Html));
+    assert_eq!(texts(&tab)[0], "Before  after");
+    let pics = tab_pictures(&tab);
+    let px = 9525;
+    let sizes: Vec<(i64, i64)> = pics.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        sizes,
+        [
+            (64 * px, 32 * px),
+            (20 * px, 10 * px),
+            (3 * px, 2 * px),
+            (40 * px, 20 * px)
+        ]
+    );
+    // The `<![if !vml]>` image, not its VML twin; the plain one; the data
+    // image; the remote one a placeholder (one grey pixel).
+    assert_eq!(pics[0].1, png(64, 32));
+    assert_eq!(pics[1].1, png(20, 10));
+    assert!(pics[2].1.starts_with(b"GIF89a"));
+    let placeholder = docxcore::image::sniff(&pics[3].1).unwrap();
+    assert_eq!((placeholder.width, placeholder.height), (1, 1));
+    // Through the real child too: the same pictures.
+    let bytes = std::fs::read(&path).unwrap();
+    let l = convert_doc_with(
+        &path,
+        &bytes,
+        What::Html,
+        convert_child::tests::test_child_runner,
+    )
+    .unwrap();
+    let child = l.into_tab(Kind::Docx, "page.htm".into(), Some(path.clone()), false);
+    assert_eq!(tab_pictures(&child), pics);
+}
+
 #[test]
 fn a_docxy_bundle_still_opens_as_a_bundle() {
     let dir = Scratch::new();
