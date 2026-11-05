@@ -41,18 +41,73 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   inherited through the row and reset at a `table`; none is `center`, a
   browser's middle; `baseline`, `super`, `sub` on a cell are `top` and no
   longer make the cell's runs super- or subscript). `tblPr`: `tblW`, `jc`
-  (`align=center|right`, which does not align the text inside; `align` on
-  a row aligns its cells' text), `tblCellSpacing` (half the HTML
+  (the table's float `align`, auto margins or container alignment: see
+  "HTML import centring (#1922)"; none of them aligns the text inside;
+  `align` on a row aligns its cells' text), `tblCellSpacing` (half the HTML
   `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
   `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
   `border` is 1; `0` or none writes none, the layout-table case),
   `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
   `grid_span`/`v_merge` match, so a save writes them unchanged.
 - Known limits: CSS borders, `frame`/`rules`, `border-color`, row heights,
-  `<col>` widths, `max-width`, `margin: 0 auto` and `<center>`/`align`
-  ancestors centring a table, `th` bold/centre, background images; a table
+  `<col>` widths, `max-width`, `th` bold/centre, background images; a table
   directly in a `tr`/`table` (no cell) joins the next cell (a browser puts
   it before the table).
+
+## HTML import centring (#1922)
+
+- A browser's model, part of the computed `Look`: `text-align`'s
+  `-webkit-center` / `-webkit-right` (and `-moz-`) align the text and also
+  place block-level children; they inherit, and any plain `text-align`
+  replaces them (one property). `Look::block_align` holds that place
+  (`Center`/`Right`, else `None`). Its presentational sources: `<center>`
+  and `align` (`center`, `middle`, `right`; `left`/`justify` clear it) on a
+  `div`, `p`, `caption`, `td`, `th`, `tr`, `thead`, `tbody`, `tfoot`.
+  `align` on `h1`-`h6`, `li` and the rest is plain (measured in headless
+  Chrome: `<p align=center>` centres a block image, `<h2 align=center>`
+  does not). A `table` start tag closes an open `p`, so `<p
+  align=center><table>` is not centred.
+- A block-level box's place (`block_position`): both side margins `auto`
+  centre it, `margin-left: auto` alone right, `margin-right: auto` alone
+  left; neither, its parent's `block_align`. `Cascade::margin_auto` keeps
+  the auto sides beside `margin` (`css::box_autos`, longhands too; a later
+  valid declaration replaces a side), as `box_sides` folds `auto` into
+  none. The result is `Look::own_place` (not inherited).
+- Tables: `table_spec`'s `jc` is `right` for `align=right` and none for
+  `align=left` (floats, which nothing moves), else the table's place
+  (`center` / `right`). `<table align=center>` is the hint
+  `margin-left: auto; margin-right: auto`, so a page's `margin: 0` on it
+  leaves it at the left. A table's own `align` and margins never align its
+  cells' text; its own `text-align`, like its ancestors', still does (it
+  is not its place).
+- Images: `display: block` on an `img` (`Look::own_block`; any other
+  `display` but `none` clears it, so an e-mail's `img {display: block}`
+  reset is undone by a later `inline`) makes the picture, or an unsized
+  unresolved image's alt text, a paragraph of its own: the text before it
+  ends (`begin_block_object`), and its paragraph ends at once aligned to
+  its place, `Left` with none (`end_para_with`). A `</p>` right after it
+  ends only a paragraph with content (`after_block_object`), so
+  `<p><img style="display:block"></p>` leaves no empty paragraph; `<p></p>`
+  is still one. In a list item, the paragraphs past the item's numbered
+  one are unnumbered continuations at the level's indent (`Block`'s
+  `item_numbered` / `item_split` on the `li`'s own entry, `open_item`, not
+  across a cell), so the split adds no item and a nested list's items
+  leave their parent's flags alone; a picture opening its item carries the
+  number.
+- Fixed-width blocks: a `Kind::Block` with an absolute CSS `width` (not a
+  percentage or `auto`; a negative or invalid one leaves the width
+  before it) and both side margins auto gets
+  `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
+  each side, after its own box is added: a content box, so its padding is
+  outside the width. Its text alignment is unchanged. Not inside a cell
+  (`Look::in_cell`): a cell's width is known only at layout.
+- Drawing: the suite draws a `w:jc` table where it sits (#1922,
+  `docs/claude/suite-document.md`).
+- Known limits: a block's auto margins inside a cell; an outermost
+  `width=100%` table inside a centred fixed-width block is still laid out
+  in `BODY_TWIPS` with no `tblInd`, so it spans the body while the block's
+  text is indented; PDF export does not place a table by `w:jc`; `max-width`;
+  CSS `float`; `<img align>`; `box-sizing`; right-to-left.
 
 ## HTML import CSS (#1872)
 

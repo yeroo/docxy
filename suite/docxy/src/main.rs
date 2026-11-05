@@ -8933,11 +8933,15 @@ type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
 /// (`view`: its x and width, window coordinates), rounded to a pixel;
 /// `fits_text`, whether it is at most the text width `text_w` (+1 px for
 /// rounding), and `right_in_view`, whether its right edge lies inside the
-/// viewport (so a table scrolled to its end shows it).
+/// viewport (so a table scrolled to its end shows it). `place` (#1922) is
+/// where it sits across the text `column` it is drawn in (its x and width,
+/// window coordinates): `left` (at the column's left, as a table wider
+/// than it is), `center`, `right`, else `other`; `null` with no column.
 fn painted_tables_json(
     tables: &PaintedTables,
     text_w: Option<f32>,
     view: Option<(f32, f32)>,
+    column: Option<(f32, f32)>,
 ) -> ctlcore::json::Json {
     use ctlcore::json::Json;
     let (x0, view_w) = view.unwrap_or((0., 0.));
@@ -8951,6 +8955,25 @@ fn painted_tables_json(
                 let left = f32::from(b.origin.x) - x0;
                 let width = f32::from(b.size.width);
                 let right = left + width;
+                let place = column.map_or(Json::Null, |(cx, cw)| {
+                    let (l, r) = (f32::from(b.origin.x), f32::from(b.origin.x) + width);
+                    // 2.5 px: rounding, and Print Layout's band rect is
+                    // 2 px narrower than the column its blocks are drawn in
+                    // (the page's 1 px border).
+                    let near = |a: f32, b: f32| (a - b).abs() <= 2.5;
+                    Json::Str(
+                        if near(l, cx) {
+                            "left"
+                        } else if near(l - cx, cx + cw - r) {
+                            "center"
+                        } else if near(r, cx + cw) {
+                            "right"
+                        } else {
+                            "other"
+                        }
+                        .into(),
+                    )
+                });
                 Json::obj(vec![
                     ("block", Json::Num(*block as f64)),
                     ("width", round(width)),
@@ -8964,6 +8987,7 @@ fn painted_tables_json(
                         "right_in_view",
                         Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
                     ),
+                    ("place", place),
                 ])
             })
             .collect(),
@@ -35449,11 +35473,24 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         }
         _ => None,
     };
+    // Its `w:jc` places it across its block's room (#1922) with auto side
+    // margins, only when it fits that room: gpui centres a wider box past
+    // both edges, and a wide table must start at the text's left so it
+    // scrolls (#1895). The room is the flow view's text width or a fitted
+    // cell's, else the column's or cell's (Print Layout), else a header's;
+    // unknown, the table stays at the left.
+    let room = ctx.fit_width.or(ctx.line_width).or(ctx.hf_width);
+    let fits = room.is_some_and(|r| tw_px(widest.min(i32::MAX as u32) as i32, zoom) <= r + 0.5);
     v_flex()
         .relative()
         .flex_none()
         .w(w(widest))
         .my_2()
+        .when(fits, |d| match table_view::h_align(t) {
+            table_view::HAlign::Left => d,
+            table_view::HAlign::Center => d.mx_auto(),
+            table_view::HAlign::Right => d.ml_auto(),
+        })
         .children(rows)
         .children(probe)
         .into_any_element()

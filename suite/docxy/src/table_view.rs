@@ -280,6 +280,29 @@ pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
     out
 }
 
+/// Where a table sits across the room its block is drawn in (#1922).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// `t`'s place from its own `w:tblPr/w:jc` (#1922): `center` centres it,
+/// `right` / `end` puts it at the right; anything else (`left`, `start`,
+/// none) is the left. A table style's `jc` and right-to-left tables are
+/// not read.
+pub fn h_align(t: &Table) -> HAlign {
+    match docxcore::table::table_props(t)
+        .attr("w:jc", "w:val")
+        .as_deref()
+    {
+        Some("center") => HAlign::Center,
+        Some("right" | "end") => HAlign::Right,
+        _ => HAlign::Left,
+    }
+}
+
 /// Lay out `t` with its table style (if any), its grid fitted to `fit`
 /// ([`fitted_grid`]).
 pub fn layout(t: &Table, style: Option<&TableStyle>, fit: Option<u32>) -> Vec<RowBox> {
@@ -462,6 +485,30 @@ mod tests {
     use docxcore::table::{AutoFit, edit_cell_props, edit_table_props, new_table};
     use docxcore::table_props::TblLook;
     use docxcore::table_styles::lookup_style;
+
+    #[test]
+    fn h_align_reads_the_tables_own_jc() {
+        let with = |jc: Option<&str>| {
+            let mut t = new_table(1, 1, 3000, AutoFit::Default);
+            t.raw_tblpr = Some(match jc {
+                Some(v) => format!(
+                    "<w:tblPr><w:tblW w:w=\"3000\" w:type=\"dxa\"/><w:jc w:val=\"{v}\"/></w:tblPr>"
+                ),
+                None => "<w:tblPr><w:tblW w:w=\"3000\" w:type=\"dxa\"/></w:tblPr>".into(),
+            });
+            h_align(&t)
+        };
+        assert_eq!(with(Some("center")), HAlign::Center);
+        assert_eq!(with(Some("right")), HAlign::Right);
+        assert_eq!(with(Some("end")), HAlign::Right);
+        assert_eq!(with(Some("left")), HAlign::Left);
+        assert_eq!(with(Some("start")), HAlign::Left);
+        assert_eq!(with(Some("bogus")), HAlign::Left);
+        assert_eq!(with(None), HAlign::Left);
+        let mut t = new_table(1, 1, 3000, AutoFit::Default);
+        t.raw_tblpr = None;
+        assert_eq!(h_align(&t), HAlign::Left);
+    }
 
     #[test]
     fn widths_follow_the_grid_spans_and_grid_before() {

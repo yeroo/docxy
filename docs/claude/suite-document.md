@@ -264,3 +264,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   ink) reaches 4.5:1. Not claimed for every page colour or fill.
 - Not done: the Help manuals' links (`help_view/render.rs`, `LINK` on the
   theme ground) and the sheet's hyperlink cells (`0x0563c1`).
+
+## Table placement by `w:jc` (#1922)
+
+- `table_el` places a table by its own `w:tblPr/w:jc`
+  (`table_view::h_align`: `center`; `right`/`end`; anything else, a table
+  style's `jc` and right-to-left are not read) with auto side margins
+  (`mx_auto` / `ml_auto`) on its root, in Web and Print Layout, headers,
+  footers, cells and `ext::DocView`.
+- Only when the table fits its room: `fit_width` (the flow view's text
+  width or a fitted cell's), else `line_width` (Print Layout's column, a
+  cell's), else `hf_width`. gpui centres a wider box past both edges, so a
+  wider table (or one with no known room) stays at the text's left, where
+  #1895's sideways scroll reaches it.
+- The probe, the table pen's `TableGeom` (its `left` comes from the row
+  canvas) and the #1477 margin rows are measured where the cells are
+  drawn, so they follow the table.
+- The harness: `doc {}`'s `flow.tables.N.place` is `left`, `center`,
+  `right` or `other` across `flow.text_column` (Web Layout's column, else
+  Print Layout's first page's first band, whose rect is 2 px narrower than
+  the column its blocks draw in: the page's border; 2.5 px tolerance).
+  `uiharness/cases/table-jc.uit`.

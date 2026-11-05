@@ -1,0 +1,36 @@
+# A table's w:jc places it across the text column (#1922): `center`
+# centres it, `right` puts it at the right edge, none leaves it at the
+# left, and a centred table wider than the column stays at the column's
+# left (`table_el` gives a table that does not fit no auto margins, which
+# gpui would centre past both edges) and scrolls sideways (#1895). `doc`'s
+# `flow.tables.N.place` reads each top-level table's painted edges
+# against the text column it is drawn in: `left`, `center`, `right` or
+# `other`. The fixture's tables are fixed (dxa), so Web Layout keeps
+# their widths. Each read follows a `shot`, which waits for the frame
+# after the change.
+
+test issue 1922 a table is drawn where its w:jc puts it, in Web and Print Layout
+  open copy:../fixtures/table-jc.docx
+  assert view.layout is web
+  call window-size {"w":1100,"h":900}
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is 200
+  assert reply.flow.tables.0.place is left
+  assert reply.flow.tables.1.width is 200
+  assert reply.flow.tables.1.place is center
+  assert reply.flow.tables.2.place is right
+  # Wider than the view: at the text's left, as wide as its grid, and the
+  # view scrolls sideways to it.
+  assert reply.flow.tables.3.width is 2000
+  assert reply.flow.tables.3.left is {doc.flow.tables.0.left}
+  assert reply.flow.max_scroll_x is not 0
+  # Print Layout: the page's text column.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.place is left
+  assert reply.flow.tables.1.place is center
+  assert reply.flow.tables.2.place is right
+  assert reply.flow.tables.3.left is {doc.flow.tables.0.left}

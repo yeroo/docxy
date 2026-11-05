@@ -452,6 +452,7 @@ impl DocView {
                     self.viewport
                         .get()
                         .map(|v| (f32::from(v.origin.x), f32::from(v.size.width))),
+                    None,
                 ),
             ),
             (

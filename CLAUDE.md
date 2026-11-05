@@ -33,11 +33,11 @@ issue number to find its notes.
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
-  (#1900), link colours (#1906).
+  (#1900), link colours (#1906), tables placed by `w:jc` (#1922).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
-  images (#1880), links (#1879).
+  images (#1880), links (#1879), centring (#1922).
 - `docs/claude/clipboard.md`: before changing copy and paste with other apps: rich (RTF)
   document copy (#1074), sheet HTML tables (#1248).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
