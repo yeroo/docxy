@@ -90,7 +90,8 @@ issue number to find its notes.
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
   Ctrl+A (#1376).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
-  id (#1884, #1881), the body format (#1901).
+  id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
+  Items after a send (#1885).
 
 ## Build and test
 

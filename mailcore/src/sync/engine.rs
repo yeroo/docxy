@@ -13,6 +13,10 @@
 //! failures drop to `Offline` with exponential back-off while the UI keeps
 //! reading the store.
 //!
+//! An opt-in fast cycle (`EngineOptions::fast_tick`, #1885) syncs only the
+//! folders a caller names (`SyncCommand::SetFastFolders`) between two normal
+//! ticks, and `SyncCommand::SyncFolder` syncs one folder on demand.
+//!
 //! All Graph/auth base URLs are injectable (see `spawn_with_bases`) so tests
 //! drive the whole engine against the in-process fake server with no network.
 //! Secrets (access/refresh tokens) are never logged.
@@ -36,6 +40,23 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub enum SyncCommand {
     /// Re-enumerate folders, re-run every folder's delta, and drain the outbox.
     Refresh,
+    /// Sync one folder now (#1885, "Update Folder"): drain the outbox, run
+    /// that folder's delta (its initial one, with the `backfill_days`
+    /// cutoff, when it never synced), and re-read its counts
+    /// (`GET /me/mailFolders/{id}`). Emits `MessagesUpdated { folder_id }`
+    /// and, when the counts changed, `FoldersUpdated`. No other folder is
+    /// touched. Signed out or inside a throttle/back-off window it does
+    /// nothing, as a tick does there; a folder id not in the store is an
+    /// [`SyncEvent::Error`] and makes no Graph call.
+    SyncFolder { id: String },
+    /// The folders the fast cycle keeps fresh (#1885), replacing the set
+    /// whole (duplicates dropped, order kept): a UI sends its Inbox and the
+    /// folder it has open, and again when the open folder changes. Each
+    /// fast tick drains the outbox and syncs these folders as `SyncFolder`
+    /// does, skipping one that never synced (the normal pass backfills it).
+    /// Without [`EngineOptions::fast_tick`] the set is kept but has no
+    /// effect.
+    SetFastFolders { ids: Vec<String> },
     /// Start the interactive browser sign-in flow (see [`Engine::sign_in`]).
     SignIn,
     /// Mark a message read/unread (optimistic local write + queued Graph op).
@@ -280,6 +301,28 @@ struct Repair {
     /// A row was completed or deleted, so the folder needs a reload.
     changed: bool,
 }
+/// How `Engine::drain_outbox` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// Every queued op was tried: applied, or bumped/quarantined on a 4xx.
+    Done,
+    /// An op got a 5xx: it stays queued (attempts bumped) and the drain
+    /// stopped there, keeping the order, under the outbox's own back-off
+    /// (`op_retry`); or that back-off is still running and nothing was
+    /// sent. The caller's sync carries on.
+    Deferred,
+    /// Auth, throttle or transport, or the post-send sync stopping: the
+    /// caller stops too and keeps the back-off.
+    Aborted,
+}
+
+impl Drain {
+    /// Whether the caller's sync goes on after the drain.
+    fn carry_on(self) -> bool {
+        self != Drain::Aborted
+    }
+}
+
 /// Offline back-off bounds (exponential between them).
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -329,6 +372,17 @@ pub struct EngineOptions {
     /// `Text`, what lookxy shows). Bodies stored under the other format are
     /// told apart with `Store::get_body_for`.
     pub body_format: BodyFormat,
+    /// The fast cycle's interval (#1885). `None` (the default) or zero
+    /// keeps the single tick: the wait restarts on every command, as
+    /// `spawn` always did. With `Some`, the engine keeps two deadlines: the
+    /// normal pass (every folder's delta and the calendar) every `tick`,
+    /// and between them a fast tick every `fast_tick` that drains the
+    /// outbox and syncs only the [`SyncCommand::SetFastFolders`] folders.
+    /// Commands do not move either deadline, except `Refresh` and `SignIn`,
+    /// whose full pass reschedules both. A fast
+    /// tick never runs while the normal pass is due, nor inside a
+    /// throttle/back-off window.
+    pub fast_tick: Option<Duration>,
 }
 
 /// Like [`spawn`], with the engine's [`EngineOptions`].
@@ -439,6 +493,12 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backoff: BACKOFF_MIN,
         backfill_done: false,
         reconverge_pending: false,
+        fast_folders: Vec::new(),
+        next_full: Instant::now(),
+        next_fast: Instant::now(),
+        hold_full: false,
+        op_retry: None,
+        op_backoff: BACKOFF_MIN,
     };
     engine.startup();
     engine.main_loop(cmd_rx);
@@ -471,6 +531,25 @@ struct Engine {
     /// removed locally — including messages that have since aged past the
     /// sliding window. Cleared once that reconverge pass completes.
     reconverge_pending: bool,
+    /// The fast cycle's folders (`SyncCommand::SetFastFolders`), in order.
+    fast_folders: Vec<String>,
+    /// With a fast tick only: when the normal pass is next due.
+    next_full: Instant,
+    /// With a fast tick only: when the next fast tick is due.
+    next_fast: Instant,
+    /// With a fast tick only: the full pass that last ran (normal, startup,
+    /// `Refresh`, sign-in) ran to its end and still
+    /// left the folders to re-enumerate (the folder list failed
+    /// non-fatally: a 403, a 5xx, a parse error), so the fast deadlines do
+    /// not repeat it before `next_full`; a quarantine since
+    /// (`reconverge_pending`) still promotes one.
+    hold_full: bool,
+    /// When set, a drain sends no op before this instant: the first queued
+    /// op got a 5xx (#1885). Only the outbox waits; the folders still sync.
+    op_retry: Option<Instant>,
+    /// The outbox's own back-off after a 5xx, doubled per consecutive 5xx
+    /// (`BACKOFF_MIN`..`BACKOFF_MAX`), reset when an op goes through.
+    op_backoff: Duration,
 }
 
 impl Engine {
@@ -501,11 +580,16 @@ impl Engine {
     /// times out (or a back-off deadline elapses). Returns when a `Shutdown`
     /// arrives or the command channel is dropped.
     fn main_loop(&mut self, cmd_rx: Receiver<SyncCommand>) {
+        // The startup pass schedules the deadlines like any other.
+        self.after_pass_if_fast();
         loop {
             match cmd_rx.recv_timeout(self.recv_timeout()) {
                 Ok(SyncCommand::Shutdown) => return,
                 Ok(cmd) => self.handle_command(cmd),
-                Err(RecvTimeoutError::Timeout) => self.on_tick(),
+                Err(RecvTimeoutError::Timeout) => match self.fast_tick() {
+                    None => self.on_tick(),
+                    Some(fast) => self.on_deadline(fast),
+                },
                 // The UI dropped its `SyncHandle`: no one is listening anymore.
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -513,12 +597,98 @@ impl Engine {
     }
 
     /// How long to block for the next command: until the back-off deadline if
-    /// one is pending, otherwise the configured tick.
+    /// one is pending, otherwise the configured tick, and no later than a
+    /// deferred op's `op_retry`. With a fast tick: until the nearer of the
+    /// two deadlines, but never before a back-off deadline.
     fn recv_timeout(&self) -> Duration {
-        match self.next_retry {
-            Some(t) => t.saturating_duration_since(Instant::now()),
-            None => self.config.tick,
+        if self.fast_tick().is_some() {
+            let mut at = self.next_full.min(self.next_fast);
+            if let Some(t) = self.next_retry {
+                at = at.max(t);
+            }
+            return at.saturating_duration_since(Instant::now());
         }
+        let now = Instant::now();
+        let wait = match self.next_retry {
+            Some(t) => t.saturating_duration_since(now),
+            None => self.config.tick,
+        };
+        // Also wake for an op deferred by a 5xx (`op_retry`): the tick at
+        // that instant drains it, as a back-off deadline did before #1885.
+        // Only a future one while signed in, so a passed `op_retry` never
+        // makes a zero wait.
+        match self.op_retry {
+            Some(t) if self.token.is_some() && t > now => wait.min(t - now),
+            _ => wait,
+        }
+    }
+
+    /// The fast cycle's interval, when it is on (`Some(ZERO)` is off).
+    fn fast_tick(&self) -> Option<Duration> {
+        self.config.options.fast_tick.filter(|d| !d.is_zero())
+    }
+
+    /// With a fast tick, `after_full_pass` for a full pass that ran outside
+    /// the schedule: startup, `Refresh`, a sign-in. Without one, nothing.
+    fn after_pass_if_fast(&mut self) {
+        if let Some(fast) = self.fast_tick() {
+            self.after_full_pass(fast);
+        }
+    }
+
+    /// Whether the next pass must re-enumerate folders: the initial
+    /// enumeration never completed (launched offline, or a quarantine
+    /// reconverge reset it), or no folder is stored.
+    fn needs_full_pass(&self) -> bool {
+        !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true)
+    }
+
+    /// Whether the full pass that just ran (normal, startup, `Refresh`,
+    /// sign-in) ran to its end and still left the folders to re-enumerate:
+    /// not cut short by a lost sign-in or a back-off, so its folder list
+    /// failed non-fatally.
+    fn full_pass_held(&self) -> bool {
+        let cut_short = self.token.is_none() || self.next_retry.is_some_and(|t| t > Instant::now());
+        !cut_short && self.needs_full_pass()
+    }
+
+    /// A deadline of the fast-tick schedule elapsed. Inside a back-off
+    /// window nothing runs. The normal pass runs when due: its deadline, or
+    /// a pass that must re-enumerate folders, so a quarantine or an offline
+    /// start recovers at the next fast deadline rather than a tick later.
+    /// When the last pass ran to its end and its folder list still failed
+    /// (`hold_full`), only a quarantine since promotes one, so a folder list
+    /// that keeps failing is asked for once a tick, not at every fast
+    /// deadline. Otherwise a fast tick runs when its deadline passed. An
+    /// aborted normal pass is retried at its back-off deadline, as without a
+    /// fast tick.
+    fn on_deadline(&mut self, fast: Duration) {
+        let now = Instant::now();
+        if self.next_retry.is_some_and(|t| now < t) {
+            return;
+        }
+        let promote = self.needs_full_pass() && (!self.hold_full || self.reconverge_pending);
+        if now >= self.next_full || promote {
+            self.on_tick();
+            self.after_full_pass(fast);
+        } else if now >= self.next_fast {
+            self.on_fast_tick();
+            self.next_fast = Instant::now() + fast;
+        }
+    }
+
+    /// With a fast tick: schedules both deadlines after a full pass (a normal
+    /// one, the startup one, `Refresh`'s, a sign-in's) and decides
+    /// `hold_full`. A pass a throttle or back-off cut short is due again at
+    /// its deadline.
+    fn after_full_pass(&mut self, fast: Duration) {
+        let now = Instant::now();
+        self.next_fast = now + fast;
+        self.next_full = match self.next_retry {
+            Some(t) if self.token.is_some() && t > now => t,
+            _ => now + self.config.tick,
+        };
+        self.hold_full = self.full_pass_held();
     }
 
     /// Periodic tick: skip while signed out or inside a back-off window,
@@ -536,8 +706,7 @@ impl Engine {
                 return;
             }
         }
-        let needs_full =
-            !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true);
+        let needs_full = self.needs_full_pass();
         self.sync_pass(needs_full);
         // Interleave a calendar refresh with the periodic mail sync (see
         // `SyncCommand::RefreshCalendar` for the on-demand path) — but ONLY
@@ -559,7 +728,23 @@ impl Engine {
     /// Dispatches one UI command.
     fn handle_command(&mut self, cmd: SyncCommand) {
         match cmd {
-            SyncCommand::Refresh => self.sync_pass(true),
+            SyncCommand::Refresh => {
+                // F9 resends a deferred op now; its back-off keeps growing
+                // if it fails again.
+                self.op_retry = None;
+                self.sync_pass(true);
+                self.after_pass_if_fast();
+            }
+            SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
+            SyncCommand::SetFastFolders { ids } => {
+                let mut set: Vec<String> = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if !set.contains(&id) {
+                        set.push(id);
+                    }
+                }
+                self.fast_folders = set;
+            }
             SyncCommand::SignIn => self.sign_in(),
             SyncCommand::MarkRead { id, read } => {
                 self.store.set_read(&id, read);
@@ -731,7 +916,13 @@ impl Engine {
         // Clear it before draining: if the drain quarantines a fresh op it will
         // re-arm reconverge for the next pass.
         self.reconverge_pending = false;
-        self.drain_outbox();
+        // A drain that a throttle, an offline error or a lost sign-in cut
+        // short keeps its back-off: the pass stops here, as after a folder.
+        // An op deferred by a 5xx does not stop the pass; it waits for the
+        // next drain.
+        if !self.drain_outbox().carry_on() {
+            return;
+        }
         // A full pass without a hard failure clears any offline back-off.
         self.clear_backoff();
 
@@ -749,6 +940,98 @@ impl Engine {
             self.refresh_master_categories();
         }
 
+        self.settle_state();
+    }
+
+    /// One folder's sync, as `SyncCommand::SyncFolder` and the fast cycle do
+    /// it (#1885), without the drain: its delta, then its counts
+    /// (`GET /me/mailFolders/{id}`) into the store, with `FoldersUpdated`
+    /// when they changed. A non-fatal failure (a 4xx or parse error) is
+    /// surfaced and skipped. Returns `false` when the caller must stop (an
+    /// auth, throttle or transport failure, already handled by `react`).
+    fn refresh_folder(&mut self, folder_id: &str) -> bool {
+        if !self.sync_folder_delta(folder_id) {
+            return false;
+        }
+        match self.with_auth(|c| c.get_folder_counts(folder_id)) {
+            Ok((total, unread)) => {
+                if let Ok(true) = self.store.set_folder_counts(folder_id, total, unread) {
+                    self.emit(SyncEvent::FoldersUpdated);
+                }
+                true
+            }
+            Err(e) => !self.react(e),
+        }
+    }
+
+    /// `SyncCommand::SyncFolder`: an unknown id is an `Error` with no Graph
+    /// call; signed out or inside a back-off window, nothing (as a tick);
+    /// else drain the outbox and sync that folder (`refresh_folder`). A
+    /// sync cut short keeps the state its failure set (Offline,
+    /// SignInRequired, or settled by a throttle).
+    fn sync_one_folder(&mut self, id: &str) {
+        match self.store.folders() {
+            Ok(folders) if folders.iter().any(|f| f.id == id) => {}
+            Ok(_) => {
+                self.emit(SyncEvent::Error(format!(
+                    "sync folder: unknown folder {id}"
+                )));
+                return;
+            }
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        }
+        if self.token.is_none() || self.next_retry.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        self.set_state(SyncState::Syncing);
+        if self.drain_outbox().carry_on() && self.refresh_folder(id) {
+            self.clear_backoff();
+            self.settle_state();
+        }
+    }
+
+    /// One fast tick (#1885): drain the outbox, then sync the fast folders
+    /// that already have a delta link (`refresh_folder`). A folder that
+    /// never synced is left to the normal pass, which backfills it: the fast
+    /// cycle only runs deltas (#1871). The folders are picked after the
+    /// drain, so a quarantine in it (which clears every delta link) starts
+    /// no reconverge here; the next deadline runs the normal pass. Sets no
+    /// `Syncing` state (it runs every few seconds); a complete tick only
+    /// settles, and one cut short keeps the state its failure set, so
+    /// Offline, PendingOps and SignInRequired still show.
+    fn on_fast_tick(&mut self) {
+        if self.token.is_none() || self.next_retry.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        if !self.drain_outbox().carry_on() {
+            return;
+        }
+        let stored = match self.store.folders() {
+            Ok(f) => f,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let ids: Vec<String> = self
+            .fast_folders
+            .iter()
+            .filter(|id| {
+                stored
+                    .iter()
+                    .any(|f| &f.id == *id && f.delta_link.is_some())
+            })
+            .cloned()
+            .collect();
+        for id in &ids {
+            if !self.refresh_folder(id) {
+                return;
+            }
+        }
+        self.clear_backoff();
         self.settle_state();
     }
 
@@ -1016,6 +1299,8 @@ impl Engine {
             return;
         }
         self.set_state(SyncState::PendingOps(self.pending_count()));
+        // A 5xx defers the op under the outbox's own back-off (`op_retry`),
+        // not an engine-wide Offline: the folders keep syncing.
         if self.token.is_some() {
             self.drain_outbox();
         }
@@ -1026,8 +1311,19 @@ impl Engine {
     /// the op; auth/throttle/transport stop the drain (handled centrally);
     /// a non-retryable 4xx/parse bumps the attempt count and, past
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
-    /// the rest of the queue proceeds; a 5xx backs off and retries later.
-    fn drain_outbox(&mut self) {
+    /// the rest of the queue proceeds; a 5xx keeps the op and stops the
+    /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
+    /// it must not stop the caller's sync either. It arms the outbox's own
+    /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
+    /// through or the queue is empty): until then a drain sends nothing and
+    /// is `Deferred` too.
+    ///
+    /// After a drain that sent a draft, Drafts and then Sent Items are
+    /// synced at once (`sync_after_send`, #1885). Returns
+    /// [`Drain::Aborted`] when the drain was cut short (auth, throttle,
+    /// transport, or that sync stopping), so the caller stops too and keeps
+    /// the back-off.
+    fn drain_outbox(&mut self) -> Drain {
         let ops = match self.store.pending_ops() {
             Ok(o) => o,
             // A row that won't deserialize can't be pinpointed through the
@@ -1039,43 +1335,59 @@ impl Engine {
                 self.emit(SyncEvent::Error(format!(
                     "outbox decode error (drain skipped): {m}"
                 )));
-                return;
+                return Drain::Done;
             }
             Err(e) => {
                 self.emit(SyncEvent::Error(e.to_string()));
-                return;
+                return Drain::Done;
             }
         };
+        if ops.is_empty() {
+            self.clear_op_backoff();
+            return Drain::Done;
+        }
+        if self.op_retry.is_some_and(|t| Instant::now() < t) {
+            return Drain::Deferred;
+        }
 
+        let mut sent = Vec::new();
+        let mut deferred = false;
         for row in ops {
             match self.apply_op_with_retry(&row.op) {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
+                    self.clear_op_backoff();
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
+                        sent.push(id.clone());
                     }
                 }
                 Err(GraphError::Unauthorized) => {
                     self.enter_signin();
-                    return;
+                    return Drain::Aborted;
                 }
                 Err(GraphError::Throttled { retry_after_secs }) => {
+                    // As `react` does: wait out the throttle, out of `Syncing`.
                     self.schedule_retry(Duration::from_secs(retry_after_secs));
-                    return;
+                    self.settle_state();
+                    return Drain::Aborted;
                 }
                 Err(GraphError::Transport(_)) => {
                     self.go_offline();
-                    return;
+                    return Drain::Aborted;
                 }
                 Err(other) => {
                     // 4xx (incl. 404) and parse failures are non-retryable;
-                    // 5xx is a transient server error worth backing off on.
+                    // 5xx is a transient server error: keep the op, in order,
+                    // for the next drain.
                     let retryable_5xx =
                         matches!(&other, GraphError::Http { status, .. } if *status >= 500);
                     if retryable_5xx {
                         self.store.bump_op_attempts(row.seq, &other.to_string());
-                        self.go_offline();
-                        return;
+                        self.op_retry = Some(Instant::now() + self.op_backoff);
+                        self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
+                        deferred = true;
+                        break;
                     }
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
@@ -1119,6 +1431,59 @@ impl Engine {
                 }
             }
         }
+        if !sent.is_empty() && !self.sync_after_send(&sent) {
+            return Drain::Aborted;
+        }
+        if deferred {
+            Drain::Deferred
+        } else {
+            Drain::Done
+        }
+    }
+
+    /// Right after a drain sent the drafts `sent` (the ids their ops
+    /// carried) (#1885): sync Drafts, then Sent Items, each only when stored
+    /// with a delta link (this never backfills). Drafts first: Graph gives a
+    /// sent message a new id in Sent Items, so the Drafts delta's `@removed`
+    /// of the draft's id removes the row `SendDraft` re-filed under Sent,
+    /// and Sent never shows it twice. Graph moves the draft and files the
+    /// Sent copy asynchronously, so either may only come with a later delta:
+    /// a Drafts delta that still reports a sent draft (an upsert, which
+    /// re-files the row) is undone by re-filing it under Sent Items again,
+    /// until the `@removed` deletes it whatever its folder. Returns `false`
+    /// when a sync must stop (`refresh_folder`).
+    fn sync_after_send(&mut self, sent: &[String]) -> bool {
+        let Ok(folders) = self.store.folders() else {
+            return true;
+        };
+        let find = |well_known: &str| {
+            folders
+                .iter()
+                .find(|f| f.well_known_name.as_deref() == Some(well_known))
+        };
+        let (drafts, sent_items) = (find("drafts"), find("sentitems"));
+        if let Some(d) = drafts.filter(|d| d.delta_link.is_some()) {
+            if !self.refresh_folder(&d.id) {
+                return false;
+            }
+            if let Some(s) = sent_items {
+                for id in sent {
+                    let in_drafts = matches!(
+                        self.store.draft(id),
+                        Ok(Some((row, _))) if row.folder_id == d.id
+                    );
+                    if in_drafts {
+                        let _ = self.store.move_message(id, &s.id);
+                    }
+                }
+            }
+        }
+        if let Some(s) = sent_items.filter(|s| s.delta_link.is_some()) {
+            if !self.refresh_folder(&s.id) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Count of ops still queued (0 if the count can't be read).
@@ -1655,6 +2020,7 @@ impl Engine {
                 // succeeded, rather than staying stuck if the first sync fails.
                 self.set_state(SyncState::Syncing);
                 self.sync_pass(true);
+                self.after_pass_if_fast();
             }
             Err(e) => {
                 self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
@@ -1710,6 +2076,13 @@ impl Engine {
         self.next_retry = Some(Instant::now() + self.backoff);
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         self.set_state(SyncState::Offline);
+    }
+
+    /// An op went through, or none is queued: the outbox's own 5xx back-off
+    /// (`op_retry`) is over.
+    fn clear_op_backoff(&mut self) {
+        self.op_retry = None;
+        self.op_backoff = BACKOFF_MIN;
     }
 
     /// A clean pass resets the back-off and clears any pending retry deadline.
@@ -3983,6 +4356,7 @@ mod tests {
     fn html_options() -> EngineOptions {
         EngineOptions {
             body_format: BodyFormat::Html,
+            ..Default::default()
         }
     }
 
@@ -4673,6 +5047,45 @@ mod tests {
         drop(client);
     }
 
+    /// Sends `SignIn` and plays the browser: lands on the `redirect_uri` of
+    /// `SignInStarted` with a code and its `state`. Returns that
+    /// `redirect_uri` and the loopback listener's response.
+    fn sign_in_through_loopback(handle: &SyncHandle) -> (String, String) {
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInStarted { .. })
+        });
+        let authorize_url = events
+            .iter()
+            .find_map(|e| match e {
+                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
+                _ => None,
+            })
+            .expect("SignInStarted carries the authorize_url");
+        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let params = parse_query(query);
+        let param = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("authorize_url carries {name}"))
+        };
+        let (redirect_uri, state) = (param("redirect_uri"), param("state"));
+        let port: u16 = redirect_uri
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("redirect_uri ends with the loopback port");
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
+        let request =
+            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        client.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        (redirect_uri, response)
+    }
+
     #[test]
     fn sign_in_completes_via_loopback_redirect_and_caches_token() {
         // End-to-end proof of the port/redirect wiring: `begin_auth` must be
@@ -4713,26 +5126,7 @@ mod tests {
 
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
 
-        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
-
-        let events = wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::SignInStarted { .. })
-        });
-        let authorize_url = events
-            .iter()
-            .find_map(|e| match e {
-                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
-                _ => None,
-            })
-            .expect("SignInStarted carries the authorize_url");
-
-        let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let params = parse_query(query);
-        let redirect_uri = params
-            .iter()
-            .find(|(k, _)| k == "redirect_uri")
-            .map(|(_, v)| v.clone())
-            .expect("authorize_url carries redirect_uri");
+        let (redirect_uri, response) = sign_in_through_loopback(&handle);
         // Entra matches the loopback redirect host literally and the Graph CLI
         // client registers `http://localhost` (not `http://127.0.0.1`), so the
         // redirect we send MUST use the `localhost` host or sign-in fails with
@@ -4741,24 +5135,6 @@ mod tests {
             redirect_uri.starts_with("http://localhost:"),
             "redirect_uri must use the localhost host, got {redirect_uri}"
         );
-        let state = params
-            .iter()
-            .find(|(k, _)| k == "state")
-            .map(|(_, v)| v.clone())
-            .expect("authorize_url carries state");
-        let port: u16 = redirect_uri
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .expect("redirect_uri ends with the loopback port");
-
-        // Simulate the browser landing on the loopback redirect.
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
-        let request =
-            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        client.write_all(request.as_bytes()).unwrap();
-        let mut response = String::new();
-        client.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.to_lowercase().contains("close this tab"));
 
@@ -5697,6 +6073,1068 @@ mod tests {
         assert!(store.draft(DRAFT_G).unwrap().is_none());
         assert!(store.pending_ops().unwrap().is_empty());
         no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Sync one folder, the fast cycle, Sent Items after a send (#1885) ---
+
+    /// A delta page holding `items` and ending in `link`.
+    fn delta_page(items: &[String], link: &str) -> String {
+        format!(
+            r#"{{"value":[{}],"@odata.deltaLink":"{link}"}}"#,
+            items.join(",")
+        )
+    }
+
+    /// A folder as `/me/mailFolders` lists it.
+    fn folder_json(id: &str, name: &str, well_known: Option<&str>) -> String {
+        let wk = well_known.map_or("null".to_string(), |w| format!("\"{w}\""));
+        format!(
+            r#"{{"id":"{id}","displayName":"{name}","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":{wk}}}"#
+        )
+    }
+
+    /// Routes for the folders `(id, name, well_known)` listed by
+    /// `/me/mailFolders`, each with no child folders, an empty first delta
+    /// (so each holds a delta link after startup) and counts. `next` answers
+    /// a folder's incremental deltas in order, each once, before the empty
+    /// page every later one gets; `counts` overrides a folder's count body.
+    fn folder_routes(
+        folders: &[(&str, &str, Option<&str>)],
+        next: &[(&str, &str)],
+        counts: &[(&str, &str)],
+    ) -> Vec<(Route, Option<usize>)> {
+        let mut routes = Vec::new();
+        for (id, _, _) in folders {
+            let delta = format!("/me/mailFolders/{id}/messages/delta");
+            let link = format!("{delta}?token=D-{id}");
+            routes.push((
+                get_route(
+                    &format!("/me/mailFolders/{id}/childFolders"),
+                    200,
+                    r#"{"value":[]}"#,
+                ),
+                None,
+            ));
+            for (fid, body) in next {
+                if fid == id {
+                    routes.push((get_route(&link, 200, body), Some(1)));
+                }
+            }
+            routes.push((get_route(&delta, 200, &delta_page(&[], &link)), None));
+            let count = counts
+                .iter()
+                .find(|(fid, _)| fid == id)
+                .map_or(r#"{"totalItemCount":0,"unreadItemCount":0}"#, |(_, c)| c);
+            routes.push((
+                get_route(&format!("/me/mailFolders/{id}?"), 200, count),
+                None,
+            ));
+        }
+        let listed: Vec<String> = folders
+            .iter()
+            .map(|(id, name, wk)| folder_json(id, name, *wk))
+            .collect();
+        routes.push((
+            get_route(
+                "/me/mailFolders?",
+                200,
+                &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+            ),
+            None,
+        ));
+        routes
+    }
+
+    const F1_F2: &[(&str, &str, Option<&str>)] =
+        &[("F1", "Inbox", Some("inbox")), ("F2", "Projects", None)];
+
+    /// Spawns an engine on `srv` with a seeded token, the given normal tick
+    /// and fast tick; `seed` runs on the store before the engine opens it.
+    fn spawn_fast(
+        srv: &FakeServer,
+        tag: &str,
+        tick: Duration,
+        fast_tick: Option<Duration>,
+        seed: impl FnOnce(&Store),
+    ) -> (SyncHandle, PathBuf, PathBuf) {
+        let dir = unique_dir(tag);
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        seed(&Store::open(&store_path).unwrap());
+        let handle = spawn_with_bases_and_options(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            tick,
+            EngineOptions {
+                fast_tick,
+                ..Default::default()
+            },
+        );
+        (handle, store_path, dir)
+    }
+
+    /// The paths of the requests from index `from` on.
+    fn paths_from(srv: &FakeServer, from: usize) -> Vec<String> {
+        srv.requests()
+            .into_iter()
+            .skip(from)
+            .map(|r| r.path)
+            .collect()
+    }
+
+    fn is_delta(path: &str, folder: &str) -> bool {
+        path.starts_with(&format!("/me/mailFolders/{folder}/messages/delta"))
+    }
+
+    fn is_counts(path: &str, folder: &str) -> bool {
+        path.starts_with(&format!("/me/mailFolders/{folder}?"))
+    }
+
+    fn is_folder_list(path: &str) -> bool {
+        path.starts_with("/me/mailFolders?")
+    }
+
+    fn is_calendar(path: &str) -> bool {
+        path.starts_with("/me/calendarView")
+    }
+
+    fn count(srv: &FakeServer, pred: impl Fn(&str) -> bool) -> usize {
+        paths_from(srv, 0).iter().filter(|p| pred(p)).count()
+    }
+
+    const HOUR: Duration = Duration::from_secs(3600);
+    const FAST: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn fast_tick_syncs_only_the_fast_folders() {
+        let new = delta_page(
+            &[full_message_json("NEW1", "New", "2026-07-16T10:00:00Z")],
+            "/me/mailFolders/F1/messages/delta?token=D-F1",
+        );
+        let srv = FakeServer::start_limited(folder_routes(F1_F2, &[("F1", &new)], &[]));
+        let (handle, store_path, dir) = spawn_fast(&srv, "fast-only", HOUR, Some(FAST), |_| {});
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        // The startup pass reports F1 once; the fast tick that fetches NEW1
+        // reports it again.
+        wait_for_updates(&handle.evt_rx, "F1", 2);
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store
+                .messages_in_folder("F1", 50, 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == "NEW1")),
+            "NEW1 reached the store"
+        );
+        // Several more fast intervals: still only F1.
+        std::thread::sleep(Duration::from_millis(1000));
+        let f1_deltas = count(&srv, |p| is_delta(p, "F1"));
+        assert!(f1_deltas >= 3, "startup + fast deltas of F1: {f1_deltas}");
+        assert!(count(&srv, |p| is_counts(p, "F1")) >= 1);
+        assert_eq!(
+            count(&srv, |p| is_delta(p, "F2")),
+            1,
+            "F2: the startup delta only"
+        );
+        assert_eq!(count(&srv, |p| is_counts(p, "F2")), 0);
+        assert_eq!(count(&srv, is_folder_list), 1, "the startup list only");
+        assert_eq!(count(&srv, is_calendar), 0, "no calendar on a fast tick");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_folder_fetches_one_folder_and_its_counts() {
+        let new = delta_page(
+            &[full_message_json("NEW1", "New", "2026-07-16T10:00:00Z")],
+            "/me/mailFolders/F1/messages/delta?token=D-F1",
+        );
+        let srv = FakeServer::start_limited(folder_routes(
+            F1_F2,
+            &[("F1", &new)],
+            &[(
+                "F1",
+                r#"{"id":"F1","totalItemCount":2,"unreadItemCount":1}"#,
+            )],
+        ));
+        let (handle, store_path, dir) = spawn_fast(&srv, "sync-folder", HOUR, None, |_| {});
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        let mark = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SyncFolder { id: "F1".into() })
+            .unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Idle))
+        });
+        assert!(events.contains(&SyncEvent::MessagesUpdated {
+            folder_id: "F1".into()
+        }));
+        assert!(events.contains(&SyncEvent::FoldersUpdated), "{events:?}");
+        let paths = paths_from(&srv, mark);
+        assert!(paths.iter().any(|p| is_delta(p, "F1")), "{paths:?}");
+        assert!(paths.iter().any(|p| is_counts(p, "F1")), "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|p| is_delta(p, "F1") || is_counts(p, "F1")),
+            "only F1's delta and counts: {paths:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            store
+                .messages_in_folder("F1", 50, 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == "NEW1")
+        );
+        let f1 = store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "F1")
+            .unwrap();
+        assert_eq!((f1.total_count, f1.unread_count), (2, 1));
+        assert_eq!(f1.display_name, "Inbox", "the counts GET leaves the name");
+
+        // Same counts again: no FoldersUpdated.
+        let mark = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SyncFolder { id: "F1".into() })
+            .unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Idle))
+        });
+        assert!(!events.contains(&SyncEvent::FoldersUpdated), "{events:?}");
+        let paths = paths_from(&srv, mark);
+        assert!(
+            !paths.is_empty()
+                && paths
+                    .iter()
+                    .all(|p| is_delta(p, "F1") || is_counts(p, "F1")),
+            "{paths:?}"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_folder_unknown_id_is_an_error() {
+        let srv = FakeServer::start_limited(folder_routes(F1_F2, &[], &[]));
+        let (handle, _store_path, dir) = spawn_fast(&srv, "sync-unknown", HOUR, None, |_| {});
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        let mark = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SyncFolder { id: "NOPE".into() })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("unknown folder NOPE")),
+        );
+        // A known folder's sync after it, as a barrier: everything NOPE could
+        // have caused has reached the server by the time this one settles.
+        handle
+            .cmd_tx
+            .send(SyncCommand::SyncFolder { id: "F1".into() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        let paths = paths_from(&srv, mark);
+        assert!(
+            paths
+                .iter()
+                .all(|p| is_delta(p, "F1") || is_counts(p, "F1")),
+            "NOPE made no Graph request: {paths:?}"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_fast_folders_replaces_the_set() {
+        let srv = FakeServer::start_limited(folder_routes(F1_F2, &[], &[]));
+        let (handle, _store_path, dir) = spawn_fast(&srv, "fast-replace", HOUR, Some(FAST), |_| {});
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| is_delta(
+            p, "F1"
+        )) >= 2));
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F2".into(), "F2".into()],
+            })
+            .unwrap();
+        // F2's first fast delta shows the switch.
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| is_delta(
+            p, "F2"
+        )) >= 2));
+        let mark = srv.requests().len();
+        std::thread::sleep(Duration::from_millis(1000));
+        let paths = paths_from(&srv, mark);
+        assert!(paths.iter().any(|p| is_delta(p, "F2")), "{paths:?}");
+        assert!(!paths.iter().any(|p| is_delta(p, "F1")), "{paths:?}");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_draft_syncs_drafts_and_sent_items_at_once() {
+        let folders: &[(&str, &str, Option<&str>)] = &[
+            ("DRAFTS1", "Drafts", Some("drafts")),
+            ("SENT1", "Sent Items", Some("sentitems")),
+        ];
+        // After the send, Drafts reports the draft gone and Sent Items has
+        // the server's copy under a new id.
+        let drafts_next = delta_page(
+            &[r#"{"id":"GRAPH-42","@removed":{"reason":"deleted"}}"#.to_string()],
+            "/me/mailFolders/DRAFTS1/messages/delta?token=D-DRAFTS1",
+        );
+        let sent_next = delta_page(
+            &[full_message_json("NEW-42", "Hi", "2026-07-16T10:00:00Z")],
+            "/me/mailFolders/SENT1/messages/delta?token=D-SENT1",
+        );
+        let mut routes = vec![
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-42/send".into(),
+                    status: 202,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: r#"{"id":"GRAPH-42","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+                },
+                None,
+            ),
+        ];
+        routes.extend(folder_routes(
+            folders,
+            &[("DRAFTS1", &drafts_next), ("SENT1", &sent_next)],
+            &[("SENT1", r#"{"totalItemCount":1,"unreadItemCount":0}"#)],
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-sync", HOUR, None, |s| {
+            local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+        });
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        let mark = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Idle))
+        });
+        assert!(
+            events.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{events:?}"
+        );
+
+        let paths = paths_from(&srv, mark);
+        let at = |pred: &dyn Fn(&str) -> bool| paths.iter().position(|p| pred(p));
+        let send = at(&|p| p.starts_with("/me/messages/GRAPH-42/send")).expect("sent");
+        let drafts = at(&|p| is_delta(p, "DRAFTS1")).expect("Drafts delta after the send");
+        let drafts_counts = at(&|p| is_counts(p, "DRAFTS1")).expect("Drafts counts");
+        let sent = at(&|p| is_delta(p, "SENT1")).expect("Sent Items delta after the send");
+        let sent_counts = at(&|p| is_counts(p, "SENT1")).expect("Sent Items counts");
+        assert!(
+            send < drafts && drafts < drafts_counts && drafts_counts < sent && sent < sent_counts,
+            "{paths:?}"
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let ids: Vec<String> = store
+            .messages_in_folder("SENT1", 50, 0)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["NEW-42".to_string()], "one row in Sent Items");
+        let sent_folder = store
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "SENT1")
+            .unwrap();
+        assert_eq!(sent_folder.total_count, 1);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_throttle_in_a_tick_is_honoured() {
+        // A queued MarkRead whose first PATCH is throttled for 4 s. The tick
+        // (300 ms) is shorter than the throttle, so a pass that forgot the
+        // throttle would reach Graph again inside the window.
+        let mut routes = vec![
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/M1".into(),
+                    status: 429,
+                    headers: vec![("Retry-After".into(), "4".into())],
+                    body: "{}".into(),
+                },
+                Some(1),
+            ),
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/M1".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: "{}".into(),
+                },
+                None,
+            ),
+        ];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(
+            &srv,
+            "drain-throttle",
+            Duration::from_millis(300),
+            None,
+            |s| {
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "M1".into(),
+                    read: true,
+                })
+                .unwrap();
+            },
+        );
+        let patches = || {
+            srv.requests()
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .count()
+        };
+        assert!(
+            wait_until(ENGINE_WAIT, || patches() >= 1),
+            "the throttled PATCH"
+        );
+        assert_eq!(patches(), 1, "the throttled PATCH only");
+        let mark = srv.requests().len();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            paths_from(&srv, mark),
+            Vec::<String>::new(),
+            "no Graph request inside the throttle window"
+        );
+        // After the deadline the op goes through.
+        assert!(wait_until(ENGINE_WAIT, || patches() == 2));
+        let store = Store::open(&store_path).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || store
+            .pending_ops()
+            .unwrap()
+            .is_empty()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_mode_quarantine_runs_a_full_pass_soon() {
+        // An op one failure away from quarantine, answered 400: the startup
+        // drain quarantines it, which clears every delta link.
+        let mut routes = vec![(
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 400,
+                headers: vec![],
+                body: r#"{"error":"bad"}"#.into(),
+            },
+            None,
+        )];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "fast-quarantine", HOUR, Some(FAST), |s| {
+                let seq = s
+                    .enqueue_op(&OutboxOp::MarkRead {
+                        id: "M1".into(),
+                        read: true,
+                    })
+                    .unwrap();
+                for _ in 0..MAX_OP_ATTEMPTS - 1 {
+                    s.bump_op_attempts(seq, "bad");
+                }
+            });
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("quarantined")),
+        );
+        // The next fast deadline runs the normal pass (it re-lists the
+        // folders), not the hour-long tick.
+        assert!(
+            wait_until(Duration::from_secs(10), || count(&srv, is_folder_list) >= 2),
+            "a full pass soon after the quarantine: {:?}",
+            paths_from(&srv, 0)
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_tick_honours_retry_after() {
+        let throttled = (
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F1/messages/delta?token=".into(),
+                status: 429,
+                headers: vec![("Retry-After".into(), "4".into())],
+                body: "{}".into(),
+            },
+            Some(1),
+        );
+        let mut routes = vec![throttled];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "fast-throttle", HOUR, Some(FAST), |_| {});
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        // The first fast delta of F1 (its startup delta was the first call)
+        // is the throttled one.
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| is_delta(
+            p, "F1"
+        )) >= 2));
+        let mark = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SyncFolder { id: "F1".into() })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            paths_from(&srv, mark),
+            Vec::<String>::new(),
+            "no fast tick and no SyncFolder call inside the window"
+        );
+        // After the deadline, fast ticks resume.
+        assert!(wait_until(ENGINE_WAIT, || paths_from(&srv, mark)
+            .iter()
+            .any(|p| is_delta(p, "F1"))));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normal_tick_without_fast_option_is_unchanged() {
+        let mut routes = folder_routes(F1_F2, &[], &[]);
+        routes.insert(
+            0,
+            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+        );
+        let srv = FakeServer::start_limited(routes);
+        let (handle, _store_path, dir) = spawn_fast(
+            &srv,
+            "legacy-tick",
+            Duration::from_millis(300),
+            None,
+            |_| {},
+        );
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, is_calendar) >= 1));
+        // The startup pass, then one tick: its folders' deltas and the
+        // calendar, and no counts GET of a single folder.
+        let kinds: Vec<&str> = paths_from(&srv, 0)
+            .iter()
+            .map(|p| {
+                if is_folder_list(p) {
+                    "list"
+                } else if p.starts_with("/me/mailFolders/F1/childFolders") {
+                    "children F1"
+                } else if p.starts_with("/me/mailFolders/F2/childFolders") {
+                    "children F2"
+                } else if is_delta(p, "F1") {
+                    "delta F1"
+                } else if is_delta(p, "F2") {
+                    "delta F2"
+                } else if p.starts_with("/me/people") {
+                    "people"
+                } else if p.starts_with("/me/outlook/masterCategories") {
+                    "categories"
+                } else if is_calendar(p) {
+                    "calendar"
+                } else {
+                    "other"
+                }
+            })
+            .take_while(|k| *k != "calendar")
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "list",
+                "children F1",
+                "children F2",
+                "delta F1",
+                "delta F2",
+                "people",
+                "categories",
+                "delta F1",
+                "delta F2",
+            ]
+        );
+        assert_eq!(count(&srv, |p| is_counts(p, "F1") || is_counts(p, "F2")), 0);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queued MarkRead of M1 that Graph answers 500 on every attempt.
+    fn failing_5xx_op_routes() -> Vec<(Route, Option<usize>)> {
+        let mut routes = vec![
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/M1".into(),
+                    status: 500,
+                    headers: vec![],
+                    body: r#"{"error":"boom"}"#.into(),
+                },
+                None,
+            ),
+            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+        ];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        routes
+    }
+
+    fn seed_mark_read(s: &Store) {
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "M1".into(),
+            read: true,
+        })
+        .unwrap();
+    }
+
+    fn patch_count(srv: &FakeServer) -> usize {
+        srv.requests()
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .count()
+    }
+
+    #[test]
+    fn a_5xx_op_does_not_stall_the_normal_tick() {
+        // A 5xx op is never quarantined: if it stopped the pass, the
+        // calendar would never refresh again and the engine would sit
+        // Offline under a growing back-off. The op waits under the outbox's
+        // own back-off (5 s first) instead, and is not resent every tick.
+        let srv = FakeServer::start_limited(failing_5xx_op_routes());
+        let (handle, store_path, dir) = spawn_fast(
+            &srv,
+            "5xx-tick",
+            Duration::from_millis(300),
+            None,
+            seed_mark_read,
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), || count(&srv, is_calendar) >= 3),
+            "ticks go on past the 5xx op: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert_eq!(patch_count(&srv), 1, "the op waits for its back-off");
+        // The pass settles at PendingOps, not Offline.
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
+        });
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.pending_ops().unwrap().len(), 1, "the op stays queued");
+        // After the back-off a tick sends it again.
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_5xx_op_does_not_stall_the_fast_cycle() {
+        let srv = FakeServer::start_limited(failing_5xx_op_routes());
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "5xx-fast", HOUR, Some(FAST), seed_mark_read);
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        // Fast ticks keep syncing F1 every fast interval, while the op waits
+        // for its own back-off (5 s) rather than being resent each time.
+        assert!(
+            wait_until(Duration::from_secs(3), || count(&srv, |p| is_delta(
+                p, "F1"
+            )) >= 6),
+            "fast ticks go on past the 5xx op: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(
+            patch_count(&srv) <= 2,
+            "the op is not resent at every fast tick: {}",
+            patch_count(&srv)
+        );
+        // A command's op goes into the same queue behind it: no engine-wide
+        // Offline, and the folders still sync.
+        handle
+            .cmd_tx
+            .send(SyncCommand::MarkRead {
+                id: "M2".into(),
+                read: true,
+            })
+            .unwrap();
+        let before = count(&srv, |p| is_delta(p, "F1"));
+        assert!(wait_until(Duration::from_secs(3), || count(&srv, |p| {
+            is_delta(p, "F1")
+        }) >= before + 3));
+        assert!(patch_count(&srv) <= 2, "{}", patch_count(&srv));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fast_tick_cut_short_offline_stays_offline() {
+        let srv = FakeServer::start_limited(folder_routes(F1_F2, &[], &[]));
+        let (handle, _store_path, dir) = spawn_fast(&srv, "fast-offline", HOUR, Some(FAST), |_| {});
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| is_delta(
+            p, "F1"
+        )) >= 2));
+        // The server goes away: the next fast delta is a transport error.
+        drop(srv);
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Offline))
+        });
+        // Nothing settles it back to Idle inside the back-off (5 s).
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match handle.evt_rx.recv_timeout(left) {
+                Ok(SyncEvent::State(s)) => panic!("state left Offline: {s:?}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_folder_list_is_not_asked_for_at_every_fast_deadline() {
+        // The folder list answers 403 (non-fatal: no back-off), so the
+        // folders still need enumerating after every pass. The fast
+        // deadlines must not turn into full passes: the list waits for the
+        // normal tick.
+        let srv = FakeServer::start(vec![get_route(
+            "/me/mailFolders?",
+            403,
+            r#"{"error":"no"}"#,
+        )]);
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "fast-list-403", HOUR, Some(FAST), |_| {});
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        assert!(wait_until(ENGINE_WAIT, || count(&srv, is_folder_list) >= 1));
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(
+            count(&srv, is_folder_list),
+            1,
+            "the startup list only: {:?}",
+            paths_from(&srv, 0)
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F1/F2 routes where F2's first (initial) delta is throttled once for
+    /// 2 s, so a full pass is cut short after the folder list and F1.
+    fn f2_initial_delta_throttled_routes() -> Vec<(Route, Option<usize>)> {
+        let mut routes = vec![(
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F2/messages/delta?$select".into(),
+                status: 429,
+                headers: vec![("Retry-After".into(), "2".into())],
+                body: "{}".into(),
+            },
+            Some(1),
+        )];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        routes
+    }
+
+    fn f2_delta_link(store_path: &std::path::Path) -> Option<String> {
+        Store::open(store_path)
+            .unwrap()
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "F2")
+            .and_then(|f| f.delta_link)
+    }
+
+    #[test]
+    fn a_throttled_startup_pass_is_retried_at_its_deadline_in_fast_mode() {
+        let srv = FakeServer::start_limited(f2_initial_delta_throttled_routes());
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "fast-startup-retry", HOUR, Some(FAST), |_| {});
+        // The startup pass stops at F2's 429; at the deadline the normal
+        // pass runs again (not a fast tick that only clears the back-off),
+        // so F2 gets its delta well before the hour-long tick.
+        assert!(
+            wait_until(Duration::from_secs(10), || count(&srv, |p| is_delta(
+                p, "F2"
+            )) >= 2),
+            "F2's delta retried: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(wait_until(ENGINE_WAIT, || f2_delta_link(&store_path).is_some()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_throttled_sign_in_pass_is_retried_at_its_deadline_in_fast_mode() {
+        let mut routes = vec![(
+            Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+            },
+            None,
+        )];
+        routes.extend(f2_initial_delta_throttled_routes());
+        let srv = FakeServer::start_limited(routes);
+        let dir = unique_dir("fast-signin-retry");
+        let store_path = dir.join("mail.db");
+        let handle = spawn_with_bases_and_options(
+            store_path.clone(),
+            dir.join("token.bin"), // no seed_token: starts signed out
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            HOUR,
+            EngineOptions {
+                fast_tick: Some(FAST),
+                ..Default::default()
+            },
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let (_, response) = sign_in_through_loopback(&handle);
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(
+            wait_until(Duration::from_secs(10), || count(&srv, |p| is_delta(
+                p, "F2"
+            )) >= 2),
+            "F2's delta retried after the sign-in pass: {:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(wait_until(ENGINE_WAIT, || f2_delta_link(&store_path).is_some()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_sent_draft_the_drafts_delta_still_reports_stays_in_sent_items() {
+        let folders: &[(&str, &str, Option<&str>)] = &[
+            ("DRAFTS1", "Drafts", Some("drafts")),
+            ("SENT1", "Sent Items", Some("sentitems")),
+        ];
+        // Graph has not moved the draft yet: the Drafts delta right after the
+        // send reports it as changed (an upsert into Drafts), and Sent Items
+        // has nothing new.
+        let drafts_next = delta_page(
+            &[full_message_json("GRAPH-42", "Hi", "2026-07-16T10:00:00Z")],
+            "/me/mailFolders/DRAFTS1/messages/delta?token=D-DRAFTS1",
+        );
+        let mut routes = vec![
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-42/send".into(),
+                    status: 202,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: r#"{"id":"GRAPH-42","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#.into(),
+                },
+                None,
+            ),
+        ];
+        routes.extend(folder_routes(folders, &[("DRAFTS1", &drafts_next)], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let mut local = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "send-upsert", HOUR, None, |s| {
+            local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+        });
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        assert!(
+            srv.requests().iter().any(|r| r
+                .path
+                .starts_with("/me/mailFolders/DRAFTS1/messages/delta?token=")),
+            "the post-send Drafts delta ran"
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, _) = store.draft(&local).unwrap().expect("the sent row");
+        assert_eq!(row.id, "GRAPH-42");
+        assert_eq!(
+            row.folder_id, "SENT1",
+            "the sent row stays under Sent Items"
+        );
+        assert!(
+            store
+                .messages_in_folder("DRAFTS1", 50, 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A queued MarkRead of M1 whose first PATCH gets a 500 and every later
+    /// one succeeds.
+    fn one_5xx_then_ok_routes() -> Vec<(Route, Option<usize>)> {
+        let patch = |status: u16| Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let mut routes = vec![(patch(500), Some(1)), (patch(200), None)];
+        routes.extend(folder_routes(F1_F2, &[], &[]));
+        routes
+    }
+
+    #[test]
+    fn a_deferred_op_is_resent_at_its_back_off_without_a_fast_tick() {
+        // An hour-long tick: only the op's own back-off (5 s) can bring the
+        // second PATCH within the wait.
+        let srv = FakeServer::start_limited(one_5xx_then_ok_routes());
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "op-retry-legacy", HOUR, None, seed_mark_read);
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 1));
+        assert!(
+            wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2),
+            "the op is resent at its back-off, not after the tick"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || store
+            .pending_ops()
+            .unwrap()
+            .is_empty()));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_resends_a_deferred_op_at_once() {
+        let srv = FakeServer::start_limited(one_5xx_then_ok_routes());
+        let (handle, _store_path, dir) =
+            spawn_fast(&srv, "op-retry-refresh", HOUR, None, seed_mark_read);
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 1));
+        let sent_at = Instant::now();
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2));
+        assert!(
+            sent_at.elapsed() < Duration::from_secs(4),
+            "Refresh resent it before its 5 s back-off: {:?}",
+            sent_at.elapsed()
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

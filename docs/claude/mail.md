@@ -59,3 +59,63 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   Graph: the caller gates on `get_body_for` (`get_body` still shows
   whatever is stored).
 - Not done: FTS indexes an html body's markup (the triggers copy `content`).
+
+## Sync one folder, the fast cycle, Sent Items after a send (#1885)
+
+- `SyncCommand::SyncFolder { id }` (Shift+F9, "Update Folder") drains the
+  outbox, runs that folder's delta and re-reads its counts
+  (`GraphClient::get_folder_counts`: `GET /me/mailFolders/{id}?$select=…`,
+  stored by `Store::set_folder_counts`, which leaves name, parent and
+  well-known name alone), with `FoldersUpdated` only when the counts
+  changed (`Engine::refresh_folder`). An id not in the store is an `Error`
+  with no Graph call; signed out or inside `next_retry` it does nothing. A
+  folder that never synced runs its initial delta (with the cutoff): the user
+  asked for it.
+- The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
+  old single tick, whose wait restarts on every command). With it the engine
+  keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
+  not move them, except `Refresh` and `SignIn`, whose full pass reschedules
+  both. The normal pass runs when its
+  deadline passed or `needs_full_pass()` (no enumeration yet, or no folders:
+  a quarantine or an offline start recovers at the next fast deadline). When
+  the last pass ran to its end and its folder list still failed non-fatally
+  (a 403, a 5xx: no back-off), `hold_full` keeps the fast deadlines from
+  repeating it before `next_full`, unless a quarantine (`reconverge_pending`)
+  came since; otherwise `on_fast_tick` drains the outbox and refreshes the
+  `SetFastFolders` folders that already have a delta link (never a backfill,
+  #1871), picked after the drain. Nothing runs inside `next_retry`; an
+  aborted normal pass is due again at its deadline. `after_full_pass` (both
+  deadlines, `hold_full`) follows every full pass: a normal one, and
+  through `after_pass_if_fast` the startup pass, `Refresh` and a sign-in, so
+  a throttled startup or sign-in pass is retried at its deadline too. A
+  fast tick sets no `Syncing` state; a complete one settles, and one cut
+  short (like a `SyncFolder` cut short) keeps the state its failure set, so
+  Offline is not settled away. `SetFastFolders` without `fast_tick` is kept
+  and does nothing.
+- Without `fast_tick`, a throttled `SyncFolder` makes the deadline run a full
+  pass (`recv_timeout` waits for `next_retry`, then `on_tick`), as any
+  throttled command does.
+- `drain_outbox` returns a `Drain`: `Aborted` when cut short (auth,
+  throttle, transport, or the post-send sync stopping), and every sync
+  (`sync_pass`, a fast tick, `SyncFolder`) then stops and keeps the back-off
+  (`sync_pass` used to `clear_backoff` right after a failed drain). Its
+  throttle arm settles the state, as `react` does. A 5xx op is never
+  quarantined, so it is `Deferred`, not `Aborted`: the op keeps its place,
+  the drain stops there, and the sync carries on (else one op Graph keeps
+  failing would stop the calendar and the fast cycle for good). The outbox
+  has its own back-off for it (`op_retry`/`op_backoff`, 5 s doubling to
+  300 s, cleared when an op goes through or the queue is empty): until then
+  every drain, a command's included, sends nothing and is `Deferred`, so the
+  op is not resent at every fast tick and no engine-wide Offline is set.
+  Without `fast_tick`, `recv_timeout` also wakes at a future `op_retry`
+  (signed in only), so the tick there resends it as a back-off deadline
+  did; `Refresh` clears `op_retry` (not `op_backoff`) to resend at once.
+- After a drain that sent a draft, `sync_after_send` refreshes Drafts, then
+  Sent Items, each only when it has a delta link. Drafts first: without
+  `ImmutableId` Graph gives the sent message a new id in Sent Items, and the
+  Drafts delta's `@removed` of the draft's id removes the row `SendDraft`
+  re-filed under Sent, so Sent never shows it twice. Graph moves the draft
+  and files the Sent copy asynchronously, so either may only come with a
+  later delta: a Drafts delta that still reports a sent draft (an upsert,
+  which re-files the row under Drafts) is undone by re-filing the ids this
+  drain sent under Sent Items again, until the `@removed` deletes the row.

@@ -664,6 +664,20 @@ impl Store {
         Ok(())
     }
 
+    /// Sets one folder's `total_count`/`unread_count`, as one folder's
+    /// `GET /me/mailFolders/{id}` read them (#1885), and leaves its name,
+    /// parent and well-known name as they are (`upsert_folder` would
+    /// overwrite them). True when a stored count changed; false when they
+    /// were already these, or no folder has `id`.
+    pub fn set_folder_counts(&self, id: &str, total: i64, unread: i64) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE folders SET total_count = ?2, unread_count = ?3
+             WHERE id = ?1 AND (total_count IS NOT ?2 OR unread_count IS NOT ?3)",
+            params![id, total, unread],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// All folders, well-known ones first (Inbox, Drafts, Sent, Deleted,
     /// Junk, Archive, in that order), then everything else alphabetically.
     pub fn folders(&self) -> Result<Vec<FolderRow>, StoreError> {
@@ -3196,6 +3210,41 @@ mod tests {
         s.move_message("10", "DEST").unwrap();
         assert!(s.messages_in_folder("F", 50, 0).unwrap().is_empty());
         assert_eq!(s.messages_in_folder("DEST", 50, 0).unwrap()[0].id, "10");
+    }
+
+    #[test]
+    fn set_folder_counts_changes_only_the_counts() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F1".into(),
+            display_name: "Inbox".into(),
+            parent_id: Some("ROOT".into()),
+            total_count: 2,
+            unread_count: 1,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.set_delta_link("F1", "LINK").unwrap();
+
+        assert!(s.set_folder_counts("F1", 5, 3).unwrap(), "changed");
+        let f = s
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "F1")
+            .unwrap();
+        assert_eq!((f.total_count, f.unread_count), (5, 3));
+        assert_eq!(f.display_name, "Inbox");
+        assert_eq!(f.parent_id.as_deref(), Some("ROOT"));
+        assert_eq!(f.well_known_name.as_deref(), Some("inbox"));
+        assert_eq!(f.delta_link.as_deref(), Some("LINK"));
+
+        assert!(!s.set_folder_counts("F1", 5, 3).unwrap(), "unchanged");
+        assert!(
+            s.set_folder_counts("F1", 5, 2).unwrap(),
+            "unread alone changed"
+        );
+        assert!(!s.set_folder_counts("NOPE", 1, 1).unwrap(), "unknown id");
     }
 
     #[test]
