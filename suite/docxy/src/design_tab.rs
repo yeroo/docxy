@@ -309,14 +309,27 @@ pub(crate) fn page_sheet_color(tab: &DocTab) -> u32 {
 /// `sheet`: dark ink on a light page, light ink on a dark one, as Word draws
 /// automatic text.
 pub(crate) fn page_ink(sheet: u32) -> (u32, u32) {
-    let [r, g, b] = [16, 8, 0].map(|s| f32::from(((sheet >> s) & 0xFF) as u8) / 255.0);
-    // Relative luminance (Rec. 709 weights on the gamma-encoded channels is
-    // close enough to pick a side).
-    if 0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45 {
+    if dark_ground(sheet) {
         (0xF2F2F2, 0xB0B0B0)
     } else {
         (0x202020, 0x808080)
     }
+}
+
+/// Whether a ground of colour `rgb` takes light ink.
+fn dark_ground(rgb: u32) -> bool {
+    let [r, g, b] = [16, 8, 0].map(|s| f32::from(((rgb >> s) & 0xFF) as u8) / 255.0);
+    // Relative luminance (Rec. 709 weights on the gamma-encoded channels is
+    // close enough to pick a side).
+    0.2126 * r + 0.7152 * g + 0.0722 * b < 0.45
+}
+
+/// The colour a link with no colour of its own draws in on a sheet of colour
+/// `ground` (#1906): the light link blue on a dark ground, where
+/// [`page_ink`] draws light ink, else the usual one. A mid grey reads with
+/// neither, as it does with neither ink.
+pub(crate) fn page_link(ground: u32) -> u32 {
+    if dark_ground(ground) { LINK_DARK } else { LINK }
 }
 
 /// How a table cell's text draws on its fill (#765).
@@ -329,6 +342,8 @@ pub(crate) struct CellInk {
     /// wash: `(colour, alpha)` laid over the fill, so the chip reads against
     /// the fill and the ink reads on the chip.
     pub chip: (u32, f32),
+    /// The colour of a link with no colour of its own ([`page_link`]).
+    pub link: u32,
 }
 
 /// The ink a table cell's automatic text draws in (#765): on a fill, the
@@ -336,7 +351,8 @@ pub(crate) struct CellInk {
 /// [`page_ink`] does on a page colour, with chips that shade the fill
 /// darker under either; `None` without a fill (the surrounding ink).
 pub(crate) fn cell_ink(fill: Option<u32>) -> Option<CellInk> {
-    let (fg, dim) = page_ink(fill?);
+    let fill = fill?;
+    let (fg, dim) = page_ink(fill);
     // Light ink is on a dark fill: a deeper shade keeps it readable; dark
     // ink on a light fill takes a faint one, as Print Layout's chips do.
     let light = fg > 0x808080;
@@ -344,6 +360,7 @@ pub(crate) fn cell_ink(fill: Option<u32>) -> Option<CellInk> {
         fg,
         dim,
         chip: (0x000000, if light { 0.3 } else { 0.06 }),
+        link: page_link(fill),
     })
 }
 

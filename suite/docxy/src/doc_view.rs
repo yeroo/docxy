@@ -902,6 +902,7 @@ mod tests {
             panel: c,
             hover: c,
             sel: hsla_u(0x123456),
+            link: hsla_u(0x0000ff),
         }
     }
 
@@ -924,6 +925,34 @@ mod tests {
         let (bg, p) = content_look(theme, theme_bg, false, true);
         assert_eq!(bg, hsla_u(0xffffff));
         assert_eq!(p.fg, ink);
+    }
+
+    #[test]
+    fn an_uncoloured_link_reads_on_the_light_and_the_dark_content_page_1906() {
+        use crate::style_gallery::contrast;
+        // The palette `Pal::of` reads off gpui-component's stock dark theme.
+        let dark = gpui_component::ThemeColor::dark();
+        let theme = Pal {
+            link: hsla_u(crate::theme_link(true)),
+            ..pal(0xeeeeee)
+        };
+        for (theme_dark, content_dark) in [(false, false), (true, false), (true, true)] {
+            let (bg, p) = content_look(theme, dark.background, theme_dark, content_dark);
+            let r = contrast(p.link.to_rgb(), bg.to_rgb());
+            assert!(
+                r >= 4.5,
+                "theme {theme_dark} content {content_dark}: {r:.2}"
+            );
+        }
+        // The dark page is the theme's; on the white page the usual blue.
+        assert_eq!(
+            content_look(theme, dark.background, true, true).1.link,
+            theme.link
+        );
+        assert_eq!(
+            content_look(theme, dark.background, true, false).1.link,
+            hsla_u(crate::LINK)
+        );
     }
 
     fn b(x: f32) -> Bounds<Pixels> {
