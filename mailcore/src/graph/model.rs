@@ -130,6 +130,105 @@ impl Message {
     }
 }
 
+/// Which of a message's stored properties a Graph JSON object actually
+/// carried, by key (a key holding JSON `null` counts as carried: Graph said
+/// the value is empty). `Message::from_json` turns an absent key into an
+/// empty value, which is right for a complete item but not for a partial
+/// one: a delta round can return only the properties that changed (`{id,
+/// isRead}`) or a bare `{id}` for an item created and changed between two
+/// rounds (#1899). `Store::merge_message` writes only the columns whose
+/// property is carried, so an absent property never blanks a stored one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MessageFields {
+    pub conversation_id: bool,
+    pub subject: bool,
+    pub from: bool,
+    pub to: bool,
+    pub cc: bool,
+    pub received: bool,
+    pub sent: bool,
+    pub is_read: bool,
+    pub flag: bool,
+    pub has_attachments: bool,
+    pub importance: bool,
+    pub preview: bool,
+    pub is_draft: bool,
+    /// `@odata.type`, from which `is_meeting_request` is read.
+    pub odata_type: bool,
+    pub categories: bool,
+}
+
+impl MessageFields {
+    /// The keys `v` carries, by `Message::from_json`'s key names.
+    pub fn of(v: &Value) -> Self {
+        let has = |k: &str| v.get(k).is_some();
+        MessageFields {
+            conversation_id: has("conversationId"),
+            subject: has("subject"),
+            from: has("from"),
+            to: has("toRecipients"),
+            cc: has("ccRecipients"),
+            received: has("receivedDateTime"),
+            sent: has("sentDateTime"),
+            is_read: has("isRead"),
+            flag: has("flag"),
+            has_attachments: has("hasAttachments"),
+            importance: has("importance"),
+            preview: has("bodyPreview"),
+            is_draft: has("isDraft"),
+            odata_type: has("@odata.type"),
+            categories: has("categories"),
+        }
+    }
+
+    /// Every property carried: what a merge of a `Message` built in code
+    /// (not parsed) means.
+    pub fn all() -> Self {
+        MessageFields {
+            conversation_id: true,
+            subject: true,
+            from: true,
+            to: true,
+            cc: true,
+            received: true,
+            sent: true,
+            is_read: true,
+            flag: true,
+            has_attachments: true,
+            importance: true,
+            preview: true,
+            is_draft: true,
+            odata_type: true,
+            categories: true,
+        }
+    }
+
+    /// A partial item: one of the header keys (`receivedDateTime`,
+    /// `subject`, `from`) is absent. Every message Graph has carries them
+    /// when `MESSAGE_SELECT` asks for them, so their absence marks a
+    /// partial representation.
+    pub fn is_partial(&self) -> bool {
+        !(self.received && self.subject && self.from)
+    }
+
+    /// Whether `is_meeting_request` is to be written. `@odata.type` is an
+    /// annotation Graph emits only for a derived type, so a complete plain
+    /// message has none and that means "not a meeting request", as
+    /// `upsert_message` writes it. On a partial item its absence says
+    /// nothing.
+    pub fn writes_meeting_request(&self) -> bool {
+        self.odata_type || !self.is_partial()
+    }
+
+    /// Whether `is_draft` is to be written. `isDraft` is not in
+    /// `MESSAGE_SELECT`, so a complete delta item writes 0 as
+    /// `upsert_message` does (unchanged behaviour); a partial item keeps
+    /// the stored value unless it carries the key.
+    pub fn writes_is_draft(&self) -> bool {
+        self.is_draft || !self.is_partial()
+    }
+}
+
 /// A message body: its content plus whether that content is `text` or
 /// `html`.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -434,7 +533,9 @@ impl MasterCategory {
 /// a message that was removed since the last sync.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeltaItem {
-    Upsert(Message),
+    /// A message and which of its properties the item carried: a delta
+    /// item may be partial (#1899), see `MessageFields`.
+    Upsert(Message, MessageFields),
     Delete(String),
 }
 
@@ -458,7 +559,7 @@ impl DeltaPage {
                     let id = item.get("id").and_then(Value::as_str).unwrap_or("");
                     Some(DeltaItem::Delete(id.to_string()))
                 } else {
-                    Message::from_json(item).map(DeltaItem::Upsert)
+                    Message::from_json(item).map(|m| DeltaItem::Upsert(m, MessageFields::of(item)))
                 }
             })
             .collect();
@@ -1051,6 +1152,72 @@ mod tests {
             Some("https://graph/delta?token=xyz")
         );
         assert!(page.next_link.is_none());
+    }
+
+    #[test]
+    fn message_fields_track_present_keys() {
+        // A key holding `null` is carried (Graph said "empty"); an absent
+        // key is not.
+        let v = parse(r#"{"id":"M1","isRead":true,"from":null,"categories":[]}"#).unwrap();
+        let f = MessageFields::of(&v);
+        assert!(f.is_read && f.from && f.categories);
+        assert!(!f.subject && !f.received && !f.preview && !f.flag && !f.odata_type);
+        assert!(f.is_partial(), "no subject and no receivedDateTime");
+        assert!(!f.writes_meeting_request() && !f.writes_is_draft());
+
+        let complete = parse(
+            r#"{"id":"M2","subject":"","from":null,"receivedDateTime":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let f = MessageFields::of(&complete);
+        assert!(!f.is_partial());
+        // A complete plain message writes `is_meeting_request` and
+        // `is_draft` (as 0), as `upsert_message` does.
+        assert!(f.writes_meeting_request() && f.writes_is_draft());
+
+        for key in ["receivedDateTime", "subject", "from"] {
+            let mut keys = vec![r#""id":"M3""#.to_string()];
+            for k in ["receivedDateTime", "subject", "from"] {
+                if k != key {
+                    keys.push(format!(r#""{k}":null"#));
+                }
+            }
+            let v = parse(&format!("{{{}}}", keys.join(","))).unwrap();
+            assert!(MessageFields::of(&v).is_partial(), "{key} absent");
+        }
+
+        let invite = parse(
+            r##"{"@odata.type":"#microsoft.graph.eventMessageRequest","id":"M4","isDraft":false}"##,
+        )
+        .unwrap();
+        let f = MessageFields::of(&invite);
+        assert!(f.is_partial() && f.writes_meeting_request() && f.writes_is_draft());
+        assert!(!MessageFields::all().is_partial());
+    }
+
+    #[test]
+    fn delta_page_marks_partial_items() {
+        let v = parse(r#"{
+          "value":[
+            {"id":"M1","subject":"a","from":{"emailAddress":{"name":"","address":""}},"receivedDateTime":"2026-01-01T00:00:00Z","sentDateTime":"","isRead":true,"conversationId":"","importance":"normal","bodyPreview":""},
+            {"id":"M2","isRead":true},
+            {"id":"M3"}
+          ]
+        }"#).unwrap();
+        let page = DeltaPage::from_json(&v).unwrap();
+        let partial: Vec<(&str, bool)> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                DeltaItem::Upsert(m, f) => (m.id.as_str(), f.is_partial()),
+                DeltaItem::Delete(_) => panic!("no removals here"),
+            })
+            .collect();
+        assert_eq!(partial, vec![("M1", false), ("M2", true), ("M3", true)]);
+        let DeltaItem::Upsert(m2, f2) = &page.items[1] else {
+            unreachable!()
+        };
+        assert!(m2.is_read && f2.is_read && !f2.subject);
     }
 
     #[test]
