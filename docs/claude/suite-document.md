@@ -232,11 +232,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   later are not seen. Before `init` (unit tests) every family passes through
   unchanged.
 - `font_subst::tests::every_family_reaching_gpui_is_resolved` scans
-  `suite/docxy/src` for every way of setting a family (`sets_family`:
-  `.font_family(`, `font_family` / `.family` assignments and fields, free
-  `font(` calls, `family:` in a `Font {` literal; comments ignored): each needs
-  `font_subst::` in code on its line or the two above, or an allowlist entry,
-  which names the resolver line its file must hold.
+  `suite/docxy/src` for the usual ways of setting a family (`sets_family`:
+  `.font_family(`, `font_family` / `.family` assignments and fields,
+  `.family.clone_from(`, `&mut <x>.family`, free `font(` calls, a `family`
+  field of a `Font {` literal tracked by brace depth, shorthand included;
+  comments ignored): each needs `font_subst::` in code on its line or the two
+  above, or an allowlist entry, which names the resolver line its file must
+  hold. It does not prove that a `Font` built elsewhere and passed whole
+  (gpui's `Styled::font(Font)`, a `TextRun`'s `font`) was resolved, nor that
+  the nearby `font_subst::` call resolves the value set: review those.
 - Not done: a real platform-match tier (fontconfig `FcFontMatch`, CoreText,
   DirectWrite fallback) for unknown families; the generic serif/mono lists
   stand in.
