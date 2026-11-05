@@ -479,7 +479,14 @@ Text boxes appear in `textboxes` as separate stories.
 column as last painted; `null` before it has drawn) and `tables`, one object
 per top-level body table the last frame painted (Print Layout's too):
 `block`, `width`, `left` / `right` (from the view's left), `fits_text` (at
-most `text_width`, +1 px) and `right_in_view`. A table is fitted to the
+most `text_width`, +1 px), `right_in_view` and `place` (#1922): where the
+table sits across `text_column`, `left`, `center`, `right` or `other`
+(within 2.5 px: Print Layout's band rect is 2 px narrower than the column
+its blocks draw in), `null` with no column. `text_column` is that column,
+`left` (from the view's left) and `width`: Web Layout's text column, else
+Print Layout's first page's first band; `null` before either has drawn
+(`docs/claude/suite-document.md` "Table placement by `w:jc`"). A table is
+fitted to the
 width the frame before measured, so read it after a `shot`, which waits for
 the frame after the change. The embedded view's `ext-doc-read` reports
 `scroll_x`, `max_scroll_x`, `text_width` and `table_widths` the same way

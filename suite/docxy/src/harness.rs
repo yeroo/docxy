@@ -2408,10 +2408,12 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 
 /// The document view's horizontal scroll and painted tables (#1895):
 /// `scroll_x` / `max_scroll_x` (px), `text_width` (the flow view's text
-/// column as last painted, px; `null` before Web Layout has drawn), and
-/// `tables`, each top-level table the last frame painted (`block`, `width`,
-/// its `left` / `right` edges from the view's left, px, `fits_text`,
-/// `right_in_view` and `place` across the text column (#1922):
+/// column as last painted, px; `null` before Web Layout has drawn),
+/// `text_column` (#1922: [`text_column`]'s `left` from the view's left and
+/// `width`, px; `null` before it is painted), and `tables`, each top-level
+/// table the last frame painted (`block`, `width`, its `left` / `right`
+/// edges from the view's left, px, `fits_text`, `right_in_view` and
+/// `place` across `text_column`, `null` without one:
 /// `crate::painted_tables_json`).
 fn flow_state(app: &crate::Docxy) -> Json {
     let probe = app.ruler_probe.borrow();

@@ -1,7 +1,8 @@
 # A table's w:jc places it across the text column (#1922): `center`
 # centres it, `right` puts it at the right edge, none leaves it at the
 # left, and a centred table wider than the column stays at the column's
-# left (its side margins come to 0) and scrolls sideways (#1895). `doc`'s
+# left (`table_el` gives a table that does not fit no auto margins, which
+# gpui would centre past both edges) and scrolls sideways (#1895). `doc`'s
 # `flow.tables.N.place` reads each top-level table's painted edges
 # against the text column it is drawn in: `left`, `center`, `right` or
 # `other`. The fixture's tables are fixed (dxa), so Web Layout keeps

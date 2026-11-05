@@ -41,8 +41,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   inherited through the row and reset at a `table`; none is `center`, a
   browser's middle; `baseline`, `super`, `sub` on a cell are `top` and no
   longer make the cell's runs super- or subscript). `tblPr`: `tblW`, `jc`
-  (`align=center|right`, which does not align the text inside; `align` on
-  a row aligns its cells' text), `tblCellSpacing` (half the HTML
+  (the table's float `align`, auto margins or container alignment: see
+  "HTML import centring (#1922)"; none of them aligns the text inside;
+  `align` on a row aligns its cells' text), `tblCellSpacing` (half the HTML
   `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
   `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
   `border` is 1; `0` or none writes none, the layout-table case),
@@ -83,12 +84,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   reset is undone by a later `inline`) makes the picture, or an unsized
   unresolved image's alt text, a paragraph of its own: the text before it
   ends (`begin_block_object`), and its paragraph ends at once aligned to
-  its place, `Left` with none (`end_para_with`). In a list item, the
-  paragraphs past the item's numbered one are unnumbered continuations at
-  the level's indent (`item_numbered` / `item_split`, reset at an `li`), so
-  the split adds no item; a picture opening its item carries the number.
+  its place, `Left` with none (`end_para_with`). A `</p>` right after it
+  ends only a paragraph with content (`after_block_object`), so
+  `<p><img style="display:block"></p>` leaves no empty paragraph; `<p></p>`
+  is still one. In a list item, the paragraphs past the item's numbered
+  one are unnumbered continuations at the level's indent (`Block`'s
+  `item_numbered` / `item_split` on the `li`'s own entry, `open_item`, not
+  across a cell), so the split adds no item and a nested list's items
+  leave their parent's flags alone; a picture opening its item carries the
+  number.
 - Fixed-width blocks: a `Kind::Block` with an absolute CSS `width` (not a
-  percentage or `auto`) and both side margins auto gets
+  percentage or `auto`; a negative or invalid one leaves the width
+  before it) and both side margins auto gets
   `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
   each side, after its own box is added: a content box, so its padding is
   outside the width. Its text alignment is unchanged. Not inside a cell
