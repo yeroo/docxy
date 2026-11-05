@@ -7165,4 +7165,456 @@ mod tests {
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- Folders and counts on every tick (#1886) ---
+
+    /// A folder as `/me/mailFolders` or a `childFolders` list gives it, with
+    /// its counts and `childFolderCount`.
+    fn tree_folder(
+        id: &str,
+        name: &str,
+        parent: Option<&str>,
+        counts: (i64, i64),
+        children: i64,
+    ) -> String {
+        let parent = parent.map_or("null".to_string(), |p| format!("\"{p}\""));
+        let wk = if id == "F1" { r#""inbox""# } else { "null" };
+        format!(
+            r#"{{"id":"{id}","displayName":"{name}","parentFolderId":{parent},"totalItemCount":{},"unreadItemCount":{},"childFolderCount":{children},"wellKnownName":{wk}}}"#,
+            counts.0, counts.1
+        )
+    }
+
+    fn list(folders: &[String]) -> String {
+        format!(r#"{{"value":[{}]}}"#, folders.join(","))
+    }
+
+    /// `path`'s answer for the startup pass (once), then `later` for every
+    /// pass after it.
+    fn startup_then(path: &str, startup: &str, later: &str) -> Vec<(Route, Option<usize>)> {
+        vec![
+            (get_route(path, 200, startup), Some(1)),
+            (get_route(path, 200, later), None),
+        ]
+    }
+
+    /// A folder's deltas: the startup delta holds `startup` and ends in a
+    /// link; the first incremental delta answers `next` (if any), every
+    /// later one an empty page.
+    fn deltas(id: &str, startup: &[String], next: &[String]) -> Vec<(Route, Option<usize>)> {
+        let delta = format!("/me/mailFolders/{id}/messages/delta");
+        let link = format!("{delta}?token=D-{id}");
+        let mut routes = Vec::new();
+        if !next.is_empty() {
+            routes.push((get_route(&link, 200, &delta_page(next, &link)), Some(1)));
+        }
+        routes.push((get_route(&link, 200, &delta_page(&[], &link)), None));
+        routes.push((get_route(&delta, 200, &delta_page(startup, &link)), None));
+        routes
+    }
+
+    /// The calendar a tick refreshes: empty.
+    fn calendar_route() -> (Route, Option<usize>) {
+        (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None)
+    }
+
+    fn message_json(id: &str, read: bool, flagged: bool, categories: &[&str]) -> String {
+        let flag = if flagged { "flagged" } else { "notFlagged" };
+        let cats: Vec<String> = categories.iter().map(|c| format!("\"{c}\"")).collect();
+        format!(
+            r#"{{"id":"{id}","conversationId":"C-{id}","subject":"S {id}","from":{{"emailAddress":{{"name":"Alice","address":"alice@x"}}}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"2026-07-16T10:00:00Z","isRead":{read},"flag":{{"flagStatus":"{flag}"}},"hasAttachments":false,"importance":"normal","bodyPreview":"p","categories":[{}]}}"#,
+            cats.join(",")
+        )
+    }
+
+    fn stored_folder(store: &Store, id: &str) -> Option<crate::store::FolderRow> {
+        store.folders().unwrap().into_iter().find(|f| f.id == id)
+    }
+
+    fn sorted_folder_ids(store: &Store) -> Vec<String> {
+        let mut ids: Vec<String> = store.folders().unwrap().into_iter().map(|f| f.id).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Long enough for a missed change to show, short of `ENGINE_WAIT`.
+    const TICK_WAIT: Duration = Duration::from_secs(10);
+    const TICK: Duration = Duration::from_millis(300);
+
+    #[test]
+    fn a_tick_follows_message_changes_and_folder_counts() {
+        // After startup the server marks M1 read, flags it and gives it a
+        // category, and moves M2 from F1 to F2; its folder list now has
+        // the new counts.
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas(
+            "F1",
+            &[
+                message_json("M1", false, false, &[]),
+                message_json("M2", false, false, &[]),
+            ],
+            &[
+                message_json("M1", true, true, &["Red"]),
+                r#"{"id":"M2","@removed":{"reason":"deleted"}}"#.to_string(),
+            ],
+        ));
+        routes.extend(deltas("F2", &[], &[message_json("M2", false, false, &[])]));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (2, 2), 0),
+                tree_folder("F2", "Projects", None, (0, 0), 0),
+            ]),
+            &list(&[
+                tree_folder("F1", "Inbox", None, (1, 0), 0),
+                tree_folder("F2", "Projects", None, (1, 1), 0),
+            ]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-counts", TICK, None, |_| {});
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(TICK_WAIT, || {
+                let f1 = store.messages_in_folder("F1", 50, 0).unwrap();
+                let f2 = store.messages_in_folder("F2", 50, 0).unwrap();
+                let counts =
+                    |id| stored_folder(&store, id).map(|f| (f.total_count, f.unread_count));
+                f1.len() == 1
+                    && f1[0].id == "M1"
+                    && f1[0].is_read
+                    && f1[0].is_flagged
+                    && f1[0].categories == vec!["Red".to_string()]
+                    && f2.len() == 1
+                    && f2[0].id == "M2"
+                    && counts("F1") == Some((1, 0))
+                    && counts("F2") == Some((1, 1))
+            }),
+            "folders: {:?}\nrequests: {:?}",
+            store.folders().unwrap(),
+            paths_from(&srv, 0)
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tick_follows_renamed_moved_and_created_folders() {
+        // Startup: F1 (with child C1), F2, F3. Then on the server F2 is
+        // renamed, F3 moves under F1, NEW is created at the top and NESTED
+        // under C1.
+        let mut routes = vec![calendar_route()];
+        for id in ["F1", "F2", "F3", "C1", "NEW", "NESTED"] {
+            routes.extend(deltas(id, &[], &[]));
+        }
+        routes.extend(startup_then(
+            "/me/mailFolders/F1/childFolders",
+            &list(&[tree_folder("C1", "Sub", Some("F1"), (0, 0), 0)]),
+            &list(&[
+                tree_folder("C1", "Sub", Some("F1"), (0, 0), 1),
+                tree_folder("F3", "Old place", Some("F1"), (0, 0), 0),
+            ]),
+        ));
+        routes.push((
+            get_route(
+                "/me/mailFolders/C1/childFolders",
+                200,
+                &list(&[tree_folder("NESTED", "Nested", Some("C1"), (0, 0), 0)]),
+            ),
+            None,
+        ));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 1),
+                tree_folder("F2", "Projects", None, (0, 0), 0),
+                tree_folder("F3", "Old place", None, (0, 0), 0),
+            ]),
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 2),
+                tree_folder("F2", "Projects 2026", None, (0, 0), 0),
+                tree_folder("NEW", "Fresh", None, (0, 0), 0),
+            ]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        // F2 and F3 are expanded locally before the engine starts.
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-tree", TICK, None, |s| {
+            for (id, name) in [("F2", "Projects"), ("F3", "Old place")] {
+                s.upsert_folder(&crate::graph::model::MailFolder {
+                    id: id.into(),
+                    display_name: name.into(),
+                    parent_id: None,
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: None,
+                })
+                .unwrap();
+                s.set_folder_expanded(id, true).unwrap();
+            }
+        });
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(TICK_WAIT, || {
+                let f2 = stored_folder(&store, "F2");
+                let f3 = stored_folder(&store, "F3");
+                let new = stored_folder(&store, "NEW");
+                let nested = stored_folder(&store, "NESTED");
+                f2.is_some_and(|f| f.display_name == "Projects 2026" && f.is_expanded)
+                    && f3.is_some_and(|f| f.parent_id.as_deref() == Some("F1") && f.is_expanded)
+                    && new.is_some_and(|f| f.parent_id.is_none() && f.display_name == "Fresh")
+                    && nested.is_some_and(|f| f.parent_id.as_deref() == Some("C1"))
+            }),
+            "folders: {:?}\nrequests: {:?}",
+            store.folders().unwrap(),
+            paths_from(&srv, 0)
+        );
+        // At startup C1 said it had no children (`childFolderCount: 0`),
+        // so the startup pass did not ask for them; the tick, where it says
+        // it has one, did.
+        let paths = paths_from(&srv, 0);
+        let second_list = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| is_folder_list(p))
+            .nth(1)
+            .map(|(i, _)| i)
+            .unwrap();
+        let is_c1_children = |p: &String| p.starts_with("/me/mailFolders/C1/childFolders");
+        assert!(
+            !paths[..second_list].iter().any(is_c1_children),
+            "{paths:?}"
+        );
+        assert!(paths[second_list..].iter().any(is_c1_children), "{paths:?}");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tick_removes_a_folder_deleted_on_the_server_with_its_child() {
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.extend(deltas(
+            "GONE",
+            &[message_json("G1", false, false, &[])],
+            &[],
+        ));
+        routes.extend(deltas("KID", &[message_json("G2", false, false, &[])], &[]));
+        routes.push((
+            get_route(
+                "/me/mailFolders/GONE/childFolders",
+                200,
+                &list(&[tree_folder("KID", "Kid", Some("GONE"), (1, 1), 0)]),
+            ),
+            None,
+        ));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 0),
+                tree_folder("GONE", "Old", None, (1, 1), 1),
+            ]),
+            &list(&[tree_folder("F1", "Inbox", None, (0, 0), 0)]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-delete", TICK, None, |_| {});
+        let store = Store::open(&store_path).unwrap();
+        // The startup pass stores both folders and their messages.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        // Two ticks after startup.
+        assert!(wait_until(TICK_WAIT, || count(&srv, is_folder_list) >= 3));
+        assert_eq!(sorted_folder_ids(&store), vec!["F1"]);
+        assert!(store.search("S G1", 10).unwrap().is_empty());
+        assert!(store.search("S G2", 10).unwrap().is_empty());
+        let n: usize = ["GONE", "KID"]
+            .iter()
+            .map(|id| store.messages_in_folder(id, 50, 0).unwrap().len())
+            .sum();
+        assert_eq!(n, 0);
+        // Their startup deltas only: none on the tick that removed them,
+        // none after.
+        assert_eq!(count(&srv, |p| is_delta(p, "GONE")), 1);
+        assert_eq!(count(&srv, |p| is_delta(p, "KID")), 1);
+        let errors: Vec<SyncEvent> = handle
+            .evt_rx
+            .try_iter()
+            .filter(|e| matches!(e, SyncEvent::Error(_)))
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_later_folder_page_removes_nothing() {
+        // After startup the list's second page answers 500: the tick
+        // neither renames F1 (its first page) nor removes F2.
+        let mut routes = vec![
+            calendar_route(),
+            (
+                get_route("/me/mailFolders?$top=100&$skiptoken=P2", 500, "boom"),
+                None,
+            ),
+        ];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.extend(deltas("F2", &[], &[]));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 0),
+                tree_folder("F2", "Projects", None, (0, 0), 0),
+            ]),
+            &format!(
+                r#"{{"value":[{}],"@odata.nextLink":"/me/mailFolders?$top=100&$skiptoken=P2"}}"#,
+                tree_folder("F1", "Renamed", None, (0, 0), 0)
+            ),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-page-500", TICK, None, |_| {});
+        let store = Store::open(&store_path).unwrap();
+        // Two ticks that failed on the second page.
+        assert!(wait_until(TICK_WAIT, || count(&srv, |p| p
+            .contains("skiptoken=P2"))
+            >= 2));
+        assert_eq!(sorted_folder_ids(&store), vec!["F1", "F2"]);
+        assert_eq!(stored_folder(&store, "F1").unwrap().display_name, "Inbox");
+        // The folders still sync.
+        assert!(count(&srv, |p| is_delta(p, "F2")) >= 2);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_child_folders_call_removes_nothing() {
+        // After startup F1's childFolders answers 500 and the top list no
+        // longer has F2: the listing is incomplete, so neither C1 (unseen)
+        // nor F2 (gone) is removed, and F1's new name is still stored.
+        let mut routes = vec![calendar_route()];
+        for id in ["F1", "F2", "C1"] {
+            routes.extend(deltas(id, &[], &[]));
+        }
+        routes.push((
+            get_route(
+                "/me/mailFolders/F1/childFolders",
+                200,
+                &list(&[tree_folder("C1", "Sub", Some("F1"), (0, 0), 0)]),
+            ),
+            Some(1),
+        ));
+        routes.push((
+            get_route("/me/mailFolders/F1/childFolders", 500, "boom"),
+            None,
+        ));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 1),
+                tree_folder("F2", "Projects", None, (0, 0), 0),
+            ]),
+            &list(&[tree_folder("F1", "Renamed", None, (0, 0), 1)]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-child-500", TICK, None, |_| {});
+        let store = Store::open(&store_path).unwrap();
+        assert!(wait_until(TICK_WAIT, || count(&srv, is_folder_list) >= 3));
+        assert_eq!(sorted_folder_ids(&store), vec!["C1", "F1", "F2"]);
+        assert_eq!(stored_folder(&store, "F1").unwrap().display_name, "Renamed");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_folder_list_removes_nothing() {
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[tree_folder("F1", "Inbox", None, (0, 0), 0)]),
+            &list(&[]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-empty", TICK, None, |_| {});
+        let store = Store::open(&store_path).unwrap();
+        assert!(wait_until(TICK_WAIT, || count(&srv, is_folder_list) >= 3));
+        assert_eq!(sorted_folder_ids(&store), vec!["F1"]);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_drafts_sentinel_survives_an_enumeration_that_does_not_list_it() {
+        // A draft made before any folder synced sits under the sentinel.
+        // The startup enumeration lists no Drafts: the sentinel stays with
+        // the draft. A later one (Refresh) lists Drafts: the draft is
+        // adopted and the empty sentinel goes.
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.extend(deltas("DRAFTS", &[], &[]));
+        let mut drafts = tree_folder("DRAFTS", "Drafts", None, (0, 0), 0);
+        drafts = drafts.replace(r#""wellKnownName":null"#, r#""wellKnownName":"drafts""#);
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[tree_folder("F1", "Inbox", None, (0, 0), 0)]),
+            &list(&[tree_folder("F1", "Inbox", None, (0, 0), 0), drafts]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let mut draft_id = String::new();
+        let (handle, store_path, dir) = spawn_fast(&srv, "tick-sentinel", HOUR, None, |s| {
+            draft_id = s.create_local_draft("Hi", "", "", "<p>x</p>").unwrap();
+        });
+        let store = Store::open(&store_path).unwrap();
+        let sentinel = store.drafts_folder_id().unwrap();
+        assert_eq!(sentinel, "local:drafts-pending");
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert_eq!(sorted_folder_ids(&store), vec!["F1", sentinel.as_str()]);
+        assert_eq!(
+            store.messages_in_folder(&sentinel, 50, 0).unwrap()[0].id,
+            draft_id
+        );
+
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(TICK_WAIT, || sorted_folder_ids(&store)
+                == vec!["DRAFTS", "F1"]),
+            "{:?}",
+            store.folders().unwrap()
+        );
+        assert_eq!(
+            store.messages_in_folder("DRAFTS", 50, 0).unwrap()[0].id,
+            draft_id
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tick_with_no_folder_change_emits_no_folders_updated() {
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.push((
+            get_route(
+                "/me/mailFolders?",
+                200,
+                &list(&[tree_folder("F1", "Inbox", None, (3, 1), 0)]),
+            ),
+            None,
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, _store_path, dir) = spawn_fast(&srv, "tick-quiet", TICK, None, |_| {});
+        // The startup pass emits it.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        // By the fourth list, the second and third passes have emitted
+        // whatever they would.
+        assert!(wait_until(TICK_WAIT, || count(&srv, is_folder_list) >= 4));
+        let events: Vec<SyncEvent> = handle.evt_rx.try_iter().collect();
+        assert!(!events.contains(&SyncEvent::FoldersUpdated), "{events:?}");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
