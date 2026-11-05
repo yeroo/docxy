@@ -1112,18 +1112,23 @@ impl Store {
     /// and a body is fetched once per format, not on every open. Use
     /// [`Store::get_body`] to show whatever is stored meanwhile.
     ///
-    /// A body satisfies `format` unless it was asked for in the other one.
-    /// What it was asked for is `fetched_as` when `FetchBody` recorded it;
-    /// otherwise (`NULL`) a text body counts as asked for text, since an
-    /// engine from before the column always asked for text, and an html
-    /// body (a draft written locally, or by `createReply`) as asked for
-    /// neither, so it satisfies both. So a plain-text message fetched under
-    /// `Html` (its native body is text) satisfies `Html` and is not fetched
-    /// again. One edge: a `createReply` draft of a plain-text message comes
-    /// back as text and is stored with no format, so under `Html` it reads
-    /// as asked for text and is fetched once more, natively (the same text);
-    /// compose edits are stored as html (`update_draft_fields`), so they
-    /// are never invited to be overwritten.
+    /// A body `FetchBody` recorded (`fetched_as`) satisfies the format it
+    /// was asked in, so a plain-text message fetched under `Html` (its
+    /// native body is text) satisfies `Html` and is not fetched again. A
+    /// body with no recorded format (`NULL`) satisfies both when it is html,
+    /// or a draft's (below), and otherwise counts as asked for text: an
+    /// engine from before the column always asked for text.
+    ///
+    /// A draft's body with no recorded format is a local write (compose,
+    /// `createReply`), never a refetch candidate: a `FetchBody` over it
+    /// would replace unsynced edits, which a queued `SaveDraft` then pushes
+    /// back as Graph's old body. That covers a `createReply` draft of a
+    /// plain-text message (stored as text) and a draft an older build's
+    /// `update_draft_fields` left as html content under `content_type =
+    /// 'text'`. A draft is a message marked `is_draft` or filed in the
+    /// Drafts folder (the synced one, or the local sentinel): a complete
+    /// delta item resets `is_draft` to 0, as `isDraft` is not in
+    /// `MESSAGE_SELECT`, so the flag alone would not last past a sync.
     pub fn get_body_for(
         &self,
         message_id: &str,
@@ -1132,8 +1137,13 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT content_type, content, fetched_as FROM bodies WHERE message_id = ?1",
-                params![message_id],
+                "SELECT b.content_type, b.content, b.fetched_as,
+                        COALESCE(m.is_draft = 1 OR f.well_known_name = 'drafts' OR m.folder_id = ?2, 0)
+                 FROM bodies b
+                 LEFT JOIN messages m ON m.id = b.message_id
+                 LEFT JOIN folders f ON f.id = m.folder_id
+                 WHERE b.message_id = ?1",
+                params![message_id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
                 |row| {
                     Ok((
                         Body {
@@ -1141,6 +1151,7 @@ impl Store {
                             content: row.get(1)?,
                         },
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
@@ -1152,13 +1163,17 @@ impl Store {
                     Err(e)
                 }
             })?;
-        let Some((body, fetched_as)) = row else {
+        let Some((body, fetched_as, draft)) = row else {
             return Ok(None);
         };
         let satisfies = match fetched_as.as_deref() {
             // A value this build does not know is not `format`: refetch.
             Some(asked) => BodyFormat::parse(asked) == Some(format),
-            None => body.content_type.eq_ignore_ascii_case("html") || format == BodyFormat::Text,
+            None => {
+                draft
+                    || body.content_type.eq_ignore_ascii_case("html")
+                    || format == BodyFormat::Text
+            }
         };
         Ok(satisfies.then_some(body))
     }
@@ -4435,7 +4450,52 @@ mod local_id_tests {
         assert_eq!(s.draft(&local).unwrap().unwrap().0.subject, "From Graph");
     }
 
-    // --- Body format (#1901) ------------------------------------------------
+    #[test]
+    fn a_database_from_before_local_id_is_migrated() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-local-id-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let local = {
+            let s = Store::open(&path).unwrap();
+            let local = s.create_local_draft("Old", "", "", "body").unwrap();
+            // Take the database back to before the column existed.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_local_id;
+                     ALTER TABLE messages DROP COLUMN local_id;",
+                )
+                .unwrap();
+            local
+        };
+        let s = Store::open(&path).unwrap();
+        let has_index: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_local_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+        s.reconcile_id(&local, "G").unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        assert_eq!(s.draft(&local).unwrap().unwrap().0.id, "G");
+        drop(s);
+        // Opening again (column and index already there) is fine.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod body_format_tests {
+    use super::*;
 
     fn text_body(content: &str) -> Body {
         Body {
@@ -4451,13 +4511,26 @@ mod local_id_tests {
         }
     }
 
-    /// A store holding one message `M` (in Drafts, so `update_draft_fields`
-    /// reaches it), for bodies to hang off.
+    /// A store holding one Inbox message `M`, not a draft, for bodies to
+    /// hang off.
     fn store_with_message() -> Store {
         let s = Store::open_in_memory().unwrap();
-        let folder = s.drafts_folder_id().unwrap();
-        let m = Message {
-            id: "M".into(),
+        s.upsert_folder(&MailFolder {
+            id: "INBOX".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.upsert_message("INBOX", &message("M", false)).unwrap();
+        s
+    }
+
+    fn message(id: &str, is_draft: bool) -> Message {
+        Message {
+            id: id.into(),
             conversation_id: String::new(),
             subject: "S".into(),
             from: Recipient::default(),
@@ -4470,12 +4543,10 @@ mod local_id_tests {
             has_attachments: false,
             importance: "normal".into(),
             preview: String::new(),
-            is_draft: false,
+            is_draft,
             is_meeting_request: false,
             categories: Vec::new(),
-        };
-        s.upsert_message(&folder, &m).unwrap();
-        s
+        }
     }
 
     fn satisfies(s: &Store, id: &str) -> (bool, bool) {
@@ -4568,6 +4639,11 @@ mod local_id_tests {
         let s = store_with_message();
         s.put_fetched_body("M", &text_body("server text"), BodyFormat::Text)
             .unwrap();
+        // Recorded as a text fetch, the strict rule holds even for a draft.
+        s.conn
+            .execute("UPDATE messages SET is_draft = 1 WHERE id = 'M'", [])
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
         s.update_draft_fields("M", "S", "", "", "", "<p>my edit</p>")
             .unwrap();
         let b = s.get_body_for("M", BodyFormat::Html).unwrap().unwrap();
@@ -4595,18 +4671,22 @@ mod local_id_tests {
         let path = dir.join("mail.db");
         let id = {
             let s = Store::open(&path).unwrap();
-            let id = s.create_local_draft("Old", "", "", "body").unwrap();
-            s.conn
-                .execute(
-                    "UPDATE bodies SET content_type = 'text' WHERE message_id = ?1",
-                    params![id],
-                )
-                .unwrap();
+            s.upsert_folder(&MailFolder {
+                id: "INBOX".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            s.upsert_message("INBOX", &message("M", false)).unwrap();
+            s.put_body("M", &text_body("old")).unwrap();
             // Take the database back to before the column existed.
             s.conn
                 .execute_batch("ALTER TABLE bodies DROP COLUMN fetched_as;")
                 .unwrap();
-            id
+            "M".to_string()
         };
         let s = Store::open(&path).unwrap();
         // The old row reads as an older engine's text fetch.
@@ -4622,45 +4702,54 @@ mod local_id_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Drafts folder as Graph syncs it.
+    fn synced_drafts(s: &Store) {
+        s.upsert_folder(&MailFolder {
+            id: "DRAFTS".into(),
+            display_name: "Drafts".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("drafts".into()),
+        })
+        .unwrap();
+    }
+
     #[test]
-    fn a_database_from_before_local_id_is_migrated() {
-        let dir = std::env::temp_dir().join(format!(
-            "lookxy-store-local-id-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mail.db");
-        let local = {
-            let s = Store::open(&path).unwrap();
-            let local = s.create_local_draft("Old", "", "", "body").unwrap();
-            // Take the database back to before the column existed.
-            s.conn
-                .execute_batch(
-                    "DROP INDEX idx_messages_local_id;
-                     ALTER TABLE messages DROP COLUMN local_id;",
-                )
-                .unwrap();
-            local
-        };
-        let s = Store::open(&path).unwrap();
-        let has_index: i64 = s
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_local_id'",
+    fn a_legacy_edited_draft_is_never_a_refetch_candidate() {
+        // An older build's `update_draft_fields` kept `content_type = 'text'`
+        // under the html it wrote: a FetchBody over it would lose the edit.
+        let s = store_with_message();
+        synced_drafts(&s);
+        s.upsert_message("DRAFTS", &message("D", true)).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO bodies (message_id, content_type, content)
+                 VALUES ('D', 'text', '<p>unsynced edit</p>')",
                 [],
-                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(has_index, 1);
-        s.reconcile_id(&local, "G").unwrap();
-        assert_eq!(s.current_id(&local).unwrap(), "G");
-        assert_eq!(s.draft(&local).unwrap().unwrap().0.id, "G");
-        drop(s);
-        // Opening again (column and index already there) is fine.
-        let s = Store::open(&path).unwrap();
-        assert_eq!(s.current_id(&local).unwrap(), "G");
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(satisfies(&s, "D"), (true, true));
+        // A complete delta item writes `is_draft = 0` (`isDraft` is not
+        // selected): the Drafts folder still says it is a draft.
+        s.upsert_message("DRAFTS", &message("D", false)).unwrap();
+        assert_eq!(satisfies(&s, "D"), (true, true));
+        // A message elsewhere with the same body still upgrades.
+        s.put_body("M", &text_body("old")).unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
+    }
+
+    #[test]
+    fn a_draft_under_the_local_sentinel_is_a_draft() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("S", "", "", "").unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET is_draft = 0 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        s.put_body(&id, &text_body("t")).unwrap();
+        assert_eq!(satisfies(&s, &id), (true, true));
     }
 }

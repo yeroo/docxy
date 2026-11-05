@@ -4154,6 +4154,68 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_text_reply_draft_is_not_a_refetch_candidate() {
+        // `createReply` of a plain-text message comes back as text, stored
+        // with no fetch format; a FetchBody over the draft compose just
+        // opened would lose the user's edits. The response here carries no
+        // `isDraft` (so `is_draft` is 0, as a later complete delta item
+        // leaves it anyway): the Drafts folder is what marks it a draft.
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-reply-draft",
+            vec![
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/M1/createReply".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: r#"{"id":"DRAFT1","conversationId":"C1","subject":"Re: Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":""}"#.into(),
+                },
+                get_route(
+                    "/me/messages/DRAFT1?$select=body",
+                    200,
+                    r#"{"body":{"contentType":"text","content":"> quoted"}}"#,
+                ),
+            ],
+            html_options(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: false,
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT1"),
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        assert!(!store.draft("DRAFT1").unwrap().unwrap().0.is_draft);
+        let body = store
+            .get_body_for("DRAFT1", BodyFormat::Html)
+            .unwrap()
+            .expect("a reply draft's body satisfies Html");
+        assert_eq!(body.content_type, "text");
+        assert_eq!(body.content, "> quoted");
+        assert!(
+            store
+                .get_body_for("DRAFT1", BodyFormat::Text)
+                .unwrap()
+                .is_some()
+        );
+        let draft_gets = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/me/messages/DRAFT1"))
+            .count();
+        assert_eq!(draft_gets, 1, "only store_composed_draft's own GET");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_html_engine_stores_inline_attachments_content_id() {
         let (_srv, handle, store_path, dir) = body_engine(
             "body-inline",

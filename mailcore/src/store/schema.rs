@@ -70,9 +70,9 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 
 -- `fetched_as` is the format `FetchBody` asked Graph for (`text`/`html`,
--- #1901); NULL for a body written locally (drafts, createReply) or by an
--- engine from before the column (which always asked for text). See
--- `Store::get_body_for`.
+-- #1901); NULL for a body written locally (drafts, createReply), which
+-- `Store::get_body_for` never offers for a refetch, or by an engine from
+-- before the column (which always asked for text).
 CREATE TABLE IF NOT EXISTS bodies (
     message_id   TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
     content_type TEXT NOT NULL DEFAULT '',
