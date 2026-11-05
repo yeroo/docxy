@@ -93,11 +93,14 @@ CREATE TABLE IF NOT EXISTS attachments (
     PRIMARY KEY (message_id, id)
 );
 
+-- `uploaded` is 1 once a send put the file on the Graph draft (#1874), so a
+-- resend after a failed send does not attach it twice.
 CREATE TABLE IF NOT EXISTS outbound_attachments (
     draft_id  TEXT NOT NULL,
     path      TEXT NOT NULL,
     name      TEXT NOT NULL,
     size      INTEGER NOT NULL DEFAULT 0,
+    uploaded  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (draft_id, path)
 );
 
