@@ -246,6 +246,39 @@ impl Body {
     }
 }
 
+/// Which body format the sync engine asks Graph for on a `FetchBody`
+/// (#1901). `Text` sends `Prefer: outlook.body-content-type="text"`, so
+/// every body comes back as plain text (lookxy, a terminal client). `Html`
+/// sends no `Prefer`, so each body comes back in its *native* format: html
+/// for an html message, but still text for a plain-text one. That is why
+/// the store records the format a body was asked for (`bodies.fetched_as`),
+/// not just the content type it came back as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BodyFormat {
+    #[default]
+    Text,
+    Html,
+}
+
+impl BodyFormat {
+    /// The value stored in `bodies.fetched_as`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BodyFormat::Text => "text",
+            BodyFormat::Html => "html",
+        }
+    }
+
+    /// The inverse of [`BodyFormat::as_str`]; `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "text" => Some(BodyFormat::Text),
+            "html" => Some(BodyFormat::Html),
+            _ => None,
+        }
+    }
+}
+
 /// Which Graph attachment kind this is (`@odata.type`). Determines what the
 /// UI does on save: `File` downloads its `contentBytes`; `Item` downloads its
 /// `/$value` MIME (`.eml`/`.ics`); `Reference` opens `source_url`.
