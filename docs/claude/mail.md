@@ -119,3 +119,62 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   later delta: a Drafts delta that still reports a sent draft (an upsert,
   which re-files the row under Drafts) is undone by re-filing the ids this
   drain sent under Sent Items again, until the `@removed` deletes the row.
+
+## Folders and counts on every tick (#1886)
+
+- Every sync pass lists the folder tree (`sync_pass(full)` always calls
+  `sync_folders`). `full` (startup, `Refresh`, sign-in, a pass that
+  `needs_full_pass`) only adds people and master categories, and a
+  `FoldersUpdated` after every successful list. A normal tick emits
+  `FoldersUpdated` only when a folder row was added, changed
+  (`Store::upsert_folder` returns whether it did) or removed. Fast ticks
+  never list. Names, parents, new folders and counts follow the server
+  within one tick. A count changed by an op this pass drains shows a tick
+  later: the list runs before the drain.
+- Why not `GET /me/mailFolders/delta`: it would need its own delta link,
+  410 reset and quarantine handling, and it is not clear that it reports
+  a count change. `list_folders` stays cheap instead. It skips a folder's
+  `childFolders` call when the listing says `childFolderCount: 0` (asked
+  when the property is absent). A new child bumps its parent's count in the
+  same listing, so the child is still found in one tick. Every list
+  (top level and `childFolders`) follows `@odata.nextLink`.
+- `list_folders` returns a `FolderListing { folders, complete }`. An error
+  on a top-level page propagates (nothing is upserted). `Unauthorized` and
+  `Throttled` on a `childFolders` page propagate too. Any other
+  `childFolders` error (a 404 for a folder deleted between the two calls,
+  a 5xx) keeps what was listed and sets `complete = false`, as does a
+  listed folder without an id (dropped, never upserted as `""`).
+- The walk is many requests, not a snapshot. A folder moved during it (into
+  a parent already read, e.g. a soft delete into Deleted Items, or past an
+  offset `nextLink`) is in no page, yet the listing says complete. So after
+  a complete, non-empty listing, each stored folder missing from it (but
+  never the drafts sentinel) is first asked for
+  (`GraphClient::folder_exists`: `GET /me/mailFolders/{id}?$select=id`,
+  `Engine::folders_to_keep`). Only a 404 lets it go. One that exists, or
+  whose GET fails non-fatally, is kept for the next tick to list. A fatal
+  failure (auth, throttle, transport) keeps every unconfirmed folder and
+  stops the pass. A child of a deleted parent gets its own 404. This costs
+  one GET per missing folder, only when one is missing.
+- Then `Store::retain_folders` removes every folder not kept, in one
+  IMMEDIATE transaction. Messages go
+  by `ON DELETE CASCADE` (bodies, attachments, FTS rows), and delta links
+  go with the row. Removal runs before the pass's deltas, so a deleted
+  folder never gets a delta (no 404 `Error`). An incomplete or empty
+  listing removes nothing and waits for the next tick. `sort_order`,
+  `is_expanded` and `delta_link` are never written by `upsert_folder`, so
+  they survive a rename or move. Deleting a folder in Outlook or OWA moves
+  it under Deleted Items (same id, a re-parent). Only a hard delete
+  removes it.
+- The drafts sentinel (`local:drafts-pending`) is never listed by Graph.
+  It is removed only once it holds no message, by a statement that checks
+  that itself. `create_local_draft` resolves its folder (`drafts_folder_id_on`)
+  inside its own IMMEDIATE transaction, so `retain_folders` runs wholly
+  before it or after it. It never runs between the sentinel's insert and
+  the draft's, which would fail the draft's foreign key. The engine's own
+  `drafts_folder_id` caller is on the sync thread, so it cannot race the
+  removal.
+- A non-fatal list failure (a 403, or a 5xx other than 503, on
+  `/me/mailFolders`) now surfaces an `Error` on every normal tick through
+  `react`. The pass carries on with the stored folders. 429 and 503 are
+  throttles: the pass stops and backs off, as auth and transport failures
+  abort it.

@@ -32,6 +32,17 @@ impl MailFolder {
     }
 }
 
+/// The whole folder tree, as `GraphClient::list_folders` enumerated it
+/// (#1886). `complete` is false when part of it could not be listed (a
+/// `childFolders` call that failed, a listed folder without an id): the
+/// folders that were listed are still here, but a folder missing from
+/// them may still exist, so the sync engine removes nothing after it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderListing {
+    pub folders: Vec<MailFolder>,
+    pub complete: bool,
+}
+
 /// An email address with an optional display name, as Graph's
 /// `emailAddress` object.
 #[derive(Debug, Clone, PartialEq, Default)]

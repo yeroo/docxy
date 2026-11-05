@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, Row, TransactionBehavior, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, MailFolder, MasterCategory,
@@ -641,9 +641,13 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// Inserts or updates a folder row by `id`.
-    pub fn upsert_folder(&self, f: &MailFolder) -> Result<(), StoreError> {
-        self.conn.execute(
+    /// Inserts or updates a folder row by `id`: its parent, name, counts and
+    /// well-known name. Its local state (`sort_order`, `is_expanded`) and
+    /// `delta_link` are left as they are, so a folder renamed or moved on
+    /// the server keeps them (#1886). True when the row was inserted or one
+    /// of those columns changed; false when it already had these values.
+    pub fn upsert_folder(&self, f: &MailFolder) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
             "INSERT INTO folders (id, parent_id, display_name, total_count, unread_count, well_known_name)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
@@ -651,7 +655,12 @@ impl Store {
                  display_name = excluded.display_name,
                  total_count = excluded.total_count,
                  unread_count = excluded.unread_count,
-                 well_known_name = excluded.well_known_name",
+                 well_known_name = excluded.well_known_name
+             WHERE parent_id IS NOT excluded.parent_id
+                OR display_name IS NOT excluded.display_name
+                OR total_count IS NOT excluded.total_count
+                OR unread_count IS NOT excluded.unread_count
+                OR well_known_name IS NOT excluded.well_known_name",
             params![
                 f.id,
                 f.parent_id,
@@ -661,7 +670,35 @@ impl Store {
                 f.well_known_name,
             ],
         )?;
-        Ok(())
+        Ok(changed > 0)
+    }
+
+    /// Removes every folder whose id is not in `keep`: the folders a
+    /// *complete* enumeration no longer lists, deleted on the server
+    /// (#1886). Their messages go with them (`ON DELETE CASCADE`, and so
+    /// their bodies, attachments and search rows), and so do their delta
+    /// links, which live on the folder row. The local drafts sentinel
+    /// (`drafts_folder_id`) is never listed by Graph: it is removed only
+    /// once it holds no message (its drafts adopted into the real Drafts
+    /// folder), in the same statement that checks it, so a draft
+    /// `create_local_draft` files there is never lost. One IMMEDIATE
+    /// transaction. Returns how many folder rows were removed.
+    pub fn retain_folders(&self, keep: &[String]) -> Result<usize, StoreError> {
+        let keep_json =
+            Value::Array(keep.iter().map(|id| Value::Str(id.clone())).collect()).to_string();
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut removed = tx.execute(
+            "DELETE FROM folders
+             WHERE id <> ?2 AND id NOT IN (SELECT value FROM json_each(?1))",
+            params![keep_json, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+        )?;
+        removed += tx.execute(
+            "DELETE FROM folders
+             WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE folder_id = ?1)",
+            params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+        )?;
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Sets one folder's `total_count`/`unread_count`, as one folder's
@@ -1236,8 +1273,13 @@ impl Store {
         body_html: &str,
     ) -> Result<String, StoreError> {
         let id = local_draft_id();
-        let folder_id = self.drafts_folder_id()?;
-        let tx = self.conn.unchecked_transaction()?;
+        // The folder is resolved inside the write (IMMEDIATE), so the sync
+        // thread's `retain_folders` runs wholly before it (the sentinel is
+        // not there yet, or Drafts is) or after it (the sentinel holds this
+        // draft and is kept), never between the sentinel's insert and the
+        // draft's (#1886).
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let folder_id = drafts_folder_id_on(&tx)?;
         tx.execute(
             "INSERT INTO messages (
                  id, folder_id, conversation_id, subject, from_name, from_addr,
@@ -1483,24 +1525,7 @@ impl Store {
     /// reply/forward draft fetched from Graph, so both call sites agree on
     /// where "the Drafts folder" is instead of duplicating this logic.
     pub(crate) fn drafts_folder_id(&self) -> Result<String, StoreError> {
-        let existing = self.conn.query_row(
-            "SELECT id FROM folders WHERE well_known_name = 'drafts' LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        );
-        match existing {
-            Ok(id) => Ok(id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO folders
-                         (id, parent_id, display_name, total_count, unread_count, well_known_name)
-                     VALUES (?1, NULL, 'Drafts', 0, 0, NULL)",
-                    params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
-                )?;
-                Ok(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string())
-            }
-            Err(e) => Err(e.into()),
-        }
+        drafts_folder_id_on(&self.conn)
     }
 
     /// Re-files every message still sitting under the local drafts sentinel
@@ -2292,10 +2317,33 @@ impl Store {
     }
 }
 
+/// `Store::drafts_folder_id` on `conn`, which `create_local_draft` passes
+/// its transaction as.
+fn drafts_folder_id_on(conn: &Connection) -> Result<String, StoreError> {
+    let existing = conn.query_row(
+        "SELECT id FROM folders WHERE well_known_name = 'drafts' LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    match existing {
+        Ok(id) => Ok(id),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            conn.execute(
+                "INSERT OR IGNORE INTO folders
+                     (id, parent_id, display_name, total_count, unread_count, well_known_name)
+                 VALUES (?1, NULL, 'Drafts', 0, 0, NULL)",
+                params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+            )?;
+            Ok(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The local `folders.id` a new draft is filed under when the real Drafts
 /// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
 /// See `Store::drafts_folder_id`.
-const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
+pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
@@ -4800,5 +4848,200 @@ mod body_format_tests {
             .unwrap();
         s.put_body(&id, &text_body("t")).unwrap();
         assert_eq!(satisfies(&s, &id), (true, true));
+    }
+}
+
+/// Folders the server renamed, moved or deleted (#1886).
+#[cfg(test)]
+mod folder_retain_tests {
+    use super::*;
+    use crate::graph::model::{Body, MailFolder, Message, Recipient};
+
+    fn msg(id: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: "C".into(),
+            subject: format!("s{id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: format!("2026-07-{id}T00:00:00Z"),
+            sent: "".into(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: Vec::new(),
+        }
+    }
+
+    fn folder(id: &str, parent: Option<&str>, name: &str, total: i64, unread: i64) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: name.into(),
+            parent_id: parent.map(str::to_string),
+            total_count: total,
+            unread_count: unread,
+            well_known_name: None,
+        }
+    }
+
+    fn folder_ids(s: &Store) -> Vec<String> {
+        let mut ids: Vec<String> = s.folders().unwrap().into_iter().map(|f| f.id).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn upsert_folder_reports_whether_the_row_changed() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(
+            s.upsert_folder(&folder("F", None, "A", 1, 0)).unwrap(),
+            "inserted"
+        );
+        assert!(
+            !s.upsert_folder(&folder("F", None, "A", 1, 0)).unwrap(),
+            "same"
+        );
+        assert!(
+            s.upsert_folder(&folder("F", None, "B", 1, 0)).unwrap(),
+            "renamed"
+        );
+        assert!(
+            s.upsert_folder(&folder("F", None, "B", 2, 0)).unwrap(),
+            "total"
+        );
+        assert!(
+            s.upsert_folder(&folder("F", None, "B", 2, 1)).unwrap(),
+            "unread"
+        );
+        assert!(
+            s.upsert_folder(&folder("F", Some("P"), "B", 2, 1)).unwrap(),
+            "moved"
+        );
+        let mut wk = folder("F", Some("P"), "B", 2, 1);
+        wk.well_known_name = Some("inbox".into());
+        assert!(s.upsert_folder(&wk).unwrap(), "well-known name");
+        assert!(!s.upsert_folder(&wk).unwrap(), "same again");
+    }
+
+    #[test]
+    fn upsert_folder_keeps_local_state_across_a_rename_and_a_move() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&folder("F", None, "Old", 0, 0)).unwrap();
+        s.set_folder_expanded("F", true).unwrap();
+        s.conn
+            .execute("UPDATE folders SET sort_order = 7 WHERE id = 'F'", [])
+            .unwrap();
+        s.set_delta_link("F", "LINK").unwrap();
+
+        s.upsert_folder(&folder("F", Some("P"), "New", 3, 1))
+            .unwrap();
+        let f = s
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == "F")
+            .unwrap();
+        assert_eq!(f.display_name, "New");
+        assert_eq!(f.parent_id.as_deref(), Some("P"));
+        assert_eq!((f.total_count, f.unread_count), (3, 1));
+        assert!(f.is_expanded);
+        assert_eq!(f.sort_order, Some(7));
+        assert_eq!(f.delta_link.as_deref(), Some("LINK"));
+    }
+
+    #[test]
+    fn retain_folders_drops_unlisted_folders_with_their_messages() {
+        let s = Store::open_in_memory().unwrap();
+        for id in ["KEEP", "GONE", "GONE_CHILD"] {
+            s.upsert_folder(&folder(id, None, id, 0, 0)).unwrap();
+            s.set_delta_link(id, "LINK").unwrap();
+        }
+        s.upsert_message("KEEP", &msg("11")).unwrap();
+        s.upsert_message("GONE", &msg("12")).unwrap();
+        s.upsert_message("GONE_CHILD", &msg("13")).unwrap();
+        s.put_body(
+            "12",
+            &Body {
+                content_type: "text".into(),
+                content: "zanzibar".into(),
+            },
+        )
+        .unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO attachments (id, message_id, name) VALUES ('A1', '12', 'a.txt')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.search("zanzibar", 10).unwrap().len(), 1);
+
+        let removed = s.retain_folders(&["KEEP".to_string()]).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(folder_ids(&s), vec!["KEEP"]);
+        assert_eq!(s.messages_in_folder("KEEP", 50, 0).unwrap()[0].id, "11");
+        for table in ["messages", "bodies", "attachments"] {
+            let col = if table == "messages" {
+                "id"
+            } else {
+                "message_id"
+            };
+            let n: i64 = s
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {col} IN ('12', '13')"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
+        assert!(s.search("zanzibar", 10).unwrap().is_empty());
+        assert!(s.search("s12", 10).unwrap().is_empty());
+        assert_eq!(s.search("s11", 10).unwrap().len(), 1);
+
+        assert_eq!(
+            s.retain_folders(&["KEEP".to_string()]).unwrap(),
+            0,
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn retain_folders_keeps_the_drafts_sentinel_while_it_holds_a_draft() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&folder("INBOX", None, "Inbox", 0, 0))
+            .unwrap();
+        // No Drafts row: the draft lands under the sentinel.
+        let id = s.create_local_draft("Hi", "", "", "<p>x</p>").unwrap();
+        assert_eq!(
+            s.messages_in_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, 50, 0)
+                .unwrap()[0]
+                .id,
+            id
+        );
+
+        assert_eq!(s.retain_folders(&["INBOX".to_string()]).unwrap(), 0);
+        assert_eq!(
+            folder_ids(&s),
+            vec!["INBOX", LOCAL_DRAFTS_SENTINEL_FOLDER_ID]
+        );
+
+        // Adopted into the real Drafts folder, the empty sentinel goes.
+        let mut drafts = folder("DRAFTS", None, "Drafts", 0, 0);
+        drafts.well_known_name = Some("drafts".into());
+        s.upsert_folder(&drafts).unwrap();
+        s.adopt_sentinel_drafts("DRAFTS").unwrap();
+        let keep = ["INBOX".to_string(), "DRAFTS".to_string()];
+        assert_eq!(s.retain_folders(&keep).unwrap(), 1);
+        assert_eq!(folder_ids(&s), vec!["DRAFTS", "INBOX"]);
+        assert_eq!(s.messages_in_folder("DRAFTS", 50, 0).unwrap()[0].id, id);
     }
 }
