@@ -24,8 +24,10 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
 pub use crate::graph::model::BodyFormat;
-use crate::graph::model::{AutomaticReplies, DeltaItem, Message, ScheduleEntry};
-use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
+use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Message, ScheduleEntry};
+use crate::store::{
+    LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, Store, StoreError,
+};
 use crate::sync::outbox::apply_op;
 use crate::tokencache;
 use std::io::{Read, Write};
@@ -1128,23 +1130,68 @@ impl Engine {
                 {
                     let _ = self.store.adopt_sentinel_drafts(&drafts.id);
                 }
+                let mut carry_on = true;
                 if listing.complete && !listing.folders.is_empty() {
-                    let keep: Vec<String> = listing.folders.iter().map(|f| f.id.clone()).collect();
+                    let (keep, go_on) = self.folders_to_keep(&listing.folders);
+                    carry_on = go_on;
                     match self.store.retain_folders(&keep) {
                         Ok(removed) => changed |= removed > 0,
                         Err(e) => self.emit(SyncEvent::Error(e.to_string())),
                     }
                 }
-                // The initial enumeration has now succeeded at least once, so
-                // ticks can safely drop to incremental deltas.
+                // The folders have been enumerated at least once: a pass no
+                // longer needs to be a full one for them (`needs_full_pass`).
                 self.backfill_done = true;
                 if full || changed {
                     self.emit(SyncEvent::FoldersUpdated);
                 }
-                true
+                carry_on
             }
             Err(e) => !self.react(e),
         }
+    }
+
+    /// The folder ids `retain_folders` keeps after a complete listing of
+    /// `listed`: those listed, plus each stored folder missing from it that
+    /// Graph does not confirm deleted (#1886). The tree walk is many
+    /// requests, not a snapshot, so a folder moved during it (into a parent
+    /// already read, or past an offset `nextLink`) is missing although it
+    /// exists: each missing folder is asked for (`folder_exists`) and
+    /// removed only on a 404. One that exists, or whose GET fails
+    /// non-fatally, is kept for the next tick to list. A fatal failure
+    /// (auth, throttle, transport, through `react`) keeps every folder not
+    /// yet confirmed gone and returns `false`: the pass stops. The drafts
+    /// sentinel is never asked for; `retain_folders` keeps it while it
+    /// holds a draft.
+    fn folders_to_keep(&mut self, listed: &[MailFolder]) -> (Vec<String>, bool) {
+        let mut keep: Vec<String> = listed.iter().map(|f| f.id.clone()).collect();
+        let missing: Vec<String> = match self.store.folders() {
+            Ok(stored) => stored
+                .into_iter()
+                .map(|f| f.id)
+                .filter(|id| id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID && !keep.contains(id))
+                .collect(),
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return (keep, true);
+            }
+        };
+        let mut carry_on = true;
+        for id in missing {
+            if !carry_on {
+                keep.push(id);
+                continue;
+            }
+            match self.with_auth(|c| c.folder_exists(&id)) {
+                Ok(false) => {}
+                Ok(true) => keep.push(id),
+                Err(e) => {
+                    carry_on = !self.react(e);
+                    keep.push(id);
+                }
+            }
+        }
+        (keep, carry_on)
     }
 
     /// Delta-sync one folder: page through from the stored `deltaLink` (or a
@@ -7368,6 +7415,13 @@ mod tests {
             store.folders().unwrap(),
             paths_from(&srv, 0)
         );
+        // The startup pass emits FoldersUpdated, and so does the tick that
+        // renamed, moved and created folders.
+        let mut updates = 0;
+        wait_for(&handle.evt_rx, |e| {
+            updates += usize::from(matches!(e, SyncEvent::FoldersUpdated));
+            updates == 2
+        });
         // At startup C1 said it had no children (`childFolderCount: 0`),
         // so the startup pass did not ask for them; the tick, where it says
         // it has one, did.
@@ -7400,6 +7454,13 @@ mod tests {
             &[],
         ));
         routes.extend(deltas("KID", &[message_json("G2", false, false, &[])], &[]));
+        // Graph confirms both gone (#1886: a missing folder is asked for).
+        for id in ["GONE", "KID"] {
+            routes.push((
+                get_route(&format!("/me/mailFolders/{id}?"), 404, "{}"),
+                None,
+            ));
+        }
         routes.push((
             get_route(
                 "/me/mailFolders/GONE/childFolders",
@@ -7435,15 +7496,104 @@ mod tests {
         // none after.
         assert_eq!(count(&srv, |p| is_delta(p, "GONE")), 1);
         assert_eq!(count(&srv, |p| is_delta(p, "KID")), 1);
-        let errors: Vec<SyncEvent> = handle
-            .evt_rx
-            .try_iter()
-            .filter(|e| matches!(e, SyncEvent::Error(_)))
-            .collect();
-        assert!(errors.is_empty(), "{errors:?}");
+        // Each was confirmed gone before it was removed, once.
+        for id in ["GONE", "KID"] {
+            let confirm = format!("/me/mailFolders/{id}?$select=id");
+            assert_eq!(count(&srv, |p| p == confirm), 1, "{id}");
+        }
+        // The removal tick emitted FoldersUpdated; nothing emitted an error.
+        let events: Vec<SyncEvent> = handle.evt_rx.try_iter().collect();
+        assert!(events.contains(&SyncEvent::FoldersUpdated), "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{events:?}"
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After startup the listing no longer has X (expanded, holding XM),
+    /// and Graph answers `status` when asked for X. Returns the store and
+    /// the events after the startup pass, two ticks later.
+    fn run_missing_folder(tag: &str, status: u16) -> (Store, Vec<SyncEvent>, FakeServer) {
+        let mut routes = vec![calendar_route()];
+        routes.extend(deltas("F1", &[], &[]));
+        routes.extend(deltas("X", &[message_json("XM", false, false, &[])], &[]));
+        let body = if status == 200 {
+            r#"{"id":"X"}"#
+        } else {
+            "boom"
+        };
+        routes.push((get_route("/me/mailFolders/X?", status, body), None));
+        routes.extend(startup_then(
+            "/me/mailFolders?",
+            &list(&[
+                tree_folder("F1", "Inbox", None, (0, 0), 0),
+                tree_folder("X", "Moving", None, (1, 1), 0),
+            ]),
+            &list(&[tree_folder("F1", "Inbox", None, (0, 0), 0)]),
+        ));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, tag, TICK, None, |s| {
+            s.upsert_folder(&MailFolder {
+                id: "X".into(),
+                display_name: "Moving".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+            s.set_folder_expanded("X", true).unwrap();
+        });
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let confirm = "/me/mailFolders/X?$select=id";
+        assert!(wait_until(TICK_WAIT, || count(&srv, |p| p == confirm) >= 2));
+        // By the third list, the second tick's confirm has been answered.
+        assert!(wait_until(TICK_WAIT, || count(&srv, is_folder_list) >= 4));
+        let events: Vec<SyncEvent> = handle.evt_rx.try_iter().collect();
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (store, events, srv)
+    }
+
+    fn assert_x_kept(store: &Store) {
+        let x = stored_folder(store, "X").expect("X kept");
+        assert!(x.is_expanded);
+        assert_eq!(store.messages_in_folder("X", 50, 0).unwrap()[0].id, "XM");
+    }
+
+    #[test]
+    fn a_folder_missing_from_a_complete_listing_but_still_on_the_server_is_kept() {
+        // Moved during the walk (e.g. into a parent already read): Graph
+        // still has it, so it keeps its messages and local state, and no
+        // tick reports a folder change.
+        let (store, events, _srv) = run_missing_folder("tick-missing-200", 200);
+        assert_x_kept(&store);
+        assert!(!events.contains(&SyncEvent::FoldersUpdated), "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_folder_whose_confirm_get_fails_is_kept() {
+        // A 500 is non-fatal: X stays for a later tick, the error shows,
+        // and the pass goes on.
+        let (store, events, srv) = run_missing_folder("tick-missing-500", 500);
+        assert_x_kept(&store);
+        assert!(
+            events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{events:?}"
+        );
+        assert!(
+            count(&srv, |p| p
+                .starts_with("/me/mailFolders/F1/messages/delta?token="))
+                >= 2
+        );
     }
 
     #[test]

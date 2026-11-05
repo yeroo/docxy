@@ -265,6 +265,23 @@ impl GraphClient {
         })
     }
 
+    /// GET `/me/mailFolders/{id}?$select=id`: whether the folder still
+    /// exists. The sync engine asks it for a folder a complete listing no
+    /// longer has before removing it (#1886): the tree walk is many
+    /// requests, not a snapshot, so a folder moved during it can be missed.
+    /// `Ok(false)` only on a 404; any other error is returned.
+    pub fn folder_exists(&self, folder_id: &str) -> Result<bool, GraphError> {
+        let path = format!(
+            "/me/mailFolders/{}?$select=id",
+            encode_path_segment(folder_id)
+        );
+        match self.send(Method::Get, &path, None, &[]) {
+            Ok(_) => Ok(true),
+            Err(GraphError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// GET `/me/mailFolders/{id}?$select=totalItemCount,unreadItemCount`:
     /// one folder's `(total, unread)` counts, which the sync engine re-reads
     /// after syncing just that folder (#1885). A missing count is 0, as in
@@ -1840,6 +1857,27 @@ mod tests {
             c.list_folders(),
             Err(GraphError::Http { status: 500, .. })
         ));
+    }
+
+    #[test]
+    fn folder_exists_is_true_on_200_false_on_404_and_errs_otherwise() {
+        let srv = FakeServer::start(vec![
+            get("/me/mailFolders/HERE?", 200, r#"{"id":"HERE"}"#.into()),
+            get("/me/mailFolders/GONE?", 404, "{}".into()),
+            get("/me/mailFolders/BAD?", 500, "boom".into()),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.folder_exists("HERE"), Ok(true));
+        assert_eq!(c.folder_exists("GONE"), Ok(false));
+        assert!(matches!(
+            c.folder_exists("BAD"),
+            Err(GraphError::Http { status: 500, .. })
+        ));
+        assert!(
+            srv.requests()
+                .iter()
+                .all(|r| r.path.ends_with("?$select=id"))
+        );
     }
 
     #[test]

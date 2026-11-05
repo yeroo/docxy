@@ -2343,7 +2343,7 @@ fn drafts_folder_id_on(conn: &Connection) -> Result<String, StoreError> {
 /// The local `folders.id` a new draft is filed under when the real Drafts
 /// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
 /// See `Store::drafts_folder_id`.
-const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
+pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
