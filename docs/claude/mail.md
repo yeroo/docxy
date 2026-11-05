@@ -192,7 +192,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   refusal Graph answered (a 4xx, a 404, a 401) clears it, as nothing went
   out. Any 5xx, a 429/503 throttle (a gateway 503 can follow a send the
   back end accepted) or a dropped connection leaves it set: Graph may
-  still have delivered, and the retry costs one GET.
+  still have delivered, and the retry costs one GET. On the open that adds
+  the column, every `sendDraft` op an older engine left queued is marked
+  posted, as it may follow a lost answer; a reopen leaves the flags alone.
+  A posted op whose draft is still `local:` was never on Graph: the flag is
+  cleared and it is sent with no check.
 - The next attempt of a posted op first checks delivery, before any PATCH
   or upload. The local row gone (a Drafts delta's `@removed`), or
   `GraphClient::is_draft` (`GET /me/messages/{id}?$select=isDraft`)

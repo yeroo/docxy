@@ -138,7 +138,9 @@ pub(crate) fn apply_send(
         let Some((row, _)) = store.draft(id).map_err(store_err)? else {
             return Ok(());
         };
-        if !client.is_draft(&row.id)? {
+        // Still `local:`: never on Graph, so never sent (a send queued by an
+        // older engine reads as posted). No check: send it as usual.
+        if !row.id.starts_with("local:") && !client.is_draft(&row.id)? {
             let _ = store.clear_outbound_attachments(&row.id);
             return Ok(());
         }
@@ -953,6 +955,46 @@ mod tests {
                 .any(|r| r.path == "/me/messages/GRAPH-3/send")
         );
         assert!(store.outbound_attachments(&local_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_posted_send_of_a_draft_still_local_creates_and_sends_without_a_check() {
+        // FIX r3: a send an older engine queued reads as posted, but a
+        // `local:` draft was never on Graph, so it cannot have been sent.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-5/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-5", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "bob@x", "", "body").unwrap();
+        let seq = store
+            .enqueue_op(&OutboxOp::SendDraft {
+                id: local_id.clone(),
+            })
+            .unwrap();
+        store.set_send_posted(seq, true).unwrap();
+
+        apply_send(&c, &store, &local_id, Some(seq)).unwrap();
+
+        let reqs = srv.requests();
+        assert!(reqs.iter().all(|r| r.method != "GET"), "no delivery check");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/me/messages");
+        assert_eq!(reqs[1].path, "/me/messages/GRAPH-5/send");
+        assert!(store.send_posted(seq).unwrap(), "set again for this POST");
     }
 
     #[test]

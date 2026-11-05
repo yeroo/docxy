@@ -647,12 +647,24 @@ impl Store {
             [],
         );
         // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
-        // a `SendDraft` op's `/send` POST went out). An op from before it
-        // reads as never posted.
-        let _ = conn.execute(
-            "ALTER TABLE outbox ADD COLUMN send_posted INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        // a `SendDraft` op's `/send` POST went out). On the open that adds
+        // the column, every `SendDraft` an older engine left queued reads
+        // as posted: it may be there after a 5xx or a lost answer on
+        // `/send`, so its next attempt checks delivery first (one GET; a
+        // `local:` draft, never on Graph, skips it). A reopen, with the
+        // column already there, leaves the flags alone.
+        if conn
+            .execute(
+                "ALTER TABLE outbox ADD COLUMN send_posted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok()
+        {
+            conn.execute(
+                "UPDATE outbox SET send_posted = 1 WHERE op = 'sendDraft'",
+                [],
+            )?;
+        }
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(local_id)",
             [],
@@ -1760,8 +1772,9 @@ impl Store {
 
     /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
     /// (#1874). Set right before the POST, so a lost answer or a crash
-    /// counts; cleared once Graph says the message is still a draft. A
-    /// missing `seq` changes nothing.
+    /// counts; cleared when Graph refuses the POST (a 4xx, a 404, a 401) or
+    /// later says the message is still a draft. A missing `seq` changes
+    /// nothing.
     pub fn set_send_posted(&self, seq: i64, posted: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE outbox SET send_posted = ?2 WHERE seq = ?1",
@@ -4462,22 +4475,46 @@ mod draft_tests {
                  CREATE TABLE outbox (
                      seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, message_id TEXT,
                      payload TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
-                     last_error TEXT);
-                 INSERT INTO outbox (seq, op, payload) VALUES
-                     (7, 'SendDraft', '{\"op\":\"SendDraft\",\"id\":\"G\"}');",
+                     last_error TEXT);",
             )
             .unwrap();
+            // Rows as an older engine's `enqueue_op` wrote them.
+            for (seq, op) in [
+                (7, OutboxOp::SendDraft { id: "G".into() }),
+                (
+                    8,
+                    OutboxOp::MarkRead {
+                        id: "M1".into(),
+                        read: true,
+                    },
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO outbox (seq, op, payload) VALUES (?1, ?2, ?3)",
+                    params![seq, op.kind(), op.to_json().to_string()],
+                )
+                .unwrap();
+            }
         }
         let s = Store::open(&path).unwrap();
         let got = s.outbound_attachments("local:d").unwrap();
         assert_eq!(got.len(), 1);
         assert!(!got[0].uploaded, "an old row is not on any Graph draft");
         assert!(
-            !s.send_posted(7).unwrap(),
-            "an old op reads as never posted"
+            s.send_posted(7).unwrap(),
+            "an inherited send may follow a lost answer: it reads as posted"
         );
-        s.set_send_posted(7, true).unwrap();
-        assert!(s.send_posted(7).unwrap());
+        assert!(!s.send_posted(8).unwrap(), "another op kind does not");
+        assert_eq!(s.pending_ops().unwrap().len(), 2);
+        // A reopen, with the column already there, leaves the flags alone.
+        s.set_send_posted(7, false).unwrap();
+        let fresh = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G2".into() })
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(!s.send_posted(7).unwrap());
+        assert!(!s.send_posted(fresh).unwrap());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
