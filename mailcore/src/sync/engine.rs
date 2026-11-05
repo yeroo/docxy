@@ -244,7 +244,9 @@ pub enum SyncEvent {
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
-    /// per-folder failure, etc.). Never contains a secret.
+    /// per-folder failure, etc.). Never contains a secret. It also carries
+    /// the notice that a folder holds messages stored without headers,
+    /// which the sync is fetching (#1899).
     Error(String),
     /// No valid token; the UI must trigger `SyncCommand::SignIn`.
     SignInRequired,
@@ -268,6 +270,14 @@ const MAX_OP_ATTEMPTS: i64 = 5;
 /// At most this many header-less rows of a folder are fetched from Graph per
 /// sync pass (`Engine::repair_headerless`, #1899); the rest wait for the next.
 const REPAIR_LIMIT: usize = 50;
+
+/// What `Engine::repair_headerless` did to a folder.
+struct Repair {
+    /// An auth, throttle or transport failure: the sync pass stops.
+    abort: bool,
+    /// A row was completed or deleted, so the folder needs a reload.
+    changed: bool,
+}
 /// Offline back-off bounds (exponential between them).
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -785,11 +795,13 @@ impl Engine {
     /// stored one; a new partial item is inserted header-less and completed
     /// by `repair_headerless` right after the folder's pages. The cutoff
     /// skips only an item whose `receivedDateTime` it can read, so a partial
-    /// item in a backfill is kept (and completed) even if old. Partial items
-    /// are reported as one `SyncEvent::Error` per folder per pass with their
-    /// count; if `{id, isRead}` is Graph's usual shape for a read change,
-    /// that is every read change made elsewhere. lookxy shows it until the
-    /// pass settles, so it is a transient notice, not a failure.
+    /// item in a backfill is kept (and completed) even if old. A partial
+    /// update merged into a complete row is not reported; header-less rows
+    /// are, by `repair_headerless`.
+    ///
+    /// `MessagesUpdated` is emitted once the pages are stored, before the
+    /// repair (so an aborted repair still shows them), and again after a
+    /// repair that changed a row.
     fn sync_folder_delta(&mut self, folder_id: &str) -> bool {
         let stored = self.store.get_delta_link(folder_id).ok().flatten();
         let is_backfill = stored.is_none();
@@ -803,7 +815,6 @@ impl Engine {
             None => DeltaCursor::Folder(folder_id.to_string()),
         };
 
-        let mut partial = 0usize;
         loop {
             let page = match self.with_auth(|c| c.delta(cursor.clone())) {
                 Ok(p) => p,
@@ -819,9 +830,6 @@ impl Engine {
                             if !m.received.is_empty() && m.received.as_str() < cut.as_str() {
                                 continue;
                             }
-                        }
-                        if fields.is_partial() {
-                            partial += 1;
                         }
                         let _ = self.store.merge_message(folder_id, m, fields);
                     }
@@ -841,34 +849,45 @@ impl Engine {
             }
             break;
         }
-        if partial > 0 {
-            self.emit(SyncEvent::Error(format!(
-                "mail sync: {partial} partial message(s) in folder {}; fetching their headers",
-                self.folder_label(folder_id)
-            )));
-        }
-        if !self.repair_headerless(folder_id) {
-            return false;
-        }
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: folder_id.to_string(),
         });
-        true
+        let repair = self.repair_headerless(folder_id);
+        if repair.changed {
+            self.emit(SyncEvent::MessagesUpdated {
+                folder_id: folder_id.to_string(),
+            });
+        }
+        !repair.abort
     }
 
     /// Completes up to `REPAIR_LIMIT` of `folder_id`'s header-less rows
     /// (`Store::headerless_message_ids`: no `received_at`, not a row docxy
     /// made itself) from `GET /me/messages/{id}` (#1899): rows a partial
     /// delta item of this pass inserted, and rows an older build blanked.
-    /// A 404 deletes the row (Graph no longer has that id; a moved message
-    /// comes back under its new id through delta). An auth, throttle or
-    /// transport failure aborts the pass like the delta call (returns
-    /// `false`); any other failure skips that id, so one bad id cannot hold
-    /// up the rows behind it, and is reported once for the folder.
-    fn repair_headerless(&mut self, folder_id: &str) -> bool {
-        let Ok(ids) = self.store.headerless_message_ids(folder_id, REPAIR_LIMIT) else {
-            return true;
+    /// When it finds any, it says so in one `SyncEvent::Error` with their
+    /// count (a partial delta item that left a row header-less, or a row an
+    /// older build blanked). A 404 deletes the row (Graph no longer has that
+    /// id; a moved message comes back under its new id through delta). An
+    /// auth, throttle or transport failure aborts the pass like the delta
+    /// call; any other failure skips that id, so one bad id cannot hold up
+    /// the rows behind it, and is reported once for the folder.
+    fn repair_headerless(&mut self, folder_id: &str) -> Repair {
+        let mut repair = Repair {
+            abort: false,
+            changed: false,
         };
+        let Ok(ids) = self.store.headerless_message_ids(folder_id, REPAIR_LIMIT) else {
+            return repair;
+        };
+        if ids.is_empty() {
+            return repair;
+        }
+        self.emit(SyncEvent::Error(format!(
+            "mail sync: {} message(s) in folder {} were stored without headers; fetching them",
+            ids.len(),
+            self.folder_label(folder_id)
+        )));
         let mut failed = 0usize;
         let mut last_error = None;
         for id in ids {
@@ -880,10 +899,14 @@ impl Engine {
                         id: id.clone(),
                         ..m
                     };
-                    let _ = self.store.merge_message(folder_id, &m, &fields);
+                    if self.store.merge_message(folder_id, &m, &fields).is_ok() {
+                        repair.changed = true;
+                    }
                 }
                 Err(GraphError::NotFound) => {
-                    let _ = self.store.delete_message(&id);
+                    if let Ok(Some(_)) = self.store.delete_message_resolved(&id) {
+                        repair.changed = true;
+                    }
                 }
                 Err(
                     e @ (GraphError::Unauthorized
@@ -891,7 +914,8 @@ impl Engine {
                     | GraphError::Transport(_)),
                 ) => {
                     self.react(e);
-                    return false;
+                    repair.abort = true;
+                    return repair;
                 }
                 Err(e @ (GraphError::Http { .. } | GraphError::Parse(_))) => {
                     failed += 1;
@@ -905,7 +929,7 @@ impl Engine {
                 self.folder_label(folder_id)
             )));
         }
-        true
+        repair
     }
 
     /// A folder's display name for a message, else its id.
@@ -2167,6 +2191,17 @@ mod tests {
         )
     }
 
+    /// Collects events until `n` `MessagesUpdated` for `folder` have come.
+    fn wait_for_updates(rx: &Receiver<SyncEvent>, folder: &str, n: usize) -> Vec<SyncEvent> {
+        let mut seen = 0;
+        wait_for(rx, |e| {
+            if matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == folder) {
+                seen += 1;
+            }
+            seen == n
+        })
+    }
+
     /// Partial delta items (#1899): pass 1 backfills M1 and M2 complete;
     /// pass 2 (the stored deltaLink) returns `{id, isRead}` for M1 and a
     /// bare `{id}` for the new M3. M1 is merged (headers kept, no fetch), M3
@@ -2223,10 +2258,8 @@ mod tests {
         assert_eq!(store.messages_in_folder("F1", 50, 0).unwrap().len(), 2);
 
         handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
-        let pass2_events = wait_for(
-            &handle.evt_rx,
-            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
-        );
+        // Once for the delta pages, once for the repair that completed M3.
+        let pass2_events = wait_for_updates(&handle.evt_rx, "F1", 2);
 
         let msgs = store.messages_in_folder("F1", 50, 0).unwrap();
         let by_id = |id: &str| msgs.iter().find(|m| m.id == id).unwrap().clone();
@@ -2265,11 +2298,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            notices
-                .iter()
-                .any(|m| m.contains("2 partial message(s)") && m.contains("Inbox")),
-            "{notices:?}"
+        // Only M3 was left header-less; M1's merged read change is not
+        // reported.
+        assert_eq!(
+            notices,
+            vec![
+                "mail sync: 1 message(s) in folder Inbox were stored without headers; fetching them"
+            ],
         );
         assert!(
             notices
@@ -2283,12 +2318,15 @@ mod tests {
 
     /// Runs one sync pass (a backfill returning only M1) over a store seeded
     /// with header-less rows `seed` in F1, as an older build left them, with
-    /// `routes` answering their fetches. Returns the store, the pass's
-    /// events and the paths requested.
+    /// `routes` answering their fetches, until `updates` `MessagesUpdated`
+    /// for F1 have come (2 when the repair changes a row) and the pass has
+    /// settled. Returns the store,
+    /// the pass's events and the paths requested.
     fn repair_pass(
         tag: &str,
         seed: &[&str],
         routes: Vec<Route>,
+        updates: usize,
     ) -> (Store, Vec<SyncEvent>, Vec<String>, PathBuf) {
         let mut all = routes;
         all.extend(backfill_routes());
@@ -2346,10 +2384,13 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        let events = wait_for(
+        let mut events = wait_for_updates(&handle.evt_rx, "F1", updates);
+        // The pass then settles (also after a repair abort), so every
+        // request it made has been recorded.
+        events.extend(wait_for(
             &handle.evt_rx,
-            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
-        );
+            |e| matches!(e, SyncEvent::State(st) if *st != SyncState::Syncing),
+        ));
         let paths = srv.requests().into_iter().map(|r| r.path).collect();
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         (Store::open(&store_path).unwrap(), events, paths, dir)
@@ -2365,6 +2406,7 @@ mod tests {
                 200,
                 &full_message_json("M9", "Was blank", "2026-07-15T08:00:00Z"),
             )],
+            2,
         );
         let msgs = store.messages_in_folder("F1", 50, 0).unwrap();
         let m9 = msgs.iter().find(|m| m.id == "M9").unwrap();
@@ -2388,6 +2430,7 @@ mod tests {
             "repair-404",
             &["M7"],
             vec![get_route("/me/messages/M7", 404, "{}")],
+            2,
         );
         assert!(paths.iter().any(|p| p.starts_with("/me/messages/M7?")));
         let ids: Vec<String> = store
@@ -2397,6 +2440,32 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, vec!["M1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repair fetch that aborts the pass (here a 429) must not hide the
+    /// delta changes already stored: `MessagesUpdated` for the folder came
+    /// before the repair, and the row stays header-less for a later pass.
+    #[test]
+    fn throttled_repair_still_reports_the_folders_delta() {
+        let mut throttled = get_route("/me/messages/M9", 429, "{}");
+        throttled.headers = vec![("Retry-After".into(), "3600".into())];
+        let (store, events, paths, dir) = repair_pass("repair-429", &["M9"], vec![throttled], 1);
+        assert!(paths.iter().any(|p| p.starts_with("/me/messages/M9?")));
+        let pos = |pred: &dyn Fn(&SyncEvent) -> bool| events.iter().position(pred);
+        let notice = pos(&|e| matches!(e, SyncEvent::Error(m) if m.contains("without headers")));
+        let updated =
+            pos(&|e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"));
+        assert!(updated.is_some() && updated < notice, "{events:?}");
+        // The delta's M1 is stored; M9 waits for the next pass.
+        assert!(
+            store
+                .messages_in_folder("F1", 50, 0)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == "M1")
+        );
+        assert_eq!(store.headerless_message_ids("F1", 10).unwrap(), vec!["M9"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2417,6 +2486,7 @@ mod tests {
                     &full_message_json("M9", "Still repaired", "2026-07-15T08:00:00Z"),
                 ),
             ],
+            2,
         );
         let p8 = paths.iter().position(|p| p.starts_with("/me/messages/M8?"));
         let p9 = paths.iter().position(|p| p.starts_with("/me/messages/M9?"));

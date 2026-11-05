@@ -703,55 +703,10 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts or updates a message row, filing it under `folder_id`.
+    /// Inserts or updates a message row, filing it under `folder_id`: every
+    /// column from `m` (`merge_message` with every property carried).
     pub fn upsert_message(&self, folder_id: &str, m: &Message) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO messages (
-                 id, folder_id, conversation_id, subject, from_name, from_addr,
-                 to_recipients, cc_recipients, received_at, sent_at,
-                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                 is_meeting_request, categories
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-             ON CONFLICT(id) DO UPDATE SET
-                 folder_id = excluded.folder_id,
-                 conversation_id = excluded.conversation_id,
-                 subject = excluded.subject,
-                 from_name = excluded.from_name,
-                 from_addr = excluded.from_addr,
-                 to_recipients = excluded.to_recipients,
-                 cc_recipients = excluded.cc_recipients,
-                 received_at = excluded.received_at,
-                 sent_at = excluded.sent_at,
-                 is_read = excluded.is_read,
-                 is_flagged = excluded.is_flagged,
-                 has_attachments = excluded.has_attachments,
-                 importance = excluded.importance,
-                 preview = excluded.preview,
-                 is_draft = excluded.is_draft,
-                 is_meeting_request = excluded.is_meeting_request,
-                 categories = excluded.categories",
-            params![
-                m.id,
-                folder_id,
-                m.conversation_id,
-                m.subject,
-                m.from.name,
-                m.from.address,
-                encode_recipients(&m.to),
-                encode_recipients(&m.cc),
-                m.received,
-                m.sent,
-                m.is_read,
-                m.is_flagged,
-                m.has_attachments,
-                m.importance,
-                m.preview,
-                m.is_draft,
-                m.is_meeting_request,
-                encode_categories(&m.categories),
-            ],
-        )?;
-        Ok(())
+        self.merge_message(folder_id, m, &MessageFields::all())
     }
 
     /// Inserts or updates a message row from a Graph item that may be
@@ -759,7 +714,7 @@ impl Store {
     /// the columns whose property `fields` says the item carried are
     /// written, so an absent property never blanks a stored one; a missing
     /// row is inserted with what the item carried (empty otherwise). With
-    /// every property carried it writes exactly what `upsert_message` does.
+    /// every property carried it writes every column (`upsert_message`).
     /// `is_meeting_request` and `is_draft` follow
     /// `MessageFields::writes_meeting_request` / `writes_is_draft`.
     ///
@@ -2774,35 +2729,128 @@ mod tests {
         assert_eq!(s.headerless_message_ids("F", 10).unwrap(), vec!["12"]);
     }
 
+    /// `upsert_message` (a merge with every property carried) writes every
+    /// column from the message, on insert and over an existing row, and
+    /// leaves the columns it does not own alone. Spelled out column by
+    /// column, as the statement was before it became a merge.
     #[test]
-    fn merge_with_all_fields_matches_upsert() {
-        let a = Store::open_in_memory().unwrap();
-        let b = Store::open_in_memory().unwrap();
-        for s in [&a, &b] {
-            folder(s, "F");
-        }
+    fn upsert_writes_every_column() {
+        use rusqlite::types::Value as V;
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        let names: Vec<String> = s
+            .conn
+            .prepare("SELECT * FROM messages LIMIT 0")
+            .unwrap()
+            .column_names()
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let expect = |s: &Store, id: &str, want: &[(&str, V)]| {
+            let row = raw_row(s, id);
+            for (i, name) in names.iter().enumerate() {
+                let w = want
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| panic!("column {name} not covered"));
+                assert_eq!(row[i], w, "{name}");
+            }
+        };
+        let t = |x: &str| V::Text(x.into());
         let mut m = msg("13", true);
         m.is_flagged = true;
         m.has_attachments = true;
+        m.is_draft = true;
+        m.is_meeting_request = true;
         m.categories = vec!["X".into(), "Y".into()];
+        m.to = vec![Recipient {
+            name: "B".into(),
+            address: "b@x".into(),
+        }];
         m.cc = vec![Recipient {
             name: "C".into(),
             address: "c@x".into(),
         }];
-        // Fresh insert.
-        a.upsert_message("F", &m).unwrap();
-        b.merge_message("F", &m, &MessageFields::all()).unwrap();
-        assert_eq!(raw_row(&a, "13"), raw_row(&b, "13"));
-        // Over an existing row, with every field changed.
-        let mut m2 = msg("13", false);
-        m2.subject = "changed".into();
-        m2.importance = "high".into();
-        a.upsert_message("F", &m2).unwrap();
-        b.merge_message("F", &m2, &MessageFields::all()).unwrap();
-        assert_eq!(raw_row(&a, "13"), raw_row(&b, "13"));
-        assert_eq!(
-            a.messages_in_folder("F", 10, 0).unwrap()[0].subject,
-            "changed"
+        m.sent = "2026-07-13T00:00:00Z".into();
+        s.upsert_message("F", &m).unwrap();
+        let first = [
+            ("id", t("13")),
+            ("folder_id", t("F")),
+            ("conversation_id", t("C")),
+            ("subject", t("s13")),
+            ("from_name", t("A")),
+            ("from_addr", t("a@x")),
+            ("to_recipients", t(&encode_recipients(&m.to))),
+            ("cc_recipients", t(&encode_recipients(&m.cc))),
+            ("bcc_recipients", t("")),
+            ("received_at", t("2026-07-13T00:00:00Z")),
+            ("sent_at", t("2026-07-13T00:00:00Z")),
+            ("is_read", V::Integer(1)),
+            ("is_flagged", V::Integer(1)),
+            ("has_attachments", V::Integer(1)),
+            ("importance", t("normal")),
+            ("preview", t("p")),
+            ("is_draft", V::Integer(1)),
+            ("is_meeting_request", V::Integer(1)),
+            ("categories", t(&encode_categories(&m.categories))),
+            ("local_id", V::Null),
+        ];
+        expect(&s, "13", &first);
+
+        // Over the row, with every column changed (to empty / false where
+        // a value can be), moved to G; bcc (not a Graph column here) kept.
+        s.conn
+            .execute(
+                "UPDATE messages SET bcc_recipients = 'kept' WHERE id = '13'",
+                [],
+            )
+            .unwrap();
+        let m2 = Message {
+            id: "13".into(),
+            conversation_id: "C2".into(),
+            subject: "changed".into(),
+            from: Recipient::default(),
+            to: vec![],
+            cc: vec![],
+            received: String::new(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "high".into(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+        };
+        s.upsert_message("G", &m2).unwrap();
+        expect(
+            &s,
+            "13",
+            &[
+                ("id", t("13")),
+                ("folder_id", t("G")),
+                ("conversation_id", t("C2")),
+                ("subject", t("changed")),
+                ("from_name", t("")),
+                ("from_addr", t("")),
+                ("to_recipients", t(&encode_recipients(&[]))),
+                ("cc_recipients", t(&encode_recipients(&[]))),
+                ("bcc_recipients", t("kept")),
+                ("received_at", t("")),
+                ("sent_at", t("")),
+                ("is_read", V::Integer(0)),
+                ("is_flagged", V::Integer(0)),
+                ("has_attachments", V::Integer(0)),
+                ("importance", t("high")),
+                ("preview", t("")),
+                ("is_draft", V::Integer(0)),
+                ("is_meeting_request", V::Integer(0)),
+                ("categories", t(&encode_categories(&[]))),
+                ("local_id", V::Null),
+            ],
         );
     }
 
