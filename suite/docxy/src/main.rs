@@ -5563,6 +5563,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
+    /// The flow view's block the caret moved into (#1895), followed in y by
+    /// the scroll area's probe once the next layout has laid it out.
+    doc_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
     // The frame's line-number counting state and harness record, shared by
     // the numbered rows' canvases in paint order (#746; LineProbe).
     line_probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
@@ -6651,10 +6654,13 @@ fn ruler_probe_el(
 /// (the width this frame's tables were fitted to; `None` on the first
 /// frame) one more frame is drawn with it. `window.refresh()` would do
 /// nothing while drawing.
-fn fit_width_probe(used: Option<f32>, record: impl Fn(Bounds<Pixels>) + 'static) -> AnyElement {
+fn fit_width_probe(
+    used: Option<f32>,
+    record: impl Fn(Bounds<Pixels>, &mut Window) + 'static,
+) -> AnyElement {
     canvas(
         move |b: Bounds<Pixels>, w: &mut Window, _a: &mut App| {
-            record(b);
+            record(b, w);
             if fit_width_stale(used, f32::from(b.size.width)) {
                 w.request_animation_frame();
             }
@@ -6672,6 +6678,66 @@ fn fit_width_probe(used: Option<f32>, record: impl Fn(Bounds<Pixels>) + 'static)
 /// Whether a probed text width `now` calls for another frame over `used`.
 fn fit_width_stale(used: Option<f32>, now: f32) -> bool {
     used.is_none_or(|u| (u - now).abs() > 0.5)
+}
+
+/// The vertical scroll offset that brings `child` into `view`, as gpui's
+/// `ScrollStrategy::FirstVisible` computes it (a child taller than the view
+/// shows its top; one above shows its top, one below its bottom), from the
+/// offset `y` it has now; `y` when it is already in view. Both bounds are
+/// unscrolled layout bounds, as a `ScrollHandle` records them.
+fn follow_y(view: Bounds<Pixels>, child: Bounds<Pixels>, y: Pixels) -> Pixels {
+    if child.size.height > view.size.height || child.top() + y < view.top() {
+        view.top() - child.top()
+    } else if child.bottom() + y > view.bottom() {
+        view.bottom() - child.bottom()
+    } else {
+        y
+    }
+}
+
+/// Scroll the flow view's `handle` so its child `ix` is in view, in y only
+/// (#1895): gpui's `scroll_to_item` also moves x on a scroll area that
+/// scrolls sideways, snapping a view scrolled to a wide table's right back
+/// to its left on every key. Called from a child's prepaint, after the
+/// scroll area recorded this layout's children; the move shows next frame.
+/// Whether it moved; nothing happens for a child the layout did not record.
+fn follow_item_y(handle: &ScrollHandle, ix: usize) -> bool {
+    let Some(child) = handle.bounds_for_item(ix) else {
+        return false;
+    };
+    let offset = handle.offset();
+    let y = follow_y(handle.bounds(), child, offset.y);
+    if y == offset.y {
+        return false;
+    }
+    handle.set_offset(point(offset.x, y));
+    true
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn rect(top: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(0.), px(top)), size(px(600.), px(h)))
+    }
+
+    /// #1895: the flow view follows a block in y as gpui's FirstVisible
+    /// does; x is never its business.
+    #[test]
+    fn a_block_is_followed_into_view_in_y() {
+        let view = rect(100., 400.);
+        // In view at this offset: left alone.
+        assert_eq!(follow_y(view, rect(200., 50.), px(0.)), px(0.));
+        assert_eq!(follow_y(view, rect(700., 50.), px(-300.)), px(-300.));
+        // Below the view: its bottom meets the view's.
+        assert_eq!(follow_y(view, rect(600., 50.), px(0.)), px(-150.));
+        // Above it (scrolled past): its top meets the view's.
+        assert_eq!(follow_y(view, rect(150., 50.), px(-300.)), px(-50.));
+        // Taller than the view: its top.
+        assert_eq!(follow_y(view, rect(300., 900.), px(0.)), px(-200.));
+    }
 }
 
 impl Docxy {
@@ -15326,6 +15392,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             painted_tables: PaintedTables::default(),
+            doc_follow: std::rc::Rc::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
                 line_numbers::LineProbe::default(),
             )),
@@ -24860,7 +24927,13 @@ impl Docxy {
                             self.doc_scroll.scroll_to_item(page);
                         }
                     } else {
-                        self.doc_scroll.scroll_to_item(b);
+                        // The flow view scrolls sideways too (#1895): gpui's
+                        // scroll_to_item would move x as well, so the scroll
+                        // area's probe follows the block in y only, once the
+                        // next layout has laid the edit out (a new or grown
+                        // block; the last layout's bounds may be another
+                        // block's after an Enter or a delete).
+                        self.doc_follow.set(Some(b));
                     }
                 }
             }
@@ -35189,7 +35262,12 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // sideways (#1895), and the probe reads the table's own width.
     let widest = boxes
         .iter()
-        .map(|rb| rb.before + rb.cells.iter().map(|c| c.width).sum::<u32>())
+        // Saturating: a document's grid may hold any u32 (#1895 r1).
+        .map(|rb| {
+            rb.cells
+                .iter()
+                .fold(rb.before, |a, c| a.saturating_add(c.width))
+        })
         .max()
         .unwrap_or(0);
     let probe = match (ctx.tables, path) {
@@ -41061,6 +41139,8 @@ impl Render for Docxy {
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages = vec![None; pages.len()];
+                            // A flow view's caret follow is for its own blocks.
+                            self.doc_follow.set(None);
                             probe.frames.clear();
                             probe.contents = vec![None; pages.len()];
                             probe.bands = pf
@@ -41779,6 +41859,7 @@ impl Render for Docxy {
                             .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), flow_ctx))
                             .collect();
                         let probe = self.ruler_probe.clone();
+                        let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .relative()
@@ -41799,12 +41880,21 @@ impl Render for Docxy {
                             // Keep it last so scroll_to_item(b) still indexes block b.
                             // A percent width resolves against the scroll area,
                             // not its scrolled extent: it is the text width.
+                            // Its prepaint comes after the scroll area has
+                            // recorded this layout's children, so a caret's
+                            // block is followed from where it is now drawn
+                            // (#1895), shown the next frame.
                             .child(div().relative().w_full().h(px(0.)).child(fit_width_probe(
                                 used_w,
-                                move |b| {
+                                move |b, window| {
                                     let mut state = probe.borrow_mut();
                                     state.draft_column = Some(ScreenRect::from_bounds(b));
                                     state.draft_text_w = Some(f32::from(b.size.width));
+                                    if let Some(ix) = follow.take() {
+                                        if follow_item_y(&handle, ix) {
+                                            window.request_animation_frame();
+                                        }
+                                    }
                                 },
                             )))
                             .into_any_element();

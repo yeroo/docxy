@@ -188,10 +188,19 @@ impl RowBox {
 /// (an HTML spacer) has no floor: it scales with the others.
 pub const MIN_FIT_COL_TW: u32 = 432;
 
+/// The widest pct a table is drawn at (#1895): 10000%, in fiftieths. A
+/// mail body is outside input; anything above is drawn at this.
+const MAX_FIT_PCT: u64 = 5000 * 100;
+
+/// The widest a fitted table is drawn (#1895), in twips (about 694"): far
+/// past any view, and small enough that its columns' sums fit a `u32`.
+const MAX_FIT_TW: u64 = 1_000_000;
+
 /// The width a table asks for in a flow view (#1895), from its `w:tblW`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Wants {
-    /// `pct`, in fiftieths of a percent (5000 = 100%).
+    /// `pct`, in fiftieths of a percent (5000 = 100%), at most
+    /// [`MAX_FIT_PCT`].
     Pct(u64),
     /// `auto`, `nil`, a missing `w:tblW`, or a pct of 0 or unreadable: at
     /// most the room there is.
@@ -216,10 +225,12 @@ fn wants(t: &Table) -> Wants {
                     .parse::<f64>()
                     .ok()
                     .filter(|v| v.is_finite() && *v > 0.)
-                    .map(|v| (v * 50.).round() as u64),
+                    .map(|v| (v * 50.).round().min(MAX_FIT_PCT as f64) as u64),
                 None => w.parse::<u64>().ok(),
             };
-            fiftieths.filter(|&f| f > 0).map_or(Wants::Auto, Wants::Pct)
+            fiftieths
+                .filter(|&f| f > 0)
+                .map_or(Wants::Auto, |f| Wants::Pct(f.min(MAX_FIT_PCT)))
         }
         "auto" | "nil" => Wants::Auto,
         _ => Wants::Fixed,
@@ -233,7 +244,7 @@ fn wants(t: &Table) -> Wants {
 /// in proportion, summing exactly to the target (the remainder goes to the
 /// last), then any that was at least [`MIN_FIT_COL_TW`] wide and fell below
 /// it is lifted back to it, so a table that cannot shrink comes out wider
-/// than `fit`.
+/// than `fit`. The target is at most [`MAX_FIT_TW`], so no sum overflows.
 pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
     let grid = usable_grid(t);
     let Some(fit) = fit else { return grid };
@@ -245,7 +256,8 @@ pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
         Wants::Pct(f) => u64::from(fit) * f / 5000,
         Wants::Auto => sum.min(u64::from(fit)),
         Wants::Fixed => return grid,
-    };
+    }
+    .min(MAX_FIT_TW);
     if target == sum {
         return grid;
     }
@@ -275,7 +287,14 @@ pub fn layout(t: &Table, style: Option<&TableStyle>, fit: Option<u32>) -> Vec<Ro
     // A missing, short or zero-width grid is filled out as the table
     // commands repair it, so the view and the edits agree.
     let widths = fitted_grid(t, fit);
-    let span_w = |s: usize, n: usize| widths.iter().skip(s).take(n).sum::<u32>();
+    // Saturating: a document's grid may hold any u32 (#1895 r1).
+    let span_w = |s: usize, n: usize| {
+        widths
+            .iter()
+            .skip(s)
+            .take(n)
+            .fold(0u32, |a, &w| a.saturating_add(w))
+    };
     let looks = resolve(t, style);
     let mut rows: Vec<RowBox> = map
         .rows
@@ -898,6 +917,25 @@ mod tests {
         // Above 100% is kept: wider than the view.
         let t = sized(&[4680, 4680], Some("<w:tblW w:w=\"7500\" w:type=\"pct\"/>"));
         assert_eq!(widths(&t, Some(6000)), [4500, 4500]);
+    }
+
+    #[test]
+    fn an_unbounded_pct_is_drawn_at_most_its_cap_1895() {
+        // 4000000000 fiftieths and 1e30%: 10000% at most, and the target at
+        // most MAX_FIT_TW, so nothing overflows (a debug build panics).
+        for w in ["4000000000", "1e30%", "99999999999999999999%"] {
+            let tblw = format!("<w:tblW w:w=\"{w}\" w:type=\"pct\"/>");
+            let t = sized(&[4680, 4680], Some(&tblw));
+            assert_eq!(widths(&t, Some(6000)), [300_000, 300_000], "{w}");
+            let w = widths(&t, Some(u32::MAX));
+            assert_eq!(w.iter().map(|&c| u64::from(c)).sum::<u64>(), MAX_FIT_TW);
+        }
+        // A grid of huge columns (their u32 sum stays below u32::MAX, which
+        // docxcore's usable_grid needs) scaled to the cap.
+        let t = sized(&[1_000_000_000, 1_000_000_000], Some(PCT_100));
+        let w = widths(&t, Some(u32::MAX));
+        assert_eq!(w.iter().map(|&c| u64::from(c)).sum::<u64>(), MAX_FIT_TW);
+        assert_eq!(w, [500_000, 500_000]);
     }
 
     #[test]

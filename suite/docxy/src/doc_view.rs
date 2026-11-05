@@ -638,7 +638,7 @@ impl Render for DocView {
                             .relative()
                             .w_full()
                             .h(px(0.))
-                            .child(fit_width_probe(used_w, move |b| {
+                            .child(fit_width_probe(used_w, move |b, _| {
                                 text_w.set(Some(f32::from(b.size.width)))
                             })),
                     ),

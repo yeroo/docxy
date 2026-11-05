@@ -463,7 +463,7 @@ replaces the saved reply, and `open` clears it.
 ### Document tabs
 
 `state()` and `call doc {}` report `text`, `textboxes`, `sel`, `anchor`,
-`caret`, `cross_story`, `para`, `run`, `view`, `hf_edit`, `ruler`, and `mail` from the active body
+`caret`, `cross_story`, `para`, `run`, `view`, `hf_edit`, `ruler`, `flow`, and `mail` from the active body
 editor. `doc` returns only those document fields. `text` is the main story;
 each paragraph contributes a final `\n`, including a table cell paragraph.
 Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
@@ -472,6 +472,18 @@ its cached result text, like revision text, has no editor caret and
 contributes no offset. An equation and an inline (not floating) picture
 each contribute one U+FFFC too (#1242); a floating picture contributes none.
 Text boxes appear in `textboxes` as separate stories.
+
+`flow` is the view's horizontal scroll and its tables as last painted (#1895,
+`docs/claude/docx-editing.md` "Web Layout fits tables to the view"):
+`scroll_x` and `max_scroll_x` (logical px), `text_width` (Web Layout's text
+column as last painted; `null` before it has drawn) and `tables`, one object
+per top-level body table the last frame painted (Print Layout's too):
+`block`, `width`, `left` / `right` (from the view's left), `fits_text` (at
+most `text_width`, +1 px) and `right_in_view`. A table is fitted to the
+width the frame before measured, so read it after a `shot`, which waits for
+the frame after the change. The embedded view's `ext-doc-read` reports
+`scroll_x`, `max_scroll_x`, `text_width` and `table_widths` the same way
+(`docs/claude/suite-extensions.md`).
 
 `table` is the caret's innermost table, or `null` outside one (#705):
 `rows`, `columns` (grid columns), the caret's `row` and `cell`, the table's
@@ -615,7 +627,7 @@ footer editor; `selection-set` refuses while it is open.
 | `fill-handle-into {"probe":"tab-more-item:*","except":["tab-more-item:23"],"inset":4,"within":"A1:T30"}` | select a cell of `within` whose fill-handle point (its bottom-right corner, where `pointer-click {"at":"fill-handle"}` presses) lies inside a probe's drawn bounds inset by `inset` logical pixels on every edge, edges included (#1149). `probe` names one probe, or ends in `*` for every drawn probe it starts, less those in `except`; of several fits, the one nearest its probe's centre. A wildcard lets a case aim at whichever more-tabs item a row line crosses: items and rows differ in height, so one item's inset band can miss every row line. Only cells fully on screen count, and `within` caps the search at 4000 cells, so a case can `snapshot` them all. The selection is set as a click's would be, without a click: an open list stays open and the grid does not scroll. It draws first, like the pointer verbs. Replies `{cell, x, y, probe, item}`, `item` being the more-tabs item under the point as `pointer-click` reports it. With no fit it is refused, giving the probe's bounds raw and inset (a wildcard's: the item nearest a handle) and the nearest cell's handle point and distance |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 9 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The ninth pressed move lands at the destination, so the drag's handlers see the final cell before the release. gpui arms a drag once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of 2px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-move {"to":"cell:C2"}` | dispatch a real hover (a move with no button held) at the region's centre through gpui's hit testing, as between gestures. Replies `{to:[x,y]}` |
-| `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. `"ctrl":true` holds Ctrl for the notch (Ctrl+wheel zooms the Project chart, #1535; a positive `dy` is wheel up). Refuses under a dialog; does not pre-close menus |
+| `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. `"ctrl":true` holds Ctrl for the notch (Ctrl+wheel zooms the Project chart, #1535; a positive `dy` is wheel up). `"shift":true` makes the notch horizontal, `point(dy, 0)` with Shift held, as the X11 and Wayland clients deliver a shifted wheel (#1895; a negative `dy` scrolls the content right; `docs/claude/docx-editing.md`). Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`, `export`), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible`. Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
 | `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` and `export` (a document tab only; Export is Change File Type, #635) and `account` call the rail's handler; `close` presses the rail's Close item (with no tab it does nothing, #806); `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
 | `recent-files {}` | read the recent files (#1194), newest first, from `<DOCXY_CONFIG_DIR>/docxy/recent.json` as it is now: `{files:[{index, path, name, kind, exists}], message}`, where `message` is what the Recent list shows under its heading (a missing file's row was clicked) or null; reopening the File screen clears it. A path is stored absolute and canonical, compared as text (ignoring case on Windows). `kind` is the tab the file opens as (`docx`, `xlsx`, `project`). A file is recorded when an open leaves a tab bound to it (not a failed load, a template, a restored session or a kept draft) and when a save moves a tab to a new file (Save As, a first save), including `proj.open` and `proj.save {path}`. At most 25 files; one file appears once however it was spelled. Every case in a run shares the store, so assert by position and `name`, not by count |

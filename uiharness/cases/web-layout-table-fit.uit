@@ -68,6 +68,23 @@ test issue 1895 Web Layout fits a table to the window and Print Layout draws its
   call doc {}
   assert reply.flow.scroll_x is {doc.flow.max_scroll_x}
   assert reply.flow.tables.0.right_in_view is true
+  # Keys in the scrolled table keep the sideways scroll: the caret is
+  # followed in y only (#1895 r1). Into the right cell, a letter, Tab on.
+  call real-key {"key":"ctrl+home"}
+  call real-key {"key":"tab"}
+  call real-type {"text":"x"}
+  call real-key {"key":"tab"}
+  shot window
+  call doc {}
+  assert reply.flow.scroll_x is {doc.flow.max_scroll_x}
+  assert reply.flow.tables.0.right_in_view is true
+  assert table.cells.0.1.0 is x
+  # And typing in the paragraph after the table.
+  call real-key {"key":"ctrl+end"}
+  call real-type {"text":"y"}
+  shot window
+  call doc {}
+  assert reply.flow.scroll_x is {doc.flow.max_scroll_x}
   call pointer-wheel {"region":"window","dy":1000,"shift":true}
   shot window
   call doc {}

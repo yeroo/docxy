@@ -187,8 +187,21 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   scroll on both axes under a 12 px horizontal bar (`doc-hscrollbar`,
   `ext-doc-hscrollbar`); the doc tab's `ruler_scroll_view(.., shrink:
   true)` sets `min_w(0)`, else the flex item would widen to the table.
-  Print Layout passes false and still widens to a wide sheet. A caret in a
-  cell scrolled out of view does not scroll x.
+  Print Layout passes false and still widens to a wide sheet.
+- The flow view's caret follow is y only (#1895 r1): gpui's
+  `scroll_to_item` also moves x on a scroll area that scrolls sideways
+  (back to a wide block's left on every key), so `scroll_to_caret` only
+  sets `Docxy::doc_follow`, and the flow probe's prepaint (after the scroll
+  area recorded this layout's children, so a new or grown block is where it
+  is now drawn) runs `follow_item_y` (`follow_y`: gpui's FirstVisible for
+  y) and asks for one more frame when it moved: the follow shows a frame
+  after the edit. The last layout's bounds are not used: after an Enter or
+  a delete they can be another block's. A caret in a cell scrolled out of
+  view sideways does not scroll x. Print Layout keeps `scroll_to_item`
+  (its scroll area scrolls in y only).
+- `fitted_grid` caps a pct at 10000% (`MAX_FIT_PCT`) and the target at
+  `MAX_FIT_TW` (1,000,000 twips), so a mail body's `w:w="4000000000"` or
+  `"1e30%"` overflows nothing; cell sums saturate.
 - Harness: `doc`'s `flow` (`scroll_x`, `max_scroll_x`, `text_width`, and
   `tables`: each top-level table's `block`, `width`, `left` / `right` from
   the view's left, `fits_text`, `right_in_view`, Print Layout's too) and
