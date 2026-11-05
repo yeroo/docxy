@@ -2605,12 +2605,21 @@
   white space, ends its paragraph before a block), and
   `take_leading_marker` never drains an object.
 - The suite's converting child (`convert_child::convert_bytes`, which now
-  takes the page's path) resolves only local files beside the page:
-  `local_image_path` refuses every scheme but `file:`, UNC, device and
-  `file://host` paths (escaped spellings too) and Windows drive-relative
-  `C:x`; `read_local_image` reads a regular file within the limit, its size
-  checked first. So opening a page never reaches the network. The child
-  writes the package with its media (`ConvertedDoc::docx`).
+  takes the page's path) resolves only a relative src under the page's
+  folder, as Word, Outlook and Save Page write them (`page_files/…`;
+  `image_src_parts`, #1880 r1, a deliberate tightening of the plan's
+  absolute and `file:` paths): no URI scheme (`file:` included), no
+  absolute, rooted, drive, UNC or device path, no `:`, `?`, `*`, NUL (or
+  `<>|"`) once escapes are decoded, no `..` out of the folder, no name
+  ending in a dot or space. An absolute path is refused because looking at
+  one can reach the network (autofs or macOS's default `/net/<host>`,
+  `/afs`), as Windows' `\??\UNC\…` does. The page folder is made absolute
+  (`std::path::absolute`), and `read_local_image` walks each step below it
+  with `symlink_metadata`, refusing a symbolic link or (Windows) any
+  reparse point, then reads a regular file within the limit, its size
+  checked first. The page folder itself may be on a share or behind a link.
+  So opening a page never reaches the network. The child writes the
+  package with its media (`ConvertedDoc::docx`).
 - Out of scope: `<base href>`, MHTML, `<a>` around images, `srcset`,
   `<picture>`, background images, SVG/WebP (placeholders), `max-width`,
   float/align, the suite drawing a placeholder's alt text.

@@ -13,8 +13,10 @@
 //! of time is a load error; the suite carries on.
 //!
 //! A Web Page's images (#1880) come along: a `data:` src from the page, a
-//! file beside it through [`read_local_image`]; every other src (`cid:`,
-//! `http:`, a network path) is a placeholder, so opening a page never
+//! file under the page's folder through [`read_local_image`] (a relative
+//! src only, reached through no link: no absolute path or `file:` URI, so no
+//! automounted `/net/<host>` and no Windows `\??\` or UNC path); every
+//! other src (`cid:`, `http:`, …) is a placeholder, so opening a page never
 //! reaches the network.
 //!
 //! The ordinary `.docx`, Markdown and bundle loads stay in process. Unit
@@ -244,13 +246,27 @@ fn page_dir(path: Option<&Path>) -> Option<PathBuf> {
     })
 }
 
-/// The bytes of the local file `src` names beside a page in `page_dir`
-/// ([`local_image_path`]): a regular file of at most `limit` bytes, its
-/// size read before it is; `None` for anything else.
+/// The bytes of the file `src` names under the page's folder `page_dir`
+/// ([`image_src_parts`]): a regular file of at most `limit` bytes, reached
+/// through no symbolic link, junction or other reparse point (each step
+/// below `page_dir` is looked at with `symlink_metadata` before the next),
+/// its size read before it is; `None` for anything else. `page_dir` itself
+/// may be on a share or behind a link: it is where the page came from.
 pub(crate) fn read_local_image(page_dir: &Path, src: &str, limit: usize) -> Option<Vec<u8>> {
     use std::io::Read;
-    let path = local_image_path(page_dir, src)?;
-    let meta = std::fs::metadata(&path).ok()?;
+    let dir = std::path::absolute(page_dir).ok()?;
+    let target = local_image_path(&dir, src)?;
+    let mut path = dir.clone();
+    let mut meta = None;
+    for part in target.strip_prefix(&dir).ok()?.components() {
+        path.push(part);
+        let m = std::fs::symlink_metadata(&path).ok()?;
+        if is_link(&m) {
+            return None;
+        }
+        meta = Some(m);
+    }
+    let meta = meta?;
     if !meta.is_file() || meta.len() > limit as u64 {
         return None;
     }
@@ -263,74 +279,69 @@ pub(crate) fn read_local_image(page_dir: &Path, src: &str, limit: usize) -> Opti
     (bytes.len() <= limit).then_some(bytes)
 }
 
-/// The local file an `<img src>` names, for a page in `page_dir`; `None`
-/// for anything that is not one, so the network is never reached:
-///
-/// - a src with a URI scheme other than `file:` (`cid:`, `http:`, …);
-/// - a network or device path: `\\host\share`, `//host/share`,
-///   `\\?\…`, `\\.\…`, `file://host/…` (any host but `localhost`), and the
-///   same spelled with escapes (`file:///%5C%5Chost`);
-/// - a Windows drive-relative path (`C:x.png`, relative to that drive's
-///   current folder, not the page's).
-///
-/// A `file:` URI (`file:///x`, `file:///C:/x`, `file://localhost/x`)
-/// names its path; any other src is a path, absolute or relative to
-/// `page_dir`. Escapes are decoded, the query and fragment dropped, `\`
-/// and `/` both separators.
+/// A symbolic link, or on Windows any reparse point (a junction, a mount
+/// point), which could lead out of the page's folder.
+fn is_link(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    m.file_type().is_symlink()
+}
+
+/// The path an `<img src>` names under a page in `page_dir`, made absolute
+/// without touching the file system; `None` unless `src` is a relative
+/// path that stays in that folder ([`image_src_parts`]).
 pub(crate) fn local_image_path(page_dir: &Path, src: &str) -> Option<PathBuf> {
+    let parts = image_src_parts(src)?;
+    let dir = std::path::absolute(page_dir).ok()?;
+    Some(parts.iter().fold(dir, |p, c| p.join(c)))
+}
+
+/// The folder names and file name a relative `<img src>` names under the
+/// page's folder, the way Word, Outlook and a browser's Save Page write
+/// them (`page_files/image001.png`); `None` for anything else, so opening a
+/// page never reaches the network (#1880 r1):
+///
+/// - any URI scheme, `file:` included (`cid:`, `http:`, …);
+/// - an absolute or rooted path, a drive, UNC or device path: a `:` or a
+///   leading `/` or `\` anywhere, as written or escaped. A local absolute
+///   path is refused too: an automounter's `/net/<host>` (macOS's default,
+///   Linux autofs `-hosts`) or `/afs` contacts the host it names when the
+///   path is only looked at, and Windows hands `\??\UNC\…` to SMB;
+/// - `?`, `*` or a NUL once escapes are decoded (`%3F%3F` is not `??`), and
+///   `<`, `>`, `|`, `"`, which no Windows name holds;
+/// - a `..` that would leave the folder, and a name that ends in a dot or a
+///   space (Windows drops those, so `.. ` would be `..`).
+///
+/// Escapes are decoded after the query and fragment are cut from the src
+/// as written; `\` and `/` both separate names; `.` and empty names are
+/// skipped.
+pub(crate) fn image_src_parts(src: &str) -> Option<Vec<String>> {
     let src = src.trim();
-    if src.is_empty() || network_path(src) {
+    if uri_scheme(src).is_some() {
         return None;
     }
-    let path = match uri_scheme(src) {
-        Some(scheme) if scheme.eq_ignore_ascii_case("file") => {
-            let rest = &src[scheme.len() + 1..];
-            let path = match rest.strip_prefix("//") {
-                Some(after) => {
-                    let (host, path) =
-                        after.split_at(after.find(['/', '\\']).unwrap_or(after.len()));
-                    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
-                        return None;
-                    }
-                    path
-                }
-                None => rest,
-            };
-            let path = decoded_path(path)?;
-            // `file:///C:/x` names `C:/x`.
-            let path = match path.strip_prefix(['/', '\\']) {
-                Some(p) if drive_letter(p) => p.to_string(),
-                _ => path,
-            };
-            if network_path(&path) || !is_absolute_local(&path) {
-                return None;
-            }
-            path
-        }
-        Some(_) => return None,
-        None => {
-            let path = decoded_path(src)?;
-            if network_path(&path) {
-                return None;
-            }
-            path
-        }
-    };
-    if drive_letter(&path) && !path[2..].starts_with(['/', '\\']) {
+    let path = decoded_path(src)?;
+    if path.starts_with(['/', '\\']) || path.contains([':', '?', '*', '\0', '<', '>', '|', '"']) {
         return None;
     }
-    // On Windows `\` is a separator already; elsewhere it is one too here.
-    let path = if cfg!(windows) {
-        path
-    } else {
-        path.replace('\\', "/")
-    };
-    let path = PathBuf::from(path);
-    Some(if path.is_absolute() {
-        path
-    } else {
-        page_dir.join(path)
-    })
+    let mut parts: Vec<String> = Vec::new();
+    for name in path.split(['/', '\\']) {
+        match name {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ if name.ends_with(['.', ' ']) => return None,
+            _ => parts.push(name.to_string()),
+        }
+    }
+    (!parts.is_empty()).then_some(parts)
 }
 
 /// A src's URI scheme: two or more of a letter then letters, digits, `+`,
@@ -345,30 +356,8 @@ fn uri_scheme(src: &str) -> Option<&str> {
     .then_some(scheme)
 }
 
-/// Whether `p` starts with a drive letter and its colon.
-fn drive_letter(p: &str) -> bool {
-    let b = p.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
-}
-
-/// A UNC, device or other network path: two separators first.
-fn network_path(p: &str) -> bool {
-    let b = p.as_bytes();
-    b.len() >= 2 && matches!(b[0], b'/' | b'\\') && matches!(b[1], b'/' | b'\\')
-}
-
-/// What a `file:` URI's path must be: a drive path on Windows, rooted
-/// elsewhere.
-fn is_absolute_local(p: &str) -> bool {
-    if cfg!(windows) {
-        drive_letter(p) && p[2..].starts_with(['/', '\\'])
-    } else {
-        p.starts_with('/')
-    }
-}
-
-/// A src path without its query and fragment, its `%XX` escapes decoded;
-/// `None` when that is not UTF-8 or holds a NUL.
+/// A src path without its query and fragment (cut as written), its `%XX`
+/// escapes decoded; `None` when that is not UTF-8 or is empty.
 fn decoded_path(src: &str) -> Option<String> {
     let path = src.split(['?', '#']).next().unwrap_or("");
     let b = path.as_bytes();
@@ -387,7 +376,7 @@ fn decoded_path(src: &str) -> Option<String> {
         i += 1;
     }
     let path = String::from_utf8(out).ok()?;
-    (!path.is_empty() && !path.contains('\0')).then_some(path)
+    (!path.is_empty()).then_some(path)
 }
 
 /// The parent's side: convert `path` as `what` in a child process.
@@ -791,17 +780,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_image_src_names_a_local_file_or_nothing() {
-        let dir = Path::new("pages");
-        let at = |src: &str| local_image_path(dir, src);
-        // Relative: beside the page; escapes, query and fragment.
+    fn an_image_src_names_a_file_under_the_page_or_nothing() {
+        let dir = std::path::absolute("pages").unwrap();
+        let at = |src: &str| local_image_path(&dir, src);
+        // Relative: under the page; escapes, query and fragment, `.`, `..`.
         assert_eq!(
             at("a_files/image001.png"),
-            Some(dir.join("a_files/image001.png"))
+            Some(dir.join("a_files").join("image001.png"))
+        );
+        assert_eq!(
+            at("a_files\\image001.png"),
+            Some(dir.join("a_files").join("image001.png"))
         );
         assert_eq!(at(" My%20Pic.png?v=2#top "), Some(dir.join("My Pic.png")));
-        assert_eq!(at("../up.gif"), Some(dir.join("../up.gif")));
-        // Schemes other than file: never.
+        assert_eq!(at("a/./b/../c.png"), Some(dir.join("a").join("c.png")));
+        assert_eq!(at("a//b.png"), Some(dir.join("a").join("b.png")));
+        // Any scheme, file: included.
         for src in [
             "cid:logo@example.com",
             "http://example.com/a.png",
@@ -809,79 +803,96 @@ pub(crate) mod tests {
             "about:blank",
             "javascript:x",
             "data:image/png;base64,AAAA",
-            "mailto:a@b",
+            "file:///srv/a.png",
+            "FILE:/srv/a.png",
+            "file://localhost/x",
+            "file://host/share/x.png",
+            "file:a.png",
         ] {
             assert_eq!(at(src), None, "{src}");
         }
-        // Network and device paths never, as written or escaped.
+        // Absolute, rooted, drive, UNC and device paths, as written or
+        // escaped; out of the folder; characters no name holds.
         for src in [
+            "/srv/a.png",
+            "/net/evil.example/x.png",
+            "../../../net/x",
+            "a/../../x.png",
+            "..",
+            "\\img\\a.png",
+            "C:\\img\\a.png",
+            "C:x.png",
             "\\\\host\\share\\x.png",
             "//host/share/x.png",
-            "/\\host/share/x.png",
             "\\\\?\\UNC\\host\\share\\x.png",
-            "\\\\?\\C:\\x.png",
             "\\\\.\\pipe\\x",
-            "file://host/share/x.png",
-            "file:////host/share/x.png",
-            "file://///host/share/x.png",
-            "file:///%5C%5Chost/share/x.png",
+            "\\%3F%3F\\UNC\\h\\s\\x.png",
+            "%5C%3F%3F%5CUNC%5Ch%5Cs%5Cx.png",
+            "%2Fsrv%2Fa.png",
             "%5C%5Chost/share/x.png",
-            "%2F%2Fhost/share/x.png",
+            "a%3Fb.png",
+            "a%3A.png",
+            "a%2A.png",
+            "a%00.png",
+            "a%7C.png",
+            "%FF.png",
+            ".. /x.png",
+            "a./x.png",
+            "a /x.png",
+            "",
+            ".",
+            "./",
         ] {
             assert_eq!(at(src), None, "{src}");
         }
-        // Drive-relative: that drive's current folder, not the page's.
-        assert_eq!(at("C:x.png"), None);
-        assert_eq!(at(""), None);
-        assert_eq!(at("a%00.png"), None);
-        assert_eq!(at("%FF.png"), None, "not UTF-8");
     }
 
-    #[cfg(not(windows))]
     #[test]
-    fn local_absolute_paths_and_file_uris_on_unix() {
-        let dir = Path::new("pages");
-        let at = |src: &str| local_image_path(dir, src);
-        assert_eq!(at("/srv/a.png"), Some(PathBuf::from("/srv/a.png")));
-        assert_eq!(
-            at("file:///srv/a%20b.png"),
-            Some(PathBuf::from("/srv/a b.png"))
-        );
-        assert_eq!(
-            at("file://localhost/srv/a.png"),
-            Some(PathBuf::from("/srv/a.png"))
-        );
-        assert_eq!(at("FILE:/srv/a.png"), Some(PathBuf::from("/srv/a.png")));
-        assert_eq!(at("file:a.png"), None, "a file: URI names an absolute path");
-        assert_eq!(at("file:///C:/a.png"), None, "no drives here");
-        // A Windows page's separators.
-        assert_eq!(
-            at("a_files\\image001.png"),
-            Some(dir.join("a_files/image001.png"))
-        );
-        assert_eq!(at("C:\\a.png"), Some(dir.join("C:/a.png")));
+    fn a_relative_page_folder_is_made_absolute() {
+        for dir in [Path::new("."), Path::new("sub")] {
+            let got = local_image_path(dir, "a_files/x.png").unwrap();
+            assert!(got.is_absolute(), "{}", got.display());
+            assert!(got.starts_with(std::path::absolute(dir).unwrap()));
+        }
+        assert_eq!(page_dir(None), None);
+        assert_eq!(page_dir(Some(Path::new("p.htm"))), Some(PathBuf::from(".")));
     }
 
     #[cfg(windows)]
     #[test]
-    fn local_absolute_paths_and_file_uris_on_windows() {
+    fn windows_paths_stay_under_the_page() {
         let dir = Path::new("C:\\pages");
         let at = |src: &str| local_image_path(dir, src);
-        assert_eq!(at("C:\\img\\a.png"), Some(PathBuf::from("C:\\img\\a.png")));
-        assert_eq!(at("d:/img/a.png"), Some(PathBuf::from("d:/img/a.png")));
-        assert_eq!(
-            at("file:///C:/img/a%20b.png"),
-            Some(PathBuf::from("C:/img/a b.png"))
-        );
-        assert_eq!(
-            at("file://localhost/C:/a.png"),
-            Some(PathBuf::from("C:/a.png"))
-        );
-        assert_eq!(at("file:///img/a.png"), None, "no drive");
-        assert_eq!(at("\\img\\a.png"), Some(PathBuf::from("C:\\img\\a.png")));
         assert_eq!(
             at("a_files\\image001.png"),
-            Some(dir.join("a_files\\image001.png"))
+            Some(dir.join("a_files").join("image001.png"))
+        );
+        assert_eq!(at("C:\\img\\a.png"), None);
+        assert_eq!(at("\\img\\a.png"), None);
+        assert_eq!(at("d:/img/a.png"), None);
+        assert_eq!(at("file:///C:/img/a.png"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_beside_the_page_is_not_followed() {
+        let dir = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        write(&target, "a.png", b"0123");
+        std::fs::create_dir(dir.0.join("real")).unwrap();
+        write(&dir, "real/b.png", b"4567");
+        std::os::unix::fs::symlink(target.0.join("a.png"), dir.0.join("file.png")).unwrap();
+        std::os::unix::fs::symlink(&target.0, dir.0.join("folder")).unwrap();
+        assert_eq!(
+            read_local_image(&dir.0, "real/b.png", 100).as_deref(),
+            Some(&b"4567"[..])
+        );
+        assert_eq!(read_local_image(&dir.0, "file.png", 100), None);
+        assert_eq!(read_local_image(&dir.0, "folder/a.png", 100), None);
+        // The page's own folder may be reached through a link.
+        assert_eq!(
+            read_local_image(&dir.0.join("folder"), "a.png", 100).as_deref(),
+            Some(&b"0123"[..])
         );
     }
 
@@ -898,8 +909,9 @@ pub(crate) mod tests {
         assert_eq!(read_local_image(&dir.0, "sub.png", 100), None);
         assert_eq!(read_local_image(&dir.0, "gone.png", 100), None);
         assert_eq!(read_local_image(&dir.0, "cid:a.png", 100), None);
+        assert_eq!(read_local_image(&dir.0, "../a.png", 100), None);
         #[cfg(unix)]
-        assert_eq!(read_local_image(Path::new("/"), "/dev/zero", 100), None);
+        assert_eq!(read_local_image(Path::new("/"), "dev/zero", 100), None);
     }
 
     #[test]
@@ -908,8 +920,6 @@ pub(crate) mod tests {
         let c = convert_bytes(What::Html, page, None).unwrap().unwrap();
         let base = c.base.as_ref().unwrap();
         let pkg = docxcore::package::load_package(&c.docx()).unwrap();
-        assert_eq!(page_dir(None), None);
-        assert_eq!(page_dir(Some(Path::new("p.htm"))), Some(PathBuf::from(".")));
         let media: Vec<&str> = pkg
             .part_names()
             .into_iter()
