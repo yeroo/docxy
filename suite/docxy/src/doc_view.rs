@@ -85,6 +85,10 @@ pub struct DocView {
     content_dark: bool,
     words: Words,
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The text width (px) as last painted, which tables fit to (#1895).
+    text_w: Rc<Cell<Option<f32>>>,
+    /// Each top-level table's painted bounds in the last frame (#1895).
+    tables: PaintedTables,
     /// The scroll offset of the last render: a Ctrl+wheel puts it back, as
     /// the scroll area has already moved by then.
     held_scroll: Point<Pixels>,
@@ -119,6 +123,8 @@ impl DocView {
             content_dark: false,
             words: Words::default(),
             viewport: Rc::default(),
+            text_w: Rc::default(),
+            tables: PaintedTables::default(),
             held_scroll: Point::default(),
             wheel_acc: 0.,
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
@@ -334,6 +340,14 @@ impl DocView {
         f32::from(self.scroll.max_offset().y).max(0.)
     }
 
+    fn scroll_x(&self) -> f32 {
+        -f32::from(self.scroll.offset().x)
+    }
+
+    fn max_scroll_x(&self) -> f32 {
+        f32::from(self.scroll.max_offset().x).max(0.)
+    }
+
     fn scroll_to(&mut self, y: f32) -> bool {
         let y = y.clamp(0., self.max_scroll_y());
         let x = self.scroll.offset().x;
@@ -417,6 +431,24 @@ impl DocView {
                 "max_scroll_y",
                 Json::Num(f64::from(self.max_scroll_y().round())),
             ),
+            ("scroll_x", Json::Num(f64::from(self.scroll_x().round()))),
+            (
+                "max_scroll_x",
+                Json::Num(f64::from(self.max_scroll_x().round())),
+            ),
+            (
+                "text_width",
+                self.text_w
+                    .get()
+                    .map_or(Json::Null, |w| Json::Num(f64::from(w.round()))),
+            ),
+            (
+                "table_widths",
+                painted_tables_json(
+                    &self.tables,
+                    self.viewport.get().map(|v| f32::from(v.origin.x)),
+                ),
+            ),
             (
                 "link_click",
                 Json::Str(
@@ -495,6 +527,7 @@ impl Focusable for DocView {
 impl Render for DocView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.words.borrow_mut().clear();
+        self.tables.borrow_mut().clear();
         self.held_scroll = self.scroll.offset();
         let theme_dark = cx.theme().mode.is_dark();
         let (bg, pal) = content_look(
@@ -537,6 +570,9 @@ impl Render for DocView {
             cell_run: None,
             pics: pictures::scope(pics.as_ref(), Some(BODY_PART)),
             page_vals: None,
+            // Tables fit the text width as last painted (#1895).
+            fit_width: self.text_w.get(),
+            tables: Some(&self.tables),
         };
         let blocks: Vec<AnyElement> = body
             .iter()
@@ -544,6 +580,7 @@ impl Render for DocView {
             .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
             .collect();
         let viewport = self.viewport.clone();
+        let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
         div()
             .id("ext-doc-view")
             .font_family(ui_font)
@@ -581,12 +618,25 @@ impl Render for DocView {
                     .id("ext-doc-scroll")
                     .track_scroll(&self.scroll)
                     .size_full()
-                    .overflow_y_scroll()
+                    // Both axes: a table wider than the view scrolls
+                    // sideways (#1895).
+                    .overflow_scroll()
                     .text_color(pal.fg)
                     .px(px(48.))
                     .py(px(28.))
                     .gap_1()
-                    .children(blocks),
+                    .children(blocks)
+                    // The text width, inside the padding: a percent width
+                    // resolves against the scroll area, not its extent.
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(0.))
+                            .child(fit_width_probe(used_w, move |b| {
+                                text_w.set(Some(f32::from(b.size.width)))
+                            })),
+                    ),
             )
             .child(
                 canvas(
@@ -608,6 +658,19 @@ impl Render for DocView {
                     .child(
                         Scrollbar::vertical(&self.scroll)
                             .id("ext-doc-scrollbar")
+                            .scrollbar_show(ScrollbarShow::Scrolling),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .h(px(12.))
+                    .child(
+                        Scrollbar::horizontal(&self.scroll)
+                            .id("ext-doc-hscrollbar")
                             .scrollbar_show(ScrollbarShow::Scrolling),
                     ),
             )
