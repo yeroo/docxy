@@ -13,7 +13,7 @@ use rusqlite::{Connection, Row, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, MasterCategory, Message,
-    Recipient, Recurrence,
+    MessageFields, Recipient, Recurrence,
 };
 use crate::json::{self, Value};
 
@@ -752,6 +752,111 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Inserts or updates a message row from a Graph item that may be
+    /// partial (#1899), filing it under `folder_id`: on an existing row only
+    /// the columns whose property `fields` says the item carried are
+    /// written, so an absent property never blanks a stored one; a missing
+    /// row is inserted with what the item carried (empty otherwise). With
+    /// every property carried it writes exactly what `upsert_message` does.
+    /// `is_meeting_request` and `is_draft` follow
+    /// `MessageFields::writes_meeting_request` / `writes_is_draft`.
+    ///
+    /// One static statement, so the FTS update trigger fires once.
+    pub fn merge_message(
+        &self,
+        folder_id: &str,
+        m: &Message,
+        fields: &MessageFields,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO messages (
+                 id, folder_id, conversation_id, subject, from_name, from_addr,
+                 to_recipients, cc_recipients, received_at, sent_at,
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                 is_meeting_request, categories
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(id) DO UPDATE SET
+                 folder_id = excluded.folder_id,
+                 conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
+                 subject = CASE WHEN ?20 THEN excluded.subject ELSE messages.subject END,
+                 from_name = CASE WHEN ?21 THEN excluded.from_name ELSE messages.from_name END,
+                 from_addr = CASE WHEN ?21 THEN excluded.from_addr ELSE messages.from_addr END,
+                 to_recipients = CASE WHEN ?22 THEN excluded.to_recipients ELSE messages.to_recipients END,
+                 cc_recipients = CASE WHEN ?23 THEN excluded.cc_recipients ELSE messages.cc_recipients END,
+                 received_at = CASE WHEN ?24 THEN excluded.received_at ELSE messages.received_at END,
+                 sent_at = CASE WHEN ?25 THEN excluded.sent_at ELSE messages.sent_at END,
+                 is_read = CASE WHEN ?26 THEN excluded.is_read ELSE messages.is_read END,
+                 is_flagged = CASE WHEN ?27 THEN excluded.is_flagged ELSE messages.is_flagged END,
+                 has_attachments = CASE WHEN ?28 THEN excluded.has_attachments ELSE messages.has_attachments END,
+                 importance = CASE WHEN ?29 THEN excluded.importance ELSE messages.importance END,
+                 preview = CASE WHEN ?30 THEN excluded.preview ELSE messages.preview END,
+                 is_draft = CASE WHEN ?31 THEN excluded.is_draft ELSE messages.is_draft END,
+                 is_meeting_request = CASE WHEN ?32 THEN excluded.is_meeting_request ELSE messages.is_meeting_request END,
+                 categories = CASE WHEN ?33 THEN excluded.categories ELSE messages.categories END",
+            params![
+                m.id,
+                folder_id,
+                m.conversation_id,
+                m.subject,
+                m.from.name,
+                m.from.address,
+                encode_recipients(&m.to),
+                encode_recipients(&m.cc),
+                m.received,
+                m.sent,
+                m.is_read,
+                m.is_flagged,
+                m.has_attachments,
+                m.importance,
+                m.preview,
+                m.is_draft,
+                m.is_meeting_request,
+                encode_categories(&m.categories),
+                fields.conversation_id,
+                fields.subject,
+                fields.from,
+                fields.to,
+                fields.cc,
+                fields.received,
+                fields.sent,
+                fields.is_read,
+                fields.flag,
+                fields.has_attachments,
+                fields.importance,
+                fields.preview,
+                fields.writes_is_draft(),
+                fields.writes_meeting_request(),
+                fields.categories,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Up to `limit` ids of `folder_id`'s header-less rows (`received_at`
+    /// empty: every message Graph has carries `receivedDateTime`), oldest
+    /// row first, for the sync engine to complete from Graph (#1899). A row
+    /// docxy made itself is left out: a `local:` id, a draft
+    /// (`is_draft = 1`, still edited here), and a row with a `local_id` (a
+    /// draft reconciled and then sent: `mark_sent` cleared `is_draft`, and a
+    /// `SendDraft` retry may still need the row). Mail Graph delivered has
+    /// none of these.
+    pub fn headerless_message_ids(
+        &self,
+        folder_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM messages
+             WHERE folder_id = ?1 AND received_at = ''
+               AND substr(id, 1, 6) <> 'local:' AND is_draft = 0 AND local_id IS NULL
+             ORDER BY rowid LIMIT ?2",
+        )?;
+        let ids = stmt
+            .query_map(params![folder_id, limit as i64], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
     }
 
     /// Deletes a message by id. Affects zero rows (not an error) if the id
@@ -2560,6 +2665,259 @@ mod tests {
         s.set_read("10", true);
         let rows = s.messages_in_folder("F", 50, 0).unwrap();
         assert!(rows[0].is_read);
+    }
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    /// Every column of a message row, as SQLite holds it.
+    fn raw_row(s: &Store, id: &str) -> Vec<rusqlite::types::Value> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT * FROM messages WHERE id = ?1")
+            .unwrap();
+        let n = stmt.column_count();
+        stmt.query_row(params![id], |r| {
+            (0..n)
+                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .collect()
+        })
+        .unwrap()
+    }
+
+    /// The fields a Graph item `{id, isRead}` carries.
+    fn read_only_fields() -> MessageFields {
+        MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        }
+    }
+
+    #[test]
+    fn merge_message_updates_only_present_columns() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        let mut full = msg("11", false);
+        full.is_flagged = true;
+        full.categories = vec!["Work".into()];
+        full.to = vec![Recipient {
+            name: "B".into(),
+            address: "b@x".into(),
+        }];
+        s.upsert_message("F", &full).unwrap();
+        let before = raw_row(&s, "11");
+
+        // `{id, isRead: true}` as `Message::from_json` parses it: every
+        // other field empty.
+        let partial = Message {
+            id: "11".into(),
+            conversation_id: String::new(),
+            subject: String::new(),
+            from: Recipient::default(),
+            to: vec![],
+            cc: vec![],
+            received: String::new(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: String::new(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+        };
+        s.merge_message("G", &partial, &read_only_fields()).unwrap();
+        let after = raw_row(&s, "11");
+
+        let stmt = s.conn.prepare("SELECT * FROM messages LIMIT 0").unwrap();
+        let names: Vec<String> = stmt.column_names().iter().map(|c| c.to_string()).collect();
+        for (i, name) in names.iter().enumerate() {
+            match name.as_str() {
+                "is_read" => assert_eq!(after[i], rusqlite::types::Value::Integer(1)),
+                "folder_id" => assert_eq!(after[i], rusqlite::types::Value::Text("G".into())),
+                _ => assert_eq!(after[i], before[i], "{name} kept"),
+            }
+        }
+        let is_read = names.iter().position(|n| n == "is_read").unwrap();
+        assert_ne!(before[is_read], after[is_read]);
+        // The full-text index still finds the kept subject.
+        let hits = s.search("s11", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn merge_message_inserts_missing_row() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let mut m = msg("12", true);
+        m.subject = String::new();
+        m.received = String::new();
+        s.merge_message("F", &m, &read_only_fields()).unwrap();
+        let rows = s.messages_in_folder("F", 10, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "12");
+        assert!(rows[0].is_read);
+        assert_eq!(rows[0].subject, "");
+        assert_eq!(rows[0].received_at, "");
+        // And it is header-less, so the engine will complete it.
+        assert_eq!(s.headerless_message_ids("F", 10).unwrap(), vec!["12"]);
+    }
+
+    #[test]
+    fn merge_with_all_fields_matches_upsert() {
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        for s in [&a, &b] {
+            folder(s, "F");
+        }
+        let mut m = msg("13", true);
+        m.is_flagged = true;
+        m.has_attachments = true;
+        m.categories = vec!["X".into(), "Y".into()];
+        m.cc = vec![Recipient {
+            name: "C".into(),
+            address: "c@x".into(),
+        }];
+        // Fresh insert.
+        a.upsert_message("F", &m).unwrap();
+        b.merge_message("F", &m, &MessageFields::all()).unwrap();
+        assert_eq!(raw_row(&a, "13"), raw_row(&b, "13"));
+        // Over an existing row, with every field changed.
+        let mut m2 = msg("13", false);
+        m2.subject = "changed".into();
+        m2.importance = "high".into();
+        a.upsert_message("F", &m2).unwrap();
+        b.merge_message("F", &m2, &MessageFields::all()).unwrap();
+        assert_eq!(raw_row(&a, "13"), raw_row(&b, "13"));
+        assert_eq!(
+            a.messages_in_folder("F", 10, 0).unwrap()[0].subject,
+            "changed"
+        );
+    }
+
+    /// The `MessageFields` of a complete Graph item under `MESSAGE_SELECT`:
+    /// every selected key, no `isDraft` (not selected) and no `@odata.type`
+    /// (a plain message).
+    fn complete_plain_fields() -> MessageFields {
+        MessageFields {
+            is_draft: false,
+            odata_type: false,
+            ..MessageFields::all()
+        }
+    }
+
+    #[test]
+    fn merge_plain_message_clears_meeting_flag_like_upsert() {
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        let mut invite = msg("14", false);
+        invite.is_meeting_request = true;
+        for s in [&a, &b] {
+            folder(s, "F");
+            s.upsert_message("F", &invite).unwrap();
+        }
+        let plain = msg("14", false);
+        let fields = complete_plain_fields();
+        assert!(!fields.is_partial());
+        a.upsert_message("F", &plain).unwrap();
+        b.merge_message("F", &plain, &fields).unwrap();
+        assert_eq!(raw_row(&a, "14"), raw_row(&b, "14"));
+        let flag: bool = b
+            .conn
+            .query_row(
+                "SELECT is_meeting_request FROM messages WHERE id = '14'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!flag);
+    }
+
+    #[test]
+    fn merge_complete_item_clears_draft_like_upsert_and_partial_keeps_it() {
+        let a = Store::open_in_memory().unwrap();
+        let b = Store::open_in_memory().unwrap();
+        let mut draft = msg("15", false);
+        draft.is_draft = true;
+        for s in [&a, &b] {
+            folder(s, "F");
+            s.upsert_message("F", &draft).unwrap();
+        }
+        let is_draft = |s: &Store| -> bool {
+            s.conn
+                .query_row("SELECT is_draft FROM messages WHERE id = '15'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        // A partial `{id, isRead}` keeps the draft a draft.
+        let mut read = msg("15", true);
+        read.is_draft = false;
+        b.merge_message("F", &read, &read_only_fields()).unwrap();
+        assert!(is_draft(&b));
+        // A complete item (no `isDraft` key) writes 0, as `upsert_message`.
+        let plain = msg("15", false);
+        a.upsert_message("F", &plain).unwrap();
+        b.merge_message("F", &plain, &complete_plain_fields())
+            .unwrap();
+        assert_eq!(raw_row(&a, "15"), raw_row(&b, "15"));
+        assert!(!is_draft(&b));
+    }
+
+    #[test]
+    fn headerless_ids_skip_local_and_draft_rows() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "Other");
+        let blank = |id: &str| {
+            let mut m = msg("01", false);
+            m.id = id.into();
+            m.received = String::new();
+            m
+        };
+        s.upsert_message("F", &blank("G1")).unwrap();
+        s.upsert_message("F", &msg("02", false)).unwrap(); // complete: not listed
+        s.upsert_message("Other", &blank("G2")).unwrap(); // another folder
+        s.upsert_message("F", &blank("local:abc")).unwrap();
+        let mut draft = blank("G3");
+        draft.is_draft = true;
+        s.upsert_message("F", &draft).unwrap();
+        s.upsert_message("F", &blank("G4")).unwrap();
+        assert_eq!(s.headerless_message_ids("F", 10).unwrap(), vec!["G1", "G4"]);
+        assert_eq!(s.headerless_message_ids("F", 1).unwrap(), vec!["G1"]);
+    }
+
+    #[test]
+    fn headerless_ids_skip_reconciled_sent_draft() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "SENT");
+        // A draft written here, reconciled to its Graph id, then sent:
+        // `local_id` set, `is_draft = 0`, `received_at = ''`, in Sent Items.
+        let local = s.create_local_draft("Hi", "bob@x", "", "<p>x</p>").unwrap();
+        s.reconcile_id(&local, "GRAPH-DRAFT").unwrap();
+        s.mark_sent("GRAPH-DRAFT");
+        s.move_message("GRAPH-DRAFT", "SENT").unwrap();
+        let (received, is_draft): (String, bool) = s
+            .conn
+            .query_row(
+                "SELECT received_at, is_draft FROM messages WHERE id = 'GRAPH-DRAFT'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((received.as_str(), is_draft), ("", false));
+        assert!(s.headerless_message_ids("SENT", 10).unwrap().is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, MasterCategory, Message,
-    OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
+    MessageFields, OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -216,6 +216,19 @@ impl GraphClient {
         let v = parse_body(resp)?;
         DeltaPage::from_json(&v)
             .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))
+    }
+
+    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT`: one message's
+    /// stored properties, with which of them the response carried. The
+    /// sync engine completes a header-less row with it (#1899).
+    pub fn get_message(&self, message_id: &str) -> Result<(Message, MessageFields), GraphError> {
+        let message_id = encode_path_segment(message_id);
+        let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT}");
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        let m = Message::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
+        Ok((m, MessageFields::of(&v)))
     }
 
     /// GET `/me/messages/{id}?$select=body`. When `prefer_text` is set,
@@ -1178,6 +1191,50 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer SECRET")
         );
+    }
+
+    #[test]
+    fn get_message_selects_header_fields() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"M1","subject":"Hi","from":{"emailAddress":{"name":"A","address":"a@x"}},"receivedDateTime":"2026-01-01T00:00:00Z","isRead":true}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (m, f) = c.get_message("M1").unwrap();
+        assert_eq!(m.subject, "Hi");
+        assert_eq!(m.from.address, "a@x");
+        assert_eq!(m.received, "2026-01-01T00:00:00Z");
+        assert!(!f.is_partial());
+        assert!(!f.preview, "bodyPreview was not in the response");
+        let path = &srv.requests()[0].path;
+        assert!(path.starts_with("/me/messages/M1?$select="), "{path}");
+        for field in [
+            "receivedDateTime",
+            "subject",
+            "from",
+            "isRead",
+            "bodyPreview",
+        ] {
+            assert!(path.contains(field), "{field} selected: {path}");
+        }
+    }
+
+    #[test]
+    fn get_message_escapes_id() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"A/B+C="}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.get_message("A/B+C=").unwrap();
+        let path = &srv.requests()[0].path;
+        assert!(path.starts_with("/me/messages/A%2FB%2BC%3D?"), "{path}");
     }
 
     #[test]
