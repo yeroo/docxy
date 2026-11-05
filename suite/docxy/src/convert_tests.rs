@@ -64,6 +64,52 @@ fn a_word_web_page_in_windows_1252_opens_converted_from_html() {
     assert_eq!(texts(&tab), ["Title", "Caf\u{e9} \u{20ac}"]);
 }
 
+#[test]
+fn a_web_pages_links_open_as_hyperlinks() {
+    // #1879: a plain page (not an editable-HTML bundle) with a link, an
+    // anchor link and a `javascript:` one.
+    let dir = Scratch::new();
+    let path = write(
+        &dir,
+        "links.htm",
+        b"<html><body><p>See <a href=\"https://example.com/a?b=1&amp;c=2\">the docs</a>, \
+          <a href=\"#top\">top</a> or <a href=\"javascript:go()\">this</a>.</p></body></html>",
+    );
+    let tab = tab_from_path(&path);
+    assert_eq!(tab.status.as_ref(), "loaded (converted from HTML)");
+    assert!(tab.bundle_html.is_none());
+    assert_eq!(texts(&tab), ["See the docs, top or this."]);
+    let Surface::Doc(ed) = &tab.surface else {
+        panic!("not a document tab")
+    };
+    let Block::Paragraph(p) = &ed.doc.body[0] else {
+        panic!("{:?}", ed.doc.body)
+    };
+    let links: Vec<(Option<&str>, Option<&str>, String)> = p
+        .content
+        .iter()
+        .filter_map(|i| match i {
+            docxcore::model::Inline::Hyperlink(h) => Some((
+                h.target.as_deref(),
+                h.anchor.as_deref(),
+                h.runs.iter().map(|r| r.text.as_str()).collect(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        links,
+        [
+            (
+                Some("https://example.com/a?b=1&c=2"),
+                None,
+                "the docs".to_string()
+            ),
+            (None, Some("top"), "top".to_string()),
+        ]
+    );
+}
+
 /// A PNG header `image::sniff` reads as `w` x `h`.
 fn png(w: u32, h: u32) -> Vec<u8> {
     let mut out = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();

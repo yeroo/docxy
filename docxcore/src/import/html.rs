@@ -26,7 +26,17 @@
 //! above it are computed again), an end reopens the formatting elements
 //! left open inside (three alike at most), and no close reaches across a
 //! table, as in a browser. White space collapses as a browser collapses it, except in
-//! `pre`. Links' targets and forms are not converted.
+//! `pre`. Forms are not converted.
+//!
+//! Links (#1879): an `<a href>` to an absolute `http`, `https`, `ftp` or
+//! `mailto` URL is a hyperlink to it, and `href="#name"` an anchor link to
+//! `name`; any other `href` (`javascript:`, `data:`, `file:`, relative, …)
+//! leaves plain text ([`link_of`]). The link is part of the computed look,
+//! so it follows the cascade, the reopened formatting elements and
+//! mis-nesting as formatting does; an `a` ends an open `a` first. A link
+//! has a browser's look (underline, Word's Hyperlink blue) under the page's
+//! CSS. A break, tab or picture inside a link is written outside it. The
+//! saved package gets the links' relationships.
 //!
 //! Images (#1880) only through [`import_html_with`] ([`html_image`]): an
 //! `<img>` is an inline picture sized by its `width` / `height` (attributes,
@@ -49,12 +59,25 @@
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
 use super::html_image::{self, ImageResolver, Images, ImportedMedia, Source};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
-use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
+use super::{Budget, Builder, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
 use crate::model::{Align, Block as DocBlock, Document, Inline, ParProps, RunProps, VertAlign};
 use crate::package::Package;
+use std::rc::Rc;
 
 /// The longest tag name or list marker kept, in bytes.
 const MAX_TAG: usize = 32;
+
+/// The longest link target or anchor kept (#1879), in bytes, once
+/// normalized; a longer `href` is not a link.
+pub(crate) const MAX_HREF: usize = 4096;
+
+/// The URL schemes an `href` may name to become a link (#1879), lowercase:
+/// an allow-list, so `javascript:`, `data:`, `file:` and any other scheme,
+/// however spelled, stays text.
+const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
+
+/// The colour of a link's user-agent look (#1879): Word's Hyperlink style.
+const LINK_COLOR: &str = "0563C1";
 
 /// Read an HTML page. `Err` when it holds no text, or would cost more
 /// than an import may ([`TOO_BIG`]).
@@ -383,6 +406,10 @@ struct Look {
     /// `valign` / `vertical-align` of a row group, row or cell, inherited
     /// by the cells below and reset at a `table`.
     valign: Option<VAlign>,
+    /// The link the text is in (#1879): set by an `a` (none when its
+    /// `href` is not a usable link), inherited. Shared, so a look's clone
+    /// stays O(1) whatever the target's length.
+    link: Option<Rc<Link>>,
 }
 
 /// An open element.
@@ -471,6 +498,7 @@ struct Attrs {
     src: Option<String>,
     alt: Option<String>,
     height: Option<String>,
+    href: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -479,6 +507,9 @@ struct Cascade {
     look: Look,
     kind: Kind,
     parent_pt: f64,
+    /// The parent's run colour: what `color: inherit` gives back (#1879:
+    /// over a link's user-agent blue).
+    parent_color: Option<String>,
     margin: [Option<Len>; 4],
     padding: [Option<Len>; 4],
     text_indent: Option<Len>,
@@ -634,10 +665,12 @@ impl Cascade {
             look.shade = None;
         }
         let parent_pt = font_pt(&look.run);
+        let parent_color = look.run.color.clone();
         Cascade {
             look,
             kind,
             parent_pt,
+            parent_color,
             margin: [None; 4],
             padding: [None; 4],
             text_indent: None,
@@ -697,8 +730,18 @@ impl Cascade {
 
     /// Presentational attributes: `align` on a block, cell, row or row
     /// group; `bgcolor` and `valign` on a table part; `width` on a table or
-    /// cell; `<font color face size>`.
+    /// cell; `<font color face size>`; an `a`'s `href` (#1879).
     fn presentational(&mut self, tag: &str, attrs: &Attrs) {
+        if tag == "a" {
+            // A link (#1879), with a browser's `a:link` look; the page's
+            // CSS on or inside it overrides that. An `a` without a usable
+            // `href` (`<a name>`, `javascript:`) is no link.
+            self.look.link = attrs.href.as_deref().and_then(link_of).map(Rc::new);
+            if self.look.link.is_some() {
+                self.look.run.underline = true;
+                self.look.run.color = Some(LINK_COLOR.to_string());
+            }
+        }
         if matches!(self.kind, Kind::Block | Kind::Cell) || self.table_part() {
             if let Some(a) = attrs.align.as_deref().and_then(align_value) {
                 self.look.align = Some(a);
@@ -754,7 +797,10 @@ impl Cascade {
             "color" => match css::color(v) {
                 Some(Color::Rgb(c)) => run.color = Some(c),
                 Some(Color::Reset) => run.color = None,
-                Some(Color::Keep) | None => {}
+                // The parent's, over a user-agent or presentational colour
+                // set on this element (#1879).
+                Some(Color::Keep) => run.color.clone_from(&self.parent_color),
+                None => {}
             },
             "background" | "background-color" => {
                 if let Some(c) = css::background(v) {
@@ -1080,8 +1126,8 @@ struct Html<'a> {
     /// Open `pre` elements on `blocks`.
     pre: usize,
     /// A space is owed before the next visible character, in these
-    /// properties.
-    space: Option<RunProps>,
+    /// properties and link.
+    space: Option<(RunProps, Option<Rc<Link>>)>,
     /// Nothing visible yet in this paragraph (leading spaces are dropped).
     para_start: bool,
     /// Inside `<![if !supportLists]>`: text is the list marker.
@@ -1246,6 +1292,12 @@ impl<'a> Html<'a> {
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
         let kind = Kind::of(name);
+        // An `a` ends the open `a` first (#1879), as a browser's adoption
+        // agency does: the formatting inside it is reopened under the new
+        // one. Nothing when none is open, nor across a table or cell.
+        if name == "a" {
+            self.close_tag("a");
+        }
         // Omitted table end tags (#1872 r3): a cell ends the open cell of its
         // row, a row the open cell and row of its table, a row group both
         // and the open row group; never across a nested table.
@@ -1814,8 +1866,11 @@ impl<'a> Html<'a> {
         };
         let Some(box_twips) = html_image::picture_twips(width, height, pixels) else {
             if !alt.is_empty() {
+                // Alt text in a link is the link's text, as a browser
+                // shows it (#1879).
+                let link = self.run_link();
                 self.pay_space();
-                self.out.text(&alt, &props);
+                self.out.link_text(&alt, &props, link.as_deref());
                 self.para_start = false;
             }
             return;
@@ -1835,11 +1890,17 @@ impl<'a> Html<'a> {
         self.para_start = false;
     }
 
-    /// Write the space owed before what comes next, in its own properties.
+    /// Write the space owed before what comes next, in its own properties
+    /// and link.
     fn pay_space(&mut self) {
-        if let Some(sp) = self.space.take() {
-            self.out.text(" ", &sp);
+        if let Some((sp, link)) = self.space.take() {
+            self.out.link_text(" ", &sp, link.as_deref());
         }
+    }
+
+    /// The link the innermost element's text is in (#1879).
+    fn run_link(&self) -> Option<Rc<Link>> {
+        self.elems.last().and_then(|e| e.look.link.clone())
     }
 
     fn run_props(&self) -> RunProps {
@@ -1870,18 +1931,21 @@ impl<'a> Html<'a> {
             return;
         }
         let props = self.run_props();
+        let link = self.run_link();
         let mut out = String::new();
         for c in text.chars() {
             if self.pre > 0 {
+                // A break or tab is written outside the link, which goes on
+                // after it as a link of its own to the same place.
                 match c {
                     '\n' => {
-                        self.out.text(&out, &props);
+                        self.out.link_text(&out, &props, link.as_deref());
                         out.clear();
                         self.out.line_break(&props);
                     }
                     '\r' => {}
                     '\t' => {
-                        self.out.text(&out, &props);
+                        self.out.link_text(&out, &props, link.as_deref());
                         out.clear();
                         self.out.tab(&props);
                     }
@@ -1892,20 +1956,21 @@ impl<'a> Html<'a> {
             }
             if c.is_ascii_whitespace() {
                 if !self.para_start && self.space.is_none() {
-                    self.space = Some(props.clone());
+                    self.space = Some((props.clone(), link.clone()));
                 }
                 continue;
             }
-            // The owed space is in the formatting it was written in.
+            // The owed space is in the formatting and link it was written
+            // in.
             match self.space.take() {
-                Some(sp) if sp == props => out.push(' '),
-                Some(sp) => self.out.text(" ", &sp),
+                Some((sp, sl)) if sp == props && sl == link => out.push(' '),
+                Some((sp, sl)) => self.out.link_text(" ", &sp, sl.as_deref()),
                 None => {}
             }
             self.para_start = false;
             out.push(c);
         }
-        self.out.text(&out, &props);
+        self.out.link_text(&out, &props, link.as_deref());
     }
 
     fn par_props(&self) -> ParProps {
@@ -2093,10 +2158,11 @@ fn attrs_of(attrs: &str) -> Attrs {
             "src" => Some(&mut out.src),
             "alt" => Some(&mut out.alt),
             "height" => Some(&mut out.height),
+            "href" => Some(&mut out.href),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
-            *slot = Some(entities(value));
+            *slot = Some(attr_entities(value));
         }
         if i == start {
             i += 1;
@@ -2105,8 +2171,71 @@ fn attrs_of(attrs: &str) -> Attrs {
     out
 }
 
+/// The link an `href` (its character references decoded) makes (#1879),
+/// read as a browser's URL parser reads it: leading and trailing control
+/// characters and spaces stripped, every tab and line break inside removed
+/// (so `java\tscript:` is `javascript:`). `#name` is an anchor link to
+/// `name`, percent-decoded. Otherwise only an absolute URL whose scheme is
+/// in [`LINK_SCHEMES`] is a link, its scheme lowercased and space, `"`,
+/// `<`, `>` and `` ` `` percent-encoded (a field's `HYPERLINK "…"` quotes
+/// it). `None` (no link) for anything else: a relative or empty `href`, one
+/// holding another control character, one longer than [`MAX_HREF`].
+fn link_of(href: &str) -> Option<Link> {
+    // Bounded by the limit, not by the attribute.
+    if href.len() > 2 * MAX_HREF {
+        return None;
+    }
+    let href: String = href
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    if href.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(fragment) = href.strip_prefix('#') {
+        let name = String::from_utf8_lossy(&html_image::percent_decode(fragment)).into_owned();
+        let usable =
+            !name.is_empty() && name.len() <= MAX_HREF && !name.chars().any(char::is_control);
+        return usable.then_some(Link::Anchor(name));
+    }
+    let (scheme, rest) = href.split_once(':')?;
+    let mut letters = scheme.chars();
+    let is_scheme = letters.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && letters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !is_scheme || rest.is_empty() || !LINK_SCHEMES.iter().any(|k| scheme.eq_ignore_ascii_case(k))
+    {
+        return None;
+    }
+    let mut url = scheme.to_ascii_lowercase();
+    url.push(':');
+    for c in rest.chars() {
+        match c {
+            ' ' => url.push_str("%20"),
+            '"' => url.push_str("%22"),
+            '<' => url.push_str("%3C"),
+            '>' => url.push_str("%3E"),
+            '`' => url.push_str("%60"),
+            _ => url.push(c),
+        }
+    }
+    (url.len() <= MAX_HREF).then_some(Link::Url(url))
+}
+
 /// `text` with character references decoded.
 fn entities(text: &str) -> String {
+    decode_references(text, false)
+}
+
+/// An attribute value with character references decoded, as HTML decodes
+/// them there (#1879 r1): a named reference not ended by `;` and followed
+/// by `=` or an ASCII letter or digit is kept as written, so
+/// `href="?id=3&copy=2"` keeps its `&copy=2`.
+fn attr_entities(value: &str) -> String {
+    decode_references(value, true)
+}
+
+fn decode_references(text: &str, in_attribute: bool) -> String {
     if !text.contains('&') {
         return text.to_string();
     }
@@ -2127,7 +2256,9 @@ fn entities(text: &str) -> String {
             };
             n.map(numeric_char)
         } else {
-            named(name)
+            let next = rest[end..].chars().next();
+            let held = in_attribute && next.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric());
+            if held { None } else { named(name) }
         };
         match decoded {
             Some(c) => {
@@ -4068,5 +4199,478 @@ mod image_tests {
         let b = Budget::new(1000, crate::import::MAX_WORK);
         import_html_within(b"<p>x<img src=a.png></p>", &b, Some(&mut resolve)).unwrap();
         assert_eq!(limits, [1000]);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    //! `<a href>` links (#1879).
+    use super::*;
+    use crate::import::paragraph_texts;
+    use crate::model::{Block as DocBlock, Hyperlink, Paragraph, Run};
+
+    const U: &str = "https://x.test/";
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    fn all_paras(d: &Document) -> Vec<Paragraph> {
+        fn walk(blocks: &[DocBlock], out: &mut Vec<Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p.clone()),
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    fn links(d: &Document) -> Vec<Hyperlink> {
+        all_paras(d)
+            .iter()
+            .flat_map(|p| p.content.clone())
+            .filter_map(|i| match i {
+                Inline::Hyperlink(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One paragraph's inlines as a sketch: `Run "x"`, `Link <target or
+    /// #anchor> ["a", "b"]`, `Break`, `Tab`, `Object`.
+    fn sketch(p: &Paragraph) -> Vec<String> {
+        p.content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => format!("Run {:?}", r.text),
+                Inline::Hyperlink(h) => {
+                    let to = match (&h.target, &h.anchor) {
+                        (Some(t), None) => t.clone(),
+                        (None, Some(a)) => format!("#{a}"),
+                        other => format!("{other:?}"),
+                    };
+                    let runs: Vec<&str> = h.runs.iter().map(|r| r.text.as_str()).collect();
+                    format!("Link {to} {runs:?}")
+                }
+                Inline::Break(..) => "Break".into(),
+                Inline::Tab(_) => "Tab".into(),
+                _ => "Object".into(),
+            })
+            .collect()
+    }
+
+    fn first(d: &Document) -> Vec<String> {
+        sketch(&all_paras(d)[0])
+    }
+
+    fn link_run<'a>(h: &'a Hyperlink, text: &str) -> &'a Run {
+        h.runs
+            .iter()
+            .find(|r| r.text == text)
+            .unwrap_or_else(|| panic!("no run {text:?} in {h:?}"))
+    }
+
+    #[test]
+    fn a_href_becomes_a_hyperlink_with_its_formatting() {
+        let d = doc(r#"<p>x <a href="https://example.com/a?x=1&amp;y=2">see <b>this</b></a></p>"#);
+        assert_eq!(
+            first(&d),
+            [
+                r#"Run "x ""#,
+                r#"Link https://example.com/a?x=1&y=2 ["see ", "this"]"#
+            ]
+        );
+        let h = &links(&d)[0];
+        assert_eq!(
+            (&h.rel_id, &h.raw, h.content.is_empty()),
+            (&None, &None, true)
+        );
+        // The user-agent link look, under the formatting inside.
+        let see = link_run(h, "see ");
+        assert!(see.props.underline && !see.props.bold);
+        assert_eq!(see.props.color.as_deref(), Some(LINK_COLOR));
+        let this = link_run(h, "this");
+        assert!(this.props.underline && this.props.bold);
+        assert_eq!(this.props.color.as_deref(), Some(LINK_COLOR));
+        // Text outside has none of it.
+        let Inline::Run(x) = &all_paras(&d)[0].content[0] else {
+            panic!()
+        };
+        assert!(!x.props.underline && x.props.color.is_none());
+    }
+
+    #[test]
+    fn the_page_s_css_overrides_the_link_look() {
+        let plain = |d: &Document, color: Option<&str>| {
+            let h = &links(d)[0];
+            assert!(!h.runs[0].props.underline, "{h:?}");
+            assert_eq!(h.runs[0].props.color.as_deref(), color, "{h:?}");
+        };
+        plain(
+            &doc(
+                r#"<p><a href="https://x.test/" style="text-decoration:none;color:#f00">r</a></p>"#,
+            ),
+            Some("FF0000"),
+        );
+        // Gmail's reset: the parent's colour, not the user agent's blue.
+        plain(
+            &doc(r#"<style>a{color:inherit;text-decoration:none}</style>
+                   <p style="color:red"><a href="https://x.test/">r</a></p>"#),
+            Some("FF0000"),
+        );
+        plain(
+            &doc(
+                r#"<style>a{color:inherit;text-decoration:none}</style><p><a href="https://x.test/">r</a></p>"#,
+            ),
+            None,
+        );
+        // A span inside a link keeps its own colour.
+        let d =
+            doc(r#"<p><a href="https://x.test/">a <span style="color:#00ff00">g</span></a></p>"#);
+        let ls = links(&d);
+        let g = link_run(&ls[0], "g");
+        assert_eq!(g.props.color.as_deref(), Some("00FF00"));
+        assert!(g.props.underline);
+        // `inherit` is the parent's colour over a presentational one too.
+        let d = doc(r#"<p style="color:blue"><font color=red style="color:inherit">f</font></p>"#);
+        let Inline::Run(f) = &all_paras(&d)[0].content[0] else {
+            panic!()
+        };
+        assert_eq!(f.props.color.as_deref(), Some("0000FF"));
+    }
+
+    #[test]
+    fn an_a_that_is_not_a_link_has_no_link_look() {
+        for page in [
+            "<p><a name=top>n</a></p>",
+            "<p><a>n</a></p>",
+            "<p><a href=\"javascript:alert(1)\">n</a></p>",
+        ] {
+            let d = doc(page);
+            assert_eq!(first(&d), [r#"Run "n""#], "{page}");
+            let Inline::Run(r) = &all_paras(&d)[0].content[0] else {
+                panic!()
+            };
+            assert!(!r.props.underline && r.props.color.is_none(), "{page}");
+        }
+    }
+
+    #[test]
+    fn adjacent_text_of_one_link_joins_and_other_links_do_not() {
+        let d = doc(&format!(
+            "<p><a href={U}>a</a><a href={U}><i>b</i></a><a href=https://y.test/>c</a></p>"
+        ));
+        assert_eq!(
+            first(&d),
+            [
+                format!(r#"Link {U} ["a", "b"]"#),
+                r#"Link https://y.test/ ["c"]"#.to_string()
+            ]
+        );
+        // A link's own text in the same formatting is one run.
+        let d = doc(&format!(
+            "<p><a href={U}>one <span>two</span> three</a></p>"
+        ));
+        assert_eq!(first(&d), [format!(r#"Link {U} ["one two three"]"#)]);
+    }
+
+    #[test]
+    fn a_fragment_href_is_an_anchor_link() {
+        let d = doc("<p><a href=#intro>i</a> <a href='#caf%C3%A9'>c</a> <a href=#>n</a></p>");
+        assert_eq!(
+            first(&d),
+            [
+                r#"Link #intro ["i"]"#,
+                r#"Run " ""#,
+                r#"Link #café ["c"]"#,
+                r#"Run " n""#
+            ]
+        );
+        let h = &links(&d)[0];
+        assert_eq!(
+            (h.target.as_deref(), h.anchor.as_deref()),
+            (None, Some("intro"))
+        );
+    }
+
+    #[test]
+    fn unsafe_and_relative_hrefs_are_not_links() {
+        for href in [
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(1)",
+            "java&#9;script:alert(1)",
+            "java&#10;script:alert(1)",
+            " javascript:alert(1)",
+            "&#106;avascript:alert(1)",
+            "&#x01;javascript:alert(1)",
+            "vbscript:msgbox",
+            "data:text/html,<b>x</b>",
+            "file:///etc/passwd",
+            "about:blank",
+            "chrome://settings",
+            "C:\\x.html",
+            "page.html",
+            "/x",
+            "//host/x",
+            "?q=1",
+            "a/b:c",
+            "",
+            "   ",
+            "mailto:",
+            "https:",
+        ] {
+            let d = doc(&format!("<p>a <a href=\"{href}\">t</a> b</p>"));
+            assert!(links(&d).is_empty(), "{href:?}: {:?}", first(&d));
+            assert_eq!(paragraph_texts(&d), ["a t b"], "{href:?}");
+        }
+        let d = doc("<p><a name=x>t</a> <a id=y>u</a></p>");
+        assert!(links(&d).is_empty());
+    }
+
+    #[test]
+    fn allowed_schemes_in_any_case_are_links() {
+        for (href, target) in [
+            ("https://x.test/", "https://x.test/"),
+            ("HTTPS://x.test/A", "https://x.test/A"),
+            ("http://x.test/", "http://x.test/"),
+            ("ftp://x.test/f", "ftp://x.test/f"),
+            ("MailTo:sam@example.com", "mailto:sam@example.com"),
+            (" \t https://x.test/ \n", "https://x.test/"),
+            ("ht&#9;tps://x.test/a&#10;b", "https://x.test/ab"),
+        ] {
+            let d = doc(&format!("<p><a href=\"{href}\">t</a></p>"));
+            assert_eq!(first(&d), [format!(r#"Link {target} ["t"]"#)], "{href:?}");
+        }
+    }
+
+    #[test]
+    fn an_href_keeps_a_named_reference_before_an_equals_sign() {
+        // r1: HTML keeps `&name=` / `&nameX` in an attribute as written.
+        for (href, target) in [
+            (
+                "https://shop.test/?id=3&copy=2",
+                "https://shop.test/?id=3&copy=2",
+            ),
+            (
+                "https://shop.test/?a=1&para=1",
+                "https://shop.test/?a=1&para=1",
+            ),
+            ("https://shop.test/?r=&reg2", "https://shop.test/?r=&reg2"),
+            (
+                "https://shop.test/?a=1&amp;b=2",
+                "https://shop.test/?a=1&b=2",
+            ),
+            ("https://shop.test/&copy;", "https://shop.test/\u{a9}"),
+            ("https://shop.test/&copy x", "https://shop.test/\u{a9}%20x"),
+            ("https://shop.test/&#169=", "https://shop.test/\u{a9}="),
+        ] {
+            let d = doc(&format!("<p><a href=\"{href}\">t</a></p>"));
+            assert_eq!(links(&d)[0].target.as_deref(), Some(target), "{href:?}");
+        }
+        // Text is decoded as before.
+        assert_eq!(paragraph_texts(&doc("<p>a&copy=2</p>")), ["a\u{a9}=2"]);
+    }
+
+    #[test]
+    fn link_href_limits() {
+        // Normalized length: at the limit a link, past it none.
+        let at = format!("{U}{}", "a".repeat(MAX_HREF - U.len()));
+        assert_eq!(
+            links(&doc(&format!("<p><a href={at}>t</a></p>")))[0].target,
+            Some(at)
+        );
+        let over = format!("{U}{}", "a".repeat(MAX_HREF - U.len() + 1));
+        assert!(links(&doc(&format!("<p><a href={over}>t</a></p>"))).is_empty());
+        // Encoding counts: an href within the limit whose spaces make it
+        // longer than it is not a link.
+        let spaced = format!("{U}{}", " a".repeat((MAX_HREF - U.len()) / 2));
+        assert!(spaced.len() <= MAX_HREF);
+        assert!(links(&doc(&format!("<p><a href=\"{spaced}\">t</a></p>"))).is_empty());
+        // A huge attribute is refused before any work on it.
+        let huge = format!("{U}{}", "\t".repeat(3 * MAX_HREF));
+        assert!(link_of(&huge).is_none());
+        // A control character other than a tab or line break.
+        for bad in [
+            "https://x.test/a&#1;b",
+            "https://x.test/a&#127;b",
+            "#a&#1;b",
+            "#a%01b",
+        ] {
+            let d = doc(&format!("<p><a href=\"{bad}\">t</a></p>"));
+            assert!(links(&d).is_empty(), "{bad:?}");
+        }
+        // Space, `"`, `<`, `>` and backtick are percent-encoded.
+        let d = doc("<p><a href='https://x.test/a&quot;b&lt;c&gt; d`e'>t</a></p>");
+        assert_eq!(
+            links(&d)[0].target.as_deref(),
+            Some("https://x.test/a%22b%3Cc%3E%20d%60e")
+        );
+    }
+
+    #[test]
+    fn spaces_around_and_inside_a_link() {
+        let d = doc(&format!("<p>x <a href={U}>foo  bar</a> y</p>"));
+        assert_eq!(
+            first(&d),
+            [
+                r#"Run "x ""#.to_string(),
+                format!(r#"Link {U} ["foo bar"]"#),
+                r#"Run " y""#.to_string()
+            ]
+        );
+        let d = doc(&format!("<p><a href={U}>x </a>y</p>"));
+        assert_eq!(
+            first(&d),
+            [format!(r#"Link {U} ["x "]"#), r#"Run "y""#.to_string()]
+        );
+        // A space owed at the paragraph's end is never written.
+        let d = doc(&format!("<p><a href={U}> x </a></p>"));
+        assert_eq!(first(&d), [format!(r#"Link {U} ["x"]"#)]);
+    }
+
+    #[test]
+    fn a_link_across_paragraphs_and_breaks() {
+        let d = doc(&format!("<p><a href={U}>one</p><p>two</a> three</p>"));
+        let ps = all_paras(&d);
+        assert_eq!(sketch(&ps[0]), [format!(r#"Link {U} ["one"]"#)]);
+        assert_eq!(
+            sketch(&ps[1]),
+            [
+                format!(r#"Link {U} ["two"]"#),
+                r#"Run " three""#.to_string()
+            ]
+        );
+        let split = |inner: &str| {
+            vec![
+                format!(r#"Link {U} ["a"]"#),
+                inner.to_string(),
+                format!(r#"Link {U} ["b"]"#),
+            ]
+        };
+        let d = doc(&format!("<p><a href={U}>a<br>b</a></p>"));
+        assert_eq!(first(&d), split("Break"));
+        let d = doc(&format!(
+            "<p><a href={U}>a<span style='mso-tab-count:1'>&nbsp; </span>b</a></p>"
+        ));
+        assert_eq!(first(&d), split("Tab"));
+        let d = doc(&format!("<pre><a href={U}>a\nb</a></pre>"));
+        assert_eq!(first(&d), split("Break"));
+    }
+
+    #[test]
+    fn a_picture_in_a_link_stays_outside_it_and_its_alt_text_is_in_it() {
+        let mut resolve = |src: &str, _: usize| {
+            (src == "logo.png").then(|| {
+                // A 1 x 1 PNG's header is all `sniff` and the size read.
+                let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+                png.extend(1u32.to_be_bytes());
+                png.extend(1u32.to_be_bytes());
+                png.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+                png
+            })
+        };
+        let page = format!(
+            "<p><a href={U}>x<img src=logo.png width=10 height=10>y</a></p>\
+             <p><a href={U}><img src=missing.png alt=Logo></a></p>"
+        );
+        let (d, _) =
+            import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
+        let ps = all_paras(&d);
+        assert_eq!(
+            sketch(&ps[0]),
+            [
+                format!(r#"Link {U} ["x"]"#),
+                "Object".into(),
+                format!(r#"Link {U} ["y"]"#)
+            ]
+        );
+        assert_eq!(sketch(&ps[1]), [format!(r#"Link {U} ["Logo"]"#)]);
+    }
+
+    #[test]
+    fn a_link_of_white_space_alone_is_an_empty_paragraph() {
+        let linked = doc(&format!("<p><a href={U}>&nbsp;</a></p><p>x</p>"));
+        let plain = doc("<p>&nbsp;</p><p>x</p>");
+        assert_eq!(linked.body, plain.body);
+    }
+
+    #[test]
+    fn a_link_is_never_taken_for_a_typed_list_marker() {
+        // Filtered HTML's list paragraph with no marker text: a leading
+        // short word in a link stays, link and all.
+        let d = doc(&format!(
+            "<p class=MsoListParagraph><a href={U}>see</a> it</p>"
+        ));
+        assert_eq!(
+            first(&d),
+            [format!(r#"Link {U} ["see"]"#), r#"Run " it""#.to_string()]
+        );
+        assert_eq!(all_paras(&d)[0].props.num_id, None);
+    }
+
+    #[test]
+    fn an_a_inside_an_a_closes_the_outer_one() {
+        let d = doc("<p><a href=https://one.test/>x<a href=https://two.test/>y</a>z</a></p>");
+        assert_eq!(
+            first(&d),
+            [
+                r#"Link https://one.test/ ["x"]"#,
+                r#"Link https://two.test/ ["y"]"#,
+                r#"Run "z""#
+            ]
+        );
+        let Inline::Run(z) = &all_paras(&d)[0].content[2] else {
+            panic!()
+        };
+        assert!(!z.props.underline && z.props.color.is_none());
+        // The formatting open inside the outer link goes on in the new one.
+        let d = doc("<p><a href=https://one.test/><b>x<a href=https://two.test/>y</a></b></p>");
+        let ls = links(&d);
+        assert_eq!(ls.len(), 2);
+        assert!(link_run(&ls[0], "x").props.bold);
+        assert!(link_run(&ls[1], "y").props.bold);
+        // Not across a table: the inner link is the cell's, the outer one
+        // goes on after the table.
+        let d = doc(
+            "<a href=https://one.test/>a<table><tr><td><a href=https://two.test/>c</a></td></tr></table>b</a>",
+        );
+        let targets: Vec<_> = links(&d)
+            .iter()
+            .map(|h| h.target.clone().unwrap())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "https://one.test/",
+                "https://two.test/",
+                "https://one.test/"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_link_in_a_table_cell() {
+        let d = doc(&format!(
+            "<table><tr><td>a <a href={U}>b</a></td><td>c</td></tr></table>"
+        ));
+        let DocBlock::Table(t) = &d.body[0] else {
+            panic!("{:?}", d.body)
+        };
+        let DocBlock::Paragraph(p) = &t.rows[0].cells[0].blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            sketch(p),
+            [r#"Run "a ""#.to_string(), format!(r#"Link {U} ["b"]"#)]
+        );
     }
 }
