@@ -686,7 +686,9 @@ pub(crate) enum Color {
     Rgb(String),
     /// `windowtext`, `auto`: the default colour again.
     Reset,
-    /// `inherit`, `currentcolor`: the parent's, which is already there.
+    /// `inherit`, `currentcolor`: the parent's colour, given back over any
+    /// colour this element set itself (a link's user-agent blue, `<font
+    /// color>`; #1879).
     Keep,
 }
 

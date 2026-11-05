@@ -2162,7 +2162,7 @@ fn attrs_of(attrs: &str) -> Attrs {
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
-            *slot = Some(entities(value));
+            *slot = Some(attr_entities(value));
         }
         if i == start {
             i += 1;
@@ -2224,6 +2224,18 @@ fn link_of(href: &str) -> Option<Link> {
 
 /// `text` with character references decoded.
 fn entities(text: &str) -> String {
+    decode_references(text, false)
+}
+
+/// An attribute value with character references decoded, as HTML decodes
+/// them there (#1879 r1): a named reference not ended by `;` and followed
+/// by `=` or an ASCII letter or digit is kept as written, so
+/// `href="?id=3&copy=2"` keeps its `&copy=2`.
+fn attr_entities(value: &str) -> String {
+    decode_references(value, true)
+}
+
+fn decode_references(text: &str, in_attribute: bool) -> String {
     if !text.contains('&') {
         return text.to_string();
     }
@@ -2244,7 +2256,9 @@ fn entities(text: &str) -> String {
             };
             n.map(numeric_char)
         } else {
-            named(name)
+            let next = rest[end..].chars().next();
+            let held = in_attribute && next.is_some_and(|c| c == '=' || c.is_ascii_alphanumeric());
+            if held { None } else { named(name) }
         };
         match decoded {
             Some(c) => {
@@ -4436,6 +4450,34 @@ mod link_tests {
             let d = doc(&format!("<p><a href=\"{href}\">t</a></p>"));
             assert_eq!(first(&d), [format!(r#"Link {target} ["t"]"#)], "{href:?}");
         }
+    }
+
+    #[test]
+    fn an_href_keeps_a_named_reference_before_an_equals_sign() {
+        // r1: HTML keeps `&name=` / `&nameX` in an attribute as written.
+        for (href, target) in [
+            (
+                "https://shop.test/?id=3&copy=2",
+                "https://shop.test/?id=3&copy=2",
+            ),
+            (
+                "https://shop.test/?a=1&para=1",
+                "https://shop.test/?a=1&para=1",
+            ),
+            ("https://shop.test/?r=&reg2", "https://shop.test/?r=&reg2"),
+            (
+                "https://shop.test/?a=1&amp;b=2",
+                "https://shop.test/?a=1&b=2",
+            ),
+            ("https://shop.test/&copy;", "https://shop.test/\u{a9}"),
+            ("https://shop.test/&copy x", "https://shop.test/\u{a9}%20x"),
+            ("https://shop.test/&#169=", "https://shop.test/\u{a9}="),
+        ] {
+            let d = doc(&format!("<p><a href=\"{href}\">t</a></p>"));
+            assert_eq!(links(&d)[0].target.as_deref(), Some(target), "{href:?}");
+        }
+        // Text is decoded as before.
+        assert_eq!(paragraph_texts(&doc("<p>a&copy=2</p>")), ["a\u{a9}=2"]);
     }
 
     #[test]
