@@ -387,14 +387,10 @@ fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) 
         None => avail,
     };
     let mut grid: Vec<u32>;
-    if unknown > 0 {
+    if let Some(each) = width.saturating_sub(known).checked_div(unknown) {
         let left = width.saturating_sub(known);
-        let share = (left / unknown).max(MIN_COL);
-        let mut extra = if left / unknown >= MIN_COL {
-            left % unknown
-        } else {
-            0
-        };
+        let share = each.max(MIN_COL);
+        let mut extra = if each >= MIN_COL { left % unknown } else { 0 };
         grid = col
             .iter()
             .map(|c| match c {

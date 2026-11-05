@@ -27,6 +27,14 @@
 //! left open inside (three alike at most), and no close reaches across a
 //! table, as in a browser. White space collapses as a browser collapses it, except in
 //! `pre`. Images, links' targets and forms are not converted.
+//!
+//! Tables (#1878) are laid out by [`html_table`]: `colspan` / `rowspan`,
+//! the table's and cells' `width` (attribute or CSS), cell shading from the
+//! cell's `bgcolor` / CSS background else its row's, row group's or
+//! table's, `valign` / `vertical-align` (inherited from the row, a cell
+//! with none `center`), a cell's `padding` as its margins, and the table's
+//! `border`, `cellpadding`, `cellspacing` and `align`. Nested tables stay
+//! nested, to [`MAX_TABLE_NESTING`] levels.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};

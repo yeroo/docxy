@@ -32,6 +32,9 @@
 //! | `Builder::end_para` / `end_cell` / `end_row` | a paragraph / cell / row | work + built (`size_of` each) |
 //! | `Builder::end_cell`, `end_table` | cells past `MAX_COLUMNS` | join the last cell (no new cell) |
 //! | `Builder::end_table` | padding a short row | ≤ 62 cells a row, each work + built |
+//! | `Builder` tables | open tables | HTML: ≤ `MAX_TABLE_NESTING` (8), deeper ones are their cell's text; RTF: one |
+//! | `html_table::layout` | the slot grid, cells emitted | rows × ≤ `MAX_COLUMNS` slots; each cell emitted (placed, continuation or pad) work + built; a cell with no free slot joins a neighbour |
+//! | `html_table::layout` | nested tables | each laid out once, inside its cell, depth ≤ `MAX_TABLE_NESTING` |
 //! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one `drain` |
 //! | `Builder::para_text` | the paragraph in progress | O(paragraph), once per paragraph end |
 //! | run props cloned per inline | `RunProps` | flags, and strings of ≤ 64 bytes (font, colour, highlight) plus ≤ 2 kept elements (HTML's shading, bold off): O(1), charged as built |
@@ -56,7 +59,7 @@
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
 //! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | one scan a tag | the seven read (`style class id align color face size`) copied, first of a name only |
+//! | html attributes | one scan a tag | the fifteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign`) copied, first of a name only |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |
 //! | `recover::document_xml` | the header scan | work (input/16), up front; forward only |
