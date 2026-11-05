@@ -361,12 +361,13 @@ fn delete(app: &mut App, args: &Json) -> Result<Json, String> {
         .ok_or("mail.delete needs an 'id'")?
         .to_string();
     // A script may hold a draft's `local:` id after the draft was reconciled
-    // to its Graph id: resolve it before the local delete, which takes the
-    // alias with the row, so the command names the Graph id (#1884).
-    let target = app.store.current_id(&id).map_err(|e| e.to_string())?;
-    app.store
-        .delete_message(&target)
-        .map_err(|e| e.to_string())?;
+    // to its Graph id: the command names the id of the row deleted, as the
+    // local delete takes the alias with the row (#1884).
+    let target = app
+        .store
+        .delete_message_resolved(&id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| id.clone());
     app.reload_messages();
     let _ = app.sync.cmd_tx.send(SyncCommand::Delete { id: target });
     Ok(Json::obj(vec![

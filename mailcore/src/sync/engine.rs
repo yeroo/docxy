@@ -520,11 +520,16 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::Move { id, dest });
             }
             SyncCommand::Delete { id } => {
-                // Resolve before the local delete: a reconciled draft's
+                // Resolve and delete in one statement: a reconciled draft's
                 // `local:` id leads to its Graph id only while the row exists
-                // (#1884), so the queued op carries the resolved id.
-                let target = self.store.current_id(&id).unwrap_or(id);
-                let _ = self.store.delete_message(&target);
+                // (#1884), so the queued op carries the id of the row deleted.
+                // When the UI already deleted the row (with the id it sends
+                // here, as lookxy does), there is nothing to resolve against:
+                // `current_id` then leaves the id as it is.
+                let target = match self.store.delete_message_resolved(&id) {
+                    Ok(Some(deleted)) => deleted,
+                    _ => self.store.current_id(&id).unwrap_or(id),
+                };
                 self.enqueue_and_drain(OutboxOp::Delete { id: target });
             }
             SyncCommand::FetchBody { id } => self.fetch_body(&id),

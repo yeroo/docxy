@@ -598,11 +598,15 @@
 - `ensure_draft_on_graph` decides create vs update by the row's current id,
   so a second `SaveDraft`/`SendDraft` with a reconciled `local:` id is a
   `PATCH`, never a second create. Their payloads and `Sent { id }` keep the id
-  the caller used. `Delete` resolves before the engine's local delete and
-  queues the resolved id; `OutboxOp::Delete` of a `local:` id that never
-  reached Graph calls nothing. A caller that deletes locally itself resolves
-  first (`current_id`): lookxy's `mail.delete` does. `Move`, `MarkRead`,
-  `SetFlag` and `SetCategories` with a `local:` id still reach Graph with it.
+  the caller used. A local delete that also sends `SyncCommand::Delete` goes
+  through `Store::delete_message_resolved` (one `DELETE … RETURNING id`) and
+  sends the id it returns, else the id it had: the engine's `Delete` arm, and
+  lookxy's list deletes (`delete_and_send`) and `mail.delete`, as the list can
+  still hold a `local:` id the sync thread reconciled. `OutboxOp::Delete` of
+  an id that still resolves to `local:` is treated as never having reached
+  Graph and calls nothing; a delete that races the engine's create leaves the
+  Graph draft for a later sync. `Move`, `MarkRead`, `SetFlag` and
+  `SetCategories` with a `local:` id still reach Graph with it.
 - `FakeServer::start_limited` gives a route a use limit; a used-up route is
   skipped for the next match (a send that fails once, then succeeds).
 

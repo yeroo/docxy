@@ -759,16 +759,42 @@ impl Store {
     /// `@removed` entry lacking `id` can produce (see `graph::model`).
     ///
     /// A draft's `local:` id still reaches it after `reconcile_id` (#1884),
-    /// and the deleted row takes that alias with it. So a caller holding a
-    /// `local:` id that will also send `SyncCommand::Delete` resolves it with
-    /// `current_id` first and sends the command with the resolved id: once
-    /// the row is gone, the `local:` id no longer leads to the Graph id.
+    /// and the deleted row takes that alias with it. So a caller that will
+    /// also send `SyncCommand::Delete` uses `delete_message_resolved`
+    /// instead, and sends the command with the id it returns: once the row
+    /// is gone, a `local:` id no longer leads to the Graph id.
     pub fn delete_message(&self, id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            concat!("DELETE FROM messages WHERE ", draft_row_sql!()),
-            params![id],
-        )?;
+        self.delete_message_resolved(id)?;
         Ok(())
+    }
+
+    /// `delete_message`, returning the id the deleted row was stored under
+    /// (the Graph id for a reconciled draft's `local:` id, #1884), or `None`
+    /// when nothing matched. The match and the delete are one statement, so
+    /// a `reconcile_id` the sync thread commits on its own connection cannot
+    /// land between them. A caller that also sends `SyncCommand::Delete`
+    /// sends it with the returned id, else with the id it had.
+    pub fn delete_message_resolved(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let deleted = self
+            .conn
+            .query_row(
+                concat!(
+                    "DELETE FROM messages WHERE ",
+                    draft_row_sql!(),
+                    " RETURNING id"
+                ),
+                params![id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(deleted)
     }
 
     /// Messages in `folder_id`, newest received first.
@@ -3843,6 +3869,29 @@ mod local_id_tests {
         s.delete_message(&local).unwrap();
         assert!(s.draft("G").unwrap().is_none());
         assert_eq!(s.current_id(&local).unwrap(), local);
+    }
+
+    #[test]
+    fn delete_message_resolved_returns_the_id_it_deleted() {
+        let (s, local) = reconciled();
+        assert_eq!(
+            s.delete_message_resolved(&local).unwrap().as_deref(),
+            Some("G")
+        );
+        assert!(s.draft("G").unwrap().is_none());
+        assert_eq!(s.current_id(&local).unwrap(), local);
+        // Nothing left to match, by either id.
+        assert_eq!(s.delete_message_resolved(&local).unwrap(), None);
+        assert_eq!(s.delete_message_resolved("G").unwrap(), None);
+        assert_eq!(s.delete_message_resolved("unknown").unwrap(), None);
+        assert_eq!(s.delete_message_resolved("").unwrap(), None);
+
+        let (s, _) = reconciled();
+        assert_eq!(
+            s.delete_message_resolved("G").unwrap().as_deref(),
+            Some("G")
+        );
+        assert!(s.draft("G").unwrap().is_none());
     }
 
     #[test]

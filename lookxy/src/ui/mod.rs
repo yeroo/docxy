@@ -972,6 +972,95 @@ mod tests {
         ));
     }
 
+    /// Files a local draft under the inbox in conversation `conv`, as the
+    /// list shows it, then reconciles it to `graph_id` behind the list's back
+    /// (the sync thread's `SaveDraft` drain reloads nothing). Returns the
+    /// `local:` id the list still holds.
+    fn stale_local_draft(app: &mut App, conv: &str, graph_id: &str) -> String {
+        let local = app
+            .store
+            .create_local_draft("Draft", "", "", "body")
+            .unwrap();
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: local.clone(),
+                    conversation_id: conv.into(),
+                    subject: "Draft".into(),
+                    from: Recipient {
+                        name: String::new(),
+                        address: String::new(),
+                    },
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-17T09:00:00Z".into(),
+                    sent: String::new(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: String::new(),
+                    is_draft: true,
+                    is_meeting_request: false,
+                    categories: Vec::new(),
+                },
+            )
+            .unwrap();
+        app.reload_messages();
+        app.store.reconcile_id(&local, graph_id).unwrap();
+        local
+    }
+
+    fn sent_deletes(app: &App) -> Vec<String> {
+        let rx = app.test_cmd_rx.as_ref().unwrap();
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|c| match c {
+                SyncCommand::Delete { id } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deleting_a_row_still_holding_a_reconciled_local_id_names_the_graph_id() {
+        // #1884: the list still holds `local:` after the draft became G.
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = false;
+        app.focus = Pane::List;
+        let local = stale_local_draft(&mut app, "", "G");
+        app.msg_index = app.messages.iter().position(|m| m.id == local).unwrap();
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete));
+
+        assert_eq!(sent_deletes(&app), vec!["G".to_string()]);
+        assert!(app.store.draft("G").unwrap().is_none());
+        assert!(app.messages.iter().all(|m| m.id != local));
+    }
+
+    #[test]
+    fn deleting_a_thread_holding_a_reconciled_local_id_names_the_graph_id() {
+        let mut app = App::for_test_with_seeded_store();
+        app.threaded = true;
+        app.focus = Pane::List;
+        // In m1's conversation, so the thread has two messages and asks first.
+        stale_local_draft(&mut app, "c1", "G");
+        app.row_index = 0;
+        assert!(matches!(
+            app.visible_rows.first(),
+            Some(crate::app::Row::Header(_))
+        ));
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Delete));
+        assert!(app.confirm.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('y')));
+
+        let mut deletes = sent_deletes(&app);
+        deletes.sort();
+        assert_eq!(deletes, vec!["G".to_string(), "m1".to_string()]);
+        assert!(app.store.draft("G").unwrap().is_none());
+    }
+
     #[test]
     fn delete_key_removes_the_row_and_clamps_selection() {
         let mut app = App::for_test_with_seeded_store();

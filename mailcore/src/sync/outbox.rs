@@ -37,8 +37,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
         OutboxOp::Move { id, dest } => client.move_message(id, dest).map(|_new_id| ()),
         OutboxOp::Delete { id } => {
             // A reconciled draft's `local:` id is deleted under its Graph id
-            // (#1884); one still `local:` never reached Graph, so there is
-            // nothing to delete there (as `DeleteEvent`).
+            // (#1884). An id that still resolves to `local:` is treated as
+            // never having reached Graph, so nothing is deleted there (as
+            // `DeleteEvent`). That is not an invariant: a delete on another
+            // connection that lands while this engine's `create_draft` is in
+            // flight leaves `reconcile_id` no row to rename, and the Graph
+            // draft stays for a later sync to bring back.
             let target = store
                 .current_id(id)
                 .map_err(|e| GraphError::Parse(e.to_string()))?;
