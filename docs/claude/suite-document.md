@@ -168,8 +168,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   the character style beats the paragraph style outright (Word's toggle XOR
   between them is not modelled). `emit_words` and `Measurer::width_in` use the
   run's font family and `run_look::run_size_px` (a style's or direct `w:sz`,
-  scaled by zoom), so tab positions match what is drawn; an unavailable
-  family falls back in gpui (`resolve_font`).
+  scaled by zoom), so tab positions match what is drawn; the family goes
+  through `font_subst` first (see Font substitution (#1900)), never to gpui
+  unresolved.
 - `DocTab::run_styles` (`run_look::Cache`) parses `word/styles.xml` once per
   change of the part (a moved `Package::parts_stamp` with other part text does
   not reparse). `Docxy::render` hands the same text to the body and open
@@ -189,3 +190,46 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   styles, table style size/font, `block_height_est` for styled sizes.
   `uiharness/cases/doc-run-styles.uit` was written without being run (macOS
   cannot drive the window).
+
+## Font substitution (#1900)
+
+- gpui caches a failed family lookup but rebuilds an `anyhow::Error` from it on
+  every `font_id` call, and `resolve_font` then walks its fallback stack
+  (`.ZedMono`, `.ZedSans`, Helvetica, Segoe UI, ...), most of which fail on
+  Linux too: per run, per layout pass. With `RUST_BACKTRACE=1` each error
+  captures a backtrace (100% CPU, a frozen embedding app). So no family is
+  handed to gpui unresolved: `suite/docxy/src/font_subst.rs` resolves each
+  once per process.
+- A document's or plugin's family (`font_subst::family`): the family itself
+  (any case, drawn in its installed spelling), then
+  `docxcore::fonts::substitutes` (metric-compatible first: Calibri → Carlito,
+  Cambria → Caladea, Arial → Liberation Sans, Times New Roman → Liberation
+  Serif, Courier New → Liberation Mono, Aptos → Liberation Sans), then a
+  generic serif or mono list picked from the name, else `None`: the inherited
+  theme font. `pdffont` (terminal docxy's PDF export; the suite has no PDF
+  export) uses the same table, so screen and PDF pick the same substitute.
+- The theme's own families: gpui-component's default is `.SystemUIFont`, which
+  gpui maps to IBM Plex Sans on Linux. The suite does not embed it, so all UI
+  text failed per pass. `font_subst::apply_to_theme` (in `run` after
+  `gpui_component::init`, and after every `Theme::change`) replaces an
+  unloadable sans with the first installed of gpui's own fallback order
+  (Ubuntu, Adwaita Sans, Cantarell, Noto Sans, DejaVu Sans, ...): the face
+  drawn is unchanged, it just stops failing first. The mono family takes its
+  substitutes or the mono list. macOS and Windows keep theirs.
+- The embedded `ext::DocView` (#1873) calls `font_subst::init` from
+  `DocView::new` and gives its root `.font_family(ui_family(host theme font))`
+  without touching the host's theme; `Measurer::new` resolves its base family
+  the same way, so measured = drawn.
+- Installed or not: `TextSystem::all_font_names` (a name not listed never
+  reaches gpui) plus one probe per listed candidate (`resolve_font` +
+  `get_font_for_id`; gpui's `font_id` is private), since gpui lists its own
+  fallback stack whether installed or not. `init` snapshots the list: it runs
+  after any `add_fonts`, and fonts added later are not seen. Before `init`
+  (unit tests) every family passes through unchanged.
+- `font_subst::tests::every_family_reaching_gpui_is_resolved` scans
+  `suite/docxy/src` for `.font_family(`, `font.family =` and `family: "`: each
+  needs `font_subst::` on its line or the two above, or an entry in its
+  commented allowlist.
+- Not done: a real platform-match tier (fontconfig `FcFontMatch`, CoreText,
+  DirectWrite fallback) for unknown families; the generic serif/mono lists
+  stand in.
