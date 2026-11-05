@@ -1,0 +1,174 @@
+# An extension tab's embedded read-only document view (#1873). The script's
+# `ext fixture` line has this instance draw Mail tabs with the suite's test
+# extension: a header line over a DocView of a document built in code
+# (heading "Embedded view", "Alpha Beta Gamma" with Beta bold, a paragraph
+# holding the hyperlink "docxy link" to https://example.com/docxy, an
+# indented paragraph that starts with the link "Indented link" to
+# https://example.com/indented, a picture, a 2x2 table, then Line 1..Line 80). The extension records every link the
+# view hands it (`ext-doc-read` link_calls). Keys go through `real-key`: the
+# `key` verb presses the suite's own handler and never reaches the view.
+# Each test opens its own Mail tab and closes it at the end.
+ext fixture
+
+test issue 1873 the test extension's Mail tab draws the document in the embedded view
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call tab-list {}
+  assert reply.tabs.1.kind is mail
+  assert reply.active is 1
+  call ext-doc-read {}
+  assert reply.blocks is 86
+  assert reply.tables is 1
+  assert reply.pictures is 1
+  assert reply.links.0.url is https://example.com/docxy
+  assert reply.links.1.url is https://example.com/indented
+  assert reply.zoom is 1
+  assert reply.scroll_y is 0
+  assert reply.max_scroll_y is not 0
+  assert reply.links_followed is 0
+  assert reply.link_click is ctrl-click
+  assert reply.selection is empty
+  call ext-doc-set {"content_dark":true}
+  assert reply.content_dark is true
+  shot window
+  call ext-doc-set {"content_dark":false}
+  assert reply.content_dark is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1873 a drag selects in the view and Ctrl+C copies its text and RTF, Ctrl+A all, Tab nothing
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  # The press gave the view the keys; the suite took none of them back.
+  assert reply.focused is true
+  assert reply.selection is Alpha Beta Gamma
+  assert reply.selected_paragraphs is 1
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha Beta Gamma
+  assert reply.rtf is not nothing
+  assert reply.rtf_bold is Beta
+  # Tab is the extension's: the suite edits nothing and the view keeps its
+  # selection and the keys.
+  call real-key {"key":"tab"}
+  call ext-doc-read {}
+  assert reply.selection is Alpha Beta Gamma
+  assert reply.focused is true
+  call real-key {"key":"ctrl+a"}
+  call ext-doc-read {}
+  assert reply.selected_paragraphs is 89
+  shot window
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1873 the wheel and the keys scroll the view, Ctrl with them zooms it
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-doc-view"}
+  call pointer-wheel {"region":"ext-doc-view","dy":-200}
+  call ext-doc-read {}
+  assert reply.scroll_y is not 0
+  # Page Down scrolls further (the snapshot is ext-doc-set's reply).
+  call ext-doc-set {"content_dark":false}
+  call real-key {"key":"pagedown"}
+  call ext-doc-read {}
+  assert reply.scroll_y is not {ext-doc-set.scroll_y}
+  call real-key {"key":"home"}
+  call ext-doc-read {}
+  assert reply.scroll_y is 0
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+="}
+  call ext-doc-read {}
+  assert reply.zoom is 1.2
+  call real-key {"key":"ctrl+-"}
+  call ext-doc-read {}
+  assert reply.zoom is 1.1
+  call real-key {"key":"ctrl+0"}
+  call ext-doc-read {}
+  assert reply.zoom is 1
+  # Ctrl+wheel down zooms out a step and leaves the scroll where it was,
+  # though the view was scrolled and could scroll further.
+  call pointer-wheel {"region":"ext-doc-view","dy":-300}
+  call ext-doc-set {"content_dark":false}
+  assert reply.scroll_y is not 0
+  call pointer-wheel {"region":"ext-doc-view","dy":-120,"ctrl":true}
+  call ext-doc-read {}
+  assert reply.zoom is 0.9
+  assert reply.scroll_y is {ext-doc-set.scroll_y}
+  shot window
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1873 a hyperlink press reaches the extension's callback, by Ctrl+click or as set by click
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  # Ctrl+click (the default mode) hands the link over and selects nothing.
+  call pointer-click {"region":"ext-doc-link:0","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  assert reply.link_calls.0 is https://example.com/docxy
+  assert reply.selection is empty
+  # A plain click does not follow it in that mode.
+  call pointer-click {"region":"ext-doc-link:0"}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  # Set to follow on a plain click, it does.
+  call ext-doc-set {"link_click":"click"}
+  assert reply.link_click is click
+  call pointer-click {"region":"ext-doc-link:0"}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  assert reply.link_calls.1 is https://example.com/docxy
+  # A press in the blank indent beside a row that starts with a link is not
+  # on the link: neither a plain press there (in click mode) nor a Ctrl+press
+  # follows it, though the row's nearest stop is the link's first character.
+  call pointer-click {"region":"ext-doc-link:1:left"}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  call pointer-click {"region":"ext-doc-link:1:left","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  # On the link itself it does.
+  call pointer-click {"region":"ext-doc-link:1","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 3
+  assert reply.link_calls.2 is https://example.com/indented
+  # A drag that starts on the link selects and follows nothing.
+  call pointer-drag {"from":"ext-doc-link:0","to":"ext-doc-word:here.:end"}
+  call ext-doc-read {}
+  assert reply.links_followed is 3
+  assert reply.selection is not empty
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1873 the view's copy pastes into a document with its bold, as another app's rich copy
+  # Last: the document it pastes into stays open (and edited).
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.rtf_bold is Beta
+  open copy:../fixtures/basic.docx
+  key ctrl+v
+  assert text is Alpha Beta Gamma
+  call selection-set {"start":8,"end":8}
+  assert run.bold is true
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false

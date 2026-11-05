@@ -681,6 +681,17 @@ pub fn request_start_screen(sandbox: &Path) -> Result<(), String> {
     std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))
 }
 
+/// Ask the suite started in `sandbox` to draw Mail tabs with its test
+/// extension (#1873): a marker file in its config root, read once at start
+/// by a harness instance only, as [`request_start_screen`]'s is.
+pub fn request_ext_fixture(sandbox: &Path) -> Result<(), String> {
+    let marker = sandbox.join("docxy").join("ext-fixture");
+    if let Some(dir) = marker.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))
+}
+
 /// Where the suite started in `sandbox` reads `editor`'s help manual from
 /// (#1855): its config root's `docxy/manual/<editor>`. A harness instance
 /// reads a manual from nowhere else.
@@ -1010,6 +1021,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sandbox);
         request_start_screen(&sandbox).unwrap();
         assert!(sandbox.join("docxy").join("start-screen").is_file());
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// #1873: the marker the suite looks for in its config root.
+    #[test]
+    fn an_ext_fixture_request_is_a_marker_in_the_sandboxs_config_root() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "uiharness-ext-fixture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        request_ext_fixture(&sandbox).unwrap();
+        assert!(sandbox.join("docxy").join("ext-fixture").is_file());
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 

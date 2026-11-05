@@ -29,6 +29,39 @@ pub(crate) fn is_notch(delta: &ScrollDelta) -> bool {
 /// The pixel deltas of a smooth wheel that make one zoom step.
 pub(crate) const WHEEL_STEP: f32 = 40.;
 
+/// One Ctrl+wheel turn of `dy` px (gpui's sign: up is positive) into `acc`,
+/// the sum of the turns not yet stepped: `Some(1)` (in) or `Some(-1)` (out)
+/// when it makes a step. A whole-line `notch` steps at once; smooth deltas
+/// add up and step per [`WHEEL_STEP`] px, a change of direction starting the
+/// sum afresh. The one rule for the Project chart and the embedded document
+/// view (#1873).
+pub(crate) fn wheel_step(acc: &mut f32, dy: f32, notch: bool) -> Option<i32> {
+    if dy == 0. {
+        return None;
+    }
+    let dir = if dy > 0. { 1 } else { -1 };
+    if notch {
+        *acc = 0.;
+        return Some(dir);
+    }
+    if *acc * dy < 0. {
+        *acc = 0.;
+    }
+    *acc += dy;
+    if acc.abs() >= WHEEL_STEP {
+        *acc = 0.;
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// A wheel event's vertical turn in px (a line is `line_h`) and whether it
+/// is a notch ([`is_notch`]): what [`wheel_step`] takes.
+pub(crate) fn wheel_px(delta: &ScrollDelta, line_h: Pixels) -> (f32, bool) {
+    (f32::from(delta.pixel_delta(line_h).y), is_notch(delta))
+}
+
 /// A header tier's unit: where one starts and what it is called.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unit {
@@ -399,26 +432,12 @@ impl ProjectView {
         let out = if dy == 0. || self.pane_at(x) != ProjectPane::Chart {
             WheelZoom::NotChart
         } else {
-            let dir = if dy > 0. { 1 } else { -1 };
-            let step = if notch {
-                self.wheel_acc = 0.;
-                true
-            } else {
-                if self.wheel_acc * dy < 0. {
-                    self.wheel_acc = 0.;
+            match wheel_step(&mut self.wheel_acc, dy, notch) {
+                Some(dir) => {
+                    let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
+                    WheelZoom::Stepped(self.zoom_step(dir, pointer))
                 }
-                self.wheel_acc += dy;
-                let step = self.wheel_acc.abs() >= WHEEL_STEP;
-                if step {
-                    self.wheel_acc = 0.;
-                }
-                step
-            };
-            if step {
-                let pointer = (x - self.table_w - GANTT_INSET).clamp(0., self.gantt_w);
-                WheelZoom::Stepped(self.zoom_step(dir, pointer))
-            } else {
-                WheelZoom::Absorbed
+                None => WheelZoom::Absorbed,
             }
         };
         if phase == TouchPhase::Ended {
