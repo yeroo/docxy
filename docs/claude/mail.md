@@ -59,3 +59,40 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   Graph: the caller gates on `get_body_for` (`get_body` still shows
   whatever is stored).
 - Not done: FTS indexes an html body's markup (the triggers copy `content`).
+
+## Sync one folder, the fast cycle, Sent Items after a send (#1885)
+
+- `SyncCommand::SyncFolder { id }` (Shift+F9, "Update Folder") drains the
+  outbox, runs that folder's delta and re-reads its counts
+  (`GraphClient::get_folder_counts`: `GET /me/mailFolders/{id}?$select=…`,
+  stored by `Store::set_folder_counts`, which leaves name, parent and
+  well-known name alone), with `FoldersUpdated` only when the counts
+  changed (`Engine::refresh_folder`). An id not in the store is an `Error`
+  with no Graph call; signed out or inside `next_retry` it does nothing. A
+  folder that never synced runs its initial delta (with the cutoff): the user
+  asked for it.
+- The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
+  old single tick, whose wait restarts on every command). With it the engine
+  keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
+  not move them, `Refresh` resets both. The normal pass runs when its
+  deadline passed or `needs_full_pass()` (no enumeration yet, or no folders:
+  a quarantine or an offline start recovers at the next fast deadline);
+  otherwise `on_fast_tick` drains the outbox and refreshes the
+  `SetFastFolders` folders that already have a delta link (never a backfill,
+  #1871), picked after the drain. Nothing runs inside `next_retry`; an
+  aborted normal pass is due again at its deadline (`after_full_pass`). A
+  fast tick sets no `Syncing` state, only settles. `SetFastFolders` without
+  `fast_tick` is kept and does nothing.
+- Without `fast_tick`, a throttled `SyncFolder` makes the deadline run a full
+  pass (`recv_timeout` waits for `next_retry`, then `on_tick`), as any
+  throttled command does.
+- `drain_outbox` returns `false` when cut short (auth, throttle, transport, a
+  5xx, or the post-send sync stopping); `sync_pass` then stops and keeps the
+  back-off (it used to `clear_backoff` right after a failed drain). Its
+  throttle arm settles the state, as `react` does.
+- After a drain that sent a draft, `sync_after_send` refreshes Drafts, then
+  Sent Items, each only when it has a delta link. Drafts first: without
+  `ImmutableId` Graph gives the sent message a new id in Sent Items, and the
+  Drafts delta's `@removed` of the draft's id removes the row `SendDraft`
+  re-filed under Sent, so Sent never shows it twice. Graph files the Sent
+  copy asynchronously, so it may only come with a later delta.
