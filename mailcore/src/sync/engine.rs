@@ -4753,12 +4753,31 @@ mod tests {
             .cmd_tx
             .send(SyncCommand::SendDraft { id: local.clone() })
             .unwrap();
-        assert!(wait_until(ENGINE_WAIT, || hits(&srv, "POST", &send_path()) == 1));
-        // The 503 leaves the op queued (`PendingOps(1)`), nothing sent.
+        // A 503 is `Throttled`: the drain stops with the op queued and its
+        // attempts untouched, and retries only after Retry-After (30 s
+        // without the header), emitting no event. Commands run in order, so a
+        // FetchBody of an unknown id is the barrier: its 404 error comes only
+        // once the SendDraft has been handled.
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchBody {
+                id: "barrier".into(),
+            })
+            .unwrap();
         seen.extend(wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
+            matches!(e, SyncEvent::Error(_))
         }));
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.method == "GET" && r.path.starts_with("/me/messages/barrier"))
+        );
+        assert_eq!(hits(&srv, "POST", &send_path()), 1);
         assert!(!seen.iter().any(|e| matches!(e, SyncEvent::Sent { .. })));
+        let queued = Store::open(&store_path).unwrap().pending_ops().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert!(matches!(&queued[0].op, OutboxOp::SendDraft { id } if id == &local));
+        assert_eq!(queued[0].attempts, 0);
 
         handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
         seen.extend(wait_for(&handle.evt_rx, |e| {
