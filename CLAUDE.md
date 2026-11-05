@@ -660,6 +660,29 @@
 - `FakeServer::start_limited` gives a route a use limit; a used-up route is
   skipped for the next match (a send that fails once, then succeeds).
 
+## Mail body format (#1901)
+
+- `engine::EngineOptions { body_format }` (`graph::model::BodyFormat`,
+  default `Text`, re-exported from `sync::engine`) is chosen at spawn:
+  `spawn` runs the default, `spawn_with_options` takes one. `Text` asks
+  Graph for plain text (`Prefer: outlook.body-content-type="text"`, lookxy
+  unchanged); `Html` sends no `Prefer`, so a body comes back native (html,
+  or text for a plain-text message).
+- `bodies.fetched_as` records the format `FetchBody` *asked for*
+  (`Store::put_fetched_body`), not the content type that came back. NULL is
+  a body not fetched by `FetchBody`: `put_body` (a `createReply` draft),
+  `create_local_draft`, `update_draft_fields` (which also makes the body
+  html, as compose writes html), or a row from before the column.
+  `Store::get_body_for(id, format)` is the body when it satisfies the format:
+  a recorded format must equal it; NULL with a text body counts as asked
+  for text (the old engine always did), NULL with html satisfies both. So a
+  store filled as text upgrades one message per `FetchBody` and a native
+  text answer to `Html` is not refetched. `FetchBody` itself always goes to
+  Graph: the caller gates on `get_body_for` (`get_body` still shows
+  whatever is stored). A `createReply` draft of a plain-text message is
+  stored as text with no format, so under `Html` it is refetched once.
+- Not done: FTS indexes an html body's markup (the triggers copy `content`).
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)
