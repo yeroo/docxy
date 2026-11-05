@@ -114,11 +114,15 @@ impl RawCell {
     }
 }
 
-/// A table as read: its spec and its rows of cells.
+/// A table as read: its spec, its rows of cells and where its row groups
+/// start.
 #[derive(Debug, Default)]
 pub(crate) struct RawTable {
     pub spec: TableSpec,
     pub rows: Vec<Vec<RawCell>>,
+    /// Row indexes where a row group (`thead`, `tbody`, `tfoot`, or the rows
+    /// after one) starts, ascending: a `rowspan` ends with its group.
+    pub groups: Vec<usize>,
 }
 
 /// The placeholder a nested table holds in its cell until [`layout`].
@@ -153,9 +157,9 @@ enum Slot {
 /// Lay `t` out in `avail` twips, its nested tables in their cells' widths.
 pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
     let avail = avail.clamp(MIN_COL, MAX_TWIPS);
-    let RawTable { spec, rows } = t;
+    let RawTable { spec, rows, groups } = t;
     let nrows = rows.len();
-    let (placed, slots) = place(rows, nrows);
+    let (placed, slots) = place(rows, nrows, &groups);
     let ncols = slots
         .iter()
         .map(|r| {
@@ -264,12 +268,19 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
 /// Place every cell in the first free slot of its row from the last one
 /// placed (a browser's table model), spanning `colspan` free columns, at
 /// most to [`MAX_COLUMNS`], and `rowspan` rows (0 or past the end: to the
-/// last row). A cell with no free slot left joins the row's previous cell,
+/// last row of its row group, as a browser's table model clips it). A cell with no free slot left joins the row's previous cell,
 /// else the cell that covers the row's last slot.
-fn place(rows: Vec<Vec<RawCell>>, nrows: usize) -> (Vec<Placed>, Vec<Vec<Slot>>) {
+fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed>, Vec<Vec<Slot>>) {
     let mut slots: Vec<Vec<Slot>> = (0..nrows).map(|_| Vec::new()).collect();
     let mut placed: Vec<Placed> = Vec::new();
     for (r, row) in rows.into_iter().enumerate() {
+        // The end of row `r`'s group.
+        let group_end = groups
+            .iter()
+            .copied()
+            .find(|&g| g > r)
+            .unwrap_or(nrows)
+            .min(nrows);
         let mut cursor = 0;
         let mut last: Option<usize> = None;
         for cell in row {
@@ -294,8 +305,8 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize) -> (Vec<Placed>, Vec<Vec<Slot>>)
                 span += 1;
             }
             let reach = match cell.spec.rowspan {
-                0 => nrows - r,
-                n => (n as usize).min(nrows - r),
+                0 => group_end - r,
+                n => (n as usize).min(group_end - r),
             };
             let i = placed.len();
             for (k, row_slots) in slots[r..r + reach].iter_mut().enumerate() {
@@ -606,6 +617,7 @@ mod tests {
             RawTable {
                 spec: TableSpec::default(),
                 rows,
+                groups: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -712,6 +724,7 @@ mod tests {
                     ..TableSpec::default()
                 },
                 rows: vec![row],
+                groups: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -812,6 +825,7 @@ mod tests {
                         padding: [Some(150), None, Some(-30), Some(300)],
                     },
                 )]],
+                groups: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -849,6 +863,7 @@ mod tests {
                 ..TableSpec::default()
             },
             rows: vec![vec![text_cell("in", spec(1, 1))]],
+            groups: Vec::new(),
         };
         let mut outer = text_cell("out", spec(1, 1));
         outer.nested.push((1, inner));
@@ -861,6 +876,7 @@ mod tests {
                     ..TableSpec::default()
                 },
                 rows: vec![vec![outer, text_cell("b", spec(1, 1))]],
+                groups: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),

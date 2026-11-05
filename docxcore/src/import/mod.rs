@@ -399,6 +399,8 @@ struct HtmlAcc {
     cell: Option<html_table::CellSpec>,
     /// Nested tables at placeholder indexes of `TableAcc::blocks`.
     nested: Vec<(usize, html_table::RawTable)>,
+    /// Row indexes where a row group starts ([`html_table::RawTable::groups`]).
+    groups: Vec<usize>,
 }
 
 impl<'b> Builder<'b> {
@@ -549,6 +551,7 @@ impl<'b> Builder<'b> {
                 cells: Vec::new(),
                 cell: None,
                 nested: Vec::new(),
+                groups: Vec::new(),
             }),
             ..TableAcc::default()
         });
@@ -559,6 +562,17 @@ impl<'b> Builder<'b> {
     pub(crate) fn begin_cell(&mut self, spec: html_table::CellSpec) {
         if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
             h.cell = Some(spec);
+        }
+    }
+
+    /// A row group of the innermost HTML table starts or ends here: the
+    /// rows after it are another group, which no `rowspan` reaches into.
+    pub(crate) fn row_group_boundary(&mut self) {
+        if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
+            let at = h.rows.len();
+            if at > 0 && h.groups.last() != Some(&at) {
+                h.groups.push(at);
+            }
         }
     }
 
@@ -726,6 +740,7 @@ impl<'b> Builder<'b> {
         let raw = html_table::RawTable {
             spec: h.spec,
             rows: h.rows,
+            groups: h.groups,
         };
         match self.tables.last_mut() {
             Some(outer) if outer.html.is_some() => {

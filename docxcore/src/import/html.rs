@@ -567,8 +567,9 @@ impl Cascade {
         }
     }
 
-    /// Presentational attributes: `align` on a block or cell, `<font color
-    /// face size>`.
+    /// Presentational attributes: `align` on a block, cell, row or row
+    /// group; `bgcolor` and `valign` on a table part; `width` on a table or
+    /// cell; `<font color face size>`.
     fn presentational(&mut self, tag: &str, attrs: &Attrs) {
         if matches!(self.kind, Kind::Block | Kind::Cell) || self.table_part() {
             if let Some(a) = attrs.align.as_deref().and_then(align_value) {
@@ -1082,6 +1083,9 @@ impl<'a> Html<'a> {
                 self.close_open(&["tr"], &["table", "thead", "tbody", "tfoot"]);
                 if ROW_GROUPS.contains(&name) {
                     self.close_open(&ROW_GROUPS, &["table"]);
+                    if self.kept_table() {
+                        self.out.row_group_boundary();
+                    }
                 }
             }
             _ => {}
@@ -1437,6 +1441,17 @@ impl<'a> Html<'a> {
             "thead" | "tbody" | "tfoot" => {
                 self.close_open(&["td", "th"], &["tr", "table", "thead", "tbody", "tfoot"]);
                 self.close_open(&["tr"], &["table", "thead", "tbody", "tfoot"]);
+                // Rows after it are another group (a bare `tr` there opens an
+                // implied `tbody` in a browser).
+                let open = self
+                    .elems
+                    .iter()
+                    .rev()
+                    .take_while(|e| e.key.tag != "table")
+                    .any(|e| e.key.tag == name);
+                if open && self.kept_table() {
+                    self.out.row_group_boundary();
+                }
             }
             _ => {}
         }
@@ -3124,6 +3139,48 @@ mod tests {
             let cols: u32 = r.cells.iter().map(|c| c.grid_span).sum();
             assert_eq!(cols, 4);
         }
+    }
+
+    #[test]
+    fn a_rowspan_ends_with_its_row_group() {
+        use crate::model::VMerge::{self, *};
+        let shape = |d: &Document| -> Vec<Vec<(u32, VMerge)>> {
+            table(d)
+                .rows
+                .iter()
+                .map(|r| r.cells.iter().map(|c| (c.grid_span, c.v_merge)).collect())
+                .collect()
+        };
+        // A header cell's rowspan does not reach into the body.
+        let d = doc(
+            "<table><thead><tr><th rowspan=2>H</th><th>A</th></tr></thead>\
+             <tbody><tr><td>x</td><td>y</td></tr></tbody></table>",
+        );
+        assert_eq!(table(&d).grid.len(), 2);
+        assert_eq!(
+            shape(&d),
+            [vec![(1, None), (1, None)], vec![(1, None), (1, None)]]
+        );
+        assert_eq!(table_texts(&d), [["H", "A"], ["x", "y"]]);
+        // `rowspan=0` reaches its group's last row, with implied group ends.
+        let d = doc("<table><tbody><tr><td rowspan=0>a<td>b<tr><td>c\
+             <tbody><tr><td>d<td>e</table>");
+        assert_eq!(
+            shape(&d),
+            [
+                vec![(1, Restart), (1, None)],
+                vec![(1, Continue), (1, None)],
+                vec![(1, None), (1, None)],
+            ]
+        );
+        assert_eq!(table_texts(&d)[2], ["d", "e"]);
+        // Bare rows after a closed group are a group of their own.
+        let d = doc("<table><tbody><tr><td rowspan=3>a<td>b</tbody><tr><td>c<td>d</tr></table>");
+        assert_eq!(table_texts(&d), [["a", "b"], ["c", "d"]]);
+        assert_eq!(shape(&d)[0], [(1, None), (1, None)]);
+        // Without row groups the rowspan reaches as far as the table.
+        let d = doc("<table><tr><td rowspan=3>a<td>b<tr><td>c</table>");
+        assert_eq!(shape(&d)[1], [(1, Continue), (1, None)]);
     }
 
     #[test]

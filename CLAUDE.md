@@ -593,7 +593,8 @@
   `begin_cell`); RTF never calls them and keeps its one even 6.5" grid.
 - Cells go into a slot grid as a browser's table model places them:
   `colspan` (1..=1000, cut at `MAX_COLUMNS`) as `gridSpan`, `rowspan` (0 to
-  the last row, clipped there) as a `vMerge` restart and continuations
+  the last row of its row group, clipped there: a group is a `thead`,
+  `tbody`, `tfoot`, or the rows after one closes) as a `vMerge` restart and continuations
   (empty, the same `tcPr` but `<w:vMerge/>`), rows padded to the grid; a
   cell with no free slot joins the row's previous cell, else the cell
   covering the row. A begun cell is ended by its row's or table's end even
