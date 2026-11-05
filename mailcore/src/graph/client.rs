@@ -196,6 +196,19 @@ impl GraphClient {
         Ok(items.iter().filter_map(MailFolder::from_json).collect())
     }
 
+    /// GET `/me/mailFolders/{id}?$select=totalItemCount,unreadItemCount`:
+    /// one folder's `(total, unread)` counts, which the sync engine re-reads
+    /// after syncing just that folder (#1885). A missing count is 0, as in
+    /// `MailFolder::from_json`.
+    pub fn get_folder_counts(&self, folder_id: &str) -> Result<(i64, i64), GraphError> {
+        let folder_id = encode_path_segment(folder_id);
+        let path = format!("/me/mailFolders/{folder_id}?$select=totalItemCount,unreadItemCount");
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        let count = |name: &str| v.get(name).and_then(Value::as_i64).unwrap_or(0);
+        Ok((count("totalItemCount"), count("unreadItemCount")))
+    }
+
     /// GET a folder's `/messages/delta` (first call, `DeltaCursor::Folder`)
     /// or a stored `nextLink`/`deltaLink` (`DeltaCursor::Link`), requesting
     /// pages of 50 via `Prefer: odata.maxpagesize=50`.
@@ -1220,6 +1233,35 @@ mod tests {
         ] {
             assert!(path.contains(field), "{field} selected: {path}");
         }
+    }
+
+    #[test]
+    fn get_folder_counts_reads_totals() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/A%2FB%3D?".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"A/B=","totalItemCount":12,"unreadItemCount":3}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F2".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"F2","totalItemCount":4}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.get_folder_counts("A/B=").unwrap(), (12, 3));
+        // A missing count is 0, as in `MailFolder::from_json`.
+        assert_eq!(c.get_folder_counts("F2").unwrap(), (4, 0));
+        let path = &srv.requests()[0].path;
+        assert_eq!(
+            path,
+            "/me/mailFolders/A%2FB%3D?$select=totalItemCount,unreadItemCount"
+        );
     }
 
     #[test]
