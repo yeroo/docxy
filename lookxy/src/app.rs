@@ -2993,7 +2993,11 @@ impl App {
             return;
         };
         if action == ComposeAction::Discard {
-            let _ = self.store.clear_outbound_attachments(&compose.draft_id);
+            // Only the files not on the Graph draft yet: one a failed send
+            // uploaded stays listed, as Send would still deliver it (#1874).
+            let _ = self
+                .store
+                .discard_pending_outbound_attachments(&compose.draft_id);
             return;
         }
         let html = compose_html::to_html(&compose.editor.text);
@@ -6754,6 +6758,34 @@ pub(crate) mod tests {
             app.error_notice.as_deref(),
             Some("x.txt is already attached to the server draft")
         );
+    }
+
+    #[test]
+    fn discard_keeps_an_attachment_a_failed_send_uploaded() {
+        // FIX r1 M2 (#1874): Discard drops only what is not on the Graph
+        // draft, so the next open still lists what Send would deliver.
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new();
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/up.txt", "up.txt", 3)
+            .unwrap();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/new.txt", "new.txt", 3)
+            .unwrap();
+        app.store
+            .mark_outbound_attachment_uploaded(&draft_id, "/tmp/up.txt")
+            .unwrap();
+        app.compose_action = Some(ComposeAction::Discard);
+
+        app.apply_compose_action();
+
+        assert!(app.compose.is_none());
+        let left = app.store.outbound_attachments(&draft_id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "up.txt");
+        app.open_draft(&draft_id);
+        assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
     }
 
     #[test]
