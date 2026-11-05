@@ -55,6 +55,15 @@
 //! with none `center`), a cell's `padding` as its margins, and the table's
 //! `border`, `cellpadding`, `cellspacing` and `align`. Nested tables stay
 //! nested, to [`MAX_TABLE_NESTING`] levels.
+//!
+//! Centring (#1922): a table's `w:jc` comes from its `align=left|right`
+//! (a float, first), else its auto `margin-left`/`margin-right` (`<table
+//! align=center>` is that hint), else its container's `-webkit-` alignment
+//! (`<center>`, `align` on a `div`, `p`, `caption` or table part,
+//! `text-align: -webkit-center`); plain `text-align` moves no box. A
+//! `display: block` image is a paragraph of its own, aligned to its place
+//! by the same rule, and a body block with an absolute `width` and both
+//! side margins auto is indented evenly.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
 use super::html_image::{self, ImageResolver, Images, ImportedMedia, Source};
@@ -381,6 +390,14 @@ struct Look {
     /// under a heading that is an explicit off (#1872 6b).
     bold_off: bool,
     align: Option<Align>,
+    /// Where a block-level child is placed when its own margins do not say
+    /// (#1922): `Center` or `Right` from an inherited `-webkit-center` /
+    /// `-webkit-right` (`<center>`, `align` on a `div`, `p`, `caption` or
+    /// table part), else `None`. A plain `text-align` clears it.
+    block_align: Option<Align>,
+    /// Inside a table cell (inherited): a fixed-width block's centring
+    /// needs the body width, unknown there (#1922).
+    in_cell: bool,
     line: Option<Line>,
     line_exact: bool,
     /// `text-indent`, in twips (inherited).
@@ -400,6 +417,13 @@ struct Look {
     own_width: Option<Width>,
     /// An image's own `height` (not inherited; only `img` reads one).
     own_height: Option<Width>,
+    /// A table's or block image's own place in its line (not inherited,
+    /// #1922): `Center`, `Right`, else `None` (the left), by its auto
+    /// margins, else its parent's [`Look::block_align`].
+    own_place: Option<Align>,
+    /// An image is `display: block` (not inherited, #1922): a paragraph of
+    /// its own, placed by `own_place`.
+    own_block: bool,
     /// A cell's own `padding`, in twips, top, right, bottom, left (not
     /// inherited): its `tcMar`.
     own_padding: [Option<i32>; 4],
@@ -519,6 +543,13 @@ struct Cascade {
     is_table: bool,
     /// The element is an `img`: what reads `width` and `height` as its size.
     is_img: bool,
+    /// The `auto` sides of its margin, top, right, bottom, left (#1922).
+    margin_auto: [bool; 4],
+    /// The parent's [`Look::block_align`]: what places this element's box
+    /// when it is block-level and its margins are not auto.
+    parent_block_align: Option<Align>,
+    /// A block's own absolute CSS `width` (#1922).
+    block_width: Option<Len>,
 }
 
 /// A twips sum kept in Word's range.
@@ -538,6 +569,46 @@ fn align_value(v: &str) -> Option<Align> {
         "justify" => Some(Align::Justify),
         "left" | "start" | "-webkit-left" => Some(Align::Left),
         _ => None,
+    }
+}
+
+/// An `align` attribute's alignment: `text-align`'s values, and `middle`,
+/// HTML's other spelling of `center` (#1922).
+fn align_attr(v: &str) -> Option<Align> {
+    if v.trim().eq_ignore_ascii_case("middle") {
+        return Some(Align::Center);
+    }
+    align_value(v)
+}
+
+/// Whether a `text-align` value is a vendor one (`-webkit-center`,
+/// `-moz-center`): it places block-level children too (#1922).
+fn prefixed_align(v: &str) -> bool {
+    let v = v.trim();
+    ["-webkit-", "-moz-"]
+        .iter()
+        .any(|p| v.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))
+}
+
+/// The [`Look::block_align`] a `text-align` of `a` sets: a `-webkit-`
+/// centre or right places block children, anything else clears it.
+fn webkit_block_align(a: Align, webkit: bool) -> Option<Align> {
+    match a {
+        Align::Center | Align::Right if webkit => Some(a),
+        _ => None,
+    }
+}
+
+/// Where a block-level box sits in its line (#1922), as a browser
+/// resolves its inline margins: both `auto` centre it, a left `auto` alone
+/// puts it right, a right `auto` alone left; with neither, the containing
+/// block's `-webkit-` alignment (`parent`) places it. `None` is the left.
+fn block_position(auto: [bool; 4], parent: Option<Align>) -> Option<Align> {
+    match (auto[3], auto[1]) {
+        (true, true) => Some(Align::Center),
+        (true, false) => Some(Align::Right),
+        (false, true) => None,
+        (false, false) => parent.filter(|a| matches!(a, Align::Center | Align::Right)),
     }
 }
 
@@ -635,14 +706,21 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
             .as_deref()
             .and_then(html_int)
             .map(|n| n.min(1000)),
+        // `align=left|right` floats the table: it decides first (#1922).
+        // Otherwise its margins, else its container's `-webkit-` alignment
+        // (`<table align=center>` is an auto-margins hint).
         jc: match attrs
             .align
             .as_deref()
             .map(|a| a.trim().to_ascii_lowercase())
         {
-            Some(a) if a == "center" => Some("center"),
             Some(a) if a == "right" => Some("right"),
-            _ => None,
+            Some(a) if a == "left" => None,
+            _ => match look.own_place {
+                Some(Align::Center) => Some("center"),
+                Some(Align::Right) => Some("right"),
+                _ => None,
+            },
         },
     }
 }
@@ -656,7 +734,11 @@ impl Cascade {
         look.own_width = None;
         look.own_height = None;
         look.own_padding = [None; 4];
+        look.own_place = None;
+        look.own_block = false;
+        let parent_block_align = look.block_align;
         if kind == Kind::Cell {
+            look.in_cell = true;
             // A cell starts a fresh block look; what is inherited (the runs,
             // alignment, line height) still passes in.
             look.indent = 0;
@@ -678,6 +760,9 @@ impl Cascade {
             background: None,
             is_table: false,
             is_img: false,
+            margin_auto: [false; 4],
+            parent_block_align,
+            block_width: None,
         }
     }
 
@@ -715,7 +800,10 @@ impl Cascade {
             "s" | "strike" | "del" => run.strike = true,
             "sup" => run.vert_align = VertAlign::Superscript,
             "sub" => run.vert_align = VertAlign::Subscript,
-            "center" => self.look.align = Some(Align::Center),
+            "center" => {
+                self.look.align = Some(Align::Center);
+                self.look.block_align = Some(Align::Center);
+            }
             "blockquote" => {
                 let m = Some(Len {
                     v: 40.0,
@@ -743,8 +831,26 @@ impl Cascade {
             }
         }
         if matches!(self.kind, Kind::Block | Kind::Cell) || self.table_part() {
-            if let Some(a) = attrs.align.as_deref().and_then(align_value) {
+            if let Some(a) = attrs.align.as_deref().and_then(align_attr) {
                 self.look.align = Some(a);
+                // `align` on these is `text-align: -webkit-*` (it also
+                // places block-level children, #1922); on a heading, `li`
+                // and the rest it is plain, which clears an inherited one.
+                let webkit = matches!(tag, "div" | "p" | "caption") || self.kind == Kind::Cell;
+                self.look.block_align = webkit_block_align(a, webkit || self.table_part());
+            }
+        }
+        if self.is_table {
+            // `<table align=center>` is the hint `margin-left: auto;
+            // margin-right: auto` (#1922): the page's margins override it.
+            // `left` and `right` are floats, `table_spec`'s.
+            let center = attrs
+                .align
+                .as_deref()
+                .is_some_and(|a| a.trim().eq_ignore_ascii_case("center"));
+            if center {
+                self.margin_auto[1] = true;
+                self.margin_auto[3] = true;
             }
         }
         if self.kind.table() {
@@ -848,6 +954,11 @@ impl Cascade {
                     };
                 }
             }
+            "width" if self.kind == Kind::Block => {
+                // An absolute width only (#1922): a percentage or `auto`
+                // leaves the block as wide as its container.
+                self.block_width = css::length(v.trim()).filter(|l| l.unit != css::Unit::Percent);
+            }
             "font-family" => {
                 if let Some(f) = css::font_family(v) {
                     run.font = Some(f);
@@ -909,6 +1020,7 @@ impl Cascade {
             "text-align" => {
                 if let Some(a) = align_value(v) {
                     self.look.align = Some(a);
+                    self.look.block_align = webkit_block_align(a, prefixed_align(v));
                 }
             }
             "line-height" => {
@@ -925,6 +1037,7 @@ impl Cascade {
                 if let Some(sides) = css::box_sides(v) {
                     if d.name == "margin" {
                         self.margin = sides;
+                        self.margin_auto = css::box_autos(v).unwrap_or_default();
                     } else {
                         self.padding = sides;
                     }
@@ -936,8 +1049,13 @@ impl Cascade {
                 }
             }
             "display" => {
-                if v.trim().eq_ignore_ascii_case("none") {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("none") {
                     run.vanish = true;
+                } else if self.is_img && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
+                    // A block image is a paragraph of its own (#1922); any
+                    // other display (`inline`, `inline-block`) undoes it.
+                    self.look.own_block = v.eq_ignore_ascii_case("block");
                 }
             }
             "mso-hide" => {
@@ -959,6 +1077,7 @@ impl Cascade {
                     if let (Some(i), Ok(len)) = (side(s), css::side(v)) {
                         if margin {
                             self.margin[i] = len;
+                            self.margin_auto[i] = v.trim().eq_ignore_ascii_case("auto");
                         } else {
                             self.padding[i] = len;
                         }
@@ -1004,6 +1123,21 @@ impl Cascade {
                 if let Some(r) = sum(self.margin[1], self.padding[1]) {
                     look.indent_right = clamp_twips(i64::from(look.indent_right) + i64::from(r));
                 }
+                // A fixed-width box with both side margins auto is centred
+                // in the body (#1922): its content box, so its own padding
+                // (in the indents now) is outside the width.
+                let width = self.block_width.and_then(|l| l.twips(pt));
+                if let Some(width) = width.filter(|_| self.margin_auto[1] && self.margin_auto[3]) {
+                    if !look.in_cell {
+                        let room = i64::from(html_table::BODY_TWIPS)
+                            - i64::from(look.indent)
+                            - i64::from(look.indent_right)
+                            - i64::from(width.max(0));
+                        let extra = (room / 2).max(0);
+                        look.indent = clamp_twips(i64::from(look.indent) + extra);
+                        look.indent_right = clamp_twips(i64::from(look.indent_right) + extra);
+                    }
+                }
                 if let Some(fill) = self.background {
                     look.shade = Some(fill);
                 }
@@ -1015,6 +1149,9 @@ impl Cascade {
                 }
             }
             Kind::Cell | Kind::Table => {
+                if self.is_table {
+                    look.own_place = block_position(self.margin_auto, self.parent_block_align);
+                }
                 look.own_fill = self.background;
                 if self.kind == Kind::Cell {
                     for (side, p) in self.padding.iter().enumerate() {
@@ -1022,7 +1159,11 @@ impl Cascade {
                     }
                 }
             }
-            Kind::List | Kind::Container | Kind::Other => {}
+            Kind::List | Kind::Container | Kind::Other => {
+                if self.is_img && look.own_block {
+                    look.own_place = block_position(self.margin_auto, self.parent_block_align);
+                }
+            }
         }
         self.look
     }
@@ -1140,6 +1281,11 @@ struct Html<'a> {
     in_not_vml: bool,
     /// The page's images, when the import converts them.
     images: Option<Images<'a>>,
+    /// The open list item has ended a numbered paragraph (#1922).
+    item_numbered: bool,
+    /// A block image split the open list item's text: its paragraphs past
+    /// the numbered one are continuations (#1922).
+    item_split: bool,
 }
 
 impl<'a> Html<'a> {
@@ -1162,6 +1308,8 @@ impl<'a> Html<'a> {
             in_downlevel: false,
             in_not_vml: false,
             images: None,
+            item_numbered: false,
+            item_split: false,
         }
     }
 
@@ -1400,6 +1548,8 @@ impl<'a> Html<'a> {
                     block.mso_list = class.starts_with("msolist");
                 }
                 if name == "li" {
+                    self.item_numbered = false;
+                    self.item_split = false;
                     let numbered = self.lists.last().copied().unwrap_or(false);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
@@ -1864,14 +2014,21 @@ impl<'a> Html<'a> {
             Source::Media { rid, width, height } => (Some(rid), Some((width, height))),
             Source::Unresolved => (None, None),
         };
+        // A block image (#1922) is a paragraph of its own, placed by its
+        // margins or its container's `-webkit-` alignment.
+        let block = look
+            .own_block
+            .then(|| look.own_place.unwrap_or(Align::Left));
         let Some(box_twips) = html_image::picture_twips(width, height, pixels) else {
             if !alt.is_empty() {
+                self.begin_block_object(block);
                 // Alt text in a link is the link's text, as a browser
                 // shows it (#1879).
                 let link = self.run_link();
                 self.pay_space();
                 self.out.link_text(&alt, &props, link.as_deref());
                 self.para_start = false;
+                self.end_block_object(block);
             }
             return;
         };
@@ -1884,10 +2041,30 @@ impl<'a> Html<'a> {
         let name = html_image::picture_name(src, id);
         let raw =
             crate::image::inline_picture_run_described(&rid, cx, cy, id, &name, &alt, outline);
+        self.begin_block_object(block);
         self.pay_space();
         let heap = raw.len();
         self.out.object(Inline::Raw(raw), heap);
         self.para_start = false;
+        self.end_block_object(block);
+    }
+
+    /// Before a block image's content (`block`: its place): end the text
+    /// before it, which stays its own paragraph (#1922).
+    fn begin_block_object(&mut self, block: Option<Align>) {
+        if block.is_some() {
+            self.end_para_if_any();
+            self.space = None;
+            self.item_split = true;
+        }
+    }
+
+    /// After a block image's content: end its paragraph, aligned to its
+    /// place; text after it starts the next one (#1922).
+    fn end_block_object(&mut self, block: Option<Align>) {
+        if let Some(align) = block {
+            self.end_para_with(Some(align));
+        }
     }
 
     /// Write the space owed before what comes next, in its own properties
@@ -1973,6 +2150,17 @@ impl<'a> Html<'a> {
         self.out.link_text(&out, &props, link.as_deref());
     }
 
+    /// The innermost paragraph-making element's look, else the innermost
+    /// element's (text straight in `body`).
+    fn para_look(&self) -> Option<&Look> {
+        self.elems
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, Kind::Block | Kind::Cell))
+            .or(self.elems.last())
+            .map(|e| &e.look)
+    }
+
     fn par_props(&self) -> ParProps {
         let block = self
             .blocks
@@ -1983,16 +2171,7 @@ impl<'a> Html<'a> {
             Some(level) => heading_props(level),
             None => ParProps::default(),
         };
-        // The innermost paragraph-making element's look, else the
-        // innermost element's (text straight in `body`).
-        let Some(look) = self
-            .elems
-            .iter()
-            .rev()
-            .find(|e| matches!(e.kind, Kind::Block | Kind::Cell))
-            .or(self.elems.last())
-            .map(|e| &e.look)
-        else {
+        let Some(look) = self.para_look() else {
             return p;
         };
         p.align = look.align.unwrap_or_default();
@@ -2044,12 +2223,21 @@ impl<'a> Html<'a> {
     }
 
     fn end_para(&mut self) {
+        self.end_para_with(None);
+    }
+
+    /// End the paragraph, its alignment `align` when given (a block
+    /// image's place, #1922).
+    fn end_para_with(&mut self, align: Option<Align>) {
         let block = self
             .blocks
             .last()
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
         let mut props = self.par_props();
+        if let Some(a) = align {
+            props.align = a;
+        }
         let mut marker = self.marker.take();
         if marker.is_none() && block.mso_list && block.heading.is_none() {
             marker = self.out.take_leading_marker();
@@ -2058,8 +2246,17 @@ impl<'a> Html<'a> {
             if let Some(m) = &marker {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
             } else if let Some((numbered, level)) = block.item {
-                props.num_id = Some(if numbered { 2 } else { 1 });
-                props.ilvl = level;
+                if self.item_split && self.item_numbered && !block.mso_list {
+                    // Past a block image, the item's text goes on in
+                    // unnumbered paragraphs at its level's indent (#1922).
+                    let boxes = self.para_look().map_or(0, |l| l.indent);
+                    props.indent = (720 * (level + 1) + boxes).max(0);
+                    props.first_line = 0;
+                } else {
+                    props.num_id = Some(if numbered { 2 } else { 1 });
+                    props.ilvl = level;
+                    self.item_numbered = true;
+                }
             }
         }
         // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty; a
@@ -4672,5 +4869,443 @@ mod link_tests {
             sketch(p),
             [r#"Run "a ""#.to_string(), format!(r#"Link {U} ["b"]"#)]
         );
+    }
+}
+
+#[cfg(test)]
+mod centering_tests {
+    //! Centring (#1922): tables and block images placed by auto margins
+    //! and a container's `-webkit-` alignment; fixed-width blocks.
+    use super::*;
+    use crate::image::inline_embed;
+    use crate::model::{Block as DocBlock, Paragraph, Table};
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    /// `html` imported with every image resolving to a 40 x 20 PNG.
+    fn with_images(html: &str) -> Document {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend(40u32.to_be_bytes());
+        png.extend(20u32.to_be_bytes());
+        png.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        let mut resolve = |_: &str, _: usize| Some(png.clone());
+        import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve))
+            .unwrap()
+            .0
+    }
+
+    /// Every table of `d`, top-level and nested, in document order.
+    fn tables(d: &Document) -> Vec<&Table> {
+        fn walk<'d>(blocks: &'d [DocBlock], out: &mut Vec<&'d Table>) {
+            for b in blocks {
+                if let DocBlock::Table(t) = b {
+                    out.push(t);
+                    for row in &t.rows {
+                        for cell in &row.cells {
+                            walk(&cell.blocks, out);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    /// A table's `w:jc`, if any.
+    fn jc(t: &Table) -> Option<String> {
+        let pr = t.raw_tblpr.as_deref().unwrap_or("");
+        let v = pr.split("<w:jc w:val=\"").nth(1)?;
+        Some(v[..v.find('"').unwrap()].to_string())
+    }
+
+    /// The `w:jc` of every table of `html`, in document order.
+    fn jcs(html: &str) -> Vec<Option<String>> {
+        tables(&doc(html)).into_iter().map(jc).collect()
+    }
+
+    fn some(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    const T: &str = "<table width=200><tr><td>t</td></tr></table>";
+
+    /// Body paragraphs and the paragraphs of cells, in document order.
+    fn all_paras(d: &Document) -> Vec<&Paragraph> {
+        fn walk<'d>(blocks: &'d [DocBlock], out: &mut Vec<&'d Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p),
+                    DocBlock::Table(t) => {
+                        for row in &t.rows {
+                            for cell in &row.cells {
+                                walk(&cell.blocks, out);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    fn has_picture(p: &Paragraph) -> bool {
+        p.content
+            .iter()
+            .any(|i| matches!(i, Inline::Raw(r) if inline_embed(r).is_some()))
+    }
+
+    /// Each paragraph as (its text, whether it holds a picture, its
+    /// alignment).
+    fn sketch(d: &Document) -> Vec<(String, bool, Align)> {
+        all_paras(d)
+            .into_iter()
+            .map(|p| (p.plain_text(), has_picture(p), p.props.align))
+            .collect()
+    }
+
+    #[test]
+    fn margin_auto_centres_a_table() {
+        for style in [
+            "margin:0 auto",
+            "margin-left:auto;margin-right:auto",
+            "margin:10px auto 0",
+            "MARGIN: 0 Auto !important",
+        ] {
+            let html = format!("<table width=600 style='{style}'><tr><td>x</td></tr></table>");
+            assert_eq!(jcs(&html), [some("center")], "{style}");
+        }
+        assert_eq!(
+            jcs("<table style='margin-left:auto'><tr><td>x</td></tr></table>"),
+            [some("right")]
+        );
+        assert_eq!(
+            jcs("<table style='margin:0 0 0 auto'><tr><td>x</td></tr></table>"),
+            [some("right")]
+        );
+        assert_eq!(
+            jcs("<table style='margin-right:auto'><tr><td>x</td></tr></table>"),
+            [None]
+        );
+        // A later declaration replaces the side.
+        assert_eq!(
+            jcs("<table style='margin:0 auto;margin-left:0'><tr><td>x</td></tr></table>"),
+            [None]
+        );
+        // From a style sheet too.
+        assert_eq!(
+            jcs("<style>.c{margin:0 auto}</style><table class=c><tr><td>x</td></tr></table>"),
+            [some("center")]
+        );
+        // An invalid margin changes nothing.
+        assert_eq!(
+            jcs("<table style='margin:0 auto;margin:0 red'><tr><td>x</td></tr></table>"),
+            [some("center")]
+        );
+    }
+
+    #[test]
+    fn table_align_center_yields_to_css_margin() {
+        assert_eq!(
+            jcs("<table align=center><tr><td>x</td></tr></table>"),
+            [some("center")]
+        );
+        assert_eq!(
+            jcs("<table align=center style='margin:0'><tr><td>x</td></tr></table>"),
+            [None]
+        );
+        assert_eq!(
+            jcs("<table align=center style='margin-left:0'><tr><td>x</td></tr></table>"),
+            [None]
+        );
+    }
+
+    #[test]
+    fn webkit_center_ancestors_centre_tables() {
+        for wrap in [
+            "<center>{T}</center>",
+            "<center><div><div>{T}</div></div></center>",
+            "<div align=center>{T}</div>",
+            "<div align=middle>{T}</div>",
+            "<div style='text-align:-webkit-center'>{T}</div>",
+            "<div style='text-align:-moz-center'>{T}</div>",
+            "<table><tr><td align=center>{T}</td></tr></table>",
+            "<table><tr align=center><td>{T}</td></tr></table>",
+            "<table><tbody align=center><tr><td>{T}</td></tr></tbody></table>",
+            "<table><tr><th align=center>{T}</th></tr></table>",
+        ] {
+            let html = wrap.replace("{T}", T);
+            let got = jcs(&html);
+            assert_eq!(got.last(), Some(&some("center")), "{html}");
+        }
+        for wrap in [
+            "<div align=right>{T}</div>",
+            "<div style='text-align:-webkit-right'>{T}</div>",
+            "<table><tr><td align=right>{T}</td></tr></table>",
+        ] {
+            let html = wrap.replace("{T}", T);
+            assert_eq!(jcs(&html).last(), Some(&some("right")), "{html}");
+        }
+        // Through an outer table and its cell: the nested one is centred
+        // too, as a browser's standards mode inherits `text-align`.
+        assert_eq!(
+            jcs(
+                "<center><table><tr><td><table><tr><td>x</td></tr></table></td></tr></table></center>"
+            ),
+            [some("center"), some("center")]
+        );
+    }
+
+    #[test]
+    fn plain_text_align_does_not_centre_tables() {
+        for wrap in [
+            "<div style='text-align:center'>{T}</div>",
+            "<table><tr><td style='text-align:center'>{T}</td></tr></table>",
+            "<div align=center><div style='text-align:left'>{T}</div></div>",
+            "<center><div style='text-align:center'>{T}</div></center>",
+            // A table closes the open `p`: it is not inside it.
+            "<p align=center>{T}",
+            // A heading's `align` is plain, and clears an inherited one.
+            "<center><h2 align=center>{T}</h2></center>",
+            "<div align=center><div align=justify>{T}</div></div>",
+        ] {
+            let html = wrap.replace("{T}", T);
+            assert_eq!(jcs(&html).last(), Some(&None), "{html}");
+        }
+    }
+
+    #[test]
+    fn own_margins_beat_ancestor_alignment() {
+        assert_eq!(
+            jcs(
+                "<center><table style='margin-left:auto;margin-right:0'><tr><td>x</td></tr></table></center>"
+            ),
+            [some("right")]
+        );
+        assert_eq!(
+            jcs("<div align=right><table style='margin:0 auto'><tr><td>x</td></tr></table></div>"),
+            [some("center")]
+        );
+        assert_eq!(
+            jcs("<center><table style='margin-right:auto'><tr><td>x</td></tr></table></center>"),
+            [None]
+        );
+        // A table's own text-align is its cells', not its place.
+        assert_eq!(
+            jcs("<center><table style='text-align:left'><tr><td>x</td></tr></table></center>"),
+            [some("center")]
+        );
+    }
+
+    #[test]
+    fn table_float_align_beats_margins_and_ancestors() {
+        assert_eq!(
+            jcs("<center><table align=right><tr><td>x</td></tr></table></center>"),
+            [some("right")]
+        );
+        assert_eq!(
+            jcs(&format!(
+                "<table><tr><td align=center><table align=left><tr><td>x</td></tr></table>{T}</td></tr></table>"
+            )),
+            [None, None, some("center")]
+        );
+        assert_eq!(
+            jcs("<table align=left style='margin:0 auto'><tr><td>x</td></tr></table>"),
+            [None]
+        );
+    }
+
+    #[test]
+    fn a_centred_table_keeps_its_cell_text_alignment() {
+        let d = doc("<center><table><tr><td>in</td></tr></table></center>\
+             <table style='margin:0 auto'><tr><td>own</td></tr></table>\
+             <div align=center><table align=center><tr><td style='text-align:left'>left</td></tr></table></div>");
+        assert_eq!(
+            tables(&d).into_iter().map(jc).collect::<Vec<_>>(),
+            [some("center"), some("center"), some("center")]
+        );
+        let align = |text: &str| {
+            all_paras(&d)
+                .into_iter()
+                .find(|p| p.plain_text() == text)
+                .unwrap()
+                .props
+                .align
+        };
+        // The ancestors' alignment still reaches the text; the table's own
+        // margin never does.
+        assert_eq!(align("in"), Align::Center);
+        assert_eq!(align("own"), Align::Left);
+        assert_eq!(align("left"), Align::Left);
+    }
+
+    #[test]
+    fn block_image_with_auto_margins_is_its_own_centred_paragraph() {
+        let d = with_images(
+            "<p style='text-align:justify;margin-left:20px'>before<img src=a.png \
+             style='display:block;margin:0 auto'>after</p>",
+        );
+        assert_eq!(
+            sketch(&d),
+            [
+                ("before".to_string(), false, Align::Justify),
+                (String::new(), true, Align::Center),
+                ("after".to_string(), false, Align::Justify),
+            ]
+        );
+        // Each keeps the enclosing block's indent.
+        assert!(all_paras(&d).iter().all(|p| p.props.indent == 300));
+        let d = with_images("<div><img src=a.png style='display:block;margin-left:auto'></div>");
+        assert_eq!(sketch(&d), [(String::new(), true, Align::Right)]);
+        let d = with_images("<div><img src=a.png style='display:block;margin-right:auto'></div>");
+        assert_eq!(sketch(&d), [(String::new(), true, Align::Left)]);
+        // An inline image is a run of its paragraph, as before.
+        let d = with_images("<p align=center>a <img src=a.png style='margin:0 auto'> b</p>");
+        assert_eq!(sketch(&d), [("a  b".to_string(), true, Align::Center)]);
+    }
+
+    #[test]
+    fn a_block_image_is_placed_by_its_container() {
+        let img = "<img src=a.png style='display:block'>";
+        for (wrap, want) in [
+            (
+                "<table><tr><td align=center>{I}</td></tr></table>",
+                Align::Center,
+            ),
+            ("<p align=center>{I}</p>", Align::Center),
+            ("<center>{I}</center>", Align::Center),
+            ("<div align=right>{I}</div>", Align::Right),
+            ("<div style='text-align:center'>{I}</div>", Align::Left),
+            ("<h2 align=center>{I}</h2>", Align::Left),
+            (
+                "<table><tr><td style='text-align:center'>{I}</td></tr></table>",
+                Align::Left,
+            ),
+        ] {
+            let html = wrap.replace("{I}", img);
+            let got: Vec<Align> = sketch(&with_images(&html))
+                .into_iter()
+                .filter(|(_, pic, _)| *pic)
+                .map(|(_, _, a)| a)
+                .collect();
+            assert_eq!(got, [want], "{html}");
+        }
+    }
+
+    #[test]
+    fn a_style_sheets_block_image_and_a_display_reset() {
+        // An e-mail's reset sheet: every image is a block; one in a link in
+        // a centred cell is its own centred paragraph, outside the link.
+        let d = with_images(
+            "<style>img{display:block;border:0}</style><table><tr><td align=center>\
+             <a href='https://example.com/'><img src=logo.png></a>Caption</td></tr></table>",
+        );
+        assert_eq!(
+            sketch(&d),
+            [
+                (String::new(), true, Align::Center),
+                ("Caption".to_string(), false, Align::Center),
+            ]
+        );
+        // A later display undoes it.
+        for reset in ["display:inline", "display:inline-block"] {
+            let d = with_images(&format!(
+                "<style>img{{display:block}}</style><p align=center>a<img src=a.png style='{reset}'>b</p>"
+            ));
+            assert_eq!(
+                sketch(&d),
+                [("ab".to_string(), true, Align::Center)],
+                "{reset}"
+            );
+        }
+        // `display:none` stays hidden.
+        let d = with_images("<p>a<img src=a.png style='display:block;display:none'>b</p>");
+        assert_eq!(sketch(&d), [("ab".to_string(), false, Align::Left)]);
+    }
+
+    #[test]
+    fn block_image_in_a_list_item_is_an_unnumbered_continuation() {
+        let num = |d: &Document| -> Vec<(String, Option<i32>, i32, i32)> {
+            all_paras(d)
+                .into_iter()
+                .map(|p| {
+                    (
+                        p.plain_text(),
+                        p.props.num_id,
+                        p.props.indent,
+                        p.props.first_line,
+                    )
+                })
+                .collect()
+        };
+        let img = "<img src=a.png style='display:block;margin:0 auto'>";
+        let d = with_images(&format!("<ul><li>a{img}b</li><li>c</li></ul>"));
+        assert_eq!(
+            num(&d),
+            [
+                ("a".to_string(), Some(1), 0, 0),
+                (String::new(), None, 720, 0),
+                ("b".to_string(), None, 720, 0),
+                ("c".to_string(), Some(1), 0, 0),
+            ]
+        );
+        // The picture opening its item carries the item's number.
+        let d = with_images(&format!("<ol><li>{img}c</li><li>d</li></ol>"));
+        assert_eq!(
+            num(&d),
+            [
+                (String::new(), Some(2), 0, 0),
+                ("c".to_string(), None, 720, 0),
+                ("d".to_string(), Some(2), 0, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_width_block_with_auto_margins_is_indented_evenly() {
+        let indents = |html: &str| -> Vec<(String, i32, i32)> {
+            all_paras(&doc(html))
+                .into_iter()
+                .map(|p| (p.plain_text(), p.props.indent, p.props.indent_right))
+                .collect()
+        };
+        // 300 px = 4500 twips in a 9360 body: 2430 each side.
+        assert_eq!(
+            indents("<div style='width:300px;margin:0 auto'>x</div><p>y</p>"),
+            [("x".into(), 2430, 2430), ("y".into(), 0, 0)]
+        );
+        // Content box: 20 px (300 twips) padding is outside the width.
+        assert_eq!(
+            indents(
+                "<div style='width:300px;padding:0 20px;margin:0 auto;text-align:left'>x</div>"
+            ),
+            [("x".into(), 2430, 2430)]
+        );
+        // Centred in what an enclosing indent leaves (9360 - 1440 - 2880
+        // = 5040 over two); the text's alignment is untouched.
+        let d = doc("<div style='margin-left:1in'><p style='width:2in;margin:0 auto'>x</p></div>");
+        let p = all_paras(&d)[0];
+        assert_eq!((p.props.indent, p.props.indent_right), (1440 + 2520, 2520));
+        assert_eq!(p.props.align, Align::Left);
+        // Wider than the room: no extra indent, never negative.
+        assert_eq!(
+            indents("<div style='width:9in;margin:0 auto'>x</div>"),
+            [("x".into(), 0, 0)]
+        );
+        // Not without a width, a percentage, both auto sides, or in a cell.
+        for html in [
+            "<div style='margin:0 auto'>x</div>",
+            "<div style='width:50%;margin:0 auto'>x</div>",
+            "<div style='width:300px;margin-left:auto'>x</div>",
+            "<table><tr><td><div style='width:100px;margin:0 auto'>x</div></td></tr></table>",
+        ] {
+            assert_eq!(indents(html), [("x".into(), 0, 0)], "{html}");
+        }
     }
 }

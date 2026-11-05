@@ -1149,13 +1149,30 @@ pub(crate) fn box_sides(value: &str) -> Option<[Option<Len>; 4]> {
         let len = length(t)?;
         vals.push((len.unit != Unit::Percent).then_some(len));
     }
-    Some(match vals.as_slice() {
+    four_sides(&vals)
+}
+
+/// One to four box values as top, right, bottom, left.
+fn four_sides<T: Copy>(vals: &[T]) -> Option<[T; 4]> {
+    Some(match vals {
         [a] => [*a, *a, *a, *a],
         [a, b] => [*a, *b, *a, *b],
         [a, b, c] => [*a, *b, *c, *b],
         [a, b, c, d] => [*a, *b, *c, *d],
         _ => return None,
     })
+}
+
+/// The `auto` sides of a `margin` shorthand, top, right, bottom, left
+/// (#1922: `margin: 0 auto` centres a block-level box); `None` when the
+/// declaration is invalid, as [`box_sides`] says.
+pub(crate) fn box_autos(value: &str) -> Option<[bool; 4]> {
+    box_sides(value)?;
+    let autos: Vec<bool> = tokens(value)
+        .iter()
+        .map(|t| t.eq_ignore_ascii_case("auto"))
+        .collect();
+    four_sides(&autos)
 }
 
 /// One side's value (`margin-left: …`): a length, else `None` for `auto` or
@@ -1543,6 +1560,16 @@ mod tests {
         assert_eq!(box_sides(""), None);
         assert_eq!(side("auto"), Ok(None));
         assert_eq!(side("x"), Err(()));
+
+        // The auto sides (#1922), expanded as the lengths are.
+        assert_eq!(box_autos("auto"), Some([true; 4]));
+        assert_eq!(box_autos("0 auto"), Some([false, true, false, true]));
+        assert_eq!(box_autos("10px AUTO 0"), Some([false, true, false, true]));
+        assert_eq!(box_autos("0 0 0 auto"), Some([false, false, false, true]));
+        assert_eq!(box_autos("1px 2px"), Some([false; 4]));
+        assert_eq!(box_autos("0 auto red"), None);
+        assert_eq!(box_autos("auto auto auto auto auto"), None);
+        assert_eq!(box_autos(""), None);
     }
 
     #[test]
