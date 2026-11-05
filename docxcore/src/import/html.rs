@@ -2806,15 +2806,24 @@ mod tests {
         let rows = table_texts(&d);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), crate::import::MAX_COLUMNS);
-        // A nested table without its `</td>` stays in the outer cell.
+        // A nested table without its `</td>` stays in the outer cell, as a
+        // table of its own (#1878).
         let d = doc(
             "<table><tr><td>outer<table><tr><td>in1<td>in2</table>more</td><td>next</td></tr></table>",
         );
         let rows = table_texts(&d);
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].len(), 2, "{rows:?}");
-        assert!(rows[0][0].contains("more"), "{rows:?}");
+        assert_eq!(rows[0][0], "outer|more", "{rows:?}");
         assert_eq!(rows[0][1], "next");
+        let inner = nested(table(&d), 0, 0);
+        assert_eq!(inner.len(), 1);
+        let texts: Vec<String> = inner[0].rows[0]
+            .cells
+            .iter()
+            .map(|c| c.blocks.iter().map(|b| b.plain_text()).collect())
+            .collect();
+        assert_eq!(texts, ["in1", "in2"]);
     }
 
     #[test]
@@ -3035,5 +3044,384 @@ mod tests {
         for i in 0..=page.len() {
             let _ = import_html(&page.as_bytes()[..i]);
         }
+    }
+
+    /// The first table of `d`.
+    fn table(d: &Document) -> &crate::model::Table {
+        match d.body.iter().find(|b| matches!(b, DocBlock::Table(_))) {
+            Some(DocBlock::Table(t)) => t,
+            _ => panic!("no table: {:?}", d.body),
+        }
+    }
+
+    fn tcpr(t: &crate::model::Table, row: usize, cell: usize) -> &str {
+        t.rows[row].cells[cell].raw_tcpr.as_deref().unwrap_or("")
+    }
+
+    fn tcw(t: &crate::model::Table, row: usize, cell: usize) -> u32 {
+        let pr = tcpr(t, row, cell);
+        let w = pr
+            .split("<w:tcW w:w=\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{pr}"));
+        w[..w.find('"').unwrap()].parse().unwrap()
+    }
+
+    /// The nested tables of a cell.
+    fn nested(t: &crate::model::Table, row: usize, cell: usize) -> Vec<&crate::model::Table> {
+        t.rows[row].cells[cell]
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn colspan_and_rowspan_make_grid_spans_and_vertical_merges() {
+        use crate::model::VMerge;
+        let d = doc(
+            "<table><tr><td colspan=2>head</td><td rowspan=2>side</td></tr>\
+             <tr><td>a</td><td>b</td></tr><tr><td rowspan=0>all</td><td colspan=\"3\">wide</td></tr>\
+             <tr><td>last</td></tr></table>",
+        );
+        let t = table(&d);
+        // `wide` spans three columns after `all`: the grid grows to four.
+        assert_eq!(t.grid.len(), 4);
+        let shape: Vec<Vec<(u32, VMerge)>> = t
+            .rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| (c.grid_span, c.v_merge)).collect())
+            .collect();
+        use VMerge::*;
+        assert_eq!(
+            shape,
+            [
+                vec![(2, None), (1, Restart), (1, None)],
+                vec![(1, None), (1, None), (1, Continue), (1, None)],
+                // `rowspan=0` reaches the last row.
+                vec![(1, Restart), (3, None)],
+                vec![(1, Continue), (1, None), (1, None), (1, None)],
+            ]
+        );
+        assert!(tcpr(t, 0, 0).contains("<w:gridSpan w:val=\"2\"/>"));
+        assert!(tcpr(t, 2, 0).contains("<w:vMerge w:val=\"restart\"/>"));
+        assert!(tcpr(t, 3, 0).contains("<w:vMerge/>"));
+        // The continuation is an empty cell; `last` sits after it.
+        assert_eq!(table_texts(&d)[3], ["", "last", "", ""]);
+        // Every row covers the grid.
+        for r in &t.rows {
+            let cols: u32 = r.cells.iter().map(|c| c.grid_span).sum();
+            assert_eq!(cols, 4);
+        }
+    }
+
+    #[test]
+    fn widths_from_attributes_and_css_build_the_grid() {
+        // `width` attributes: px and a percentage of the table's.
+        let d = doc(
+            "<table width=600><tr><td width=200>a</td><td width='50%'>b</td><td>c</td></tr></table>",
+        );
+        let t = table(&d);
+        assert_eq!(t.grid, [3000, 4500, 1500]);
+        assert!(
+            t.raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>")
+        );
+        assert_eq!(
+            (tcw(t, 0, 0), tcw(t, 0, 1), tcw(t, 0, 2)),
+            (3000, 4500, 1500)
+        );
+        // CSS over the attribute; a percent table.
+        let d = doc("<style>.w{width:1in}</style><table style='width:50%'><tr>\
+             <td class=w width=10>a</td><td style='width:auto' width=100>b</td></tr></table>");
+        let t = table(&d);
+        assert_eq!(t.grid, [1440, 3240]);
+        assert!(
+            t.raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("<w:tblW w:w=\"2500\" w:type=\"pct\"/>")
+        );
+        // No widths: the 6.5" column shared, tblW auto; a garbage width
+        // is none.
+        let d = doc("<table width=wide><tr><td width=*>a</td><td>b</td></tr></table>");
+        let t = table(&d);
+        assert_eq!(t.grid, [4680, 4680]);
+        assert!(
+            t.raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("<w:tblW w:w=\"0\" w:type=\"auto\"/>")
+        );
+        // Every column known and no table width: their sum.
+        let d = doc("<table><tr><td width=100px>a</td><td width=50>b</td></tr></table>");
+        assert_eq!(table(&d).grid, [1500, 750]);
+    }
+
+    #[test]
+    fn over_full_declared_widths_widen_the_grid() {
+        let d = doc("<table width=100><tr><td width=300>a</td><td>b</td></tr></table>");
+        let t = table(&d);
+        assert_eq!(t.grid, [4500, html_table::MIN_COL]);
+        assert!(
+            t.raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("<w:tblW w:w=\"1500\" w:type=\"dxa\"/>")
+        );
+        let d = doc("<table width=600><tr><td width=70%>a</td><td width=70%>b</td></tr></table>");
+        assert_eq!(table(&d).grid, [4500, 4500]);
+    }
+
+    #[test]
+    fn cell_shading_falls_back_to_row_and_table() {
+        let d = doc(
+            "<style>.blue{background:#0000ff} tr.g{background-color:green}</style>\
+             <table bgcolor=#ffff00><tbody bgcolor=silver><tr bgcolor=red>\
+             <td bgcolor=white>own</td><td class=blue bgcolor=white>css</td><td>row</td></tr>\
+             <tr><td>group</td><td style='background:none' bgcolor=white>cleared</td></tr></tbody>\
+             <tr class=g><td>css row</td></tr><tr><td><p>table</p></td></tr></table>",
+        );
+        let t = table(&d);
+        let fill = |r: usize, c: usize| {
+            let pr = tcpr(t, r, c);
+            pr.split("w:fill=\"").nth(1).map(|f| f[..6].to_string())
+        };
+        assert_eq!(fill(0, 0).as_deref(), Some("FFFFFF"));
+        assert_eq!(fill(0, 1).as_deref(), Some("0000FF"), "CSS over bgcolor");
+        assert_eq!(fill(0, 2).as_deref(), Some("FF0000"), "the row's");
+        assert_eq!(fill(1, 0).as_deref(), Some("C0C0C0"), "the row group's");
+        assert_eq!(
+            fill(1, 1).as_deref(),
+            Some("C0C0C0"),
+            "none shows the group's"
+        );
+        assert_eq!(fill(2, 0).as_deref(), Some("008000"));
+        assert_eq!(fill(3, 0).as_deref(), Some("FFFF00"), "the table's");
+        // The cells' paragraphs are not shaded by it.
+        for p in all_paras(&d) {
+            assert!(p.props.raw_props.is_empty(), "{:?}", p.props.raw_props);
+        }
+        // A cell without any fill has no shd.
+        let d = doc("<table><tr><td>x</td></tr></table>");
+        assert!(!tcpr(table(&d), 0, 0).contains("w:shd"));
+    }
+
+    #[test]
+    fn valign_from_attribute_css_and_row() {
+        let d = doc(
+            "<table><tbody valign=bottom><tr valign=top><td>a</td><td valign=middle>b</td>\
+             <td style='vertical-align:bottom'>c</td></tr><tr><td>d</td></tr></tbody>\
+             <tr><td>e</td><td style='vertical-align:super'>f</td></tr></table>",
+        );
+        let t = table(&d);
+        let va = |r: usize, c: usize| {
+            let pr = tcpr(t, r, c);
+            let v = pr.split("<w:vAlign w:val=\"").nth(1).unwrap();
+            v[..v.find('"').unwrap()].to_string()
+        };
+        assert_eq!(va(0, 0), "top", "the row's");
+        assert_eq!(va(0, 1), "center");
+        assert_eq!(va(0, 2), "bottom");
+        assert_eq!(va(1, 0), "bottom", "the row group's, through its row");
+        assert_eq!(va(2, 0), "center", "a browser's middle");
+        assert_eq!(va(2, 1), "top", "super on a cell is its baseline");
+        // ... and it makes no superscript text.
+        assert_eq!(run_of(&d, "f").props.vert_align, VertAlign::Baseline);
+        // A nested table does not inherit its cell's alignment.
+        let d =
+            doc("<table><tr valign=top><td><table><tr><td>in</td></tr></table></td></tr></table>");
+        let inner = nested(table(&d), 0, 0)[0];
+        assert!(tcpr(inner, 0, 0).contains("<w:vAlign w:val=\"center\"/>"));
+    }
+
+    #[test]
+    fn border_cellpadding_cellspacing_and_table_align() {
+        let d = doc(
+            "<table border=2 cellpadding=4 cellspacing=6 align=center><tr align=right>\
+             <td style='padding:2px 0'>a</td><td>b</td></tr></table>",
+        );
+        let t = table(&d);
+        let pr = t.raw_tblpr.as_deref().unwrap();
+        assert!(pr.contains("<w:jc w:val=\"center\"/>"), "{pr}");
+        assert!(
+            pr.contains("<w:tblCellSpacing w:w=\"45\" w:type=\"dxa\"/>"),
+            "{pr}"
+        );
+        assert!(pr.contains("<w:top w:val=\"single\" w:sz=\"12\""), "{pr}");
+        assert!(
+            pr.contains("<w:insideH w:val=\"single\" w:sz=\"6\""),
+            "{pr}"
+        );
+        assert!(
+            pr.contains(
+                "<w:tblCellMar><w:top w:w=\"60\" w:type=\"dxa\"/><w:left w:w=\"60\" \
+                 w:type=\"dxa\"/><w:bottom w:w=\"60\" w:type=\"dxa\"/><w:right w:w=\"60\" \
+                 w:type=\"dxa\"/></w:tblCellMar>"
+            ),
+            "{pr}"
+        );
+        // A cell's own padding is its tcMar.
+        assert!(
+            tcpr(t, 0, 0).contains(
+                "<w:tcMar><w:top w:w=\"30\" w:type=\"dxa\"/><w:left w:w=\"0\" w:type=\"dxa\"/>\
+                 <w:bottom w:w=\"30\" w:type=\"dxa\"/><w:right w:w=\"0\" w:type=\"dxa\"/></w:tcMar>"
+            ),
+            "{}",
+            tcpr(t, 0, 0)
+        );
+        assert!(!tcpr(t, 0, 1).contains("w:tcMar"));
+        // The table's align is the table's; the row's aligns the text.
+        assert_eq!(para_of(&d, "a").props.align, Align::Right);
+        let d = doc("<table align=center><tr><td>x</td></tr></table>");
+        assert_eq!(para_of(&d, "x").props.align, Align::Left);
+        // A bare border is 1px; border=0, a layout table, has none; an
+        // explicit cellpadding=0 is four zero margins.
+        let d = doc("<table border><tr><td>x</td></tr></table>");
+        assert!(
+            table(&d)
+                .raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("w:sz=\"6\"")
+        );
+        let d = doc("<table border=0 cellpadding=0 cellspacing=0><tr><td>x</td></tr></table>");
+        let pr = table(&d).raw_tblpr.as_deref().unwrap().to_string();
+        assert!(
+            !pr.contains("tblBorders") && !pr.contains("tblCellSpacing"),
+            "{pr}"
+        );
+        assert!(
+            pr.contains("<w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/>"),
+            "{pr}"
+        );
+        assert_eq!(pr.matches("w:w=\"0\" w:type=\"dxa\"").count(), 4, "{pr}");
+        assert!(!tcpr(table(&d), 0, 0).contains("Borders"));
+    }
+
+    #[test]
+    fn nested_tables_stay_nested() {
+        let d = doc(
+            "<table><tr><td>outer<table><tr><td>in1</td><td>in2</td></tr></table></td>\
+             <td><table><tr><td>last</td></tr></table></td></tr></table><p>after</p>",
+        );
+        let t = table(&d);
+        assert_eq!(t.rows[0].cells.len(), 2);
+        let first = &t.rows[0].cells[0].blocks;
+        assert!(matches!(&first[0], DocBlock::Paragraph(p) if p.plain_text() == "outer"));
+        let inner = nested(t, 0, 0);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].rows[0].cells.len(), 2);
+        // A cell ends in a paragraph after its table.
+        for c in &t.rows[0].cells {
+            assert!(
+                matches!(c.blocks.last(), Some(DocBlock::Paragraph(_))),
+                "{:?}",
+                c.blocks
+            );
+        }
+        assert_eq!(nested(t, 0, 1).len(), 1);
+        assert_eq!(
+            paragraph_texts(&d).last().map(String::as_str),
+            Some("after")
+        );
+        // Past MAX_TABLE_NESTING a table is its cell's text.
+        let depth = MAX_TABLE_NESTING + 3;
+        let mut page = String::new();
+        for k in 0..depth {
+            page.push_str(&format!("<table><tr><td>t{k}"));
+        }
+        for _ in 0..depth {
+            page.push_str("</td></tr></table>");
+        }
+        let d = doc(&page);
+        let mut t = table(&d);
+        let mut levels = 1;
+        while let Some(n) = nested(t, 0, 0).first().copied() {
+            t = n;
+            levels += 1;
+        }
+        assert_eq!(levels, MAX_TABLE_NESTING);
+        let deepest: Vec<String> = t.rows[0].cells[0]
+            .blocks
+            .iter()
+            .map(|b| b.plain_text())
+            .collect();
+        assert!(deepest.contains(&format!("t{}", depth - 1)), "{deepest:?}");
+        // 300 unclosed nested tables are bounded.
+        let page = "<table><tr><td>x".repeat(300);
+        let d = doc(&page);
+        assert!(paragraph_texts(&d).len() >= 300);
+    }
+
+    #[test]
+    fn a_nested_full_width_table_fills_its_cell_not_the_outer_table() {
+        let d = doc(
+            "<table width=600 cellpadding=0><tr><td>left<table width=100%><tr><td>in</td></tr></table></td>\
+             <td>right</td></tr></table>",
+        );
+        let t = table(&d);
+        assert_eq!(t.grid, [4500, 4500]);
+        let inner = nested(t, 0, 0)[0];
+        assert_eq!(inner.grid, [4500]);
+        assert!(
+            inner
+                .raw_tblpr
+                .as_deref()
+                .unwrap()
+                .contains("<w:tblW w:w=\"5000\" w:type=\"pct\"/>")
+        );
+        // A cell's padding narrows the room its table has.
+        let d = doc(
+            "<table width=600><tr><td style='padding:0 10px'><table width=100%><tr><td>in</td></tr></table></td>\
+             <td>right</td></tr></table>",
+        );
+        assert_eq!(nested(table(&d), 0, 0)[0].grid, [4200]);
+    }
+
+    #[test]
+    fn an_unclosed_empty_spacer_cell_keeps_its_width_and_shading() {
+        let d = doc("<table><tr><td>a<td width=20 bgcolor=red></tr></table>");
+        let t = table(&d);
+        assert_eq!(t.rows[0].cells.len(), 2);
+        assert_eq!(tcw(t, 0, 1), 300);
+        assert!(tcpr(t, 0, 1).contains("w:fill=\"FF0000\""));
+        // Ended by the table, too.
+        let d = doc("<table><tr><td>a<td bgcolor=red></table>");
+        assert_eq!(table(&d).rows[0].cells.len(), 2);
+    }
+
+    #[test]
+    fn an_imported_html_table_round_trips_through_docx() {
+        let d = doc(
+            "<table width=600 border=1><tr><td colspan=2 bgcolor=red>h</td><td rowspan=2>s</td></tr>\
+             <tr><td>a<table><tr><td>in</td></tr></table></td><td>b</td></tr></table>",
+        );
+        let xml = crate::serialize::document_to_xml(&d);
+        let back = crate::load::parse_document_xml(&xml, &crate::load::Relationships::default());
+        let (a, b) = (table(&d), table(&back));
+        assert_eq!(a.grid, b.grid);
+        let shape =
+            |t: &crate::model::Table| -> Vec<Vec<(u32, crate::model::VMerge, Option<String>)>> {
+                t.rows
+                    .iter()
+                    .map(|r| {
+                        r.cells
+                            .iter()
+                            .map(|c| (c.grid_span, c.v_merge, c.raw_tcpr.clone()))
+                            .collect()
+                    })
+                    .collect()
+            };
+        assert_eq!(shape(a), shape(b));
+        assert_eq!(a.raw_tblpr, b.raw_tblpr);
+        assert_eq!(nested(b, 1, 0).len(), 1);
+        assert_eq!(nested(a, 1, 0)[0].grid, nested(b, 1, 0)[0].grid);
+        assert_eq!(paragraph_texts(&d), paragraph_texts(&back));
     }
 }
