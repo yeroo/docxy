@@ -1252,7 +1252,7 @@ impl Docxy {
                     p.set(&format!("<w:tblStyle w:val=\"{}\"/>", it.preview))
                 });
                 let style = docxcore::table_styles::lookup_style(None, it.preview);
-                let boxes = crate::table_view::layout(&sample, style.as_ref());
+                let boxes = crate::table_view::layout(&sample, style.as_ref(), None);
                 let ink = hsla_u(0x404040);
                 let side =
                     |l: Option<crate::table_view::Line>| l.map(|l| l.color.map_or(ink, hsla_u));

@@ -1454,14 +1454,24 @@ fn double_click_events(p: Point<Pixels>) -> Vec<PlatformInput> {
 /// The wheel notch a `pointer-wheel` dispatches at `p`: the pointer moves
 /// there first, as it would before a real wheel turn. A negative `dy` scrolls
 /// the content down (gpui's own sign).
-fn wheel_events(p: Point<Pixels>, dy: f32, ctrl: bool) -> Vec<PlatformInput> {
+///
+/// With `shift` the turn is horizontal, as the platforms deliver a shifted
+/// wheel (#1895): X11 and Wayland swap it into `delta.x` and Windows sends
+/// it as a horizontal wheel; a negative `dy` then scrolls the content right.
+fn wheel_events(p: Point<Pixels>, dy: f32, ctrl: bool, shift: bool) -> Vec<PlatformInput> {
+    let delta = if shift {
+        point(px(dy), px(0.))
+    } else {
+        point(px(0.), px(dy))
+    };
     vec![
         mouse_move(p, None),
         PlatformInput::ScrollWheel(ScrollWheelEvent {
             position: p,
-            delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+            delta: ScrollDelta::Pixels(delta),
             modifiers: Modifiers {
                 control: ctrl,
+                shift,
                 ..Modifiers::default()
             },
             touch_phase: TouchPhase::Moved,
@@ -2388,11 +2398,42 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
     if let Json::Obj(fields) = &mut doc {
         fields.push(("ruler".into(), ruler_state(app)));
         fields.push(("line_numbers".into(), line_numbers_state(app)));
+        fields.push(("flow".into(), flow_state(app)));
         if let Some(tab) = app.tabs.get(app.active) {
             fields.push(("mail".into(), mail_state(tab)));
         }
     }
     Ok(doc)
+}
+
+/// The document view's horizontal scroll and painted tables (#1895):
+/// `scroll_x` / `max_scroll_x` (px), `text_width` (the flow view's text
+/// column as last painted, px; `null` before Web Layout has drawn), and
+/// `tables`, each top-level table the last frame painted (`block`, `width`,
+/// its `left` / `right` edges from the view's left, px, `fits_text` and
+/// `right_in_view`: `crate::painted_tables_json`).
+fn flow_state(app: &crate::Docxy) -> Json {
+    let probe = app.ruler_probe.borrow();
+    let num = |v: f32| Json::Num(f64::from(v.round()));
+    let max_x = f32::from(app.doc_scroll.max_offset().x).max(0.);
+    Json::obj(vec![
+        // Within what the last frame allowed: gpui clamps a wheel's offset
+        // only as it paints.
+        (
+            "scroll_x",
+            num((-f32::from(app.doc_scroll.offset().x)).clamp(0., max_x)),
+        ),
+        ("max_scroll_x", num(max_x)),
+        ("text_width", probe.draft_text_w.map_or(Json::Null, num)),
+        (
+            "tables",
+            crate::painted_tables_json(
+                &app.painted_tables,
+                probe.draft_text_w,
+                probe.viewport.map(|v| (v.x, v.w)),
+            ),
+        ),
+    ])
 }
 
 /// The tab's mail merge (#628): the main document type (`null` for a Normal
@@ -6272,6 +6313,7 @@ fn dispatch_verb(
                 p,
                 dy,
                 args.get("ctrl").and_then(Json::as_bool).unwrap_or(false),
+                args.get("shift").and_then(Json::as_bool).unwrap_or(false),
             );
             Ok(done)
         }
@@ -7421,6 +7463,30 @@ mod tests {
     }
 
     use super::*;
+
+    /// #1895: a shifted wheel turn is horizontal, as the platforms deliver
+    /// it; a plain one stays vertical, a Ctrl one keeps its Ctrl.
+    #[test]
+    fn a_shifted_pointer_wheel_turns_horizontally() {
+        let p = point(px(10.), px(20.));
+        let wheel = |events: Vec<PlatformInput>| match events.last() {
+            Some(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                delta: ScrollDelta::Pixels(d),
+                modifiers,
+                ..
+            })) => ((f32::from(d.x), f32::from(d.y)), *modifiers),
+            _ => panic!("no pixel wheel event"),
+        };
+        let (delta, mods) = wheel(wheel_events(p, -120., false, true));
+        assert_eq!(delta, (-120., 0.));
+        assert!(mods.shift && !mods.control);
+        let (delta, mods) = wheel(wheel_events(p, -120., false, false));
+        assert_eq!(delta, (0., -120.));
+        assert!(!mods.shift);
+        let (delta, mods) = wheel(wheel_events(p, 40., true, false));
+        assert_eq!(delta, (0., 40.));
+        assert!(mods.control && !mods.shift);
+    }
 
     use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps, Spacing};
 

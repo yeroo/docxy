@@ -5560,6 +5560,12 @@ struct Docxy {
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    /// The document tab's top-level tables as last painted (#1895), for the
+    /// harness's `doc` read.
+    painted_tables: PaintedTables,
+    /// The flow view's block the caret moved into (#1895), followed in y by
+    /// the scroll area's probe once the next layout has laid it out.
+    doc_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
     // The frame's line-number counting state and harness record, shared by
     // the numbered rows' canvases in paint order (#746; LineProbe).
     line_probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
@@ -6584,6 +6590,9 @@ fn vruler_geom(text_rect: ScreenRect) -> VRulerGeom {
 struct RulerProbe {
     viewport: Option<ScreenRect>,
     draft_column: Option<ScreenRect>,
+    /// The flow view's text width (px) as last painted, which its tables
+    /// fit to (#1895). Unlike `draft_column`, a frame never clears it.
+    draft_text_w: Option<f32>,
     pages: Vec<Option<ScreenRect>>,
     /// Each frame of framed header/footer paragraphs drawn in Print
     /// Layout (#767), one per frame group.
@@ -6638,6 +6647,97 @@ fn ruler_probe_el(
     .right_0()
     .bottom_0()
     .into_any_element()
+}
+
+/// A flow view's text-width probe (#1895): `record` takes its bounds at
+/// prepaint, and when its width moved more than half a pixel from `used`
+/// (the width this frame's tables were fitted to; `None` on the first
+/// frame) one more frame is drawn with it. `window.refresh()` would do
+/// nothing while drawing.
+fn fit_width_probe(
+    used: Option<f32>,
+    record: impl Fn(Bounds<Pixels>, &mut Window) + 'static,
+) -> AnyElement {
+    canvas(
+        move |b: Bounds<Pixels>, w: &mut Window, _a: &mut App| {
+            record(b, w);
+            if fit_width_stale(used, f32::from(b.size.width)) {
+                w.request_animation_frame();
+            }
+        },
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .into_any_element()
+}
+
+/// Whether a probed text width `now` calls for another frame over `used`.
+fn fit_width_stale(used: Option<f32>, now: f32) -> bool {
+    used.is_none_or(|u| (u - now).abs() > 0.5)
+}
+
+/// The vertical scroll offset that brings `child` into `view`, as gpui's
+/// `ScrollStrategy::FirstVisible` computes it (a child taller than the view
+/// shows its top; one above shows its top, one below its bottom), from the
+/// offset `y` it has now; `y` when it is already in view. Both bounds are
+/// unscrolled layout bounds, as a `ScrollHandle` records them.
+fn follow_y(view: Bounds<Pixels>, child: Bounds<Pixels>, y: Pixels) -> Pixels {
+    if child.size.height > view.size.height || child.top() + y < view.top() {
+        view.top() - child.top()
+    } else if child.bottom() + y > view.bottom() {
+        view.bottom() - child.bottom()
+    } else {
+        y
+    }
+}
+
+/// Scroll the flow view's `handle` so its child `ix` is in view, in y only
+/// (#1895): gpui's `scroll_to_item` also moves x on a scroll area that
+/// scrolls sideways, snapping a view scrolled to a wide table's right back
+/// to its left on every key. Called from a child's prepaint, after the
+/// scroll area recorded this layout's children; the move shows next frame.
+/// Whether it moved; nothing happens for a child the layout did not record.
+fn follow_item_y(handle: &ScrollHandle, ix: usize) -> bool {
+    let Some(child) = handle.bounds_for_item(ix) else {
+        return false;
+    };
+    let offset = handle.offset();
+    let y = follow_y(handle.bounds(), child, offset.y);
+    if y == offset.y {
+        return false;
+    }
+    handle.set_offset(point(offset.x, y));
+    true
+}
+
+#[cfg(test)]
+mod follow_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn rect(top: f32, h: f32) -> Bounds<Pixels> {
+        Bounds::new(point(px(0.), px(top)), size(px(600.), px(h)))
+    }
+
+    /// #1895: the flow view follows a block in y as gpui's FirstVisible
+    /// does; x is never its business.
+    #[test]
+    fn a_block_is_followed_into_view_in_y() {
+        let view = rect(100., 400.);
+        // In view at this offset: left alone.
+        assert_eq!(follow_y(view, rect(200., 50.), px(0.)), px(0.));
+        assert_eq!(follow_y(view, rect(700., 50.), px(-300.)), px(-300.));
+        // Below the view: its bottom meets the view's.
+        assert_eq!(follow_y(view, rect(600., 50.), px(0.)), px(-150.));
+        // Above it (scrolled past): its top meets the view's.
+        assert_eq!(follow_y(view, rect(150., 50.), px(-300.)), px(-50.));
+        // Taller than the view: its top.
+        assert_eq!(follow_y(view, rect(300., 900.), px(0.)), px(-200.));
+    }
 }
 
 impl Docxy {
@@ -6710,15 +6810,26 @@ impl Docxy {
     }
 }
 
+/// The document's scroll area under the probe of its viewport, which the
+/// ruler and the harness read.
+///
+/// `shrink`: the view is no wider than the window, whatever it holds (the
+/// flow view, #1895: a table wider than the view scrolls inside it). Print
+/// Layout passes false, so its area still widens to a sheet wider than the
+/// window, as it always has.
 fn ruler_scroll_view(
     scroll: AnyElement,
     probe: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    shrink: bool,
 ) -> AnyElement {
     v_flex()
         .relative()
         .flex_1()
         .h_full()
         .min_h(px(0.))
+        // A flex item is at least as wide as its content unless told
+        // otherwise.
+        .when(shrink, |d| d.min_w(px(0.)))
         .child(scroll)
         .child(ruler_probe_el(probe, |state, rect| {
             state.viewport = Some(rect)
@@ -8670,6 +8781,58 @@ struct RenderCtx<'a> {
     /// The page a header or footer is drawn on: its PAGE, NUMPAGES and
     /// SECTIONPAGES fields show these (#1437); `None` draws the cached text.
     page_vals: Option<&'a page_fields::PageVals>,
+    /// The text width (px) a table here is fitted to (#1895): the flow
+    /// view's text column, then each fitted cell's own; `None` (Print
+    /// Layout, headers and footers) draws tables at their grid.
+    fit_width: Option<f32>,
+    /// Where each top-level body table's painted bounds go, by block, for
+    /// the harness (#1895); `None` records none.
+    tables: Option<&'a PaintedTables>,
+}
+
+/// Each top-level table's block and painted bounds in the frame last drawn.
+type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
+
+/// The harness's view of [`PaintedTables`] (#1895): each table's block, its
+/// painted width, its left and right edges from the viewport's left
+/// (`view`: its x and width, window coordinates), rounded to a pixel;
+/// `fits_text`, whether it is at most the text width `text_w` (+1 px for
+/// rounding), and `right_in_view`, whether its right edge lies inside the
+/// viewport (so a table scrolled to its end shows it).
+fn painted_tables_json(
+    tables: &PaintedTables,
+    text_w: Option<f32>,
+    view: Option<(f32, f32)>,
+) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let (x0, view_w) = view.unwrap_or((0., 0.));
+    let round = |v: f32| Json::Num(f64::from(v.round()));
+    Json::Arr(
+        tables
+            .borrow()
+            .iter()
+            .map(|(block, at)| {
+                let b = at.get();
+                let left = f32::from(b.origin.x) - x0;
+                let width = f32::from(b.size.width);
+                let right = left + width;
+                Json::obj(vec![
+                    ("block", Json::Num(*block as f64)),
+                    ("width", round(width)),
+                    ("left", round(left)),
+                    ("right", round(right)),
+                    (
+                        "fits_text",
+                        Json::Bool(text_w.is_some_and(|t| width <= t + 1.)),
+                    ),
+                    (
+                        "right_in_view",
+                        Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// What drawing a table needs beyond the table: the package's styles part
@@ -15228,6 +15391,8 @@ impl Docxy {
             ruler_indent_base: RulerIndentBase::default(),
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
+            painted_tables: PaintedTables::default(),
+            doc_follow: std::rc::Rc::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
                 line_numbers::LineProbe::default(),
             )),
@@ -24762,7 +24927,13 @@ impl Docxy {
                             self.doc_scroll.scroll_to_item(page);
                         }
                     } else {
-                        self.doc_scroll.scroll_to_item(b);
+                        // The flow view scrolls sideways too (#1895): gpui's
+                        // scroll_to_item would move x as well, so the scroll
+                        // area's probe follows the block in y only, once the
+                        // next layout has laid the edit out (a new or grown
+                        // block; the last layout's bounds may be another
+                        // block's after an Enter or a delete).
+                        self.doc_follow.set(Some(b));
                     }
                 }
             }
@@ -34778,10 +34949,16 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     let style = docxcore::table::table_props(t)
         .attr("w:tblStyle", "w:val")
         .and_then(|id| ctx.tbl.style(&id));
-    let boxes = table_view::layout(t, style.as_ref());
     // A table pen is on (#763): record where this table and its rows lie.
     let hf = ctx.hf_width.is_some();
     let drawing = ctx.tbl.draw.clone();
+    // A flow view fits the table to its text width (#1895), except while a
+    // pen is on: the pen's geometry is the grid's, in the model's twips.
+    let fit = ctx
+        .fit_width
+        .filter(|_| drawing.is_none())
+        .map(|w| (w.max(0.) * 15.0 / ctx.zoom).floor() as u32);
+    let boxes = table_view::layout(t, style.as_ref(), fit);
     if let Some(geom) = &drawing {
         let mut grid = vec![0];
         for w in docxcore::table::usable_grid(t) {
@@ -34842,10 +35019,13 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let cell = &row.cells[cb.cell];
             // The cell's text: over its style's run formatting, and in ink
             // that reads on its fill (#765).
+            let text_w = tw_px(cb.width as i32 - 216, zoom).max(0.0);
             let cell_ctx = RenderCtx {
-                line_width: Some(tw_px(cb.width as i32 - 216, zoom).max(0.0)),
+                line_width: Some(text_w),
                 pal: cell_pal(ctx.pal, cb.fill),
                 cell_run: Some(&cb.run),
+                // A nested table fits its cell when this one was fitted.
+                fit_width: fit.map(|_| text_w),
                 ..ctx
             };
             let inner: Vec<AnyElement> = if cb.continues {
@@ -35077,7 +35257,44 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         }
         rows.push(row_el.into_any_element());
     }
-    v_flex().my_2().children(rows).into_any_element()
+    // As wide as its widest row, not stretched to the view: the scroll area
+    // measures its children's boxes, so a table wider than the view scrolls
+    // sideways (#1895), and the probe reads the table's own width.
+    let widest = boxes
+        .iter()
+        // Saturating: a document's grid may hold any u32 (#1895 r1).
+        .map(|rb| {
+            rb.cells
+                .iter()
+                .fold(rb.before, |a, c| a.saturating_add(c.width))
+        })
+        .max()
+        .unwrap_or(0);
+    let probe = match (ctx.tables, path) {
+        (Some(tables), [block]) if !hf => {
+            let at = UnitCell::default();
+            tables.borrow_mut().push((*block, at.clone()));
+            Some(
+                canvas(
+                    move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| at.set(b),
+                    |_b, _s, _w, _a| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
+        }
+        _ => None,
+    };
+    v_flex()
+        .relative()
+        .flex_none()
+        .w(w(widest))
+        .my_2()
+        .children(rows)
+        .children(probe)
+        .into_any_element()
 }
 
 /// Render one block at absolute `path`, wiring caret/selection/click from `ctx`.
@@ -40873,6 +41090,8 @@ impl Render for Docxy {
                         .pkg
                         .as_ref()
                         .map(|pkg| pictures::Pictures::new(pkg, &tab.pictures));
+                    let painted_tables = self.painted_tables.clone();
+                    painted_tables.borrow_mut().clear();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -40892,6 +41111,9 @@ impl Render for Docxy {
                         cell_run: None,
                         pics: pictures::scope(pictures.as_ref(), Some("word/document.xml")),
                         page_vals: None,
+                        // The flow branch below fits its tables (#1895).
+                        fit_width: None,
+                        tables: Some(&painted_tables),
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -40917,6 +41139,8 @@ impl Render for Docxy {
                         {
                             let mut probe = self.ruler_probe.borrow_mut();
                             probe.pages = vec![None; pages.len()];
+                            // A flow view's caret follow is for its own blocks.
+                            self.doc_follow.set(None);
                             probe.frames.clear();
                             probe.contents = vec![None; pages.len()];
                             probe.bands = pf
@@ -41175,6 +41399,8 @@ impl Render for Docxy {
                                     cell_run: None,
                                     pics: pictures::scope(pictures.as_ref(), Some(&h.part_name)),
                                     page_vals: page_vals.get(pi),
+                                    fit_width: None,
+                                    tables: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -41584,7 +41810,7 @@ impl Render for Docxy {
                             .py(px(24.))
                             .children(sheets)
                             .into_any_element();
-                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
+                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe, false);
                         if self.show_ruler {
                             h_flex()
                                 .flex_1()
@@ -41620,11 +41846,20 @@ impl Render for Docxy {
                             probe.counting = Default::default();
                             probe.painted.clear();
                         }
+                        // Tables fit the text column as last painted
+                        // (#1895); the pen draws them at their grid.
+                        let used_w = self.ruler_probe.borrow().draft_text_w;
+                        let flow_ctx = RenderCtx {
+                            fit_width: used_w,
+                            ..ctx
+                        };
                         let blocks: Vec<AnyElement> = body
                             .iter()
                             .enumerate()
-                            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
+                            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), flow_ctx))
                             .collect();
+                        let probe = self.ruler_probe.clone();
+                        let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .relative()
@@ -41632,7 +41867,9 @@ impl Render for Docxy {
                             .flex_1()
                             .h_full()
                             .min_h(px(0.))
-                            .overflow_y_scroll()
+                            // Both axes: a table wider than the view scrolls
+                            // sideways (#1895).
+                            .overflow_scroll()
                             .bg(bg)
                             .text_color(fg)
                             .px(px(48.))
@@ -41640,18 +41877,52 @@ impl Render for Docxy {
                             .gap_1()
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
-                            // Keep it last so scroll_to_item(b) still indexes block b.
+                            // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.
+                            // A percent width resolves against the scroll area,
+                            // not its scrolled extent: it is the text width.
+                            // Its prepaint comes after the scroll area has
+                            // recorded this layout's children, so a caret's
+                            // block is followed from where it is now drawn
+                            // (#1895), shown the next frame.
+                            .child(div().relative().w_full().h(px(0.)).child(fit_width_probe(
+                                used_w,
+                                move |b, window| {
+                                    let mut state = probe.borrow_mut();
+                                    state.draft_column = Some(ScreenRect::from_bounds(b));
+                                    state.draft_text_w = Some(f32::from(b.size.width));
+                                    if let Some(ix) = follow.take() {
+                                        if follow_item_y(&handle, ix) {
+                                            window.request_animation_frame();
+                                        }
+                                    }
+                                },
+                            )))
+                            .into_any_element();
+                        let scroll = v_flex()
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .min_h(px(0.))
+                            .child(scroll)
                             .child(
                                 div()
-                                    .relative()
-                                    .w_full()
-                                    .h(px(0.))
-                                    .child(ruler_probe_el(&self.ruler_probe, |state, rect| {
-                                        state.draft_column = Some(rect)
-                                    })),
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .bottom_0()
+                                    .h(px(12.))
+                                    .child(
+                                        gpui_component::scroll::Scrollbar::horizontal(
+                                            &self.doc_scroll,
+                                        )
+                                        .id("doc-hscrollbar")
+                                        .scrollbar_show(
+                                            gpui_component::scroll::ScrollbarShow::Scrolling,
+                                        ),
+                                    ),
                             )
                             .into_any_element();
-                        ruler_scroll_view(scroll, &self.ruler_probe)
+                        ruler_scroll_view(scroll, &self.ruler_probe, true)
                     }
                 }
                 Surface::Sheet(v) => sheet_el(

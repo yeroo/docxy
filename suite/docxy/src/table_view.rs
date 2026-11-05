@@ -183,13 +183,118 @@ impl RowBox {
     }
 }
 
-/// Lay out `t` with its table style (if any).
-pub fn layout(t: &Table, style: Option<&TableStyle>) -> Vec<RowBox> {
+/// The narrowest a fitted column is scaled to (#1895): the cell's 216-twip
+/// margins and room for a few characters. A grid column already narrower
+/// (an HTML spacer) has no floor: it scales with the others.
+pub const MIN_FIT_COL_TW: u32 = 432;
+
+/// The widest pct a table is drawn at (#1895): 10000%, in fiftieths. A
+/// mail body is outside input; anything above is drawn at this.
+const MAX_FIT_PCT: u64 = 5000 * 100;
+
+/// The widest a fitted table is drawn (#1895), in twips (about 694"): far
+/// past any view, and small enough that its columns' sums fit a `u32`.
+const MAX_FIT_TW: u64 = 1_000_000;
+
+/// The width a table asks for in a flow view (#1895), from its `w:tblW`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Wants {
+    /// `pct`, in fiftieths of a percent (5000 = 100%), at most
+    /// [`MAX_FIT_PCT`].
+    Pct(u64),
+    /// `auto`, `nil`, a missing `w:tblW`, or a pct of 0 or unreadable: at
+    /// most the room there is.
+    Auto,
+    /// `dxa` (or no type): its own widths.
+    Fixed,
+}
+
+fn wants(t: &Table) -> Wants {
+    let p = docxcore::table::table_props(t);
+    if p.get("w:tblW").is_none() {
+        return Wants::Auto;
+    }
+    match p.attr("w:tblW", "w:type").as_deref().unwrap_or("dxa") {
+        "pct" => {
+            let w = p.attr("w:tblW", "w:w").unwrap_or_default();
+            let w = w.trim();
+            // The schema also allows "50%" (ST_MeasurementOrPercent).
+            let fiftieths = match w.strip_suffix('%') {
+                Some(n) => n
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v > 0.)
+                    .map(|v| (v * 50.).round() as u64),
+                None => w.parse::<u64>().ok(),
+            };
+            fiftieths
+                .filter(|&f| f > 0)
+                .map_or(Wants::Auto, |f| Wants::Pct(f.min(MAX_FIT_PCT)))
+        }
+        "auto" | "nil" => Wants::Auto,
+        _ => Wants::Fixed,
+    }
+}
+
+/// The grid widths `t` is drawn at (#1895). `fit` is the text width (twips)
+/// a flow view gives it; `None` (Print Layout, headers and footers) draws
+/// the grid as it is. A `pct` table takes its share of `fit`, an `auto` one
+/// shrinks to it when wider, a `dxa` one keeps its grid. The columns scale
+/// in proportion, summing exactly to the target (the remainder goes to the
+/// last), then any that was at least [`MIN_FIT_COL_TW`] wide and fell below
+/// it is lifted back to it, so a table that cannot shrink comes out wider
+/// than `fit`. The target is at most [`MAX_FIT_TW`], so no sum overflows.
+pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
+    let grid = usable_grid(t);
+    let Some(fit) = fit else { return grid };
+    let sum: u64 = grid.iter().map(|&w| u64::from(w)).sum();
+    if sum == 0 {
+        return grid;
+    }
+    let target = match wants(t) {
+        Wants::Pct(f) => u64::from(fit) * f / 5000,
+        Wants::Auto => sum.min(u64::from(fit)),
+        Wants::Fixed => return grid,
+    }
+    .min(MAX_FIT_TW);
+    if target == sum {
+        return grid;
+    }
+    let mut out: Vec<u32> = grid
+        .iter()
+        .map(|&w| (u64::from(w) * target / sum) as u32)
+        .collect();
+    let given: u64 = out.iter().map(|&w| u64::from(w)).sum();
+    if let Some(last) = out.last_mut() {
+        *last += (target - given) as u32;
+    }
+    // A column at least the floor wide stops there; one already narrower
+    // (an HTML spacer) scales with the rest, so it is never widened and the
+    // table still meets its target.
+    for (w, &g) in out.iter_mut().zip(&grid) {
+        if g >= MIN_FIT_COL_TW {
+            *w = (*w).max(MIN_FIT_COL_TW);
+        }
+    }
+    out
+}
+
+/// Lay out `t` with its table style (if any), its grid fitted to `fit`
+/// ([`fitted_grid`]).
+pub fn layout(t: &Table, style: Option<&TableStyle>, fit: Option<u32>) -> Vec<RowBox> {
     let map = GridMap::of(t);
     // A missing, short or zero-width grid is filled out as the table
     // commands repair it, so the view and the edits agree.
-    let widths = usable_grid(t);
-    let span_w = |s: usize, n: usize| widths.iter().skip(s).take(n).sum::<u32>();
+    let widths = fitted_grid(t, fit);
+    // Saturating: a document's grid may hold any u32 (#1895 r1).
+    let span_w = |s: usize, n: usize| {
+        widths
+            .iter()
+            .skip(s)
+            .take(n)
+            .fold(0u32, |a, &w| a.saturating_add(w))
+    };
     let looks = resolve(t, style);
     let mut rows: Vec<RowBox> = map
         .rows
@@ -366,7 +471,7 @@ mod tests {
         t.rows[0].cells[0].grid_span = 2;
         t.rows[1].cells.remove(0);
         t.rows[1].raw_props = vec!["<w:trPr><w:gridBefore w:val=\"1\"/></w:trPr>".into()];
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         assert_eq!(rows[0].before, 0);
         assert_eq!(
             rows[0].cells.iter().map(|c| c.width).collect::<Vec<_>>(),
@@ -387,7 +492,7 @@ mod tests {
         ]) {
             row.raw_props = vec![format!("<w:trPr>{xml}</w:trPr>")];
         }
-        let heights: Vec<_> = layout(&t, None).iter().map(|r| r.height).collect();
+        let heights: Vec<_> = layout(&t, None, None).iter().map(|r| r.height).collect();
         assert_eq!(
             heights,
             [
@@ -398,7 +503,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            layout(&new_table(1, 1, 9000, AutoFit::Default), None)[0].height,
+            layout(&new_table(1, 1, 9000, AutoFit::Default), None, None)[0].height,
             None
         );
     }
@@ -410,13 +515,13 @@ mod tests {
         for row in &mut t.rows {
             row.raw_props = vec![exact.into()];
         }
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         assert!(rows.iter().all(RowBox::exact));
         // A merge from row 0 down over row 1: row 0 grows to fit; row 1,
         // which only continues it, stays exact.
         t.rows[0].cells[0].v_merge = VMerge::Restart;
         t.rows[1].cells[0].v_merge = VMerge::Continue;
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         assert!(rows[0].cells[0].merges_down);
         assert!(!rows[0].exact(), "the merge's first row grows");
         assert!(rows[1].exact());
@@ -424,7 +529,7 @@ mod tests {
         // An at-least row or an unset height is never exact.
         t.rows[2].raw_props = vec!["<w:trPr><w:trHeight w:val=\"400\"/></w:trPr>".into()];
         t.rows[1].raw_props.clear();
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         assert!(!rows[1].exact());
         assert!(!rows[2].exact());
     }
@@ -433,7 +538,7 @@ mod tests {
     fn a_missing_grid_falls_back_to_equal_columns() {
         let mut t = new_table(1, 3, 9000, AutoFit::Default);
         t.grid = vec![0, 0, 0];
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         assert!(
             rows[0]
                 .cells
@@ -448,7 +553,7 @@ mod tests {
         t.rows[0].cells[0].v_merge = VMerge::Restart;
         t.rows[1].cells[0].v_merge = VMerge::Continue;
         let grid = lookup_style(None, "TableGrid");
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         assert!(rows[0].cells[0].top.is_some());
         assert!(rows[0].cells[0].bottom.is_none());
         assert!(rows[1].cells[0].top.is_none());
@@ -470,7 +575,7 @@ mod tests {
             p.set("<w:vAlign w:val=\"bottom\"/>");
         });
         let st = lookup_style(None, "GridTable4-Accent1").unwrap();
-        let rows = layout(&t, Some(&st));
+        let rows = layout(&t, Some(&st), None);
         assert_eq!(
             rows[0].cells[0].fill,
             Some(0x4472C4),
@@ -493,7 +598,7 @@ mod tests {
         edit_cell_props(&mut t.rows[0].cells[0], |p| {
             p.set("<w:tcBorders><w:top w:val=\"nil\"/></w:tcBorders>")
         });
-        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref());
+        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref(), None);
         assert!(rows[0].cells[0].top.is_none());
         assert!(rows[0].cells[0].left.is_some());
     }
@@ -532,7 +637,7 @@ mod tests {
     fn an_inside_edge_is_drawn_by_one_cell_765() {
         let grid = lookup_style(None, "TableGrid");
         let t = new_table(2, 2, 9000, AutoFit::Default);
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         // Across: the left cell draws the edge, the right one leaves it.
         assert!(rows[0].cells[0].right.is_some());
         assert!(rows[0].cells[1].left.is_none());
@@ -553,12 +658,12 @@ mod tests {
         edit_cell_props(&mut t.rows[0].cells[1], |p| {
             p.set("<w:tcBorders><w:left w:val=\"double\" w:sz=\"4\" w:color=\"FF0000\"/></w:tcBorders>")
         });
-        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref());
+        let rows = layout(&t, lookup_style(None, "TableGrid").as_ref(), None);
         assert!(rows[0].cells[0].right.is_none());
         assert!(rows[0].cells[0].neighbour_draws[3]);
         assert_eq!(rows[0].cells[1].left.map(|l| l.color), Some(Some(0xFF0000)));
         // A gridline edge (no line either side) is the left cell's alone.
-        let rows = layout(&new_table(1, 2, 9000, AutoFit::Default), None);
+        let rows = layout(&new_table(1, 2, 9000, AutoFit::Default), None, None);
         assert!(!rows[0].cells[0].neighbour_draws[3]);
         assert!(rows[0].cells[1].neighbour_draws[2]);
     }
@@ -573,7 +678,7 @@ mod tests {
         // Row 2's first cell spans both columns.
         t.rows[2].cells.remove(1);
         t.rows[2].cells[0].grid_span = 2;
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         // Row 1's cell has no left neighbour, and sits under row 0's second.
         assert!(rows[1].cells[0].left.is_some());
         assert!(rows[1].cells[0].top.is_none());
@@ -589,7 +694,7 @@ mod tests {
         let mut t = new_table(3, 1, 9000, AutoFit::Default);
         t.rows[0].cells[0].v_merge = VMerge::Restart;
         t.rows[1].cells[0].v_merge = VMerge::Continue;
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         assert!(rows[1].cells[0].top.is_none());
         assert!(!rows[1].cells[0].neighbour_draws[0]);
         assert!(rows[1].cells[0].bottom.is_some());
@@ -607,7 +712,7 @@ mod tests {
         t.rows[0].cells[0].grid_span = 2;
         t.rows[2].cells.remove(1);
         t.rows[2].cells[0].grid_span = 2;
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         // The header draws the edge once; the cells under it leave it.
         assert!(rows[0].cells[0].bottom.is_some());
         for c in &rows[1].cells {
@@ -624,10 +729,10 @@ mod tests {
         edit_cell_props(&mut t.rows[1].cells[1], |p| {
             p.set("<w:tcBorders><w:top w:val=\"double\" w:sz=\"12\" w:color=\"FF0000\"/></w:tcBorders>")
         });
-        let rows = layout(&t, grid.as_ref());
+        let rows = layout(&t, grid.as_ref(), None);
         assert!(rows[0].cells[0].bottom.is_none() && rows[0].cells[0].neighbour_draws[1]);
         assert_eq!(rows[1].cells[1].top.map(|l| l.color), Some(Some(0xFF0000)));
-        let header = layout(&t, grid.as_ref())[0].cells[0].left;
+        let header = layout(&t, grid.as_ref(), None)[0].cells[0].left;
         assert_eq!(rows[1].cells[0].top, header, "the header's single line");
     }
 
@@ -639,7 +744,7 @@ mod tests {
                 "<w:tblBorders><w:top w:val=\"double\" w:sz=\"4\"/><w:left w:val=\"double\" w:sz=\"4\"/>                 <w:bottom w:val=\"single\" w:sz=\"4\"/><w:right w:val=\"double\" w:sz=\"4\"/></w:tblBorders>",
             )
         });
-        let rows = layout(&t, None);
+        let rows = layout(&t, None, None);
         let [top, bottom, left, right] = rows[0].cells[0].strokes_at(1.0);
         // The outer top line runs edge to edge; the inner one stops at the
         // left and right sides' inner lines.
@@ -678,7 +783,11 @@ mod tests {
             p.set("<w:tblStyle w:val=\"GridTable5Dark-Accent1\"/>");
             p.set(&TblLook::default().to_xml());
         });
-        let rows = layout(&t, lookup_style(None, "GridTable5Dark-Accent1").as_ref());
+        let rows = layout(
+            &t,
+            lookup_style(None, "GridTable5Dark-Accent1").as_ref(),
+            None,
+        );
         // The header: the style's white, bold, whatever the ink.
         let run = rows[0].cells[1].run.under(&RunProps::default());
         assert!(run.bold);
@@ -699,5 +808,150 @@ mod tests {
             crate::design_tab::cell_ink(band.fill).map(|i| i.fg),
             Some(0x202020)
         );
+    }
+
+    /// A one-row table with `grid` and the given `w:tblW` (none when `None`).
+    fn sized(grid: &[u32], tblw: Option<&str>) -> Table {
+        let mut t = new_table(1, grid.len(), 9360, AutoFit::Default);
+        t.grid = grid.to_vec();
+        edit_table_props(&mut t, |p| {
+            p.remove("w:tblW");
+            if let Some(w) = tblw {
+                p.set(w);
+            }
+        });
+        t
+    }
+
+    fn widths(t: &Table, fit: Option<u32>) -> Vec<u32> {
+        layout(t, None, fit)[0]
+            .cells
+            .iter()
+            .map(|c| c.width)
+            .collect()
+    }
+
+    const PCT_100: &str = "<w:tblW w:w=\"5000\" w:type=\"pct\"/>";
+
+    #[test]
+    fn a_pct_table_takes_its_share_of_the_view_in_its_grids_proportions_1895() {
+        let t = sized(&[4680, 4680], Some(PCT_100));
+        assert_eq!(widths(&t, Some(6000)), [3000, 3000]);
+        let t = sized(&[6000, 2000], Some(PCT_100));
+        assert_eq!(widths(&t, Some(6000)), [4500, 1500]);
+        // Rounding: the widths sum exactly to the target, the remainder last.
+        let t = sized(&[3000, 3000, 3000], Some(PCT_100));
+        assert_eq!(widths(&t, Some(4000)), [1333, 1333, 1334]);
+        // Half the view.
+        let t = sized(&[4680, 4680], Some("<w:tblW w:w=\"2500\" w:type=\"pct\"/>"));
+        assert_eq!(widths(&t, Some(6000)), [1500, 1500]);
+        // Narrower than the view: it grows.
+        let t = sized(&[4680, 4680], Some(PCT_100));
+        assert_eq!(widths(&t, Some(12000)), [6000, 6000]);
+    }
+
+    #[test]
+    fn an_auto_table_shrinks_to_the_view_and_never_grows_1895() {
+        for tblw in [Some("<w:tblW w:w=\"0\" w:type=\"auto\"/>"), None] {
+            let t = sized(&[6000, 3000], tblw);
+            assert_eq!(widths(&t, Some(6000)), [4000, 2000], "{tblw:?}");
+            assert_eq!(widths(&t, Some(12000)), [6000, 3000], "{tblw:?}");
+        }
+        let t = sized(&[6000, 3000], Some("<w:tblW w:w=\"0\" w:type=\"nil\"/>"));
+        assert_eq!(widths(&t, Some(6000)), [4000, 2000]);
+    }
+
+    #[test]
+    fn a_dxa_table_keeps_its_grid_1895() {
+        for tblw in [
+            "<w:tblW w:w=\"12000\" w:type=\"dxa\"/>",
+            "<w:tblW w:w=\"12000\"/>",
+        ] {
+            let t = sized(&[6000, 6000], Some(tblw));
+            assert_eq!(widths(&t, Some(6000)), [6000, 6000], "{tblw}");
+        }
+    }
+
+    #[test]
+    fn without_a_fit_every_table_draws_at_its_grid_1895() {
+        for tblw in [
+            Some(PCT_100),
+            Some("<w:tblW w:w=\"2500\" w:type=\"pct\"/>"),
+            Some("<w:tblW w:w=\"0\" w:type=\"auto\"/>"),
+            Some("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>"),
+            None,
+        ] {
+            let t = sized(&[6000, 3000], tblw);
+            assert_eq!(widths(&t, None), [6000, 3000], "{tblw:?}");
+            assert_eq!(fitted_grid(&t, None), usable_grid(&t), "{tblw:?}");
+        }
+    }
+
+    #[test]
+    fn a_column_stops_at_its_floor_and_a_spacer_is_never_widened_1895() {
+        // Twenty columns in 2000 twips: each stops at the floor, so the
+        // table comes out wider than the view (it scrolls).
+        let t = sized(&[1000; 20], Some(PCT_100));
+        let w = widths(&t, Some(2000));
+        assert!(w.iter().all(|&c| c == MIN_FIT_COL_TW), "{w:?}");
+        assert!(w.iter().sum::<u32>() > 2000);
+        // A 300-twip spacer between two wide columns, shrunk: the spacer
+        // stays at most its own width and the sum is the target.
+        let t = sized(&[4000, 300, 4000], Some(PCT_100));
+        let w = widths(&t, Some(6000));
+        assert!(w[1] <= 300, "{w:?}");
+        assert_eq!(w.iter().sum::<u32>(), 6000, "{w:?}");
+    }
+
+    #[test]
+    fn pct_widths_read_as_the_schema_writes_them_1895() {
+        // 0 or unreadable: auto (shrinks to the view, never grows).
+        for w in ["0", "wide", ""] {
+            let tblw = format!("<w:tblW w:w=\"{w}\" w:type=\"pct\"/>");
+            let t = sized(&[6000, 3000], Some(&tblw));
+            assert_eq!(widths(&t, Some(6000)), [4000, 2000], "{w}");
+            assert_eq!(widths(&t, Some(12000)), [6000, 3000], "{w}");
+        }
+        let t = sized(&[4680, 4680], Some("<w:tblW w:w=\"50%\" w:type=\"pct\"/>"));
+        assert_eq!(widths(&t, Some(6000)), [1500, 1500]);
+        // Above 100% is kept: wider than the view.
+        let t = sized(&[4680, 4680], Some("<w:tblW w:w=\"7500\" w:type=\"pct\"/>"));
+        assert_eq!(widths(&t, Some(6000)), [4500, 4500]);
+    }
+
+    #[test]
+    fn an_unbounded_pct_is_drawn_at_most_its_cap_1895() {
+        // 4000000000 fiftieths and 1e30%: 10000% at most, and the target at
+        // most MAX_FIT_TW, so nothing overflows (a debug build panics).
+        for w in ["4000000000", "1e30%", "99999999999999999999%"] {
+            let tblw = format!("<w:tblW w:w=\"{w}\" w:type=\"pct\"/>");
+            let t = sized(&[4680, 4680], Some(&tblw));
+            assert_eq!(widths(&t, Some(6000)), [300_000, 300_000], "{w}");
+            let w = widths(&t, Some(u32::MAX));
+            assert_eq!(w.iter().map(|&c| u64::from(c)).sum::<u64>(), MAX_FIT_TW);
+        }
+        // A grid of huge columns (their u32 sum stays below u32::MAX, which
+        // docxcore's usable_grid needs) scaled to the cap.
+        let t = sized(&[1_000_000_000, 1_000_000_000], Some(PCT_100));
+        let w = widths(&t, Some(u32::MAX));
+        assert_eq!(w.iter().map(|&c| u64::from(c)).sum::<u64>(), MAX_FIT_TW);
+        assert_eq!(w, [500_000, 500_000]);
+    }
+
+    #[test]
+    fn grid_before_scales_with_the_columns_1895() {
+        let mut t = new_table(2, 2, 9000, AutoFit::Window);
+        t.grid = vec![2000, 4000, 4000];
+        t.rows[1].cells.remove(0);
+        t.rows[0].cells[0].grid_span = 2;
+        t.rows[1].raw_props = vec!["<w:trPr><w:gridBefore w:val=\"1\"/></w:trPr>".into()];
+        let rows = layout(&t, None, Some(5000));
+        assert_eq!(rows[0].before, 0);
+        assert_eq!(
+            rows[0].cells.iter().map(|c| c.width).collect::<Vec<_>>(),
+            [3000, 2000]
+        );
+        assert_eq!(rows[1].before, 1000);
+        assert_eq!(rows[1].cells[0].width, 2000);
     }
 }

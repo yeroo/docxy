@@ -154,3 +154,56 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `FrameGeom.even` use the page's number, not its place in the document, as
   export.rs does, so `w:start="2"` makes the first page even. No harness verb
   reads drawn header text, so there is no `.uit` case.
+
+## Web Layout fits tables to the view (#1895)
+
+- In the flow view (a document tab with Print Layout off, and `ext::DocView`)
+  `table_view::fitted_grid` lays a table out against the text width it sits
+  in: `pct` (fiftieths, or the schema's `"NN%"`; 0 or unreadable counts as
+  auto; above 100% is kept and scrolls) takes its share, shrinking or
+  growing; `auto`, `nil` or no `w:tblW` shrinks to it and never grows; `dxa`
+  keeps its grid. The columns (and `gridBefore`) scale in proportion,
+  summing exactly to the target (the remainder to the last); a column at
+  least `MIN_FIT_COL_TW` (432) wide stops there, a narrower one (an HTML
+  spacer) scales freely, so a table that cannot shrink comes out wider and
+  scrolls. It is a drawing-time decision: the model, Print Layout, headers
+  and footers (`fit_width: None`) are untouched, and a resize keeps the
+  scroll and selection. Min-content widths (a long word) are not measured.
+- `RenderCtx::fit_width` (px) carries the width; `table_el` turns it into
+  twips at the zoom and gives each cell its own text width, so a nested
+  table fits its cell. While a table pen is on nothing fits (`TableGeom` is
+  the grid's, in model twips): a pct table shows its grid until the pen is
+  off.
+- The width is the last paint's: the doc tab's `RulerProbe::draft_text_w`
+  (written beside `draft_column` by the flow view's last in-flow probe,
+  never cleared), DocView's `text_w`. `fit_width_probe` asks for one more
+  frame (`request_animation_frame`; `window.refresh()` is a no-op while
+  drawing) when the width moved more than half a pixel, so the first frame
+  and the frame after a resize draw the old width. A harness read of
+  painted geometry follows a `shot`, which waits for the frame after.
+- A table's root is as wide as its widest row (`w`, not stretched): gpui's
+  scroll extent is the union of the scroll area's direct children, so a
+  stretched root would hide a wide table from it. Both flow scroll areas
+  scroll on both axes under a 12 px horizontal bar (`doc-hscrollbar`,
+  `ext-doc-hscrollbar`); the doc tab's `ruler_scroll_view(.., shrink:
+  true)` sets `min_w(0)`, else the flex item would widen to the table.
+  Print Layout passes false and still widens to a wide sheet.
+- The flow view's caret follow is y only (#1895 r1): gpui's
+  `scroll_to_item` also moves x on a scroll area that scrolls sideways
+  (back to a wide block's left on every key), so `scroll_to_caret` only
+  sets `Docxy::doc_follow`, and the flow probe's prepaint (after the scroll
+  area recorded this layout's children, so a new or grown block is where it
+  is now drawn) runs `follow_item_y` (`follow_y`: gpui's FirstVisible for
+  y) and asks for one more frame when it moved: the follow shows a frame
+  after the edit. The last layout's bounds are not used: after an Enter or
+  a delete they can be another block's. A caret in a cell scrolled out of
+  view sideways does not scroll x. Print Layout keeps `scroll_to_item`
+  (its scroll area scrolls in y only).
+- `fitted_grid` caps a pct at 10000% (`MAX_FIT_PCT`) and the target at
+  `MAX_FIT_TW` (1,000,000 twips), so a mail body's `w:w="4000000000"` or
+  `"1e30%"` overflows nothing; cell sums saturate.
+- Harness: `doc`'s `flow` (`scroll_x`, `max_scroll_x`, `text_width`, and
+  `tables`: each top-level table's `block`, `width`, `left` / `right` from
+  the view's left, `fits_text`, `right_in_view`, Print Layout's too) and
+  `pointer-wheel`'s `"shift": true`; `uiharness/cases/web-layout-table-fit.uit`
+  and `ext-doc-view.uit` drive them.
