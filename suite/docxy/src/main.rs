@@ -7053,6 +7053,48 @@ mod link_colour_tests {
     }
 
     #[test]
+    fn a_tracked_change_in_a_link_draws_as_link_text_1906() {
+        use docxcore::model::{Hyperlink, RevisionKind, RevisionMetadata, Run};
+        let run = |t: &str| Run {
+            text: t.into(),
+            props: RunProps::default(),
+        };
+        let ins = |content: Vec<Inline>| Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: String::new(),
+            content,
+            content_changed: false,
+        };
+        let flags = |content: &[Inline], in_link: bool| -> Vec<(String, bool)> {
+            revision_runs(content, in_link)
+                .into_iter()
+                .map(|(r, l)| (r.text.clone(), l))
+                .collect()
+        };
+        let own = |t: &str, l: bool| (t.to_string(), l);
+        // A change in a link's content: every run in it is link text, nested
+        // changes too.
+        let change = vec![Inline::Run(run("a")), ins(vec![Inline::Run(run("b"))])];
+        assert_eq!(flags(&change, true), vec![own("a", true), own("b", true)]);
+        // Outside a link only a hyperlink within the change is.
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://example.com".into()),
+            anchor: None,
+            rel_id: None,
+            runs: vec![run("c")],
+            content: vec![ins(vec![Inline::Run(run("d"))])],
+            raw: None,
+            content_changed: false,
+        });
+        let change = vec![Inline::Run(run("a")), link];
+        assert_eq!(
+            flags(&change, false),
+            vec![own("a", false), own("c", true), own("d", true)]
+        );
+    }
+
+    #[test]
     fn the_theme_link_colour_reads_on_the_theme_1906() {
         for dark in [false, true] {
             let theme = if dark {
@@ -34363,11 +34405,40 @@ fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
     out
 }
 
+/// The runs under a tracked change, in order, each flagged when it sits in a
+/// link: inside a hyperlink, or the whole change when `in_link` (a change
+/// within a link's `content`, #1906).
+fn revision_runs(content: &[Inline], in_link: bool) -> Vec<(&docxcore::model::Run, bool)> {
+    fn push<'a>(
+        content: &'a [Inline],
+        in_link: bool,
+        out: &mut Vec<(&'a docxcore::model::Run, bool)>,
+    ) {
+        for inline in content {
+            match inline {
+                Inline::Run(r) => out.push((r, in_link)),
+                Inline::Hyperlink(h) => {
+                    out.extend(h.runs.iter().map(|r| (r, true)));
+                    push(&h.content, true, out);
+                }
+                Inline::Revision { content, .. } => push(content, in_link, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    push(content, in_link, &mut out);
+    out
+}
+
 /// The runs under a tracked change, drawn as plain text with no caret mapping;
-/// in a table cell, over its style's run formatting (#765).
+/// in a table cell, over its style's run formatting (#765). A run in a link
+/// draws as one (`in_link`, [`revision_runs`]).
+#[allow(clippy::too_many_arguments)]
 fn emit_revision_text(
     out: &mut Vec<AnyElement>,
     content: &[Inline],
+    in_link: bool,
     base: f32,
     pal: Pal,
     styler: run_look::RunStyler,
@@ -34382,52 +34453,24 @@ fn emit_revision_text(
         probe_only: true,
         ..c
     });
-    for inline in content {
-        match inline {
-            Inline::Run(r) => {
-                let (mut idx, mut caret) = (anchor, None);
-                // The caret never lands in revision text (caret is None), so
-                // the bar height is unused; 19 keeps the signature honest.
-                emit_run(
-                    out,
-                    &r.text,
-                    &styler.shown(r),
-                    base,
-                    false,
-                    &mut idx,
-                    &mut caret,
-                    None,
-                    click,
-                    pal,
-                    19.0,
-                    zoom,
-                );
-            }
-            Inline::Hyperlink(h) => {
-                for r in &h.runs {
-                    let (mut idx, mut caret) = (anchor, None);
-                    emit_run(
-                        out,
-                        &r.text,
-                        &styler.shown(r),
-                        base,
-                        true,
-                        &mut idx,
-                        &mut caret,
-                        None,
-                        click,
-                        pal,
-                        19.0,
-                        zoom,
-                    );
-                }
-                emit_revision_text(out, &h.content, base, pal, styler, zoom, click, anchor);
-            }
-            Inline::Revision { content, .. } => {
-                emit_revision_text(out, content, base, pal, styler, zoom, click, anchor)
-            }
-            _ => {}
-        }
+    for (r, link) in revision_runs(content, in_link) {
+        let (mut idx, mut caret) = (anchor, None);
+        // The caret never lands in revision text (caret is None), so the bar
+        // height is unused; 19 keeps the signature honest.
+        emit_run(
+            out,
+            &r.text,
+            &styler.shown(r),
+            base,
+            link,
+            &mut idx,
+            &mut caret,
+            None,
+            click,
+            pal,
+            19.0,
+            zoom,
+        );
     }
 }
 
@@ -34707,7 +34750,9 @@ fn paragraph_el(
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
-                emit_revision_text(&mut spans, content, base, pal, styler, zoom, click, idx);
+                emit_revision_text(
+                    &mut spans, content, in_link, base, pal, styler, zoom, click, idx,
+                );
             }
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the

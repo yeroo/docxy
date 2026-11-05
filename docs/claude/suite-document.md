@@ -251,6 +251,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   character style over paragraph/table style), as Word does; only a link run
   without one (or one `hex_rgb` rejects) takes `Pal::link`. The underline
   stays.
+- A tracked change inside a link (`<w:hyperlink><w:ins>`) draws as link
+  text too: `emit_revision_text` takes the item's `in_link`, and
+  `revision_runs` flags each run under the change.
 - `Pal::link` follows the ground the palette draws on: `Pal::of` takes
   `theme_link(t.mode.is_dark())`; `page_pal` and `cell_ink` (a filled cell)
   take `design_tab::page_link`, which uses `page_ink`'s light/dark cutoff
