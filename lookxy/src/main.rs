@@ -231,6 +231,7 @@ fn run(
                     // Any key press acknowledges (and clears) a transient error
                     // notice — same lifecycle as the sync states that clear it.
                     app.error_notice = None;
+                    app.send_failure = None;
                     // The shared confirm modal owns every key while open —
                     // checked before `is_global_quit` so a `q`/`y`/`n` press
                     // answers the dialog instead of being treated as a fresh

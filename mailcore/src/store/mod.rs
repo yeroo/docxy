@@ -123,6 +123,12 @@ pub struct OutboundAttachment {
     pub path: String,
     pub name: String,
     pub size: i64,
+    /// Already on the Graph draft (#1874): a send uploaded it, Graph
+    /// confirmed it, and the send then failed, so a resend skips it: a
+    /// confirmed upload is never repeated. An upload whose answer was lost,
+    /// or whose marker could not be written, is not marked and is uploaded
+    /// again. Removing it locally would not remove it from the Graph draft.
+    pub uploaded: bool,
 }
 
 /// A `contacts` row — one per normalized (lowercased) email address, the
@@ -634,6 +640,31 @@ impl Store {
         // which `get_body_for` reads as "asked for text" for a text body,
         // as the engine then always did.
         let _ = conn.execute("ALTER TABLE bodies ADD COLUMN fetched_as TEXT", []);
+        // Same idempotent-migration pattern, for `outbound_attachments.uploaded`
+        // (#1874: the file is already on the Graph draft).
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN uploaded INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
+        // a `SendDraft` op's `/send` POST went out). On the open that adds
+        // the column, every `SendDraft` an older engine left queued reads
+        // as posted: it may be there after a 5xx or a lost answer on
+        // `/send`, so its next attempt checks delivery first (one GET; a
+        // `local:` draft, never on Graph, skips it). A reopen, with the
+        // column already there, leaves the flags alone.
+        if conn
+            .execute(
+                "ALTER TABLE outbox ADD COLUMN send_posted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .is_ok()
+        {
+            conn.execute(
+                "UPDATE outbox SET send_posted = 1 WHERE op = 'sendDraft'",
+                [],
+            )?;
+        }
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(local_id)",
             [],
@@ -1057,6 +1088,23 @@ impl Store {
         );
     }
 
+    /// Undoes `mark_sent` and `SendDraft`'s optimistic re-file into Sent
+    /// Items after a send failed for good (#1874): the row is a draft again
+    /// (`is_draft = 1`), filed under `drafts_folder_id`. One statement, so a
+    /// `local:` id the failed send's own create reconciled still reaches the
+    /// row (#1884). Subject, recipients, body and attachments are untouched.
+    /// A missing row changes nothing (not an error).
+    pub fn return_to_drafts(&self, id: &str, drafts_folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE messages SET is_draft = 1, folder_id = ?2 WHERE ",
+                draft_row_sql!()
+            ),
+            params![id, drafts_folder_id],
+        )?;
+        Ok(())
+    }
+
     /// Locally re-files a message under `dest_folder_id` — the optimistic
     /// half of a triage move (the sync engine's outbox is what tells Graph).
     /// Unlike `set_read`/`set_flag` this returns a `Result`: the sync engine
@@ -1347,7 +1395,8 @@ impl Store {
         Ok(())
     }
 
-    /// Records a file attached to draft `draft_id`. Idempotent per (draft, path).
+    /// Records a file attached to draft `draft_id`. Idempotent per (draft, path):
+    /// an existing row keeps its `uploaded` flag.
     /// A reconciled draft's `local:` id still reaches it (#1884), as in every
     /// `outbound_attachments` call: the row is keyed by `current_id_sql!`.
     pub fn add_outbound_attachment(
@@ -1377,7 +1426,7 @@ impl Store {
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
         let mut stmt = self.conn.prepare(concat!(
-            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ",
+            "SELECT path, name, size, uploaded FROM outbound_attachments WHERE draft_id = ",
             current_id_sql!(),
             " ORDER BY rowid"
         ))?;
@@ -1387,6 +1436,7 @@ impl Store {
                     path: r.get(0)?,
                     name: r.get(1)?,
                     size: r.get(2)?,
+                    uploaded: r.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1406,7 +1456,40 @@ impl Store {
         Ok(())
     }
 
-    /// Removes every attached file from `draft_id` (after a send, or on discard).
+    /// Marks the file `path` of `draft_id` as already on the Graph draft
+    /// (#1874), right after `SendDraft` uploaded it, so a resend after a
+    /// failed send does not upload it again. No-op if absent.
+    pub fn mark_outbound_attachment_uploaded(
+        &self,
+        draft_id: &str,
+        path: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE outbound_attachments SET uploaded = 1 WHERE draft_id = ",
+                current_id_sql!(),
+                " AND path = ?2"
+            ),
+            params![draft_id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Removes the files attached to `draft_id` that are not on the Graph
+    /// draft yet (`uploaded = 0`): compose's Discard (#1874). An uploaded
+    /// one stays listed, as Send would still deliver it.
+    pub fn discard_pending_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "DELETE FROM outbound_attachments WHERE uploaded = 0 AND draft_id = ",
+                current_id_sql!()
+            ),
+            params![draft_id],
+        )?;
+        Ok(())
+    }
+
+    /// Removes every attached file from `draft_id` (after a send).
     pub fn clear_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
@@ -1685,6 +1768,39 @@ impl Store {
                 Ok(OutboxRow { seq, op, attempts })
             })
             .collect()
+    }
+
+    /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
+    /// (#1874). Set right before the POST, so a lost answer or a crash
+    /// counts; cleared when Graph refuses the POST (a 4xx, a 404, a 401) or
+    /// later says the message is still a draft. A missing `seq` changes
+    /// nothing.
+    pub fn set_send_posted(&self, seq: i64, posted: bool) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE outbox SET send_posted = ?2 WHERE seq = ?1",
+            params![seq, posted],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the `/send` POST of the op `seq` may have gone out
+    /// (`set_send_posted`). A missing `seq` is `false`.
+    pub fn send_posted(&self, seq: i64) -> Result<bool, StoreError> {
+        let posted = self
+            .conn
+            .query_row(
+                "SELECT send_posted FROM outbox WHERE seq = ?1",
+                params![seq],
+                |row| row.get::<_, bool>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(posted)
     }
 
     /// Removes a queued op by `seq` — called once it's been applied
@@ -4277,6 +4393,169 @@ mod draft_tests {
         assert_eq!(s.outbound_attachments("local:d1").unwrap().len(), 1);
         s.clear_outbound_attachments("local:d1").unwrap();
         assert!(s.outbound_attachments("local:d1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_uploaded_flag_survives_reconcile_and_a_second_add() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/b.pdf", "b.pdf", 10)
+            .unwrap();
+        assert!(!s.outbound_attachments(&id).unwrap()[0].uploaded);
+        s.reconcile_id(&id, "GRAPH-1").unwrap();
+        // Marked by the reconciled local id, as `SendDraft` may hold it.
+        s.mark_outbound_attachment_uploaded(&id, "/tmp/a.pdf")
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        let got = s.outbound_attachments("GRAPH-1").unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].uploaded, "the same path again keeps the flag");
+        assert!(!got[1].uploaded, "only the one uploaded is marked");
+    }
+
+    #[test]
+    fn send_posted_is_set_and_cleared_per_op() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G1".into() })
+            .unwrap();
+        let b = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G2".into() })
+            .unwrap();
+        assert!(!s.send_posted(a).unwrap());
+        s.set_send_posted(a, true).unwrap();
+        assert!(s.send_posted(a).unwrap());
+        assert!(!s.send_posted(b).unwrap(), "only that op");
+        s.set_send_posted(a, false).unwrap();
+        assert!(!s.send_posted(a).unwrap());
+        assert!(!s.send_posted(9999).unwrap(), "a missing op is not posted");
+    }
+
+    #[test]
+    fn discard_keeps_only_the_uploaded_attachments() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/up.pdf", "up.pdf", 1)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/new.pdf", "new.pdf", 1)
+            .unwrap();
+        s.reconcile_id(&id, "G").unwrap();
+        s.mark_outbound_attachment_uploaded(&id, "/tmp/up.pdf")
+            .unwrap();
+        s.discard_pending_outbound_attachments(&id).unwrap();
+        let left = s.outbound_attachments("G").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "up.pdf");
+        s.clear_outbound_attachments(&id).unwrap();
+        assert!(s.outbound_attachments("G").unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_adds_the_uploaded_and_send_posted_columns_to_old_tables() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-uploaded-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE outbound_attachments (
+                     draft_id TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
+                     size INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (draft_id, path));
+                 INSERT INTO outbound_attachments VALUES ('local:d', '/tmp/a.pdf', 'a.pdf', 1);
+                 CREATE TABLE outbox (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT, op TEXT NOT NULL, message_id TEXT,
+                     payload TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT);",
+            )
+            .unwrap();
+            // Rows as an older engine's `enqueue_op` wrote them.
+            for (seq, op) in [
+                (7, OutboxOp::SendDraft { id: "G".into() }),
+                (
+                    8,
+                    OutboxOp::MarkRead {
+                        id: "M1".into(),
+                        read: true,
+                    },
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO outbox (seq, op, payload) VALUES (?1, ?2, ?3)",
+                    params![seq, op.kind(), op.to_json().to_string()],
+                )
+                .unwrap();
+            }
+        }
+        let s = Store::open(&path).unwrap();
+        let got = s.outbound_attachments("local:d").unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].uploaded, "an old row is not on any Graph draft");
+        assert!(
+            s.send_posted(7).unwrap(),
+            "an inherited send may follow a lost answer: it reads as posted"
+        );
+        assert!(!s.send_posted(8).unwrap(), "another op kind does not");
+        assert_eq!(s.pending_ops().unwrap().len(), 2);
+        // A reopen, with the column already there, leaves the flags alone.
+        s.set_send_posted(7, false).unwrap();
+        let fresh = s
+            .enqueue_op(&OutboxOp::SendDraft { id: "G2".into() })
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(!s.send_posted(7).unwrap());
+        assert!(!s.send_posted(fresh).unwrap());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn return_to_drafts_undoes_a_send_by_either_id() {
+        let s = Store::open_in_memory().unwrap();
+        for (id, wk) in [("DRAFTS1", "drafts"), ("SENT1", "sentitems")] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: id.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some(wk.into()),
+            })
+            .unwrap();
+        }
+        let local = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        s.reconcile_id(&local, "G").unwrap();
+        for id in [local.as_str(), "G"] {
+            s.mark_sent(id);
+            s.move_message(id, "SENT1").unwrap();
+            s.return_to_drafts(id, "DRAFTS1").unwrap();
+            let (row, body) = s.draft("G").unwrap().unwrap();
+            assert_eq!(row.folder_id, "DRAFTS1", "by {id}");
+            assert!(row.is_draft, "by {id}");
+            assert_eq!(row.subject, "Hi");
+            assert_eq!(row.to_recipients, "b@x");
+            assert_eq!(body.content, "body");
+        }
+        // Sent Items never synced: the row never left Drafts, only
+        // `is_draft` flips back.
+        let other = s.create_local_draft("Two", "c@x", "", "b2").unwrap();
+        s.mark_sent(&other);
+        s.return_to_drafts(&other, "DRAFTS1").unwrap();
+        let (row, _) = s.draft(&other).unwrap().unwrap();
+        assert_eq!(row.folder_id, "DRAFTS1");
+        assert!(row.is_draft);
+        // A missing row is no error.
+        s.return_to_drafts("local:gone", "DRAFTS1").unwrap();
     }
 
     #[test]

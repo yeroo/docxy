@@ -53,32 +53,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             }
         }
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
-        OutboxOp::SendDraft { id } => {
-            let graph_id = ensure_draft_on_graph(client, store, id)?;
-            // Upload each pending attachment to the (now-on-Graph) draft before
-            // sending. A file-read or upload error returns here, so the drain's
-            // retry/quarantine policy applies and the attachments are NOT
-            // cleared — the send hasn't happened, so a retry is clean.
-            for att in store
-                .outbound_attachments(&graph_id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?
-            {
-                let bytes = std::fs::read(&att.path).map_err(|e| {
-                    GraphError::Parse(format!("cannot read attachment {}: {e}", att.path))
-                })?;
-                client.add_attachment(
-                    &graph_id,
-                    &att.name,
-                    &content_type_for(&att.name),
-                    &bytes,
-                )?;
-            }
-            client.send_draft(&graph_id)?;
-            store
-                .clear_outbound_attachments(&graph_id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?;
-            Ok(())
-        }
+        OutboxOp::SendDraft { id } => apply_send(client, store, id, None),
         OutboxOp::RespondEvent {
             id,
             kind,
@@ -120,6 +95,112 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 client.delete_event(id)
             }
         }
+    }
+}
+
+/// Sends the draft `id`: `SaveDraft`'s create or PATCH, then each pending
+/// attachment, then the `/send` POST. `seq` is the queued op's outbox row
+/// (`None` for a call outside the outbox, which tracks nothing).
+///
+/// With a `seq`, `outbox.send_posted` is set right before the POST (#1874),
+/// so an answer that may follow a delivery (any 5xx, a 429/503 throttle
+/// included: a gateway 503 can follow a send the back end accepted), a
+/// dropped connection or a crash counts; only a refusal Graph answered (a
+/// 4xx, a 404, a 401) clears it, as nothing went out. A later attempt of a
+/// posted op first asks whether it went out, before any PATCH or upload:
+/// the local row gone (a Drafts delta's `@removed`), or Graph saying the
+/// draft id is gone (404) or no draft any more, is a delivered send (`Ok`).
+/// When Graph answered, the attachment rows are cleared; when the row is
+/// gone they stay behind (a `local:` id no longer resolves to the Graph id
+/// they are keyed by), which is harmless: nothing reads them. Graph saying
+/// it is still a draft clears the flag and sends it again. A failure of
+/// that check is returned as is: the drain keeps a retryable one queued and
+/// never returns a posted op to Drafts.
+///
+/// A file-read or upload error returns before the POST, so the drain's
+/// failure policy applies (a 5xx defers the op; a 401, a 429/503 throttle
+/// or a transport failure keeps it queued; any other failure returns the
+/// draft to Drafts) and the attachments are NOT cleared. Each upload Graph
+/// confirmed is marked `uploaded` at once, and one already marked is
+/// skipped, so a confirmed upload is never repeated. An upload whose answer
+/// was lost (a 5xx or a dropped connection after Graph stored it), or whose
+/// marker could not be written, is uploaded again by the next attempt.
+pub(crate) fn apply_send(
+    client: &GraphClient,
+    store: &Store,
+    id: &str,
+    seq: Option<i64>,
+) -> Result<(), GraphError> {
+    let store_err = |e: crate::store::StoreError| GraphError::Parse(e.to_string());
+    if let Some(seq) = seq
+        && store.send_posted(seq).map_err(store_err)?
+    {
+        let Some((row, _)) = store.draft(id).map_err(store_err)? else {
+            return Ok(());
+        };
+        // Still `local:`: never on Graph, so never sent (a send queued by an
+        // older engine reads as posted). No check: send it as usual.
+        if !row.id.starts_with("local:") && !client.is_draft(&row.id)? {
+            let _ = store.clear_outbound_attachments(&row.id);
+            return Ok(());
+        }
+        store.set_send_posted(seq, false).map_err(store_err)?;
+    }
+    let graph_id = ensure_draft_on_graph(client, store, id)?;
+    for att in store.outbound_attachments(&graph_id).map_err(store_err)? {
+        if att.uploaded {
+            continue;
+        }
+        let bytes = std::fs::read(&att.path)
+            .map_err(|e| GraphError::Parse(format!("cannot read attachment {}: {e}", att.path)))?;
+        client.add_attachment(&graph_id, &att.name, &content_type_for(&att.name), &bytes)?;
+        store
+            .mark_outbound_attachment_uploaded(&graph_id, &att.path)
+            .map_err(store_err)?;
+    }
+    if let Some(seq) = seq {
+        store.set_send_posted(seq, true).map_err(store_err)?;
+    }
+    if let Err(e) = client.send_draft(&graph_id) {
+        // Graph answered and refused it (a 4xx, a 404, a 401): it was not
+        // sent, so the failure is the send's own. A 5xx, a 429/503 throttle
+        // (a gateway 503 can follow a send the back end accepted) or a lost
+        // answer leaves the flag: the next attempt checks delivery first,
+        // at the cost of one GET.
+        let refused = matches!(
+            e,
+            GraphError::Http { status, .. } if status < 500
+        ) || matches!(e, GraphError::NotFound | GraphError::Unauthorized);
+        if let (Some(seq), true) = (seq, refused) {
+            let _ = store.set_send_posted(seq, false);
+        }
+        return Err(e);
+    }
+    // The send happened: from here nothing may read as a failed send, which
+    // would return a delivered message to Drafts (#1874). A store error
+    // leaves the attachment rows behind, which is harmless.
+    let _ = store.clear_outbound_attachments(&graph_id);
+    Ok(())
+}
+
+/// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's
+/// own `error.message` for an HTTP error whose body carries a non-empty one,
+/// else `HTTP {status}`; a `Parse` failure's message as is (a missing
+/// attachment file, a store error); any other error's `Display`.
+pub(crate) fn send_error_text(err: &GraphError) -> String {
+    match err {
+        GraphError::Http { status, body } => crate::json::parse(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")?
+                    .get("message")?
+                    .as_str()
+                    .map(|m| m.trim().to_string())
+            })
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| format!("HTTP {status}")),
+        GraphError::Parse(m) => m.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -809,9 +890,140 @@ mod tests {
         // once the file is back). The draft is reconciled to GRAPH-2 by
         // `ensure_draft_on_graph` before the upload loop runs, so that's
         // where the pending row now lives.
-        assert!(!store.outbound_attachments("GRAPH-2").unwrap().is_empty());
+        let kept = store.outbound_attachments("GRAPH-2").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].uploaded, "a file never uploaded is not marked");
         // And send was never reached.
         assert!(!srv.requests().iter().any(|r| r.path.ends_with("/send")));
+    }
+
+    #[test]
+    fn send_draft_skips_an_attachment_already_uploaded() {
+        // #1874: a failed send uploaded it; the resend must not attach it twice.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-3/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-3/attachments".into(),
+                status: 201,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/GRAPH-3".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "bob@x", "", "body").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-3").unwrap();
+        // The file is gone too: an uploaded row is never read again.
+        store
+            .add_outbound_attachment(&local_id, "/does/not/exist/a.pdf", "a.pdf", 1)
+            .unwrap();
+        store
+            .mark_outbound_attachment_uploaded(&local_id, "/does/not/exist/a.pdf")
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.contains("/attachments"))
+        );
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me/messages/GRAPH-3/send")
+        );
+        assert!(store.outbound_attachments(&local_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_posted_send_of_a_draft_still_local_creates_and_sends_without_a_check() {
+        // FIX r3: a send an older engine queued reads as posted, but a
+        // `local:` draft was never on Graph, so it cannot have been sent.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-5/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-5", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "bob@x", "", "body").unwrap();
+        let seq = store
+            .enqueue_op(&OutboxOp::SendDraft {
+                id: local_id.clone(),
+            })
+            .unwrap();
+        store.set_send_posted(seq, true).unwrap();
+
+        apply_send(&c, &store, &local_id, Some(seq)).unwrap();
+
+        let reqs = srv.requests();
+        assert!(reqs.iter().all(|r| r.method != "GET"), "no delivery check");
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/me/messages");
+        assert_eq!(reqs[1].path, "/me/messages/GRAPH-5/send");
+        assert!(store.send_posted(seq).unwrap(), "set again for this POST");
+    }
+
+    #[test]
+    fn send_error_text_prefers_graphs_own_message() {
+        let http = |status: u16, body: &str| GraphError::Http {
+            status,
+            body: body.into(),
+        };
+        assert_eq!(
+            send_error_text(&http(
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied","message":"Access is denied."}}"#
+            )),
+            "Access is denied."
+        );
+        assert_eq!(send_error_text(&http(403, "<html>nope</html>")), "HTTP 403");
+        assert_eq!(
+            send_error_text(&http(400, r#"{"error":{"code":"X","message":"  "}}"#)),
+            "HTTP 400"
+        );
+        assert_eq!(
+            send_error_text(&http(400, r#"{"error":{"code":"X"}}"#)),
+            "HTTP 400"
+        );
+        assert_eq!(send_error_text(&GraphError::NotFound), "not found (404)");
+        assert_eq!(
+            send_error_text(&GraphError::Parse("cannot read attachment /x: gone".into())),
+            "cannot read attachment /x: gone"
+        );
     }
 
     /// A Graph event JSON body shaped like `create_event`'s response —

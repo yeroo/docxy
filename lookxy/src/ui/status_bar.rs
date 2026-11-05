@@ -45,9 +45,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     };
     // An error notice takes precedence over the attachment (success) notice
     // and is drawn in a distinct red style — a failed save must never look
-    // like a success. Otherwise the normal dark-gray bar shows the last
+    // like a success. A failed send (#1874) is drawn the same way, after the
+    // error notice. Otherwise the normal dark-gray bar shows the last
     // attachment save/open outcome, if any.
-    let style = if let Some(err) = &app.error_notice {
+    let style = if let Some(err) = app.error_notice.as_ref().or(app.send_failure.as_ref()) {
         line.push_str(" — ");
         line.push_str(err);
         Style::new().fg(Color::White).bg(Color::Red)
@@ -98,6 +99,38 @@ mod tests {
         assert!(text.contains("save failed"));
         // The success notice is suppressed while an error is showing.
         assert!(!text.contains("Saved: ok.txt"));
+    }
+
+    #[test]
+    fn a_failed_send_stays_shown_after_the_engine_settles() {
+        use mailcore::sync::engine::{SyncEvent, SyncState};
+        let mut app = App::for_test_with_seeded_store();
+        // The order the engine emits for a 403 on `/send` (#1874): the
+        // failure, the folder reloads, then the settle to `Idle`, which
+        // clears `error_notice`.
+        for evt in [
+            SyncEvent::Sending {
+                id: "local:1".into(),
+            },
+            SyncEvent::SendFailed {
+                id: "local:1".into(),
+                error: "Access is denied.".into(),
+            },
+            SyncEvent::MessagesUpdated {
+                folder_id: "DRAFTS1".into(),
+            },
+            SyncEvent::MessagesUpdated {
+                folder_id: "SENT1".into(),
+            },
+            SyncEvent::State(SyncState::Idle),
+        ] {
+            app.on_sync_event(evt);
+        }
+        assert_eq!(
+            app.send_failure.as_deref(),
+            Some("Send failed: Access is denied.")
+        );
+        assert!(render(&app).contains("Send failed: Access is denied."));
     }
 
     #[test]

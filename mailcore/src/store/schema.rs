@@ -93,21 +93,28 @@ CREATE TABLE IF NOT EXISTS attachments (
     PRIMARY KEY (message_id, id)
 );
 
+-- `uploaded` is 1 once Graph confirmed a send's upload of the file to the
+-- draft (#1874), so a resend after a failed send does not upload it again.
 CREATE TABLE IF NOT EXISTS outbound_attachments (
     draft_id  TEXT NOT NULL,
     path      TEXT NOT NULL,
     name      TEXT NOT NULL,
     size      INTEGER NOT NULL DEFAULT 0,
+    uploaded  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (draft_id, path)
 );
 
+-- `send_posted` is 1 once a `SendDraft` op's `/send` POST went out (#1874):
+-- written before the POST, so a lost answer or a crash still counts, and a
+-- later attempt first asks Graph whether the message was delivered.
 CREATE TABLE IF NOT EXISTS outbox (
-    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-    op         TEXT NOT NULL,
-    message_id TEXT,
-    payload    TEXT NOT NULL DEFAULT '',
-    attempts   INTEGER NOT NULL DEFAULT 0,
-    last_error TEXT
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    op          TEXT NOT NULL,
+    message_id  TEXT,
+    payload     TEXT NOT NULL DEFAULT '',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    send_posted INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS meta (

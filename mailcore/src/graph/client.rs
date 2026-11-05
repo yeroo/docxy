@@ -282,6 +282,22 @@ impl GraphClient {
         }
     }
 
+    /// GET `/me/messages/{id}?$select=isDraft`: whether the message is still
+    /// an unsent draft (#1874). A 404 is `Ok(false)`: a draft Graph sent
+    /// moves to Sent Items under a new id, so its draft id is gone. A body
+    /// without `isDraft` is a `Parse` error.
+    pub fn is_draft(&self, id: &str) -> Result<bool, GraphError> {
+        let path = format!("/me/messages/{}?$select=isDraft", encode_path_segment(id));
+        match self.send(Method::Get, &path, None, &[]) {
+            Ok(resp) => parse_body(resp)?
+                .get("isDraft")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| GraphError::Parse(format!("no isDraft for message {id}"))),
+            Err(GraphError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// GET `/me/mailFolders/{id}?$select=totalItemCount,unreadItemCount`:
     /// one folder's `(total, unread)` counts, which the sync engine re-reads
     /// after syncing just that folder (#1885). A missing count is 0, as in
@@ -1857,6 +1873,39 @@ mod tests {
             c.list_folders(),
             Err(GraphError::Http { status: 500, .. })
         ));
+    }
+
+    #[test]
+    fn is_draft_reads_is_draft_and_a_404_is_no_draft() {
+        let srv = FakeServer::start(vec![
+            get(
+                "/me/messages/D?",
+                200,
+                r#"{"id":"D","isDraft":true}"#.into(),
+            ),
+            get(
+                "/me/messages/S?",
+                200,
+                r#"{"id":"S","isDraft":false}"#.into(),
+            ),
+            get("/me/messages/GONE?", 404, "{}".into()),
+            get("/me/messages/ODD?", 200, r#"{"id":"ODD"}"#.into()),
+            get("/me/messages/BAD?", 500, "boom".into()),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.is_draft("D"), Ok(true));
+        assert_eq!(c.is_draft("S"), Ok(false));
+        assert_eq!(c.is_draft("GONE"), Ok(false));
+        assert!(matches!(c.is_draft("ODD"), Err(GraphError::Parse(_))));
+        assert!(matches!(
+            c.is_draft("BAD"),
+            Err(GraphError::Http { status: 500, .. })
+        ));
+        assert!(
+            srv.requests()
+                .iter()
+                .all(|r| r.path.ends_with("?$select=isDraft"))
+        );
     }
 
     #[test]

@@ -129,6 +129,12 @@ pub struct App {
     /// `main::run`) or the next successful sync state (`State(Idle)`/
     /// `FoldersUpdated`) — see `on_sync_event`.
     pub error_notice: Option<String>,
+    /// The last `SyncEvent::SendFailed` (#1874), as `Send failed: <error>`,
+    /// drawn in the status bar's error style after `error_notice`. Unlike
+    /// `error_notice`, no sync event clears it (the engine settles to
+    /// `State(Idle)` right after a failed send's `SendFailed`): only the
+    /// next key press does (see `main::run`).
+    pub send_failure: Option<String>,
     /// In-flight `SaveAttachment` requests keyed by their `dest` path, each
     /// mapped to whether it should be opened once it completes (`o`) or
     /// merely reported (Enter). Keyed per-request (rather than one shared
@@ -509,6 +515,7 @@ impl App {
             attachments: None,
             attachment_notice: None,
             error_notice: None,
+            send_failure: None,
             pending_saves: std::collections::HashMap::new(),
             token_path,
             account: None,
@@ -712,6 +719,12 @@ impl App {
             // isn't currently showing is harmless, and keeps `agenda` correct
             // for the moment `g` shows it again rather than reloading late.
             SyncEvent::CalendarUpdated => self.reload_agenda(),
+            // A send failed for good: the engine already put the message
+            // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
+            SyncEvent::SendFailed { error, .. } => {
+                self.send_failure = Some(format!("Send failed: {error}"));
+                self.reload_messages();
+            }
             // `Sent` has no TUI consumer yet: the composer already closes
             // optimistically the moment Send is pressed (`apply_compose_action`),
             // before the engine's outbox drain even reaches Graph, so by the
@@ -734,7 +747,8 @@ impl App {
             SyncEvent::InlineImageReady { .. } => {} // for a message no longer open — drop
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
-            | SyncEvent::Sent { .. } => {}
+            | SyncEvent::Sent { .. }
+            | SyncEvent::Sending { .. } => {}
         }
     }
 
@@ -2979,7 +2993,11 @@ impl App {
             return;
         };
         if action == ComposeAction::Discard {
-            let _ = self.store.clear_outbound_attachments(&compose.draft_id);
+            // Only the files not on the Graph draft yet: one a failed send
+            // uploaded stays listed, as Send would still deliver it (#1874).
+            let _ = self
+                .store
+                .discard_pending_outbound_attachments(&compose.draft_id);
             return;
         }
         let html = compose_html::to_html(&compose.editor.text);
@@ -3589,14 +3607,25 @@ impl App {
     /// the open draft: deletes it in the store, then re-reads `compose.attachments`
     /// from the store so the in-memory list can't drift from the stored truth even
     /// if the delete fails. No-op if nothing is attached / no composer open.
+    /// An attachment a failed send already uploaded (`uploaded`, #1874) is on
+    /// the Graph draft, which removing the row would not change: it is kept,
+    /// with a notice, so the list never hides a file Send would deliver.
     pub fn remove_last_attachment(&mut self) {
         let Some(compose) = self.compose.as_mut() else {
             return;
         };
         let draft_id = compose.draft_id.clone();
-        let Some(last) = compose.attachments.last().map(|a| a.path.clone()) else {
+        let Some(last) = compose.attachments.last() else {
             return;
         };
+        if last.uploaded {
+            self.error_notice = Some(format!(
+                "{} is already attached to the server draft",
+                last.name
+            ));
+            return;
+        }
+        let last = last.path.clone();
         let _ = self.store.remove_outbound_attachment(&draft_id, &last);
         if let Some(compose) = self.compose.as_mut() {
             compose.attachments = self
@@ -6703,6 +6732,59 @@ pub(crate) mod tests {
             .add_outbound_attachment(&draft_id, "/tmp/x.txt", "x.txt", 3)
             .unwrap();
         app.open_draft(&draft_id); // reopen
+        assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_attachment_keeps_one_a_failed_send_uploaded() {
+        // #1874: the file is on the Graph draft; removing the row would not
+        // remove it there, so Send would still deliver it.
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new();
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/x.txt", "x.txt", 3)
+            .unwrap();
+        app.store
+            .mark_outbound_attachment_uploaded(&draft_id, "/tmp/x.txt")
+            .unwrap();
+        app.open_draft(&draft_id);
+
+        app.remove_last_attachment();
+
+        assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
+        assert_eq!(app.store.outbound_attachments(&draft_id).unwrap().len(), 1);
+        assert_eq!(
+            app.error_notice.as_deref(),
+            Some("x.txt is already attached to the server draft")
+        );
+    }
+
+    #[test]
+    fn discard_keeps_an_attachment_a_failed_send_uploaded() {
+        // FIX r1 M2 (#1874): Discard drops only what is not on the Graph
+        // draft, so the next open still lists what Send would deliver.
+        let mut app = App::for_test_with_seeded_store();
+        app.compose_new();
+        let draft_id = app.compose.as_ref().unwrap().draft_id.clone();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/up.txt", "up.txt", 3)
+            .unwrap();
+        app.store
+            .add_outbound_attachment(&draft_id, "/tmp/new.txt", "new.txt", 3)
+            .unwrap();
+        app.store
+            .mark_outbound_attachment_uploaded(&draft_id, "/tmp/up.txt")
+            .unwrap();
+        app.compose_action = Some(ComposeAction::Discard);
+
+        app.apply_compose_action();
+
+        assert!(app.compose.is_none());
+        let left = app.store.outbound_attachments(&draft_id).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "up.txt");
+        app.open_draft(&draft_id);
         assert_eq!(app.compose.as_ref().unwrap().attachments.len(), 1);
     }
 
