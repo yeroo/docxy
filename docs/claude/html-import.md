@@ -77,8 +77,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `align=left` (floats, which nothing moves), else the table's place
   (`center` / `right`). `<table align=center>` is the hint
   `margin-left: auto; margin-right: auto`, so a page's `margin: 0` on it
-  leaves it at the left. A table's own `align`, margins and `text-align`
-  never align its cells' text; its ancestors' `text-align` still does.
+  leaves it at the left. A table's own `align` and margins never align its
+  cells' text; its own `text-align`, like its ancestors', still does (it
+  is not its place).
 - Images: `display: block` on an `img` (`Look::own_block`; any other
   `display` but `none` clears it, so an e-mail's `img {display: block}`
   reset is undone by a later `inline`) makes the picture, or an unsized

@@ -587,6 +587,13 @@ fn align_attr(v: &str) -> Option<Align> {
     align_value(v)
 }
 
+/// A list item paragraph's left indent at `level` (0-based) inside
+/// enclosing boxes summing `boxes` twips: the level's own 720 per level,
+/// as the Markdown package's numbering has it (#1872 9b, #1922).
+fn item_indent(level: i32, boxes: i32) -> i32 {
+    (720 * (level + 1) + boxes).max(0)
+}
+
 /// Whether a `text-align` value is a vendor one (`-webkit-center`,
 /// `-moz-center`): it places block-level children too (#1922).
 fn prefixed_align(v: &str) -> bool {
@@ -2221,7 +2228,7 @@ impl<'a> Html<'a> {
             // boxes move it as a whole (#1872 9b).
             Some((_, level)) if !block.mso_list => {
                 if look.indent != 0 {
-                    p.indent = (720 * (level + 1) + look.indent).max(0);
+                    p.indent = item_indent(level, look.indent);
                     p.first_line = -360;
                 }
             }
@@ -2281,7 +2288,7 @@ impl<'a> Html<'a> {
                     // Past a block image, the item's text goes on in
                     // unnumbered paragraphs at its level's indent (#1922).
                     let boxes = self.para_look().map_or(0, |l| l.indent);
-                    props.indent = (720 * (level + 1) + boxes).max(0);
+                    props.indent = item_indent(level, boxes);
                     props.first_line = 0;
                 } else {
                     props.num_id = Some(if numbered { 2 } else { 1 });
