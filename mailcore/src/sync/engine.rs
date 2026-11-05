@@ -19,6 +19,7 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
+pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{AutomaticReplies, DeltaItem, Message, ScheduleEntry};
 use crate::store::{NewAttendee, NewEvent, OutboxOp, Store, StoreError};
 use crate::sync::outbox::apply_op;
@@ -60,7 +61,8 @@ pub enum SyncCommand {
     Move { id: String, dest: String },
     /// Delete a message (optimistic local delete + queued Graph op).
     Delete { id: String },
-    /// Fetch and store a message body, then emit [`SyncEvent::BodyReady`].
+    /// Fetch and store a message body in the engine's
+    /// [`EngineOptions::body_format`], then emit [`SyncEvent::BodyReady`].
     FetchBody { id: String },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
@@ -298,6 +300,9 @@ const SIGNIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// much of the tick has elapsed) — lookxy passes its `Config::refresh_secs`
 /// here, so the configured interval genuinely governs how often the engine
 /// syncs on its own.
+///
+/// Runs with [`EngineOptions::default`] (plain-text bodies); see
+/// [`spawn_with_options`].
 pub fn spawn(
     store_path: PathBuf,
     token_path: PathBuf,
@@ -305,7 +310,37 @@ pub fn spawn(
     backfill_days: i64,
     tick: Duration,
 ) -> SyncHandle {
-    spawn_with_bases(
+    spawn_with_options(
+        store_path,
+        token_path,
+        cfg,
+        backfill_days,
+        tick,
+        EngineOptions::default(),
+    )
+}
+
+/// Engine behaviour chosen once, at spawn (#1901). Build it from the
+/// default so a later field does not break the caller:
+/// `EngineOptions { body_format: BodyFormat::Html, ..Default::default() }`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineOptions {
+    /// The format [`SyncCommand::FetchBody`] asks Graph for (default
+    /// `Text`, what lookxy shows). Bodies stored under the other format are
+    /// told apart with `Store::get_body_for`.
+    pub body_format: BodyFormat,
+}
+
+/// Like [`spawn`], with the engine's [`EngineOptions`].
+pub fn spawn_with_options(
+    store_path: PathBuf,
+    token_path: PathBuf,
+    cfg: AuthConfig,
+    backfill_days: i64,
+    tick: Duration,
+    options: EngineOptions,
+) -> SyncHandle {
+    spawn_with_bases_and_options(
         store_path,
         token_path,
         cfg,
@@ -313,12 +348,14 @@ pub fn spawn(
         "https://graph.microsoft.com/v1.0".to_string(),
         "https://login.microsoftonline.com".to_string(),
         tick,
+        options,
     )
 }
 
 /// Like [`spawn`], but with the Graph base URL, auth base URL, and tick
 /// injected — the seam integration tests use to point the whole engine at the
 /// in-process fake server.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_with_bases(
     store_path: PathBuf,
@@ -328,6 +365,30 @@ pub(crate) fn spawn_with_bases(
     graph_base: String,
     auth_base: String,
     tick: Duration,
+) -> SyncHandle {
+    spawn_with_bases_and_options(
+        store_path,
+        token_path,
+        cfg,
+        backfill_days,
+        graph_base,
+        auth_base,
+        tick,
+        EngineOptions::default(),
+    )
+}
+
+/// [`spawn_with_bases`] with the engine's [`EngineOptions`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_with_bases_and_options(
+    store_path: PathBuf,
+    token_path: PathBuf,
+    cfg: AuthConfig,
+    backfill_days: i64,
+    graph_base: String,
+    auth_base: String,
+    tick: Duration,
+    options: EngineOptions,
 ) -> SyncHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (evt_tx, evt_rx) = mpsc::channel();
@@ -339,6 +400,7 @@ pub(crate) fn spawn_with_bases(
         graph_base,
         auth_base,
         tick,
+        options,
     };
     thread::spawn(move || run(config, cmd_rx, evt_tx));
     SyncHandle { cmd_tx, evt_rx }
@@ -353,6 +415,7 @@ struct EngineConfig {
     graph_base: String,
     auth_base: String,
     tick: Duration,
+    options: EngineOptions,
 }
 
 /// Thread entry point: open the store, build the engine, run startup, then the
@@ -1106,16 +1169,23 @@ impl Engine {
 
     // --- Bodies ----------------------------------------------------------
 
-    /// Fetch a message body (plain text, best for a TUI), store it, and emit
-    /// `BodyReady`.
+    /// Fetch a message body in the engine's `EngineOptions::body_format`,
+    /// store it, and emit `BodyReady`. `Text` asks Graph for plain text
+    /// (best for a TUI); `Html` sends no `Prefer` and gets each body in its
+    /// native format (html, or text for a plain-text message). The body is
+    /// stored with the format *asked for*, not the content type it came back
+    /// as (`Store::put_fetched_body`), so `Store::get_body_for` can tell a
+    /// native-text answer to an `Html` ask from a body to refetch. Every
+    /// `FetchBody` goes to Graph: the caller decides when one is needed.
     fn fetch_body(&mut self, id: &str) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        match self.with_auth(|c| c.get_body(id, true)) {
+        let format = self.config.options.body_format;
+        match self.with_auth(|c| c.get_body(id, format == BodyFormat::Text)) {
             Ok(body) => {
-                let _ = self.store.put_body(id, &body);
+                let _ = self.store.put_fetched_body(id, &body, format);
                 self.emit(SyncEvent::BodyReady { id: id.to_string() });
             }
             Err(e) => {
@@ -3870,6 +3940,308 @@ mod tests {
         let atts = store.attachments("M1").unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].name, "f.txt");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Body format (#1901) ------------------------------------------------
+
+    /// `backfill_routes` with `extra` routes ahead of them (the fake server
+    /// matches the first prefix), an engine spawned with `options` on it,
+    /// and the backfill landed (so M1 exists locally).
+    fn body_engine(
+        tag: &str,
+        extra: Vec<Route>,
+        options: EngineOptions,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let mut routes = extra;
+        routes.extend(backfill_routes());
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases_and_options(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+            options,
+        );
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
+        );
+        (srv, handle, store_path, dir)
+    }
+
+    fn html_options() -> EngineOptions {
+        EngineOptions {
+            body_format: BodyFormat::Html,
+        }
+    }
+
+    /// M1's body GET (`get_body`'s path), answering `content_type`/`content`.
+    fn body_route(content_type: &str, content: &str) -> Route {
+        get_route(
+            "/me/messages/M1?$select=body",
+            200,
+            &format!(r#"{{"body":{{"contentType":"{content_type}","content":"{content}"}}}}"#),
+        )
+    }
+
+    fn fetch_m1_body(handle: &SyncHandle) {
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchBody { id: "M1".into() })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::BodyReady { id } if id == "M1"),
+        );
+    }
+
+    /// The body GETs the server saw for M1.
+    fn m1_body_gets(srv: &FakeServer) -> Vec<crate::testserver::RecordedRequest> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select=body"))
+            .collect()
+    }
+
+    fn prefers_text(r: &crate::testserver::RecordedRequest) -> bool {
+        r.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("prefer") && v == "outlook.body-content-type=\"text\""
+        })
+    }
+
+    #[test]
+    fn a_default_engine_fetches_bodies_as_text_and_records_it() {
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-text",
+            vec![body_route("text", "hi")],
+            EngineOptions::default(),
+        );
+        fetch_m1_body(&handle);
+
+        let gets = m1_body_gets(&srv);
+        assert_eq!(gets.len(), 1);
+        assert!(prefers_text(&gets[0]), "headers: {:?}", gets[0].headers);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.get_body("M1").unwrap().unwrap().content, "hi");
+        assert!(
+            store
+                .get_body_for("M1", BodyFormat::Text)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_body_for("M1", BodyFormat::Html)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_html_engine_fetches_native_bodies_and_stores_html() {
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-html",
+            vec![body_route("html", "<p>hi</p>")],
+            html_options(),
+        );
+        fetch_m1_body(&handle);
+
+        let gets = m1_body_gets(&srv);
+        assert_eq!(gets.len(), 1);
+        assert!(
+            !gets[0]
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("prefer")),
+            "headers: {:?}",
+            gets[0].headers
+        );
+        let store = Store::open(&store_path).unwrap();
+        let body = store.get_body_for("M1", BodyFormat::Html).unwrap().unwrap();
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>hi</p>");
+        assert!(
+            store
+                .get_body_for("M1", BodyFormat::Text)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_body_stored_as_text_is_fetched_as_html_once() {
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-upgrade",
+            vec![body_route("html", "<p>rich</p>")],
+            html_options(),
+        );
+        // As an engine from before #1901 left it: fetched as text, no format.
+        let store = Store::open(&store_path).unwrap();
+        store
+            .put_body(
+                "M1",
+                &crate::graph::model::Body {
+                    content_type: "text".into(),
+                    content: "plain".into(),
+                },
+            )
+            .unwrap();
+
+        // The embedder's gate, run as on two opens of the message.
+        for _ in 0..2 {
+            if store
+                .get_body_for("M1", BodyFormat::Html)
+                .unwrap()
+                .is_none()
+            {
+                fetch_m1_body(&handle);
+            }
+        }
+
+        assert_eq!(m1_body_gets(&srv).len(), 1);
+        let body = store.get_body_for("M1", BodyFormat::Html).unwrap().unwrap();
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>rich</p>");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_native_text_body_fetched_as_html_is_not_fetched_again() {
+        // A plain-text message's native body is text: it answers the `Html`
+        // ask, so the gate must not send it back to Graph on every open.
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-native-text",
+            vec![body_route("text", "just text")],
+            html_options(),
+        );
+        let store = Store::open(&store_path).unwrap();
+        for _ in 0..2 {
+            if store
+                .get_body_for("M1", BodyFormat::Html)
+                .unwrap()
+                .is_none()
+            {
+                fetch_m1_body(&handle);
+            }
+        }
+
+        assert_eq!(m1_body_gets(&srv).len(), 1);
+        let body = store.get_body_for("M1", BodyFormat::Html).unwrap().unwrap();
+        assert_eq!(body.content_type, "text");
+        assert_eq!(body.content, "just text");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_text_reply_draft_is_not_a_refetch_candidate() {
+        // `createReply` of a plain-text message comes back as text, stored
+        // with no fetch format; a FetchBody over the draft compose just
+        // opened would lose the user's edits. The response here carries no
+        // `isDraft` (so `is_draft` is 0, as a later complete delta item
+        // leaves it anyway): the Drafts folder is what marks it a draft.
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-reply-draft",
+            vec![
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/M1/createReply".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: r#"{"id":"DRAFT1","conversationId":"C1","subject":"Re: Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":""}"#.into(),
+                },
+                get_route(
+                    "/me/messages/DRAFT1?$select=body",
+                    200,
+                    r#"{"body":{"contentType":"text","content":"> quoted"}}"#,
+                ),
+            ],
+            html_options(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: false,
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT1"),
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        assert!(!store.draft("DRAFT1").unwrap().unwrap().0.is_draft);
+        let body = store
+            .get_body_for("DRAFT1", BodyFormat::Html)
+            .unwrap()
+            .expect("a reply draft's body satisfies Html");
+        assert_eq!(body.content_type, "text");
+        assert_eq!(body.content, "> quoted");
+        assert!(
+            store
+                .get_body_for("DRAFT1", BodyFormat::Text)
+                .unwrap()
+                .is_some()
+        );
+        let draft_gets = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/me/messages/DRAFT1"))
+            .count();
+        assert_eq!(draft_gets, 1, "only store_composed_draft's own GET");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_html_engine_stores_inline_attachments_content_id() {
+        let (_srv, handle, store_path, dir) = body_engine(
+            "body-inline",
+            vec![get_route(
+                "/me/messages/M1/attachments",
+                200,
+                r##"{"value":[{"@odata.type":"#microsoft.graph.fileAttachment","id":"A1","name":"logo.png","contentType":"image/png","size":3,"isInline":true,"contentId":"logo@x"}]}"##,
+            )],
+            html_options(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchAttachments {
+                message_id: "M1".into(),
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::AttachmentsUpdated { message_id } if message_id == "M1"),
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let atts = store.attachments("M1").unwrap();
+        assert_eq!(atts.len(), 1);
+        assert!(atts[0].is_inline);
+        assert_eq!(atts[0].content_id.as_deref(), Some("logo@x"));
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

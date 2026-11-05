@@ -12,8 +12,8 @@ use std::path::Path;
 use rusqlite::{Connection, Row, params};
 
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, Event, MailFolder, MasterCategory, Message,
-    MessageFields, Recipient, Recurrence,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, MailFolder, MasterCategory,
+    Message, MessageFields, Recipient, Recurrence,
 };
 use crate::json::{self, Value};
 
@@ -629,6 +629,11 @@ impl Store {
         // come after the ALTER, not in `SCHEMA_SQL`: on an old database
         // `SCHEMA_SQL` runs before the column exists. NULLs never collide.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN local_id TEXT", []);
+        // Same idempotent-migration pattern, for `bodies.fetched_as` (#1901:
+        // the format `FetchBody` asked for). Rows from before it stay NULL,
+        // which `get_body_for` reads as "asked for text" for a text body,
+        // as the engine then always did.
+        let _ = conn.execute("ALTER TABLE bodies ADD COLUMN fetched_as TEXT", []);
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(local_id)",
             [],
@@ -1061,18 +1066,116 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts or replaces the body of a message. The schema's `bodies_fts_*`
-    /// triggers (see `schema.rs`) keep `messages_fts` in step with this
-    /// automatically, so `search` sees the new content right away.
+    /// Inserts or replaces the body of a message, as a body that was not
+    /// fetched by `FetchBody` (a draft's, written locally or from
+    /// `createReply`): no fetch format is recorded (`fetched_as` NULL; see
+    /// [`Store::get_body_for`]). The schema's `bodies_fts_*` triggers (see
+    /// `schema.rs`) keep `messages_fts` in step with this automatically, so
+    /// `search` sees the new content right away.
     pub fn put_body(&self, message_id: &str, b: &Body) -> Result<(), StoreError> {
+        self.write_body(message_id, b, None)
+    }
+
+    /// Inserts or replaces the body of a message as `FetchBody` fetched it,
+    /// recording the format it asked Graph for (`fetched_as`, #1901), which
+    /// for `Html` can differ from the content type that came back (a
+    /// plain-text message's native body is text).
+    pub fn put_fetched_body(
+        &self,
+        message_id: &str,
+        b: &Body,
+        asked: BodyFormat,
+    ) -> Result<(), StoreError> {
+        self.write_body(message_id, b, Some(asked))
+    }
+
+    fn write_body(
+        &self,
+        message_id: &str,
+        b: &Body,
+        asked: Option<BodyFormat>,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, ?2, ?3)
+            "INSERT INTO bodies (message_id, content_type, content, fetched_as) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(message_id) DO UPDATE SET
                  content_type = excluded.content_type,
-                 content = excluded.content",
-            params![message_id, b.content_type, b.content],
+                 content = excluded.content,
+                 fetched_as = excluded.fetched_as",
+            params![message_id, b.content_type, b.content, asked.map(BodyFormat::as_str)],
         )?;
         Ok(())
+    }
+
+    /// The stored body of a message when it satisfies `format`, else `None`
+    /// (#1901): what an embedder checks before sending `FetchBody`, so a
+    /// store filled under the other format upgrades one message at a time
+    /// and a body is fetched once per format, not on every open. Use
+    /// [`Store::get_body`] to show whatever is stored meanwhile.
+    ///
+    /// A body `FetchBody` recorded (`fetched_as`) satisfies the format it
+    /// was asked in, so a plain-text message fetched under `Html` (its
+    /// native body is text) satisfies `Html` and is not fetched again. A
+    /// body with no recorded format (`NULL`) satisfies both when it is html,
+    /// or a draft's (below), and otherwise counts as asked for text: an
+    /// engine from before the column always asked for text.
+    ///
+    /// A draft's body with no recorded format is a local write (compose,
+    /// `createReply`), never a refetch candidate: a `FetchBody` over it
+    /// would replace unsynced edits, which a queued `SaveDraft` then pushes
+    /// back as Graph's old body. That covers a `createReply` draft of a
+    /// plain-text message (stored as text) and a draft an older build's
+    /// `update_draft_fields` left as html content under `content_type =
+    /// 'text'`. A draft is a message marked `is_draft` or filed in the
+    /// Drafts folder (the synced one, or the local sentinel): a complete
+    /// delta item resets `is_draft` to 0, as `isDraft` is not in
+    /// `MESSAGE_SELECT`, so the flag alone would not last past a sync.
+    pub fn get_body_for(
+        &self,
+        message_id: &str,
+        format: BodyFormat,
+    ) -> Result<Option<Body>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT b.content_type, b.content, b.fetched_as,
+                        COALESCE(m.is_draft = 1 OR f.well_known_name = 'drafts' OR m.folder_id = ?2, 0)
+                 FROM bodies b
+                 LEFT JOIN messages m ON m.id = b.message_id
+                 LEFT JOIN folders f ON f.id = m.folder_id
+                 WHERE b.message_id = ?1",
+                params![message_id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+                |row| {
+                    Ok((
+                        Body {
+                            content_type: row.get(0)?,
+                            content: row.get(1)?,
+                        },
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        let Some((body, fetched_as, draft)) = row else {
+            return Ok(None);
+        };
+        let satisfies = match fetched_as.as_deref() {
+            // A value this build does not know is not `format`: refetch.
+            Some(asked) => BodyFormat::parse(asked) == Some(format),
+            None => {
+                draft
+                    || body.content_type.eq_ignore_ascii_case("html")
+                    || format == BodyFormat::Text
+            }
+        };
+        Ok(satisfies.then_some(body))
     }
 
     /// The stored body of a message, if any (`None` before `put_body` is
@@ -1151,6 +1254,11 @@ impl Store {
     /// matched by `draft_row_sql!` and the body keyed by `current_id_sql!`,
     /// in one transaction whose first statement is the write, so both see
     /// the same state.
+    ///
+    /// The body is html (compose writes html), so a draft whose stored body
+    /// was fetched as text becomes `content_type = 'html'` with no fetch
+    /// format (#1901): [`Store::get_body_for`] then keeps the user's edits
+    /// in either format rather than inviting a `FetchBody` over them.
     pub fn update_draft_fields(
         &self,
         id: &str,
@@ -1174,7 +1282,8 @@ impl Store {
                 "INSERT INTO bodies (message_id, content_type, content) VALUES (",
                 current_id_sql!(),
                 ", 'html', ?2)
-                 ON CONFLICT(message_id) DO UPDATE SET content = excluded.content"
+                 ON CONFLICT(message_id) DO UPDATE SET
+                     content_type = 'html', content = excluded.content, fetched_as = NULL"
             ),
             params![id, body_html],
         )?;
@@ -4381,5 +4490,266 @@ mod local_id_tests {
         assert_eq!(s.current_id(&local).unwrap(), "G");
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod body_format_tests {
+    use super::*;
+
+    fn text_body(content: &str) -> Body {
+        Body {
+            content_type: "text".into(),
+            content: content.into(),
+        }
+    }
+
+    fn html_body(content: &str) -> Body {
+        Body {
+            content_type: "html".into(),
+            content: content.into(),
+        }
+    }
+
+    /// A store holding one Inbox message `M`, not a draft, for bodies to
+    /// hang off.
+    fn store_with_message() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "INBOX".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.upsert_message("INBOX", &message("M", false)).unwrap();
+        s
+    }
+
+    fn message(id: &str, is_draft: bool) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: String::new(),
+            subject: "S".into(),
+            from: Recipient::default(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            received: String::new(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft,
+            is_meeting_request: false,
+            categories: Vec::new(),
+        }
+    }
+
+    fn satisfies(s: &Store, id: &str) -> (bool, bool) {
+        (
+            s.get_body_for(id, BodyFormat::Text).unwrap().is_some(),
+            s.get_body_for(id, BodyFormat::Html).unwrap().is_some(),
+        )
+    }
+
+    #[test]
+    fn get_body_for_has_nothing_without_a_body() {
+        let s = store_with_message();
+        assert_eq!(satisfies(&s, "M"), (false, false));
+        assert_eq!(satisfies(&s, "nope"), (false, false));
+    }
+
+    #[test]
+    fn a_fetched_body_satisfies_the_format_it_was_asked_in() {
+        let s = store_with_message();
+        s.put_fetched_body("M", &text_body("t"), BodyFormat::Text)
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
+        s.put_fetched_body("M", &html_body("<p>h</p>"), BodyFormat::Html)
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (false, true));
+        let b = s.get_body_for("M", BodyFormat::Html).unwrap().unwrap();
+        assert_eq!(b, html_body("<p>h</p>"));
+    }
+
+    #[test]
+    fn a_native_text_body_asked_as_html_satisfies_html() {
+        // A plain-text message's native body is text: asked for html, it is
+        // the right answer and must not read as "fetch again".
+        let s = store_with_message();
+        s.put_fetched_body("M", &text_body("plain"), BodyFormat::Html)
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (false, true));
+    }
+
+    #[test]
+    fn a_body_with_no_format_counts_as_text_when_text_and_as_either_when_html() {
+        // No `fetched_as`: an older engine's fetch (always text), or a body
+        // written locally. `put_body` writes none, and overwrites a format.
+        let s = store_with_message();
+        s.put_body("M", &text_body("old")).unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
+        s.put_body("M", &html_body("<p>local</p>")).unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, true));
+        s.put_fetched_body("M", &text_body("t"), BodyFormat::Text)
+            .unwrap();
+        s.put_body("M", &html_body("<p>local</p>")).unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, true));
+        // Content types compare as lookxy's readers do, ignoring case.
+        s.put_body(
+            "M",
+            &Body {
+                content_type: "HTML".into(),
+                content: "<p>x</p>".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, true));
+    }
+
+    #[test]
+    fn an_unknown_fetch_format_is_fetched_again() {
+        let s = store_with_message();
+        s.put_fetched_body("M", &html_body("<p>h</p>"), BodyFormat::Html)
+            .unwrap();
+        s.conn
+            .execute("UPDATE bodies SET fetched_as = 'rtf'", [])
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (false, false));
+    }
+
+    #[test]
+    fn local_draft_bodies_satisfy_both_formats() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("S", "", "", "<p>hi</p>").unwrap();
+        assert_eq!(satisfies(&s, &id), (true, true));
+        s.update_draft_fields(&id, "S", "", "", "", "<p>edited</p>")
+            .unwrap();
+        assert_eq!(satisfies(&s, &id), (true, true));
+    }
+
+    #[test]
+    fn editing_a_draft_fetched_as_text_keeps_the_edit_for_html() {
+        // A synced draft whose body `FetchBody` stored as text: compose
+        // writes html, which must not read as "fetch the html over it".
+        let s = store_with_message();
+        s.put_fetched_body("M", &text_body("server text"), BodyFormat::Text)
+            .unwrap();
+        // Recorded as a text fetch, the strict rule holds even for a draft.
+        s.conn
+            .execute("UPDATE messages SET is_draft = 1 WHERE id = 'M'", [])
+            .unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
+        s.update_draft_fields("M", "S", "", "", "", "<p>my edit</p>")
+            .unwrap();
+        let b = s.get_body_for("M", BodyFormat::Html).unwrap().unwrap();
+        assert_eq!(b, html_body("<p>my edit</p>"));
+        assert_eq!(satisfies(&s, "M"), (true, true));
+    }
+
+    #[test]
+    fn reconcile_id_keeps_the_fetch_format() {
+        let s = store_with_message();
+        s.put_fetched_body("M", &html_body("<p>h</p>"), BodyFormat::Html)
+            .unwrap();
+        s.reconcile_id("M", "G").unwrap();
+        assert_eq!(satisfies(&s, "G"), (false, true));
+    }
+
+    #[test]
+    fn a_database_from_before_fetched_as_is_migrated() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-fetched-as-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let id = {
+            let s = Store::open(&path).unwrap();
+            s.upsert_folder(&MailFolder {
+                id: "INBOX".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            s.upsert_message("INBOX", &message("M", false)).unwrap();
+            s.put_body("M", &text_body("old")).unwrap();
+            // Take the database back to before the column existed.
+            s.conn
+                .execute_batch("ALTER TABLE bodies DROP COLUMN fetched_as;")
+                .unwrap();
+            "M".to_string()
+        };
+        let s = Store::open(&path).unwrap();
+        // The old row reads as an older engine's text fetch.
+        assert_eq!(satisfies(&s, &id), (true, false));
+        s.put_fetched_body(&id, &html_body("<p>h</p>"), BodyFormat::Html)
+            .unwrap();
+        assert_eq!(satisfies(&s, &id), (false, true));
+        drop(s);
+        // Opening again (column already there) is fine.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(satisfies(&s, &id), (false, true));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Drafts folder as Graph syncs it.
+    fn synced_drafts(s: &Store) {
+        s.upsert_folder(&MailFolder {
+            id: "DRAFTS".into(),
+            display_name: "Drafts".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("drafts".into()),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_legacy_edited_draft_is_never_a_refetch_candidate() {
+        // An older build's `update_draft_fields` kept `content_type = 'text'`
+        // under the html it wrote: a FetchBody over it would lose the edit.
+        let s = store_with_message();
+        synced_drafts(&s);
+        s.upsert_message("DRAFTS", &message("D", true)).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO bodies (message_id, content_type, content)
+                 VALUES ('D', 'text', '<p>unsynced edit</p>')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(satisfies(&s, "D"), (true, true));
+        // A complete delta item writes `is_draft = 0` (`isDraft` is not
+        // selected): the Drafts folder still says it is a draft.
+        s.upsert_message("DRAFTS", &message("D", false)).unwrap();
+        assert_eq!(satisfies(&s, "D"), (true, true));
+        // A message elsewhere with the same body still upgrades.
+        s.put_body("M", &text_body("old")).unwrap();
+        assert_eq!(satisfies(&s, "M"), (true, false));
+    }
+
+    #[test]
+    fn a_draft_under_the_local_sentinel_is_a_draft() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("S", "", "", "").unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET is_draft = 0 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        s.put_body(&id, &text_body("t")).unwrap();
+        assert_eq!(satisfies(&s, &id), (true, true));
     }
 }
