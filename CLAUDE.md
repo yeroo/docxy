@@ -579,6 +579,56 @@
   inside the view (they reach the callback as `#name`), macOS ⌘-key
   routing for the view (untested).
 
+## HTML import tables (#1878)
+
+- An HTML table is collected as an `import::html_table::RawTable` (each
+  cell's blocks and the `CellSpec` its element computed, the table's
+  `TableSpec` from its attributes) and laid out by `html_table::layout`
+  when the outermost table ends. A nested table waits in its cell's blocks
+  at a placeholder (`Block::Raw("")`, builder-internal, always replaced) and
+  is laid out top-down in that cell's width (less its stated left and right
+  margin), so a `width=100%` table in a column fills the column. Nesting is
+  kept to `MAX_TABLE_NESTING` (8); a deeper table's cells are its enclosing
+  cell's text. The `Builder` holds a stack of tables (`begin_table`,
+  `begin_cell`); RTF never calls them and keeps its one even 6.5" grid.
+- Cells go into a slot grid as a browser's table model places them:
+  `colspan` (1..=1000, cut at `MAX_COLUMNS`) as `gridSpan`, `rowspan` (0 to
+  the last row of its row group, clipped there: a group is a `thead`,
+  `tbody`, `tfoot`, or the rows after one closes) as a `vMerge` restart and continuations
+  (empty, the same `tcPr` but `<w:vMerge/>`), rows padded to the grid; a
+  cell with no free slot joins the row's previous cell, else the cell
+  covering the row. A begun cell is ended by its row's or table's end even
+  when empty (a spacer `<td width=20>` without `</td>`).
+- Widths (`width` attribute: digits as px, `N%`, `Npx`; CSS `width`, `auto`
+  none): a column takes its widest colspan-1 cell's (percentages of the
+  table, scaled down to 100 in all); a spanned cell's width spreads what its
+  columns lack over those without one; the rest share what is left, each at
+  least 15 twips. The table is its own width, else its columns' when all
+  are known, else the room it has (6.5" outermost). Declared columns
+  narrower than a declared table grow to it; wider ones widen the grid
+  (tblW stays as declared). `tblW` is dxa, pct (fiftieths) or auto; every
+  cell's `tcW` is its columns' sum.
+- `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `shd` (the cell's
+  own `bgcolor` / CSS background, CSS over the attribute, else its row's,
+  row group's, then table's; `background: none|transparent` on a table part
+  clears its own), `tcMar` (the cell's CSS padding, sides given only), and
+  `vAlign` always (`valign` / `vertical-align` on a cell, row or row group,
+  inherited through the row and reset at a `table`; none is `center`, a
+  browser's middle; `baseline`, `super`, `sub` on a cell are `top` and no
+  longer make the cell's runs super- or subscript). `tblPr`: `tblW`, `jc`
+  (`align=center|right`, which does not align the text inside; `align` on
+  a row aligns its cells' text), `tblCellSpacing` (half the HTML
+  `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
+  `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
+  `border` is 1; `0` or none writes none, the layout-table case),
+  `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
+  `grid_span`/`v_merge` match, so a save writes them unchanged.
+- Known limits: CSS borders, `frame`/`rules`, `border-color`, row heights,
+  `<col>` widths, `max-width`, `margin: 0 auto` and `<center>`/`align`
+  ancestors centring a table, `th` bold/centre, background images; a table
+  directly in a `tr`/`table` (no cell) joins the next cell (a browser puts
+  it before the table).
+
 ## Mail drafts keep their `local:` id (#1884, #1881)
 
 - `Store::reconcile_id` keeps a draft's `local:` id on its row as
@@ -2487,8 +2537,8 @@
   (negative clamps at 0), `text-indent`, a block's background as `w:shd`.
 - Boundaries: `html`/`body` box and background are the page's, never read; a
   `td`/`th` starts a fresh indent, right indent, first line and shading (its
-  padding is the cell's, #1878), while inherited run properties and line
-  height pass in; `ul`/`ol` and `table` boxes are not counted (the level
+  padding is the cell's `tcMar`, below), while inherited run properties and
+  line height pass in; `ul`/`ol` and `table` boxes are not counted (the level
   indent stands for the list's). An HTML `li` keeps the level's hanging
   indent: with an enclosing box it writes `720*(lvl+1) + box`, first line
   −360, else no indent. A `MsoList…` paragraph keeps its own CSS.

@@ -32,6 +32,9 @@
 //! | `Builder::end_para` / `end_cell` / `end_row` | a paragraph / cell / row | work + built (`size_of` each) |
 //! | `Builder::end_cell`, `end_table` | cells past `MAX_COLUMNS` | join the last cell (no new cell) |
 //! | `Builder::end_table` | padding a short row | ≤ 62 cells a row, each work + built |
+//! | `Builder` tables | open tables | HTML: ≤ `MAX_TABLE_NESTING` (8), deeper ones are their cell's text; RTF: one |
+//! | `html_table::layout` | the slot grid, cells emitted | rows × ≤ `MAX_COLUMNS` slots; each cell emitted (placed, continuation or pad) work + built; a cell with no free slot joins a neighbour |
+//! | `html_table::layout` | nested tables | each laid out once, inside its cell, depth ≤ `MAX_TABLE_NESTING` |
 //! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one `drain` |
 //! | `Builder::para_text` | the paragraph in progress | O(paragraph), once per paragraph end |
 //! | run props cloned per inline | `RunProps` | flags, and strings of ≤ 64 bytes (font, colour, highlight) plus ≤ 2 kept elements (HTML's shading, bold off): O(1), charged as built |
@@ -56,7 +59,7 @@
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
 //! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | one scan a tag | the seven read (`style class id align color face size`) copied, first of a name only |
+//! | html attributes | one scan a tag | the fifteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign`) copied, first of a name only |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |
 //! | `recover::document_xml` | the header scan | work (input/16), up front; forward only |
@@ -94,6 +97,7 @@
 
 pub(crate) mod css;
 pub mod html;
+pub(crate) mod html_table;
 pub mod pdf;
 pub mod recover;
 pub mod rtf;
@@ -367,7 +371,9 @@ pub(crate) struct Builder<'b> {
     budget: &'b Budget,
     body: Vec<Block>,
     para: Vec<Inline>,
-    table: Option<TableAcc>,
+    /// The open tables, innermost last: an RTF table (one, made on its
+    /// first cell paragraph) or HTML's nested ones ([`Builder::begin_table`]).
+    tables: Vec<TableAcc>,
 }
 
 #[derive(Default)]
@@ -378,6 +384,23 @@ struct TableAcc {
     /// A paragraph has been ended in the current cell since it began, so an
     /// empty cell end need not add one.
     cell_has_para: bool,
+    /// An HTML table: laid out from specs ([`html_table::layout`]) instead
+    /// of `rows` / `cells`.
+    html: Option<HtmlAcc>,
+}
+
+/// An HTML table being read: its spec, its rows of raw cells, the cell
+/// open now and the nested tables in its pending blocks.
+struct HtmlAcc {
+    spec: html_table::TableSpec,
+    rows: Vec<Vec<html_table::RawCell>>,
+    cells: Vec<html_table::RawCell>,
+    /// The open cell's spec, from [`Builder::begin_cell`] to its end.
+    cell: Option<html_table::CellSpec>,
+    /// Nested tables at placeholder indexes of `TableAcc::blocks`.
+    nested: Vec<(usize, html_table::RawTable)>,
+    /// Row indexes where a row group starts ([`html_table::RawTable::groups`]).
+    groups: Vec<usize>,
 }
 
 impl<'b> Builder<'b> {
@@ -386,7 +409,7 @@ impl<'b> Builder<'b> {
             budget,
             body: Vec::new(),
             para: Vec::new(),
-            table: None,
+            tables: Vec::new(),
         }
     }
 
@@ -492,11 +515,11 @@ impl<'b> Builder<'b> {
             content: std::mem::take(&mut self.para),
         });
         if in_table {
-            let t = self.table.get_or_insert_with(TableAcc::default);
+            let t = self.top();
             t.blocks.push(p);
             t.cell_has_para = true;
         } else {
-            self.end_table();
+            self.end_tables();
             self.body.push(p);
         }
     }
@@ -508,19 +531,87 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// The innermost open table, made when there is none (an RTF table's
+    /// first cell paragraph).
+    fn top(&mut self) -> &mut TableAcc {
+        if self.tables.is_empty() {
+            self.tables.push(TableAcc::default());
+        }
+        self.tables.last_mut().expect("just pushed")
+    }
+
+    /// Open an HTML table (#1878), inside the open one's cell when there is
+    /// one: it is laid out from `spec` and its cells' specs when the
+    /// outermost table ends.
+    pub(crate) fn begin_table(&mut self, spec: html_table::TableSpec) {
+        self.tables.push(TableAcc {
+            html: Some(HtmlAcc {
+                spec,
+                rows: Vec::new(),
+                cells: Vec::new(),
+                cell: None,
+                nested: Vec::new(),
+                groups: Vec::new(),
+            }),
+            ..TableAcc::default()
+        });
+    }
+
+    /// Open a cell of the innermost HTML table with `spec`: its end, or the
+    /// end of its row or table, makes it even when it holds nothing.
+    pub(crate) fn begin_cell(&mut self, spec: html_table::CellSpec) {
+        if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
+            h.cell = Some(spec);
+        }
+    }
+
+    /// A row group of the innermost HTML table starts or ends here: the
+    /// rows after it are another group, which no `rowspan` reaches into.
+    pub(crate) fn row_group_boundary(&mut self) {
+        if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
+            let at = h.rows.len();
+            if at > 0 && h.groups.last() != Some(&at) {
+                h.groups.push(at);
+            }
+        }
+    }
+
+    /// Whether the innermost table has a begun cell open.
+    fn cell_open(&self) -> bool {
+        self.tables
+            .last()
+            .and_then(|t| t.html.as_ref())
+            .is_some_and(|h| h.cell.is_some())
+    }
+
     /// End a table cell: text since the last paragraph end is its last
     /// paragraph, and a cell always has at least one. A row keeps at most
     /// [`MAX_COLUMNS`] cells: past that, a cell's paragraphs join the last.
     pub(crate) fn end_cell(&mut self, props: ParProps) {
-        let has_para = self.table.as_ref().is_some_and(|t| t.cell_has_para);
+        let has_para = self.tables.last().is_some_and(|t| t.cell_has_para);
         if !self.para.is_empty() || !has_para {
             self.end_para(props, true);
         }
         if !self.budget.keep::<Cell>(0) {
             return;
         }
-        let t = self.table.get_or_insert_with(TableAcc::default);
+        let t = self.top();
         let blocks = std::mem::take(&mut t.blocks);
+        t.cell_has_para = false;
+        if let Some(h) = t.html.as_mut() {
+            let cell = html_table::RawCell {
+                spec: h.cell.take().unwrap_or_default(),
+                blocks,
+                nested: std::mem::take(&mut h.nested),
+            };
+            // Past MAX_COLUMNS the cell (and its spec) joins the last.
+            let full = h.cells.len() >= MAX_COLUMNS;
+            match h.cells.last_mut() {
+                Some(last) if full => last.absorb(cell),
+                _ => h.cells.push(cell),
+            }
+            return;
+        }
         let full = t.cells.len() >= MAX_COLUMNS;
         match t.cells.last_mut() {
             Some(last) if full => last.blocks.extend(blocks),
@@ -529,21 +620,26 @@ impl<'b> Builder<'b> {
                 ..Cell::default()
             }),
         }
-        t.cell_has_para = false;
     }
 
-    /// End a table row. A row with text but no cell end closes that cell.
+    /// End a table row. A row with text but no cell end closes that cell,
+    /// as does one with a begun cell open.
     pub(crate) fn end_row(&mut self, props: ParProps) {
-        let open_text =
-            !self.para.is_empty() || self.table.as_ref().is_some_and(|t| !t.blocks.is_empty());
+        let open_text = !self.para.is_empty()
+            || self.tables.last().is_some_and(|t| !t.blocks.is_empty())
+            || self.cell_open();
         if open_text {
             self.end_cell(props);
         }
         if !self.budget.keep::<Row>(0) {
             return;
         }
-        if let Some(t) = self.table.as_mut() {
-            if !t.cells.is_empty() {
+        if let Some(t) = self.tables.last_mut() {
+            if let Some(h) = t.html.as_mut() {
+                if !h.cells.is_empty() {
+                    h.rows.push(std::mem::take(&mut h.cells));
+                }
+            } else if !t.cells.is_empty() {
                 t.rows.push(Row {
                     cells: std::mem::take(&mut t.cells),
                     ..Row::default()
@@ -552,11 +648,22 @@ impl<'b> Builder<'b> {
         }
     }
 
-    /// Close the table in progress, if any, into the body.
+    /// Close every open table, innermost first.
+    fn end_tables(&mut self) {
+        while !self.tables.is_empty() {
+            self.end_table();
+        }
+    }
+
+    /// Close the innermost table in progress, if any: into the open cell of
+    /// the table around it (an HTML table), else into the body.
     pub(crate) fn end_table(&mut self) {
-        let Some(mut t) = self.table.take() else {
+        let Some(mut t) = self.tables.pop() else {
             return;
         };
+        if let Some(h) = t.html.take() {
+            return self.end_html_table(t, h);
+        }
         if !t.cells.is_empty() || !t.blocks.is_empty() {
             // Cells with no row end: keep them as a last row (a full row's
             // pending paragraphs join its last cell, as in end_cell).
@@ -606,20 +713,65 @@ impl<'b> Builder<'b> {
         }));
     }
 
+    /// The end of HTML table `t`: what is pending is its last cell and row;
+    /// nested, it waits in its enclosing cell as a [`html_table::RawTable`]
+    /// at a placeholder; outermost, it is laid out in the body's width.
+    fn end_html_table(&mut self, mut t: TableAcc, mut h: HtmlAcc) {
+        if !t.blocks.is_empty() || h.cell.is_some() {
+            let cell = html_table::RawCell {
+                spec: h.cell.take().unwrap_or_default(),
+                blocks: std::mem::take(&mut t.blocks),
+                nested: std::mem::take(&mut h.nested),
+            };
+            if self.budget.keep::<Cell>(0) {
+                let full = h.cells.len() >= MAX_COLUMNS;
+                match h.cells.last_mut() {
+                    Some(last) if full => last.absorb(cell),
+                    _ => h.cells.push(cell),
+                }
+            }
+        }
+        if !h.cells.is_empty() && self.budget.keep::<Row>(0) {
+            h.rows.push(std::mem::take(&mut h.cells));
+        }
+        if h.rows.is_empty() {
+            return;
+        }
+        let raw = html_table::RawTable {
+            spec: h.spec,
+            rows: h.rows,
+            groups: h.groups,
+        };
+        match self.tables.last_mut() {
+            Some(outer) if outer.html.is_some() => {
+                let at = outer.blocks.len();
+                outer.blocks.push(html_table::placeholder());
+                outer.cell_has_para = true;
+                if let Some(oh) = outer.html.as_mut() {
+                    oh.nested.push((at, raw));
+                }
+            }
+            _ => {
+                let table = html_table::layout(raw, html_table::BODY_TWIPS, self.budget);
+                self.body.push(Block::Table(table));
+            }
+        }
+    }
+
     pub(crate) fn finish(mut self, props: ParProps) -> Document {
-        let in_table = self.table.is_some() && !self.para.is_empty();
+        let in_table = !self.tables.is_empty() && !self.para.is_empty();
         if in_table {
             self.end_cell(props.clone());
         } else {
             self.end_para_if_any(props, false);
         }
-        self.end_table();
+        self.end_tables();
         Document { body: self.body }
     }
 
     /// Whether nothing at all has been produced.
     pub(crate) fn is_empty(&self) -> bool {
-        self.body.is_empty() && self.para.is_empty() && self.table.is_none()
+        self.body.is_empty() && self.para.is_empty() && self.tables.is_empty()
     }
 }
 

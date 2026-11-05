@@ -1,9 +1,10 @@
 //! HTML import with CSS (#1872): hand-written pages in the shapes real HTML
 //! comes in (a newsletter, an Outlook reply, a Gmail message), checked for
-//! the colours, fonts, sizes, spacing, indents and shading their CSS gives.
+//! the colours, fonts, sizes, spacing, indents and shading their CSS gives,
+//! and (#1878) an HTML-email table layout's widths, spans and shading.
 
 use docxcore::import::{import_html, paragraph_texts};
-use docxcore::model::{Block, Document, Inline, Paragraph, Run};
+use docxcore::model::{Block, Document, Inline, Paragraph, Run, Table, VMerge};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -200,6 +201,7 @@ fn a_plain_message_and_its_gmail_quote() {
 fn every_prefix_of_every_fixture_imports_without_panicking() {
     for name in [
         "newsletter.html",
+        "newsletter-tables.html",
         "outlook-reply.html",
         "plain-message.html",
     ] {
@@ -208,4 +210,183 @@ fn every_prefix_of_every_fixture_imports_without_panicking() {
             let _ = import_html(&bytes[..i]);
         }
     }
+}
+
+/// The tables in a cell's blocks.
+fn nested(t: &Table, row: usize, cell: usize) -> Vec<&Table> {
+    t.rows[row].cells[cell]
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The value of `attr` on the first `el` element of `xml`.
+fn attr_of(xml: &str, el: &str, attr: &str) -> Option<String> {
+    let at = xml.find(&format!("<{el} "))?;
+    let rest = &xml[at..];
+    let rest = &rest[..rest.find('>')?];
+    let v = rest.split(&format!("{attr}=\"")).nth(1)?;
+    Some(v[..v.find('"')?].to_string())
+}
+
+fn tcpr(t: &Table, row: usize, cell: usize) -> &str {
+    t.rows[row].cells[cell].raw_tcpr.as_deref().unwrap_or("")
+}
+
+fn tblpr(t: &Table) -> &str {
+    t.raw_tblpr.as_deref().unwrap_or("")
+}
+
+fn cell_text(t: &Table, row: usize, cell: usize) -> String {
+    t.rows[row].cells[cell]
+        .blocks
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_)))
+        .map(|b| b.plain_text())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+#[test]
+fn a_newsletter_table_layout_keeps_widths_spans_and_shading() {
+    let d = import("newsletter-tables.html");
+    let tables: Vec<&Table> = d
+        .body
+        .iter()
+        .filter_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tables.len(), 1, "only the wrapper is in the body");
+
+    // The 100% wrapper: the whole text column, its grey on its cell, no
+    // borders, zero cell margins.
+    let wrapper = tables[0];
+    assert_eq!(wrapper.grid, [9360]);
+    assert_eq!(
+        attr_of(tblpr(wrapper), "w:tblW", "w:type").as_deref(),
+        Some("pct")
+    );
+    assert_eq!(
+        attr_of(tblpr(wrapper), "w:tblW", "w:w").as_deref(),
+        Some("5000")
+    );
+    assert!(!tblpr(wrapper).contains("tblBorders"), "{}", tblpr(wrapper));
+    assert!(tblpr(wrapper).contains("<w:tblCellMar><w:top w:w=\"0\""));
+    assert_eq!(
+        attr_of(tcpr(wrapper, 0, 0), "w:shd", "w:fill").as_deref(),
+        Some("DDDDDD")
+    );
+    assert_eq!(
+        attr_of(tcpr(wrapper, 0, 0), "w:vAlign", "w:val").as_deref(),
+        Some("top")
+    );
+
+    // The centred 600px container inside it.
+    let c = nested(wrapper, 0, 0);
+    assert_eq!(c.len(), 1, "the container is nested, not flattened");
+    let c = c[0];
+    assert_eq!(c.grid, [3000, 6000], "200px and 400px");
+    assert_eq!(attr_of(tblpr(c), "w:tblW", "w:w").as_deref(), Some("9000"));
+    assert_eq!(
+        attr_of(tblpr(c), "w:jc", "w:val").as_deref(),
+        Some("center")
+    );
+    assert!(
+        !tblpr(c).contains("tblBorders"),
+        "a layout table: {}",
+        tblpr(c)
+    );
+    for (r, row) in c.rows.iter().enumerate() {
+        for k in 0..row.cells.len() {
+            assert!(!tcpr(c, r, k).contains("tcBorders"));
+        }
+    }
+    // Header: colspan 2, its own blue, its padding as margins.
+    assert_eq!(c.rows[0].cells.len(), 1);
+    assert_eq!(c.rows[0].cells[0].grid_span, 2);
+    let head = tcpr(c, 0, 0);
+    assert_eq!(attr_of(head, "w:tcW", "w:w").as_deref(), Some("9000"));
+    assert_eq!(attr_of(head, "w:shd", "w:fill").as_deref(), Some("0B5394"));
+    assert_eq!(attr_of(head, "w:top", "w:w").as_deref(), Some("300"));
+    assert_eq!(attr_of(head, "w:left", "w:w").as_deref(), Some("450"));
+    // The two columns, top-aligned, on the container's white.
+    for (k, w) in [(0, "3000"), (1, "6000")] {
+        let pr = tcpr(c, 1, k);
+        assert_eq!(attr_of(pr, "w:tcW", "w:w").as_deref(), Some(w));
+        assert_eq!(attr_of(pr, "w:vAlign", "w:val").as_deref(), Some("top"));
+        assert_eq!(attr_of(pr, "w:shd", "w:fill").as_deref(), Some("FFFFFF"));
+    }
+    assert_eq!(cell_text(c, 1, 0), "Sidebar: this week's picks.");
+
+    // The card: nested in the main column, its width that column's less
+    // its 20px right padding, its class background on its cells, the
+    // badge's own.
+    let card = nested(c, 1, 1);
+    assert_eq!(card.len(), 1);
+    let card = card[0];
+    assert_eq!(card.grid, [1200, 4500]);
+    assert!(!tblpr(card).contains("tblBorders"));
+    assert_eq!(
+        attr_of(tcpr(card, 0, 0), "w:shd", "w:fill").as_deref(),
+        Some("1F6FB2")
+    );
+    assert_eq!(
+        attr_of(tcpr(card, 0, 1), "w:shd", "w:fill").as_deref(),
+        Some("EAF2FB")
+    );
+    assert_eq!(
+        attr_of(tblpr(card), "w:left", "w:w").as_deref(),
+        Some("120"),
+        "cellpadding=8"
+    );
+    assert_eq!(cell_text(card, 0, 1), "Gift cards now come in any amount.");
+
+    // Offers spans two rows, centred, on its own peach.
+    assert_eq!(c.rows[2].cells[0].v_merge, VMerge::Restart);
+    assert_eq!(c.rows[3].cells[0].v_merge, VMerge::Continue);
+    assert_eq!(
+        attr_of(tcpr(c, 2, 0), "w:shd", "w:fill").as_deref(),
+        Some("FCE5CD")
+    );
+    assert_eq!(
+        attr_of(tcpr(c, 2, 0), "w:vAlign", "w:val").as_deref(),
+        Some("center")
+    );
+    assert_eq!(cell_text(c, 3, 1), "Free delivery over fifty pounds.");
+
+    // The data table keeps its border, within the cell's padding.
+    let data = nested(c, 4, 0);
+    assert_eq!(data.len(), 1);
+    let data = data[0];
+    assert_eq!(data.grid, [4200, 4200]);
+    assert_eq!(
+        attr_of(tblpr(data), "w:top", "w:val").as_deref(),
+        Some("single")
+    );
+    assert_eq!(attr_of(tblpr(data), "w:top", "w:sz").as_deref(), Some("6"));
+    assert_eq!(
+        attr_of(tblpr(data), "w:insideH", "w:val").as_deref(),
+        Some("single")
+    );
+    assert_eq!(data.rows.len(), 3);
+    assert_eq!(cell_text(data, 2, 0), "Market Square");
+
+    // Every cell of every table ends in a paragraph (Word's rule).
+    fn ends_in_paragraphs(t: &Table) {
+        for cell in t.rows.iter().flat_map(|r| &r.cells) {
+            assert!(matches!(cell.blocks.last(), Some(Block::Paragraph(_))));
+            for b in &cell.blocks {
+                if let Block::Table(n) = b {
+                    ends_in_paragraphs(n);
+                }
+            }
+        }
+    }
+    ends_in_paragraphs(wrapper);
 }
