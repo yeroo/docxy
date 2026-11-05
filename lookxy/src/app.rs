@@ -792,8 +792,7 @@ impl App {
                     ConfirmAction::Exit => self.quit = true,
                     ConfirmAction::DeleteThread(ids) => {
                         for id in ids {
-                            let _ = self.store.delete_message(&id);
-                            let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+                            self.delete_and_send(id);
                         }
                         self.reload_messages();
                     }
@@ -2761,18 +2760,32 @@ impl App {
             }
             // A singleton / single message row: delete directly.
             if let Some(id) = ids.into_iter().next() {
-                let _ = self.store.delete_message(&id);
+                self.delete_and_send(id);
                 self.reload_messages();
-                let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
             }
             return;
         }
         let Some(id) = self.highlighted_message_id() else {
             return;
         };
-        let _ = self.store.delete_message(&id);
+        self.delete_and_send(id);
         self.reload_messages();
-        let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id });
+    }
+
+    /// Deletes message `id` locally and sends `SyncCommand::Delete` for it.
+    /// The list can still hold a draft's `local:` id after the sync thread
+    /// reconciled it to its Graph id (a `SaveDraft` drain reloads nothing),
+    /// so the command names the id of the row actually deleted
+    /// (`Store::delete_message_resolved`, #1884); with nothing deleted, the
+    /// id as it was.
+    fn delete_and_send(&mut self, id: String) {
+        let target = self
+            .store
+            .delete_message_resolved(&id)
+            .ok()
+            .flatten()
+            .unwrap_or(id);
+        let _ = self.sync.cmd_tx.send(SyncCommand::Delete { id: target });
     }
 
     /// Opens the move-folder popup over the highlighted message. A no-op if

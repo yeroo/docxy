@@ -360,9 +360,16 @@ fn delete(app: &mut App, args: &Json) -> Result<Json, String> {
         .get_str("id")
         .ok_or("mail.delete needs an 'id'")?
         .to_string();
-    app.store.delete_message(&id).map_err(|e| e.to_string())?;
+    // A script may hold a draft's `local:` id after the draft was reconciled
+    // to its Graph id: the command names the id of the row deleted, as the
+    // local delete takes the alias with the row (#1884).
+    let target = app
+        .store
+        .delete_message_resolved(&id)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| id.clone());
     app.reload_messages();
-    let _ = app.sync.cmd_tx.send(SyncCommand::Delete { id: id.clone() });
+    let _ = app.sync.cmd_tx.send(SyncCommand::Delete { id: target });
     Ok(Json::obj(vec![
         ("id", Json::Str(id)),
         ("deleted", Json::Bool(true)),
@@ -728,6 +735,20 @@ mod tests {
         assert!(matches!(
             drain_last_command(&app),
             Some(SyncCommand::Delete { id }) if id == "m1"
+        ));
+    }
+
+    #[test]
+    fn delete_by_a_reconciled_local_id_sends_the_graph_id() {
+        let mut app = App::for_test_with_seeded_store();
+        let local = app.store.create_local_draft("Hi", "", "", "body").unwrap();
+        app.store.reconcile_id(&local, "G").unwrap();
+        let r = delete(&mut app, &args(vec![("id", Json::Str(local.clone()))])).unwrap();
+        assert_eq!(r.get("id").and_then(Json::as_str), Some(local.as_str()));
+        assert!(app.store.draft("G").unwrap().is_none());
+        assert!(matches!(
+            drain_last_command(&app),
+            Some(SyncCommand::Delete { id }) if id == "G"
         ));
     }
 

@@ -579,6 +579,37 @@
   inside the view (they reach the callback as `#name`), macOS ⌘-key
   routing for the view (untested).
 
+## Mail drafts keep their `local:` id (#1884, #1881)
+
+- `Store::reconcile_id` keeps a draft's `local:` id on its row as
+  `messages.local_id` (migrated in `Store::init` like the other columns, its
+  unique index created after the ALTER), so a caller still holding it (a
+  compose window left open across `SaveDraft`, a queued `SendDraft` retried
+  after a 503) keeps reaching the draft now stored under its Graph id. The
+  alias is on the row, so it goes with the message on every delete path
+  (`delete_message`, a delta `@removed`, a folder cascade); a delta upsert
+  keeps it.
+- Every draft call resolves inside its one statement (atomic against the
+  sync thread's `reconcile_id` on its own connection): `draft` (the row's
+  `id` is the current id), `update_draft_fields`, `mark_sent`,
+  `move_message`, `delete_message` (`draft_row_sql!`), and the
+  `outbound_attachments` calls (`current_id_sql!`). Only a `local:` id is
+  looked up; `Store::current_id` is the same rule on its own.
+- `ensure_draft_on_graph` decides create vs update by the row's current id,
+  so a second `SaveDraft`/`SendDraft` with a reconciled `local:` id is a
+  `PATCH`, never a second create. Their payloads and `Sent { id }` keep the id
+  the caller used. A local delete that also sends `SyncCommand::Delete` goes
+  through `Store::delete_message_resolved` (one `DELETE … RETURNING id`) and
+  sends the id it returns, else the id it had: the engine's `Delete` arm, and
+  lookxy's list deletes (`delete_and_send`) and `mail.delete`, as the list can
+  still hold a `local:` id the sync thread reconciled. `OutboxOp::Delete` of
+  an id that still resolves to `local:` is treated as never having reached
+  Graph and calls nothing; a delete that races the engine's create leaves the
+  Graph draft for a later sync. `Move`, `MarkRead`, `SetFlag` and
+  `SetCategories` with a `local:` id still reach Graph with it.
+- `FakeServer::start_limited` gives a route a use limit; a used-up route is
+  skipped for the next match (a send that fails once, then succeeds).
+
 ## Format plugins
 
 - A format plugin is a `yppx_*` shared library (`.dll`/`.so`/`.dylib`)

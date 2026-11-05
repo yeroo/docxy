@@ -35,7 +35,23 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
         OutboxOp::SetFlag { id, flagged } => client.set_flag(id, *flagged),
         OutboxOp::SetCategories { id, categories } => client.set_message_categories(id, categories),
         OutboxOp::Move { id, dest } => client.move_message(id, dest).map(|_new_id| ()),
-        OutboxOp::Delete { id } => client.delete_message(id),
+        OutboxOp::Delete { id } => {
+            // A reconciled draft's `local:` id is deleted under its Graph id
+            // (#1884). An id that still resolves to `local:` is treated as
+            // never having reached Graph, so nothing is deleted there (as
+            // `DeleteEvent`). That is not an invariant: a delete on another
+            // connection that lands while this engine's `create_draft` is in
+            // flight leaves `reconcile_id` no row to rename, and the Graph
+            // draft stays for a later sync to bring back.
+            let target = store
+                .current_id(id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            if target.starts_with("local:") {
+                Ok(())
+            } else {
+                client.delete_message(&target)
+            }
+        }
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
         OutboxOp::SendDraft { id } => {
             let graph_id = ensure_draft_on_graph(client, store, id)?;
@@ -172,13 +188,16 @@ fn rsvp_kind(kind: &str) -> Option<RsvpKind> {
 /// Ensures the draft addressed by `id` exists on Graph with its
 /// currently-stored fields, returning the id it now lives under on Graph.
 ///
-/// If `id` is a `local:` id (never yet pushed), loads the draft's stored
-/// subject/recipients/body, `create_draft`s it, and reconciles the store
-/// (`Store::reconcile_id`) from `id` to the Graph-minted id — so the local
-/// row and body are addressable by the id the rest of Graph (and the next
-/// `SendDraft`, if this was a `SaveDraft`) now knows it by. Otherwise (`id`
-/// already is a Graph id) `update_draft`s it in place with whatever is
-/// currently stored, and returns `id` unchanged.
+/// The draft is loaded with `Store::draft`, which also follows a `local:` id
+/// already reconciled to its Graph id (#1884, #1881), and create vs update is
+/// decided by the id it is stored under now (`row.id`), not by `id`. Still
+/// `local:` (never yet pushed): `create_draft`s it with its stored
+/// subject/recipients/body and reconciles the store (`Store::reconcile_id`)
+/// to the Graph-minted id, which the rest of Graph (and the next `SendDraft`,
+/// if this was a `SaveDraft`) now knows it by. Otherwise `update_draft`s the
+/// Graph id in place with whatever is currently stored and returns it, so a
+/// second `SaveDraft`/`SendDraft` with the same `local:` id patches the draft
+/// rather than creating it twice.
 ///
 /// Shared by `SaveDraft` (which only needs this) and `SendDraft` (which
 /// needs it done first, then sends the result).
@@ -195,15 +214,15 @@ fn ensure_draft_on_graph(
     let cc = parse_recipients(&row.cc_recipients);
     let bcc = parse_recipients(&row.bcc_recipients);
 
-    if let Some(local_id) = id.strip_prefix("local:") {
+    if row.id.starts_with("local:") {
         let created = client.create_draft(&body.content, &row.subject, &to, &cc, &bcc)?;
         store
-            .reconcile_id(&format!("local:{local_id}"), &created.id)
+            .reconcile_id(&row.id, &created.id)
             .map_err(|e| GraphError::Parse(e.to_string()))?;
         Ok(created.id)
     } else {
-        client.update_draft(id, &body.content, &row.subject, &to, &cc, &bcc)?;
-        Ok(id.to_string())
+        client.update_draft(&row.id, &body.content, &row.subject, &to, &cc, &bcc)?;
+        Ok(row.id)
     }
 }
 
@@ -564,8 +583,10 @@ mod tests {
             Some("carol@x")
         );
 
-        // Reconciled: the old local id is gone, the Graph id has the draft.
-        assert!(store.draft(&local_id).unwrap().is_none());
+        // Reconciled: the draft is stored under the Graph id, and the local
+        // id still reaches it (#1884).
+        let (row, _) = store.draft(&local_id).unwrap().unwrap();
+        assert_eq!(row.id, "GRAPH-1");
         let (row, body) = store.draft("GRAPH-1").unwrap().unwrap();
         assert_eq!(row.subject, "Hi");
         assert_eq!(body.content, "<p>hello</p>");
@@ -646,7 +667,8 @@ mod tests {
         assert_eq!(reqs[0].path, "/me/messages");
         assert!(reqs[1].path.starts_with("/me/messages/GRAPH-9/send"));
 
-        assert!(store.draft(&local_id).unwrap().is_none());
+        let (row, _) = store.draft(&local_id).unwrap().unwrap();
+        assert_eq!(row.id, "GRAPH-9");
         assert!(store.draft("GRAPH-9").unwrap().is_some());
     }
 
@@ -1140,5 +1162,118 @@ mod tests {
             Some("Doe, John")
         );
         assert!(reqs[1].path.starts_with("/me/messages/DRAFT1/send"));
+    }
+
+    fn route(method: &str, path_prefix: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: method.into(),
+            path_prefix: path_prefix.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn apply_op_save_draft_by_a_reconciled_local_id_patches_and_never_creates() {
+        // #1884: a compose window left open across a SaveDraft still holds
+        // the local id; its next SaveDraft must patch the Graph draft.
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/GRAPH-5", 200, "{}"),
+            route("POST", "/me/messages", 201, r#"{"id":"SECOND"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Old", "b@x", "", "old").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-5").unwrap();
+        store
+            .update_draft_fields(&local_id, "Edited", "b@x", "", "", "<p>new</p>")
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SaveDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/GRAPH-5");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Edited"));
+        assert_eq!(store.current_id(&local_id).unwrap(), "GRAPH-5");
+    }
+
+    #[test]
+    fn apply_op_send_draft_by_a_reconciled_local_id_patches_then_sends() {
+        // #1881: the retry of a SendDraft whose create already happened.
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/GRAPH-7/send", 202, ""),
+            route("PATCH", "/me/messages/GRAPH-7", 200, "{}"),
+            route("POST", "/me/messages", 201, r#"{"id":"SECOND"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-7").unwrap();
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local_id }).unwrap();
+
+        let reqs = srv.requests();
+        let seen: Vec<(&str, &str)> = reqs
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("PATCH", "/me/messages/GRAPH-7"),
+                ("POST", "/me/messages/GRAPH-7/send")
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_op_delete_by_a_reconciled_local_id_deletes_the_graph_id() {
+        let srv = FakeServer::start(vec![route("DELETE", "/me/messages/", 204, "")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "", "", "body").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-8").unwrap();
+
+        apply_op(&c, &store, &OutboxOp::Delete { id: local_id }).unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/me/messages/GRAPH-8");
+    }
+
+    #[test]
+    fn apply_op_delete_of_a_never_synced_local_id_makes_no_graph_call() {
+        // A local: draft that never reached Graph has nothing to delete there
+        // (before #1884 this sent DELETE /me/messages/local:… and was
+        // quarantined).
+        let srv = FakeServer::start(vec![route("DELETE", "/me/messages/", 204, "")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "", "", "body").unwrap();
+        store.delete_message(&local_id).unwrap();
+
+        apply_op(&c, &store, &OutboxOp::Delete { id: local_id }).unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::Delete {
+                id: "local:never".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(srv.requests().is_empty());
     }
 }

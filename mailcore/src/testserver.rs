@@ -47,6 +47,15 @@ pub struct FakeServer {
 
 impl FakeServer {
     pub fn start(routes: Vec<Route>) -> FakeServer {
+        FakeServer::start_limited(routes.into_iter().map(|r| (r, None)).collect())
+    }
+
+    /// Like [`FakeServer::start`], but each route may answer at most a given
+    /// number of requests (`None`: any number). A route that has used up its
+    /// limit is skipped, so the next matching route answers: a request can
+    /// fail once and then succeed (#1881's retried send).
+    pub fn start_limited(routes: Vec<(Route, Option<usize>)>) -> FakeServer {
+        let mut routes = routes;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
         let port = listener.local_addr().expect("local_addr").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -60,7 +69,7 @@ impl FakeServer {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                handle_connection(stream, &routes, &thread_requests);
+                handle_connection(stream, &mut routes, &thread_requests);
             }
         });
 
@@ -91,11 +100,12 @@ impl Drop for FakeServer {
 }
 
 /// Read one HTTP/1.1 request (request line, headers, optional
-/// Content-Length body), match it against `routes`, write the response, and
-/// record the request.
+/// Content-Length body), match it against `routes` (the first matching one
+/// with uses left, whose count it then takes one from), write the response,
+/// and record the request.
 fn handle_connection(
     stream: TcpStream,
-    routes: &[Route],
+    routes: &mut [(Route, Option<usize>)],
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -148,8 +158,16 @@ fn handle_connection(
         });
 
     let route = routes
-        .iter()
-        .find(|r| r.method == method && path.starts_with(r.path_prefix.as_str()));
+        .iter_mut()
+        .find(|(r, left)| {
+            *left != Some(0) && r.method == method && path.starts_with(r.path_prefix.as_str())
+        })
+        .map(|(r, left)| {
+            if let Some(n) = left {
+                *n -= 1;
+            }
+            &*r
+        });
 
     let mut stream = stream;
     match route {
@@ -184,12 +202,14 @@ fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Unknown",
     }
 }
@@ -213,5 +233,41 @@ mod tests {
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].path, "/ping");
+    }
+
+    fn route(status: u16, body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/send".into(),
+            status,
+            body: body.into(),
+            headers: vec![],
+        }
+    }
+
+    #[test]
+    fn a_used_up_route_is_skipped_for_the_next_match() {
+        let srv = FakeServer::start_limited(vec![
+            (route(503, "busy"), Some(1)),
+            (route(202, "ok"), None),
+        ]);
+        let url = format!("{}/send", srv.base_url);
+        let first = ureq::post(&url).call();
+        assert!(matches!(first, Err(ureq::Error::Status(503, _))));
+        for _ in 0..2 {
+            let resp = ureq::post(&url).call().unwrap();
+            assert_eq!(resp.status(), 202);
+            assert_eq!(resp.into_string().unwrap(), "ok");
+        }
+        assert_eq!(srv.requests().len(), 3);
+    }
+
+    #[test]
+    fn start_never_uses_up_a_route() {
+        let srv = FakeServer::start(vec![route(202, "ok"), route(503, "never")]);
+        let url = format!("{}/send", srv.base_url);
+        for _ in 0..3 {
+            assert_eq!(ureq::post(&url).call().unwrap().status(), 202);
+        }
     }
 }

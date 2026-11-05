@@ -19,6 +19,32 @@ use crate::json::{self, Value};
 
 mod schema;
 
+/// SQL matching the `messages` row a draft id `?1` addresses now (#1884):
+/// the row whose `id` is `?1`, or, for a `local:` id only, the row
+/// `reconcile_id` renamed from it (`local_id`). A Graph id is never looked up
+/// in `local_id`. Used inside the one statement that acts on the row, so the
+/// lookup is atomic against a `reconcile_id` the sync thread's own
+/// connection commits. Unqualified, so a `JOIN bodies` (which has no `id` or
+/// `local_id` column) can use it as is.
+macro_rules! draft_row_sql {
+    () => {
+        "(id = ?1 OR (substr(?1, 1, 6) = 'local:' AND local_id = ?1))"
+    };
+}
+
+/// SQL for the id a draft addressed by `?1` is stored under now: the Graph
+/// id a `local:` id was reconciled to, else `?1` itself (a Graph id, or a
+/// `local:` id never reconciled or whose message is gone). For tables keyed
+/// by the message id without being `messages` (`bodies`,
+/// `outbound_attachments`); see `draft_row_sql!` for why it is inline SQL.
+macro_rules! current_id_sql {
+    () => {
+        "(CASE WHEN substr(?1, 1, 6) = 'local:'
+              THEN COALESCE((SELECT id FROM messages WHERE local_id = ?1), ?1)
+              ELSE ?1 END)"
+    };
+}
+
 /// A local SQLite store error. Wraps `rusqlite::Error` behind a small,
 /// crate-local type so callers don't need to depend on `rusqlite` directly.
 #[derive(Debug)]
@@ -598,6 +624,15 @@ impl Store {
             "ALTER TABLE folders ADD COLUMN is_expanded INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Same idempotent-migration pattern, for `messages.local_id` (#1884:
+        // the `local:` id a reconciled draft had). Its unique index has to
+        // come after the ALTER, not in `SCHEMA_SQL`: on an old database
+        // `SCHEMA_SQL` runs before the column exists. NULLs never collide.
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN local_id TEXT", []);
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(local_id)",
+            [],
+        )?;
         Ok(Store { conn })
     }
 
@@ -722,10 +757,44 @@ impl Store {
     /// Deletes a message by id. Affects zero rows (not an error) if the id
     /// doesn't match anything — including an empty id, which a delta
     /// `@removed` entry lacking `id` can produce (see `graph::model`).
+    ///
+    /// A draft's `local:` id still reaches it after `reconcile_id` (#1884),
+    /// and the deleted row takes that alias with it. So a caller that will
+    /// also send `SyncCommand::Delete` uses `delete_message_resolved`
+    /// instead, and sends the command with the id it returns: once the row
+    /// is gone, a `local:` id no longer leads to the Graph id.
     pub fn delete_message(&self, id: &str) -> Result<(), StoreError> {
-        self.conn
-            .execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+        self.delete_message_resolved(id)?;
         Ok(())
+    }
+
+    /// `delete_message`, returning the id the deleted row was stored under
+    /// (the Graph id for a reconciled draft's `local:` id, #1884), or `None`
+    /// when nothing matched. The match and the delete are one statement, so
+    /// a `reconcile_id` the sync thread commits on its own connection cannot
+    /// land between them. A caller that also sends `SyncCommand::Delete`
+    /// sends it with the returned id, else with the id it had.
+    pub fn delete_message_resolved(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let deleted = self
+            .conn
+            .query_row(
+                concat!(
+                    "DELETE FROM messages WHERE ",
+                    draft_row_sql!(),
+                    " RETURNING id"
+                ),
+                params![id],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(deleted)
     }
 
     /// Messages in `folder_id`, newest received first.
@@ -863,10 +932,11 @@ impl Store {
     /// of `SyncCommand::SendDraft` (the sync engine's outbox, via
     /// `OutboxOp::SendDraft`, is what actually hands the draft to Graph for
     /// delivery). See `set_read` for why this doesn't return a `Result`: a
-    /// mismatched/already-gone `id` just changes zero rows.
+    /// mismatched/already-gone `id` just changes zero rows. A reconciled
+    /// draft's `local:` id still reaches it (#1884).
     pub fn mark_sent(&self, id: &str) {
         let _ = self.conn.execute(
-            "UPDATE messages SET is_draft = 0 WHERE id = ?1",
+            concat!("UPDATE messages SET is_draft = 0 WHERE ", draft_row_sql!()),
             params![id],
         );
     }
@@ -878,10 +948,14 @@ impl Store {
     /// failure is worth surfacing. A mismatched/already-gone `id` just changes
     /// zero rows (not an error). Graph mints a *new* id on move, but that's
     /// reconciled by the next delta (old id `@removed`, new id added), so the
-    /// local id is left as-is here.
+    /// local id is left as-is here. A reconciled draft's `local:` id still
+    /// reaches it (#1884; `SendDraft`'s optimistic re-file into Sent Items).
     pub fn move_message(&self, id: &str, dest_folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE messages SET folder_id = ?2 WHERE id = ?1",
+            concat!(
+                "UPDATE messages SET folder_id = ?2 WHERE ",
+                draft_row_sql!()
+            ),
             params![id, dest_folder_id],
         )?;
         Ok(())
@@ -974,8 +1048,9 @@ impl Store {
     /// `drafts_folder_id` for what happens if that folder hasn't synced
     /// yet), marks it `is_draft = 1`, and stores `body_html` as its body.
     /// Returns the minted id so the caller (compose) can address this draft
-    /// with `update_draft_fields`/`draft` until `reconcile_id` swaps it for
-    /// the real Graph id.
+    /// with `update_draft_fields`/`draft`, and the `SaveDraft`/`SendDraft`
+    /// commands; it keeps working after `reconcile_id` stores the draft under
+    /// its Graph id (#1884).
     pub fn create_local_draft(
         &self,
         subject: &str,
@@ -1011,6 +1086,11 @@ impl Store {
     /// might have raced with something else — except here the body write
     /// is real work worth reporting failure on, so this does return a
     /// `Result`.
+    ///
+    /// A reconciled draft's `local:` id still reaches it (#1884): the row is
+    /// matched by `draft_row_sql!` and the body keyed by `current_id_sql!`,
+    /// in one transaction whose first statement is the write, so both see
+    /// the same state.
     pub fn update_draft_fields(
         &self,
         id: &str,
@@ -1022,13 +1102,20 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5
-             WHERE id = ?1",
+            concat!(
+                "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5
+                 WHERE ",
+                draft_row_sql!()
+            ),
             params![id, subject, to, cc, bcc],
         )?;
         tx.execute(
-            "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, 'html', ?2)
-             ON CONFLICT(message_id) DO UPDATE SET content = excluded.content",
+            concat!(
+                "INSERT INTO bodies (message_id, content_type, content) VALUES (",
+                current_id_sql!(),
+                ", 'html', ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET content = excluded.content"
+            ),
             params![id, body_html],
         )?;
         tx.commit()?;
@@ -1036,6 +1123,8 @@ impl Store {
     }
 
     /// Records a file attached to draft `draft_id`. Idempotent per (draft, path).
+    /// A reconciled draft's `local:` id still reaches it (#1884), as in every
+    /// `outbound_attachments` call: the row is keyed by `current_id_sql!`.
     pub fn add_outbound_attachment(
         &self,
         draft_id: &str,
@@ -1044,7 +1133,11 @@ impl Store {
         size: i64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO outbound_attachments (draft_id, path, name, size) VALUES (?1, ?2, ?3, ?4)",
+            concat!(
+                "INSERT OR IGNORE INTO outbound_attachments (draft_id, path, name, size) VALUES (",
+                current_id_sql!(),
+                ", ?2, ?3, ?4)"
+            ),
             params![draft_id, path, name, size],
         )?;
         Ok(())
@@ -1058,9 +1151,11 @@ impl Store {
         &self,
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ?1 ORDER BY rowid",
-        )?;
+        let mut stmt = self.conn.prepare(concat!(
+            "SELECT path, name, size FROM outbound_attachments WHERE draft_id = ",
+            current_id_sql!(),
+            " ORDER BY rowid"
+        ))?;
         let rows = stmt
             .query_map(params![draft_id], |r| {
                 Ok(OutboundAttachment {
@@ -1076,7 +1171,11 @@ impl Store {
     /// Removes one attached file from `draft_id` (by path). No-op if absent.
     pub fn remove_outbound_attachment(&self, draft_id: &str, path: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM outbound_attachments WHERE draft_id = ?1 AND path = ?2",
+            concat!(
+                "DELETE FROM outbound_attachments WHERE draft_id = ",
+                current_id_sql!(),
+                " AND path = ?2"
+            ),
             params![draft_id, path],
         )?;
         Ok(())
@@ -1085,7 +1184,10 @@ impl Store {
     /// Removes every attached file from `draft_id` (after a send, or on discard).
     pub fn clear_outbound_attachments(&self, draft_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM outbound_attachments WHERE draft_id = ?1",
+            concat!(
+                "DELETE FROM outbound_attachments WHERE draft_id = ",
+                current_id_sql!()
+            ),
             params![draft_id],
         )?;
         Ok(())
@@ -1103,11 +1205,19 @@ impl Store {
     /// since the child rows still point at the old id until the very next
     /// statement fixes them up. Deferring means the check runs once, at
     /// `commit()`, by which point every row agrees.
+    ///
+    /// A `local:` id is kept on the row as `local_id` (#1884), so a caller
+    /// still holding it (a compose window left open across `SaveDraft`, or
+    /// a queued `SendDraft` retried after its send failed, #1881) keeps
+    /// reaching the draft: see `current_id` and the calls that take a draft
+    /// id. The alias goes with the row whenever the message is deleted.
     pub fn reconcile_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
-            "UPDATE messages SET id = ?2 WHERE id = ?1",
+            "UPDATE messages SET id = ?2,
+                 local_id = CASE WHEN substr(?1, 1, 6) = 'local:' THEN ?1 ELSE local_id END
+             WHERE id = ?1",
             params![local_id, graph_id],
         )?;
         tx.execute(
@@ -1122,31 +1232,49 @@ impl Store {
         Ok(())
     }
 
-    /// Loads a draft (its message row and body) for editing, by whatever id
-    /// currently addresses it (`local:` before sync, the Graph id after
-    /// `reconcile_id`). `None` if there's no message with that id, or no
-    /// body stored for it — either of which means there's nothing for
-    /// compose to load.
+    /// Loads a draft (its message row and body) for editing, by its `local:`
+    /// id (before sync, and still after `reconcile_id`, #1884) or its Graph
+    /// id. The returned row's `id` is the id it is stored under now. `None`
+    /// if there's no message with that id, or no body stored for it — either
+    /// of which means there's nothing for compose to load. One statement, so
+    /// the row and body always belong together.
     pub fn draft(&self, id: &str) -> Result<Option<(MessageRow, Body)>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(concat!(
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request, categories
-             FROM messages
-             WHERE id = ?1",
-        )?;
-        let row = stmt
-            .query_map(params![id], map_message_row)?
+                    bcc_recipients, is_meeting_request, categories,
+                    bodies.content_type, bodies.content
+             FROM messages JOIN bodies ON bodies.message_id = messages.id
+             WHERE ",
+            draft_row_sql!()
+        ))?;
+        let found = stmt
+            .query_map(params![id], |r| {
+                Ok((
+                    map_message_row(r)?,
+                    Body {
+                        content_type: r.get(19)?,
+                        content: r.get(20)?,
+                    },
+                ))
+            })?
             .next()
             .transpose()?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let Some(body) = self.get_body(id)? else {
-            return Ok(None);
-        };
-        Ok(Some((row, body)))
+        Ok(found)
+    }
+
+    /// The id the message addressed by `id` is stored under now: the Graph
+    /// id a draft's `local:` id was reconciled to (`reconcile_id`, #1884),
+    /// else `id` itself (a Graph id, which is never looked up, or a `local:`
+    /// id never reconciled or whose message has since been deleted).
+    pub fn current_id(&self, id: &str) -> Result<String, StoreError> {
+        let current =
+            self.conn
+                .query_row(concat!("SELECT ", current_id_sql!()), params![id], |r| {
+                    r.get(0)
+                })?;
+        Ok(current)
     }
 
     /// Resolves the Drafts folder's id, for filing a new local draft (or a
@@ -3496,7 +3624,13 @@ mod draft_tests {
             .unwrap();
         s.reconcile_id(&local_id, "GRAPH-ID-1").unwrap();
 
-        assert!(s.draft(&local_id).unwrap().is_none());
+        // The local id still reaches the draft (#1884), which is now stored
+        // under the Graph id.
+        let (row, _) = s
+            .draft(&local_id)
+            .unwrap()
+            .expect("local id still resolves");
+        assert_eq!(row.id, "GRAPH-ID-1");
         let (row, body) = s
             .draft("GRAPH-ID-1")
             .unwrap()
@@ -3541,8 +3675,19 @@ mod draft_tests {
         s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
             .unwrap();
         s.reconcile_id(&id, "GRAPH-1").unwrap();
-        assert!(s.outbound_attachments(&id).unwrap().is_empty()); // old id emptied
-        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 1); // moved to graph id
+        // The row itself moved to the graph id ...
+        let keys: Vec<String> = s
+            .conn
+            .prepare("SELECT draft_id FROM outbound_attachments")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(keys, vec!["GRAPH-1".to_string()]);
+        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 1);
+        // ... and the local id still lists it (#1884).
+        assert_eq!(s.outbound_attachments(&id).unwrap().len(), 1);
     }
 
     #[test]
@@ -3614,5 +3759,221 @@ mod draft_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+/// A draft stays addressable by its `local:` id after `reconcile_id` (#1884).
+#[cfg(test)]
+mod local_id_tests {
+    use super::*;
+    use crate::graph::model::{Message, Recipient};
+
+    /// A store holding one reconciled draft: `(store, local id)`, with the
+    /// draft filed under the sentinel Drafts folder and stored as `G`.
+    fn reconciled() -> (Store, String) {
+        let s = Store::open_in_memory().unwrap();
+        let local = s
+            .create_local_draft("Subj", "a@x", "", "<p>old</p>")
+            .unwrap();
+        s.reconcile_id(&local, "G").unwrap();
+        (s, local)
+    }
+
+    #[test]
+    fn current_id_follows_a_reconciled_local_id_only() {
+        let (s, local) = reconciled();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        assert_eq!(s.current_id("G").unwrap(), "G");
+        assert_eq!(s.current_id("local:never").unwrap(), "local:never");
+        assert_eq!(s.current_id("OTHER").unwrap(), "OTHER");
+    }
+
+    #[test]
+    fn a_graph_id_is_never_looked_up_as_an_alias() {
+        // Even a row whose `local_id` held a non-`local:` value (no code
+        // writes one) is not reached by it.
+        let (s, _) = reconciled();
+        s.conn
+            .execute("UPDATE messages SET local_id = 'X' WHERE id = 'G'", [])
+            .unwrap();
+        assert_eq!(s.current_id("X").unwrap(), "X");
+        assert!(s.draft("X").unwrap().is_none());
+    }
+
+    #[test]
+    fn every_draft_call_reaches_the_reconciled_draft_by_its_local_id() {
+        let (s, local) = reconciled();
+
+        let (row, body) = s.draft(&local).unwrap().expect("local id resolves");
+        assert_eq!(row.id, "G");
+        assert_eq!(row.subject, "Subj");
+        assert_eq!(body.content, "<p>old</p>");
+
+        s.update_draft_fields(&local, "New", "b@x", "c@x", "d@x", "<p>new</p>")
+            .unwrap();
+        let (row, body) = s.draft("G").unwrap().unwrap();
+        assert_eq!(
+            (
+                row.subject.as_str(),
+                row.to_recipients.as_str(),
+                row.cc_recipients.as_str(),
+                row.bcc_recipients.as_str()
+            ),
+            ("New", "b@x", "c@x", "d@x")
+        );
+        assert_eq!(body.content, "<p>new</p>");
+        // No stray body was written under the local id.
+        let bodies: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bodies, 1);
+
+        s.add_outbound_attachment(&local, "/tmp/a.pdf", "a.pdf", 1)
+            .unwrap();
+        s.add_outbound_attachment(&local, "/tmp/b.pdf", "b.pdf", 2)
+            .unwrap();
+        assert_eq!(s.outbound_attachments("G").unwrap().len(), 2);
+        assert_eq!(s.outbound_attachments(&local).unwrap().len(), 2);
+        s.remove_outbound_attachment(&local, "/tmp/a.pdf").unwrap();
+        let left = s.outbound_attachments("G").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "b.pdf");
+        s.clear_outbound_attachments(&local).unwrap();
+        assert!(s.outbound_attachments("G").unwrap().is_empty());
+
+        s.mark_sent(&local);
+        assert!(!s.draft("G").unwrap().unwrap().0.is_draft);
+
+        s.conn
+            .execute(
+                "INSERT INTO folders (id, display_name) VALUES ('SENT', 'Sent Items')",
+                [],
+            )
+            .unwrap();
+        s.move_message(&local, "SENT").unwrap();
+        assert_eq!(s.draft("G").unwrap().unwrap().0.folder_id, "SENT");
+    }
+
+    #[test]
+    fn deleting_the_graph_id_drops_the_alias() {
+        let (s, local) = reconciled();
+        s.delete_message("G").unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), local);
+        assert!(s.draft(&local).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_by_the_local_id_deletes_the_graph_row() {
+        let (s, local) = reconciled();
+        s.delete_message(&local).unwrap();
+        assert!(s.draft("G").unwrap().is_none());
+        assert_eq!(s.current_id(&local).unwrap(), local);
+    }
+
+    #[test]
+    fn delete_message_resolved_returns_the_id_it_deleted() {
+        let (s, local) = reconciled();
+        assert_eq!(
+            s.delete_message_resolved(&local).unwrap().as_deref(),
+            Some("G")
+        );
+        assert!(s.draft("G").unwrap().is_none());
+        assert_eq!(s.current_id(&local).unwrap(), local);
+        // Nothing left to match, by either id.
+        assert_eq!(s.delete_message_resolved(&local).unwrap(), None);
+        assert_eq!(s.delete_message_resolved("G").unwrap(), None);
+        assert_eq!(s.delete_message_resolved("unknown").unwrap(), None);
+        assert_eq!(s.delete_message_resolved("").unwrap(), None);
+
+        let (s, _) = reconciled();
+        assert_eq!(
+            s.delete_message_resolved("G").unwrap().as_deref(),
+            Some("G")
+        );
+        assert!(s.draft("G").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_folder_cascade_drops_the_alias() {
+        let (s, local) = reconciled();
+        let folder = s.draft("G").unwrap().unwrap().0.folder_id;
+        s.conn
+            .execute("DELETE FROM folders WHERE id = ?1", params![folder])
+            .unwrap();
+        assert!(s.draft("G").unwrap().is_none());
+        assert_eq!(s.current_id(&local).unwrap(), local);
+    }
+
+    #[test]
+    fn a_delta_upsert_of_the_graph_id_keeps_the_alias() {
+        let (s, local) = reconciled();
+        let folder = s.draft("G").unwrap().unwrap().0.folder_id;
+        let m = Message {
+            id: "G".into(),
+            conversation_id: "C".into(),
+            subject: "From Graph".into(),
+            from: Recipient {
+                name: String::new(),
+                address: String::new(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: String::new(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft: true,
+            is_meeting_request: false,
+            categories: Vec::new(),
+        };
+        s.upsert_message(&folder, &m).unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        assert_eq!(s.draft(&local).unwrap().unwrap().0.subject, "From Graph");
+    }
+
+    #[test]
+    fn a_database_from_before_local_id_is_migrated() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-local-id-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let local = {
+            let s = Store::open(&path).unwrap();
+            let local = s.create_local_draft("Old", "", "", "body").unwrap();
+            // Take the database back to before the column existed.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_local_id;
+                     ALTER TABLE messages DROP COLUMN local_id;",
+                )
+                .unwrap();
+            local
+        };
+        let s = Store::open(&path).unwrap();
+        let has_index: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_local_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_index, 1);
+        s.reconcile_id(&local, "G").unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        assert_eq!(s.draft(&local).unwrap().unwrap().0.id, "G");
+        drop(s);
+        // Opening again (column and index already there) is fine.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

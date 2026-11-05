@@ -43,7 +43,13 @@ CREATE TABLE IF NOT EXISTS messages (
     preview         TEXT NOT NULL DEFAULT '',
     is_draft        INTEGER NOT NULL DEFAULT 0,
     is_meeting_request INTEGER NOT NULL DEFAULT 0,
-    categories      TEXT NOT NULL DEFAULT ''
+    categories      TEXT NOT NULL DEFAULT '',
+    -- The `local:` id a draft had before `Store::reconcile_id` renamed it to
+    -- its Graph id (#1884), so a caller still holding that id keeps reaching
+    -- the draft. NULL for every other row. Lives on the row, so it goes with
+    -- the message on every delete path. Its unique index is created in
+    -- `Store::init`, after the migration that adds the column to old files.
+    local_id        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
