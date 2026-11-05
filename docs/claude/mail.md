@@ -178,3 +178,35 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `react`. The pass carries on with the stored folders. 429 and 503 are
   throttles: the pass stops and backs off, as auth and transport failures
   abort it.
+
+## A send that fails goes back to Drafts (#1874)
+
+- `SyncCommand::SendDraft` queues the op first (a send that cannot be
+  queued is a `SendFailed` and touches nothing), then makes its optimistic
+  write (`mark_sent`, and the move into Sent Items once that has synced),
+  emits `SyncEvent::Sending { id }` and drains. A send left queued by an
+  earlier run gets no `Sending`.
+- In `drain_outbox`, a 5xx still defers the op, and 401, 429/503 and
+  transport still stop the drain. Any other failure of a `SendDraft` (a 4xx,
+  a 404, a `Parse`: an attachment file that cannot be read, a store error)
+  is final on the first attempt. `Engine::fail_send` drops the op,
+  `Store::return_to_drafts` makes the row a draft again in the Drafts
+  folder (or the local sentinel), in one `draft_row_sql!` statement, emits
+  `SendFailed { id, error }` (`id` as the command carried it, `error` from
+  `outbox::send_error_text`: Graph's `error.message`, else `HTTP {status}`
+  or the failure's own text), then `MessagesUpdated` for Drafts and Sent
+  Items, and the drain goes on. A send is never quarantined: there is no
+  `Error` and no delta reconverge. After a 404 (the Graph draft is gone)
+  the Drafts delta may then remove the reverted row.
+- Once `/send` succeeded nothing may read as a failure: the clear of the
+  attachment rows after it ignores a store error.
+- `outbound_attachments.uploaded` (migrated in `Store::init`) is set on a
+  row right after its upload, and `SendDraft` skips a row already set. A
+  resend after a failed send, or a retry after a 5xx, never attaches a
+  file twice. The rows stay until the send succeeds, so compose still lists
+  them. lookxy's Ctrl+R refuses to remove an uploaded one (a notice says it
+  is already on the server draft), as removing the row would not take it
+  off the Graph draft.
+- lookxy shows a `SendFailed` as `Send failed: <error>` in `App::send_failure`,
+  which no sync event clears: the engine settles to `State(Idle)` right after
+  it, and that clears `error_notice`. The next key press clears it.

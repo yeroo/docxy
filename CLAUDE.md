@@ -91,7 +91,8 @@ issue number to find its notes.
   Ctrl+A (#1376).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
-  Items after a send (#1885), folders and counts on every tick, deleted folders (#1886).
+  Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
+  a failed send back to Drafts (#1874).
 
 ## Build and test
 
