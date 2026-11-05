@@ -7,7 +7,8 @@ index of area files under docs/claude/; a feature's notes go into its area
 file. This script checks, each failure one line on stderr, exit 1 if any:
 
 1. CLAUDE.md is at most --budget characters (UTF-8 decoded);
-2. every docs/claude/*.md is named in CLAUDE.md as docs/claude/<name>.md;
+2. every docs/claude/*.md has a bullet of its own in CLAUDE.md's Area notes
+   section (a line starting "- `docs/claude/<name>.md`");
 3. every docs/claude/<name>.md named in CLAUDE.md exists;
 4. no `## ` heading appears twice across CLAUDE.md and docs/claude/*.md;
 5. CLAUDE.md's `## ` headings are exactly KEPT (as a set).
@@ -44,7 +45,13 @@ KEPT = [
 ]
 
 AREA_DIR = "docs/claude"
+INDEX_HEADING = "## Area notes"
+# Any mention of an area file (check 3: it must exist).
 INDEX_REF = re.compile(r"docs/claude/([A-Za-z0-9_.-]+\.md)")
+# An index entry (check 2): a bullet of the Area notes section whose first
+# item is the file, so a cross-pointer inside another file's bullet, or a
+# mention elsewhere in CLAUDE.md, does not count.
+INDEX_ENTRY = re.compile(r"(?m)^- `docs/claude/([A-Za-z0-9_.-]+\.md)`")
 FENCE = re.compile(r"^\s*(```|~~~)")
 
 
@@ -118,10 +125,20 @@ def check(root, budget=BUDGET):
 
     files = area_files(root)
     named = set(INDEX_REF.findall(claude))
+    index = sections(claude).get(INDEX_HEADING)
+    if index is None:
+        errors.append(
+            "CLAUDE.md has no %r section: the area files' index lives there"
+            % INDEX_HEADING
+        )
+        indexed = set()
+    else:
+        indexed = set(INDEX_ENTRY.findall(index))
     for p in files:
-        if p.name not in named:
+        if p.name not in indexed:
             errors.append(
-                "%s/%s is not in CLAUDE.md's Area notes index" % (AREA_DIR, p.name)
+                "%s/%s is not in CLAUDE.md's Area notes index (a bullet starting "
+                "`%s/%s`)" % (AREA_DIR, p.name, AREA_DIR, p.name)
             )
     present = {p.name for p in files}
     for name in sorted(named - present):

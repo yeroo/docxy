@@ -94,6 +94,43 @@ class Check(unittest.TestCase):
             self.assertEqual(len(errors), 1)
             self.assertIn("docs/claude/other.md is not in CLAUDE.md's Area notes index", errors[0])
 
+    def test_area_file_named_only_outside_the_index_fails(self):
+        # Named under Cross-crate invariants, not in Area notes: no index entry.
+        claude = kept_claude().replace(
+            "## Cross-crate invariants\n\nBody.\n",
+            "## Cross-crate invariants\n\n- A rule (`docs/claude/other.md`).\n",
+        )
+        areas = {"area.md": "## Feature (#1)\n", "other.md": "## Other (#2)\n"}
+        with Tree(claude, areas) as t:
+            errors = t.errors()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("docs/claude/other.md is not in CLAUDE.md's Area notes index", errors[0])
+
+    def test_area_file_named_only_inside_another_bullet_fails(self):
+        # A cross-pointer inside area.md's bullet is not other.md's own entry.
+        claude = kept_claude(extra_index="  Its tier styles are in `docs/claude/other.md`.\n")
+        areas = {"area.md": "## Feature (#1)\n", "other.md": "## Other (#2)\n"}
+        with Tree(claude, areas) as t:
+            errors = t.errors()
+            self.assertEqual(len(errors), 1)
+            self.assertIn("docs/claude/other.md is not in CLAUDE.md's Area notes index", errors[0])
+        # Its own bullet makes it pass.
+        claude = kept_claude(
+            extra_index="  Its tier styles are in `docs/claude/other.md`.\n"
+            "- `docs/claude/other.md`: before changing the other area.\n"
+        )
+        with Tree(claude, areas) as t:
+            self.assertEqual(t.errors(), [])
+
+    def test_missing_index_section_says_so(self):
+        claude = kept_claude().replace("## Area notes\n", "## Areas\n")
+        with Tree(claude) as t:
+            errors = t.errors()
+            self.assertTrue(
+                any("has no '## Area notes' section" in e for e in errors), errors
+            )
+            self.assertTrue(any("docs/claude/area.md is not in" in e for e in errors), errors)
+
     def test_listed_missing_area_file_fails(self):
         claude = kept_claude(extra_index="- `docs/claude/gone.md`: before changing nothing.\n")
         with Tree(claude) as t:
