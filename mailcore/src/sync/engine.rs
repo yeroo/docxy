@@ -5,8 +5,11 @@
 //! [`spawn`] launches the thread and hands back a [`SyncHandle`]
 //! (`cmd_tx` down, `evt_rx` up). The thread loads the cached token, does an
 //! initial folder + delta backfill, then blocks on
-//! `cmd_rx.recv_timeout(tick)`: each tick (or an explicit `Refresh`) re-runs
-//! per-folder delta sync and drains the outbox; mutation commands write the
+//! `cmd_rx.recv_timeout(tick)`: each tick (or an explicit `Refresh`) lists
+//! the folder tree (#1886: names, parents, counts, new folders, and the
+//! removal of folders deleted on the server), re-runs per-folder delta sync
+//! and drains the outbox; a full pass (startup, `Refresh`, sign-in) also
+//! refreshes people and master categories. Mutation commands write the
 //! store optimistically, enqueue an outbox op, and drain. Graph calls go
 //! through [`Engine::with_auth`], which refreshes the token once on a 401 and
 //! retries. Throttling (`Retry-After`) is honored by rescheduling; transport
@@ -521,11 +524,14 @@ struct Engine {
     next_retry: Option<Instant>,
     /// Current offline back-off, doubled on each consecutive transport error.
     backoff: Duration,
-    /// Whether an initial folder enumeration has ever completed successfully.
+    /// Whether a folder enumeration has ever completed successfully.
     /// False at startup, after a failed first backfill (e.g. launched
-    /// offline), and after a quarantine reconverge — while false, ticks run a
-    /// FULL pass (re-enumerate folders) so the client can recover instead of
-    /// running incremental deltas over an empty/stale folder set forever.
+    /// offline), and after a quarantine reconverge — while false
+    /// (`needs_full_pass`), a tick runs a FULL pass (people and master
+    /// categories too, and `FoldersUpdated` after every list) and the fast
+    /// schedule promotes its next deadline to one, so the client recovers
+    /// instead of running deltas over an empty/stale folder set. Every pass
+    /// lists the folders either way (#1886).
     backfill_done: bool,
     /// Set when an outbox op is quarantined: the next full backfill pass must
     /// re-fetch *all* current server messages regardless of age (ignore the
@@ -540,9 +546,9 @@ struct Engine {
     /// With a fast tick only: when the next fast tick is due.
     next_fast: Instant,
     /// With a fast tick only: the full pass that last ran (normal, startup,
-    /// `Refresh`, sign-in) ran to its end and still
-    /// left the folders to re-enumerate (the folder list failed
-    /// non-fatally: a 403, a 5xx, a parse error), so the fast deadlines do
+    /// `Refresh`, sign-in) ran to its end and its folder list still never
+    /// succeeded (`needs_full_pass`: it failed non-fatally, a 403, a 5xx
+    /// other than 503, a parse error), so the fast deadlines do
     /// not repeat it before `next_full`; a quarantine since
     /// (`reconverge_pending`) still promotes one.
     hold_full: bool,
@@ -638,17 +644,19 @@ impl Engine {
         }
     }
 
-    /// Whether the next pass must re-enumerate folders: the initial
-    /// enumeration never completed (launched offline, or a quarantine
-    /// reconverge reset it), or no folder is stored.
+    /// Whether the next normal pass must be a full one: no folder
+    /// enumeration has completed (launched offline, or a quarantine
+    /// reconverge reset it), or no folder is stored. Every pass lists the
+    /// folders (#1886); a full one also refreshes people and master
+    /// categories, and the fast schedule runs it at its next deadline.
     fn needs_full_pass(&self) -> bool {
         !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true)
     }
 
     /// Whether the full pass that just ran (normal, startup, `Refresh`,
-    /// sign-in) ran to its end and still left the folders to re-enumerate:
-    /// not cut short by a lost sign-in or a back-off, so its folder list
-    /// failed non-fatally.
+    /// sign-in) ran to its end and still `needs_full_pass`: not cut short
+    /// by a lost sign-in or a back-off, so its folder list failed
+    /// non-fatally.
     fn full_pass_held(&self) -> bool {
         let cut_short = self.token.is_none() || self.next_retry.is_some_and(|t| t > Instant::now());
         !cut_short && self.needs_full_pass()
@@ -656,7 +664,7 @@ impl Engine {
 
     /// A deadline of the fast-tick schedule elapsed. Inside a back-off
     /// window nothing runs. The normal pass runs when due: its deadline, or
-    /// a pass that must re-enumerate folders, so a quarantine or an offline
+    /// one that must be full (`needs_full_pass`), so a quarantine or an offline
     /// start recovers at the next fast deadline rather than a tick later.
     /// When the last pass ran to its end and its folder list still failed
     /// (`hold_full`), only a quarantine since promotes one, so a folder list
@@ -694,11 +702,12 @@ impl Engine {
     }
 
     /// Periodic tick: skip while signed out or inside a back-off window,
-    /// otherwise re-run every folder's delta and drain the outbox. When the
-    /// initial backfill never completed (launched offline, or a quarantine
-    /// reconverge reset it) — or the folder set is empty — run a FULL pass so
-    /// the client keeps re-attempting folder enumeration under back-off rather
-    /// than idling forever on an empty/stale folder set.
+    /// otherwise list the folder tree, re-run every folder's delta and drain
+    /// the outbox (`sync_pass`). When the initial backfill never completed
+    /// (launched offline, or a quarantine reconverge reset it) — or the
+    /// folder set is empty — the pass is a FULL one (people and master
+    /// categories too), so the client recovers under back-off rather than
+    /// idling forever on an empty/stale folder set.
     fn on_tick(&mut self) {
         if self.token.is_none() {
             return;

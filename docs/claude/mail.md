@@ -144,8 +144,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `childFolders` error (a 404 for a folder deleted between the two calls,
   a 5xx) keeps what was listed and sets `complete = false`, as does a
   listed folder without an id (dropped, never upserted as `""`).
-- After a complete, non-empty listing, `Store::retain_folders` removes
-  every folder it does not list, in one IMMEDIATE transaction. Messages go
+- The walk is many requests, not a snapshot. A folder moved during it (into
+  a parent already read, e.g. a soft delete into Deleted Items, or past an
+  offset `nextLink`) is in no page, yet the listing says complete. So after
+  a complete, non-empty listing, each stored folder missing from it (but
+  never the drafts sentinel) is first asked for
+  (`GraphClient::folder_exists`: `GET /me/mailFolders/{id}?$select=id`,
+  `Engine::folders_to_keep`). Only a 404 lets it go. One that exists, or
+  whose GET fails non-fatally, is kept for the next tick to list. A fatal
+  failure (auth, throttle, transport) keeps every unconfirmed folder and
+  stops the pass. A child of a deleted parent gets its own 404. This costs
+  one GET per missing folder, only when one is missing.
+- Then `Store::retain_folders` removes every folder not kept, in one
+  IMMEDIATE transaction. Messages go
   by `ON DELETE CASCADE` (bodies, attachments, FTS rows), and delta links
   go with the row. Removal runs before the pass's deltas, so a deleted
   folder never gets a delta (no 404 `Error`). An incomplete or empty
@@ -162,7 +173,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   the draft's, which would fail the draft's foreign key. The engine's own
   `drafts_folder_id` caller is on the sync thread, so it cannot race the
   removal.
-- A non-fatal list failure (a 403 or 5xx on `/me/mailFolders`) now
-  surfaces an `Error` on every normal tick through `react`. The pass carries
-  on with the stored folders. A fatal one (auth, throttle, transport)
-  aborts the pass as before.
+- A non-fatal list failure (a 403, or a 5xx other than 503, on
+  `/me/mailFolders`) now surfaces an `Error` on every normal tick through
+  `react`. The pass carries on with the stored folders. 429 and 503 are
+  throttles: the pass stops and backs off, as auth and transport failures
+  abort it.
