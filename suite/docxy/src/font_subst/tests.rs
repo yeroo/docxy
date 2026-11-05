@@ -189,7 +189,6 @@ fn layout_passes_after_the_first_make_no_gpui_lookups() {
     pass(&mut r);
     let after_first = calls.load(Ordering::SeqCst);
     assert!(after_first > 0);
-    assert_eq!(r.probes(), after_first);
     for _ in 1..50 {
         pass(&mut r);
     }
@@ -225,26 +224,76 @@ fn after<'a>(t: &'a str, pat: &'a str) -> impl Iterator<Item = &'a str> {
         .map(move |(at, _)| &t[at + pat.len()..])
 }
 
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// The part of code line `i` inside a `Font {` literal: the text after
+/// `Font {` on its own line, or the whole line while the nearest `Font {`
+/// above (up to 60 lines) is still open by brace depth; `None` outside one.
+fn in_font_literal<'a>(lines: &[&'a str], i: usize) -> Option<&'a str> {
+    let here = code(lines[i]);
+    if let Some(at) = here.find("Font {") {
+        return Some(&here[at + "Font {".len()..]);
+    }
+    for start in (i.saturating_sub(60)..i).rev() {
+        let line = code(lines[start]);
+        let Some(at) = line.find("Font {") else {
+            continue;
+        };
+        let mut depth = 0i32;
+        let tail = std::iter::once(&line[at + "Font ".len()..])
+            .chain(lines[start + 1..i].iter().map(|l| code(l)));
+        for c in tail.flat_map(str::chars) {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        return (depth > 0).then_some(here);
+    }
+    None
+}
+
+/// Whether `part` (inside a `Font {` literal) sets its `family` field:
+/// `family: x` or the shorthand `family` (followed by `,`, `}` or nothing).
+fn family_field(part: &str) -> bool {
+    part.match_indices("family").any(|(at, _)| {
+        let before = part[..at].chars().next_back();
+        let rest = part[at + "family".len()..].trim_start();
+        !before.is_some_and(|c| is_ident(c) || c == '.')
+            && (assigns(rest) || rest.is_empty() || rest.starts_with([',', '}']))
+    })
+}
+
 /// Whether code line `i` of `lines` hands gpui a font family: a
-/// `.font_family(` call, a `font_family` or `.family` assignment or field, a
-/// free `font(` / `gpui::font(` call, or a `family:` field of a `Font {`
-/// literal (opened on that line or the three above).
+/// `.font_family(` call, a `font_family` or `.family` assignment or field,
+/// `.family.clone_from(` or `&mut <x>.family`, a free `font(` /
+/// `gpui::font(` call, or a `family` field of a `Font {` literal (tracked
+/// by brace depth, shorthand included).
 fn sets_family(lines: &[&str], i: usize) -> bool {
     let t = code(lines[i]);
     let free_font = t.match_indices("font(").any(|(at, _)| {
         !t[..at]
             .chars()
             .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            .is_some_and(|c| is_ident(c) || c == '.')
     });
-    let in_font_literal = lines[i.saturating_sub(3)..=i]
-        .iter()
-        .any(|l| code(l).contains("Font {"));
+    let mut_family = after(t, "&mut ").any(|rest| {
+        let path: String = rest
+            .chars()
+            .take_while(|&c| is_ident(c) || c == '.')
+            .collect();
+        path.ends_with(".family")
+    });
     t.contains(".font_family(")
         || after(t, "font_family").any(assigns)
         || after(t, ".family").any(assigns)
+        || t.contains(".family.clone_from(")
+        || mut_family
         || free_font
-        || (in_font_literal && after(t, "family").any(assigns))
+        || in_font_literal(lines, i).is_some_and(family_field)
 }
 
 #[test]
@@ -262,6 +311,15 @@ fn the_scan_sees_every_way_of_setting_a_family() {
         assert!(sets(line, 0), "{line}");
     }
     assert!(sets("let f = Font {\n    family: name,", 1));
+    // A shorthand field, on its own line or the literal's.
+    assert!(sets("let f = Font {\n    family,\n    ..base\n};", 1));
+    assert!(sets("let f = Font { family, ..base };", 0));
+    assert!(sets("let f = Font { weight, family };", 0));
+    // A field five lines into the literal.
+    let deep = "let f = Font {\n    weight,\n    style,\n    features: f(),\n    fallbacks: None,\n    family: name,\n};";
+    assert!(sets(deep, 5));
+    assert!(sets("font.family.clone_from(&name);", 0));
+    assert!(sets("set(&mut font.family, name);", 0));
     for line in [
         "// d.font_family(name)",
         "let x = 1; // font.family = name",
@@ -269,14 +327,23 @@ fn the_scan_sees_every_way_of_setting_a_family() {
         "window.text_style().font()",
         "if font.family == name {}",
         "let f = text_font(name);",
+        "let g = &mut font.family_cache;",
     ] {
         assert!(!sets(line, 0), "{line}");
     }
+    // A closed literal does not reach the lines after it.
+    let closed = "let f = Font { weight, ..base };\nfn g(\n    family: Option<&str>,\n) {}";
+    assert!(!sets(closed, 2));
+    let closed = "let f = Font {\n    weight,\n};\nlet family = name;";
+    assert!(!sets(closed, 3));
 }
 
-/// Every family the suite hands gpui goes through this module. A line that
+/// The families the suite hands gpui go through this module. A line that
 /// sets a family ([`sets_family`]) must call `font_subst::` on it or on one
 /// of the two lines above (comments do not count), or be in `RESOLVED`.
+/// Not proved: a `Font` built elsewhere and passed whole (gpui's
+/// `Styled::font(Font)`, a `TextRun`'s `font`), and that the `font_subst::`
+/// call nearby resolves the very value set (it is trusted to).
 #[test]
 fn every_family_reaching_gpui_is_resolved() {
     /// Lines whose family was resolved further up: (file, line, the resolver

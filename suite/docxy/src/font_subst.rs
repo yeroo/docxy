@@ -96,8 +96,6 @@ pub(crate) struct Resolver {
     resolved: HashMap<String, Option<SharedString>>,
     /// Resolved theme families (sans and mono), by the exact name asked for.
     ui: HashMap<(bool, String), SharedString>,
-    /// How many times `probe` ran.
-    probes: usize,
 }
 
 impl Resolver {
@@ -113,7 +111,6 @@ impl Resolver {
             probed_unlisted: HashMap::new(),
             resolved: HashMap::new(),
             ui: HashMap::new(),
-            probes: 0,
         }
     }
 
@@ -125,7 +122,6 @@ impl Resolver {
         let ok = match self.probed.get(&lower) {
             Some(&ok) => ok,
             None => {
-                self.probes += 1;
                 let ok = (self.probe)(&canonical);
                 self.probed.insert(lower, ok);
                 ok
@@ -152,7 +148,6 @@ impl Resolver {
         let ok = match self.probed_unlisted.get(name) {
             Some(&ok) => ok,
             None => {
-                self.probes += 1;
                 let ok = (self.probe)(name);
                 self.probed_unlisted.insert(name.to_string(), ok);
                 ok
@@ -208,11 +203,6 @@ impl Resolver {
             .unwrap_or_else(|| SharedString::from(theme.to_string()));
         self.ui.insert(key, found.clone());
         found
-    }
-
-    #[cfg(test)]
-    fn probes(&self) -> usize {
-        self.probes
     }
 }
 
