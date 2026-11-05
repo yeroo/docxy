@@ -86,7 +86,7 @@ regions:
   project-hbar-table  project-hbar-chart  project-vbar  project-timeline
   project-split  gallery  ribbon  ribbon-flyout  ribbon-group:0
   ribbon-launch:Number  gallery-more:fixture.wide  filter-button:B
-  ext-doc-view  ext-doc-link:0  ext-doc-word:Alpha:start
+  ext-doc-view  ext-doc-link:0  ext-doc-link:0:left  ext-doc-word:Alpha:start
 ";
 
 fn main() -> ExitCode {

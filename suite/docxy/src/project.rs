@@ -1798,10 +1798,8 @@ pub(super) fn project_el(
                     // them by the same wheel turn; put them back.
                     // Only a whole line is a notch; fractional lines (hi-res
                     // wheels, touchpads) are summed like pixels.
-                    let notch = zoom::is_notch(&ev.delta);
-                    if ev.modifiers.control
-                        && (!delta.y.is_zero() || ev.touch_phase != TouchPhase::Moved)
-                    {
+                    let (dy, notch) = zoom::wheel_px(&ev.delta, window.line_height());
+                    if ev.modifiers.control && (dy != 0. || ev.touch_phase != TouchPhase::Moved) {
                         let Some(body) = this.probes.borrow().current("project-body") else {
                             return;
                         };
@@ -1811,7 +1809,7 @@ pub(super) fn project_el(
                         {
                             let zoom = v.wheel_zoom(
                                 f32::from(ev.position.x - body.left()),
-                                f32::from(delta.y),
+                                dy,
                                 notch,
                                 ev.touch_phase,
                             );

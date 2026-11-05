@@ -536,7 +536,7 @@
   (`clip_payload`, `ClipboardStore::write_rich` with its `rtf_follows`
   gate), to the run's private clipboard in a harness instance
   (`doc_view::set_harness`, set in `run()`).
-  Arrows, Page Up/Down and (Ctrl+)Home/End scroll; Ctrl+=, Ctrl+-, Ctrl+0
+  Up/Down, Page Up/Down and (Ctrl+)Home/End scroll; Ctrl+=, Ctrl+-, Ctrl+0
   and Ctrl+wheel zoom by a tenth within 50%..300% (`step_zoom`, rounded to a
   tenth; the Project chart's `project::wheel_px` / `wheel_step`: a whole
   line steps, a fractional line counts as its pixels, pixels sum to 40). gpui's scroll
@@ -568,7 +568,8 @@
   selected_paragraphs, zoom, scroll_y, max_scroll_y, link_click,
   content_dark, focused, links_followed, link_calls), `ext-doc-set
   {link_click, content_dark}`, the regions `ext-doc-view`,
-  `ext-doc-link:<n>` and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
+  `ext-doc-link:<n>[:left]` (`:left` 8 px left of the span, at mid-height)
+  and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
   past the last character), and `pointer-click`'s `ctrl`.
   `uiharness/cases/ext-doc-view.uit` drives it (run on Linux under
   `scripts/ui-linux.py`). `suite/docxy/tests/ext_doc_view_api.rs` holds the

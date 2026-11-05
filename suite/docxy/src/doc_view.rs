@@ -3,7 +3,7 @@
 //! in its flow (web layout) style, wrapped to the view's width, with inline
 //! pictures from the package it came with. It selects (press, drag,
 //! Shift+press, Ctrl+A) and copies (Ctrl+C: text and RTF, as a document copy
-//! does), scrolls (wheel, arrows, Page Up/Down, Home/End) and zooms
+//! does), scrolls (wheel, Up/Down, Page Up/Down, Home/End) and zooms
 //! (Ctrl+wheel, Ctrl+=, Ctrl+-, Ctrl+0). It never edits and draws no caret.
 //! A hyperlink press goes to the extension's callback ([`DocView::on_link`]),
 //! never opened here. The chrome (scroll bar, selection) follows the suite's
@@ -174,8 +174,10 @@ impl DocView {
     /// The selected text, as a copy would put it on the clipboard (empty
     /// without a selection).
     pub fn selected_text(&self) -> String {
-        copy_payload(&self.editor, self.pkg.as_ref())
-            .map(|(text, _)| text)
+        // The text alone: the RTF a copy makes beside it is not needed here.
+        self.editor
+            .copy()
+            .map(|clip| doc_copy_text(&clip))
             .unwrap_or_default()
     }
 
