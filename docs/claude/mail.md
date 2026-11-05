@@ -76,20 +76,31 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
   not move them, `Refresh` resets both. The normal pass runs when its
   deadline passed or `needs_full_pass()` (no enumeration yet, or no folders:
-  a quarantine or an offline start recovers at the next fast deadline);
-  otherwise `on_fast_tick` drains the outbox and refreshes the
+  a quarantine or an offline start recovers at the next fast deadline). When
+  the last pass ran to its end and its folder list still failed non-fatally
+  (a 403, a 5xx: no back-off), `hold_full` keeps the fast deadlines from
+  repeating it before `next_full`, unless a quarantine (`reconverge_pending`)
+  came since; otherwise `on_fast_tick` drains the outbox and refreshes the
   `SetFastFolders` folders that already have a delta link (never a backfill,
   #1871), picked after the drain. Nothing runs inside `next_retry`; an
   aborted normal pass is due again at its deadline (`after_full_pass`). A
-  fast tick sets no `Syncing` state, only settles. `SetFastFolders` without
-  `fast_tick` is kept and does nothing.
+  fast tick sets no `Syncing` state; a complete one settles, and one cut
+  short (like a `SyncFolder` cut short) keeps the state its failure set, so
+  Offline is not settled away. `SetFastFolders` without `fast_tick` is kept
+  and does nothing.
 - Without `fast_tick`, a throttled `SyncFolder` makes the deadline run a full
   pass (`recv_timeout` waits for `next_retry`, then `on_tick`), as any
   throttled command does.
-- `drain_outbox` returns `false` when cut short (auth, throttle, transport, a
-  5xx, or the post-send sync stopping); `sync_pass` then stops and keeps the
-  back-off (it used to `clear_backoff` right after a failed drain). Its
-  throttle arm settles the state, as `react` does.
+- `drain_outbox` returns a `Drain`: `Aborted` when cut short (auth,
+  throttle, transport, or the post-send sync stopping), and every sync
+  (`sync_pass`, a fast tick, `SyncFolder`) then stops and keeps the back-off
+  (`sync_pass` used to `clear_backoff` right after a failed drain). Its
+  throttle arm settles the state, as `react` does. A 5xx op is never
+  quarantined, so it is `Deferred`, not `Aborted`: the op keeps its place,
+  the drain stops there, and the sync carries on (else one op Graph keeps
+  failing would stop the calendar and the fast cycle for good). A command's
+  drain (`enqueue_and_drain`) still backs off on `Deferred` (`go_offline`),
+  as before; the pass at that deadline carries on past the op and clears it.
 - After a drain that sent a draft, `sync_after_send` refreshes Drafts, then
   Sent Items, each only when it has a delta link. Drafts first: without
   `ImmutableId` Graph gives the sent message a new id in Sent Items, and the
