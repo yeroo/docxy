@@ -3778,6 +3778,20 @@ mod image_tests {
             .collect()
     }
 
+    /// `bytes` in base64, by hand (the module's decoder is under test).
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = c.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - c.len()));
+            for k in 0..=c.len() {
+                out.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
+            }
+            out.push_str(&"=".repeat(3 - c.len()));
+        }
+        out
+    }
+
     const PX: i64 = 9525;
 
     #[test]
@@ -3932,18 +3946,10 @@ mod image_tests {
     #[test]
     fn a_data_image_over_the_room_is_a_placeholder_and_the_import_goes_on() {
         let png = png(4, 2);
-        let mut b64 = String::new();
-        // A hand base64 of the header (the module's decoder is under test).
-        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for c in png.chunks(3) {
-            let n = c.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - c.len()));
-            for k in 0..=c.len() {
-                b64.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
-            }
-            b64.push_str(&"=".repeat(3 - c.len()));
-        }
-        let page =
-            format!("<p>x<img src=\"data:image/png;base64,{b64}\" width=10 height=5 alt=big></p>");
+        let page = format!(
+            "<p>x<img src=\"data:image/png;base64,{}\" width=10 height=5 alt=big></p>",
+            b64(&png)
+        );
         let mut none = |_: &str, _: usize| None;
         let roomy = Budget::standard();
         let (d, media) = import_html_within(page.as_bytes(), &roomy, Some(&mut none)).unwrap();
@@ -3955,11 +3961,35 @@ mod image_tests {
         assert_eq!(media[0].bytes, html_image::PLACEHOLDER_PNG);
         assert!(all_pictures(&d)[0].contains("descr=\"big\""));
         assert_eq!(paragraph_texts(&d), ["x"]);
-        // A budget out of work elsewhere still fails the import.
-        let poor = Budget::new(crate::import::MAX_DECODED, 50);
+    }
+
+    /// FIX r1 m2: a work budget that covers the up-front passes and runs out
+    /// among the images fails the import, though the same page and budget
+    /// with images off fit: decoding is charged, and running out is not
+    /// swallowed by the image path.
+    #[test]
+    fn images_spend_the_imports_work_and_running_out_fails_it() {
+        // Distinct lengths: no two media are compared byte for byte.
+        let page: String = (0..200)
+            .map(|i| {
+                let mut b = png(4, 2);
+                b.resize(4000 + i, 0);
+                format!(
+                    "<p>{i}<img src=\"data:image/png;base64,{}\" width=10 height=5></p>",
+                    b64(&b)
+                )
+            })
+            .collect();
         let mut none = |_: &str, _: usize| None;
+        let full = Budget::standard();
+        let (_, media) = import_html_within(page.as_bytes(), &full, Some(&mut none)).unwrap();
+        assert_eq!(media.len(), 200);
+        let upfront = 3 * (page.len() / 16 + 1);
+        let spent = crate::import::MAX_WORK - full.work.get();
+        let half = || Budget::new(crate::import::MAX_DECODED, upfront + (spent - upfront) / 2);
+        assert!(import_html_within(page.as_bytes(), &half(), None).is_ok());
         assert_eq!(
-            import_html_within(page.repeat(50).as_bytes(), &poor, Some(&mut none)).unwrap_err(),
+            import_html_within(page.as_bytes(), &half(), Some(&mut none)).unwrap_err(),
             TOO_BIG
         );
     }
