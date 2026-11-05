@@ -29,6 +29,7 @@
 //! `pre`. Images, links' targets and forms are not converted.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
+use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{Budget, Builder, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
 use crate::model::{Align, Document, ParProps, RunProps, VertAlign};
 
@@ -264,6 +265,17 @@ struct Look {
     /// The element's own top and bottom box, in twips (not inherited).
     before: Option<i32>,
     after: Option<i32>,
+    /// A cell's or table part's own background (`RRGGBB`, not inherited):
+    /// the cell shading (#1878).
+    own_fill: Option<String>,
+    /// A table's or cell's own `width` (not inherited).
+    own_width: Option<Width>,
+    /// A cell's own `padding`, in twips, top, right, bottom, left (not
+    /// inherited): its `tcMar`.
+    own_padding: [Option<i32>; 4],
+    /// `valign` / `vertical-align` of a row group, row or cell, inherited
+    /// by the cells below and reset at a `table`.
+    valign: Option<VAlign>,
 }
 
 /// An open element.
@@ -341,6 +353,14 @@ struct Attrs {
     color: Option<String>,
     face: Option<String>,
     size: Option<String>,
+    width: Option<String>,
+    bgcolor: Option<String>,
+    border: Option<String>,
+    cellpadding: Option<String>,
+    cellspacing: Option<String>,
+    colspan: Option<String>,
+    rowspan: Option<String>,
+    valign: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -354,6 +374,8 @@ struct Cascade {
     text_indent: Option<Len>,
     line: Option<LineHeight>,
     background: Option<String>,
+    /// The element is a `table` (not a row or row group).
+    is_table: bool,
 }
 
 /// A twips sum kept in Word's range.
@@ -376,11 +398,99 @@ fn align_value(v: &str) -> Option<Align> {
     }
 }
 
+/// A `valign` / cell `vertical-align` value: `baseline` and what a cell
+/// treats as baseline (`super`, `sub`, `text-top`, …) are its top.
+fn valign_value(v: &str) -> Option<VAlign> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "top" | "baseline" | "super" | "sub" | "text-top" | "text-bottom" => Some(VAlign::Top),
+        "middle" | "center" => Some(VAlign::Center),
+        "bottom" => Some(VAlign::Bottom),
+        _ => None,
+    }
+}
+
+/// A `background` that paints nothing (`none`, `transparent`).
+fn clears_background(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "none" | "transparent"
+    )
+}
+
+/// A `width` attribute: digits as px, `N%`, `Npx`; anything else none.
+fn width_attr(v: &str) -> Option<Width> {
+    let v = v.trim();
+    let (num, pct) = match v.strip_suffix('%') {
+        Some(n) => (n, true),
+        None => (v.strip_suffix("px").unwrap_or(v), false),
+    };
+    let num = num.trim_end();
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let n: f64 = num.parse().ok().filter(|n: &f64| n.is_finite())?;
+    Some(if pct {
+        Width::Pct(n)
+    } else {
+        Width::Twips((n * 15.0).round().min(f64::from(html_table::MAX_TWIPS)) as u32)
+    })
+}
+
+/// HTML's rules for a non-negative integer: leading white space, an
+/// optional `+`, digits; what follows them is ignored.
+fn html_int(v: &str) -> Option<u32> {
+    let v = v.trim_start();
+    let v = v.strip_prefix('+').unwrap_or(v);
+    let end = v.bytes().take_while(u8::is_ascii_digit).count();
+    if end == 0 {
+        return None;
+    }
+    Some(
+        v[..end]
+            .parse::<u64>()
+            .map_or(u32::MAX, |n| n.min(u64::from(u32::MAX)) as u32),
+    )
+}
+
+/// A `<table>`'s spec from its attributes and computed look.
+fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
+    TableSpec {
+        width: look.own_width,
+        // A bare or unreadable `border` is 1 px.
+        border: attrs
+            .border
+            .as_deref()
+            .map_or(0, |b| html_int(b).unwrap_or(1).min(1000)),
+        cellpadding: attrs
+            .cellpadding
+            .as_deref()
+            .and_then(html_int)
+            .map(|n| n.min(1000)),
+        cellspacing: attrs
+            .cellspacing
+            .as_deref()
+            .and_then(html_int)
+            .map(|n| n.min(1000)),
+        jc: match attrs
+            .align
+            .as_deref()
+            .map(|a| a.trim().to_ascii_lowercase())
+        {
+            Some(a) if a == "center" => Some("center"),
+            Some(a) if a == "right" => Some("right"),
+            _ => None,
+        },
+    }
+}
+
 impl Cascade {
     fn new(parent: Option<&Look>, kind: Kind) -> Self {
         let mut look = parent.cloned().unwrap_or_default();
         look.before = None;
         look.after = None;
+        look.own_fill = None;
+        look.own_width = None;
+        look.own_padding = [None; 4];
         if kind == Kind::Cell {
             // A cell starts a fresh block look; what is inherited (the runs,
             // alignment, line height) still passes in.
@@ -399,7 +509,14 @@ impl Cascade {
             text_indent: None,
             line: None,
             background: None,
+            is_table: false,
         }
+    }
+
+    /// A cell, row or row group: what `valign`, row `align` and cell
+    /// `vertical-align` apply to.
+    fn table_part(&self) -> bool {
+        self.kind == Kind::Cell || (self.kind == Kind::Table && !self.is_table)
     }
 
     fn set_bold(&mut self, bold: bool) {
@@ -416,6 +533,11 @@ impl Cascade {
             self.look.bold_off = false;
         }
         let tag = key.tag.as_str();
+        if tag == "table" {
+            // A table's cells align by their own rows (#1878).
+            self.is_table = true;
+            self.look.valign = None;
+        }
         let run = &mut self.look.run;
         match tag {
             "b" | "strong" => self.set_bold(true),
@@ -440,9 +562,24 @@ impl Cascade {
     /// Presentational attributes: `align` on a block or cell, `<font color
     /// face size>`.
     fn presentational(&mut self, tag: &str, attrs: &Attrs) {
-        if matches!(self.kind, Kind::Block | Kind::Cell) {
+        if matches!(self.kind, Kind::Block | Kind::Cell) || self.table_part() {
             if let Some(a) = attrs.align.as_deref().and_then(align_value) {
                 self.look.align = Some(a);
+            }
+        }
+        if self.kind.table() {
+            if let Some(c) = attrs.bgcolor.as_deref().and_then(css::attr_color) {
+                self.background = Some(c);
+            }
+        }
+        if self.table_part() {
+            if let Some(v) = attrs.valign.as_deref().and_then(valign_value) {
+                self.look.valign = Some(v);
+            }
+        }
+        if matches!(tag, "table" | "td" | "th") {
+            if let Some(w) = attrs.width.as_deref().and_then(width_attr) {
+                self.look.own_width = Some(w);
             }
         }
         if tag == "font" {
@@ -460,6 +597,7 @@ impl Cascade {
 
     fn apply(&mut self, d: &Decl) {
         let v = d.value.as_str();
+        let (table_part, is_table) = (self.table_part(), self.is_table);
         let run = &mut self.look.run;
         let side = |name: &str| match name {
             "top" => Some(0),
@@ -477,6 +615,24 @@ impl Cascade {
             "background" | "background-color" => {
                 if let Some(c) = css::background(v) {
                     self.background = Some(c);
+                } else if self.kind.table() && clears_background(v) {
+                    // A cell's `none` shows its row's or table's (#1878).
+                    self.background = None;
+                }
+            }
+            "width" if self.kind == Kind::Cell || is_table => {
+                let w = v.trim();
+                if w.eq_ignore_ascii_case("auto") {
+                    self.look.own_width = None;
+                } else if let Some(len) = css::length(w) {
+                    let pt = font_pt(&self.look.run);
+                    self.look.own_width = match len.unit {
+                        css::Unit::Percent => (len.v >= 0.0).then_some(Width::Pct(len.v)),
+                        _ => len
+                            .twips(pt)
+                            .filter(|&t| t >= 0)
+                            .map(|t| Width::Twips(t as u32)),
+                    };
                 }
             }
             "font-family" => {
@@ -523,6 +679,14 @@ impl Cascade {
                     run.strike = true;
                 }
             }
+            // A table part aligns its cells; on a cell `super` / `sub` are
+            // `baseline`, its top (#1878).
+            "vertical-align" if table_part => {
+                if let Some(a) = valign_value(v) {
+                    self.look.valign = Some(a);
+                }
+            }
+            "vertical-align" if is_table => {}
             "vertical-align" => match v.trim().to_ascii_lowercase().as_str() {
                 "super" => run.vert_align = VertAlign::Superscript,
                 "sub" => run.vert_align = VertAlign::Subscript,
@@ -637,7 +801,15 @@ impl Cascade {
                     look.run.raw_props.push(shd(&fill));
                 }
             }
-            Kind::Cell | Kind::List | Kind::Table | Kind::Container | Kind::Other => {}
+            Kind::Cell | Kind::Table => {
+                look.own_fill = self.background;
+                if self.kind == Kind::Cell {
+                    for (side, p) in self.padding.iter().enumerate() {
+                        look.own_padding[side] = tw(*p).map(|t| t.max(0));
+                    }
+                }
+            }
+            Kind::List | Kind::Container | Kind::Other => {}
         }
         self.look
     }
@@ -1016,7 +1188,8 @@ impl<'a> Html<'a> {
             }
             _ => {}
         }
-        if self.elems.len() < MAX_DEPTH && self.budget.work(1 + key.heap() / 16) {
+        let pushed = self.elems.len() < MAX_DEPTH && self.budget.work(1 + key.heap() / 16);
+        if pushed {
             let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs);
             self.elems.push(Elem {
                 key,
@@ -1027,6 +1200,72 @@ impl<'a> Html<'a> {
                 lists_at,
             });
         }
+        let kept = self.table_depth <= MAX_TABLE_NESTING;
+        match name {
+            "table" if kept => {
+                let look = self.elems.last().filter(|_| pushed).map(|e| &e.look);
+                let spec = table_spec(&attrs, look.unwrap_or(&Look::default()));
+                self.out.begin_table(spec);
+            }
+            "td" | "th" if kept && self.table_depth > 0 => {
+                let spec = self.cell_spec(&attrs, pushed);
+                self.out.begin_cell(spec);
+            }
+            _ => {}
+        }
+    }
+
+    /// The spec of the cell just opened (on top of `elems` when `pushed`):
+    /// its spans and width, its fill or the nearest of its row's, row
+    /// group's and table's, its inherited vertical alignment, its padding.
+    fn cell_spec(&self, attrs: &Attrs, pushed: bool) -> CellSpec {
+        let colspan = attrs
+            .colspan
+            .as_deref()
+            .and_then(html_int)
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+            .min(1000);
+        let rowspan = attrs
+            .rowspan
+            .as_deref()
+            .and_then(html_int)
+            .unwrap_or(1)
+            .min(65_534);
+        let mut spec = CellSpec {
+            colspan,
+            rowspan,
+            ..CellSpec::default()
+        };
+        let mut below = self.elems.len();
+        if pushed {
+            if let Some(e) = self.elems.last() {
+                spec.width = e.look.own_width;
+                spec.valign = e.look.valign.unwrap_or_default();
+                spec.padding = e.look.own_padding;
+                spec.fill = e.look.own_fill.clone();
+                below -= 1;
+            }
+        }
+        // Else the nearest fill of its row, row group or table.
+        if spec.fill.is_none() {
+            for e in self.elems[..below].iter().rev() {
+                if e.kind == Kind::Cell {
+                    break;
+                }
+                if e.kind != Kind::Table {
+                    continue;
+                }
+                if let Some(f) = &e.look.own_fill {
+                    spec.fill = Some(f.clone());
+                    break;
+                }
+                if e.key.tag == "table" {
+                    break;
+                }
+            }
+        }
+        spec
     }
 
     fn ctx(&self) -> Ctx<'_> {
@@ -1214,7 +1453,7 @@ impl<'a> Html<'a> {
                     .iter()
                     .rposition(|(n, _)| n == "td" || n == "th")
                 {
-                    if self.table_depth == 1 {
+                    if self.kept_table() {
                         let props = self.par_props();
                         self.out.end_cell(props);
                         self.reset_para();
@@ -1226,7 +1465,7 @@ impl<'a> Html<'a> {
                 }
             }
             "tr" => {
-                if self.table_depth == 1 {
+                if self.kept_table() {
                     let props = self.par_props();
                     self.out.end_row(props);
                     self.reset_para();
@@ -1234,10 +1473,11 @@ impl<'a> Html<'a> {
             }
             "table" => {
                 if self.table_depth > 0 {
-                    if self.table_depth == 1 {
+                    if self.kept_table() {
                         let props = self.par_props();
                         self.out.end_row(props);
                         self.out.end_table();
+                        self.reset_para();
                     }
                     self.table_depth -= 1;
                 }
@@ -1324,6 +1564,12 @@ impl<'a> Html<'a> {
             .iter()
             .rposition(|e| e.key.tag == name)
             .is_some_and(|i| self.elems[i + 1..].iter().any(|e| e.kind.table()))
+    }
+
+    /// Inside a table the builder holds: one at most [`MAX_TABLE_NESTING`]
+    /// deep (a deeper one's cells and rows are its enclosing cell's text).
+    fn kept_table(&self) -> bool {
+        (1..=MAX_TABLE_NESTING).contains(&self.table_depth)
     }
 
     fn visible(&self) -> bool {
@@ -1569,6 +1815,14 @@ fn attrs_of(attrs: &str) -> Attrs {
             "color" => Some(&mut out.color),
             "face" => Some(&mut out.face),
             "size" => Some(&mut out.size),
+            "width" => Some(&mut out.width),
+            "bgcolor" => Some(&mut out.bgcolor),
+            "border" => Some(&mut out.border),
+            "cellpadding" => Some(&mut out.cellpadding),
+            "cellspacing" => Some(&mut out.cellspacing),
+            "colspan" => Some(&mut out.colspan),
+            "rowspan" => Some(&mut out.rowspan),
+            "valign" => Some(&mut out.valign),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
