@@ -885,17 +885,20 @@ impl Engine {
 
     // --- Sync passes -----------------------------------------------------
 
-    /// One sync pass: optionally re-enumerate folders, then delta-sync every
-    /// stored folder and drain the outbox. Auth/throttle/transport failures
-    /// abort the pass (state already set); per-folder 4xx/parse errors are
-    /// surfaced and skipped so one folder can't sink the rest.
-    fn sync_pass(&mut self, include_folders: bool) {
+    /// One sync pass: re-enumerate folders (#1886: every pass, so names,
+    /// parents, new and deleted folders and counts follow the server), then
+    /// delta-sync every stored folder and drain the outbox. A `full` pass
+    /// (startup, `Refresh`, sign-in, a pass that `needs_full_pass`) also
+    /// refreshes people and master categories. Auth/throttle/transport
+    /// failures abort the pass (state already set); per-folder 4xx/parse
+    /// errors are surfaced and skipped so one folder can't sink the rest.
+    fn sync_pass(&mut self, full: bool) {
         if self.token.is_none() {
             return;
         }
         self.set_state(SyncState::Syncing);
 
-        if include_folders && !self.sync_folders() {
+        if !self.sync_folders(full) {
             return;
         }
         let folders = match self.store.folders() {
@@ -930,12 +933,12 @@ impl Engine {
         // (cheap, idempotent). Best-effort: a failure here must not fail the pass.
         let _ = self.store.refresh_local_contacts();
 
-        // On a full pass (folders were re-enumerated, e.g. after sign-in),
-        // augment contacts from the corporate directory. Best-effort and
+        // On a full pass (startup, sign-in, `Refresh`), augment contacts
+        // from the corporate directory. Best-effort and
         // gracefully degrading: People.Read may be denied (403), blocked by
         // Conditional Access, or offline — in every case we skip it silently
         // and the locally-mined contacts still power autocomplete.
-        if include_folders {
+        if full {
             self.sync_people();
             self.refresh_master_categories();
         }
@@ -1093,8 +1096,16 @@ impl Engine {
         }
     }
 
-    /// GET the folder tree, upsert every folder, emit `FoldersUpdated`.
-    /// Returns `false` if the pass should abort (auth/throttle/transport).
+    /// GET the folder tree, upsert every folder and, after a complete
+    /// enumeration, remove the folders it no longer lists (#1886:
+    /// `Store::retain_folders`, which keeps the drafts sentinel while it
+    /// holds a draft). A partial listing (a `childFolders` call that failed)
+    /// still upserts what it listed and removes nothing; an empty one
+    /// removes nothing either. Removal runs before the pass's deltas, so a
+    /// deleted folder gets no delta. A `full` pass emits `FoldersUpdated`
+    /// after every successful list; a normal tick only when a folder row
+    /// was added, changed or removed. Returns `false` if the pass should
+    /// abort (auth/throttle/transport).
     ///
     /// If the real Drafts folder (`well_known_name = "drafts"`) is present in
     /// this fetch, also re-files (`Store::adopt_sentinel_drafts`) any
@@ -1103,22 +1114,33 @@ impl Engine {
     /// report for the gap this closes. Harmless (a no-op `UPDATE` matching
     /// zero rows) once already adopted, so this doesn't need a "did we
     /// already do this" flag.
-    fn sync_folders(&mut self) -> bool {
+    fn sync_folders(&mut self, full: bool) -> bool {
         match self.with_auth(|c| c.list_folders()) {
-            Ok(folders) => {
-                for f in &folders {
-                    let _ = self.store.upsert_folder(f);
+            Ok(listing) => {
+                let mut changed = false;
+                for f in &listing.folders {
+                    changed |= self.store.upsert_folder(f).unwrap_or(false);
                 }
-                if let Some(drafts) = folders
+                if let Some(drafts) = listing
+                    .folders
                     .iter()
                     .find(|f| f.well_known_name.as_deref() == Some("drafts"))
                 {
                     let _ = self.store.adopt_sentinel_drafts(&drafts.id);
                 }
+                if listing.complete && !listing.folders.is_empty() {
+                    let keep: Vec<String> = listing.folders.iter().map(|f| f.id.clone()).collect();
+                    match self.store.retain_folders(&keep) {
+                        Ok(removed) => changed |= removed > 0,
+                        Err(e) => self.emit(SyncEvent::Error(e.to_string())),
+                    }
+                }
                 // The initial enumeration has now succeeded at least once, so
                 // ticks can safely drop to incremental deltas.
                 self.backfill_done = true;
-                self.emit(SyncEvent::FoldersUpdated);
+                if full || changed {
+                    self.emit(SyncEvent::FoldersUpdated);
+                }
                 true
             }
             Err(e) => !self.react(e),
@@ -6689,8 +6711,9 @@ mod tests {
             |_| {},
         );
         assert!(wait_until(ENGINE_WAIT, || count(&srv, is_calendar) >= 1));
-        // The startup pass, then one tick: its folders' deltas and the
-        // calendar, and no counts GET of a single folder.
+        // The startup pass, then one tick: the folder tree (#1886), its
+        // folders' deltas and the calendar; no people or categories, and no
+        // counts GET of a single folder.
         let kinds: Vec<&str> = paths_from(&srv, 0)
             .iter()
             .map(|p| {
@@ -6726,6 +6749,9 @@ mod tests {
                 "delta F2",
                 "people",
                 "categories",
+                "list",
+                "children F1",
+                "children F2",
                 "delta F1",
                 "delta F2",
             ]

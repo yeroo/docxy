@@ -9,8 +9,9 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, MailFolder, MasterCategory, Message,
-    MessageFields, OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
+    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderListing, MailFolder,
+    MasterCategory, Message, MessageFields, OofStatus, Person, Recipient, Recurrence,
+    ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -70,6 +71,15 @@ pub enum DeltaCursor {
     Link(String),
 }
 
+/// One page of a folder list (`GraphClient::fetch_folder_page`).
+struct FolderPage {
+    /// Each listed folder with its `childFolderCount` (`None` when absent).
+    folders: Vec<(MailFolder, Option<i64>)>,
+    /// False when a listed item had no id (and was dropped).
+    all_have_ids: bool,
+    next_link: Option<String>,
+}
+
 /// Which RSVP action `respond_event` sends, mapped to Graph's
 /// `/me/events/{id}/accept|decline|tentativelyAccept` endpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,73 +137,132 @@ impl GraphClient {
     /// recursively GET each folder's `/childFolders?$top=100`, flattening
     /// the whole tree into one `Vec` (each folder's `parent_id`, parsed from
     /// Graph's `parentFolderId`, is enough for callers to reconstruct the
-    /// hierarchy later). A `visited` guard skips any folder id already
+    /// hierarchy later). Every list follows `@odata.nextLink` until Graph
+    /// stops sending one. A `visited` guard skips any folder id already
     /// collected, so a server that (erroneously, or via test-double route
     /// reuse) reports a folder as its own descendant can't recurse forever.
     ///
-    /// The top-level call's error always propagates (can't list folders at
-    /// all is a real failure). Each folder's `childFolders` sub-call has a
-    /// looser policy — see `collect_folder_and_children`.
-    pub fn list_folders(&self) -> Result<Vec<MailFolder>, GraphError> {
-        let resp = self.send(Method::Get, "/me/mailFolders?$top=100", None, &[])?;
-        let v = parse_body(resp)?;
-        let items = value_array(&v, "value")?;
-        let top: Vec<MailFolder> = items.iter().filter_map(MailFolder::from_json).collect();
-
-        let mut all = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        for folder in top {
-            self.collect_folder_and_children(folder, &mut all, &mut visited)?;
+    /// A folder whose `childFolderCount` is 0 has no `childFolders` call
+    /// (#1886: the sync engine lists the tree on every tick); one without
+    /// the property is asked.
+    ///
+    /// An error on any top-level page always propagates (can't list folders
+    /// at all is a real failure). Each folder's `childFolders` sub-call has a
+    /// looser policy — see `collect_folder_and_children` — that leaves the
+    /// listing incomplete (`FolderListing::complete`), as does a listed
+    /// folder without an id, which is dropped.
+    pub fn list_folders(&self) -> Result<FolderListing, GraphError> {
+        let mut top = Vec::new();
+        let mut complete = true;
+        let mut target = "/me/mailFolders?$top=100".to_string();
+        loop {
+            let page = self.fetch_folder_page(&target)?;
+            complete &= page.all_have_ids;
+            top.extend(page.folders);
+            match page.next_link {
+                Some(next) => target = next,
+                None => break,
+            }
         }
-        Ok(all)
+
+        let mut listing = FolderListing {
+            folders: Vec::new(),
+            complete,
+        };
+        let mut visited = std::collections::HashSet::new();
+        for (folder, child_count) in top {
+            self.collect_folder_and_children(folder, child_count, &mut listing, &mut visited)?;
+        }
+        Ok(listing)
     }
 
-    /// Pushes `folder` onto `out`, then fetches and recurses into its
-    /// `/childFolders`. See `list_folders` for the `visited` cycle guard.
+    /// Pushes `folder` onto `out`, then fetches (every page of) and recurses
+    /// into its `/childFolders`, unless `child_count` says it has none. See
+    /// `list_folders` for the `visited` cycle guard.
     ///
     /// Error policy for the `childFolders` sub-call: `Unauthorized` and
     /// `Throttled` are global conditions the sync engine must handle
     /// centrally (refresh the token / back off), so those propagate out of
     /// `list_folders` same as before. Anything else (`NotFound`, `Http`,
-    /// `Transport`, malformed-JSON `Parse`) is treated as "no discoverable
-    /// children for this folder" and skipped — a transient failure or a 404
+    /// `Transport`, malformed-JSON `Parse`) keeps the children listed so far
+    /// and marks the listing incomplete — a transient failure or a 404
     /// on one deep, obscure subfolder must not discard the folders already
     /// collected (Inbox, Sent, etc.), which is what propagating via `?`
-    /// unconditionally would do.
+    /// unconditionally would do, and must not let the engine remove the
+    /// folders it could not see.
     fn collect_folder_and_children(
         &self,
         folder: MailFolder,
-        out: &mut Vec<MailFolder>,
+        child_count: Option<i64>,
+        out: &mut FolderListing,
         visited: &mut std::collections::HashSet<String>,
     ) -> Result<(), GraphError> {
         if !visited.insert(folder.id.clone()) {
             return Ok(());
         }
-        let path = format!(
+        let mut target = format!(
             "/me/mailFolders/{}/childFolders?$top=100",
             encode_path_segment(&folder.id)
         );
-        out.push(folder);
+        out.folders.push(folder);
+        if child_count == Some(0) {
+            return Ok(());
+        }
 
-        let children = match self.fetch_child_folders(&path) {
-            Ok(children) => children,
-            Err(e @ (GraphError::Unauthorized | GraphError::Throttled { .. })) => return Err(e),
-            Err(_) => return Ok(()),
-        };
-        for child in children {
-            self.collect_folder_and_children(child, out, visited)?;
+        let mut children = Vec::new();
+        loop {
+            match self.fetch_folder_page(&target) {
+                Ok(page) => {
+                    out.complete &= page.all_have_ids;
+                    children.extend(page.folders);
+                    match page.next_link {
+                        Some(next) => target = next,
+                        None => break,
+                    }
+                }
+                Err(e @ (GraphError::Unauthorized | GraphError::Throttled { .. })) => {
+                    return Err(e);
+                }
+                Err(_) => {
+                    out.complete = false;
+                    break;
+                }
+            }
+        }
+        for (child, count) in children {
+            self.collect_folder_and_children(child, count, out, visited)?;
         }
         Ok(())
     }
 
-    /// GET a `childFolders` page and parse it into `MailFolder`s. Split out
-    /// of `collect_folder_and_children` so that method's error-tolerance
-    /// match has a single fallible call to match on.
-    fn fetch_child_folders(&self, path: &str) -> Result<Vec<MailFolder>, GraphError> {
-        let resp = self.send(Method::Get, path, None, &[])?;
+    /// GET one page of a folder list (`/me/mailFolders` or a
+    /// `childFolders`, or a `nextLink` of either): each folder with its
+    /// `childFolderCount`, whether every listed item had an id (one
+    /// without is dropped), and the page's `@odata.nextLink`.
+    fn fetch_folder_page(&self, target: &str) -> Result<FolderPage, GraphError> {
+        let resp = self.send(Method::Get, target, None, &[])?;
         let v = parse_body(resp)?;
         let items = value_array(&v, "value")?;
-        Ok(items.iter().filter_map(MailFolder::from_json).collect())
+        let mut folders = Vec::with_capacity(items.len());
+        let mut all_have_ids = true;
+        for item in items {
+            match MailFolder::from_json(item) {
+                Some(f) if !f.id.is_empty() => {
+                    let child_count = item.get("childFolderCount").and_then(Value::as_i64);
+                    folders.push((f, child_count));
+                }
+                _ => all_have_ids = false,
+            }
+        }
+        let next_link = v
+            .get("@odata.nextLink")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok(FolderPage {
+            folders,
+            all_have_ids,
+            next_link,
+        })
     }
 
     /// GET `/me/mailFolders/{id}?$select=totalItemCount,unreadItemCount`:
@@ -1153,8 +1222,9 @@ mod tests {
             body: r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":2,"unreadItemCount":1,"wellKnownName":"inbox"}]}"#.into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        let folders = c.list_folders().unwrap();
-        assert_eq!(folders[0].display_name, "Inbox");
+        let listing = c.list_folders().unwrap();
+        assert_eq!(listing.folders[0].display_name, "Inbox");
+        assert!(listing.complete);
     }
 
     #[test]
@@ -1558,7 +1628,9 @@ mod tests {
             },
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        let folders = c.list_folders().unwrap();
+        let listing = c.list_folders().unwrap();
+        assert!(listing.complete);
+        let folders = listing.folders;
         assert_eq!(folders.len(), 2);
         assert!(
             folders
@@ -1591,9 +1663,199 @@ mod tests {
             },
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        let folders = c.list_folders().unwrap();
-        assert_eq!(folders.len(), 1);
-        assert_eq!(folders[0].id, "F1");
+        let listing = c.list_folders().unwrap();
+        assert_eq!(listing.folders.len(), 1);
+        assert_eq!(listing.folders[0].id, "F1");
+        // F1's children are unknown, so the listing is incomplete (#1886).
+        assert!(!listing.complete);
+    }
+
+    /// A folder JSON object with a `childFolderCount` (`None`: absent).
+    fn folder_json(id: &str, parent: Option<&str>, children: Option<i64>) -> String {
+        let parent = parent.map_or("null".to_string(), |p| format!("\"{p}\""));
+        let children = children.map_or(String::new(), |n| format!(r#","childFolderCount":{n}"#));
+        format!(
+            r#"{{"id":"{id}","displayName":"{id}","parentFolderId":{parent},"totalItemCount":0,"unreadItemCount":0{children}}}"#
+        )
+    }
+
+    fn get(path_prefix: &str, status: u16, body: String) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: path_prefix.into(),
+            status,
+            headers: vec![],
+            body,
+        }
+    }
+
+    fn ids(listing: &FolderListing) -> Vec<&str> {
+        listing.folders.iter().map(|f| f.id.as_str()).collect()
+    }
+
+    #[test]
+    fn list_folders_follows_next_links_at_top_and_in_children() {
+        // Second pages first: the fake server matches the first route whose
+        // prefix fits, and `/me/mailFolders?` / `/me/mailFolders/F1/...`
+        // would also match them.
+        let srv = FakeServer::start(vec![
+            get(
+                "/me/mailFolders/F1/childFolders?$skiptoken=C2",
+                200,
+                format!(
+                    r#"{{"value":[{}]}}"#,
+                    folder_json("C2", Some("F1"), Some(0))
+                ),
+            ),
+            get(
+                "/me/mailFolders/F1/childFolders",
+                200,
+                format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/mailFolders/F1/childFolders?$skiptoken=C2"}}"#,
+                    folder_json("C1", Some("F1"), Some(0))
+                ),
+            ),
+            get(
+                "/me/mailFolders?$top=100&$skiptoken=P2",
+                200,
+                format!(r#"{{"value":[{}]}}"#, folder_json("F2", None, Some(0))),
+            ),
+            get(
+                "/me/mailFolders?",
+                200,
+                format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/mailFolders?$top=100&$skiptoken=P2"}}"#,
+                    folder_json("F1", None, Some(2))
+                ),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let listing = c.list_folders().unwrap();
+        assert!(listing.complete);
+        assert_eq!(ids(&listing), vec!["F1", "C1", "C2", "F2"]);
+    }
+
+    #[test]
+    fn list_folders_skips_children_of_a_leaf() {
+        // F1 says it has no children: no `childFolders` call. F2 does not
+        // say: asked, as before.
+        let srv = FakeServer::start(vec![
+            get(
+                "/me/mailFolders/F2/childFolders",
+                200,
+                r#"{"value":[]}"#.into(),
+            ),
+            get(
+                "/me/mailFolders?",
+                200,
+                format!(
+                    r#"{{"value":[{},{}]}}"#,
+                    folder_json("F1", None, Some(0)),
+                    folder_json("F2", None, None)
+                ),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let listing = c.list_folders().unwrap();
+        assert!(listing.complete);
+        assert_eq!(ids(&listing), vec!["F1", "F2"]);
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("/F1/childFolders")),
+            "{paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("/F2/childFolders")),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn list_folders_is_incomplete_after_a_child_error() {
+        // F1's children answer 500: F1, F2 and nothing under F1 are listed,
+        // and the listing says it is incomplete.
+        let srv = FakeServer::start(vec![
+            get("/me/mailFolders/F1/childFolders", 500, "boom".into()),
+            get(
+                "/me/mailFolders?",
+                200,
+                format!(
+                    r#"{{"value":[{},{}]}}"#,
+                    folder_json("F1", None, Some(1)),
+                    folder_json("F2", None, Some(0))
+                ),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let listing = c.list_folders().unwrap();
+        assert_eq!(ids(&listing), vec!["F1", "F2"]);
+        assert!(!listing.complete);
+    }
+
+    #[test]
+    fn list_folders_is_incomplete_after_a_later_child_page_error() {
+        // The first page of F1's children came; the second answers 500. C1
+        // is kept, and the listing is incomplete.
+        let srv = FakeServer::start(vec![
+            get(
+                "/me/mailFolders/F1/childFolders?$skiptoken=C2",
+                500,
+                "boom".into(),
+            ),
+            get(
+                "/me/mailFolders/F1/childFolders",
+                200,
+                format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/mailFolders/F1/childFolders?$skiptoken=C2"}}"#,
+                    folder_json("C1", Some("F1"), Some(0))
+                ),
+            ),
+            get(
+                "/me/mailFolders?",
+                200,
+                format!(r#"{{"value":[{}]}}"#, folder_json("F1", None, Some(2))),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let listing = c.list_folders().unwrap();
+        assert_eq!(ids(&listing), vec!["F1", "C1"]);
+        assert!(!listing.complete);
+    }
+
+    #[test]
+    fn list_folders_top_level_later_page_error_propagates() {
+        let srv = FakeServer::start(vec![
+            get("/me/mailFolders?$top=100&$skiptoken=P2", 500, "boom".into()),
+            get(
+                "/me/mailFolders?",
+                200,
+                format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/mailFolders?$top=100&$skiptoken=P2"}}"#,
+                    folder_json("F1", None, Some(0))
+                ),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.list_folders(),
+            Err(GraphError::Http { status: 500, .. })
+        ));
+    }
+
+    #[test]
+    fn list_folders_drops_a_folder_without_an_id_and_is_incomplete() {
+        let srv = FakeServer::start(vec![get(
+            "/me/mailFolders?",
+            200,
+            format!(
+                r#"{{"value":[{},{{"displayName":"no id","childFolderCount":0}}]}}"#,
+                folder_json("F1", None, Some(0))
+            ),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let listing = c.list_folders().unwrap();
+        assert_eq!(ids(&listing), vec!["F1"]);
+        assert!(!listing.complete);
     }
 
     #[test]
