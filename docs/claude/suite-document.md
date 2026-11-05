@@ -217,19 +217,26 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   drawn is unchanged, it just stops failing first. The mono family takes its
   substitutes or the mono list. macOS and Windows keep theirs.
 - The embedded `ext::DocView` (#1873) calls `font_subst::init` from
-  `DocView::new` and gives its root `.font_family(ui_family(host theme font))`
-  without touching the host's theme; `Measurer::new` resolves its base family
-  the same way, so measured = drawn.
-- Installed or not: `TextSystem::all_font_names` (a name not listed never
-  reaches gpui) plus one probe per listed candidate (`resolve_font` +
-  `get_font_for_id`; gpui's `font_id` is private), since gpui lists its own
-  fallback stack whether installed or not. `init` snapshots the list: it runs
-  after any `add_fonts`, and fonts added later are not seen. Before `init`
-  (unit tests) every family passes through unchanged.
+  `DocView::new` and gives its root `.font_family(ui_family(inherited family))`
+  (whatever the host's ancestors set) without touching the host's theme;
+  `Measurer::new` resolves the same inherited family, so measured = drawn.
+- Installed or not: one probe per name (`resolve_font` + `get_font_for_id`;
+  gpui's `font_id` is private), since `TextSystem::all_font_names` lists
+  gpui's own fallback stack whether installed or not. A substitute or generic
+  candidate not in that list never reaches gpui. The family asked for is
+  probed even when not listed, and drawn as asked when it loads: the list holds
+  one name per family (Linux: a face's first family name; Windows: one
+  localized name), while gpui also loads "Calibri Light", "Segoe UI Semibold"
+  or a localized name. So a missing family costs one failed lookup per process.
+  `init` snapshots the list: it runs after any `add_fonts`, and fonts added
+  later are not seen. Before `init` (unit tests) every family passes through
+  unchanged.
 - `font_subst::tests::every_family_reaching_gpui_is_resolved` scans
-  `suite/docxy/src` for `.font_family(`, `font.family =` and `family: "`: each
-  needs `font_subst::` on its line or the two above, or an entry in its
-  commented allowlist.
+  `suite/docxy/src` for every way of setting a family (`sets_family`:
+  `.font_family(`, `font_family` / `.family` assignments and fields, free
+  `font(` calls, `family:` in a `Font {` literal; comments ignored): each needs
+  `font_subst::` in code on its line or the two above, or an allowlist entry,
+  which names the resolver line its file must hold.
 - Not done: a real platform-match tier (fontconfig `FcFontMatch`, CoreText,
   DirectWrite fallback) for unknown families; the generic serif/mono lists
   stand in.

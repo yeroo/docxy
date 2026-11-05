@@ -80,13 +80,18 @@ type Probe = Box<dyn Fn(&str) -> bool + Send>;
 pub(crate) struct Resolver {
     /// Installed family names, lower case → their own spelling. gpui's list
     /// also holds its fallback stack and `.SystemUIFont` whether installed or
-    /// not, hence the probe. On Linux it holds only each face's first family
-    /// name, so a substitute known only by another name is skipped (safe).
+    /// not, hence the probe. It holds one name per family (Linux: each face's
+    /// first family name; Windows: one localized name), while gpui loads more
+    /// ("Calibri Light", "Segoe UI Semibold", localized names), so a requested
+    /// family not listed is probed too ([`Resolver::requested`]).
     installed: HashMap<String, SharedString>,
     /// Whether gpui really loads a family (it may make one failed lookup).
     probe: Probe,
-    /// Probe results, by lower-case family.
+    /// Probe results of listed families, by lower-case family.
     probed: HashMap<String, bool>,
+    /// Probe results of requested families not listed, by the trimmed name
+    /// as asked (Linux matches family names case-sensitively).
+    probed_unlisted: HashMap<String, bool>,
     /// Resolved document families, by the exact name asked for.
     resolved: HashMap<String, Option<SharedString>>,
     /// Resolved theme families (sans and mono), by the exact name asked for.
@@ -105,14 +110,15 @@ impl Resolver {
             installed,
             probe: Box::new(probe),
             probed: HashMap::new(),
+            probed_unlisted: HashMap::new(),
             resolved: HashMap::new(),
             ui: HashMap::new(),
             probes: 0,
         }
     }
 
-    /// `name`'s installed spelling when gpui loads it; a name not installed
-    /// never reaches gpui.
+    /// `name`'s installed spelling when gpui loads it; a candidate not
+    /// listed never reaches gpui.
     fn available(&mut self, name: &str) -> Option<SharedString> {
         let lower = name.trim().to_lowercase();
         let canonical = self.installed.get(&lower)?.clone();
@@ -132,6 +138,29 @@ impl Resolver {
         names.iter().find_map(|n| self.available(n))
     }
 
+    /// The family asked for itself, when gpui loads it: in its listed
+    /// spelling, or as asked when the list does not hold it (probed once per
+    /// name). Substitutes and generic candidates keep the list's gate.
+    fn requested(&mut self, name: &str) -> Option<SharedString> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if self.installed.contains_key(&name.to_lowercase()) {
+            return self.available(name);
+        }
+        let ok = match self.probed_unlisted.get(name) {
+            Some(&ok) => ok,
+            None => {
+                self.probes += 1;
+                let ok = (self.probe)(name);
+                self.probed_unlisted.insert(name.to_string(), ok);
+                ok
+            }
+        };
+        ok.then(|| SharedString::from(name.to_string()))
+    }
+
     /// The family to draw `family` in, or `None` for the inherited font.
     pub(crate) fn resolve(&mut self, family: &str) -> Option<SharedString> {
         if let Some(hit) = self.resolved.get(family) {
@@ -141,7 +170,7 @@ impl Resolver {
             None
         } else {
             let lower = family.trim().to_lowercase();
-            self.available(family)
+            self.requested(family)
                 .or_else(|| self.first_available(docxcore::fonts::substitutes(family)))
                 .or_else(|| self.first_available(generic_class(&lower)))
         };
@@ -167,7 +196,7 @@ impl Resolver {
             return hit.clone();
         }
         let found = self
-            .available(theme)
+            .requested(theme)
             .or_else(|| {
                 if mono {
                     self.first_available(docxcore::fonts::substitutes(theme))
@@ -208,9 +237,14 @@ pub(crate) fn init(cx: &App) {
             let named = ts
                 .get_font_for_id(id)
                 .is_some_and(|f| f.family.eq_ignore_ascii_case(name));
+            if named {
+                // Not asking for the sentinel spares a walk of gpui's fallback
+                // stack, which panics when none of it loads.
+                return true;
+            }
             let fallback =
                 *missing.get_or_init(|| ts.resolve_font(&font("\u{1}docxy no such font")));
-            named || id != fallback
+            id != fallback
         }))
     });
 }

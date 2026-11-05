@@ -2,20 +2,32 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// A resolver over `installed`, whose probe fails for every name in
-/// `broken` (listed but not loadable, like gpui's own fallback stack on
-/// Linux), counting gpui calls in the returned counter.
+/// A resolver over `installed`, whose probe loads exactly the installed
+/// names but those in `broken` (listed but not loadable, like gpui's own
+/// fallback stack on Linux), counting gpui calls in the returned counter.
 fn resolver(installed: &[&str], broken: &[&str]) -> (Resolver, Arc<AtomicUsize>) {
+    resolver_with(installed, &[], broken)
+}
+
+/// [`resolver`] whose probe also loads `unlisted` (names gpui loads but does
+/// not list, such as "Calibri Light" on Windows).
+fn resolver_with(
+    installed: &[&str],
+    unlisted: &[&str],
+    broken: &[&str],
+) -> (Resolver, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
-    let broken: Vec<String> = broken.iter().map(|s| s.to_string()).collect();
-    let r = Resolver::new(
-        installed.iter().map(|s| s.to_string()).collect(),
-        move |name| {
-            seen.fetch_add(1, Ordering::SeqCst);
-            !broken.iter().any(|b| b == name)
-        },
-    );
+    let owned = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let loads: Vec<String> = owned(installed)
+        .into_iter()
+        .chain(owned(unlisted))
+        .collect();
+    let broken = owned(broken);
+    let r = Resolver::new(owned(installed), move |name| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        loads.iter().any(|l| l == name) && !broken.iter().any(|b| b == name)
+    });
     (r, calls)
 }
 
@@ -83,10 +95,40 @@ fn a_listed_family_gpui_cannot_load_is_not_used() {
 }
 
 #[test]
-fn a_family_not_listed_never_reaches_gpui() {
-    let (mut r, calls) = resolver(&["Liberation Sans"], &[]);
-    assert_eq!(r.resolve("Zzz Font"), None);
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+fn a_requested_family_not_listed_is_probed_once_and_drawn_as_asked() {
+    // gpui lists one name per family, but loads "Calibri Light" (Windows) or
+    // a face's second family name (Linux) too.
+    let (mut r, calls) = resolver_with(&["Calibri", "Carlito"], &["Calibri Light"], &[]);
+    assert_eq!(r.resolve(" Calibri Light "), some("Calibri Light"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(r.resolve("Calibri Light"), some("Calibri Light"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_requested_family_not_listed_that_fails_takes_its_substitute() {
+    let (mut r, calls) = resolver(&["Carlito"], &[]);
+    assert_eq!(r.resolve("Calibri"), some("Carlito"));
+    assert_eq!(r.resolve("calibri"), some("Carlito"));
+    // "Calibri" and "calibri" once each (Linux names are case-sensitive),
+    // Carlito once.
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn substitutes_not_listed_never_reach_gpui() {
+    // Only the family asked for is probed unlisted; Carlito and Liberation
+    // Sans, not listed, are skipped without a gpui call.
+    let (mut r, calls) = resolver(&["DejaVu Sans"], &[]);
+    assert_eq!(r.resolve("Calibri"), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn an_unlisted_theme_font_that_loads_is_kept() {
+    let (mut r, _) = resolver_with(&["Ubuntu"], &["Host Sans"], &[]);
+    assert_eq!(r.ui_family("Host Sans"), "Host Sans");
+    assert_eq!(r.ui_family(""), "Ubuntu");
 }
 
 #[test]
@@ -152,8 +194,8 @@ fn layout_passes_after_the_first_make_no_gpui_lookups() {
         pass(&mut r);
     }
     assert_eq!(calls.load(Ordering::SeqCst), after_first);
-    // And each candidate was asked at most once.
-    assert!(after_first <= r.installed.len());
+    // And each name was asked at most once.
+    assert_eq!(after_first, r.probed.len() + r.probed_unlisted.len());
 }
 
 #[test]
@@ -164,23 +206,95 @@ fn before_init_a_family_passes_through() {
     assert_eq!(ui_family(&".SystemUIFont".into()), ".SystemUIFont");
 }
 
+/// `line` without its `//` comment, trimmed.
+fn code(line: &str) -> &str {
+    line.split("//").next().unwrap_or("").trim()
+}
+
+/// Whether `rest` (what follows a name) assigns or initialises it: `=` (not
+/// `==`) or `:` (not `::`).
+fn assigns(rest: &str) -> bool {
+    let rest = rest.trim_start();
+    (rest.starts_with('=') && !rest.starts_with("=="))
+        || (rest.starts_with(':') && !rest.starts_with("::"))
+}
+
+/// What follows each `pat` in `t`.
+fn after<'a>(t: &'a str, pat: &'a str) -> impl Iterator<Item = &'a str> {
+    t.match_indices(pat)
+        .map(move |(at, _)| &t[at + pat.len()..])
+}
+
+/// Whether code line `i` of `lines` hands gpui a font family: a
+/// `.font_family(` call, a `font_family` or `.family` assignment or field, a
+/// free `font(` / `gpui::font(` call, or a `family:` field of a `Font {`
+/// literal (opened on that line or the three above).
+fn sets_family(lines: &[&str], i: usize) -> bool {
+    let t = code(lines[i]);
+    let free_font = t.match_indices("font(").any(|(at, _)| {
+        !t[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    });
+    let in_font_literal = lines[i.saturating_sub(3)..=i]
+        .iter()
+        .any(|l| code(l).contains("Font {"));
+    t.contains(".font_family(")
+        || after(t, "font_family").any(assigns)
+        || after(t, ".family").any(assigns)
+        || free_font
+        || (in_font_literal && after(t, "family").any(assigns))
+}
+
+#[test]
+fn the_scan_sees_every_way_of_setting_a_family() {
+    let sets = |src: &str, i: usize| sets_family(&src.lines().collect::<Vec<_>>(), i);
+    for line in [
+        "d.font_family(name)",
+        "font_family: name,",
+        "theme.font_family = name;",
+        "font.family = name;",
+        "base.family = name.into();",
+        "let f = font(name);",
+        "let f = gpui::font(name);",
+    ] {
+        assert!(sets(line, 0), "{line}");
+    }
+    assert!(sets("let f = Font {\n    family: name,", 1));
+    for line in [
+        "// d.font_family(name)",
+        "let x = 1; // font.family = name",
+        "fn f(family: Option<&str>) {}",
+        "window.text_style().font()",
+        "if font.family == name {}",
+        "let f = text_font(name);",
+    ] {
+        assert!(!sets(line, 0), "{line}");
+    }
+}
+
 /// Every family the suite hands gpui goes through this module. A line that
-/// sets a family must name `font_subst::` on it or on one of the two lines
-/// above, or be in [`RESOLVED`].
+/// sets a family ([`sets_family`]) must call `font_subst::` on it or on one
+/// of the two lines above (comments do not count), or be in `RESOLVED`.
 #[test]
 fn every_family_reaching_gpui_is_resolved() {
-    /// Lines whose family was resolved further up: (file, line text).
-    const RESOLVED: &[(&str, &str)] = &[
-        // `family` is `font_subst::family`'s, resolved once per run before the
-        // word loop.
+    /// Lines whose family was resolved further up: (file, line, the resolver
+    /// line the file must hold).
+    const RESOLVED: &[(&str, &str, &str)] = &[
+        // `emit_words` resolves once per run, before the word loop.
         (
             "main.rs",
             ".when_some(family.clone(), |d, f| d.font_family(f))",
+            "let family = props.font.as_deref().and_then(font_subst::family);",
         ),
-        // `ui_font` is `font_subst::ui_family`'s, a few lines up in render.
-        ("doc_view.rs", ".font_family(ui_font)"),
+        // DocView's root draws in the family its Measurer measures in.
+        (
+            "doc_view.rs",
+            ".font_family(ui_font)",
+            "let ui_font = crate::font_subst::ui_family(",
+        ),
     ];
-    const SETTERS: &[&str] = &[".font_family(", "font.family =", "family: \""];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     let mut dirs = vec![src.clone()];
@@ -195,6 +309,7 @@ fn every_family_reaching_gpui_is_resolved() {
         }
     }
     let mut bad = Vec::new();
+    let mut found = Vec::new();
     for path in files {
         let rel = path
             .strip_prefix(&src)
@@ -208,17 +323,30 @@ fn every_family_reaching_gpui_is_resolved() {
         let text = std::fs::read_to_string(&path).expect("read file");
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            let t = line.trim();
-            if t.starts_with("//") || !SETTERS.iter().any(|s| t.contains(s)) {
+            if !sets_family(&lines, i) {
                 continue;
             }
+            let t = code(line);
             let near = lines[i.saturating_sub(2)..=i]
                 .iter()
-                .any(|l| l.contains("font_subst::"));
-            let listed = RESOLVED.iter().any(|(f, l)| *f == name && t == *l);
-            if !near && !listed {
-                bad.push(format!("{rel}:{}: {t}", i + 1));
+                .any(|l| code(l).contains("font_subst::"));
+            let listed = RESOLVED.iter().find(|(f, l, _)| *f == name && t == *l);
+            match listed {
+                Some(entry) => {
+                    let resolver = entry.2;
+                    if !lines.iter().any(|l| code(l).starts_with(resolver)) {
+                        bad.push(format!("{rel}: no `{resolver}` for `{t}`"));
+                    }
+                    found.push(entry);
+                }
+                None if !near => bad.push(format!("{rel}:{}: {t}", i + 1)),
+                None => {}
             }
+        }
+    }
+    for entry in RESOLVED {
+        if !found.contains(&entry) {
+            bad.push(format!("stale allowlist entry: {entry:?}"));
         }
     }
     assert!(bad.is_empty(), "families not resolved:\n{}", bad.join("\n"));
