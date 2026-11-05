@@ -6,8 +6,10 @@
 //! list membership (numbering ids 1 = bullets and 2 = decimal, the two that
 //! [`crate::package::new_markdown_package`] defines) and simple tables. The
 //! result has no package of its own; it is saved through a fresh Markdown
-//! package, which defines every style and list it uses. Images, fields,
-//! notes, comments and section layout are not converted.
+//! package, which defines every style and list it uses. Fields, notes,
+//! comments and section layout are not converted; images only by
+//! [`html::import_html_with`] (#1880), whose [`html::HtmlImport`] carries
+//! their media into the package it builds.
 //!
 //! Format is decided by content first ([`sniff`]), so an RTF or HTML file
 //! named `.doc` or `.docx` still opens as what it is.
@@ -59,7 +61,12 @@
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
 //! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | one scan a tag | the fifteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign`) copied, first of a name only |
+//! | html attributes | one scan a tag | the eighteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign src alt height`) copied, first of a name only |
+//! | html `<img>` (#1880) | its look; the picture run | as an element's look, without being pushed; the run's XML built (alt ≤ `MAX_ALT` 1024 chars) |
+//! | `html_image::decode_data_uri` | a `data:` src: counted, then percent- and base64-decoded | work (src/16), up front; refused unless its counted size fits the image's limit; the bytes decoded |
+//! | `ImageResolver` answer | the bytes another src resolves to | the resolver is told the limit (room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES` 128 MiB leaves); a longer answer dropped; decoded |
+//! | resolver calls, src cache | one call per distinct src | ≤ `MAX_IMAGES` (1000) calls; each cached src built (its length) |
+//! | `Images::add` | a medium equal to one kept | work (len/16) per kept medium of the same length; kept media ≤ `MAX_MEDIA_BYTES` in all, so a converting child holds ≤ 3 × 128 MiB of them (import, package, the copy a save clones) |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |
 //! | `recover::document_xml` | the header scan | work (input/16), up front; forward only |
@@ -97,12 +104,14 @@
 
 pub(crate) mod css;
 pub mod html;
+pub mod html_image;
 pub(crate) mod html_table;
 pub mod pdf;
 pub mod recover;
 pub mod rtf;
 
-pub use html::import_html;
+pub use html::{HtmlImport, import_html, import_html_with};
+pub use html_image::{ImageResolver, ImportedMedia};
 pub use pdf::import_pdf;
 pub use recover::{paragraph_count, recover_any_text, recover_docx_text};
 pub use rtf::import_rtf;
@@ -353,6 +362,12 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric()))
 }
 
+/// An inline that is neither text nor a break: an object, content of its
+/// own.
+fn is_object(inline: &Inline) -> bool {
+    !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
+}
+
 /// The heap bytes of the run properties an importer sets: font, colour,
 /// highlight and style names, kept elements.
 fn props_heap(p: &RunProps) -> usize {
@@ -459,6 +474,20 @@ impl<'b> Builder<'b> {
         self.para.iter().map(|i| i.text()).collect()
     }
 
+    /// Append an object (an imported picture's run, #1880) to the paragraph
+    /// in progress, charged with its XML.
+    pub(crate) fn object(&mut self, inline: Inline, heap: usize) {
+        if self.budget.keep::<Inline>(heap) {
+            self.para.push(inline);
+        }
+    }
+
+    /// Whether the paragraph in progress holds an object: content though it
+    /// has no text.
+    pub(crate) fn has_object(&self) -> bool {
+        self.para.iter().any(is_object)
+    }
+
     /// Drop everything in the paragraph in progress (text only made of
     /// spaces that stands for an empty paragraph).
     pub(crate) fn clear_para(&mut self) {
@@ -487,6 +516,14 @@ impl<'b> Builder<'b> {
         let mut drop = n + gap;
         let mut whole = 0;
         for inline in &self.para {
+            if drop == 0 {
+                break;
+            }
+            // An object (an imported picture, #1880) before the marker's
+            // end: the paragraph does not start with a typed marker.
+            if is_object(inline) {
+                return None;
+            }
             let len = inline.text().chars().count();
             if len > drop {
                 break;
