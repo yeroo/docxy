@@ -30,6 +30,7 @@
 //! |---|---|---|
 //! | `sniff` | first 1 KB, first 4 KB | constant |
 //! | `Builder::text` | a run's text appended | work (len/16) + built (len); a new run built (`size_of::<Inline>` + its props' strings) |
+//! | `Builder::link_text` (#1879) | text in a link | as `Builder::text`; a new hyperlink built (`size_of::<Inline>` + a run + its props' strings + the target), an extra run in it built (`size_of::<Run>` + its props' strings) |
 //! | `Builder::tab`, `line_break`, `page_break` | one inline | work + built (with its props' strings) |
 //! | `Builder::end_para` / `end_cell` / `end_row` | a paragraph / cell / row | work + built (`size_of` each) |
 //! | `Builder::end_cell`, `end_table` | cells past `MAX_COLUMNS` | join the last cell (no new cell) |
@@ -59,9 +60,10 @@
 //! | html formatting reopened after a truncation | elements kept, looks restyled | ≤ depth, at most three alike counting those open below (work below/16 + 1 each); as `restyle` |
 //! | html `out_of_scope` | the element stack, searched once | per close tag, ≤ 256 |
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
-//! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each |
+//! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each, and its link (#1879) shared (`Rc`), ≤ `MAX_HREF` (4096) bytes, so a look's clone copies none of it |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | one scan a tag | the eighteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign src alt height`) copied, first of a name only |
+//! | html attributes | one scan a tag | the nineteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign src alt height href`) copied, first of a name only |
+//! | html `link_of` (#1879) | an `a`'s `href`, once per look computed | O(href), refused unread past 2 × `MAX_HREF`; within the attribute scan's cost |
 //! | html `<img>` (#1880) | its look; the picture run | as an element's look, without being pushed; the run's XML built (alt ≤ `MAX_ALT` 1024 chars) |
 //! | `html_image::decode_data_uri` | a `data:` src: counted, then percent- and base64-decoded | work (src/16), up front; refused unless its counted size fits the image's limit; the bytes decoded |
 //! | `ImageResolver` answer | the bytes another src resolves to | the resolver is told the limit (room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES` 128 MiB leaves); a longer answer dropped; decoded |
@@ -117,7 +119,8 @@ pub use recover::{paragraph_count, recover_any_text, recover_docx_text};
 pub use rtf::import_rtf;
 
 use crate::model::{
-    Block, BreakKind, Cell, Document, Inline, ParProps, Paragraph, Row, Run, RunProps, Table,
+    Block, BreakKind, Cell, Document, Hyperlink, Inline, ParProps, Paragraph, Row, Run, RunProps,
+    Table,
 };
 use std::cell::Cell as Counter;
 
@@ -362,10 +365,40 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric()))
 }
 
-/// An inline that is neither text nor a break: an object, content of its
-/// own.
+/// An inline that is neither text nor a break nor a link: an object,
+/// content of its own. A link (#1879) counts by its text.
 fn is_object(inline: &Inline) -> bool {
-    !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(..))
+    !matches!(
+        inline,
+        Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Hyperlink(_)
+    )
+}
+
+/// Where an imported link (#1879) goes: an external URL, or an anchor (a
+/// bookmark name) in the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Link {
+    Url(String),
+    Anchor(String),
+}
+
+impl Link {
+    fn heap(&self) -> usize {
+        match self {
+            Link::Url(s) | Link::Anchor(s) => s.len(),
+        }
+    }
+
+    /// Whether `h` is a link the importer made to this place, so text
+    /// written in this link joins it.
+    fn made(&self, h: &Hyperlink) -> bool {
+        h.raw.is_none()
+            && h.content.is_empty()
+            && match self {
+                Link::Url(u) => h.target.as_deref() == Some(u.as_str()) && h.anchor.is_none(),
+                Link::Anchor(a) => h.anchor.as_deref() == Some(a.as_str()) && h.target.is_none(),
+            }
+    }
 }
 
 /// The heap bytes of the run properties an importer sets: font, colour,
@@ -431,7 +464,53 @@ impl<'b> Builder<'b> {
     /// Append `text` in `props`, joining the previous run when it has the
     /// same properties.
     pub(crate) fn text(&mut self, text: &str, props: &RunProps) {
+        self.link_text(text, props, None);
+    }
+
+    /// Append `text` in `props`, in `link` when there is one (#1879): it
+    /// joins the paragraph's last inline when that is a link the importer
+    /// made to the same place (its last run when the properties are the
+    /// same, else as a run of its own), else it starts a hyperlink. Without
+    /// a link, as [`Builder::text`].
+    pub(crate) fn link_text(&mut self, text: &str, props: &RunProps, link: Option<&Link>) {
         if text.is_empty() || !self.budget.scanned(text.len()) || !self.budget.alloc(text.len()) {
+            return;
+        }
+        if let Some(link) = link {
+            if let Some(Inline::Hyperlink(h)) = self.para.last_mut()
+                && link.made(h)
+            {
+                if let Some(run) = h.runs.last_mut()
+                    && run.props == *props
+                {
+                    run.text.push_str(text);
+                    return;
+                }
+                if self.budget.keep::<Run>(props_heap(props)) {
+                    h.runs.push(Run {
+                        text: text.to_string(),
+                        props: props.clone(),
+                    });
+                }
+                return;
+            }
+            let heap = std::mem::size_of::<Run>() + props_heap(props) + link.heap();
+            if !self.budget.keep::<Inline>(heap) {
+                return;
+            }
+            let (target, anchor) = match link {
+                Link::Url(u) => (Some(u.clone()), None),
+                Link::Anchor(a) => (None, Some(a.clone())),
+            };
+            self.para.push(Inline::Hyperlink(Hyperlink {
+                target,
+                anchor,
+                runs: vec![Run {
+                    text: text.to_string(),
+                    props: props.clone(),
+                }],
+                ..Hyperlink::default()
+            }));
             return;
         }
         if let Some(Inline::Run(run)) = self.para.last_mut() {
@@ -519,9 +598,10 @@ impl<'b> Builder<'b> {
             if drop == 0 {
                 break;
             }
-            // An object (an imported picture, #1880) before the marker's
-            // end: the paragraph does not start with a typed marker.
-            if is_object(inline) {
+            // An object (an imported picture, #1880) or a link (#1879)
+            // before the marker's end: the paragraph does not start with a
+            // typed marker (only a leading run can be cut).
+            if is_object(inline) || matches!(inline, Inline::Hyperlink(_)) {
                 return None;
             }
             let len = inline.text().chars().count();

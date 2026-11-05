@@ -272,7 +272,7 @@ fn escape_at(b: &[u8], i: usize) -> Option<u8> {
 }
 
 /// `%XX` escapes decoded; a `%` not followed by two hex digits is kept.
-fn percent_decode(s: &str) -> Vec<u8> {
+pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
