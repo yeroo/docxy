@@ -79,7 +79,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `ext_fixture` as Mail when the build links none: a header over a DocView
   of a document built in code (`fixture_document`), recording each link.
   `ext-doc-read` (blocks, tables, pictures, links, selection,
-  selected_paragraphs, zoom, scroll_y, max_scroll_y, link_click,
+  selected_paragraphs, zoom, scroll_y, max_scroll_y, scroll_x,
+  max_scroll_x, text_width, table_widths, link_click,
   content_dark, focused, links_followed, link_calls), `ext-doc-set
   {link_click, content_dark}`, the regions `ext-doc-view`,
   `ext-doc-link:<n>[:left]` (`:left` 8 px left of the span, at mid-height)
@@ -88,6 +89,21 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `uiharness/cases/ext-doc-view.uit` drives it (run on Linux under
   `scripts/ui-linux.py`). `suite/docxy/tests/ext_doc_view_api.rs` holds the
   public API to what an extension crate needs, from outside the crate.
+- Tables fit the view (#1895), as in a document tab's Web Layout (see
+  `docs/claude/docx-editing.md`'s "Web Layout fits tables"): the view's
+  text width comes from a last in-flow `w_full` zero-height probe in
+  `ext-doc-scroll` (`text_w`), and `ext-doc-scroll` scrolls on both axes
+  under a horizontal bar (`ext-doc-hscrollbar`, a 12 px strip along the
+  bottom). gpui's X11, Wayland and Windows clients turn a shifted wheel
+  into `delta.x` (macOS sends it), so the view has no shift handling;
+  Ctrl+wheel's put-back restores both axes. `ext-doc-read` adds `scroll_x`
+  / `max_scroll_x` (clamped as the next paint will), `text_width` and
+  `table_widths` (each top-level table: `block`, `width`, `left` / `right`
+  from the view's left, `fits_text`, `right_in_view`); `pointer-wheel`
+  takes `"shift": true` (a horizontal delta, as the platforms deliver it).
+  The fixture adds, after the 2x2 table, a 100% table imported from HTML
+  (`fitted_html`, with a link to `CELL_URL`; in the model only) and a fixed
+  12000-twip table.
 - Out of scope: Find (#1887), Print Layout (#1888), a caret and keyboard
   selection, table selection zones, a context menu, anchor links scrolling
   inside the view (they reach the callback as `#name`), macOS ⌘-key

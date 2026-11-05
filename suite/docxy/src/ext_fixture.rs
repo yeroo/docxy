@@ -21,6 +21,21 @@ use std::rc::Rc;
 pub(crate) const LINK_URL: &str = "https://example.com/docxy";
 /// The target of its indented paragraph's link.
 pub(crate) const INDENTED_URL: &str = "https://example.com/indented";
+/// The link in the fitted (100%) table's left cell (#1895).
+pub(crate) const CELL_URL: &str = "https://example.com/cell";
+
+/// The fitted table (#1895), the `newsletter-tables.html` shape: a 100%
+/// table of two 50% cells whose text wraps when the view is narrow, through
+/// the HTML import as a mail body comes.
+fn fitted_html() -> String {
+    format!(
+        "<table width=\"100%\" border=\"1\"><tr>\
+         <td width=\"50%\">Fitted left column, wrapping when narrow, with the \
+         <a href=\"{CELL_URL}\">cell link</a> inside it.</td>\
+         <td width=\"50%\">Fitted right column, also long enough to wrap in a \
+         narrow view.</td></tr></table>"
+    )
+}
 
 /// The fixture's view: what the harness downcasts the Mail tab's body to.
 pub(crate) struct FixtureView {
@@ -91,8 +106,12 @@ fn run(text: &str) -> String {
 }
 
 fn cell(text: &str) -> String {
+    cell_w(text, 2400)
+}
+
+fn cell_w(text: &str, w: u32) -> String {
     format!(
-        "<w:tc><w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>{}</w:tc>",
+        "<w:tc><w:tcPr><w:tcW w:w=\"{w}\" w:type=\"dxa\"/></w:tcPr>{}</w:tc>",
         para(&run(text))
     )
 }
@@ -101,8 +120,11 @@ fn cell(text: &str) -> String {
 /// heading, `Alpha Beta Gamma` (Beta bold), a hyperlink `docxy link` to
 /// [`LINK_URL`], an indented paragraph that starts with a link
 /// (`Indented link`, to [`INDENTED_URL`]), an inline picture
-/// (`uiharness/fixtures/logo.png`), a 2x2 table `A1 B1 / A2 B2`, then
-/// `Line 1`..`Line 80` so it scrolls.
+/// (`uiharness/fixtures/logo.png`), a 2x2 table `A1 B1 / A2 B2`, the
+/// fitted 100% table ([`fitted_html`], imported, with a link to
+/// [`CELL_URL`]; only in the model, not the package's part), a fixed
+/// (`dxa`) table of two 6000-twip cells `Fixed left` / `Right Omega Zeta`
+/// (#1895), then `Line 1`..`Line 80` so it scrolls.
 pub(crate) fn fixture_document() -> (Document, Package) {
     let mut pkg = new_package(Document { body: vec![] });
     let png: &[u8] = include_bytes!("../../../uiharness/fixtures/logo.png");
@@ -160,6 +182,13 @@ pub(crate) fn fixture_document() -> (Document, Package) {
         cell("A2"),
         cell("B2")
     );
+    body += &format!(
+        "<w:tbl><w:tblPr><w:tblW w:w=\"12000\" w:type=\"dxa\"/></w:tblPr>\
+         <w:tblGrid><w:gridCol w:w=\"6000\"/><w:gridCol w:w=\"6000\"/></w:tblGrid>\
+         <w:tr>{}{}</w:tr></w:tbl>",
+        cell_w("Fixed left", 6000),
+        cell_w("Right Omega Zeta", 6000)
+    );
     for i in 1..=80 {
         body += &para(&run(&format!("Line {i}")));
     }
@@ -168,7 +197,14 @@ pub(crate) fn fixture_document() -> (Document, Package) {
          <w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{body}</w:body></w:document>"
     );
     assert!(pkg.set_part("word/document.xml", xml.clone().into_bytes()));
-    let doc = docxcore::load::parse_document_xml(&xml, &pkg.part_rels("word/document.xml"));
+    let mut doc = docxcore::load::parse_document_xml(&xml, &pkg.part_rels("word/document.xml"));
+    let fitted = docxcore::import::html::import_html(fitted_html().as_bytes())
+        .expect("the fitted table imports")
+        .body
+        .into_iter()
+        .find(|b| matches!(b, docxcore::model::Block::Table(_)))
+        .expect("a table");
+    doc.body.insert(6, fitted);
     (doc, pkg)
 }
 
@@ -182,9 +218,29 @@ mod tests {
     #[test]
     fn the_fixture_document_has_a_link_a_table_and_a_resolving_picture() {
         let (doc, pkg) = fixture_document();
-        // Heading, Alpha..., link, indented link, picture, table, 80 lines.
-        assert_eq!(doc.body.len(), 86);
+        // Heading, Alpha..., link, indented link, picture, table, the
+        // fitted and the fixed table (#1895), 80 lines.
+        assert_eq!(doc.body.len(), 88);
         assert!(matches!(doc.body[5], Block::Table(_)));
+        let Block::Table(fitted) = &doc.body[6] else {
+            panic!("the fitted table");
+        };
+        let tblw = docxcore::table::table_props(fitted);
+        assert_eq!(tblw.attr("w:tblW", "w:type").as_deref(), Some("pct"));
+        assert_eq!(tblw.attr("w:tblW", "w:w").as_deref(), Some("5000"));
+        let cell_link = &fitted.rows[0].cells[0].blocks[0];
+        let Block::Paragraph(cell_link) = cell_link else {
+            panic!("a paragraph");
+        };
+        let at = cell_link.plain_text().find("cell link").expect("the link");
+        assert_eq!(
+            crate::doc_view::link_at(cell_link, at).as_deref(),
+            Some(CELL_URL)
+        );
+        let Block::Table(fixed) = &doc.body[7] else {
+            panic!("the fixed table");
+        };
+        assert_eq!(fixed.grid, [6000, 6000]);
         let Block::Paragraph(indented) = &doc.body[3] else {
             panic!("a paragraph");
         };

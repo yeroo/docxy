@@ -1,0 +1,74 @@
+# A document tab's Web Layout fits a table to the window (#1895): an auto
+# table shrinks to the text width and never grows past its grid, an
+# AutoFit Window (pct) one takes the text width, growing too, and a fixed
+# one keeps its grid and scrolls sideways; Print Layout draws the grid as
+# before. `doc`'s `flow` reports the view's horizontal
+# scroll, its text width and each top-level table as painted (`fits_text`:
+# at most the text width). Each read follows a `shot`, which waits for the
+# frame after the change: a table is fitted to the width the frame before
+# measured.
+
+test issue 1895 Web Layout fits a table to the window and Print Layout draws its grid
+  open copy:../fixtures/basic.docx
+  assert view.layout is web
+  call window-size {"w":1100,"h":700}
+  call ribbon-click {"tab":"Insert","command":"table"}
+  call table-grid {"cols":2,"rows":2,"click":true}
+  type left cell text that wraps in the narrower column
+  shot window
+  call doc {}
+  # An auto table narrower than the text keeps its 624 px grid.
+  assert reply.flow.tables.0.width is 624
+  # Narrow: wider than the text, it shrinks to it, and nothing scrolls.
+  call window-size {"w":600,"h":700}
+  shot window
+  call doc {}
+  # The view is the window's width (less its 48 px margins), not widened
+  # to the table's.
+  assert reply.flow.text_width is 504
+  assert reply.flow.tables.0.fits_text is true
+  assert reply.flow.tables.0.width is {doc.flow.text_width}
+  assert reply.flow.tables.0.right_in_view is true
+  assert reply.flow.max_scroll_x is 0
+  # AutoFit Window (pct 100%): it takes the text width, wider than its grid
+  # in a wide window.
+  call window-size {"w":1100,"h":700}
+  call ribbon-click {"tab":"Table Layout","command":"autofit-window"}
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is {doc.flow.text_width}
+  assert reply.flow.tables.0.width is not 624
+  call window-size {"w":600,"h":700}
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is {doc.flow.text_width}
+  assert reply.flow.max_scroll_x is 0
+  # Print Layout: the grid's own width.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is 624
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is {doc.flow.text_width}
+  # Fixed widths (dxa) keep the grid, wider than the view: a shifted wheel
+  # scrolls the view sideways to the table's right edge (the window's
+  # middle is in the document).
+  call ribbon-click {"tab":"Table Layout","command":"autofit-fixed"}
+  shot window
+  call doc {}
+  assert reply.flow.tables.0.width is 624
+  assert reply.flow.tables.0.right_in_view is false
+  assert reply.flow.max_scroll_x is not 0
+  call pointer-wheel {"region":"window","dy":-1000,"shift":true}
+  shot window
+  call doc {}
+  assert reply.flow.scroll_x is {doc.flow.max_scroll_x}
+  assert reply.flow.tables.0.right_in_view is true
+  call pointer-wheel {"region":"window","dy":1000,"shift":true}
+  shot window
+  call doc {}
+  assert reply.flow.scroll_x is 0

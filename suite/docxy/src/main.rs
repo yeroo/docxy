@@ -6744,15 +6744,26 @@ impl Docxy {
     }
 }
 
+/// The document's scroll area under the probe of its viewport, which the
+/// ruler and the harness read.
+///
+/// `shrink`: the view is no wider than the window, whatever it holds (the
+/// flow view, #1895: a table wider than the view scrolls inside it). Print
+/// Layout passes false, so its area still widens to a sheet wider than the
+/// window, as it always has.
 fn ruler_scroll_view(
     scroll: AnyElement,
     probe: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    shrink: bool,
 ) -> AnyElement {
     v_flex()
         .relative()
         .flex_1()
         .h_full()
         .min_h(px(0.))
+        // A flex item is at least as wide as its content unless told
+        // otherwise.
+        .when(shrink, |d| d.min_w(px(0.)))
         .child(scroll)
         .child(ruler_probe_el(probe, |state, rect| {
             state.viewport = Some(rect)
@@ -8717,12 +8728,18 @@ struct RenderCtx<'a> {
 type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
 
 /// The harness's view of [`PaintedTables`] (#1895): each table's block, its
-/// painted width and its left and right edges from the viewport's left
-/// (window coordinates when no viewport has been painted), rounded to a
-/// pixel.
-fn painted_tables_json(tables: &PaintedTables, viewport_x: Option<f32>) -> ctlcore::json::Json {
+/// painted width, its left and right edges from the viewport's left
+/// (`view`: its x and width, window coordinates), rounded to a pixel;
+/// `fits_text`, whether it is at most the text width `text_w` (+1 px for
+/// rounding), and `right_in_view`, whether its right edge lies inside the
+/// viewport (so a table scrolled to its end shows it).
+fn painted_tables_json(
+    tables: &PaintedTables,
+    text_w: Option<f32>,
+    view: Option<(f32, f32)>,
+) -> ctlcore::json::Json {
     use ctlcore::json::Json;
-    let x0 = viewport_x.unwrap_or(0.);
+    let (x0, view_w) = view.unwrap_or((0., 0.));
     let round = |v: f32| Json::Num(f64::from(v.round()));
     Json::Arr(
         tables
@@ -8732,11 +8749,20 @@ fn painted_tables_json(tables: &PaintedTables, viewport_x: Option<f32>) -> ctlco
                 let b = at.get();
                 let left = f32::from(b.origin.x) - x0;
                 let width = f32::from(b.size.width);
+                let right = left + width;
                 Json::obj(vec![
                     ("block", Json::Num(*block as f64)),
                     ("width", round(width)),
                     ("left", round(left)),
-                    ("right", round(left + width)),
+                    ("right", round(right)),
+                    (
+                        "fits_text",
+                        Json::Bool(text_w.is_some_and(|t| width <= t + 1.)),
+                    ),
+                    (
+                        "right_in_view",
+                        Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
+                    ),
                 ])
             })
             .collect(),
@@ -41704,7 +41730,7 @@ impl Render for Docxy {
                             .py(px(24.))
                             .children(sheets)
                             .into_any_element();
-                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
+                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe, false);
                         if self.show_ruler {
                             h_flex()
                                 .flex_1()
@@ -41806,7 +41832,7 @@ impl Render for Docxy {
                                     ),
                             )
                             .into_any_element();
-                        ruler_scroll_view(scroll, &self.ruler_probe)
+                        ruler_scroll_view(scroll, &self.ruler_probe, true)
                     }
                 }
                 Surface::Sheet(v) => sheet_el(

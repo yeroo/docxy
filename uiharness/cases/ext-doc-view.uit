@@ -4,7 +4,10 @@
 # (heading "Embedded view", "Alpha Beta Gamma" with Beta bold, a paragraph
 # holding the hyperlink "docxy link" to https://example.com/docxy, an
 # indented paragraph that starts with the link "Indented link" to
-# https://example.com/indented, a picture, a 2x2 table, then Line 1..Line 80). The extension records every link the
+# https://example.com/indented, a picture, a 2x2 table, a 100% table
+# imported from HTML with the link "cell link" to https://example.com/cell,
+# a fixed 12000-twip table "Fixed left" / "Right Omega Zeta" (#1895),
+# then Line 1..Line 80). The extension records every link the
 # view hands it (`ext-doc-read` link_calls). Keys go through `real-key`: the
 # `key` verb presses the suite's own handler and never reaches the view.
 # Each test opens its own Mail tab and closes it at the end.
@@ -19,8 +22,8 @@ test issue 1873 the test extension's Mail tab draws the document in the embedded
   assert reply.tabs.1.kind is mail
   assert reply.active is 1
   call ext-doc-read {}
-  assert reply.blocks is 86
-  assert reply.tables is 1
+  assert reply.blocks is 88
+  assert reply.tables is 3
   assert reply.pictures is 1
   assert reply.links.0.url is https://example.com/docxy
   assert reply.links.1.url is https://example.com/indented
@@ -63,7 +66,7 @@ test issue 1873 a drag selects in the view and Ctrl+C copies its text and RTF, C
   assert reply.focused is true
   call real-key {"key":"ctrl+a"}
   call ext-doc-read {}
-  assert reply.selected_paragraphs is 89
+  assert reply.selected_paragraphs is 93
   shot window
   call real-key {"key":"ctrl+w"}
   call tab-list {}
@@ -151,6 +154,63 @@ test issue 1873 a hyperlink press reaches the extension's callback, by Ctrl+clic
   call ext-doc-read {}
   assert reply.links_followed is 3
   assert reply.selection is not empty
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1895 a 100% table fits a narrow view and a fixed one scrolls sideways to its right edge
+  call window-size {"w":600,"h":700}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  # The 100% table takes the text width, narrower than its 624 px grid;
+  # the fixed one keeps its 800 px and reaches past the view.
+  assert reply.table_widths.1.block is 6
+  assert reply.table_widths.1.fits_text is true
+  assert reply.table_widths.1.width is {ext-doc-read.text_width}
+  assert reply.table_widths.1.right_in_view is true
+  assert reply.table_widths.2.block is 7
+  assert reply.table_widths.2.width is 800
+  assert reply.table_widths.2.right_in_view is false
+  assert reply.scroll_x is 0
+  assert reply.max_scroll_x is not 0
+  # A link in a fitted cell still reaches the extension.
+  call pointer-click {"region":"ext-doc-link:2","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  assert reply.link_calls.0 is https://example.com/cell
+  # A plain wheel scrolls down only, and back.
+  call pointer-wheel {"region":"ext-doc-view","dy":-40}
+  call ext-doc-read {}
+  assert reply.scroll_y is not 0
+  assert reply.scroll_x is 0
+  call pointer-wheel {"region":"ext-doc-view","dy":40}
+  # A shifted one scrolls sideways, as far as the fixed table's right edge.
+  call pointer-wheel {"region":"ext-doc-view","dy":-1000,"shift":true}
+  shot window
+  call ext-doc-read {}
+  assert reply.scroll_y is 0
+  assert reply.scroll_x is not 0
+  assert reply.scroll_x is {ext-doc-read.max_scroll_x}
+  assert reply.table_widths.2.right_in_view is true
+  # A drag in the scrolled table selects its words.
+  call pointer-drag {"from":"ext-doc-word:Omega:start","to":"ext-doc-word:Zeta:end"}
+  call ext-doc-read {}
+  assert reply.selection is Omega Zeta
+  call pointer-wheel {"region":"ext-doc-view","dy":1000,"shift":true}
+  call ext-doc-read {}
+  assert reply.scroll_x is 0
+  # Wider: the 100% table grows with the view, nothing scrolls sideways and
+  # the selection stays.
+  call window-size {"w":1100,"h":700}
+  shot window
+  call ext-doc-read {}
+  assert reply.table_widths.1.width is {ext-doc-read.text_width}
+  assert reply.table_widths.1.width is not 624
+  assert reply.max_scroll_x is 0
+  assert reply.selection is Omega Zeta
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

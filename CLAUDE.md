@@ -28,7 +28,8 @@ issue number to find its notes.
   (#1653, #1728, #1792, #1814, #1815), manual hyphenation (#1266), Page Setup / Columns
   Apply to Selected text (#1272), Layout settings.xml undo steps (#1273), Header & Footer
   leftovers: `w:ptab`, bound Company/Manager properties, Date & Time (#1433), live page
-  fields (#1437).
+  fields (#1437), Web Layout and DocView fitting tables to the view width, horizontal
+  scroll (#1895).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution

@@ -2410,20 +2410,28 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// `scroll_x` / `max_scroll_x` (px), `text_width` (the flow view's text
 /// column as last painted, px; `null` before Web Layout has drawn), and
 /// `tables`, each top-level table the last frame painted (`block`, `width`,
-/// and its `left` / `right` edges from the view's left, px).
+/// its `left` / `right` edges from the view's left, px, `fits_text` and
+/// `right_in_view`: `crate::painted_tables_json`).
 fn flow_state(app: &crate::Docxy) -> Json {
     let probe = app.ruler_probe.borrow();
     let num = |v: f32| Json::Num(f64::from(v.round()));
+    let max_x = f32::from(app.doc_scroll.max_offset().x).max(0.);
     Json::obj(vec![
-        ("scroll_x", num(-f32::from(app.doc_scroll.offset().x))),
+        // Within what the last frame allowed: gpui clamps a wheel's offset
+        // only as it paints.
         (
-            "max_scroll_x",
-            num(f32::from(app.doc_scroll.max_offset().x).max(0.)),
+            "scroll_x",
+            num((-f32::from(app.doc_scroll.offset().x)).clamp(0., max_x)),
         ),
+        ("max_scroll_x", num(max_x)),
         ("text_width", probe.draft_text_w.map_or(Json::Null, num)),
         (
             "tables",
-            crate::painted_tables_json(&app.painted_tables, probe.viewport.map(|v| v.x)),
+            crate::painted_tables_json(
+                &app.painted_tables,
+                probe.draft_text_w,
+                probe.viewport.map(|v| (v.x, v.w)),
+            ),
         ),
     ])
 }

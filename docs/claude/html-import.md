@@ -30,7 +30,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   are known, else the room it has (6.5" outermost). Declared columns
   narrower than a declared table grow to it; wider ones widen the grid
   (tblW stays as declared). `tblW` is dxa, pct (fiftieths) or auto; every
-  cell's `tcW` is its columns' sum.
+  cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
+  table to the view's width when they draw it (#1895,
+  `docs/claude/docx-editing.md`); the model keeps these widths.
 - `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `shd` (the cell's
   own `bgcolor` / CSS background, CSS over the attribute, else its row's,
   row group's, then table's; `background: none|transparent` on a table part

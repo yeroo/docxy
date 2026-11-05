@@ -340,8 +340,10 @@ impl DocView {
         f32::from(self.scroll.max_offset().y).max(0.)
     }
 
+    /// The horizontal scroll, within what the last frame allowed: a wheel
+    /// turn moves the offset at once, and gpui clamps it only as it paints.
     fn scroll_x(&self) -> f32 {
-        -f32::from(self.scroll.offset().x)
+        (-f32::from(self.scroll.offset().x)).clamp(0., self.max_scroll_x())
     }
 
     fn max_scroll_x(&self) -> f32 {
@@ -446,7 +448,10 @@ impl DocView {
                 "table_widths",
                 painted_tables_json(
                     &self.tables,
-                    self.viewport.get().map(|v| f32::from(v.origin.x)),
+                    self.text_w.get(),
+                    self.viewport
+                        .get()
+                        .map(|v| (f32::from(v.origin.x), f32::from(v.size.width))),
                 ),
             ),
             (
