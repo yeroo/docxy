@@ -24,11 +24,13 @@ CREATE TABLE IF NOT EXISTS folders (
     is_expanded     INTEGER NOT NULL DEFAULT 0,
     -- The whole-mailbox backfill (#1871): the full delta's in-progress
     -- `nextLink` (NULL: not started, or done), the items it returned so
-    -- far, and what `delta_link` covers (NULL: never synced, or a link
-    -- from before #1871; 'head', 'window' or 'all').
+    -- far, what `delta_link` covers (NULL: never synced, or a link from
+    -- before #1871; 'head', 'window' or 'all'), and what the walk under way
+    -- covers ('window' once a page skipped old items, else 'all').
     backfill_link   TEXT,
     backfill_synced INTEGER NOT NULL DEFAULT 0,
-    history_scope   TEXT
+    history_scope   TEXT,
+    backfill_scope  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (

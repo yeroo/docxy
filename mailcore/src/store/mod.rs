@@ -98,11 +98,16 @@ pub struct FolderHistory {
     /// What `delta_link` covers: `None` (never synced, or a link stored
     /// before #1871), [`SCOPE_HEAD`], [`SCOPE_WINDOW`] or [`SCOPE_ALL`].
     pub scope: Option<String>,
-    /// Items the folder's full delta has returned so far (upserts only).
-    /// It may exceed `total_count`: a UI clamps.
+    /// Items the folder's full delta has walked past so far: its upserts
+    /// within the window, stored or already there (not `@removed`). It may
+    /// exceed `total_count`: a UI clamps.
     pub synced: i64,
     /// The full delta's next page, while a backfill is under way.
     pub backfill_link: Option<String>,
+    /// What the walk under way covers: [`SCOPE_WINDOW`] once a page skipped
+    /// items older than the window, else [`SCOPE_ALL`]; `None` before its
+    /// first page. A whole-mailbox engine restarts a `window` walk.
+    pub backfill_scope: Option<String>,
     /// Whether the folder has a delta link (its phase 1 is done).
     pub has_delta_link: bool,
     /// The folder's `total_count` from its last listing.
@@ -696,6 +701,7 @@ impl Store {
             [],
         );
         let _ = conn.execute("ALTER TABLE folders ADD COLUMN history_scope TEXT", []);
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN backfill_scope TEXT", []);
         // Same idempotent-migration pattern, for `messages.local_id` (#1884:
         // the `local:` id a reconciled draft had). Its unique index has to
         // come after the ALTER, not in `SCHEMA_SQL`: on an old database
@@ -943,6 +949,99 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Inserts a message row from a backfill page (#1871) only when no row
+    /// has its id, with what the item carried (empty otherwise, as
+    /// `merge_message` inserts it); an existing row is left as it is, so a
+    /// page never overwrites a local edit (a draft's unsaved fields, an
+    /// optimistic write whose op is still queued). The folder's delta
+    /// rounds keep existing rows fresh. Returns whether it inserted.
+    pub fn insert_message_if_absent(
+        &self,
+        folder_id: &str,
+        m: &Message,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "INSERT INTO messages (
+                 id, folder_id, conversation_id, subject, from_name, from_addr,
+                 to_recipients, cc_recipients, received_at, sent_at,
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                 is_meeting_request, categories
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(id) DO NOTHING",
+            params![
+                m.id,
+                folder_id,
+                m.conversation_id,
+                m.subject,
+                m.from.name,
+                m.from.address,
+                encode_recipients(&m.to),
+                encode_recipients(&m.cc),
+                m.received,
+                m.sent,
+                m.is_read,
+                m.is_flagged,
+                m.has_attachments,
+                m.importance,
+                m.preview,
+                m.is_draft,
+                m.is_meeting_request,
+                encode_categories(&m.categories),
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether the row `id` is a draft docxy may hold unsaved edits of
+    /// (#1871): `is_draft`, or filed under the Drafts folder or the local
+    /// sentinel, as `get_body_for` reads a draft. `false` for no row.
+    pub fn is_local_draft(&self, id: &str) -> Result<bool, StoreError> {
+        let draft = self
+            .conn
+            .query_row(
+                "SELECT m.is_draft = 1 OR f.well_known_name = 'drafts' OR m.folder_id = ?2
+                 FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
+                 WHERE m.id = ?1",
+                params![id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+                |r| r.get::<_, Option<bool>>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(draft.unwrap_or(false))
+    }
+
+    /// The message ids queued outbox ops name (#1871): a backfill page
+    /// leaves them alone, as their optimistic local write (a read flag, a
+    /// move, a delete, a draft's fields) has not reached Graph yet. Calendar
+    /// event ops name events, not messages, and are left out.
+    pub fn pending_message_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut ids: Vec<String> = self
+            .pending_ops()?
+            .into_iter()
+            .filter_map(|row| match row.op {
+                OutboxOp::MarkRead { id, .. }
+                | OutboxOp::SetFlag { id, .. }
+                | OutboxOp::SetCategories { id, .. }
+                | OutboxOp::Move { id, .. }
+                | OutboxOp::Delete { id }
+                | OutboxOp::SaveDraft { id }
+                | OutboxOp::SendDraft { id } => Some(id),
+                OutboxOp::RespondEvent { .. }
+                | OutboxOp::CreateEvent { .. }
+                | OutboxOp::UpdateEvent { .. }
+                | OutboxOp::DeleteEvent { .. } => None,
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Up to `limit` ids of `folder_id`'s header-less rows (`received_at`
@@ -1234,7 +1333,8 @@ impl Store {
     pub fn clear_delta_links(&self) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
-                                backfill_synced = 0, history_scope = NULL",
+                                backfill_synced = 0, history_scope = NULL,
+                                backfill_scope = NULL",
             [],
         )?;
         Ok(())
@@ -1250,17 +1350,24 @@ impl Store {
         Ok(())
     }
 
-    /// Records a backfill page (#1871): the full delta's next page and the
-    /// running count of items it has returned.
+    /// Records a backfill page (#1871): the full delta's next page, the
+    /// running count of items it has walked past, and what the page
+    /// covered (`page_scope`): the walk's scope becomes [`SCOPE_WINDOW`]
+    /// once any page is, else stays what it was ([`SCOPE_ALL`] for a
+    /// first page).
     pub fn set_backfill_progress(
         &self,
         folder_id: &str,
         next_link: &str,
         synced: i64,
+        page_scope: &str,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET backfill_link = ?2, backfill_synced = ?3 WHERE id = ?1",
-            params![folder_id, next_link, synced],
+            "UPDATE folders SET backfill_link = ?2, backfill_synced = ?3,
+                    backfill_scope = CASE WHEN ?4 = 'window' THEN 'window'
+                                          ELSE COALESCE(backfill_scope, ?4) END
+             WHERE id = ?1",
+            params![folder_id, next_link, synced, page_scope],
         )?;
         Ok(())
     }
@@ -1278,7 +1385,8 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET delta_link = ?2, history_scope = ?3,
-                                backfill_link = NULL, backfill_synced = ?4
+                                backfill_link = NULL, backfill_synced = ?4,
+                                backfill_scope = NULL
              WHERE id = ?1",
             params![folder_id, delta_link, scope, synced],
         )?;
@@ -1286,11 +1394,14 @@ impl Store {
     }
 
     /// Restarts a folder's backfill from a fresh full delta (#1871: its
-    /// page link expired): clears the link and the count, and keeps the
+    /// page link expired, or a window walk resumed in whole-mailbox mode):
+    /// clears the link, the count and the walk's scope, and keeps the
     /// head's `delta_link`.
     pub fn reset_backfill(&self, folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET backfill_link = NULL, backfill_synced = 0 WHERE id = ?1",
+            "UPDATE folders SET backfill_link = NULL, backfill_synced = 0,
+                                backfill_scope = NULL
+             WHERE id = ?1",
             params![folder_id],
         )?;
         Ok(())
@@ -1308,7 +1419,7 @@ impl Store {
     pub fn folder_histories(&self) -> Result<Vec<FolderHistory>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, history_scope, backfill_synced, backfill_link,
-                    delta_link IS NOT NULL, total_count
+                    delta_link IS NOT NULL, total_count, backfill_scope
              FROM folders
              {FOLDER_ORDER}"
         ))?;
@@ -1321,6 +1432,7 @@ impl Store {
                     backfill_link: row.get(3)?,
                     has_delta_link: row.get::<_, i64>(4)? != 0,
                     total_count: row.get(5)?,
+                    backfill_scope: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5866,7 +5978,8 @@ mod backfill_tests {
                 .execute_batch(
                     "ALTER TABLE folders DROP COLUMN backfill_link;
                      ALTER TABLE folders DROP COLUMN backfill_synced;
-                     ALTER TABLE folders DROP COLUMN history_scope;",
+                     ALTER TABLE folders DROP COLUMN history_scope;
+                     ALTER TABLE folders DROP COLUMN backfill_scope;",
                 )
                 .unwrap();
         }
@@ -5879,11 +5992,12 @@ mod backfill_tests {
                 scope: None,
                 synced: 0,
                 backfill_link: None,
+                backfill_scope: None,
                 has_delta_link: true,
                 total_count: 7,
             }
         );
-        s.set_backfill_progress("F1", "NEXT", 3).unwrap();
+        s.set_backfill_progress("F1", "NEXT", 3, SCOPE_ALL).unwrap();
         assert_eq!(history(&s, "F1").backfill_link.as_deref(), Some("NEXT"));
         drop(s);
         // Opening again (columns already there) keeps the state.
@@ -5904,7 +6018,8 @@ mod backfill_tests {
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
         assert_eq!(history(&s, "F1").scope.as_deref(), Some(SCOPE_HEAD));
 
-        s.set_backfill_progress("F1", "PAGE2", 50).unwrap();
+        s.set_backfill_progress("F1", "PAGE2", 50, SCOPE_ALL)
+            .unwrap();
         let h = history(&s, "F1");
         assert_eq!((h.backfill_link.as_deref(), h.synced), (Some("PAGE2"), 50));
         // The head link stays the folder's link while the backfill runs.
@@ -5916,7 +6031,8 @@ mod backfill_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         s.set_head_link("F1", "HEAD").unwrap();
-        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
+            .unwrap();
         s.complete_backfill("F1", "FULL", SCOPE_ALL, 120).unwrap();
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("FULL"));
         assert_eq!(
@@ -5926,6 +6042,7 @@ mod backfill_tests {
                 scope: Some(SCOPE_ALL.into()),
                 synced: 120,
                 backfill_link: None,
+                backfill_scope: None,
                 has_delta_link: true,
                 total_count: 120,
             }
@@ -5937,7 +6054,8 @@ mod backfill_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         s.set_head_link("F1", "HEAD").unwrap();
-        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
+            .unwrap();
         s.reset_backfill("F1").unwrap();
         let h = history(&s, "F1");
         assert_eq!((h.backfill_link, h.synced), (None, 0));
@@ -5951,7 +6069,8 @@ mod backfill_tests {
         folder(&s, "F1", 120, None);
         folder(&s, "F2", 10, None);
         s.set_head_link("F1", "HEAD").unwrap();
-        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
+            .unwrap();
         s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10).unwrap();
         s.clear_delta_links().unwrap();
         for id in ["F1", "F2"] {
@@ -5969,7 +6088,8 @@ mod backfill_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         s.set_head_link("F1", "HEAD").unwrap();
-        s.set_backfill_progress("F1", "PAGE2", 50).unwrap();
+        s.set_backfill_progress("F1", "PAGE2", 50, SCOPE_ALL)
+            .unwrap();
         // The next listing renames it and changes its count.
         s.upsert_folder(&MailFolder {
             id: "F1".into(),
@@ -6008,5 +6128,132 @@ mod backfill_tests {
         assert_eq!(ids, order);
         assert_eq!(ids, ["B-inbox", "C-sent", "A-other"]);
         assert!(s.folder_history("NOPE").unwrap().is_none());
+    }
+
+    fn message(id: &str, subject: &str, read: bool) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: "C".into(),
+            subject: subject.into(),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-01-01T00:00:00Z".into(),
+            sent: "".into(),
+            is_read: read,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn insert_message_if_absent_never_overwrites_a_row() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 10, None);
+        folder(&s, "F2", 10, None);
+        s.upsert_message("F1", &message("M1", "local", true))
+            .unwrap();
+        assert!(
+            !s.insert_message_if_absent("F2", &message("M1", "server", false))
+                .unwrap()
+        );
+        let row = &s.messages_in_folder("F1", 10, 0).unwrap()[0];
+        assert_eq!((row.subject.as_str(), row.is_read), ("local", true));
+        assert!(s.messages_in_folder("F2", 10, 0).unwrap().is_empty());
+
+        assert!(
+            s.insert_message_if_absent("F2", &message("M2", "new", false))
+                .unwrap()
+        );
+        let row = &s.messages_in_folder("F2", 10, 0).unwrap()[0];
+        assert_eq!((row.id.as_str(), row.subject.as_str()), ("M2", "new"));
+    }
+
+    #[test]
+    fn is_local_draft_by_flag_drafts_folder_or_sentinel() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "INBOX", 10, Some("inbox"));
+        folder(&s, "DRAFTS", 10, Some("drafts"));
+        s.upsert_message("INBOX", &message("PLAIN", "s", false))
+            .unwrap();
+        s.upsert_message("DRAFTS", &message("FILED", "s", false))
+            .unwrap();
+        s.upsert_message(
+            "INBOX",
+            &Message {
+                is_draft: true,
+                ..message("FLAGGED", "s", false)
+            },
+        )
+        .unwrap();
+        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
+        assert!(!s.is_local_draft("PLAIN").unwrap());
+        assert!(s.is_local_draft("FILED").unwrap());
+        assert!(s.is_local_draft("FLAGGED").unwrap());
+        assert!(s.is_local_draft(&local).unwrap());
+        assert!(!s.is_local_draft("NOPE").unwrap());
+    }
+
+    #[test]
+    fn pending_message_ids_names_the_message_ops_only() {
+        let s = Store::open_in_memory().unwrap();
+        for op in [
+            OutboxOp::MarkRead {
+                id: "A".into(),
+                read: true,
+            },
+            OutboxOp::SetFlag {
+                id: "B".into(),
+                flagged: true,
+            },
+            OutboxOp::Move {
+                id: "C".into(),
+                dest: "F".into(),
+            },
+            OutboxOp::Delete { id: "D".into() },
+            OutboxOp::SaveDraft { id: "E".into() },
+            OutboxOp::MarkRead {
+                id: "A".into(),
+                read: false,
+            },
+            OutboxOp::DeleteEvent { id: "EVT".into() },
+        ] {
+            s.enqueue_op(&op).unwrap();
+        }
+        assert_eq!(s.pending_message_ids().unwrap(), ["A", "B", "C", "D", "E"]);
+    }
+
+    #[test]
+    fn a_walk_is_window_once_any_page_skipped_old_mail() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_backfill_progress("F1", "P2", 1, SCOPE_ALL).unwrap();
+        assert_eq!(history(&s, "F1").backfill_scope.as_deref(), Some(SCOPE_ALL));
+        s.set_backfill_progress("F1", "P3", 2, SCOPE_WINDOW)
+            .unwrap();
+        s.set_backfill_progress("F1", "P4", 3, SCOPE_ALL).unwrap();
+        assert_eq!(
+            history(&s, "F1").backfill_scope.as_deref(),
+            Some(SCOPE_WINDOW)
+        );
+        s.reset_backfill("F1").unwrap();
+        assert_eq!(history(&s, "F1").backfill_scope, None);
+        s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
+            .unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 1).unwrap();
+        assert_eq!(history(&s, "F1").backfill_scope, None);
+        s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
+            .unwrap();
+        s.clear_delta_links().unwrap();
+        assert_eq!(history(&s, "F1").backfill_scope, None);
     }
 }

@@ -395,12 +395,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - **Phase 2, one page per idle step.** `DeltaCursor::Full`
   (`$orderby=receivedDateTime desc`, no filter), from the folder's
   persisted `backfill_link`, else a fresh first call; one folder to its end
-  before the next. Each page is merged (`merge_message`); in window mode
-  items older than the cutoff are skipped, unless a reconverge is pending.
-  `Store::set_backfill_progress` stores the `nextLink` and the count, then
-  `MessagesUpdated` and `FolderProgress` go out. The deltaLink replaces the
+  before the next. A page re-sends every message of the folder for a long
+  time, so it never overwrites a row (`apply_backfill_items`): it inserts
+  the rows the store lacks (`Store::insert_message_if_absent`), and the
+  folder's delta rounds (the head's or an older link) keep existing rows
+  fresh. Otherwise a page would undo an optimistic write whose op waits
+  after a 5xx, or a draft's fields compose saved locally (no op until
+  `SaveDraft`, whose PATCH reads the row). A message a queued outbox op
+  names (`Store::pending_message_ids`) is skipped too, so a deleted one is
+  not put back. In window mode items older than the cutoff are skipped,
+  unless a reconverge is pending. `Store::set_backfill_progress` stores the
+  `nextLink`, the count and the walk's scope (`backfill_scope`: `window`
+  once a page skipped old items, else `all`), then `MessagesUpdated` and
+  `FolderProgress` go out. A walk recorded `window` that resumes in whole
+  mode starts over (`reset_backfill`), as its pages skipped old mail. The deltaLink replaces the
   head's in one statement that marks the folder complete
-  (`Store::complete_backfill`, scope `all` or `window`), then
+  (`Store::complete_backfill`, scope `window` when any page of the walk
+  skipped old items, else `all`), then
   `repair_headerless` runs. A restart resumes from the stored link.
 - **When a page runs.** `main_loop` waits zero while `next_backfill()` has a
   folder: signed in, outside `next_retry`, a folder list done
@@ -414,9 +425,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `next_tick` moves with ticks and commands, never with pages. After a timed
   wake a passed `next_retry`/`op_retry` is dropped (`on_timer`), so one a
   tick left behind cannot run a pass at every zero wait.
-- **Complete per mode** (`history_complete(scope, has_delta_link, whole)`):
-  no delta link never (phase 1 first); a link from before #1871 (scope
-  NULL) and `window` are complete in window mode only, and whole mode
+- **Complete per mode** (`history_complete(scope, whole)`, asked only for a
+  folder with a delta link: phase 1 first): a link from before #1871
+  (scope NULL) and `window` are complete in window mode only, and whole mode
   backfills such a folder, its old link serving as the head meanwhile;
   `head` never; `all` always. Known limit: a folder completed as `window`
   stays complete when a caller later raises `backfill_days`, so the older
@@ -436,17 +447,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   and the next tick recovers it. It never calls `clear_backoff`.
 - **Progress.** `SyncEvent::FolderProgress { folder_id, synced, total,
   complete }` after every page and once at completion. `synced` counts the
-  full delta's stored upserts (not `@removed`, not items the window
-  skipped); `total` is the listed `total_count` in whole mode, `None` in
+  upserts the walk passed within the window, inserted or already stored
+  (not `@removed`, not items the window skipped); `total` is the listed `total_count` in whole mode, `None` in
   window mode. `synced` may exceed `total` (the full delta re-sends the
   head's mail, mail arrives meanwhile, delta can repeat an item): a UI
   clamps. `Store::folder_history`/`folder_histories` hold the same
   persisted state (`folders.backfill_link`, `backfill_synced`,
-  `history_scope`, migrated in `Store::init`; `upsert_folder` never writes
+  `history_scope`, `backfill_scope`, migrated in `Store::init`; `upsert_folder` never writes
   them) for a UI's first draw. lookxy ignores the event.
 - **Reconverge.** `clear_delta_links` also clears the backfill link, count
   and scope, so every folder runs both phases again. `reconverge_pending`
-  turns off phase 2's window cutoff, and is cleared only when a pass ran
+  turns off phase 2's window cutoff and makes its pages merge
+  (`merge_message`), to correct rows the dropped op left wrong, still
+  skipping the ids queued ops name and every draft
+  (`Store::is_local_draft`). It is cleared only when a pass ran
   every folder's delta and no folder's backfill remains, else by the step
   that completes the last folder.
 - One request at a time (the engine is one thread). Bodies stay lazy
