@@ -255,8 +255,10 @@ fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<Toke
 
 /// The granted scopes of a token response's `scope` (space-separated).
 /// Empty or whitespace only is `None`, like an absent `scope`: nothing is
-/// known, and on a refresh the engine then keeps the previous grant (RFC
-/// 6749 §5.1: an omitted `scope` is the one requested).
+/// known. On a refresh the engine then keeps the previous grant: Entra
+/// always names the granted scopes, so the last grant it did name stands,
+/// rather than assuming everything requested was granted (RFC 6749 §5.1's
+/// reading of an omitted `scope`), which would hide a missing scope.
 fn split_scopes(scope: &str) -> Option<Vec<String>> {
     let scopes: Vec<String> = scope.split_ascii_whitespace().map(str::to_string).collect();
     (!scopes.is_empty()).then_some(scopes)

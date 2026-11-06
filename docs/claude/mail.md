@@ -284,8 +284,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   an error. Tests writing a cache by hand go through `protect`: on Windows
   `load` DPAPI-decrypts, so a plain JSON file fails there.
 - `Engine::try_refresh` keeps the previous token's `scopes` when the refresh
-  response names none (RFC 6749 §5.1: an omitted `scope` is the one
-  requested); `auth::refresh` itself does not, as it has no previous token.
+  response names none; `auth::refresh` itself does not, as it has no
+  previous token. Why: Entra always names the granted scopes, so such an
+  answer tells nothing new, and the last grant the server did name is kept.
+  RFC 6749 §5.1 reads an omitted `scope` as everything requested
+  (`cfg.scope`); that is not taken, as claiming scopes the server never
+  named would hide a missing one until a 403, which #1875 removes.
 - `auth::missing_scopes(requested, granted)`: the scopes of `requested`
   (spelled as there, each once) the grant lacks, compared ASCII-lowercased
   without the `https://graph.microsoft.com/` prefix (`normalise_scope`).
@@ -293,20 +297,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   are never missing.
 - `SyncEvent::Scopes { granted, missing }` (`missing` against
   `AuthConfig::scope`) comes from `announce_scopes`, called after a startup
-  load, every `try_refresh` (startup near expiry and `with_auth`'s 401
-  retry) and a sign-in redeem. It is sent only for a known grant that
+  load, every `try_refresh` (startup near expiry, and the 401 retries in
+  `with_auth` and the outbox's `apply_op_with_retry`) and a sign-in redeem. It is sent only for a known grant that
   differs from `announced_scopes`, a sorted, de-duplicated set of
   normalised scopes (meta scopes kept), so a startup that refreshes sends
-  one, and an hourly refresh with the same grant, reordered or re-cased,
-  sends none. `enter_signin` clears `announced_scopes`, so every new session
+  one, and a later refresh (after a 401, about hourly) with the same grant,
+  reordered or re-cased, sends none. `enter_signin` clears `announced_scopes`, so every new session
   (after a sign-out or a failed refresh) sends it again. lookxy ignores it.
 - `handle_redirect` reports a provider error as
-  `authorization denied: <error>: <error_description>`, the description
+  `authorization denied: <error>: <error_description>`, both
   percent-decoded and on one line (`one_line`: every run of control
-  characters and whitespace becomes one space, trimmed; Entra's has `\r\n`
-  before `Trace ID:`). Only when the redirect's `state` matches: anything
-  can send the browser to the loopback port during sign-in, and free text
-  from it would be a phishing line in our UI. With a wrong or missing
-  `state`, or a blank description, it is today's `authorization denied:
-  <error>`; an error still wins over a state mismatch. The loopback page
-  stays the generic error page.
+  characters and whitespace becomes one space, trimmed; Entra's description
+  has `\r\n` before `Trace ID:`); a blank description is left out. Only
+  when the redirect's `state` matches: anything can send the browser to the
+  loopback port during sign-in, and free text from it would be a phishing
+  line in our UI. With a wrong or missing `state`, no free text is shown:
+  an `error` that is a bare OAuth code (`is_oauth_error_code`: 1-64 ASCII
+  `a-z`/`_`, e.g. `consent_required`) gives today's `authorization denied:
+  <error>`, anything else the fixed `authorization denied (redirect state
+  did not match)`. An error still wins over a state mismatch. The loopback
+  page stays the generic error page.

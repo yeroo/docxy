@@ -337,8 +337,8 @@ pub enum SyncEvent {
     /// `openid`, `profile`, `email` or a `.default` scope). Sent after the
     /// token is loaded at startup, refreshed or redeemed at sign-in, only
     /// when the grant is known and is not the one last sent (compared as a
-    /// set, case and prefix aside): an hourly refresh with the same grant
-    /// sends none. A sign-in-required (a sign-out, a failed refresh) forgets
+    /// set, case and prefix aside): a later refresh (after a 401, about
+    /// hourly) with the same grant sends none. A sign-in-required (a sign-out, a failed refresh) forgets
     /// the last one, so the next session sends it again. A token whose
     /// grant is unknown (a cache from before #1875 and a refresh that names
     /// no scopes) sends nothing.
@@ -2220,8 +2220,12 @@ impl Engine {
     /// Exchanges the refresh token for a fresh token set and persists it.
     /// Returns false on any failure (no token to refresh, or the endpoint
     /// rejected it). Token values are never logged. A response that names
-    /// no scopes (omitted, or empty) keeps the previous token's grant: RFC
-    /// 6749 §5.1 says an omitted `scope` is the one requested (#1875).
+    /// no scopes (omitted, or empty) keeps the previous token's grant
+    /// (#1875): Entra always names the granted scopes, so such an answer
+    /// tells nothing new, and the last grant the server did name is kept.
+    /// RFC 6749 §5.1 would read an omitted `scope` as everything requested,
+    /// which is not taken: claiming scopes the server never named would hide
+    /// a missing one until a 403.
     fn try_refresh(&mut self) -> bool {
         let Some((refresh_token, previous_scopes)) = self
             .token
@@ -2465,9 +2469,9 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// `?error=...`, or a `state` that doesn't match `expected_state` (the
 /// anti-CSRF check `begin_auth` set up). Never logs the code or any secret;
 /// the returned `Err` messages are diagnostic text only (parse failures,
-/// the provider's own `error` value with its `error_description` when the
-/// redirect's `state` matches, or "timed out"), safe to surface via
-/// `SyncEvent::Error`.
+/// the provider's `error` and `error_description` when the redirect's
+/// `state` matches, else only a bare OAuth error code, or "timed out"),
+/// safe to surface via `SyncEvent::Error`.
 ///
 /// Uses a non-blocking `accept` polled against a deadline rather than a
 /// dedicated timeout API (std's `TcpListener` has none) — simple, and the
@@ -2580,15 +2584,25 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
         write_html_response(stream, SIGNIN_ERROR_HTML);
         // Microsoft's `error_description` (`AADSTSnnnnn: …`) says what to do,
         // but anything can send the browser to this port during the sign-in
-        // window, so free text is shown only from the redirect that carries
-        // our `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
+        // window, so free text (the description, or an `error` that is not a
+        // bare code) is shown only from the redirect that carries our
+        // `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
+        if !state_matches {
+            return Err(if is_oauth_error_code(err) {
+                format!("authorization denied: {err}")
+            } else {
+                "authorization denied (redirect state did not match)".to_string()
+            });
+        }
+        let err = one_line(err);
         let desc = param("error_description")
-            .filter(|_| state_matches)
             .map(|d| one_line(d))
             .filter(|d| !d.is_empty());
-        return Err(match desc {
-            Some(desc) => format!("authorization denied: {err}: {desc}"),
-            None => format!("authorization denied: {err}"),
+        return Err(match (err.is_empty(), desc) {
+            (true, None) => "authorization denied".to_string(),
+            (true, Some(desc)) => format!("authorization denied: {desc}"),
+            (false, Some(desc)) => format!("authorization denied: {err}: {desc}"),
+            (false, None) => format!("authorization denied: {err}"),
         });
     }
     if !state_matches {
@@ -2605,6 +2619,13 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
     };
     write_html_response(stream, SIGNIN_SUCCESS_HTML);
     Ok(code)
+}
+
+/// An RFC 6749 error code as Entra sends one (`access_denied`,
+/// `consent_required`, `interaction_required`): non-empty, at most 64
+/// characters of ASCII `a-z` and `_`. Anything else in `error` is free text.
+fn is_oauth_error_code(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
 }
 
 /// `s` on one line: every run of control characters and whitespace (Entra's
@@ -5909,6 +5930,34 @@ mod tests {
         assert_eq!(
             redirect_result("error=access_denied&state=st", "st"),
             Err("authorization denied: access_denied".to_string())
+        );
+    }
+
+    #[test]
+    fn handle_redirect_hides_free_text_error_on_a_state_mismatch() {
+        // An `error` that is not a bare code is free text too.
+        let phishing = "error=Your+account+is+locked.+Call+%2B1-800-555-0100";
+        assert_eq!(
+            redirect_result(phishing, "st"),
+            Err("authorization denied (redirect state did not match)".to_string())
+        );
+        assert_eq!(
+            redirect_result(&format!("{phishing}&state=wrong"), "st"),
+            Err("authorization denied (redirect state did not match)".to_string())
+        );
+        assert_eq!(
+            redirect_result("error=consent_required%0D%0A&state=wrong", "st"),
+            Err("authorization denied (redirect state did not match)".to_string())
+        );
+        // A bare code is shown as before.
+        assert_eq!(
+            redirect_result("error=consent_required&state=wrong", "st"),
+            Err("authorization denied: consent_required".to_string())
+        );
+        // With our state, `error` is shown, on one line.
+        assert_eq!(
+            redirect_result("error=server+error%0D%0Aretry+later&state=st", "st"),
+            Err("authorization denied: server error retry later".to_string())
         );
     }
 
