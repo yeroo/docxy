@@ -1,11 +1,15 @@
-//! The RTF (and HTML) beside a copy's text on the OS clipboard (#1074, #1248).
+//! The RTF (and HTML) beside a copy's text on the OS clipboard (#1074, #1248,
+//! #1950).
 //!
 //! gpui's clipboard carries text (and images) only, so a document copy adds
 //! its RTF here, right after gpui wrote the text: macOS as `public.rtf` on
 //! the general pasteboard, Windows as the registered "Rich Text Format".
 //! Neither write clears the clipboard, so the text stays; gpui's next write
-//! of anything clears both. Elsewhere (Linux: gpui has no multi-format
-//! clipboard) both calls do nothing and copy and paste stay plain text.
+//! of anything clears both. On X11 the suite takes the `CLIPBOARD` selection
+//! over from gpui and serves the text beside `text/rtf` (or `text/html`) on
+//! its own connection ([`x11`], #1950); gpui's next copy takes it back.
+//! Elsewhere (Wayland, #1966, and headless) the calls do nothing and copy
+//! and paste stay plain text.
 //!
 //! The RTF goes on only while the clipboard still holds the copy's own
 //! text, checked again just before the write: another app may have copied
@@ -43,9 +47,15 @@ pub(crate) fn write_rtf(rtf: String, text: &str) {
     imp::write_rtf(&rtf, text);
 }
 
+#[cfg(target_os = "linux")]
+mod x11;
+
 /// Whether the clipboard's text `held` is the copy's `text`, line endings
 /// compared loosely (the OS may hand CRLF back).
-#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux")),
+    allow(dead_code)
+)]
 fn same_text(held: &str, text: &str) -> bool {
     held.replace("\r\n", "\n") == text.replace("\r\n", "\n")
 }
@@ -61,7 +71,17 @@ pub(crate) fn write_html(html: String, text: &str) {
     imp::write_html(&html, text);
 }
 
-/// The HTML table fragment on the clipboard, if any.
+/// At quit: hand what the suite serves to the clipboard manager, so its
+/// last copy (text, RTF, HTML) outlives it (X11, #1950: the suite owns the
+/// selection then, so gpui's own handover finds nothing of its own to hand
+/// over). Waits 100 ms at most; nothing elsewhere.
+pub(crate) fn hand_over() {
+    imp::hand_over();
+}
+
+/// The clipboard's HTML, if any: cut to its table fragment when a CF_HTML
+/// payload holds one, else the page, for a sheet paste's table and a
+/// document paste (#1950). As UTF-8 text (an X11 UTF-16 page converted).
 pub(crate) fn read_html() -> Option<String> {
     let bytes = imp::read_html()?;
     html_fragment(&bytes)
@@ -69,7 +89,10 @@ pub(crate) fn read_html() -> Option<String> {
 
 /// The meta that tells a reader the page is UTF-8: a clipboard HTML has no
 /// other way to say so, and readers assume a Windows code page without it.
-#[cfg_attr(not(any(target_os = "macos", windows, test)), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", windows, target_os = "linux", test)),
+    allow(dead_code)
+)]
 const CHARSET: &str = "<meta charset=\"utf-8\">";
 
 /// `fragment` as a CF_HTML clipboard payload (Windows' "HTML Format"): the
@@ -77,7 +100,7 @@ const CHARSET: &str = "<meta charset=\"utf-8\">";
 /// header's length does not depend on them) of the page, and of the fragment
 /// between its `<!--StartFragment-->` markers.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn cf_html(fragment: &str) -> String {
+pub(crate) fn cf_html(fragment: &str) -> String {
     const HEADER: usize = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n".len();
     let before = format!("<html><head>{CHARSET}</head><body>\r\n<!--StartFragment-->");
     let after = "<!--EndFragment-->\r\n</body>\r\n</html>";
@@ -89,9 +112,12 @@ fn cf_html(fragment: &str) -> String {
     )
 }
 
-/// `fragment` as the macOS `public.html` page.
-#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-fn html_page(fragment: &str) -> String {
+/// `fragment` as the macOS `public.html` page, and the X11 `text/html` one.
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux", test)),
+    allow(dead_code)
+)]
+pub(crate) fn html_page(fragment: &str) -> String {
     format!("<html><head>{CHARSET}</head><body>{fragment}</body></html>")
 }
 
@@ -180,6 +206,9 @@ mod imp {
     pub(super) fn read_html() -> Option<Vec<u8>> {
         read(HTML)
     }
+
+    /// The pasteboard keeps its data after the app quits.
+    pub(super) fn hand_over() {}
 }
 
 #[cfg(windows)]
@@ -277,6 +306,9 @@ mod imp {
     pub(super) fn read_html() -> Option<Vec<u8>> {
         read("HTML Format")
     }
+
+    /// The clipboard keeps its data after the app quits.
+    pub(super) fn hand_over() {}
 
     fn write(name: &str, bytes: &[u8], text: &str) {
         let Some(format) = format(name) else {
@@ -459,7 +491,57 @@ mod tests {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+/// X11 through the suite's own connection ([`x11`]); Wayland and headless
+/// (any other compositor gpui picks) do nothing, as before (#1966).
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::x11::{Extra, X11Clip};
+    use std::sync::OnceLock;
+
+    /// The app's one X11 clipboard on `DISPLAY` ([`clip`]).
+    static CLIP: OnceLock<Option<X11Clip>> = OnceLock::new();
+
+    /// The app's one X11 clipboard on `DISPLAY`, opened on first use, and
+    /// only when gpui runs on X11. Tests never open it: they own a private
+    /// display's.
+    fn clip() -> Option<&'static X11Clip> {
+        CLIP.get_or_init(|| {
+            (gpui::guess_compositor() == "X11")
+                .then(|| X11Clip::new(None))
+                .flatten()
+        })
+        .as_ref()
+    }
+
+    pub(super) fn write_rtf(rtf: &str, text: &str) {
+        if let Some(clip) = clip() {
+            clip.offer(text, Extra::Rtf, rtf.as_bytes().to_vec());
+        }
+    }
+
+    pub(super) fn read_rtf() -> Option<Vec<u8>> {
+        clip()?.read_rtf()
+    }
+
+    pub(super) fn write_html(html: &str, text: &str) {
+        if let Some(clip) = clip() {
+            clip.offer(text, Extra::Html, super::html_page(html).into_bytes());
+        }
+    }
+
+    pub(super) fn read_html() -> Option<Vec<u8>> {
+        clip()?.read_html()
+    }
+
+    pub(super) fn hand_over() {
+        // Only a clipboard a copy or paste opened can own anything.
+        if let Some(clip) = CLIP.get().and_then(Option::as_ref) {
+            clip.hand_over();
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
 mod imp {
     pub(super) fn write_rtf(_rtf: &str, _text: &str) {}
 
@@ -472,4 +554,6 @@ mod imp {
     pub(super) fn read_html() -> Option<Vec<u8>> {
         None
     }
+
+    pub(super) fn hand_over() {}
 }

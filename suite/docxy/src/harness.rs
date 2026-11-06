@@ -2195,6 +2195,14 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
         ("color", str_or_null(r.color)),
         ("highlight", str_or_null(r.highlight)),
         ("vert_align", Json::Str(vert_align.into())),
+        // The target of the hyperlink holding the caret's character (#1950).
+        (
+            "link",
+            str_or_null(
+                docxcore::editor::resolve_para(&editor.doc.body, &editor.caret.path)
+                    .and_then(|p| crate::doc_view::link_at(p, editor.caret.offset)),
+            ),
+        ),
     ]);
     let view = Json::obj(vec![
         (
@@ -4257,7 +4265,9 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
         app.clip.as_ref(),
         app.grid_clip_current(),
         &now,
-        rtf.is_some(),
+        // An RTF, or an HTML with no text beside it, is another app's copy
+        // (`doc_paste_from`, #1950).
+        rtf.is_some() || (now.text().is_none() && html.is_some()),
     );
     let bold = rtf
         .as_deref()

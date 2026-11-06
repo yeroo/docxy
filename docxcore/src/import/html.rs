@@ -185,9 +185,28 @@ pub(crate) fn import_html_within(
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    let text = decode(bytes);
-    let sheet = StyleSheet::parse(&collect_styles(&text), budget);
-    let mut h = Html::new(&text, budget, sheet);
+    import_decoded(&decode(bytes), budget, images)
+}
+
+/// [`import_html_within`] of a page already decoded, so no charset is read
+/// from it (#1950: the clipboard's HTML is UTF-8, whatever its text says):
+/// no images.
+pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Document, String> {
+    // Two passes: the `<style>` scan, then the tokenizer.
+    if !budget.work(2 * (text.len() / 16 + 1)) {
+        return Err(TOO_BIG.into());
+    }
+    import_decoded(text, budget, None).map(|(doc, _)| doc)
+}
+
+/// The import of the decoded page `text`, as [`import_html_within`] says.
+fn import_decoded(
+    text: &str,
+    budget: &Budget,
+    images: Option<&mut ImageResolver<'_>>,
+) -> Result<(Document, Vec<ImportedMedia>), String> {
+    let sheet = StyleSheet::parse(&collect_styles(text), budget);
+    let mut h = Html::new(text, budget, sheet);
     if let Some(resolve) = images {
         h.images = Some(Images::new(resolve));
     }

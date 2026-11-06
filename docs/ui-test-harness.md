@@ -472,6 +472,8 @@ its cached result text, like revision text, has no editor caret and
 contributes no offset. An equation and an inline (not floating) picture
 each contribute one U+FFFC too (#1242); a floating picture contributes none.
 Text boxes appear in `textboxes` as separate stories.
+`run.link` is the target of the hyperlink holding the caret's character (its
+URL, else `#` and its bookmark; `null` outside a link, #1950).
 
 `flow` is the view's horizontal scroll and its tables as last painted (#1895,
 `docs/claude/docx-editing.md` "Web Layout fits tables to the view"):
@@ -1030,7 +1032,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 | `save-types {}` | what the Save As dialog lists for the active tab, which a harness instance never opens: `{count, default, types: [{label, extensions}]}` in the dialog's order, `default` the first type's first extension, the one the dialog opens on. A document's types, the workbook type, or a Project's writable types: the one its Save As proposes first (the plan's own type when something writes it, else a format plugin's declared default, else `yppx`), then `Project schedule` (`yppx`) and `MSPDI` (`xml`) and any a format plugin writes. A read |
 | `new-from-template {"path":"Letter.dotx"}` | File › New › Personal templates without the click (#636): a new, untitled document from the `.dotx`/`.dotm` at `path` (a relative one resolves against the active tab's folder and is refused when that tab was never saved), the way opening a template makes one. Replies `{path: null, title, dirty, status}`; a file that is not a Word template, or one that will not load, opens nothing and is refused |
 | `clipboard {"action":"read"}` | the clipboard's text, its RTF (`rtf`, null without one) and the text of that RTF's bold runs (`rtf_bold`, #1074), its HTML table (`html`, null without one) and the texts of that table's bold cells (`html_bold`, #1248), and what the active tab's paste would use |
-| `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would; an optional `rtf` goes beside it, as a rich copy's does (#1074). An optional `html` (a table fragment) goes beside it too, as a sheet copy's does (#1248). A write without `rtf` or `html` leaves none |
+| `clipboard {"action":"write","text":"a\tb\n"}` | put text on the clipboard, as another app's copy would; an optional `rtf` goes beside it, as a rich copy's does (#1074). An optional `html` goes beside it too: any page, a sheet copy's table fragment (#1248) or a page a document paste takes (#1950). A write without `rtf` or `html` leaves none |
 | `fill-drag {"from":"B4:B5","to":"B8"}` | press the fill handle, cross each cell to `to`, release. Optional `from`, `option`, `ctrl`, `right`, `double` (#668) |
 | `border-drag {"from":"B2:B3","to":"J2"}` | press the selection's edge, drop the block with its top-left on `to` (#670). Optional `from`, `ctrl`, `right`, `choice`, `replace` |
 | `office-clipboard {"action":"open"}` | the Office Clipboard pane's own handlers (#669): `read` (the default), `open`, `close`, `paste` item `index`, `paste-all`, `clear-all`, `delete` item `index`. Replies `{open, items, state}`. It collects sheet copies and cuts only, not a document's |
@@ -1087,7 +1089,10 @@ sheet's copied cells), each kept while the clipboard still holds the text that
 copy wrote, or holds no item at all; or `{kind: "none"}`, when a document,
 sheet or Project paste takes `text` (#755). In a sheet, `none` also means a
 paste takes another app's HTML table (`html`), else its RTF table, else
-`text`, an HTML-only copy (no `text`) included (#1248). A copy with no text in it (an
+`text`, an HTML-only copy (no `text`) included (#1248). In a document a paste
+takes its own clip, else another app's RTF, else its HTML (a browser's copy),
+else `text` (#1950); an RTF or HTML with no `text` beside it is never the
+document's own clip. A copy with no text in it (an
 image, an empty copy) is newer than either clip too: `text` is `null`, `app`
 is `none`, and a paste does nothing. The exception is a document copy of only
 an image, whose own text is empty: its clip stays ours.
@@ -1122,7 +1127,8 @@ context menu has the same three after Paste (`cm-paste-keep-source`,
 clipboard's text with the formatting typing at the caret would take, as one
 undo step. `key ctrl+alt+v` or Paste Special… opens the `doc-paste-special`
 dialog: its `as` radio lists only what the clipboard holds, Formatted Text
-(RTF) (the document's own copy, or another app's RTF) and Unformatted Text, so
+(RTF) (the document's own copy, or another app's RTF) or HTML Format (another
+app's HTML when there is no RTF, #1950) and Unformatted Text, so
 `dialog-set` of a format that is not there is refused with `has no item`;
 `dialog-click` OK pastes. With nothing to paste no dialog opens and the status
 reads `There is nothing to paste`. The sheet's cell menu has Paste Special…

@@ -71,7 +71,14 @@ impl Clip {
 
 /// [`Clip::from_rtf`] against `budget`.
 fn from_rtf_within(bytes: &[u8], plain: Option<&str>, budget: &Budget) -> Option<Clip> {
-    let doc = import_rtf_within(bytes, budget).ok()?;
+    clip_of(&import_rtf_within(bytes, budget).ok()?, plain)
+}
+
+/// The clip an imported `doc` pastes as (the RTF's here, the HTML's in
+/// [`crate::clip_html`]): its paragraphs, a table row as one paragraph of
+/// tab-joined cells, and the mark `plain` says the copy ends with (see the
+/// module). `None` when it holds no paragraph.
+pub(crate) fn clip_of(doc: &Document, plain: Option<&str>) -> Option<Clip> {
     let mut paras = Vec::new();
     for block in &doc.body {
         match block {
