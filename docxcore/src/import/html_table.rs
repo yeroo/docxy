@@ -18,8 +18,32 @@ use crate::model::{Block, Cell, Paragraph, Row, Table, VMerge};
 pub(crate) const MIN_COL: u32 = 15;
 /// Word's widest page measure, in twips (22"): no width exceeds it.
 pub(crate) const MAX_TWIPS: u32 = 31_680;
-/// The room an outermost table has: a 6.5" text column.
-pub(crate) const BODY_TWIPS: u32 = 9360;
+/// The page an HTML import is laid out for (#1928): US Letter, written
+/// explicitly so a reader's locale (A4) never changes the body width.
+pub(crate) const PAGE_W_TWIPS: u32 = 12_240;
+pub(crate) const PAGE_H_TWIPS: u32 = 15_840;
+/// The page's margin on every side (#1928): 15 px, about the inset Outlook's
+/// reading pane gives a mail body (a browser's own body margin is 8 px),
+/// instead of Word's 1".
+pub(crate) const PAGE_MARGIN_TWIPS: u32 = 225;
+/// The room an outermost table has: the body of that page, 786 px.
+pub(crate) const BODY_TWIPS: u32 = PAGE_W_TWIPS - 2 * PAGE_MARGIN_TWIPS;
+
+/// The final section of an HTML import (#1928): the page and margins
+/// [`BODY_TWIPS`] is laid out for. Header and footer sit in the same 15 px
+/// band (an imported page has neither); no gutter.
+pub(crate) fn page_section() -> crate::model::SectionProperties {
+    let m = PAGE_MARGIN_TWIPS;
+    crate::model::SectionProperties {
+        raw: format!(
+            "<w:sectPr><w:pgSz w:w=\"{PAGE_W_TWIPS}\" w:h=\"{PAGE_H_TWIPS}\"/>\
+             <w:pgMar w:top=\"{m}\" w:right=\"{m}\" w:bottom=\"{m}\" w:left=\"{m}\" \
+             w:header=\"{m}\" w:footer=\"{m}\" w:gutter=\"0\"/></w:sectPr>"
+        ),
+        property_change: None,
+    }
+}
+
 /// The deepest table nesting kept; a table deeper than this joins its
 /// enclosing cell's text, as every nested table did before #1878.
 pub(crate) const MAX_TABLE_NESTING: usize = 8;
@@ -756,11 +780,11 @@ mod tests {
         assert_eq!(g, [4500, 4500]);
         // Percent of the table; pct tblW in fiftieths.
         let (g, pr) = widths(Some(Pct(50.0)), &[Some(Pct(25.0)), None]);
-        assert_eq!(g, [1170, 3510]);
+        assert_eq!(g, [1474, 4421]);
         assert!(pr.contains("<w:tblW w:w=\"2500\" w:type=\"pct\"/>"), "{pr}");
         // No widths at all: the room shared evenly.
         let (g, _) = widths(None, &[None, None, None]);
-        assert_eq!(g, [3120, 3120, 3120]);
+        assert_eq!(g, [3930, 3930, 3930]);
     }
 
     #[test]

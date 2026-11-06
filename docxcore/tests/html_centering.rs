@@ -153,9 +153,10 @@ fn a_digest_keeps_its_centring() {
     assert_eq!(pictures[0].plain_text(), "");
     assert_eq!(find("After the hero.").props.align, Align::Left);
 
-    // The 300 px note with 20 px side padding, centred: (9360 - 4500 -
-    // 2 × 300) / 2 + 300 on each side; its text keeps its alignment.
+    // The 300 px note with 20 px side padding, centred in the 11790 body
+    // (#1928): (11790 - 4500 - 2 × 300) / 2 + 300 on each side; its text
+    // keeps its alignment.
     let note = find("A note in a 300 px box, centred on the page.");
-    assert_eq!((note.props.indent, note.props.indent_right), (2430, 2430));
+    assert_eq!((note.props.indent, note.props.indent_right), (3645, 3645));
     assert_eq!(note.props.align, Align::Left);
 }

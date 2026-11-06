@@ -203,7 +203,9 @@ pub(crate) fn import_html_within(
     }
     let media = h.images.take().map(Images::into_media).unwrap_or_default();
     let props = h.par_props();
-    let doc = h.out.finish(props);
+    let mut doc = h.out.finish(props);
+    // The page the layout above assumed (#1928): Outlook-like margins.
+    doc.set_trailing_section_properties(html_table::page_section());
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
@@ -4160,18 +4162,19 @@ mod tests {
         let d = doc("<style>.w{width:1in}</style><table style='width:50%'><tr>\
              <td class=w width=10>a</td><td style='width:auto' width=100>b</td></tr></table>");
         let t = table(&d);
-        assert_eq!(t.grid, [1440, 3240]);
+        // Half the 11790 body (#1928): 5895.
+        assert_eq!(t.grid, [1440, 4455]);
         assert!(
             t.raw_tblpr
                 .as_deref()
                 .unwrap()
                 .contains("<w:tblW w:w=\"2500\" w:type=\"pct\"/>")
         );
-        // No widths: the 6.5" column shared, tblW auto; a garbage width
+        // No widths: the 11790 body shared, tblW auto; a garbage width
         // is none.
         let d = doc("<table width=wide><tr><td width=*>a</td><td>b</td></tr></table>");
         let t = table(&d);
-        assert_eq!(t.grid, [4680, 4680]);
+        assert_eq!(t.grid, [5895, 5895]);
         assert!(
             t.raw_tblpr
                 .as_deref()
@@ -4744,7 +4747,7 @@ mod image_tests {
         );
         assert_eq!(
             shapes(&d),
-            // 8 of 416 px, though drawn at 624 x 208; 4 of the pixels' 20.
+            // 8 of 416 px, though drawn at 786 x 262; 4 of the pixels' 20.
             [Ellipse, RoundRect { adj: 1923 }, RoundRect { adj: 20_000 }]
         );
         let placeholder = all_pictures(&d)[0];
@@ -4757,12 +4760,13 @@ mod image_tests {
 
     #[test]
     fn a_wide_picture_is_scaled_to_the_body() {
-        let (d, _, _) = with_images("<p><img src=a.png width=1248 height=100></p>");
-        assert_eq!(sizes(&d), [(624 * PX, 50 * PX)]);
+        // Twice the 786 px body (#1928): drawn at half size.
+        let (d, _, _) = with_images("<p><img src=a.png width=1572 height=100></p>");
+        assert_eq!(sizes(&d), [(786 * PX, 50 * PX)]);
         // FIX r2 m1: sides past a page's 2112 px keep their aspect.
         let (d, _, _) = with_images(
             "<p><img src=a.png width=3000 height=1000>\
-             <img src=a.png style='width:2400px;height:600px'>\
+             <img src=a.png style='width:3144px;height:600px'>\
              <img src=a.png width=4000>\
              <img src=a.png style='height:3000px'>\
              <img src=missing.png width=99999999999 height=1></p>",
@@ -4770,13 +4774,13 @@ mod image_tests {
         assert_eq!(
             sizes(&d),
             [
-                (624 * PX, 208 * PX),
-                (624 * PX, 156 * PX),
+                (786 * PX, 262 * PX),
+                (786 * PX, 150 * PX),
                 // One side: the 40 x 20 pixels' aspect.
-                (624 * PX, 312 * PX),
-                (624 * PX, 312 * PX),
+                (786 * PX, 393 * PX),
+                (786 * PX, 393 * PX),
                 // Saturating, then scaled: a height under a twip is one EMU.
-                (624 * PX, 1),
+                (786 * PX, 1),
             ]
         );
     }
@@ -4800,7 +4804,7 @@ mod image_tests {
             for side in [cx, cy] {
                 assert!((1..=crate::image::MAX_EMU).contains(&side), "{side}");
             }
-            assert_eq!(cx, 624 * PX, "scaled to the body");
+            assert_eq!(cx, 786 * PX, "scaled to the body");
         }
     }
 
@@ -5871,23 +5875,23 @@ mod centering_tests {
                 .map(|p| (p.plain_text(), p.props.indent, p.props.indent_right))
                 .collect()
         };
-        // 300 px = 4500 twips in a 9360 body: 2430 each side.
+        // 300 px = 4500 twips in the 11790 body (#1928): 3645 each side.
         assert_eq!(
             indents("<div style='width:300px;margin:0 auto'>x</div><p>y</p>"),
-            [("x".into(), 2430, 2430), ("y".into(), 0, 0)]
+            [("x".into(), 3645, 3645), ("y".into(), 0, 0)]
         );
         // Content box: 20 px (300 twips) padding is outside the width.
         assert_eq!(
             indents(
                 "<div style='width:300px;padding:0 20px;margin:0 auto;text-align:left'>x</div>"
             ),
-            [("x".into(), 2430, 2430)]
+            [("x".into(), 3645, 3645)]
         );
-        // Centred in what an enclosing indent leaves (9360 - 1440 - 2880
-        // = 5040 over two); the text's alignment is untouched.
+        // Centred in what an enclosing indent leaves (11790 - 1440 - 2880
+        // = 7470 over two); the text's alignment is untouched.
         let d = doc("<div style='margin-left:1in'><p style='width:2in;margin:0 auto'>x</p></div>");
         let p = all_paras(&d)[0];
-        assert_eq!((p.props.indent, p.props.indent_right), (1440 + 2520, 2520));
+        assert_eq!((p.props.indent, p.props.indent_right), (1440 + 3735, 3735));
         assert_eq!(p.props.align, Align::Left);
         // Wider than the room: no extra indent, never negative.
         assert_eq!(
@@ -5898,7 +5902,7 @@ mod centering_tests {
         // it; `auto` clears it.
         for w in ["-1px", "600", "red"] {
             let html = format!("<div style='width:300px;width:{w};margin:0 auto'>x</div>");
-            assert_eq!(indents(&html), [("x".into(), 2430, 2430)], "{html}");
+            assert_eq!(indents(&html), [("x".into(), 3645, 3645)], "{html}");
             let html = format!("<div style='width:{w};margin:0 auto'>x</div>");
             assert_eq!(indents(&html), [("x".into(), 0, 0)], "{html}");
         }
@@ -6192,7 +6196,7 @@ mod card_tests {
         let deeper = "<table><tr><td>".repeat(3);
         let d = doc(&format!("{open}<div style='background:#eee'>{deeper}x"));
         assert_eq!(table_count(&d.body), MAX_TABLE_NESTING);
-        assert_eq!(d.body.len(), 1, "{:?}", d.body);
+        assert_eq!(d.content_block_count(), 1, "{:?}", d.body);
         para(&d, "x");
         // With nothing in them, the card is dropped as empty: the tables past
         // the limit were never the builder's to end.
@@ -6250,7 +6254,7 @@ mod card_tests {
         ] {
             let d = doc(html);
             assert_eq!(table_count(&d.body), 2, "{html}: {:?}", d.body);
-            assert_eq!(d.body.len(), 2, "{html}: {:?}", d.body);
+            assert_eq!(d.content_block_count(), 2, "{html}: {:?}", d.body);
             assert_eq!(sketch(&d.body[1..]), ["tail"], "{html}");
             let outer = outer_cell(&d);
             assert_eq!(sketch(outer).last().map(String::as_str), Some("after"));
@@ -6463,5 +6467,96 @@ mod card_tests {
             "<table><tr><td>{spans}<div style='background:#eee'>x</div>y</td></tr></table>"
         ));
         assert_eq!(table_count(&d.body), 1);
+    }
+}
+
+/// The page an HTML import is laid out for (#1928): Letter with
+/// Outlook-like 15 px margins, the body [`html_table::BODY_TWIPS`] assumes.
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use crate::model::PageGeom;
+    use crate::sect::{Margins, SectionSetup};
+
+    #[test]
+    fn an_html_import_has_outlook_like_page_margins() {
+        let mut none = |_: &str, _: usize| None;
+        let with = import_html_with(b"<p>x</p>", &mut none).unwrap().document;
+        for d in [import_html(b"<p>x</p>").unwrap(), with] {
+            let section = d.trailing_section_properties().expect("a final section");
+            assert_eq!(section.property_change, None);
+            // The section is last and is no content block.
+            assert!(matches!(
+                d.body.last(),
+                Some(DocBlock::SectionProperties(_))
+            ));
+            assert_eq!(d.content_block_count(), 1);
+            let g = PageGeom::from_sect_pr(&section.raw);
+            assert_eq!(
+                (g.w, g.h, g.ml, g.mr, g.mt, g.mb, g.cols),
+                (12_240, 15_840, 225, 225, 225, 225, 1)
+            );
+            // The size is written, so no reader's locale makes it A4, and
+            // the margins carry every attribute the schema requires.
+            let raw = &section.raw;
+            assert!(
+                raw.contains(r#"<w:pgSz w:w="12240" w:h="15840"/>"#),
+                "{raw}"
+            );
+            assert!(
+                raw.contains(
+                    r#"<w:pgMar w:top="225" w:right="225" w:bottom="225" w:left="225" w:header="225" w:footer="225" w:gutter="0"/>"#
+                ),
+                "{raw}"
+            );
+            let setup = SectionSetup::parse(raw);
+            assert_eq!((setup.page.w, setup.page.h), (12_240, 15_840));
+            assert!(!setup.page.landscape);
+            assert_eq!(
+                setup.margins,
+                Margins {
+                    top: 225,
+                    right: 225,
+                    bottom: 225,
+                    left: 225,
+                    header: 225,
+                    footer: 225,
+                    gutter: 0,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn the_layout_body_is_the_page_less_its_margins() {
+        let g = PageGeom::from_sect_pr(&html_table::page_section().raw);
+        assert_eq!(
+            i64::from(html_table::BODY_TWIPS),
+            i64::from(g.w - g.ml - g.mr)
+        );
+        assert_eq!(html_table::BODY_TWIPS, 11_790);
+        // So a `width=100%` table fills exactly that body.
+        let d = import_html(b"<table width=100%><tr><td>x</td></tr></table>").unwrap();
+        let DocBlock::Table(t) = &d.body[0] else {
+            panic!("{:?}", d.body);
+        };
+        assert_eq!(t.grid, [html_table::BODY_TWIPS]);
+    }
+
+    #[test]
+    fn the_other_imports_keep_the_package_page() {
+        // A regression guard: only the HTML import has its own page.
+        let rtf = crate::import::import_rtf(br"{\rtf1 x\par}").unwrap();
+        assert!(
+            rtf.trailing_section_properties().is_none(),
+            "{:?}",
+            rtf.body
+        );
+        let text = crate::import::recover_any_text(b"plain text here").unwrap();
+        assert!(
+            text.trailing_section_properties().is_none(),
+            "{:?}",
+            text.body
+        );
     }
 }

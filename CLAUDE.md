@@ -39,7 +39,7 @@ issue number to find its notes.
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
-  nested cards (#1927).
+  nested cards (#1927), page margins (#1928).
 - `docs/claude/clipboard.md`: before changing copy and paste with other apps: rich (RTF)
   document copy (#1074), sheet HTML tables (#1248).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥

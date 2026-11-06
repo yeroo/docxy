@@ -284,10 +284,10 @@ fn a_newsletter_table_layout_keeps_widths_spans_and_shading() {
         .collect();
     assert_eq!(tables.len(), 1, "only the wrapper is in the body");
 
-    // The 100% wrapper: the whole text column, its grey on its cell, no
-    // borders, zero cell margins.
+    // The 100% wrapper: the whole text column (the HTML page's 11790 body,
+    // #1928), its grey on its cell, no borders, zero cell margins.
     let wrapper = tables[0];
-    assert_eq!(wrapper.grid, [9360]);
+    assert_eq!(wrapper.grid, [11_790]);
     assert_eq!(
         attr_of(tblpr(wrapper), "w:tblW", "w:type").as_deref(),
         Some("pct")
