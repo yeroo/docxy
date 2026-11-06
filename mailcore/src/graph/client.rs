@@ -925,9 +925,23 @@ impl GraphClient {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<(), GraphError> {
+        self.post_file_attachment(message_id, name, content_type, bytes, None)
+    }
+
+    /// `add_file_attachment`, with `content_id` `Some` making it an inline
+    /// attachment (#1949): `isInline: true` and `contentId` follow the other
+    /// keys. With `None` the body is exactly `add_file_attachment`'s.
+    fn post_file_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        content_id: Option<&str>,
+    ) -> Result<(), GraphError> {
         let id = encode_path_segment(message_id);
         let path = format!("/me/messages/{id}/attachments");
-        let body = Value::Object(vec![
+        let mut fields = vec![
             (
                 "@odata.type".to_string(),
                 Value::Str("#microsoft.graph.fileAttachment".to_string()),
@@ -938,8 +952,9 @@ impl GraphClient {
                 Value::Str(content_type.to_string()),
             ),
             ("contentBytes".to_string(), Value::Str(base64_encode(bytes))),
-        ])
-        .to_string();
+        ];
+        push_inline_fields(&mut fields, content_id);
+        let body = Value::Object(fields).to_string();
         self.send(Method::Post, &path, Some(body), &[])?;
         Ok(())
     }
@@ -954,10 +969,25 @@ impl GraphClient {
         content_type: &str,
         bytes: &[u8],
     ) -> Result<(), GraphError> {
+        self.add_attachment_with(message_id, name, content_type, bytes, None)
+    }
+
+    /// `add_attachment`, with `content_id` `Some` making the attachment
+    /// inline (#1949): both paths, the small POST and the upload session's
+    /// `AttachmentItem`, send `isInline: true` and `contentId`. With `None`
+    /// it is `add_attachment`, request bodies unchanged.
+    pub fn add_attachment_with(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        content_id: Option<&str>,
+    ) -> Result<(), GraphError> {
         if bytes.len() <= INLINE_MAX {
-            self.add_file_attachment(message_id, name, content_type, bytes)
+            self.post_file_attachment(message_id, name, content_type, bytes, content_id)
         } else {
-            self.upload_large_attachment(message_id, name, content_type, bytes)
+            self.upload_large_attachment(message_id, name, content_type, bytes, content_id)
         }
     }
 
@@ -970,22 +1000,22 @@ impl GraphClient {
         name: &str,
         content_type: &str,
         bytes: &[u8],
+        content_id: Option<&str>,
     ) -> Result<(), GraphError> {
         let id = encode_path_segment(message_id);
         let path = format!("/me/messages/{id}/attachments/createUploadSession");
-        let body = Value::Object(vec![(
-            "AttachmentItem".to_string(),
-            Value::Object(vec![
-                ("attachmentType".to_string(), Value::Str("file".to_string())),
-                ("name".to_string(), Value::Str(name.to_string())),
-                ("size".to_string(), Value::Num(bytes.len() as f64)),
-                (
-                    "contentType".to_string(),
-                    Value::Str(content_type.to_string()),
-                ),
-            ]),
-        )])
-        .to_string();
+        let mut item = vec![
+            ("attachmentType".to_string(), Value::Str("file".to_string())),
+            ("name".to_string(), Value::Str(name.to_string())),
+            ("size".to_string(), Value::Num(bytes.len() as f64)),
+            (
+                "contentType".to_string(),
+                Value::Str(content_type.to_string()),
+            ),
+        ];
+        push_inline_fields(&mut item, content_id);
+        let body =
+            Value::Object(vec![("AttachmentItem".to_string(), Value::Object(item))]).to_string();
         let resp = self.send(Method::Post, &path, Some(body), &[])?;
         let v = parse_body(resp)?;
         let upload_url = v
@@ -1373,6 +1403,16 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// Standard base64 (RFC 4648 §4: `+`/`/` alphabet, `=` padding) — the encoding
 /// Graph expects for `fileAttachment.contentBytes`. The `pkce` module's
 /// base64*url* encoder can't be reused (different alphabet, no padding).
+/// Appends `isInline: true` and `contentId` to an attachment's JSON fields
+/// when `content_id` is `Some` (#1949); with `None` adds nothing, so a plain
+/// attachment's body is unchanged.
+fn push_inline_fields(fields: &mut Vec<(String, Value)>, content_id: Option<&str>) {
+    if let Some(cid) = content_id {
+        fields.push(("isInline".to_string(), Value::Bool(true)));
+        fields.push(("contentId".to_string(), Value::Str(cid.to_string())));
+    }
+}
+
 /// Used by `add_file_attachment` to encode inline attachment bytes.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3405,6 +3445,119 @@ mod tests {
             covered = end_incl + 1;
         }
         assert_eq!(covered, big.len(), "PUT(s) cover the whole payload");
+    }
+
+    #[test]
+    fn add_file_attachment_with_a_content_id_posts_is_inline_and_content_id() {
+        // #1949: a small inline picture is a fileAttachment with both fields.
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments".into(),
+            status: 201,
+            headers: vec![],
+            body: r#"{"id":"att1"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.add_attachment_with("M1", "pic.png", "image/png", b"hello", Some("pic1"))
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/me/messages/M1/attachments");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent.get("@odata.type").and_then(Value::as_str),
+            Some("#microsoft.graph.fileAttachment")
+        );
+        assert_eq!(sent.get("isInline").and_then(Value::as_bool), Some(true));
+        assert_eq!(sent.get("contentId").and_then(Value::as_str), Some("pic1"));
+        assert_eq!(
+            sent.get("contentType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            sent.get("contentBytes").and_then(Value::as_str),
+            Some("aGVsbG8=")
+        );
+    }
+
+    #[test]
+    fn add_file_attachment_without_a_content_id_sends_neither_field() {
+        // #1949: a plain attachment's body is today's: no isInline, no contentId.
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments".into(),
+            status: 201,
+            headers: vec![],
+            body: r#"{"id":"att1"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.add_attachment_with("M1", "a.txt", "text/plain", b"hello", None)
+            .unwrap();
+        c.add_attachment("M1", "a.txt", "text/plain", b"hello")
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        for r in &reqs {
+            let sent = json::parse(&r.body).unwrap();
+            assert!(sent.get("isInline").is_none(), "{}", r.body);
+            assert!(sent.get("contentId").is_none(), "{}", r.body);
+        }
+        assert_eq!(reqs[0].body, reqs[1].body, "None is add_attachment");
+    }
+
+    #[test]
+    fn upload_session_with_a_content_id_sends_is_inline_and_content_id_in_the_attachment_item() {
+        // #1949: a large inline file goes through an upload session whose
+        // AttachmentItem carries both fields; without one, neither.
+        let upload_srv = FakeServer::start(vec![Route {
+            method: "PUT".into(),
+            path_prefix: "/upload/xyz".into(),
+            status: 201,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let session_body = format!(r#"{{"uploadUrl":"{}/upload/xyz"}}"#, upload_srv.base_url);
+        let session_srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments/createUploadSession".into(),
+            status: 200,
+            headers: vec![],
+            body: session_body,
+        }]);
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let big = vec![7u8; INLINE_MAX + 100];
+        c.add_attachment_with("M1", "big.png", "image/png", &big, Some("pic1"))
+            .unwrap();
+        c.add_attachment_with("M1", "big.bin", "application/octet-stream", &big, None)
+            .unwrap();
+
+        let reqs = session_srv.requests();
+        assert_eq!(reqs.len(), 2);
+        let item = |i: usize| {
+            json::parse(&reqs[i].body)
+                .unwrap()
+                .get("AttachmentItem")
+                .cloned()
+                .expect("an AttachmentItem")
+        };
+        let inline = item(0);
+        assert_eq!(inline.get("isInline").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            inline.get("contentId").and_then(Value::as_str),
+            Some("pic1")
+        );
+        assert_eq!(
+            inline.get("attachmentType").and_then(Value::as_str),
+            Some("file")
+        );
+        assert_eq!(
+            inline.get("contentType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        let plain = item(1);
+        assert!(plain.get("isInline").is_none());
+        assert!(plain.get("contentId").is_none());
+        assert!(!upload_srv.requests().is_empty(), "the bytes were PUT");
     }
 
     fn sample_input() -> EventInput {

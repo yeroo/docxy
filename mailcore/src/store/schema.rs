@@ -95,12 +95,18 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 -- `uploaded` is 1 once Graph confirmed a send's upload of the file to the
 -- draft (#1874), so a resend after a failed send does not upload it again.
+-- `content_id` set makes it inline (#1949: an html body's `cid:` picture);
+-- `content_type` NULL is derived from the name at send time; `data` set
+-- means the bytes live in the row (a pasted picture), keyed `cid:<content_id>`.
 CREATE TABLE IF NOT EXISTS outbound_attachments (
-    draft_id  TEXT NOT NULL,
-    path      TEXT NOT NULL,
-    name      TEXT NOT NULL,
-    size      INTEGER NOT NULL DEFAULT 0,
-    uploaded  INTEGER NOT NULL DEFAULT 0,
+    draft_id      TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    size          INTEGER NOT NULL DEFAULT 0,
+    uploaded      INTEGER NOT NULL DEFAULT 0,
+    content_id    TEXT,
+    content_type  TEXT,
+    data          BLOB,
     PRIMARY KEY (draft_id, path)
 );
 
