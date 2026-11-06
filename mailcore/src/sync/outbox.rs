@@ -20,7 +20,9 @@
 //! `CreateEvent` reconciles a `local:` id to its Graph id afterward exactly
 //! like `SaveDraft`/`SendDraft` do for drafts.
 
-use crate::graph::client::{GraphClient, GraphError, RsvpKind};
+use crate::graph::client::{
+    GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind, graph_error_message, one_line,
+};
 use crate::graph::model::Recipient;
 use crate::store::{OutboxOp, Store};
 
@@ -184,20 +186,14 @@ pub(crate) fn apply_send(
 }
 
 /// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's
-/// own `error.message` for an HTTP error whose body carries a non-empty one,
-/// else `HTTP {status}`; a `Parse` failure's message as is (a missing
+/// own `error.message` for an HTTP error whose body carries a non-empty one
+/// (as one line, capped like `GraphError`'s `Display`, #1954), else
+/// `HTTP {status}`; a `Parse` failure's message as is (a missing
 /// attachment file, a store error); any other error's `Display`.
 pub(crate) fn send_error_text(err: &GraphError) -> String {
     match err {
-        GraphError::Http { status, body } => crate::json::parse(body)
-            .ok()
-            .and_then(|v| {
-                v.get("error")?
-                    .get("message")?
-                    .as_str()
-                    .map(|m| m.trim().to_string())
-            })
-            .filter(|m| !m.is_empty())
+        GraphError::Http { status, body } => graph_error_message(body)
+            .map(|m| one_line(&m, HTTP_ERROR_TEXT_MAX))
             .unwrap_or_else(|| format!("HTTP {status}")),
         GraphError::Parse(m) => m.clone(),
         other => other.to_string(),
@@ -1010,6 +1006,23 @@ mod tests {
             )),
             "Access is denied."
         );
+        // Graph's message is shown as one line, capped like `Display` (#1954).
+        assert_eq!(
+            send_error_text(&http(
+                400,
+                r#"{"error":{"code":"X","message":"Bad id.\r\n\tTry again."}}"#
+            )),
+            "Bad id. Try again."
+        );
+        let long = send_error_text(&http(
+            400,
+            &format!(
+                r#"{{"error":{{"code":"X","message":"{}"}}}}"#,
+                "é".repeat(HTTP_ERROR_TEXT_MAX * 2)
+            ),
+        ));
+        assert_eq!(long.chars().count(), HTTP_ERROR_TEXT_MAX);
+        assert!(long.ends_with('…'), "{long}");
         assert_eq!(send_error_text(&http(403, "<html>nope</html>")), "HTTP 403");
         assert_eq!(
             send_error_text(&http(400, r#"{"error":{"code":"X","message":"  "}}"#)),

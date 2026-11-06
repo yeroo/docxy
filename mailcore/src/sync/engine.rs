@@ -5349,6 +5349,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The IIS page an Exchange Online front end answers a bodiless POST
+    /// with (#1954).
+    const IIS_411_HTML: &str = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\r\n<HTML><HEAD><TITLE>Length Required</TITLE>\r\n<META HTTP-EQUIV=\"Content-Type\" Content=\"text/html; charset=us-ascii\"></HEAD>\r\n<BODY><h2>Length Required</h2>\r\n<hr><p>HTTP Error 411. The request must be chunked or have a content length.</p>\r\n</BODY></HTML>\r\n";
+
+    /// A Reply All refused with a 411 HTML page reaches the host as one
+    /// line without markup, and opens no draft (#1954).
+    #[test]
+    fn compose_reply_all_411_emits_one_line_error() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/M1/createReplyAll".into(),
+                status: 411,
+                headers: vec![("Content-Type".into(), "text/html".into())],
+                body: IIS_411_HTML.into(),
+            },
+        ]);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("compose-reply-all-411");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: true,
+            })
+            .unwrap();
+
+        let events = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("411")),
+        );
+        let errors: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::Error(m) if m.contains("411") => Some(m.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, ["HTTP 411 Length Required"]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::DraftReady { .. })),
+            "a refused Reply All opens no draft: {events:?}"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn compose_forward_stores_draft_and_emits_ready() {
         let srv = FakeServer::start(vec![
