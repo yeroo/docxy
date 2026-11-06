@@ -1595,16 +1595,124 @@ impl Store {
         let Some((body, fetched_as, draft)) = row else {
             return Ok(None);
         };
-        let satisfies = match fetched_as.as_deref() {
-            // A value this build does not know is not `format`: refetch.
-            Some(asked) => BodyFormat::parse(asked) == Some(format),
-            None => {
-                draft
-                    || body.content_type.eq_ignore_ascii_case("html")
-                    || format == BodyFormat::Text
-            }
-        };
+        let satisfies = body_satisfies(fetched_as.as_deref(), &body.content_type, draft, format);
         Ok(satisfies.then_some(body))
+    }
+
+    /// Whether a message exists in the store (by its current id).
+    pub fn message_exists(&self, message_id: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM messages WHERE id = ?1",
+                params![message_id],
+                |_| Ok(()),
+            )
+            .map(|()| true)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?)
+    }
+
+    /// Up to `limit` ids of the messages the engine fetches a body for on
+    /// its own (#1978), newest first: received at `since` or later (so a
+    /// header-less row is out), not a draft (`get_body_for`'s rule: marked
+    /// `is_draft`, or filed in the Drafts folder, the synced one or the
+    /// local sentinel), and whose stored body does not satisfy `format`
+    /// ([`body_satisfies`], the rule `get_body_for` uses). Ids in `skip`
+    /// are left out.
+    pub fn body_candidates(
+        &self,
+        format: BodyFormat,
+        since: &str,
+        limit: usize,
+        skip: &[String],
+    ) -> Result<Vec<String>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, b.message_id IS NOT NULL, b.fetched_as, COALESCE(b.content_type, '')
+             FROM messages m
+             LEFT JOIN folders f ON f.id = m.folder_id
+             LEFT JOIN bodies b ON b.message_id = m.id
+             WHERE m.received_at >= ?1 AND m.received_at != ''
+               AND m.is_draft = 0
+               AND COALESCE(f.well_known_name, '') != 'drafts'
+               AND m.folder_id != ?2
+             ORDER BY m.received_at DESC, m.id",
+        )?;
+        let mut rows = stmt.query(params![since, LOCAL_DRAFTS_SENTINEL_FOLDER_ID])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let has_body: bool = row.get(1)?;
+            let fetched_as: Option<String> = row.get(2)?;
+            let content_type: String = row.get(3)?;
+            if has_body && body_satisfies(fetched_as.as_deref(), &content_type, false, format) {
+                continue;
+            }
+            if skip.contains(&id) {
+                continue;
+            }
+            out.push(id);
+            if out.len() == limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the engine still fetches a body for `message_id` on its own
+    /// (#1978): [`Store::body_candidates`]' rule for one row. A missing row
+    /// needs none.
+    pub fn needs_body(
+        &self,
+        message_id: &str,
+        format: BodyFormat,
+        since: &str,
+    ) -> Result<bool, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT m.received_at,
+                        m.is_draft = 1 OR COALESCE(f.well_known_name, '') = 'drafts'
+                            OR m.folder_id = ?2,
+                        b.message_id IS NOT NULL, b.fetched_as, COALESCE(b.content_type, '')
+                 FROM messages m
+                 LEFT JOIN folders f ON f.id = m.folder_id
+                 LEFT JOIN bodies b ON b.message_id = m.id
+                 WHERE m.id = ?1",
+                params![message_id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+        let Some((received, draft, has_body, fetched_as, content_type)) = row else {
+            return Ok(false);
+        };
+        if received.is_empty() || received.as_str() < since || draft {
+            return Ok(false);
+        }
+        Ok(!(has_body && body_satisfies(fetched_as.as_deref(), &content_type, false, format)))
     }
 
     /// The stored body of a message, if any (`None` before `put_body` is
@@ -2897,6 +3005,25 @@ fn drafts_folder_id_on(conn: &Connection) -> Result<String, StoreError> {
 /// The local `folders.id` a new draft is filed under when the real Drafts
 /// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
 /// See `Store::drafts_folder_id`.
+/// Whether a stored body satisfies `format` (#1901), the one rule
+/// [`Store::get_body_for`] and the engine's own fetches (#1978,
+/// [`Store::body_candidates`], [`Store::needs_body`]) share. A body
+/// `FetchBody` recorded (`fetched_as`) satisfies the format it was asked in
+/// (a value this build does not know satisfies none: refetch). One with no
+/// recorded format satisfies both when it is html or a draft's, and
+/// otherwise counts as asked for text.
+fn body_satisfies(
+    fetched_as: Option<&str>,
+    content_type: &str,
+    draft: bool,
+    format: BodyFormat,
+) -> bool {
+    match fetched_as {
+        Some(asked) => BodyFormat::parse(asked) == Some(format),
+        None => draft || content_type.eq_ignore_ascii_case("html") || format == BodyFormat::Text,
+    }
+}
+
 pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
@@ -5803,6 +5930,159 @@ mod body_format_tests {
             .unwrap();
         s.put_body(&id, &text_body("t")).unwrap();
         assert_eq!(satisfies(&s, &id), (true, true));
+    }
+
+    /// A store with an Inbox and a Drafts folder, and `rows` (id, folder,
+    /// received, is_draft) in them.
+    fn store_with_rows(rows: &[(&str, &str, &str, bool)]) -> Store {
+        let s = Store::open_in_memory().unwrap();
+        for (id, name, wk) in [("INBOX", "Inbox", "inbox"), ("DRAFTS", "Drafts", "drafts")] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: name.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some(wk.into()),
+            })
+            .unwrap();
+        }
+        for (id, folder, received, draft) in rows {
+            let m = Message {
+                received: (*received).into(),
+                ..message(id, *draft)
+            };
+            s.upsert_message(folder, &m).unwrap();
+        }
+        s
+    }
+
+    const SINCE: &str = "2026-07-01T00:00:00Z";
+
+    #[test]
+    fn body_candidates_are_the_window_newest_first_without_a_satisfying_body() {
+        let s = store_with_rows(&[
+            ("OLD", "INBOX", "2026-06-30T23:59:59Z", false),
+            ("A", "INBOX", "2026-07-02T00:00:00Z", false),
+            ("B", "INBOX", "2026-07-03T00:00:00Z", false),
+            ("C", "INBOX", "2026-07-01T00:00:00Z", false),
+            ("HEADERLESS", "INBOX", "", false),
+        ]);
+        let all = s.body_candidates(BodyFormat::Text, SINCE, 10, &[]).unwrap();
+        assert_eq!(all, vec!["B", "A", "C"]);
+        // The limit takes the newest.
+        let two = s.body_candidates(BodyFormat::Text, SINCE, 2, &[]).unwrap();
+        assert_eq!(two, vec!["B", "A"]);
+        assert!(
+            s.body_candidates(BodyFormat::Text, SINCE, 0, &[])
+                .unwrap()
+                .is_empty()
+        );
+        // Skipped ids are left out, and the limit counts what is kept.
+        let skip = vec!["B".to_string()];
+        let kept = s
+            .body_candidates(BodyFormat::Text, SINCE, 2, &skip)
+            .unwrap();
+        assert_eq!(kept, vec!["A", "C"]);
+        for id in ["B", "A", "C"] {
+            assert!(s.needs_body(id, BodyFormat::Text, SINCE).unwrap(), "{id}");
+        }
+        for id in ["OLD", "HEADERLESS", "missing"] {
+            assert!(!s.needs_body(id, BodyFormat::Text, SINCE).unwrap(), "{id}");
+        }
+    }
+
+    #[test]
+    fn body_candidates_leave_drafts_out() {
+        let s = store_with_rows(&[
+            ("FLAGGED", "INBOX", "2026-07-02T00:00:00Z", true),
+            ("FILED", "DRAFTS", "2026-07-03T00:00:00Z", false),
+            ("MAIL", "INBOX", "2026-07-04T00:00:00Z", false),
+        ]);
+        let local = s.create_local_draft("S", "", "", "<p>hi</p>").unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET received_at = '2026-07-05T00:00:00Z' WHERE id = ?1",
+                params![local],
+            )
+            .unwrap();
+        // The local draft has a body; drop it so only the folder rule keeps
+        // it out.
+        s.conn
+            .execute("DELETE FROM bodies WHERE message_id = ?1", params![local])
+            .unwrap();
+        let all = s.body_candidates(BodyFormat::Html, SINCE, 10, &[]).unwrap();
+        assert_eq!(all, vec!["MAIL"]);
+        for id in ["FLAGGED", "FILED", local.as_str()] {
+            assert!(!s.needs_body(id, BodyFormat::Html, SINCE).unwrap(), "{id}");
+        }
+    }
+
+    #[test]
+    fn body_candidates_follow_get_body_for() {
+        // Every body case of the `get_body_for` tests: a candidate exactly
+        // when `get_body_for` has nothing for the format.
+        let s = store_with_rows(&[
+            ("NONE", "INBOX", "2026-07-02T00:00:00Z", false),
+            ("TEXT", "INBOX", "2026-07-03T00:00:00Z", false),
+            ("HTML", "INBOX", "2026-07-04T00:00:00Z", false),
+            ("NATIVE", "INBOX", "2026-07-05T00:00:00Z", false),
+            ("OLDTEXT", "INBOX", "2026-07-06T00:00:00Z", false),
+            ("LOCALHTML", "INBOX", "2026-07-07T00:00:00Z", false),
+            ("RTF", "INBOX", "2026-07-08T00:00:00Z", false),
+        ]);
+        s.put_fetched_body("TEXT", &text_body("t"), BodyFormat::Text)
+            .unwrap();
+        s.put_fetched_body("HTML", &html_body("<p>h</p>"), BodyFormat::Html)
+            .unwrap();
+        s.put_fetched_body("NATIVE", &text_body("plain"), BodyFormat::Html)
+            .unwrap();
+        s.put_body("OLDTEXT", &text_body("old")).unwrap();
+        s.put_body("LOCALHTML", &html_body("<p>l</p>")).unwrap();
+        s.put_fetched_body("RTF", &html_body("<p>r</p>"), BodyFormat::Html)
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE bodies SET fetched_as = 'rtf' WHERE message_id = 'RTF'",
+                [],
+            )
+            .unwrap();
+        let ids = [
+            "NONE",
+            "TEXT",
+            "HTML",
+            "NATIVE",
+            "OLDTEXT",
+            "LOCALHTML",
+            "RTF",
+        ];
+        for format in [BodyFormat::Text, BodyFormat::Html] {
+            let candidates = s.body_candidates(format, SINCE, 100, &[]).unwrap();
+            for id in ids {
+                let lacking = s.get_body_for(id, format).unwrap().is_none();
+                assert_eq!(
+                    candidates.contains(&id.to_string()),
+                    lacking,
+                    "{id} {format:?}"
+                );
+                assert_eq!(
+                    s.needs_body(id, format, SINCE).unwrap(),
+                    lacking,
+                    "{id} {format:?}"
+                );
+            }
+        }
+        // The cases themselves, so the rule cannot drift unnoticed.
+        assert_eq!(
+            s.body_candidates(BodyFormat::Text, SINCE, 100, &[])
+                .unwrap(),
+            vec!["RTF", "NATIVE", "HTML", "NONE"]
+        );
+        assert_eq!(
+            s.body_candidates(BodyFormat::Html, SINCE, 100, &[])
+                .unwrap(),
+            vec!["RTF", "OLDTEXT", "TEXT", "NONE"]
+        );
     }
 }
 
