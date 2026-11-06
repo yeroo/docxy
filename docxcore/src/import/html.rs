@@ -72,7 +72,9 @@
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
 use super::html_image::{self, ImageResolver, Images, ImportedMedia, Source};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
-use super::{Budget, Builder, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered};
+use super::{
+    Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
+};
 use crate::model::{Align, Block as DocBlock, Document, Inline, ParProps, RunProps, VertAlign};
 use crate::package::Package;
 use std::rc::Rc;
@@ -329,6 +331,10 @@ struct Block {
     /// continuations. Per item, so a nested list's items leave their
     /// parent's alone.
     item_numbered: bool,
+    /// On an `li`'s own entry (FIX r2 m1): the empty paragraph that holds
+    /// the item's number until one with a line takes it, as its flow's
+    /// `table_depth` and index there.
+    item_held: Option<(usize, usize)>,
 }
 
 /// How an element takes part in the page, for its look.
@@ -441,8 +447,8 @@ struct Look {
     indent_right: i32,
     /// Paragraph shading (`RRGGBB`) of the nearest shaded block.
     shade: Option<String>,
-    /// The element's own top and bottom box, in twips (not inherited).
-    before: Option<i32>,
+    /// The element's own bottom box, in twips (not inherited); its top is
+    /// `margin_before` and `pad_before`, which collapse apart.
     after: Option<i32>,
     /// What of `before` and `after` is the user agent's margin, in twips
     /// (not inherited, #1979): what quirks mode drops at a body's or
@@ -860,7 +866,6 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
 impl Cascade {
     fn new(parent: Option<&Look>, kind: Kind, card: CardMode) -> Self {
         let mut look = parent.cloned().unwrap_or_default();
-        look.before = None;
         look.after = None;
         look.ua_before = 0;
         look.ua_after = 0;
@@ -1379,7 +1384,6 @@ impl Cascade {
                 look.margin_after = tw(self.margin[2]).unwrap_or(0);
                 look.pad_before = tw(self.padding[0]).unwrap_or(0);
                 // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
-                look.before = sum(self.margin[0], self.padding[0]).map(|t| t.max(0));
                 look.after = sum(self.margin[2], self.padding[2]).map(|t| t.max(0));
                 if let Some(l) = sum(self.margin[3], self.padding[3]) {
                     look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
@@ -1705,12 +1709,6 @@ struct Html<'a> {
     /// The page is in quirks mode ([`quirks_mode`], #1979): a block's
     /// user-agent margins at its body's or cell's edge are dropped.
     quirks: bool,
-    /// The user-agent bottom margin quirks mode drops from the last
-    /// paragraph ended, should it be its flow's last ([`Self::flow_end_props`]).
-    last_bottom: Option<i32>,
-    /// The bottom margin (twips) of the last paragraph ended: what the next
-    /// one's top margin collapses with when it follows it in its flow.
-    last_margin_after: i32,
 }
 
 impl<'a> Html<'a> {
@@ -1736,8 +1734,6 @@ impl<'a> Html<'a> {
             after_block_object: false,
             orphan_cards: Vec::new(),
             quirks: quirks_mode(s),
-            last_bottom: None,
-            last_margin_after: 0,
         }
     }
 
@@ -1984,6 +1980,7 @@ impl<'a> Html<'a> {
                 if name == "li" {
                     block.mso_list = false;
                     block.item_numbered = false;
+                    block.item_held = None;
                     let numbered = self.lists.last().copied().unwrap_or(false);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
@@ -2571,7 +2568,6 @@ impl<'a> Html<'a> {
         self.table_depth = self.table_depth.saturating_sub(1);
         while self.orphan_cards.last() == Some(&self.table_depth) && self.table_depth > 0 {
             self.orphan_cards.pop();
-            self.end_para_if_any();
             let props = self.flow_end_props();
             self.out.end_card(props);
             self.reset_para();
@@ -2849,7 +2845,8 @@ impl<'a> Html<'a> {
             return p;
         };
         p.align = look.align.unwrap_or_default();
-        p.spacing.before = Some(look.before.unwrap_or(0));
+        // `before` stays 0 here: `flow_spacing` sets it in the paragraph's
+        // flow.
         p.spacing.after = Some(look.after.unwrap_or(0));
         match look.line {
             Some(Line::Auto(n)) => {
@@ -2927,50 +2924,98 @@ impl<'a> Html<'a> {
         // browser draws an item's marker beside (#1979).
         let has_line =
             marker.is_some() || self.out.has_object() || !self.out.para_text().is_empty();
-        if block.heading.is_none() {
-            if let Some(m) = &marker {
+        let in_table = self.table_depth > 0;
+        // An empty paragraph holding its item's number until one with a
+        // line takes it: found again here once ended.
+        let mut holds_number = false;
+        match (&marker, block.item) {
+            (Some(m), _) if block.heading.is_none() => {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
-            } else if let Some((numbered, level)) = block.item {
-                let done = self.open_item().is_some_and(|i| i.item_numbered);
-                if (done || !has_line) && !block.mso_list {
+            }
+            // A heading in an item too (FIX r2 m2): its style stays.
+            (None, Some((numbered, level))) if !block.mso_list => {
+                let (done, held) = self
+                    .open_item()
+                    .map_or((false, None), |i| (i.item_numbered, i.item_held));
+                if done || (!has_line && held.is_some()) {
                     // Past the item's numbered paragraph, its text goes on
                     // in unnumbered paragraphs at its text indent (#1922,
-                    // #1979); one with no line before it (an empty `p`)
-                    // leaves the number to the first that has one.
+                    // #1979).
                     props.first_line = 0;
                 } else {
-                    props.num_id = Some(if numbered { 2 } else { 1 });
-                    props.ilvl = level;
-                    // The marker takes the item's look (#1979), as a
-                    // browser's `::marker` does.
-                    props.raw_props.retain(|r| !r.starts_with("<w:rPr"));
-                    if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
-                        props.raw_props.push(rpr);
-                    }
-                    // At the margin its `w:ind` says so in so many words,
-                    // or the numbering level's 720 would stand (FIX r1 m6):
-                    // written as a loaded one, so an edit replaces it.
-                    if props.indent == 0 && !block.mso_list {
-                        props.shadow = vec![ZERO_IND.to_string()];
-                    }
-                    if let Some(item) = self.open_item() {
-                        item.item_numbered = true;
+                    // The first paragraph with a line takes the number; an
+                    // empty one before it holds it until then, so an item
+                    // with no line still counts (FIX r2 m1).
+                    self.number_item(&mut props, numbered, level);
+                    if has_line {
+                        if let Some((depth, index)) = held {
+                            self.release_number(depth, index);
+                        }
+                        if let Some(item) = self.open_item() {
+                            item.item_numbered = true;
+                            item.item_held = None;
+                        }
+                    } else {
+                        holds_number = true;
                     }
                 }
             }
+            _ => {}
         }
         // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty; a
         // picture is content (#1880).
         if !self.out.has_object() && self.out.para_text().chars().all(|c| c.is_whitespace()) {
             self.out.clear_para();
         }
-        let in_table = self.table_depth > 0;
         let edges = self.para_edges();
         self.flow_spacing(&mut props, edges, in_table);
         self.out.end_para(props, in_table);
-        self.last_bottom = self.quirk_bottom(edges);
-        self.last_margin_after = edges.margin_after;
+        let tail = FlowTail {
+            margin_after: edges.margin_after,
+            quirk_bottom: self.quirk_bottom(edges),
+        };
+        self.out.set_tail(in_table, tail);
+        if holds_number {
+            let at = self.out.flow_len(in_table).and_then(|n| n.checked_sub(1));
+            let depth = self.table_depth;
+            if let Some(item) = self.open_item() {
+                item.item_held = at.map(|i| (depth, i));
+            }
+        }
         self.reset_para();
+    }
+
+    /// Make `props` its item's numbered paragraph: the list's number and
+    /// level, the item's look on the mark (#1979, as a browser's
+    /// `::marker`), and at the margin an explicit zero indent, or the
+    /// numbering level's 720 would stand (FIX r1 m6; written as a loaded
+    /// one, so an edit replaces it).
+    fn number_item(&self, props: &mut ParProps, numbered: bool, level: i32) {
+        props.num_id = Some(if numbered { 2 } else { 1 });
+        props.ilvl = level;
+        props.raw_props.retain(|r| !r.starts_with("<w:rPr"));
+        if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
+            props.raw_props.push(rpr);
+        }
+        if props.indent == 0 {
+            props.shadow = vec![ZERO_IND.to_string()];
+        }
+    }
+
+    /// The empty paragraph at `index` of the flow at `depth` gives its
+    /// item's number up to a later one with a line: it is a continuation.
+    fn release_number(&mut self, depth: usize, index: usize) {
+        if depth != self.table_depth {
+            return;
+        }
+        if let Some(p) = self.out.para_mut(depth > 0, index) {
+            if p.num_id.is_some() {
+                p.num_id = None;
+                p.ilvl = 0;
+                p.first_line = 0;
+                p.shadow.retain(|x| x != ZERO_IND);
+            }
+        }
     }
 
     /// A paragraph's top spacing in its flow (#1979): in quirks mode a
@@ -2980,17 +3025,18 @@ impl<'a> Html<'a> {
     /// do (Word and LibreOffice add the two).
     ///
     /// Only margins collapse (FIX r1 M1): the top is its padding plus what
-    /// of its margin the bottom margin above does not cover. A negative
+    /// of its margin the bottom margin above does not cover, that of the
+    /// flow's last paragraph ([`Builder::tail`], FIX r2 m5). A negative
     /// margin is not collapsed, only summed with the padding.
     fn flow_spacing(&self, p: &mut ParProps, edges: Edges, in_table: bool) {
         let mut margin = i64::from(edges.margin_before);
         if self.quirks && edges.straight && self.out.flow_is_empty(in_table) {
             margin -= i64::from(edges.ua_before);
         }
-        let above = match self.out.flow_last(in_table) {
-            Some(_) => i64::from(self.last_margin_after.max(0)),
-            None => 0,
-        };
+        let above = self
+            .out
+            .tail(in_table)
+            .map_or(0, |t| i64::from(t.margin_after.max(0)));
         let pad = i64::from(edges.pad_before);
         let before = if margin > 0 {
             pad + (margin - above).max(0)
@@ -3006,32 +3052,30 @@ impl<'a> Html<'a> {
         (self.quirks && edges.straight && edges.ua_after > 0).then_some(edges.ua_after)
     }
 
-    /// The properties of the paragraph a flow's end (a cell's, a card's,
-    /// the page's) may still make of the text in progress: its spacing in
-    /// the flow, and, as its last, no user-agent bottom margin in quirks
-    /// mode. With none in progress, the flow's last paragraph loses that
-    /// margin instead (#1979).
+    /// A flow's end (a cell's, a card's, the page's, #1979): the text in
+    /// progress is ended first, as any paragraph (FIX r1 m2: an item's
+    /// number); then the flow's last paragraph, in quirks mode, loses its
+    /// user-agent bottom margin in place. The properties returned are only
+    /// for the paragraph an empty cell still gets.
     fn flow_end_props(&mut self) -> ParProps {
-        // The text in progress ends as any paragraph does (FIX r1 m2: an
-        // item's number), so what a cell or the page still makes of it is
-        // only an empty cell's paragraph.
         self.end_para_if_any();
         let in_table = self.table_depth > 0;
+        if let Some(tail) = self.out.tail(in_table) {
+            if let Some(ua) = tail.quirk_bottom {
+                if let Some(p) = self.out.flow_last_mut(in_table) {
+                    let after = p.spacing.after.unwrap_or(0);
+                    p.spacing.after = Some((after - ua).max(0));
+                }
+                let tail = FlowTail {
+                    quirk_bottom: None,
+                    ..tail
+                };
+                self.out.set_tail(in_table, tail);
+            }
+        }
         let edges = self.para_edges();
         let mut props = self.par_props();
         self.flow_spacing(&mut props, edges, in_table);
-        let last = self.last_bottom.take();
-        if self.out.has_pending() {
-            if let Some(ua) = self.quirk_bottom(edges) {
-                let after = props.spacing.after.unwrap_or(0);
-                props.spacing.after = Some((after - ua).max(0));
-            }
-        } else if let Some(ua) = last {
-            if let Some(p) = self.out.flow_last_mut(in_table) {
-                let after = p.spacing.after.unwrap_or(0);
-                p.spacing.after = Some((after - ua).max(0));
-            }
-        }
         props
     }
 }
@@ -7404,5 +7448,54 @@ mod outlook_tests {
             xml.contains(r#"w:left="300""#) && !xml.contains(r#"w:left="0""#),
             "{xml}"
         );
+    }
+
+    #[test]
+    fn an_item_with_no_line_still_counts() {
+        // FIX r2 m1: its empty paragraph holds the number, so the next
+        // item shows "2.".
+        let d = doc("<ol><li><p></p></li><li>b</li></ol>");
+        let p = all_paras(&d);
+        assert_eq!(p.len(), 2);
+        assert_eq!(
+            p.iter()
+                .map(|q| (q.props.num_id, q.props.first_line))
+                .collect::<Vec<_>>(),
+            [(Some(2), -267), (Some(2), -267)]
+        );
+        // Two empty ones and a line: the line takes it, the rest go on.
+        let d = doc("<ol><li><p></p><p></p><p>x</p></li></ol>");
+        let p = all_paras(&d);
+        assert_eq!(
+            p.iter().map(|q| q.props.num_id).collect::<Vec<_>>(),
+            [None, None, Some(2)]
+        );
+    }
+
+    #[test]
+    fn a_heading_in_an_item_takes_its_number() {
+        // FIX r2 m2: a browser draws "1." beside the heading.
+        let d = doc("<ol><li><h3>Step one</h3><p>Do this</p></li></ol>");
+        let h = para_of(&d, "Step one");
+        assert_eq!(h.props.style_id.as_deref(), Some("Heading3"));
+        assert_eq!(
+            (h.props.num_id, h.props.indent, h.props.first_line),
+            (Some(2), 600, -267)
+        );
+        let p = para_of(&d, "Do this");
+        assert_eq!(
+            (p.props.num_id, p.props.indent, p.props.first_line),
+            (None, 600, 0)
+        );
+    }
+
+    #[test]
+    fn a_dropped_card_lends_no_margin_to_the_next_paragraph() {
+        // FIX r2 m5: the empty card's `p` is gone, so b follows the div.
+        let d = doc(
+            "<table><tr><td><div>a</div><div style=\"background:#eee\"><p>&nbsp;</p></div>\
+             <p>b</p></td></tr></table>",
+        );
+        assert_eq!(para_of(&d, "b").props.spacing.before, Some(240));
     }
 }

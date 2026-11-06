@@ -451,12 +451,15 @@ suite's flow view drawing it (marker look, spacing, line height) is
   - Only margins collapse, not padding (#1979 r1). A paragraph's written
     `before` is `pad_top + max(0, margin_top − the margin_bottom of the
     paragraph before it in its flow)` (`Html::flow_spacing`, `Look`'s
-    `margin_before`/`pad_before`/`margin_after`, `Html::last_margin_after`).
-    The paragraph above keeps its whole `after`. A negative top margin is
-    only summed with the padding.
-  - The previous block is `Builder::flow_last` (`flow_is_empty`,
-    `flow_last_mut`): the open cell's blocks or the body. No collapse
-    across a table or into a cell's or card's first paragraph.
+    `margin_before`/`pad_before`/`margin_after`). The paragraph above
+    keeps its whole `after`. A negative top margin is only summed with
+    the padding.
+  - The margin above is the flow's own (`Builder::tail`, a `FlowTail` set
+    with `set_tail` after each paragraph, #1979 r2). The flow is the open
+    cell's blocks or the body. A tail counts only while its paragraph is
+    still the flow's last block, so there is no collapse across a table,
+    into a cell's or card's first paragraph, or from a dropped empty
+    card's paragraph.
 - Quirks mode (`quirks_mode`: no doctype, a non-`html` one, or the HTML
   Standard's old public ids, its common entries; `<!DOCTYPE html>` and
   XHTML are standards). Mail, Word and Outlook pages have none, and so do
@@ -466,9 +469,10 @@ suite's flow view drawing it (marker look, spacing, line height) is
     not in a `div` or a card) loses its UA top margin when it is its
     flow's first, and its UA bottom margin when it is its flow's last.
   - The last is settled at the flow's end (`Html::flow_end_props`, at
-    `</td>`, `</tr>`, `</table>`, a card's end and the page's end). Either
-    the text in progress is that last paragraph, or the paragraph ended
-    last (`Html::last_bottom`) is patched in place.
+    `</td>`, `</tr>`, `</table>`, a card's end and the page's end). The
+    text in progress is ended first, as any paragraph, and then the flow's
+    last paragraph (`FlowTail::quirk_bottom`) is patched in place. The
+    props it returns are only for the paragraph an empty cell gets.
   - A declared margin and padding stay.
 - List geometry, through the cascade:
   - `ul ol dir menu` have a UA `padding-left: 40px`. `Kind::List` adds
@@ -491,11 +495,20 @@ suite's flow view drawing it (marker look, spacing, line height) is
   continuation at its text indent, `first_line 0`. That covers
   `<li><div>a</div><div>b</div></li>`, `<li><p>a</p><p>b</p></li>`, and
   text after a nested list or table in the item.
-  - Only a paragraph with a line (text, a break, an object or a typed
-    marker) takes the number and sets `item_numbered`. So in
-    `<li><p></p><p>x</p></li>` the empty one is an unnumbered paragraph at
-    the text indent and x is numbered, and `<div><br></div>` keeps the
-    number, as in a browser.
+  - The first paragraph with a line (text, a break, an object or a typed
+    marker) takes the number and sets `item_numbered`.
+    - An empty paragraph before it holds the number in the meantime
+      (`Block::item_held`, its flow's depth and index). The line's
+      paragraph takes the number from it (`release_number`), leaving the
+      empty one an unnumbered paragraph at the text indent.
+    - So `<li><p></p><p>x</p></li>` numbers x, and
+      `<li><p></p></li><li>b</li>` still counts the first item: b is 2,
+      as in a browser (#1979 r2).
+    - `<div><br></div>` is a line, so it keeps the number.
+  - A heading in an item is numbered too, keeping its Heading style
+    (#1979 r2). A typed-marker heading is unchanged.
+  - The shared steps are in `number_item`: number, level, the `li`'s
+    mark, and the zero indent.
   - A flow's end ends its text in progress as any paragraph
     (`flow_end_props` calls `end_para_if_any`, #1979 r1). So `<ol><li>a<li>b`
     at the page's end and `<td><ul><li>x</td>` are numbered too.
