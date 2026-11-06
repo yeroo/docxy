@@ -21,12 +21,16 @@
 //! hidden; paragraphs take alignment, line height, their block's top and
 //! bottom box as spacing, every enclosing block's left and right box as
 //! indent, `text-indent`, and a block's background as shading. A table cell
-//! starts a fresh block look; an HTML list item keeps its level's hanging
-//! indent. A mis-nested inline close ends the element at once (the looks
-//! above it are computed again), an end reopens the formatting elements
-//! left open inside (three alike at most), and no close reaches across a
-//! table, as in a browser. White space collapses as a browser collapses it, except in
-//! `pre`. Forms are not converted.
+//! starts a fresh block look. Spacing is the CSS's (with the user agent's
+//! margins, collapsed as a browser does, and quirks mode's at a body's or
+//! cell's edge), single by default; an HTML list item's text sits at its
+//! lists' 40 px, a browser's marker hanging before it in the item's look,
+//! and its later blocks continue it (#1979). A mis-nested inline close
+//! ends the element at once (the looks above it are computed again), an
+//! end reopens the formatting elements left open inside (three alike at
+//! most), and no close reaches across a table, as in a browser. White
+//! space collapses as a browser collapses it, except in `pre`. Forms are
+//! not converted.
 //!
 //! Links (#1879): an `<a href>` to an absolute `http`, `https`, `ftp` or
 //! `mailto` URL is a hyperlink to it, and `href="#name"` an anchor link to
