@@ -167,6 +167,43 @@ fn tab_pictures(tab: &DocTab) -> Vec<((i64, i64), Vec<u8>)> {
     out
 }
 
+/// The page and margins (twips) a tab's final section gives Print Layout.
+fn page_of(tab: &DocTab) -> (i32, i32, i32, i32, i32, i32) {
+    let g = crate::final_page_geom(tab);
+    (g.w, g.h, g.ml, g.mr, g.mt, g.mb)
+}
+
+#[test]
+fn an_opened_html_page_has_outlook_like_margins() {
+    // #1928: a Web Page opens on a Letter page 15 px (225 twips) in on
+    // every side, as a mail client shows it, through the real child: its
+    // converted .docx, loaded as the tab's package.
+    let dir = Scratch::new();
+    let path = write(&dir, "mail.htm", b"<html><body><p>Hello</p></body></html>");
+    let outlook = (12_240, 15_840, 225, 225, 225, 225);
+    let bytes = std::fs::read(&path).unwrap();
+    let l = convert_doc_with(
+        &path,
+        &bytes,
+        What::Html,
+        convert_child::tests::test_child_runner,
+    )
+    .unwrap();
+    let child = l.into_tab(Kind::Docx, "mail.htm".into(), Some(path.clone()), false);
+    assert_eq!(child.access.converted, Some(Converted::Html));
+    assert_eq!(page_of(&child), outlook);
+    // And as File > Open makes it.
+    let tab = tab_from_path(&path);
+    assert_eq!(texts(&tab), ["Hello"]);
+    assert_eq!(page_of(&tab), outlook);
+    // An RTF keeps the default page: 1" margins.
+    let rtf = write(&dir, "letter.rtf", RTF);
+    assert_eq!(
+        page_of(&tab_from_path(&rtf)),
+        (12_240, 15_840, 1440, 1440, 1440, 1440)
+    );
+}
+
 #[test]
 fn a_web_pages_images_open_with_it_and_the_network_is_never_reached() {
     let dir = Scratch::new();
