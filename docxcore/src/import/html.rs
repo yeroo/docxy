@@ -194,7 +194,7 @@ pub(crate) fn import_html_within(
     h.run();
     // Cards left open at the end of the page end as `</div>` would end them
     // (#1927): an empty one is dropped.
-    h.end_cards_from(0);
+    h.end_cards(0, true);
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
@@ -1453,6 +1453,10 @@ struct Html<'a> {
     /// one with content, so `<p><img style="display:block"></p>` makes no
     /// empty paragraph after the picture's.
     after_block_object: bool,
+    /// The `table_depth`s of cards whose `div` has closed while a table
+    /// with no `Elem` (opened past `MAX_DEPTH`) was open in them (#1927
+    /// r2): each ends when that table's own close brings the depth back.
+    orphan_cards: Vec<usize>,
 }
 
 impl<'a> Html<'a> {
@@ -1476,6 +1480,7 @@ impl<'a> Html<'a> {
             in_not_vml: false,
             images: None,
             after_block_object: false,
+            orphan_cards: Vec::new(),
         }
     }
 
@@ -2004,13 +2009,21 @@ impl<'a> Html<'a> {
         // A table part's close acts on the innermost real table: the cards
         // open in its innermost cell end first (#1927), as a browser's
         // `</td>` closes a `div` left open.
+        // A builder table above the innermost card with no `Elem` (one
+        // opened past `MAX_DEPTH`) owns this close instead (#1927 r2).
         if Kind::of(name).table() {
             let from = self
                 .elems
                 .iter()
                 .rposition(|e| e.kind.table())
                 .map_or(0, |t| t + 1);
-            self.end_cards_from(from);
+            let innermost = self.elems[from..].iter().rev().find_map(|e| match e.card {
+                CardMode::Yes(depth) => Some(depth),
+                _ => None,
+            });
+            if innermost.is_some_and(|depth| depth >= self.table_depth) {
+                self.end_cards_from(from);
+            }
         }
         match name {
             // A `</li>` whose `li` is below an open list is not in list-item
@@ -2097,7 +2110,7 @@ impl<'a> Html<'a> {
                         self.out.end_table();
                         self.reset_para();
                     }
-                    self.table_depth -= 1;
+                    self.table_closed();
                 }
             }
             "ul" | "ol" | "dir" | "menu" => {
@@ -2238,6 +2251,16 @@ impl<'a> Html<'a> {
     /// malformed page) ends with it, so the builder's innermost table is
     /// the card's.
     fn end_cards_from(&mut self, i: usize) {
+        self.end_cards(i, false);
+    }
+
+    /// [`Self::end_cards_from`]; `at_end` at the end of the page, where a
+    /// table left open in a card ends with it. Before that, a builder table
+    /// above a card whose `div` closes has no `Elem` (one opened past
+    /// `MAX_DEPTH`: a table with one closes before what is below it) and
+    /// owns its own close: the card's table waits for it as an orphan
+    /// ([`Self::table_closed`]).
+    fn end_cards(&mut self, i: usize, at_end: bool) {
         while let Some((j, depth)) = self.elems.get(i..).and_then(|above| {
             above
                 .iter()
@@ -2253,6 +2276,10 @@ impl<'a> Html<'a> {
                 // Its table has already ended (a stray `</table>`).
                 continue;
             }
+            if self.table_depth > depth && !at_end {
+                self.orphan_cards.push(depth);
+                continue;
+            }
             self.end_para_if_any();
             self.after_block_object = false;
             while self.table_depth > depth {
@@ -2264,12 +2291,37 @@ impl<'a> Html<'a> {
                     self.out.end_table();
                     self.reset_para();
                 }
-                self.table_depth -= 1;
+                self.table_closed();
             }
+            if self.table_depth == depth {
+                let props = self.par_props();
+                self.out.end_card(props);
+                self.reset_para();
+                self.table_closed();
+            }
+        }
+    }
+
+    /// One table level has ended: `table_depth` goes down, and the orphan
+    /// cards ([`Self::end_cards`]) it brings back to their own level end
+    /// in turn.
+    fn table_closed(&mut self) {
+        self.table_depth = self.table_depth.saturating_sub(1);
+        while self.orphan_cards.last() == Some(&self.table_depth) && self.table_depth > 0 {
+            self.orphan_cards.pop();
+            self.end_para_if_any();
             let props = self.par_props();
             self.out.end_card(props);
             self.reset_para();
             self.table_depth -= 1;
+        }
+        // One left above the depth has lost its table (a stray close).
+        while self
+            .orphan_cards
+            .last()
+            .is_some_and(|&d| d > self.table_depth)
+        {
+            self.orphan_cards.pop();
         }
     }
 
@@ -6147,6 +6199,31 @@ mod card_tests {
         let d = doc(&format!("{open}y<div style='background:#eee'>{deeper}"));
         assert_eq!(table_count(&d.body), MAX_TABLE_NESTING - 1);
         para(&d, "y");
+    }
+
+    #[test]
+    fn a_table_past_max_depth_in_a_card_owns_its_close() {
+        // The card is the last element pushed: a table opened in it has no
+        // `Elem` (past `MAX_DEPTH`) but is the builder's. Its `</table>`
+        // (or `</td>`) ends it, not the card and then the outer table:
+        // `after` stays in the outer cell and `tail` is in the body.
+        let spans = "<span>".repeat(MAX_DEPTH - 4);
+        for inner in [
+            "<table><tr><td>x</table>",
+            "<table><tr><td>x</td></tr></table>",
+        ] {
+            let html = format!(
+                "<table><tr><td>{spans}<div style='background:#eee'>{inner}after\
+                 </td></tr></table>tail"
+            );
+            let d = doc(&html);
+            assert_eq!(sketch(&d.body[1..]), ["tail"], "{inner}: {:?}", d.body);
+            assert!(
+                sketch(outer_cell(&d)).iter().any(|t| t.contains("after")),
+                "{inner}: {:?}",
+                sketch(outer_cell(&d))
+            );
+        }
     }
 
     #[test]

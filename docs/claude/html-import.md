@@ -315,7 +315,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   across a real table in it is still ignored and an `<li>` closes an open
   `li` across it (div is no scope boundary). A real table left open in a
   card at the end of the page ends with it (only tables the builder holds:
-  one past the nesting limit is text).
+  one past the nesting limit is text). Before the end, a builder table
+  above a card with no `Elem` (opened past `MAX_DEPTH`) owns its own
+  close: a table part's close leaves the card open, and a card whose `div`
+  goes first waits as an orphan (`Html::orphan_cards`) until that table's
+  `</table>` brings `table_depth` back to it (`table_closed`, #1927 r2).
 - Empty cards: one with nothing in it (no text after the white-space rule,
   `&nbsp;` too, no object, no table; only empty paragraphs) is dropped
   (`Builder::end_card`): an e-mail's 1 px divider `div` makes nothing, as
