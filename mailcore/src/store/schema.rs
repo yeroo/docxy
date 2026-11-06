@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
     ON messages(folder_id, received_at DESC);
 
+-- The engine's own body fetches (#1978) ask for the newest mail across
+-- every folder (`Store::body_candidates`), on every idle step.
+CREATE INDEX IF NOT EXISTS idx_messages_received
+    ON messages(received_at DESC);
+
 CREATE TABLE IF NOT EXISTS master_categories (
     display_name TEXT PRIMARY KEY,
     color        TEXT NOT NULL DEFAULT ''

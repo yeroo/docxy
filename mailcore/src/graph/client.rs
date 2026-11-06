@@ -470,7 +470,8 @@ impl GraphClient {
     /// GET `/me/messages/{id}?$select=body`. When `prefer_text` is set,
     /// asks Graph to convert the body to plain text via
     /// `Prefer: outlook.body-content-type="text"`; otherwise Graph returns
-    /// its native HTML.
+    /// its native HTML. A response over [`BODY_MAX`] is refused as a `Parse`
+    /// error (#1978): the client will not hold it, which no retry changes.
     pub fn get_body(&self, message_id: &str, prefer_text: bool) -> Result<Body, GraphError> {
         let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select=body");
@@ -480,7 +481,7 @@ impl GraphClient {
             &[]
         };
         let resp = self.send(Method::Get, &path, None, headers)?;
-        let v = parse_body(resp)?;
+        let v = parse_body_capped(resp, BODY_MAX)?;
         let body = v
             .get("body")
             .ok_or_else(|| GraphError::Parse("response has no body field".to_string()))?;
@@ -856,19 +857,13 @@ impl GraphClient {
     /// header without its parameters, `application/octet-stream` when absent.
     fn get_photo(&self, path: &str) -> Result<(Vec<u8>, String), GraphError> {
         let resp = self.send(Method::Get, path, None, &[("Accept", "image/*")])?;
-        let declared = resp
-            .header("Content-Length")
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if declared.is_some_and(|n| n > PHOTO_MAX as u64) {
-            return Err(photo_too_large(PHOTO_MAX));
-        }
         let content_type = resp
             .header("Content-Type")
             .map(|v| v.split(';').next().unwrap_or("").trim())
             .filter(|v| !v.is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = read_capped(resp.into_reader(), PHOTO_MAX)?;
+        let bytes = read_response_capped(resp, PHOTO_MAX, photo_too_large)?;
         Ok((bytes, content_type))
     }
 
@@ -1177,12 +1172,51 @@ fn classify_status(status: u16, resp: ureq::Response) -> GraphError {
     }
 }
 
-/// Reads a successful response's body and parses it as JSON.
+/// The largest JSON response [`parse_body`] reads: 10 MiB, the limit ureq's
+/// `into_string` kept before (#1978).
+const JSON_MAX: usize = 10 * 1024 * 1024;
+
+/// The largest response `GraphClient::get_body` reads (32 MiB, #1978): an
+/// html body with `data:` pictures can be far bigger than any listing.
+pub const BODY_MAX: usize = 32 * 1024 * 1024;
+
+/// Reads a successful response's body and parses it as JSON, at most
+/// [`JSON_MAX`] bytes ([`parse_body_capped`]).
 fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
-    let text = resp
-        .into_string()
-        .map_err(|e| GraphError::Transport(e.to_string()))?;
-    json::parse(&text).map_err(|e| GraphError::Parse(e.to_string()))
+    parse_body_capped(resp, JSON_MAX)
+}
+
+/// Reads a successful response's body, at most `max` bytes, and parses it
+/// as JSON (bytes that are not UTF-8 replaced, as ureq's `into_string`
+/// did). A response over `max`, by its `Content-Length` (refused before
+/// reading) or by what it yields, is a `Parse` error (#1978): the client
+/// refused it, the connection is fine, so it is not taken for a transport
+/// failure (offline, back-off) and retried for ever. A read that fails
+/// mid-body is still `Transport`.
+fn parse_body_capped(resp: ureq::Response, max: usize) -> Result<Value, GraphError> {
+    let bytes = read_response_capped(resp, max, response_too_large)?;
+    json::parse(&String::from_utf8_lossy(&bytes)).map_err(|e| GraphError::Parse(e.to_string()))
+}
+
+/// Reads a response's body, at most `max` bytes: a `Content-Length` over
+/// `max` is refused before reading (`too_large(max)`), and `read_capped`
+/// stops a body that yields more than it declared, or declares nothing.
+fn read_response_capped(
+    resp: ureq::Response,
+    max: usize,
+    too_large: fn(usize) -> GraphError,
+) -> Result<Vec<u8>, GraphError> {
+    let declared = resp
+        .header("Content-Length")
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > max as u64) {
+        return Err(too_large(max));
+    }
+    read_capped(resp.into_reader(), max, too_large)
+}
+
+fn response_too_large(max: usize) -> GraphError {
+    GraphError::Parse(format!("response is larger than {max} bytes"))
 }
 
 /// The largest profile photo `GraphClient::my_photo` accepts (4 MiB). Graph's
@@ -1193,17 +1227,21 @@ fn photo_too_large(max: usize) -> GraphError {
     GraphError::Parse(format!("profile photo is larger than {max} bytes"))
 }
 
-/// Reads `r` to its end, refusing (`photo_too_large`: only photos use it)
-/// once it yields more than `max` bytes. At most `max + 1` bytes are ever
-/// read, so a chunked or lying response cannot make it buffer more.
-fn read_capped(r: impl std::io::Read, max: usize) -> Result<Vec<u8>, GraphError> {
+/// Reads `r` to its end, refusing (`too_large(max)`) once it yields more
+/// than `max` bytes. At most `max + 1` bytes are ever read, so a chunked or
+/// lying response cannot make it buffer more. A read error is `Transport`.
+fn read_capped(
+    r: impl std::io::Read,
+    max: usize,
+    too_large: fn(usize) -> GraphError,
+) -> Result<Vec<u8>, GraphError> {
     use std::io::Read;
     let mut buf = Vec::new();
     r.take(max as u64 + 1)
         .read_to_end(&mut buf)
         .map_err(|e| GraphError::Transport(e.to_string()))?;
     if buf.len() > max {
-        return Err(photo_too_large(max));
+        return Err(too_large(max));
     }
     Ok(buf)
 }
@@ -3033,7 +3071,7 @@ mod tests {
     #[test]
     fn read_capped_refuses_an_endless_body() {
         // `repeat` never ends: only the cap stops the read.
-        match read_capped(std::io::repeat(b'x'), 1024) {
+        match read_capped(std::io::repeat(b'x'), 1024, photo_too_large) {
             Err(GraphError::Parse(m)) => assert!(m.contains("larger than 1024"), "{m}"),
             other => panic!("expected a Parse error, got {:?}", other.map(|b| b.len())),
         }
@@ -3042,9 +3080,64 @@ mod tests {
     #[test]
     fn read_capped_accepts_exactly_max() {
         use std::io::Read;
-        let bytes = read_capped(std::io::repeat(b'x').take(1024), 1024).unwrap();
+        let bytes = read_capped(std::io::repeat(b'x').take(1024), 1024, photo_too_large).unwrap();
         assert_eq!(bytes.len(), 1024);
-        assert_eq!(read_capped(&b""[..], 1024).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            read_capped(&b""[..], 1024, photo_too_large).unwrap(),
+            Vec::<u8>::new()
+        );
+    }
+
+    /// A GET of `body` from a fake server, as `send` would hand it on.
+    fn response_with(body: &str) -> (FakeServer, ureq::Response) {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/r".into(),
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+        }]);
+        let resp = ureq::get(&format!("{}/r", srv.base_url)).call().unwrap();
+        (srv, resp)
+    }
+
+    #[test]
+    fn a_response_over_its_cap_is_a_parse_error_not_a_transport_one() {
+        // The fake server declares its `Content-Length`: refused before
+        // reading (#1978). A response that yields more than it declared, or
+        // declares nothing, is stopped by `read_capped` the same way.
+        let body = r#"{"a":"0123456789"}"#;
+        let (_srv, resp) = response_with(body);
+        match parse_body_capped(resp, body.len() - 1) {
+            Err(GraphError::Parse(m)) => assert!(m.contains("response is larger than"), "{m}"),
+            other => panic!("expected a Parse error, got {other:?}"),
+        }
+        match read_capped(std::io::repeat(b'x'), 16, response_too_large) {
+            Err(GraphError::Parse(m)) => assert!(m.contains("response is larger than 16"), "{m}"),
+            other => panic!("expected a Parse error, got {:?}", other.map(|b| b.len())),
+        }
+        let (_srv, resp) = response_with(body);
+        let v = parse_body_capped(resp, body.len()).unwrap();
+        assert_eq!(v.get("a").and_then(Value::as_str), Some("0123456789"));
+    }
+
+    #[test]
+    fn an_oversize_message_body_is_a_parse_error() {
+        // Over `BODY_MAX`: before #1978 ureq's `into_string` refused it as an
+        // io error, which read as `Transport` (offline, retried for ever).
+        let content = "x".repeat(BODY_MAX);
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/BIG?$select=body".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"body":{{"contentType":"text","content":"{content}"}}}}"#),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "tok");
+        match c.get_body("BIG", true) {
+            Err(GraphError::Parse(m)) => assert!(m.contains("larger than"), "{m}"),
+            other => panic!("expected a Parse error, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]
