@@ -1,6 +1,6 @@
 # HTML import
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## HTML import tables (#1878)
 
@@ -224,6 +224,48 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Out of scope: `<base href>`, MHTML, `<a>` around images, `srcset`,
   `<picture>`, background images, SVG/WebP (placeholders), `max-width`,
   float/align, the suite drawing a placeholder's alt text.
+
+## HTML import rounded images (#1926)
+
+- `border-radius` on an `<img>` is the picture's crop, written as Word's
+  Picture Format > Crop to Shape writes it, the picture's
+  `pic:spPr/a:prstGeom` (`image::inline_picture_run_shaped`,
+  `image::PictureShape`): `ellipse` (`<a:avLst/>`), or `roundRect` with
+  `<a:gd name="adj" fmla="val N"/>` (the corner is `min(w, h) * N / 100000`,
+  N in 0..=50000). No radius, zero, or corners that differ write `rect`, the
+  run exactly as before. So it saves unchanged (the run is `Inline::Raw`),
+  Word and LibreOffice draw it, and the suite draws it (and a Word
+  document's own oval or rounded crop) clipped
+  (`docs/claude/suite-document.md`, "Suite inline pictures").
+- The cascade: only an `img` reads `border-radius` and the four longhands
+  (`Cascade::radius`, per corner, top left, top right, bottom right,
+  bottom left; not inherited, so a card's radius never reaches the picture
+  in it). Only the horizontal radius counts: the shorthand's part before
+  `/` (`css::radius_corners`), a longhand's first value
+  (`css::radius_corner`); the vertical part is checked and dropped. A
+  negative or unreadable value is invalid (ignored, the earlier one stands);
+  `initial`/`unset` is square. `Cascade::finish` resolves the corners with
+  the element's final font (`image_radius`: an `em` declared before the
+  `font-size` takes the new size) into `Look::own_radius`
+  (`html_image::Radius`: `Pct`, `Twips`, or `NonUniform`; a corner left
+  unset is a square one, and zero lengths and zero percentages are equal).
+- The mapping (`html_image::shape`), measured in the box the page declares
+  (`html_image::declared_box`, before `fit_to_body` scales a wide picture
+  to the body; the scale is uniform, so the ratio holds): a percentage of
+  50 or more is the ellipse, square or not; under 50 a `roundRect` of the
+  corner's short radius, `p% * min(w, h)` (adj `p * 1000`); a length on a
+  square box reaching half its side is the ellipse (a browser clamps there),
+  else a `roundRect` of `r / min(w, h)`, at most 50000 (a browser's
+  stadium). The unresolved placeholder takes the shape too; its outline
+  follows it in Word.
+- Every other element's `border-radius` (a card's cell, `div`, `span`) is
+  ignored as before: its background and padding import, its radius is
+  never text.
+- Known limits: corners that differ (`8px 8px 0 0`, Word's
+  `round2SameRect` and others not mapped), elliptical corners (a browser's
+  non-square percentage corner is `p%w x p%h`; the long radius is lost),
+  a wrapper's `overflow: hidden` rounding the image inside it, a rounded
+  card background, PDF export and the editable-HTML page drawing the crop.
 
 ## HTML import links (#1879)
 

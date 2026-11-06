@@ -2414,7 +2414,9 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// table the last frame painted (`block`, `width`, its `left` / `right`
 /// edges from the view's left, px, `fits_text`, `right_in_view` and
 /// `place` across `text_column`, `null` without one:
-/// `crate::painted_tables_json`).
+/// `crate::painted_tables_json`), and `pictures`, each body inline picture
+/// the last frame built (`width`, `height`, clip `radius`, `shape`, `round`:
+/// `crate::pictures::drawn_pictures_json`, #1926).
 fn flow_state(app: &crate::Docxy) -> Json {
     let probe = app.ruler_probe.borrow();
     let num = |v: f32| Json::Num(f64::from(v.round()));
@@ -2445,6 +2447,11 @@ fn flow_state(app: &crate::Docxy) -> Json {
                 probe.viewport.map(|v| (v.x, v.w)),
                 text_column(&probe),
             ),
+        ),
+        // The body's inline pictures as last drawn (#1926).
+        (
+            "pictures",
+            crate::pictures::drawn_pictures_json(&app.drawn_pictures),
         ),
     ])
 }

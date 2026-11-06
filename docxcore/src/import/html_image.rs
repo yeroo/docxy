@@ -329,17 +329,18 @@ fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
 /// A picture's box in twips from its declared width and height (`None`
 /// unset) and, for an image that resolved, its pixel size: both declared,
 /// those; one, the other by the image's aspect (a placeholder: square);
-/// none, its pixels (a placeholder: no box). Wider than the body, it is
-/// scaled down to the body's width keeping its aspect.
-pub(crate) fn picture_twips(
+/// none, its pixels (a placeholder: no box). This is the box the page
+/// declares, before [`fit_to_body`], in which a CSS radius is measured
+/// (#1926). In u128: a
+/// side may be any u32 (an `<img>`'s is not capped at a page) and the
+/// pixels any u32, so `w * ph` and then `h * body` can pass u64 (#1880
+/// r2b).
+pub(crate) fn declared_box(
     width: Option<u32>,
     height: Option<u32>,
     pixels: Option<(u32, u32)>,
-) -> Option<(u64, u64)> {
-    // In u128: a side may be any u32 (an `<img>`'s is not capped at a
-    // page) and the pixels any u32, so `w * ph` and then `h * body` can pass
-    // u64 (#1880 r2b).
-    let (w, h): (u128, u128) = match (width, height, pixels) {
+) -> Option<(u128, u128)> {
+    Some(match (width, height, pixels) {
         (Some(w), Some(h), _) => (w.into(), h.into()),
         (Some(w), None, Some((pw, ph))) => {
             (w.into(), u128::from(w) * u128::from(ph) / u128::from(pw))
@@ -350,7 +351,12 @@ pub(crate) fn picture_twips(
         (Some(s), None, None) | (None, Some(s), None) => (s.into(), s.into()),
         (None, None, Some((pw, ph))) => (u128::from(pw) * 15, u128::from(ph) * 15),
         (None, None, None) => return None,
-    };
+    })
+}
+
+/// A declared box wider than the body scaled down to the body's width,
+/// keeping its aspect.
+pub(crate) fn fit_to_body((w, h): (u128, u128)) -> (u64, u64) {
     let body = u128::from(BODY_TWIPS);
     let (w, h) = if w > body {
         (body, h * body / w)
@@ -358,7 +364,60 @@ pub(crate) fn picture_twips(
         (w, h)
     };
     let side = |t: u128| u64::try_from(t).unwrap_or(u64::MAX);
-    Some((side(w), side(h)))
+    (side(w), side(h))
+}
+
+/// An `<img>`'s computed `border-radius` (#1926): one radius for all four
+/// corners (horizontal radii; a vertical part is dropped), or `NonUniform`
+/// when the corners differ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Radius {
+    /// A percentage of the box's sides.
+    Pct(f64),
+    /// A length, in twips against the element's font.
+    Twips(u64),
+    NonUniform,
+}
+
+/// The crop shape a picture of declared box `(w, h)` (twips, before
+/// [`fit_to_body`]: the fit is uniform, so the ratio holds) gets from its
+/// `radius` (#1926), as Word's Crop to Shape writes it:
+///
+/// - a percentage of 50 or more: the box's ellipse; under 50, a
+///   `roundRect` whose circular corner is the browser's elliptical corner's
+///   short radius, `p% * min(w, h)` (`adj` is `p * 1000`);
+/// - a length: a square box's circle once it reaches half the side (a
+///   browser clamps it there), else a `roundRect` of `r / min(w, h)`,
+///   clamped at half the shorter side (a browser's stadium);
+/// - none, zero, corners that differ, or an empty box: a rectangle.
+pub(crate) fn shape(radius: Option<Radius>, (w, h): (u128, u128)) -> image::PictureShape {
+    use image::{PictureShape, ROUND_RECT_MAX_ADJ};
+    let round = |adj: f64| {
+        let adj = adj.round().min(f64::from(ROUND_RECT_MAX_ADJ));
+        if adj >= 1.0 {
+            PictureShape::RoundRect { adj: adj as u32 }
+        } else {
+            PictureShape::Rect
+        }
+    };
+    let short = w.min(h);
+    match radius {
+        None | Some(Radius::NonUniform) => PictureShape::Rect,
+        _ if short == 0 => PictureShape::Rect,
+        Some(Radius::Pct(p)) if p >= 50.0 => PictureShape::Ellipse,
+        Some(Radius::Pct(p)) if p > 0.0 => round(p * 1000.0),
+        Some(Radius::Pct(_)) | Some(Radius::Twips(0)) => PictureShape::Rect,
+        Some(Radius::Twips(r)) => {
+            let r = u128::from(r);
+            if w == h && 2 * r >= w {
+                PictureShape::Ellipse
+            } else {
+                // `r / short` as a fraction of 100000, in f64 only once it
+                // is at most a few times the clamp.
+                round(100_000.0 * (r.min(short) as f64) / short as f64)
+            }
+        }
+    }
 }
 
 /// A box in twips as DrawingML's EMUs (635 a twip), each side within
@@ -457,6 +516,15 @@ mod tests {
         assert!(!small.exhausted());
     }
 
+    /// The picture's box as the import writes it.
+    fn picture_twips(
+        width: Option<u32>,
+        height: Option<u32>,
+        pixels: Option<(u32, u32)>,
+    ) -> Option<(u64, u64)> {
+        declared_box(width, height, pixels).map(fit_to_body)
+    }
+
     #[test]
     fn sizes_follow_the_declared_sides_and_the_aspect() {
         let px = Some((200, 100));
@@ -483,6 +551,63 @@ mod tests {
         );
         assert_eq!(twips_emu((15, 30)), (9525, 19_050));
         assert_eq!(twips_emu((0, 1)), (1, 635));
+    }
+
+    #[test]
+    fn a_radius_maps_to_a_crop_shape_against_the_declared_box() {
+        use crate::image::PictureShape::{Ellipse, Rect, RoundRect};
+        let px = |n: u128| n * 15;
+        let avatar = (px(32), px(32));
+        let card = (px(120), px(40));
+        // Percentages: 50 or more is the ellipse, square or not.
+        assert_eq!(shape(Some(Radius::Pct(50.0)), avatar), Ellipse);
+        assert_eq!(shape(Some(Radius::Pct(80.0)), card), Ellipse);
+        // Under 50: the short radius, whatever the box.
+        assert_eq!(
+            shape(Some(Radius::Pct(10.0)), card),
+            RoundRect { adj: 10_000 }
+        );
+        assert_eq!(
+            shape(Some(Radius::Pct(25.0)), avatar),
+            RoundRect { adj: 25_000 }
+        );
+        // Lengths, against the shorter side.
+        assert_eq!(
+            shape(Some(Radius::Twips(px(8) as u64)), card),
+            RoundRect { adj: 20_000 }
+        );
+        assert_eq!(shape(Some(Radius::Twips(px(16) as u64)), avatar), Ellipse);
+        assert_eq!(shape(Some(Radius::Twips(px(99) as u64)), avatar), Ellipse);
+        assert_eq!(
+            shape(Some(Radius::Twips(px(15) as u64)), avatar),
+            RoundRect { adj: 46_875 }
+        );
+        // Past half a non-square box's short side: the stadium.
+        assert_eq!(
+            shape(Some(Radius::Twips(px(30) as u64)), card),
+            RoundRect { adj: 50_000 }
+        );
+        assert_eq!(
+            shape(Some(Radius::Twips(u64::MAX)), card),
+            RoundRect { adj: 50_000 }
+        );
+        // The ratio is the box's, so a box later fitted to the body keeps
+        // it: 8px on 1200x400 px is 2000 in 100000.
+        assert_eq!(
+            shape(Some(Radius::Twips(px(8) as u64)), (px(1200), px(400))),
+            RoundRect { adj: 2000 }
+        );
+        // Nothing to round.
+        for r in [
+            None,
+            Some(Radius::NonUniform),
+            Some(Radius::Pct(0.0)),
+            Some(Radius::Twips(0)),
+            Some(Radius::Pct(0.0001)),
+        ] {
+            assert_eq!(shape(r, card), Rect, "{r:?}");
+        }
+        assert_eq!(shape(Some(Radius::Pct(50.0)), (0, px(4))), Rect);
     }
 
     #[test]

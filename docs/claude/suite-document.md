@@ -151,9 +151,22 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   one (`carry_into_tab`, `ensure_package`); a tab whose save writes none
   (`saves_as_word`: Markdown, text, RTF) pastes the rids as they were. An
   `a:hlinkClick` `r:id` on a picture is not carried (a hyperlink, not media).
-- Out of scope: anchored pictures, `a:srcRect` cropping, rotation, alt text,
-  the flow view's non-inline cases, PDF export, wasm hosts. The harness reports
-  no pictures, so there is no `.uit` case.
+- A crop to a shape (#1926: Word's Crop to Shape, or an HTML `img`'s
+  `border-radius` from the import, `docs/claude/html-import.md`) is read by
+  `docxcore::image::inline_shape` from the picture's `pic:spPr/a:prstGeom`
+  (`ellipse`; `roundRect` with its `adj` guide; anything else a rectangle)
+  and drawn as gpui's rounded clip (`Img` hands `corner_radii` to
+  `paint_image`): `pictures::picture_radius`, half the shorter side for an
+  ellipse (a stadium when not square: gpui's corners are circular) and
+  `min(w, h) * adj / 100000` for a `roundRect`, at most that half. The
+  frame-only fallback's border takes the same corners. The harness's
+  `doc {}` `flow.pictures` lists each body picture the last frame built
+  (`pictures::Scope::recording`, `Docxy::drawn_pictures`, cleared at the
+  frame's start like `painted_tables`): `width`, `height`, `radius`,
+  `shape`, `round`; `uiharness/cases/html-rounded-images.uit` drives it.
+- Out of scope: anchored pictures, `a:srcRect` cropping, other preset
+  shapes, rotation, alt text, the flow view's non-inline cases, PDF export,
+  wasm hosts.
 
 ## Run styles (#1427)
 

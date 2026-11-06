@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Rounded images</title>
+<style>
+  body { font-family: Arial, sans-serif; }
+  img.avatar { border-radius: 50%; }
+  .card { border-radius: 8px; background: #F4F6F8; padding: 12px; }
+</style>
+</head>
+<body>
+<!-- #1926: a round 32 px avatar in a rounded card cell, a card picture
+     with 8 px corners, and a plain picture. -->
+<table width="400" cellpadding="0" cellspacing="0" border="0">
+  <tr>
+    <td class="card"><img class="avatar" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKklEQVR42mOwzrtBU8QwasGoBaMWjFowasGoBaMWjFowasGoBaMWDBULAPsZBFtER5WMAAAAAElFTkSuQmCC" width="32" height="32" alt="Ann"> Ann posted.</td>
+  </tr>
+</table>
+<p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAHgAAAAoCAIAAAC6iKlyAAAAUklEQVR42u3QQQ0AAAgEoEtkIbuZ1RbOBxsJSE1zIApEi0a0aNEWRItGtGjRFkSLRrRo0YgWjWjRohEtGtGiRSNaNKJFi0a0aESLFo1o0Yj+ZwEsGZx8FrFrNgAAAABJRU5ErkJggg==" width="120" height="40" alt="Card" style="border-radius:8px"></p>
+<p><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAIAAABM5OhcAAAAxklEQVR42u3SMQ0AAAzDsMIv7KKYtMOGECWFA5EAY2EsjAXGwlgYC4yFsTAWGAtjYSwwFsbCWGAsjIWxwFgYC2OBsTAWxgJjYSyMBcbCWBgLjIWxMBYYC2NhLDAWxsJYYCyMhbHAWBgLY4GxMBbGAmNhLIwFxsJYGAuMhbEwFhgLY2EsMBbGwlhgLIyFscBYGAtjgbEwFsYCY2EsjAXGwlgYC4yFsTAWGAtjYSwwFsbCWBgLjIWxMBYYC2NhLDAWxsJYYCx+G6QCikVj2yeNAAAAAElFTkSuQmCC" width="200" height="100" alt="Plain"></p>
+</body>
+</html>

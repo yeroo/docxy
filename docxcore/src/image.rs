@@ -100,6 +100,68 @@ pub fn inline_picture_run_described(
     descr: &str,
     outline: Option<&str>,
 ) -> String {
+    inline_picture_run_shaped(
+        rid,
+        cx,
+        cy,
+        id,
+        file_name,
+        descr,
+        outline,
+        PictureShape::Rect,
+    )
+}
+
+/// The shape a picture is cropped to (#1926): its `pic:spPr`'s
+/// `a:prstGeom`, as Word's Picture Format > Crop to Shape writes it.
+/// `Rect` is an uncropped picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PictureShape {
+    Rect,
+    /// `prst="ellipse"`: the oval inscribed in the picture's box.
+    Ellipse,
+    /// `prst="roundRect"`: corners of radius `min(w, h) * adj / 100000`,
+    /// `adj` within `0..=ROUND_RECT_MAX_ADJ`.
+    RoundRect {
+        adj: u32,
+    },
+}
+
+/// The largest `roundRect` `adj` (ECMA-376 presetShapeDefinitions pins
+/// it to `0..=50000`): corners of half the shorter side.
+pub const ROUND_RECT_MAX_ADJ: u32 = 50_000;
+
+/// A `roundRect`'s `adj` when it names none (the preset's default).
+pub const ROUND_RECT_DEFAULT_ADJ: u32 = 16_667;
+
+impl PictureShape {
+    /// The `a:prstGeom` element of this shape.
+    fn prst_geom(self) -> String {
+        match self {
+            PictureShape::Rect => "<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>".into(),
+            PictureShape::Ellipse => "<a:prstGeom prst=\"ellipse\"><a:avLst/></a:prstGeom>".into(),
+            PictureShape::RoundRect { adj } => format!(
+                "<a:prstGeom prst=\"roundRect\"><a:avLst><a:gd name=\"adj\" fmla=\"val {}\"/></a:avLst></a:prstGeom>",
+                adj.min(ROUND_RECT_MAX_ADJ)
+            ),
+        }
+    }
+}
+
+/// [`inline_picture_run_described`] cropped to `shape` (#1926);
+/// [`PictureShape::Rect`] writes exactly what that does.
+#[allow(clippy::too_many_arguments)]
+pub fn inline_picture_run_shaped(
+    rid: &str,
+    cx: i64,
+    cy: i64,
+    id: u32,
+    file_name: &str,
+    descr: &str,
+    outline: Option<&str>,
+    shape: PictureShape,
+) -> String {
+    let geom = shape.prst_geom();
     let name = crate::mermaid::xml_escape_attr(file_name);
     let descr = if descr.is_empty() {
         String::new()
@@ -124,7 +186,7 @@ pub fn inline_picture_run_described(
          <pic:nvPicPr><pic:cNvPr id=\"0\" name=\"{name}\"/><pic:cNvPicPr/></pic:nvPicPr>\
          <pic:blipFill><a:blip r:embed=\"{rid}\"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
          <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{cx}\" cy=\"{cy}\"/></a:xfrm>\
-         <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom>{line}</pic:spPr>\
+         {geom}{line}</pic:spPr>\
          </pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"
     )
 }
@@ -176,6 +238,70 @@ pub fn inline_embed(raw: &str) -> Option<String> {
     crate::load::xml_attr_value(&raw[at..end], "r:embed").filter(|rid| !rid.is_empty())
 }
 
+/// The shape an inline picture run is cropped to (#1926): the `prst` of
+/// the `a:prstGeom` in its picture's `pic:spPr`, under [`inline_embed`]'s
+/// guards. Lenient, never an error: anything but an inline picture, no
+/// `pic:spPr`, a `custGeom`, or a preset other than `ellipse` or
+/// `roundRect` is [`PictureShape::Rect`]. A `roundRect`'s `adj` guide is
+/// [`ROUND_RECT_DEFAULT_ADJ`] when absent or unreadable and clamped to
+/// `0..=ROUND_RECT_MAX_ADJ`.
+pub fn inline_shape(raw: &str) -> PictureShape {
+    picture_shape(raw).unwrap_or(PictureShape::Rect)
+}
+
+fn picture_shape(raw: &str) -> Option<PictureShape> {
+    let (_, blip_end) = picture_blip(raw)?;
+    let sp = blip_end + start_tag(&raw[blip_end..], "<pic:spPr")?;
+    let sp_end = sp + raw[sp..].find("</pic:spPr>")?;
+    let props = &raw[sp..sp_end];
+    let geom = start_tag(props, "<a:prstGeom")?;
+    let geom_end = geom + props[geom..].find('>')?;
+    let prst = crate::load::xml_attr_value(&props[geom..geom_end], "prst")?;
+    match prst.as_str() {
+        "ellipse" => Some(PictureShape::Ellipse),
+        "roundRect" => {
+            let close = props[geom..]
+                .find("</a:prstGeom>")
+                .map_or(props.len(), |at| geom + at);
+            let guides = &props[geom_end..close];
+            let adj = round_rect_adj(guides).unwrap_or(ROUND_RECT_DEFAULT_ADJ);
+            Some(PictureShape::RoundRect { adj })
+        }
+        _ => None,
+    }
+}
+
+/// The `adj` guide's value among a `roundRect`'s guides (`fmla="val N"`),
+/// clamped; `None` when there is none or it does not read.
+fn round_rect_adj(guides: &str) -> Option<u32> {
+    let mut from = 0;
+    while let Some(at) = start_tag(&guides[from..], "<a:gd") {
+        let at = from + at;
+        let end = at + guides[at..].find('>')?;
+        let gd = &guides[at..end];
+        if crate::load::xml_attr_value(gd, "name").as_deref() == Some("adj") {
+            let fmla = crate::load::xml_attr_value(gd, "fmla")?;
+            let n: i64 = fmla.trim().strip_prefix("val")?.trim().parse().ok()?;
+            return Some(n.clamp(0, i64::from(ROUND_RECT_MAX_ADJ)) as u32);
+        }
+        from = end;
+    }
+    None
+}
+
+/// Where the first `tag` start tag (`<a:gd`, not `<a:gdLst`) begins in
+/// `s`: the name followed by white space, `/` or `>`.
+fn start_tag(s: &str, tag: &str) -> Option<usize> {
+    let mut from = 0;
+    loop {
+        let at = from + s[from..].find(tag)?;
+        match s.as_bytes().get(at + tag.len()) {
+            Some(b' ' | b'/' | b'>' | b'\t' | b'\r' | b'\n') => return Some(at),
+            _ => from = at + 1,
+        }
+    }
+}
+
 /// Where the `<a:blip ...>` start tag of an inline picture run sits
 /// (`raw[at..end]`, `end` at its `>`), with [`inline_embed`]'s guards.
 fn picture_blip(raw: &str) -> Option<(usize, usize)> {
@@ -186,14 +312,7 @@ fn picture_blip(raw: &str) -> Option<(usize, usize)> {
     if crate::load::xml_attr_value(&raw[data..data_end], "uri")? != PICTURE_URI {
         return None;
     }
-    let mut from = data_end;
-    let at = loop {
-        let at = from + raw[from..].find("<a:blip")?;
-        match raw.as_bytes().get(at + "<a:blip".len()) {
-            Some(b' ' | b'/' | b'>' | b'\t' | b'\r' | b'\n') => break at,
-            _ => from = at + 1,
-        }
-    };
+    let at = data_end + start_tag(&raw[data_end..], "<a:blip")?;
     Some((at, at + raw[at..].find('>')?))
 }
 
@@ -647,5 +766,133 @@ mod tests {
         assert_eq!(sniff(&[0xff, 0xd8, 0xff, 0xd9]), None);
         assert_eq!(sniff(b"GIF89a\x01"), None);
         assert_eq!(sniff(b"BM\0\0"), None);
+    }
+
+    #[test]
+    fn a_rect_shaped_run_is_todays_run_and_shapes_write_their_preset() {
+        let today = inline_picture_run_described("rId5", 10, 20, 3, "a.png", "x", Some("A6A6A6"));
+        let rect = inline_picture_run_shaped(
+            "rId5",
+            10,
+            20,
+            3,
+            "a.png",
+            "x",
+            Some("A6A6A6"),
+            PictureShape::Rect,
+        );
+        assert_eq!(rect, today);
+        // The run as it was before #1926 (main's format string, these
+        // values filled in): a rectangle is written byte for byte as then.
+        let before = concat!(
+            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">"#,
+            r#"<wp:extent cx="10" cy="20"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            r#"<wp:docPr id="3" name="Picture 3" descr="x"/>"#,
+            r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+            r#"<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
+            r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:nvPicPr><pic:cNvPr id="0" name="a.png"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="10" cy="20"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#,
+            r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="A6A6A6"/></a:solidFill></a:ln></pic:spPr>"#,
+            r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+        );
+        assert_eq!(rect, before);
+        let shaped = |shape| inline_picture_run_shaped("rId5", 10, 20, 3, "a.png", "", None, shape);
+        let oval = shaped(PictureShape::Ellipse);
+        assert!(oval.contains(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom></pic:spPr>"#));
+        assert!(!oval.contains(r#"prst="rect""#));
+        let round = shaped(PictureShape::RoundRect { adj: 20_000 });
+        assert!(round.contains(
+            r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 20000"/></a:avLst></a:prstGeom>"#
+        ));
+        // Written clamped.
+        assert!(shaped(PictureShape::RoundRect { adj: 90_000 }).contains(r#"fmla="val 50000""#));
+        for shape in [
+            PictureShape::Rect,
+            PictureShape::Ellipse,
+            PictureShape::RoundRect { adj: 20_000 },
+            PictureShape::RoundRect { adj: 0 },
+        ] {
+            let run = shaped(shape);
+            assert_eq!(inline_shape(&run), shape, "{run}");
+            assert_eq!(inline_embed(&run).as_deref(), Some("rId5"));
+            assert_eq!(inline_extent(&run), Some((10, 20)));
+        }
+    }
+
+    /// Word's own Crop to Shape picture: `bwMode` on `pic:spPr`, other
+    /// prefixes' attributes, the geometry after the transform.
+    fn word_picture(geom: &str) -> String {
+        format!(
+            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Picture 1"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="1" name="a.png"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rId4"><a:extLst/></a:blip><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr bwMode="auto"><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></a:xfrm>{geom}<a:noFill/></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+        )
+    }
+
+    #[test]
+    fn the_shape_reads_from_words_own_crop_and_is_lenient() {
+        let read = |geom: &str| inline_shape(&word_picture(geom));
+        assert_eq!(
+            read(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>"#),
+            PictureShape::Ellipse
+        );
+        assert_eq!(
+            read(r#"<a:prstGeom prst="roundRect"><a:avLst/></a:prstGeom>"#),
+            PictureShape::RoundRect {
+                adj: ROUND_RECT_DEFAULT_ADJ
+            }
+        );
+        assert_eq!(
+            read(r#"<a:prstGeom prst="roundRect"/>"#),
+            PictureShape::RoundRect {
+                adj: ROUND_RECT_DEFAULT_ADJ
+            }
+        );
+        assert_eq!(
+            read(
+                r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 8000"/></a:avLst></a:prstGeom>"#
+            ),
+            PictureShape::RoundRect { adj: 8000 }
+        );
+        // Out of range: clamped; junk: the default.
+        for (fmla, adj) in [
+            ("val 70000", 50_000),
+            ("val -5", 0),
+            ("val x", ROUND_RECT_DEFAULT_ADJ),
+            ("*/ w 1 2", ROUND_RECT_DEFAULT_ADJ),
+        ] {
+            let geom = format!(
+                r#"<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="{fmla}"/></a:avLst></a:prstGeom>"#
+            );
+            assert_eq!(read(&geom), PictureShape::RoundRect { adj }, "{fmla}");
+        }
+        // Other presets, a custom geometry, none at all: a rectangle.
+        for geom in [
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#,
+            r#"<a:prstGeom prst="snip1Rect"><a:avLst/></a:prstGeom>"#,
+            r#"<a:custGeom><a:pathLst/></a:custGeom>"#,
+            "",
+        ] {
+            assert_eq!(read(geom), PictureShape::Rect, "{geom}");
+        }
+        // Not an inline picture: an anchored one, a shape, plain text.
+        let oval = r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>"#;
+        let anchored = word_picture(oval)
+            .replace("<wp:inline", "<wp:anchor")
+            .replace("</wp:inline>", "</wp:anchor>");
+        assert_eq!(inline_shape(&anchored), PictureShape::Rect);
+        let shape = word_picture(oval).replace(
+            "drawingml/2006/picture\"><pic:pic",
+            "drawingml/2006/wordprocessingShape\"><pic:pic",
+        );
+        assert_eq!(inline_shape(&shape), PictureShape::Rect);
+        assert_eq!(inline_shape("<w:r><w:t>x</w:t></w:r>"), PictureShape::Rect);
+        // An ellipse outside the picture's own `pic:spPr` is not its crop.
+        let elsewhere =
+            word_picture("").replace("</pic:pic>", r#"</pic:pic><a:prstGeom prst="ellipse"/>"#);
+        assert_eq!(inline_shape(&elsewhere), PictureShape::Rect);
     }
 }

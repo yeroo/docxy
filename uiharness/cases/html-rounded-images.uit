@@ -1,0 +1,26 @@
+# An HTML page's `border-radius` on an `<img>` crops its picture (#1926):
+# the import writes Word's Crop to Shape geometry (`a:prstGeom` ellipse
+# or roundRect) and the view clips the picture to its corners. `doc`'s
+# `flow.pictures.N` reads each body picture as the last frame built it:
+# its `width`, `height` and clip `radius` (px), its `shape` and `round`
+# (the radius is half the shorter side). The fixture's pictures are
+# `data:` PNGs, so nothing resolves from disk: a round 32 px avatar in a
+# rounded card cell (whose own `border-radius` is dropped, never text), a
+# 120 x 40 picture with 8 px corners and a plain one. The read follows a
+# `shot`, which waits for the frame.
+
+test issue 1926 a rounded image is drawn clipped to its corners
+  open copy:../fixtures/rounded-images.html
+  assert view.layout is web
+  call window-size {"w":1100,"h":800}
+  shot window
+  call doc {}
+  assert reply.flow.pictures.0.shape is ellipse
+  assert reply.flow.pictures.0.round is true
+  assert reply.flow.pictures.0.width is 32
+  assert reply.flow.pictures.0.radius is 16
+  assert reply.flow.pictures.1.shape is roundRect
+  assert reply.flow.pictures.1.round is false
+  assert reply.flow.pictures.1.radius is 8
+  assert reply.flow.pictures.2.shape is rect
+  assert reply.flow.pictures.2.radius is 0

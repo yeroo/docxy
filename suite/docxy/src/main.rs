@@ -5563,6 +5563,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
+    /// The document tab's body pictures as last drawn (#1926), for the
+    /// harness's `doc` read.
+    drawn_pictures: pictures::DrawnPictures,
     /// The flow view's block the caret moved into (#1895), followed in y by
     /// the scroll area's probe once the next layout has laid it out.
     doc_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
@@ -15571,6 +15574,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             painted_tables: PaintedTables::default(),
+            drawn_pictures: pictures::DrawnPictures::default(),
             doc_follow: std::rc::Rc::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
                 line_numbers::LineProbe::default(),
@@ -34810,16 +34814,34 @@ fn paragraph_el(
                 // An inline picture (#768): a box of its size, drawn in the
                 // line. It holds the picture when its media resolves to an
                 // image gpui can show (#1432), else a bordered frame. It is
-                // one offset (#1242).
+                // one offset (#1242). Cropped to an oval or rounded
+                // rectangle (Word's Crop to Shape, an HTML `border-radius`,
+                // #1926), the picture and the frame's border are clipped to
+                // its corners.
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = picture_frame_px(cx_emu, cy_emu, zoom);
+                    let shape = docxcore::image::inline_shape(xml);
+                    let radius = pictures::picture_radius(shape, w, h);
                     let frame = div().flex_none().w(px(w)).h(px(h));
                     let frame = match pics.and_then(|p| p.image(xml)) {
-                        Some(image) => {
-                            frame.child(img(image).w(px(w)).h(px(h)).object_fit(ObjectFit::Fill))
-                        }
+                        Some(image) => frame.child(
+                            img(image)
+                                .w(px(w))
+                                .h(px(h))
+                                .object_fit(ObjectFit::Fill)
+                                .rounded(px(radius)),
+                        ),
                         None => frame.border_1().border_color(pal.dim),
                     };
+                    let frame = frame.rounded(px(radius));
+                    if let Some(p) = pics {
+                        p.record(pictures::DrawnPicture {
+                            width: w,
+                            height: h,
+                            radius,
+                            shape,
+                        });
+                    }
                     emit_object_unit(
                         &mut spans, frame, &mut idx, &mut caret, sel, click, pal, caret_h,
                     );
@@ -41291,6 +41313,9 @@ impl Render for Docxy {
                         .map(|pkg| pictures::Pictures::new(pkg, &tab.pictures));
                     let painted_tables = self.painted_tables.clone();
                     painted_tables.borrow_mut().clear();
+                    // The body's pictures as drawn, for the harness (#1926).
+                    let drawn_pictures = self.drawn_pictures.clone();
+                    drawn_pictures.borrow_mut().clear();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -41308,7 +41333,8 @@ impl Render for Docxy {
                         merge_hl: tab.mail.highlight,
                         field_codes: tab.field_codes,
                         cell_run: None,
-                        pics: pictures::scope(pictures.as_ref(), Some("word/document.xml")),
+                        pics: pictures::scope(pictures.as_ref(), Some("word/document.xml"))
+                            .map(|s| s.recording(&drawn_pictures)),
                         page_vals: None,
                         // The flow branch below fits its tables (#1895).
                         fit_width: None,
