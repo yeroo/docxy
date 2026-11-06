@@ -312,14 +312,7 @@ fn picture_blip(raw: &str) -> Option<(usize, usize)> {
     if crate::load::xml_attr_value(&raw[data..data_end], "uri")? != PICTURE_URI {
         return None;
     }
-    let mut from = data_end;
-    let at = loop {
-        let at = from + raw[from..].find("<a:blip")?;
-        match raw.as_bytes().get(at + "<a:blip".len()) {
-            Some(b' ' | b'/' | b'>' | b'\t' | b'\r' | b'\n') => break at,
-            _ => from = at + 1,
-        }
-    };
+    let at = data_end + start_tag(&raw[data_end..], "<a:blip")?;
     Some((at, at + raw[at..].find('>')?))
 }
 
@@ -789,7 +782,25 @@ mod tests {
             PictureShape::Rect,
         );
         assert_eq!(rect, today);
-        assert!(today.contains(r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#));
+        // The run as it was before #1926 (main's format string, these
+        // values filled in): a rectangle is written byte for byte as then.
+        let before = concat!(
+            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0" "#,
+            r#"xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">"#,
+            r#"<wp:extent cx="10" cy="20"/><wp:effectExtent l="0" t="0" r="0" b="0"/>"#,
+            r#"<wp:docPr id="3" name="Picture 3" descr="x"/>"#,
+            r#"<wp:cNvGraphicFramePr><a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/></wp:cNvGraphicFramePr>"#,
+            r#"<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">"#,
+            r#"<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">"#,
+            r#"<pic:nvPicPr><pic:cNvPr id="0" name="a.png"/><pic:cNvPicPr/></pic:nvPicPr>"#,
+            r#"<pic:blipFill><a:blip r:embed="rId5"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>"#,
+            r#"<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="10" cy="20"/></a:xfrm>"#,
+            r#"<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>"#,
+            r#"<a:ln w="9525"><a:solidFill><a:srgbClr val="A6A6A6"/></a:solidFill></a:ln></pic:spPr>"#,
+            r#"</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#,
+        );
+        assert_eq!(rect, before);
         let shaped = |shape| inline_picture_run_shaped("rId5", 10, 20, 3, "a.png", "", None, shape);
         let oval = shaped(PictureShape::Ellipse);
         assert!(oval.contains(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom></pic:spPr>"#));

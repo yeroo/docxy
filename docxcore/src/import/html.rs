@@ -4387,7 +4387,8 @@ mod image_tests {
                 Rect,
             ]
         );
-        // No radius: exactly the run a picture had before #1926.
+        // No radius: the current rectangle writer's run (pinned to the
+        // pre-#1926 bytes in `image::tests`).
         let plain = all_pictures(&d)[5];
         let (id, rid) = (6, inline_embed(plain).unwrap());
         assert_eq!(
