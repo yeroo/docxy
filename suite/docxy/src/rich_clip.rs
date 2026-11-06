@@ -79,7 +79,9 @@ pub(crate) fn hand_over() {
     imp::hand_over();
 }
 
-/// The HTML table fragment on the clipboard, if any.
+/// The clipboard's HTML, if any: cut to its table fragment when a CF_HTML
+/// payload holds one, else the page, for a sheet paste's table and a
+/// document paste (#1950). As UTF-8 text (an X11 UTF-16 page converted).
 pub(crate) fn read_html() -> Option<String> {
     let bytes = imp::read_html()?;
     html_fragment(&bytes)

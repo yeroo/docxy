@@ -10,23 +10,24 @@
 
 use crate::editor::Clip;
 use crate::import::Budget;
-use crate::import::html::import_html_within;
+use crate::import::html::import_html_str_within;
 
 impl Clip {
-    /// The clip another app's HTML copy holds, or `None` when `bytes` holds
+    /// The clip another app's HTML copy holds, or `None` when `html` holds
     /// no text or is past what an import may cost: the paste then takes the
     /// plain text. `plain` is the text copied with it: it says whether the
-    /// clip ends with a paragraph mark, as in [`Clip::from_rtf`]. The page's
-    /// encoding is read as an HTML file's is (a BOM, a declared charset, else
-    /// UTF-8).
-    pub fn from_html(bytes: &[u8], plain: Option<&str>) -> Option<Clip> {
-        from_html_within(bytes, plain, &Budget::standard())
+    /// clip ends with a paragraph mark, as in [`Clip::from_rtf`]. The
+    /// clipboard's HTML is text already (UTF-8, a UTF-16 page converted
+    /// where it is read), so no charset is read from it: a `charset=` an
+    /// Office page or its words carry says nothing about these characters.
+    pub fn from_html(html: &str, plain: Option<&str>) -> Option<Clip> {
+        from_html_within(html, plain, &Budget::standard())
     }
 }
 
 /// [`Clip::from_html`] against `budget`.
-fn from_html_within(bytes: &[u8], plain: Option<&str>, budget: &Budget) -> Option<Clip> {
-    let (doc, _) = import_html_within(bytes, budget, None).ok()?;
+fn from_html_within(html: &str, plain: Option<&str>, budget: &Budget) -> Option<Clip> {
+    let doc = import_html_str_within(html, budget).ok()?;
     let clip = crate::clip_rtf::clip_of(&doc, plain)?;
     (!clip.to_text().is_empty()).then_some(clip)
 }
@@ -71,7 +72,7 @@ mod tests {
 
     #[test]
     fn bold_italic_and_a_link_come_through() {
-        let html = b"<html><body><p>Plain <b>bold</b> <i>it</i> <a href=\"https://example.com/\">link</a></p></body></html>";
+        let html = "<html><body><p>Plain <b>bold</b> <i>it</i> <a href=\"https://example.com/\">link</a></p></body></html>";
         let clip = Clip::from_html(html, Some("Plain bold it link")).unwrap();
         assert_eq!(clip.to_text(), "Plain bold it link");
         let got = runs(&clip);
@@ -91,7 +92,7 @@ mod tests {
 
     #[test]
     fn the_mark_comes_from_the_plain_text() {
-        let html = b"<p>one</p><p>two</p>";
+        let html = "<p>one</p><p>two</p>";
         let partial = Clip::from_html(html, Some("one\ntwo")).unwrap();
         assert_eq!(partial.paras.len(), 2);
         assert_eq!(partial.to_text(), "one\ntwo");
@@ -105,25 +106,29 @@ mod tests {
     fn a_table_row_is_one_tab_joined_paragraph() {
         let html =
             "<table><tr><td>a</td><td>M\u{fc}ller</td></tr><tr><td>1</td><td>2</td></tr></table>";
-        let clip = Clip::from_html(html.as_bytes(), None).unwrap();
+        let clip = Clip::from_html(html, None).unwrap();
         assert_eq!(clip.to_text(), "a\tM\u{fc}ller\n1\t2");
     }
 
     #[test]
     fn no_text_is_no_clip() {
-        assert_eq!(Clip::from_html(b"", None), None);
-        assert_eq!(Clip::from_html(b"<html><body></body></html>", None), None);
-        assert_eq!(Clip::from_html(b"<p>   </p><img src=x>", Some("")), None);
+        assert_eq!(Clip::from_html("", None), None);
+        assert_eq!(Clip::from_html("<html><body></body></html>", None), None);
+        assert_eq!(Clip::from_html("<p>   </p><img src=x>", Some("")), None);
     }
 
+    /// The text is never re-read for a charset: a `charset=` in the words,
+    /// or an Office page's windows-1252 meta over its UTF-8 bytes, leaves
+    /// `\u{e9}` an `\u{e9}` (#1950 r1).
     #[test]
-    fn a_utf16_page_reads() {
-        let mut bytes = vec![0xFF, 0xFE];
-        for unit in "<b>caf\u{e9}</b>".encode_utf16() {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
-        let clip = Clip::from_html(&bytes, None).unwrap();
-        assert_eq!(clip.to_text(), "caf\u{e9}");
-        assert!(runs(&clip)[0][0].1);
+    fn no_charset_is_read_from_the_clipboards_text() {
+        let html = "<p>Set charset=iso-8859-1 for caf\u{e9}</p>";
+        let clip = Clip::from_html(html, None).unwrap();
+        assert_eq!(clip.to_text(), "Set charset=iso-8859-1 for caf\u{e9}");
+        let office = "<html><head><meta http-equiv=Content-Type content=\"text/html; charset=windows-1252\"></head><body><p>caf\u{e9}</p></body></html>";
+        assert_eq!(
+            Clip::from_html(office, None).unwrap().to_text(),
+            "caf\u{e9}"
+        );
     }
 }

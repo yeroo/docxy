@@ -2176,8 +2176,9 @@ fn foreign_table(html: Option<&str>, rtf: Option<&[u8]>) -> Option<Vec<Vec<Strin
 
 /// Whether a document paste takes the window's own clip `ours` (#755,
 /// #1074): while the clipboard still holds its text ([`clip_still_ours`]),
-/// unless the clipboard holds an RTF (`rich`) with no text beside it. That
-/// is another app's copy, never ours: ours always comes with its text.
+/// unless the clipboard holds an RTF or HTML (`rich`, #1950) with no text
+/// beside it. That is another app's copy, never ours: ours always comes
+/// with its text.
 fn doc_clip_ours(ours: &DocClip, now: &ClipRead, rich: bool) -> bool {
     let rich_only = rich && now.text().is_none();
     !rich_only && clip_still_ours(&ours.text, now)
@@ -2233,22 +2234,32 @@ pub(crate) enum PasteFrom {
 /// else its HTML (a browser's copy has no RTF; a sheet copy's table too:
 /// its cells' display text, without the `'` its TSV gives a text cell),
 /// else its text. An RTF or HTML the importer cannot read falls through to
-/// the next. `html` reads the clipboard's HTML, only when neither our clip
-/// nor the RTF pastes.
+/// the next. `html` reads the clipboard's HTML, at most once: when neither
+/// our clip nor the RTF pastes, or first when the clipboard holds no text
+/// and no RTF, since an HTML with no text beside it is another app's copy,
+/// never ours ([`doc_clip_ours`], #1950 r1).
 fn doc_paste_from(
     ours: Option<&DocClip>,
     now: &ClipRead,
     rtf: Option<&[u8]>,
     html: impl FnOnce() -> Option<String>,
 ) -> Option<(PasteFrom, Clip)> {
-    if let Some(ours) = ours.filter(|ours| doc_clip_ours(ours, now, rtf.is_some())) {
+    let mut read = Some(html);
+    let mut cached: Option<Option<String>> = None;
+    let mut html = || {
+        cached
+            .get_or_insert_with(|| read.take().and_then(|read| read()))
+            .clone()
+    };
+    let rich = rtf.is_some() || (now.text().is_none() && html().is_some());
+    if let Some(ours) = ours.filter(|ours| doc_clip_ours(ours, now, rich)) {
         return Some((PasteFrom::Ours, ours.clip.clone()));
     }
     rtf.and_then(|rtf| Clip::from_rtf(rtf, now.text()))
         .map(|clip| (PasteFrom::Rtf, clip))
         .or_else(|| {
             html()
-                .and_then(|html| Clip::from_html(html.as_bytes(), now.text()))
+                .and_then(|html| Clip::from_html(&html, now.text()))
                 .map(|clip| (PasteFrom::Html, clip))
         })
         .or_else(|| {
@@ -2367,9 +2378,11 @@ impl ClipboardStore {
         }
     }
 
-    /// The clipboard's HTML table, if it has one. `os` reads the OS one's
-    /// (already cut out of its CF_HTML payload); a private `html` is read as
-    /// that one is, so a CF_HTML string given to `clipboard write` reads alike.
+    /// The clipboard's HTML, if it has one: cut to its table fragment when a
+    /// CF_HTML payload holds one, else the page, for a sheet paste's table
+    /// and a document paste (#1950). `os` reads the OS one's (already cut);
+    /// a private `html` is read as that one is, so a CF_HTML string given to
+    /// `clipboard write` reads alike.
     fn read_html(&self, harness: bool, os: impl FnOnce() -> Option<String>) -> Option<String> {
         if harness {
             let html = self.private.borrow().as_ref()?.html.clone()?;
@@ -20223,8 +20236,9 @@ impl Docxy {
         recorded_after_write(text, &now)
     }
 
-    /// The clipboard's HTML table fragment (#1248): the OS one's, or the
-    /// private one's.
+    /// The clipboard's HTML (#1248, #1950): cut to its table fragment when a
+    /// CF_HTML payload holds one, else the page, for a sheet paste's table
+    /// and a document paste. The OS one's, or the private one's.
     fn clipboard_read_html(&self) -> Option<String> {
         self.clipboard.read_html(self.harness, rich_clip::read_html)
     }
@@ -29012,6 +29026,50 @@ mod clipboard_tests {
         // An HTML-only copy, with no text beside it, still pastes.
         let got = doc_paste_clip(None, &ClipRead::Nothing, None, || Some(html.into())).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD link");
+    }
+
+    /// #1950 r1: another app's HTML with no text beside it is never our
+    /// clip, as an RTF alone is not: an older document clip of ours (or our
+    /// image-only one) does not paste over it, and the HTML is read once.
+    #[test]
+    fn an_html_only_copy_is_not_ours_1950() {
+        use docxcore::editor::Clip;
+        let html = "<p>From <b>THEM</b></p>";
+        let ours = DocClip {
+            media: Default::default(),
+            clip: Clip::from_text("mine"),
+            text: "mine".into(),
+        };
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some(html.to_string())
+        };
+        let (from, got) = doc_paste_from(Some(&ours), &ClipRead::Nothing, None, read).unwrap();
+        assert_eq!(
+            (from, got.to_text().as_str()),
+            (PasteFrom::Html, "From THEM")
+        );
+        assert_eq!(reads.get(), 1, "read once");
+        let image_only = DocClip {
+            media: Default::default(),
+            clip: Clip::default(),
+            text: String::new(),
+        };
+        let (from, _) = doc_paste_from(Some(&image_only), &ClipRead::NotText, None, || {
+            Some(html.into())
+        })
+        .unwrap();
+        assert_eq!(from, PasteFrom::Html);
+        // With no HTML either, the clip is still ours, as before.
+        let (from, _) = doc_paste_from(Some(&ours), &ClipRead::Nothing, None, || None).unwrap();
+        assert_eq!(from, PasteFrom::Ours);
+        // With text there, the HTML is not read to decide.
+        let (from, _) = doc_paste_from(Some(&ours), &ClipRead::Text("mine".into()), None, || {
+            panic!("not read")
+        })
+        .unwrap();
+        assert_eq!(from, PasteFrom::Ours);
     }
 
     /// #1950: a sheet copy pasted into a document (the document clip not

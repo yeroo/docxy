@@ -490,3 +490,21 @@ fn at_quit_our_copy_goes_to_the_clipboard_manager() {
         ]
     );
 }
+
+/// A UTF-16 page (either byte order, with its BOM) becomes UTF-8; anything
+/// else is left as it is (the document paste never sniffs it again).
+#[test]
+fn a_utf16_page_is_converted_where_it_is_read() {
+    let page = "<b>caf\u{e9}</b>";
+    let le: Vec<u8> = [0xFF, 0xFE]
+        .into_iter()
+        .chain(page.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect();
+    let be: Vec<u8> = [0xFE, 0xFF]
+        .into_iter()
+        .chain(page.encode_utf16().flat_map(u16::to_be_bytes))
+        .collect();
+    assert_eq!(utf8_page(le), page.as_bytes());
+    assert_eq!(utf8_page(be), page.as_bytes());
+    assert_eq!(utf8_page(page.as_bytes().to_vec()), page.as_bytes());
+}

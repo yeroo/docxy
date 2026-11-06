@@ -11,7 +11,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   on Wayland. It is written
   only when the text write took (`rtf_follows`). A document paste takes the
   window's own clip while the clipboard still holds its text, else the
-  clipboard's RTF, else its text (`doc_paste_clip`). A partial copy's RTF ends
+  clipboard's RTF, else its HTML (#1950), else its text (`doc_paste_from`). A
+  partial copy's RTF ends
   without `\par`; the paste takes the trailing mark from the plain text.
   Font colour and highlight cross both ways: highlight goes out as
   `\highlightN` (Word) and `\cbN` (Cocoa), and comes in as the nearest Word
@@ -66,7 +67,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
 - A document paste takes our clip, else the RTF, else the HTML, else the text
   (`doc_paste_from`, on every platform): a browser's copy has HTML and no
   RTF. `Clip::from_html` (`docxcore/src/clip_html.rs`) maps the HTML import
-  as `from_rtf` does. The HTML is read only when neither our clip nor the
+  as `from_rtf` does, from the clipboard's text as it is (`import_html_str_within`):
+  no charset is read from it, since an Office page's windows-1252 meta (or a
+  `charset=` in its words) says nothing about these UTF-8 characters; X11's
+  UTF-16 page is converted where it is read. An RTF or HTML with no text
+  beside it is never our clip (`doc_clip_ours`'s `rich`). The HTML is read only when neither our clip nor the
   RTF pastes. Paste Special offers an HTML source as "HTML Format". A sheet
   copy pasted into a document now takes its table's display text, tab-joined
   (no `'` the TSV gives a text cell like `007`). Lists are not kept: a `Clip`

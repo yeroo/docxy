@@ -4265,7 +4265,9 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
         app.clip.as_ref(),
         app.grid_clip_current(),
         &now,
-        rtf.is_some(),
+        // An RTF, or an HTML with no text beside it, is another app's copy
+        // (`doc_paste_from`, #1950).
+        rtf.is_some() || (now.text().is_none() && html.is_some()),
     );
     let bold = rtf
         .as_deref()
