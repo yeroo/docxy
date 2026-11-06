@@ -147,10 +147,12 @@ pub enum SyncCommand {
     /// call, no outbox.
     FetchPhoto,
     /// Sign out: drop the in-memory token and delete the saved one
-    /// (`tokencache::clear`), then emit [`SyncEvent::SignInRequired`] (and
-    /// `State(SignInRequired)`), so the next `SignIn` starts a fresh sign-in.
-    /// The mail store and the outbox are kept: queued ops drain after the next
-    /// sign-in. Signed out already, it still clears the file and says so.
+    /// (`tokencache::clear`), then emit [`SyncEvent::SignInRequired`], so the
+    /// next `SignIn` starts a fresh sign-in. `State(SignInRequired)` comes
+    /// only when the state changes: a SignOut while already signed out still
+    /// clears the file and emits `SignInRequired`, but no `State`, so a
+    /// client confirms a sign-out by `SignInRequired`. The mail store and the
+    /// outbox are kept: queued ops drain after the next sign-in.
     SignOut,
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
@@ -4405,9 +4407,23 @@ mod tests {
         );
         assert!(!srv.requests().iter().any(|r| r.path.starts_with("/me?")));
 
-        // Signing out again is harmless: still signed out, still says so.
+        // Signing out again is harmless: still signed out, still says so with
+        // `SignInRequired`, but no `State`, as the state did not change. The
+        // `FetchProfile` after it marks the end of what that SignOut emitted.
         handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+        );
+        assert!(
+            seen.iter().any(|e| matches!(e, SyncEvent::SignInRequired)),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::State(_))),
+            "{seen:?}"
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
 

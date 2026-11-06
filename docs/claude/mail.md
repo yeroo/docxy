@@ -262,8 +262,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - `SyncCommand::SignOut` deletes the token file (`tokencache::clear`, which
   also removes the `.tmp` sibling `save` writes, through the shared
   `tmp_path`), clears the throttle/offline back-off (not the outbox's
-  `op_retry`), and goes through `enter_signin` (`SignInRequired` plus
-  `State(SignInRequired)`). A file it cannot delete is reported as an
+  `op_retry`), and goes through `enter_signin`: it always emits
+  `SignInRequired`, but `State(SignInRequired)` only when the state changes
+  (`set_state`), so a repeated SignOut emits just `SignInRequired`, and
+  clients key on that. A file it cannot delete is reported as an
   `Error`, but the engine still signs out in memory. The store and the outbox
   are kept: queued ops drain after the next `SignIn`, whose `prompt=select_account`
   lets another account sign in. That account would then get the old
