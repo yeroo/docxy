@@ -1698,6 +1698,68 @@ pub fn field_result_props(raw: &str) -> RunProps {
     RunProps::default()
 }
 
+/// A field's cached result run by run (#1948: an e-mail writes each with
+/// its own formatting, so a hidden result run stays hidden): each result
+/// run's direct `w:rPr` and its text (`w:t` / `w:delText`, a tab as `\t`,
+/// a break as `\n`, Word's hyphens as U+2011 / U+00AD). The runs are a
+/// `w:fldSimple`'s, or a complex field's after its outermost `separate`
+/// (a nested field's result included, as [`Inline::Field`]'s text has it).
+/// A run that shows no text is left out.
+pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
+    use crate::field::FieldEvent;
+    let simple = !raw.contains("<w:fldChar");
+    let mut p = XmlParser::new(raw);
+    let (mut separated, mut depth) = (false, 0usize);
+    let mut out = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:r" => {
+                let start = p.start_pos();
+                let mut props = RunProps::default();
+                let mut text = String::new();
+                loop {
+                    match p.next() {
+                        Event::Start => match p.name() {
+                            "w:rPr" => parse_rpr(&mut p, &mut props),
+                            "w:t" | "w:delText" => text.push_str(&read_text(&mut p)),
+                            name => {
+                                match name {
+                                    "w:tab" => text.push('\t'),
+                                    "w:br" | "w:cr" => text.push('\n'),
+                                    "w:noBreakHyphen" => text.push('\u{2011}'),
+                                    "w:softHyphen" => text.push('\u{ad}'),
+                                    _ => {}
+                                }
+                                p.skip_element();
+                            }
+                        },
+                        Event::End | Event::Eof => break,
+                        Event::Text => {}
+                    }
+                }
+                let events = crate::field::field_events(p.raw_slice(start, p.pos()));
+                if events.is_empty() {
+                    if (simple || (separated && depth >= 1)) && !text.is_empty() {
+                        out.push((props, text));
+                    }
+                    continue;
+                }
+                for event in events {
+                    match event {
+                        FieldEvent::Begin => depth += 1,
+                        FieldEvent::Separate if depth == 1 => separated = true,
+                        FieldEvent::End => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            Event::Eof => break,
+            Event::Start | Event::End | Event::Text => {}
+        }
+    }
+    out
+}
+
 /// Replace `out[idx..]` (a complex field's runs, begin to end) with one
 /// [`Inline::Field`] whose `raw` is their verbatim source and whose `text` is
 /// the outermost field's cached result, or its computed value (as for a

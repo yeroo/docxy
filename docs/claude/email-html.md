@@ -92,6 +92,14 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   `vertical-align:top;padding:0 5.4pt`, `colspan` from `grid_span`, and `rowspan` counted over a
   `VMerge::Restart` and the `Continue` cells below it at the same grid column (`GridMap`).
   Continuation cells are skipped. Borders, widths and shading are not written.
-- **Other content.** Fields, equations, SmartArt and charts are written as their text, a text box as
-  its paragraphs joined by `<br>`, a note reference as `<sup>N</sup>`. Breaks are `<br>`. Headers,
+- **Fields.** A field's cached result is written run by run from its XML (`load::field_result_runs`:
+  a `w:fldSimple`'s runs, or a complex field's after its outermost `separate`). Each run is shown or
+  hidden, and styled, by its own formatting, because `Inline::Field.text` joins every result run's
+  text, hidden ones included. When the runs' text is not the field's text (a formula the model
+  computes, a `w:sym`), the field is that text in its first result run's look, and nothing at all if
+  any result run is hidden.
+- **Other content.** Equations, SmartArt and charts are written as their text, a text box as its
+  paragraphs with a `<br>` only between two that show something (a paragraph that shows nothing is
+  taken back with its break, and so is the `&nbsp;` the break made of the space before it), a note
+  reference as `<sup>N</sup>`. Breaks are `<br>`. Headers,
   footers, note bodies, comments and raw-XML content are not written.

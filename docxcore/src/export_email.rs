@@ -456,19 +456,9 @@ impl Writer<'_> {
                     pstyle,
                 ),
                 Inline::Equation { raw, text, .. } => self.run(text, &raw_run_props(raw), pstyle),
-                Inline::Field { raw, text } => {
-                    self.run(text, &crate::load::field_result_props(raw), pstyle)
-                }
+                Inline::Field { raw, text } => self.field(raw, text, pstyle),
                 Inline::TextBox { raw, .. } if self.hidden(&raw_run_props(raw), pstyle) => {}
-                Inline::TextBox { blocks, .. } => {
-                    let mut first = true;
-                    for p in text_box_paragraphs(blocks) {
-                        if !std::mem::take(&mut first) {
-                            self.line_break();
-                        }
-                        self.inlines(&p.content, p.props.style_id.as_deref());
-                    }
-                }
+                Inline::TextBox { blocks, .. } => self.text_box(blocks),
                 Inline::Revision {
                     kind: RevisionKind::Insert,
                     content,
@@ -493,6 +483,52 @@ impl Writer<'_> {
                     }
                 }
             }
+        }
+    }
+
+    /// A field's result: run by run from its XML, each shown or hidden and
+    /// styled by its own formatting. A result the model computed (a
+    /// formula), or one its XML does not spell out, is the field's text in
+    /// its first result run's formatting, and nothing at all when any result
+    /// run is hidden: hidden text never leaves.
+    fn field(&mut self, raw: &str, text: &str, pstyle: Option<&str>) {
+        let runs = crate::load::field_result_runs(raw);
+        let cached: String = runs.iter().map(|(_, t)| t.as_str()).collect();
+        if !runs.is_empty() && cached == text {
+            for (props, t) in &runs {
+                self.run(t, props, pstyle);
+            }
+            return;
+        }
+        if runs.iter().any(|(props, _)| self.hidden(props, pstyle)) {
+            return;
+        }
+        self.run(text, &crate::load::field_result_props(raw), pstyle);
+    }
+
+    /// A text box's paragraphs, a `<br>` between two that show something
+    /// (one that shows nothing is taken back with the break before it, so
+    /// a link holding only hidden paragraphs still shows nothing).
+    fn text_box(&mut self, blocks: &[Block]) {
+        let mut any = false;
+        for p in text_box_paragraphs(blocks) {
+            let (mark, text, shown) = (self.out.len(), self.text.clone(), self.shown);
+            let widened = if any { self.line_break() } else { None };
+            let after_break = self.shown;
+            self.inlines(&p.content, p.props.style_id.as_deref());
+            if self.shown != after_break {
+                any = true;
+                continue;
+            }
+            // The break may have made the space before it `&nbsp;` (five
+            // bytes longer, before `mark`): undo that too.
+            self.out
+                .truncate(mark + if widened.is_some() { 5 } else { 0 });
+            if let Some(at) = widened {
+                self.out.replace_range(at..at + 6, " ");
+            }
+            self.text = text;
+            self.shown = shown;
         }
     }
 
@@ -628,7 +664,9 @@ impl Writer<'_> {
                     self.text.after_space = true;
                     self.mark_shown();
                 }
-                '\n' => self.line_break(),
+                '\n' => {
+                    self.line_break();
+                }
                 '\t' => {
                     self.out
                         .push_str("<span style=\"mso-tab-count:1;white-space:pre\">\t</span>");
@@ -662,13 +700,17 @@ impl Writer<'_> {
         self.mark_shown();
     }
 
-    fn line_break(&mut self) {
-        if let Some(at) = self.text.trailing_space.take() {
+    /// A `<br>`. The plain space before it, which would collapse, becomes
+    /// `&nbsp;`: where, if so.
+    fn line_break(&mut self) -> Option<usize> {
+        let widened = self.text.trailing_space.take();
+        if let Some(at) = widened {
             self.out.replace_range(at..at + 1, "&nbsp;");
         }
         self.out.push_str("<br>");
         self.text.after_space = true;
         self.mark_shown();
+        widened
     }
 
     /// An inline picture: an `<img>` of its media part's `cid:`, at its
@@ -2151,5 +2193,129 @@ mod tests {
         assert!(h.contains("shown"), "{h}");
         assert!(!h.contains("<sup>"), "{h}");
         assert!(!h.contains("boxed") && !h.contains("diagram"), "{h}");
+    }
+
+    /// A paragraph of `inner` XML, as `load` reads it.
+    fn loaded(inner: &str) -> Document {
+        crate::load::parse_document_xml(
+            &format!(
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+                 <w:body><w:p>{inner}</w:p></w:body></w:document>"
+            ),
+            &crate::load::Relationships::default(),
+        )
+    }
+
+    const VISIBLE: &str = "<w:r><w:t xml:space=\"preserve\">Public </w:t></w:r>";
+    const HIDDEN: &str = "<w:r><w:rPr><w:vanish/></w:rPr><w:t>internal-only</w:t></w:r>";
+
+    fn simple_field(result: &str) -> String {
+        format!("<w:fldSimple w:instr=\" REF Bm \">{result}</w:fldSimple>")
+    }
+
+    fn complex_field(result: &str) -> String {
+        format!(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText xml:space=\"preserve\"> REF Bm </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>{result}\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+        )
+    }
+
+    /// The loaded paragraph is one field: what the writer gets.
+    fn field_html(inner: &str) -> String {
+        let d = loaded(inner);
+        let Block::Paragraph(p) = &d.body[0] else {
+            panic!("{d:?}")
+        };
+        assert!(
+            matches!(p.content.as_slice(), [Inline::Field { .. }]),
+            "{:?}",
+            p.content
+        );
+        html(&d)
+    }
+
+    #[test]
+    fn a_field_s_hidden_result_run_is_not_written() {
+        for inner in [
+            simple_field(&format!("{VISIBLE}{HIDDEN}")),
+            complex_field(&format!("{VISIBLE}{HIDDEN}")),
+        ] {
+            let h = field_html(&inner);
+            assert!(h.contains("Public"), "{h}");
+            assert!(!h.contains("internal-only"), "{h}");
+        }
+    }
+
+    #[test]
+    fn a_field_whose_first_result_run_is_hidden_shows_the_rest() {
+        for inner in [
+            simple_field(&format!("{HIDDEN}{VISIBLE}")),
+            complex_field(&format!("{HIDDEN}{VISIBLE}")),
+        ] {
+            let h = field_html(&inner);
+            assert!(h.contains("Public"), "{h}");
+            assert!(!h.contains("internal-only"), "{h}");
+        }
+    }
+
+    /// A field whose text the model computes (a formula) is that text,
+    /// unless a result run is hidden: then nothing.
+    #[test]
+    fn a_computed_field_is_its_value_and_hidden_if_any_result_run_is() {
+        let formula =
+            |result: &str| format!("<w:fldSimple w:instr=\" = 2+2 \">{result}</w:fldSimple>");
+        let h = field_html(&formula("<w:r><w:t>stale</w:t></w:r>"));
+        assert!(h.contains(">4</span>") && !h.contains("stale"), "{h}");
+        let h = field_html(&formula(HIDDEN));
+        assert!(!h.contains(">4<") && !h.contains("internal-only"), "{h}");
+    }
+
+    fn text_box(paragraphs: Vec<Block>) -> Inline {
+        Inline::TextBox {
+            raw: "<w:r><w:drawing/></w:r>".into(),
+            blocks: paragraphs,
+        }
+    }
+
+    fn hidden_para(s: &str) -> Block {
+        para(ParProps::default(), vec![Inline::Run(hidden_run(s))])
+    }
+
+    #[test]
+    fn a_link_holding_only_hidden_text_box_paragraphs_writes_no_url() {
+        let boxed = text_box(vec![hidden_para("one"), hidden_para("two")]);
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![plain("text"), link_of(vec![], vec![boxed])],
+        )]));
+        assert!(!h.contains("secret.test") && !h.contains("<br>"), "{h}");
+    }
+
+    #[test]
+    fn a_text_box_breaks_only_between_paragraphs_that_show() {
+        let boxed = text_box(vec![
+            hidden_para("lead"),
+            text_para("first "),
+            hidden_para("middle"),
+            text_para("last"),
+            hidden_para("tail"),
+        ]);
+        let h = html(&doc(vec![para(ParProps::default(), vec![boxed])]));
+        assert_eq!(h.matches("<br>").count(), 1, "{h}");
+        // The space before the break is kept as one, and nothing hidden shows.
+        assert!(h.contains("first&nbsp;</span><br>"), "{h}");
+        for hidden in ["lead", "middle", "tail"] {
+            assert!(!h.contains(hidden), "{hidden}: {h}");
+        }
+        // A taken-back break leaves the space before it as it was.
+        let boxed = text_box(vec![text_para("only "), hidden_para("gone")]);
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![boxed, plain("after")],
+        )]));
+        assert!(h.contains(">only </span><span"), "{h}");
+        assert!(!h.contains("<br>"), "{h}");
     }
 }
