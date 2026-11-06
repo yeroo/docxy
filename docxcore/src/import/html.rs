@@ -339,7 +339,8 @@ enum Kind {
     Block,
     /// `td` / `th`: a fresh block look (#1872 9a).
     Cell,
-    /// `ul ol dir menu dl`: the level indent stands for its box.
+    /// `ul ol dir menu dl`: its left and right box add to its contents'
+    /// indent (the user agent's `padding-left: 40px`, #1979).
     List,
     /// `table tr thead tbody tfoot`: its box is the table's (#1878).
     Table,
@@ -448,6 +449,11 @@ struct Look {
     /// cell's edge.
     ua_before: i32,
     ua_after: i32,
+    /// The margin and top padding parts of `before` / `after`, in twips,
+    /// signed (not inherited, #1979): only margins collapse.
+    margin_before: i32,
+    margin_after: i32,
+    pad_before: i32,
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
@@ -628,8 +634,9 @@ struct Cascade {
     /// The sides of its margin a declaration set, top, right, bottom, left:
     /// the others keep the user agent's (#1979).
     margin_declared: [bool; 4],
-    /// The user agent's top and bottom margin, in `em` of [`Self::ua_em`]
-    /// (#1979): `p` 1, a heading its own, else none.
+    /// The user agent's top and bottom margin, in `em` of the font
+    /// [`Self::ua_font`] gives (#1979): `p`, `blockquote`, `pre` 1, a
+    /// heading its own, else none.
     ua_vmargin: Option<f64>,
     /// A heading's user-agent font size, in `em` of its parent's: what its
     /// user-agent margins are in when no font size is declared on it.
@@ -667,6 +674,10 @@ fn align_attr(v: &str) -> Option<Align> {
     align_value(v)
 }
 
+/// The explicit zero indent of an HTML item paragraph at the margin
+/// (FIX r1 m6), which overrides its numbering level's.
+const ZERO_IND: &str = "<w:ind w:left=\"0\" w:hanging=\"0\"/>";
+
 /// A browser's outside list marker with its space, in `em` of the item's
 /// font (#1979, measured in Chrome): `"1. "` and `"• "`. A list item's
 /// hanging indent.
@@ -695,6 +706,10 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
 struct Edges {
     ua_before: i32,
     ua_after: i32,
+    /// Its top margin and padding, its bottom margin (signed twips).
+    margin_before: i32,
+    pad_before: i32,
+    margin_after: i32,
     straight: bool,
 }
 
@@ -849,6 +864,9 @@ impl Cascade {
         look.after = None;
         look.ua_before = 0;
         look.ua_after = 0;
+        look.margin_before = 0;
+        look.margin_after = 0;
+        look.pad_before = 0;
         look.own_fill = None;
         look.own_width = None;
         look.own_height = None;
@@ -1357,6 +1375,9 @@ impl Cascade {
                     look.ua_before = if self.margin_declared[0] { 0 } else { twips };
                     look.ua_after = if self.margin_declared[2] { 0 } else { twips };
                 }
+                look.margin_before = tw(self.margin[0]).unwrap_or(0);
+                look.margin_after = tw(self.margin[2]).unwrap_or(0);
+                look.pad_before = tw(self.padding[0]).unwrap_or(0);
                 // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
                 look.before = sum(self.margin[0], self.padding[0]).map(|t| t.max(0));
                 look.after = sum(self.margin[2], self.padding[2]).map(|t| t.max(0));
@@ -1687,6 +1708,9 @@ struct Html<'a> {
     /// The user-agent bottom margin quirks mode drops from the last
     /// paragraph ended, should it be its flow's last ([`Self::flow_end_props`]).
     last_bottom: Option<i32>,
+    /// The bottom margin (twips) of the last paragraph ended: what the next
+    /// one's top margin collapses with when it follows it in its flow.
+    last_margin_after: i32,
 }
 
 impl<'a> Html<'a> {
@@ -1713,6 +1737,7 @@ impl<'a> Html<'a> {
             orphan_cards: Vec::new(),
             quirks: quirks_mode(s),
             last_bottom: None,
+            last_margin_after: 0,
         }
     }
 
@@ -2797,6 +2822,9 @@ impl<'a> Html<'a> {
         Edges {
             ua_before: e.look.ua_before,
             ua_after: e.look.ua_after,
+            margin_before: e.look.margin_before,
+            pad_before: e.look.pad_before,
+            margin_after: e.look.margin_after,
             straight,
         }
     }
@@ -2904,10 +2932,11 @@ impl<'a> Html<'a> {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
             } else if let Some((numbered, level)) = block.item {
                 let done = self.open_item().is_some_and(|i| i.item_numbered);
-                if done && !block.mso_list {
+                if (done || !has_line) && !block.mso_list {
                     // Past the item's numbered paragraph, its text goes on
                     // in unnumbered paragraphs at its text indent (#1922,
-                    // #1979).
+                    // #1979); one with no line before it (an empty `p`)
+                    // leaves the number to the first that has one.
                     props.first_line = 0;
                 } else {
                     props.num_id = Some(if numbered { 2 } else { 1 });
@@ -2918,10 +2947,14 @@ impl<'a> Html<'a> {
                     if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
                         props.raw_props.push(rpr);
                     }
-                    if has_line {
-                        if let Some(item) = self.open_item() {
-                            item.item_numbered = true;
-                        }
+                    // At the margin its `w:ind` says so in so many words,
+                    // or the numbering level's 720 would stand (FIX r1 m6):
+                    // written as a loaded one, so an edit replaces it.
+                    if props.indent == 0 && !block.mso_list {
+                        props.shadow = vec![ZERO_IND.to_string()];
+                    }
+                    if let Some(item) = self.open_item() {
+                        item.item_numbered = true;
                     }
                 }
             }
@@ -2936,6 +2969,7 @@ impl<'a> Html<'a> {
         self.flow_spacing(&mut props, edges, in_table);
         self.out.end_para(props, in_table);
         self.last_bottom = self.quirk_bottom(edges);
+        self.last_margin_after = edges.margin_after;
         self.reset_para();
     }
 
@@ -2944,15 +2978,26 @@ impl<'a> Html<'a> {
     /// when nothing comes before it there, and its top collapses with the
     /// bottom of the paragraph before it, as a browser's adjacent margins
     /// do (Word and LibreOffice add the two).
+    ///
+    /// Only margins collapse (FIX r1 M1): the top is its padding plus what
+    /// of its margin the bottom margin above does not cover. A negative
+    /// margin is not collapsed, only summed with the padding.
     fn flow_spacing(&self, p: &mut ParProps, edges: Edges, in_table: bool) {
-        let mut before = p.spacing.before.unwrap_or(0);
+        let mut margin = i64::from(edges.margin_before);
         if self.quirks && edges.straight && self.out.flow_is_empty(in_table) {
-            before = (before - edges.ua_before).max(0);
+            margin -= i64::from(edges.ua_before);
         }
-        if let Some(prev) = self.out.flow_last(in_table) {
-            before = (before - prev.spacing.after.unwrap_or(0).max(0)).max(0);
-        }
-        p.spacing.before = Some(before);
+        let above = match self.out.flow_last(in_table) {
+            Some(_) => i64::from(self.last_margin_after.max(0)),
+            None => 0,
+        };
+        let pad = i64::from(edges.pad_before);
+        let before = if margin > 0 {
+            pad + (margin - above).max(0)
+        } else {
+            pad + margin
+        };
+        p.spacing.before = Some(clamp_twips(before).max(0));
     }
 
     /// The user-agent bottom margin quirks mode drops from a paragraph of
@@ -2967,6 +3012,10 @@ impl<'a> Html<'a> {
     /// mode. With none in progress, the flow's last paragraph loses that
     /// margin instead (#1979).
     fn flow_end_props(&mut self) -> ParProps {
+        // The text in progress ends as any paragraph does (FIX r1 m2: an
+        // item's number), so what a cell or the page still makes of it is
+        // only an empty cell's paragraph.
+        self.end_para_if_any();
         let in_table = self.table_depth > 0;
         let edges = self.para_edges();
         let mut props = self.par_props();
@@ -7113,6 +7162,19 @@ mod outlook_tests {
         // No collapse across a table.
         let d = standards("<p>a</p><table><tr><td>c</td></tr></table><p>b</p>");
         assert_eq!(gaps(&para_of(&d, "b")), (Some(240), Some(240)));
+        // Only margins collapse (FIX r1 M1): padding stays on its side.
+        let d = standards("<div style='padding-bottom:20px'>a</div><p>b</p>");
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(0), Some(300)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(240), Some(240)));
+        let d = standards("<p>a</p><div style='padding-top:20px'>b</div>");
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(300), Some(0)));
+        let d = standards(
+            "<div style='padding-bottom:20px'>a</div><div style='margin-top:20px'>b</div>",
+        );
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(300), Some(0)));
+        let d = standards("<p style='padding-bottom:10px'>a</p><p style='padding-top:5px'>b</p>");
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(240), Some(390)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(75), Some(240)));
     }
 
     #[test]
@@ -7206,6 +7268,16 @@ mod outlook_tests {
     fn an_empty_p_opening_an_item_does_not_take_its_number() {
         let d = doc("<ol><li><p></p><p>x</p></li></ol>");
         assert_eq!(para_of(&d, "x").props.num_id, Some(2));
+        // The empty one is no item of its own (FIX r1 m1).
+        let first = &all_paras(&d)[0];
+        assert_eq!(
+            (
+                first.props.num_id,
+                first.props.indent,
+                first.props.first_line
+            ),
+            (None, 600, 0)
+        );
         // A `<br>` is a line: the number is beside it, as in a browser.
         let d = doc("<ol><li><div><br></div><div>y</div></li></ol>");
         assert_eq!(para_of(&d, "y").props.num_id, None);
@@ -7287,5 +7359,50 @@ mod outlook_tests {
         );
         // An item with no look of its own: no mark, whatever its text's.
         assert_eq!(mark(&para_of(&d, "plain")), None);
+    }
+
+    #[test]
+    fn text_a_cell_or_the_page_ends_is_numbered_too() {
+        // FIX r1 m2: no `</li>`, the page's or a cell's end ends it.
+        let d = doc("<ol><li>a<li>b");
+        for t in ["a", "b"] {
+            let p = para_of(&d, t);
+            assert_eq!(
+                (p.props.num_id, p.props.indent, p.props.first_line),
+                (Some(2), 600, -267),
+                "{t}"
+            );
+        }
+        let d = doc("<table><tr><td><ul><li>x</td></tr></table>");
+        let x = para_of(&d, "x");
+        assert_eq!(
+            (x.props.num_id, x.props.indent, x.props.first_line),
+            (Some(1), 600, -330)
+        );
+    }
+
+    #[test]
+    fn an_item_at_the_margin_writes_its_zero_indent() {
+        // FIX r1 m6: else Word and LibreOffice take the level's 720.
+        let d = doc("<ul style='padding-left:0'><li>x</li></ul><ul><li>y</li></ul>");
+        let x = para_of(&d, "x");
+        assert_eq!((x.props.num_id, x.props.indent), (Some(1), 0));
+        let xml = crate::serialize::document_to_xml(&d);
+        assert!(
+            xml.contains(r#"<w:ind w:left="0" w:hanging="0"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<w:ind w:left="600" w:hanging="330"/>"#),
+            "{xml}"
+        );
+        // An edit of the indent replaces its left.
+        let mut x = x;
+        x.props.indent = 300;
+        let xml = crate::serialize::blocks_to_xml(&[DocBlock::Paragraph(x)]);
+        assert!(
+            xml.contains(r#"w:left="300""#) && !xml.contains(r#"w:left="0""#),
+            "{xml}"
+        );
     }
 }

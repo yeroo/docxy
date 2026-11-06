@@ -143,7 +143,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `td`/`th` starts a fresh indent, right indent, first line and shading (its
   padding is the cell's `tcMar`, below), while inherited run properties and
   line height pass in; `table` boxes are not counted. A list's box is
-  (#1979): see "HTML import Outlook mail" for its items' indent. A
+  counted (#1979): see "HTML import Outlook mail" for its items' indent. A
   `MsoList…` paragraph (never an `li`) keeps its own CSS.
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
@@ -448,8 +448,12 @@ suite's flow view drawing it (marker look, spacing, line height) is
   - `Look::ua_before`/`ua_after` keep the UA part, for the quirk below.
 - Adjacent margins collapse as a browser's do (Word and LibreOffice add
   them; the suite adds them too):
-  - A paragraph's written `before` is `max(0, before − after of the
-    paragraph before it in its flow)` (`Html::flow_spacing`).
+  - Only margins collapse, not padding (#1979 r1). A paragraph's written
+    `before` is `pad_top + max(0, margin_top − the margin_bottom of the
+    paragraph before it in its flow)` (`Html::flow_spacing`, `Look`'s
+    `margin_before`/`pad_before`/`margin_after`, `Html::last_margin_after`).
+    The paragraph above keeps its whole `after`. A negative top margin is
+    only summed with the padding.
   - The previous block is `Builder::flow_last` (`flow_is_empty`,
     `flow_last_mut`): the open cell's blocks or the body. No collapse
     across a table or into a cell's or card's first paragraph.
@@ -471,7 +475,10 @@ suite's flow view drawing it (marker look, spacing, line height) is
     its left and right box to `Look::indent`/`indent_right`, so an item's
     text is at 600 twips per list (1200 nested), `<style>` rules and
     `restyle` included.
-  - Every HTML item paragraph writes that `w:ind`, numbered or not.
+  - Every HTML item paragraph writes that `w:ind`, numbered or not. A
+    numbered one at the margin writes `ZERO_IND` (`w:left="0"
+    w:hanging="0"`, set as its load shadow, so an edit replaces it), or
+    Word and LibreOffice would take the level's 720 (#1979 r1).
   - A numbered paragraph hangs a browser's outside marker with its space:
     `DECIMAL_HANG` 1.1125em for an `ol`, `BULLET_HANG` 1.375em for a
     `ul`, measured in Chrome. The em is the `li`'s own font (`item_elem`),
@@ -484,9 +491,14 @@ suite's flow view drawing it (marker look, spacing, line height) is
   continuation at its text indent, `first_line 0`. That covers
   `<li><div>a</div><div>b</div></li>`, `<li><p>a</p><p>b</p></li>`, and
   text after a nested list or table in the item.
-  - `item_numbered` is set only by a paragraph with a line (text, a break,
-    an object or a typed marker), so `<li><p></p><p>x</p></li>` numbers x,
-    and `<div><br></div>` keeps the number as in a browser.
+  - Only a paragraph with a line (text, a break, an object or a typed
+    marker) takes the number and sets `item_numbered`. So in
+    `<li><p></p><p>x</p></li>` the empty one is an unnumbered paragraph at
+    the text indent and x is numbered, and `<div><br></div>` keeps the
+    number, as in a browser.
+  - A flow's end ends its text in progress as any paragraph
+    (`flow_end_props` calls `end_para_if_any`, #1979 r1). So `<ol><li>a<li>b`
+    at the page's end and `<td><ul><li>x</td>` are numbered too.
   - An `li` is an HTML item whatever its class. Classic Outlook's
     `<li class=MsoListParagraph style="margin-left:0in">` sits at the
     `ul`'s 600 with a hang, and the blocks in an item are never
