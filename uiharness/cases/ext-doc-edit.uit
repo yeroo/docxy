@@ -228,3 +228,29 @@ test issue 1947 read-only refuses typing and the host's calls, and a dialog over
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
+
+test issue 1947 Ctrl+X in the editable view takes the text away and pastes into a document with its bold
+  # Last: the document it pastes into stays open (and edited).
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.selection is Alpha Beta Gamma
+  call real-key {"key":"ctrl+x"}
+  call ext-doc-read {}
+  assert reply.selection is empty
+  assert reply.change_calls is 1
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is empty
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha Beta Gamma
+  assert reply.rtf_bold is Beta
+  open copy:../fixtures/basic.docx
+  key ctrl+v
+  assert text is Alpha Beta Gamma
+  call selection-set {"start":8,"end":8}
+  assert run.bold is true
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false
