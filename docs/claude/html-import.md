@@ -47,11 +47,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
   `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
   `border` is 1; `0` or none writes none, the layout-table case),
-  `tblCellMar` (`cellpadding`, also 0). A `div` with a background in a
-  cell is a one-cell table of its own: see "HTML import nested cards
-  (#1927)". Two tables back to back in a cell (nested or cards) get an
-  empty paragraph between them, or Word joins them (`end_html_table`). `raw_tcpr`/`raw_tblpr` hold them,
-  `grid_span`/`v_merge` match, so a save writes them unchanged.
+  `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
+  `grid_span`/`v_merge` match, so a save writes them unchanged. A `div`
+  with a background in a cell is a one-cell table of its own: see "HTML
+  import nested cards (#1927)". Two tables back to back in a cell (nested
+  or cards) get an empty paragraph between them, or Word joins them
+  (`end_html_table`).
 - Known limits: CSS borders, `frame`/`rules`, `border-color`, row heights,
   `<col>` widths, `max-width`, `th` bold/centre, background images; a table
   directly in a `tr`/`table` (no cell) joins the next cell (a browser puts
@@ -288,28 +289,33 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   and structure, as in a `td`: no `w:shd`, indent 0, no heading or list
   item from outside.
 - Deciding, one cascade: `open_tag` asks `look_of` with `CardMode::Maybe`
-  for a `div` whose parent look is `in_cell`, when visible, its `Elem`
-  and `blocks` entry are pushed (`MAX_DEPTH`), the builder holds the
+  for a `div` whose innermost open table part is a cell (not a `div`
+  straight in a `table`, row group or row: a browser moves it out, and the
+  builder's innermost table has no cell open; #1927 r1), when visible, its
+  `Elem` and `blocks` entry are pushed (`MAX_DEPTH`), the builder holds the
   enclosing table and one more fits (`table_depth < MAX_TABLE_NESTING`).
   `Cascade::finish` makes it a card (`Look::own_card`) when it has a
   background, is not hidden (`run.vanish`, inherited too) and its own
   `display` is `block` or unset (an inline or inline-block div is none).
   `background: none|transparent` clears an earlier background for a
-  candidate, as for table parts. The `Elem` keeps `Yes` or `Declined`
-  (`Elem::card`), which `restyle` passes back, so a restyle never flips a
-  card whose table is begun.
+  candidate, as for table parts. Its `width` (`block_width`, a percentage
+  too) resolves in `finish` with its final font, as #1922's fixed-width
+  centring does (which ignores a percentage). The `Elem` keeps `Yes(depth)`
+  (the builder's `table_depth` of its table) or `Declined` (`Elem::card`),
+  which `restyle` passes back, so a restyle never flips a card whose table
+  is begun.
 - Ending: `end_cards_from(i)` ends every card still open in `elems[i..]`,
   innermost first, its open paragraph with the stacks intact, then its row
-  and table into the enclosing cell. Called from `close_elem` and
-  `implicit_close` before they cut `blocks`/`lists`, at the top of
-  `close_tag` for a table part's name (the cards above the innermost real
-  table or cell: a browser's `</td>`, `<td>`, `</tr>`, `</table>` or a row
-  group's end closes a div left open), from `truncate_elems` as a guard,
-  and at the end of the page. A card is `Kind::Block`, not a table, so
-  `</div>` across a real table in it is still ignored and an `<li>` closes
-  an open `li` across it (div is no scope boundary). A real table left
-  open in a card at the end of the page ends with it (only tables the
-  builder holds: one past the nesting limit is text).
+  and table into the enclosing cell. Called from `close_elem` before it cuts
+  `blocks`/`lists`, from `truncate_elems` (so `implicit_close`, which cuts
+  after it), at the top of `close_tag` for a table part's name (the cards
+  above the innermost real table or cell: a browser's `</td>`, `<td>`,
+  `</tr>`, `</table>` or a row group's end closes a div left open) and at
+  the end of the page. A card is `Kind::Block`, not a table, so `</div>`
+  across a real table in it is still ignored and an `<li>` closes an open
+  `li` across it (div is no scope boundary). A real table left open in a
+  card at the end of the page ends with it (only tables the builder holds:
+  one past the nesting limit is text).
 - Empty cards: one with nothing in it (no text after the white-space rule,
   `&nbsp;` too, no object, no table; only empty paragraphs) is dropped
   (`Builder::end_card`): an e-mail's 1 px divider `div` makes nothing, as
