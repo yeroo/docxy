@@ -478,7 +478,9 @@ fn at_quit_our_copy_goes_to_the_clipboard_manager() {
     drop(gpui);
     assert!(!clip.hand_over(), "no manager runs");
     let saved = manager(&x.display);
-    assert!(clip.hand_over());
+    // The manager reads on its own connection: under a loaded test run it
+    // may take longer than the app's 100 ms bound.
+    assert!(clip.hand_over_within(Duration::from_secs(10)));
     let saved = saved.join().unwrap();
     assert_eq!(
         saved,

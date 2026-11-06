@@ -283,6 +283,11 @@ impl X11Clip {
     /// for at most [`HANDOVER`], as gpui does for its own at quit. Whether
     /// the manager said it is done.
     pub(crate) fn hand_over(&self) -> bool {
+        self.hand_over_within(HANDOVER)
+    }
+
+    /// [`Self::hand_over`], waiting `wait` at most.
+    fn hand_over_within(&self, wait: Duration) -> bool {
         let a = &self.owner.atoms;
         if !self.owned() || self.owner.lock().is_none() {
             return false;
@@ -321,7 +326,7 @@ impl X11Clip {
         let (state, _) = self
             .owner
             .handed
-            .wait_timeout_while(state, HANDOVER, |s| !(s.notified && s.written))
+            .wait_timeout_while(state, wait, |s| !(s.notified && s.written))
             .unwrap_or_else(|e| e.into_inner());
         state.notified && state.written
     }

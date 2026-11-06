@@ -36,10 +36,12 @@ mod tests {
     use super::*;
     use crate::model::{Inline, Run};
 
-    /// Each run's text with whether it is bold, italic, and the link it is
-    /// in, paragraph by paragraph.
-    fn runs(clip: &Clip) -> Vec<Vec<(String, bool, bool, Option<String>)>> {
-        fn push(out: &mut Vec<(String, bool, bool, Option<String>)>, r: &Run, link: Option<&str>) {
+    /// A run's text, whether it is bold and italic, and its link's target.
+    type Shown = (String, bool, bool, Option<String>);
+
+    /// Each run as [`Shown`], paragraph by paragraph.
+    fn runs(clip: &Clip) -> Vec<Vec<Shown>> {
+        fn push(out: &mut Vec<Shown>, r: &Run, link: Option<&str>) {
             out.push((
                 r.text.clone(),
                 r.props.bold,
