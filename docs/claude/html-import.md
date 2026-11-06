@@ -1,6 +1,6 @@
 # HTML import
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images, nested cards and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## HTML import tables (#1878)
 
@@ -47,7 +47,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
   `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
   `border` is 1; `0` or none writes none, the layout-table case),
-  `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
+  `tblCellMar` (`cellpadding`, also 0). A `div` with a background in a
+  cell is a one-cell table of its own: see "HTML import nested cards
+  (#1927)". Two tables back to back in a cell (nested or cards) get an
+  empty paragraph between them, or Word joins them (`end_html_table`). `raw_tcpr`/`raw_tblpr` hold them,
   `grid_span`/`v_merge` match, so a save writes them unchanged.
 - Known limits: CSS borders, `frame`/`rules`, `border-color`, row heights,
   `<col>` widths, `max-width`, `th` bold/centre, background images; a table
@@ -266,6 +269,61 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   non-square percentage corner is `p%w x p%h`; the long radius is lost),
   a wrapper's `overflow: hidden` rounding the image inside it, a rounded
   card background, PDF export and the editable-HTML page drawing the crop.
+
+## HTML import nested cards (#1927)
+
+- E-mail digests nest "cards": shaded, padded `td`s and `div`s two or three
+  deep. A `td`'s own fill and padding were already its `w:shd` and
+  `w:tcMar` (#1878). A `div` with its own background inside a table cell
+  is a card: a synthetic one-cell table through the builder's HTML table
+  path (`Html::begin_card`, `Builder::begin_table`/`begin_cell`), so it is
+  laid out top-down in its enclosing cell's width less that cell's
+  margins, like any nested table. Its `tcPr`: `w:shd` of its background,
+  `w:tcMar` of its padding (all four sides, a side not given 0, as in a
+  browser), `vAlign` top. Its `tblPr`: `tblW` of its CSS `width` (absolute
+  dxa, percentage pct; none is `5000 pct`), `jc` from its place (its auto
+  margins, else its container's `-webkit-` alignment: `own_place`, #1922;
+  `align=center` on the div itself centres its content, not it),
+  `tblCellMar` 0, no borders. Paragraphs in it start a fresh block look
+  and structure, as in a `td`: no `w:shd`, indent 0, no heading or list
+  item from outside.
+- Deciding, one cascade: `open_tag` asks `look_of` with `CardMode::Maybe`
+  for a `div` whose parent look is `in_cell`, when visible, its `Elem`
+  and `blocks` entry are pushed (`MAX_DEPTH`), the builder holds the
+  enclosing table and one more fits (`table_depth < MAX_TABLE_NESTING`).
+  `Cascade::finish` makes it a card (`Look::own_card`) when it has a
+  background, is not hidden (`run.vanish`, inherited too) and its own
+  `display` is `block` or unset (an inline or inline-block div is none).
+  `background: none|transparent` clears an earlier background for a
+  candidate, as for table parts. The `Elem` keeps `Yes` or `Declined`
+  (`Elem::card`), which `restyle` passes back, so a restyle never flips a
+  card whose table is begun.
+- Ending: `end_cards_from(i)` ends every card still open in `elems[i..]`,
+  innermost first, its open paragraph with the stacks intact, then its row
+  and table into the enclosing cell. Called from `close_elem` and
+  `implicit_close` before they cut `blocks`/`lists`, at the top of
+  `close_tag` for a table part's name (the cards above the innermost real
+  table or cell: a browser's `</td>`, `<td>`, `</tr>`, `</table>` or a row
+  group's end closes a div left open), from `truncate_elems` as a guard,
+  and at the end of the page. A card is `Kind::Block`, not a table, so
+  `</div>` across a real table in it is still ignored and an `<li>` closes
+  an open `li` across it (div is no scope boundary). A real table left
+  open in a card at the end of the page ends with it (only tables the
+  builder holds: one past the nesting limit is text).
+- Empty cards: one with nothing in it (no text after the white-space rule,
+  `&nbsp;` too, no object, no table; only empty paragraphs) is dropped
+  (`Builder::end_card`): an e-mail's 1 px divider `div` makes nothing, as
+  before, not an empty shaded row.
+- Not cards (as before): a `div` outside any table (paragraph shading and
+  indent), any other block (`p`, `blockquote`, headings), padding without
+  a background, hidden ones, past `MAX_TABLE_NESTING`.
+- Known limits: a card's side margins other than `auto` and its vertical
+  margins (stacked cards are one empty paragraph apart); `max-width`;
+  `border-radius` (#1926) and borders on a card; a card in a list item or
+  heading loses the item's indent and the heading level; a background
+  `div` outside tables stays paragraph shading. The suite's document view
+  does not draw `w:tcMar` (a fixed inset), so imported padding is in the
+  model but not on screen there.
 
 ## HTML import links (#1879)
 
