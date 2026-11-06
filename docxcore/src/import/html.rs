@@ -83,7 +83,7 @@ pub(crate) const MAX_HREF: usize = 4096;
 /// The URL schemes an `href` may name to become a link (#1879), lowercase:
 /// an allow-list, so `javascript:`, `data:`, `file:` and any other scheme,
 /// however spelled, stays text.
-const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
+pub(crate) const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
 
 /// The colour of a link's user-agent look (#1879): Word's Hyperlink style.
 const LINK_COLOR: &str = "0563C1";

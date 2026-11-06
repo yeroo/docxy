@@ -5,8 +5,8 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::model::Document;
-use crate::numbering::{Numbering, compute_markers, parse_numbering_xml};
+use crate::model::{Block, Document, Paragraph, RunProps};
+use crate::numbering::{NumFmt, Numbering, compute_markers, parse_numbering_xml};
 use crate::package::Package;
 use crate::styles::{StyleSheet, parse_styles_xml};
 
@@ -56,6 +56,70 @@ pub fn final_view(doc: &Document) -> Cow<'_, Document> {
     let mut copy = doc.clone();
     copy.accept_all_revisions();
     Cow::Owned(copy)
+}
+
+/// The formatting a run with direct properties `props` has in a paragraph
+/// of style `pstyle`: its styles resolved, as the PDF exporter does. The
+/// underline and strike are the user's: a tracked change's display cue is
+/// not formatting (the OOXML serializer drops it too).
+pub(crate) fn effective_run(
+    styles: &StyleSheet,
+    props: &RunProps,
+    pstyle: Option<&str>,
+) -> RunProps {
+    let direct = RunProps {
+        underline: props.user_underline(),
+        strike: props.user_strike(),
+        ..props.clone()
+    };
+    styles.effective_run(pstyle, direct.style_id.as_deref(), &direct)
+}
+
+/// A text box's paragraphs, its tables' included, in order.
+pub(crate) fn text_box_paragraphs(blocks: &[Block]) -> Vec<&Paragraph> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) => out.push(p),
+            Block::Table(t) => {
+                for row in &t.rows {
+                    for cell in &row.cells {
+                        out.extend(text_box_paragraphs(&cell.blocks));
+                    }
+                }
+            }
+            Block::Raw(_) | Block::SectionProperties(_) => {}
+        }
+    }
+    out
+}
+
+/// What a list marker says its level is, for a list the document's
+/// numbering does not define: a number's format (`1.`, `a)`, `i.`, the last
+/// number of `1.2.`), or `None` for a bullet. The first marker of a level
+/// is its first number, so a lone `i` is roman, not the ninth letter.
+pub(crate) fn marker_format(marker: &str) -> Option<NumFmt> {
+    let m = marker.trim();
+    if !crate::import::marker_is_numbered(m) {
+        return None;
+    }
+    let body = m.trim_end_matches(['.', ')']).trim_start_matches('(');
+    // The last number of a compound marker (`1.2.`) is this level's.
+    let own = body.rsplit('.').next().unwrap_or(body);
+    let all_in = |set: &str| !own.is_empty() && own.chars().all(|c| set.contains(c));
+    Some(if own.chars().all(|c| c.is_ascii_digit()) {
+        NumFmt::Decimal
+    } else if all_in("ivxlcdm") {
+        NumFmt::LowerRoman
+    } else if all_in("IVXLCDM") {
+        NumFmt::UpperRoman
+    } else if own.chars().all(|c| c.is_lowercase()) {
+        NumFmt::LowerLetter
+    } else if own.chars().all(|c| c.is_uppercase()) {
+        NumFmt::UpperLetter
+    } else {
+        NumFmt::Decimal
+    })
 }
 
 #[cfg(test)]

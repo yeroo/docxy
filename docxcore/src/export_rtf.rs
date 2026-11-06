@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::export_context::{ExportContext, final_view};
+use crate::export_context::{
+    ExportContext, effective_run, final_view, marker_format, text_box_paragraphs,
+};
 use crate::highlight::highlight_rgb;
 use crate::model::{
     Align, Block, BreakKind, Cell, Document, Inline, Paragraph, RevisionKind, RunProps, Table,
@@ -78,20 +80,27 @@ enum LevelKind {
 
 impl LevelKind {
     fn from_def(def: &LevelDef) -> LevelKind {
-        let nfc = match def.format {
-            NumFmt::Bullet => return LevelKind::Bullet,
-            NumFmt::Decimal => 0,
-            NumFmt::UpperRoman => 1,
-            NumFmt::LowerRoman => 2,
-            NumFmt::UpperLetter => 3,
-            NumFmt::LowerLetter => 4,
-        };
-        LevelKind::Number {
-            nfc,
-            start: def.start,
-            text: def.text.clone(),
+        match level_nfc(def.format) {
+            None => LevelKind::Bullet,
+            Some(nfc) => LevelKind::Number {
+                nfc,
+                start: def.start,
+                text: def.text.clone(),
+            },
         }
     }
+}
+
+/// A number format's `\levelnfcN`; `None` for a bullet.
+fn level_nfc(format: NumFmt) -> Option<u8> {
+    Some(match format {
+        NumFmt::Bullet => return None,
+        NumFmt::Decimal => 0,
+        NumFmt::UpperRoman => 1,
+        NumFmt::LowerRoman => 2,
+        NumFmt::UpperLetter => 3,
+        NumFmt::LowerLetter => 4,
+    })
 }
 
 struct Writer<'a> {
@@ -408,13 +417,7 @@ impl Writer<'_> {
     /// The underline and strike are the user's: a tracked change's display
     /// cue is not formatting (the OOXML serializer drops it too).
     fn effective(&self, props: &RunProps, pstyle: Option<&str>) -> RunProps {
-        let direct = RunProps {
-            underline: props.user_underline(),
-            strike: props.user_strike(),
-            ..props.clone()
-        };
-        self.styles
-            .effective_run(pstyle, direct.style_id.as_deref(), &direct)
+        effective_run(self.styles, props, pstyle)
     }
 
     fn run(&mut self, text: &str, props: &RunProps, pstyle: Option<&str>) {
@@ -602,52 +605,15 @@ fn level_text(text: &str) -> (String, String) {
 /// format, or a bullet. The first marker of a level is its first number, so
 /// a lone `i` is roman, not the ninth letter.
 fn level_kind(marker: &str, ilvl: usize) -> LevelKind {
-    let m = marker.trim();
-    if !crate::import::marker_is_numbered(m) {
+    let Some(nfc) = marker_format(marker).and_then(level_nfc) else {
         return LevelKind::Bullet;
-    }
-    let suffix = m.chars().last().unwrap_or('.');
-    let body = m.trim_end_matches(['.', ')']).trim_start_matches('(');
-    // The last number of a compound marker (`1.2.`) is this level's.
-    let own = body.rsplit('.').next().unwrap_or(body);
-    let all_in = |set: &str| !own.is_empty() && own.chars().all(|c| set.contains(c));
-    let nfc = if own.chars().all(|c| c.is_ascii_digit()) {
-        0
-    } else if all_in("ivxlcdm") {
-        2
-    } else if all_in("IVXLCDM") {
-        1
-    } else if own.chars().all(|c| c.is_lowercase()) {
-        4
-    } else if own.chars().all(|c| c.is_uppercase()) {
-        3
-    } else {
-        0
     };
+    let suffix = marker.trim().chars().last().unwrap_or('.');
     LevelKind::Number {
         nfc,
         start: 1,
         text: format!("%{}{suffix}", ilvl + 1),
     }
-}
-
-/// A text box's paragraphs, its tables' included, in order.
-fn text_box_paragraphs(blocks: &[Block]) -> Vec<&Paragraph> {
-    let mut out = Vec::new();
-    for b in blocks {
-        match b {
-            Block::Paragraph(p) => out.push(p),
-            Block::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        out.extend(text_box_paragraphs(&cell.blocks));
-                    }
-                }
-            }
-            Block::Raw(_) | Block::SectionProperties(_) => {}
-        }
-    }
-    out
 }
 
 /// `s` as RTF text: `\`, `{` and `}` escaped, tab and line feed as control

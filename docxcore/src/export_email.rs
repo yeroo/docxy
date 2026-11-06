@@ -30,8 +30,11 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::export_context::{ExportContext, final_view};
+use crate::export_context::{
+    ExportContext, effective_run, final_view, marker_format, text_box_paragraphs,
+};
 use crate::highlight::highlight_rgb;
+use crate::load::raw_run_props;
 use crate::model::{
     Align, Block, Cell, Document, Hyperlink, Inline, Paragraph, RevisionKind, RunProps, Table,
     VMerge, VertAlign,
@@ -43,10 +46,6 @@ use crate::table::GridMap;
 
 /// The part pictures' relationships belong to.
 const DOCUMENT_PART: &str = "word/document.xml";
-
-/// The URL schemes a link may have to be written as one, lowercase (as the
-/// HTML import's allow-list, #1879).
-const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
 
 /// A message body: the HTML, and the pictures its `cid:` URLs name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -118,6 +117,8 @@ struct OpenList {
     kind: ListKind,
     /// Its `<li>` is open (a deeper list goes inside it).
     item_open: bool,
+    /// The number a browser shows on its next `<li>`.
+    next: i32,
 }
 
 /// Where the text of the paragraph being written stands, so runs of spaces
@@ -186,9 +187,12 @@ impl Writer<'_> {
         if let Some(num_id) = listed {
             let ilvl = p.props.ilvl.clamp(0, 8) as usize;
             let kind = self.list_kind(num_id, ilvl, path);
-            self.open_item(num_id, ilvl, kind, ordinal);
+            let value = match self.open_item(num_id, ilvl, kind, ordinal) {
+                Some(n) => format!(" value=\"{n}\""),
+                None => String::new(),
+            };
             let style = self.paragraph_css(p, true);
-            let _ = write!(self.out, "<li{dir} style=\"{}\">", attr(&style));
+            let _ = write!(self.out, "<li{dir}{value} style=\"{}\">", attr(&style));
             self.content(p);
             // Closed by the next item, or when the list ends.
             return;
@@ -288,16 +292,23 @@ impl Writer<'_> {
             return ListKind::from_fmt(def.format);
         }
         match self.markers.get(path) {
-            Some(m) if crate::import::marker_is_numbered(m.trim()) => {
-                ListKind::Ordered(marker_type(m))
-            }
-            _ => ListKind::Bullet,
+            Some(m) => marker_format(m).map_or(ListKind::Bullet, ListKind::from_fmt),
+            None => ListKind::Bullet,
         }
     }
 
     /// Open the `<li>` of a list item at `ilvl`: close deeper lists, close
-    /// or reopen the list at its level, and open the lists down to it.
-    fn open_item(&mut self, num_id: i32, ilvl: usize, kind: ListKind, ordinal: Option<i32>) {
+    /// or reopen the list at its level, and open the lists down to it. The
+    /// item's `value` when its number (`ordinal`) is not the one its `<ol>`
+    /// shows next: a list opened between levels, then reused, has no
+    /// `start` of its own.
+    fn open_item(
+        &mut self,
+        num_id: i32,
+        ilvl: usize,
+        kind: ListKind,
+        ordinal: Option<i32>,
+    ) -> Option<i32> {
         self.close_lists(ilvl + 1);
         if let Some(top) = self.lists.get(ilvl) {
             if top.num_id != num_id || top.kind != kind {
@@ -317,9 +328,15 @@ impl Writer<'_> {
                 num_id,
                 kind,
                 item_open: false,
+                next: start.unwrap_or(1),
             });
         }
-        self.lists[ilvl].item_open = true;
+        let list = &mut self.lists[ilvl];
+        list.item_open = true;
+        let shown = ordinal.unwrap_or(list.next);
+        let value = (matches!(kind, ListKind::Ordered(_)) && shown != list.next).then_some(shown);
+        list.next = shown.saturating_add(1);
+        value
     }
 
     fn open_list(&mut self, kind: ListKind, start: Option<i32>) {
@@ -423,18 +440,21 @@ impl Writer<'_> {
                         self.shown_solid();
                     }
                 }
-                Inline::SmartArt { text, .. } => {
-                    self.run(&text.join("\n"), &RunProps::default(), pstyle)
+                // An object's text in its run's own formatting, which can
+                // hide it (an OMML equation is no run: never hidden).
+                Inline::SmartArt { raw, text } => {
+                    self.run(&text.join("\n"), &raw_run_props(raw), pstyle)
                 }
-                Inline::Chart { chart, .. } => self.run(
+                Inline::Chart { raw, chart } => self.run(
                     chart.title.as_deref().unwrap_or(""),
-                    &RunProps::default(),
+                    &raw_run_props(raw),
                     pstyle,
                 ),
-                Inline::Equation { text, .. } => self.run(text, &RunProps::default(), pstyle),
+                Inline::Equation { raw, text, .. } => self.run(text, &raw_run_props(raw), pstyle),
                 Inline::Field { raw, text } => {
                     self.run(text, &crate::load::field_result_props(raw), pstyle)
                 }
+                Inline::TextBox { raw, .. } if self.hidden(&raw_run_props(raw), pstyle) => {}
                 Inline::TextBox { blocks, .. } => {
                     let mut first = true;
                     for p in text_box_paragraphs(blocks) {
@@ -454,13 +474,17 @@ impl Writer<'_> {
                     ..
                 } => {}
                 Inline::UnsupportedRevision { .. } => {}
+                Inline::FootnoteRef { raw, .. } if self.hidden(&raw_run_props(raw), pstyle) => {}
                 Inline::FootnoteRef { id, .. } => {
                     let _ = write!(self.out, "<sup>{id}</sup>");
                     self.shown_solid();
                 }
                 Inline::Raw(raw) => {
+                    // A hidden picture is neither shown nor attached.
                     if let Some(rid) = crate::image::inline_embed(raw) {
-                        self.picture(raw, &rid);
+                        if !self.hidden(&raw_run_props(raw), pstyle) {
+                            self.picture(raw, &rid);
+                        }
                     }
                 }
             }
@@ -488,17 +512,10 @@ impl Writer<'_> {
             .effective_vanish(pstyle, props.style_id.as_deref(), props)
     }
 
-    /// The run's effective look, its styles resolved; the underline and
-    /// strike are the user's, not a tracked change's display cue (as the
-    /// Rich Text writer).
+    /// The run's effective look, its styles resolved as the Rich Text
+    /// writer resolves them.
     fn effective(&self, props: &RunProps, pstyle: Option<&str>) -> RunProps {
-        let direct = RunProps {
-            underline: props.user_underline(),
-            strike: props.user_strike(),
-            ..props.clone()
-        };
-        self.styles
-            .effective_run(pstyle, direct.style_id.as_deref(), &direct)
+        effective_run(self.styles, props, pstyle)
     }
 
     fn run(&mut self, text: &str, props: &RunProps, pstyle: Option<&str>) {
@@ -697,30 +714,6 @@ impl ListKind {
     }
 }
 
-/// The `<ol type>` a numbered marker (`1.`, `a)`, `iv.`) shows, for a list
-/// the numbering does not define.
-fn marker_type(marker: &str) -> &'static str {
-    let body = marker
-        .trim()
-        .trim_end_matches(['.', ')'])
-        .trim_start_matches('(');
-    let own = body.rsplit('.').next().unwrap_or(body);
-    let all_in = |set: &str| !own.is_empty() && own.chars().all(|c| set.contains(c));
-    if own.chars().all(|c| c.is_ascii_digit()) {
-        "1"
-    } else if all_in("ivxlcdm") {
-        "i"
-    } else if all_in("IVXLCDM") {
-        "I"
-    } else if own.chars().all(|c| c.is_lowercase()) {
-        "a"
-    } else if own.chars().all(|c| c.is_uppercase()) {
-        "A"
-    } else {
-        "1"
-    }
-}
-
 /// How many rows below `row` continue the vertical merge that starts at
 /// grid column `col`.
 fn continued_rows(t: &Table, map: &GridMap, row: usize, col: usize) -> usize {
@@ -744,7 +737,7 @@ fn link_href(h: &Hyperlink) -> Option<String> {
     if let Some(t) = h.target.as_deref().map(str::trim) {
         if let Some((scheme, _)) = t.split_once(':') {
             let scheme = scheme.to_ascii_lowercase();
-            if LINK_SCHEMES.contains(&scheme.as_str()) {
+            if crate::import::html::LINK_SCHEMES.contains(&scheme.as_str()) {
                 return Some(t.to_string());
             }
         }
@@ -815,25 +808,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
-}
-
-/// A text box's paragraphs, its tables' included, in order.
-fn text_box_paragraphs(blocks: &[Block]) -> Vec<&Paragraph> {
-    let mut out = Vec::new();
-    for b in blocks {
-        match b {
-            Block::Paragraph(p) => out.push(p),
-            Block::Table(t) => {
-                for row in &t.rows {
-                    for cell in &row.cells {
-                        out.extend(text_box_paragraphs(&cell.blocks));
-                    }
-                }
-            }
-            Block::Raw(_) | Block::SectionProperties(_) => {}
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1441,9 +1415,26 @@ mod tests {
                     .map(|s| s[..s.find('"').unwrap()].to_string())
             })
             .collect();
-        // a, a1 | (level 0), a2 at 2, b at 2 | (level 0), b1 at 1 again.
+        // a, a1 | (level 0 between), a2 at 2 | (level 0 between), b1 at 1.
         let s = |v: &str| Some(v.to_string());
         assert_eq!(starts, [None, None, None, s("2"), None, None], "{h}");
+        // b reuses the level-0 list opened between levels for a2, which
+        // shows 1 next: b says its own number, 2, as Word shows it.
+        assert!(h.contains("<li value=\"2\" style="), "{h}");
+        assert!(
+            h.split("value=\"2\"").nth(1).unwrap().contains(">b<"),
+            "{h}"
+        );
+        assert_eq!(h.matches(" value=").count(), 1, "{h}");
+    }
+
+    /// A list opened between levels shows 1 next: an item numbered 1 there
+    /// needs no `value`.
+    #[test]
+    fn an_item_in_a_list_opened_between_levels_numbered_one_has_no_value() {
+        let h = html(&doc(vec![item(2, 1, "deep"), item(2, 0, "top")]));
+        assert_eq!(ol_tags(&h).len(), 2, "{h}");
+        assert!(!h.contains(" value=") && !h.contains("start="), "{h}");
     }
 
     /// Markers are looked up on the final view: accepting a deleted
@@ -1906,9 +1897,115 @@ mod tests {
                     endnote: false,
                     raw: String::new(),
                 },
+                Inline::Field {
+                    raw: "<w:fldSimple w:instr=\"PAGE\"><w:r><w:t>Page 3</w:t></w:r></w:fldSimple>"
+                        .into(),
+                    text: "Page 3".into(),
+                },
+                Inline::Equation {
+                    raw: "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>".into(),
+                    text: "x\u{b2}".into(),
+                    latex: None,
+                },
+                Inline::SmartArt {
+                    raw: String::new(),
+                    text: vec!["node".into()],
+                },
             ],
         )]));
         assert!(h.contains("line</span><br><span"), "{h}");
         assert!(h.contains("next</span><sup>3</sup>"), "{h}");
+        for text in ["Page 3", "x\u{b2}", "node"] {
+            assert!(h.contains(&format!(">{text}</span>")), "{text}: {h}");
+        }
+    }
+
+    /// `raw`, a `<w:r>`, with `rpr` as its run properties.
+    fn with_rpr(raw: &str, rpr: &str) -> String {
+        let raw = raw.strip_prefix("<w:r>").expect("a run");
+        format!("<w:r><w:rPr>{rpr}</w:rPr>{raw}")
+    }
+
+    fn hidden_picture(rid: &str, rpr: &str) -> Inline {
+        let Inline::Raw(raw) = picture(rid, 4, 4, "alt words") else {
+            unreachable!()
+        };
+        Inline::Raw(with_rpr(&raw, rpr))
+    }
+
+    #[test]
+    fn a_hidden_picture_is_not_written_or_attached() {
+        let pkg = with_picture(&png(4, 4), |rid| {
+            vec![para(
+                ParProps::default(),
+                vec![plain("text "), hidden_picture(rid, "<w:vanish/>")],
+            )]
+        });
+        let e = to_email_html(&pkg.document, Some(&pkg));
+        assert!(
+            !e.html.contains("<img") && !e.html.contains("alt words"),
+            "{}",
+            e.html
+        );
+        assert!(e.media.is_empty());
+        // Switched off, it shows.
+        let pkg = with_picture(&png(4, 4), |rid| {
+            vec![para(
+                ParProps::default(),
+                vec![hidden_picture(rid, "<w:vanish w:val=\"0\"/>")],
+            )]
+        });
+        let e = to_email_html(&pkg.document, Some(&pkg));
+        assert_eq!((e.html.matches("<img").count(), e.media.len()), (1, 1));
+    }
+
+    #[test]
+    fn a_style_hidden_picture_is_not_written() {
+        let mut pkg = with_picture(&png(4, 4), |rid| {
+            vec![para(
+                ParProps::default(),
+                vec![
+                    plain("text "),
+                    hidden_picture(rid, "<w:rStyle w:val=\"Secret\"/>"),
+                ],
+            )]
+        });
+        let styles = pkg.part_text("word/styles.xml").expect("styles");
+        let styles = styles.replace(
+            "</w:styles>",
+            "<w:style w:type=\"character\" w:styleId=\"Secret\"><w:name w:val=\"Secret\"/>\
+             <w:rPr><w:vanish/></w:rPr></w:style></w:styles>",
+        );
+        assert!(pkg.set_part_text("word/styles.xml", &styles));
+        let e = to_email_html(&pkg.document, Some(&pkg));
+        assert!(!e.html.contains("<img"), "{}", e.html);
+        assert!(e.media.is_empty());
+    }
+
+    #[test]
+    fn hidden_footnote_ref_and_text_box_are_not_written() {
+        let hidden = |inner: &str| format!("<w:r><w:rPr><w:vanish/></w:rPr>{inner}</w:r>");
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![
+                plain("shown"),
+                Inline::FootnoteRef {
+                    id: 7,
+                    endnote: false,
+                    raw: hidden("<w:footnoteReference w:id=\"7\"/>"),
+                },
+                Inline::TextBox {
+                    raw: hidden("<w:drawing/>"),
+                    blocks: vec![text_para("boxed")],
+                },
+                Inline::SmartArt {
+                    raw: hidden("<w:drawing/>"),
+                    text: vec!["diagram".into()],
+                },
+            ],
+        )]));
+        assert!(h.contains("shown"), "{h}");
+        assert!(!h.contains("<sup>"), "{h}");
+        assert!(!h.contains("boxed") && !h.contains("diagram"), "{h}");
     }
 }

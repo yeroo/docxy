@@ -1619,6 +1619,33 @@ pub(crate) fn holds_field_code_only(raw: &str) -> bool {
     }
 }
 
+/// The direct formatting of a run kept as raw XML (a picture's, a text
+/// box's or a note reference's `w:r`): its own `w:rPr`, parsed as a loaded
+/// run's. Default when `raw` is not a run or has none (#1948: such a run's
+/// `w:vanish` hides it).
+pub(crate) fn raw_run_props(raw: &str) -> RunProps {
+    let mut props = RunProps::default();
+    let t = raw.trim_start();
+    if !(t.starts_with("<w:r>") || t.starts_with("<w:r ")) {
+        return props;
+    }
+    let mut p = XmlParser::new(t);
+    if !matches!(p.next(), Event::Start) || p.name() != "w:r" {
+        return props;
+    }
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "w:rPr" => {
+                parse_rpr(&mut p, &mut props);
+                return props;
+            }
+            Event::Start => p.skip_element(),
+            Event::Text => {}
+            Event::End | Event::Eof => return props,
+        }
+    }
+}
+
 /// The run formatting a field's result is shown with: the direct `w:rPr` of the
 /// first run of the outermost field's result (after its `separate`), of a
 /// `w:fldSimple`'s first run, or of a `w:sym` run. Default when there is none.
