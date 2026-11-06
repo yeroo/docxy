@@ -423,6 +423,9 @@ struct Look {
     own_width: Option<Width>,
     /// An image's own `height` (not inherited; only `img` reads one).
     own_height: Option<Width>,
+    /// An image's own `border-radius` (not inherited, #1926): the crop
+    /// shape of its picture. Only `img` reads one.
+    own_radius: Option<html_image::Radius>,
     /// A table's or block image's own place in its line (not inherited,
     /// #1922): `Center`, `Right`, else `None` (the left), by its auto
     /// margins, else its parent's [`Look::block_align`].
@@ -556,6 +559,10 @@ struct Cascade {
     parent_block_align: Option<Align>,
     /// A block's own absolute CSS `width` (#1922).
     block_width: Option<Len>,
+    /// An image's corner radii, top left, top right, bottom right, bottom
+    /// left (#1926): kept until its font size is known, then one
+    /// [`Look::own_radius`].
+    radius: [Option<Len>; 4],
 }
 
 /// A twips sum kept in Word's range.
@@ -746,6 +753,7 @@ impl Cascade {
         look.own_fill = None;
         look.own_width = None;
         look.own_height = None;
+        look.own_radius = None;
         look.own_padding = [None; 4];
         look.own_place = None;
         look.own_block = false;
@@ -776,6 +784,7 @@ impl Cascade {
             margin_auto: [false; 4],
             parent_block_align,
             block_width: None,
+            radius: [None; 4],
         }
     }
 
@@ -1063,6 +1072,29 @@ impl Cascade {
                     }
                 }
             }
+            "border-radius" if self.is_img => {
+                // A picture's crop (#1926); other elements' rounded boxes
+                // are not drawn, and the value is never text.
+                if let Some(corners) = css::radius_corners(v) {
+                    self.radius = corners.map(Some);
+                }
+            }
+            "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-left-radius"
+                if self.is_img =>
+            {
+                let corner = match d.name.as_str() {
+                    "border-top-left-radius" => 0,
+                    "border-top-right-radius" => 1,
+                    "border-bottom-right-radius" => 2,
+                    _ => 3,
+                };
+                if let Some(len) = css::radius_corner(v) {
+                    self.radius[corner] = Some(len);
+                }
+            }
             "text-indent" => {
                 if let Some(l) = css::length(v).filter(|l| l.unit != css::Unit::Percent) {
                     self.text_indent = Some(l);
@@ -1183,9 +1215,41 @@ impl Cascade {
                 if self.is_img && look.own_block {
                     look.own_place = block_position(self.margin_auto, self.parent_block_align);
                 }
+                if self.is_img {
+                    look.own_radius = image_radius(self.radius, pt);
+                }
             }
         }
         self.look
+    }
+}
+
+/// An image's one radius from its four corners (#1926), each resolved
+/// against its font: `None` with none set or all of them zero, `NonUniform`
+/// when they differ (a corner left unset is a square one). A zero length
+/// and a zero percentage are the same square corner.
+fn image_radius(corners: [Option<Len>; 4], font_pt: f64) -> Option<html_image::Radius> {
+    use html_image::Radius;
+    if corners.iter().all(Option::is_none) {
+        return None;
+    }
+    let resolve = |c: Option<Len>| match c {
+        Some(l) if l.unit == css::Unit::Percent && l.v > 0.0 => Radius::Pct(l.v),
+        Some(l) => {
+            let t = l.points(font_pt).map_or(0.0, |p| (p * 20.0).round());
+            // `t` is finite and non-negative (the parser refuses negative
+            // radii), so the cast saturates at most.
+            Radius::Twips(t.max(0.0) as u64)
+        }
+        None => Radius::Twips(0),
+    };
+    let first = resolve(corners[0]);
+    if corners[1..].iter().any(|&c| resolve(c) != first) {
+        return Some(Radius::NonUniform);
+    }
+    match first {
+        Radius::Twips(0) => None,
+        r => Some(r),
     }
 }
 
@@ -2040,7 +2104,8 @@ impl<'a> Html<'a> {
         let block = look
             .own_block
             .then(|| look.own_place.unwrap_or(Align::Left));
-        let Some(box_twips) = html_image::picture_twips(width, height, pixels) else {
+        let declared = html_image::declared_box(width, height, pixels);
+        let Some(box_twips) = declared.map(html_image::fit_to_body) else {
             if !alt.is_empty() {
                 self.begin_block_object(block);
                 // Alt text in a link is the link's text, as a browser
@@ -2060,8 +2125,13 @@ impl<'a> Html<'a> {
         let id = images.next_id();
         let (cx, cy) = html_image::twips_emu(box_twips);
         let name = html_image::picture_name(src, id);
+        // Its crop by its `border-radius` (#1926), measured in the box the
+        // page declares (the fit to the body is uniform).
+        let shape = declared.map_or(crate::image::PictureShape::Rect, |b| {
+            html_image::shape(look.own_radius, b)
+        });
         let raw =
-            crate::image::inline_picture_run_described(&rid, cx, cy, id, &name, &alt, outline);
+            crate::image::inline_picture_run_shaped(&rid, cx, cy, id, &name, &alt, outline, shape);
         self.begin_block_object(block);
         self.pay_space();
         let heap = raw.len();
@@ -4277,6 +4347,143 @@ mod image_tests {
         );
     }
 
+    fn shapes(d: &Document) -> Vec<crate::image::PictureShape> {
+        all_pictures(d)
+            .iter()
+            .map(|r| crate::image::inline_shape(r))
+            .collect()
+    }
+
+    #[test]
+    fn border_radius_crops_a_picture_through_the_cascade() {
+        use crate::image::PictureShape::{Ellipse, Rect, RoundRect};
+        let (d, _, _) = with_images(
+            "<style>img.avatar { border-radius: 50% } img.later { border-radius: 4px }</style>\
+             <p><img src=a.png width=32 height=32 style='border-radius:50%'>\
+             <img class=avatar src=a.png width=32 height=32>\
+             <img src=a.png width=32 height=32 style='border-radius:16px'>\
+             <img src=a.png width=120 height=40 style='border-radius:8px'>\
+             <img src=a.png width=120 height=40 style='border-radius:10%'>\
+             <img src=a.png width=120 height=40>\
+             <img class=later src=a.png width=120 height=40 style='border-radius:8px'>\
+             <img src=a.png width=32 height=32 style='border-radius:50%;border-radius:-2px'>\
+             <img src=a.png width=32 height=32 style='border-radius:50%;border-radius:red'>\
+             <img src=a.png width=32 height=32 style='border-radius:0'></p>",
+        );
+        assert_eq!(
+            shapes(&d),
+            [
+                Ellipse,
+                Ellipse,
+                Ellipse,
+                RoundRect { adj: 20_000 },
+                RoundRect { adj: 10_000 },
+                Rect,
+                // The inline style beats the rule.
+                RoundRect { adj: 20_000 },
+                // An invalid value leaves the one before it.
+                Ellipse,
+                Ellipse,
+                Rect,
+            ]
+        );
+        // No radius: exactly the run a picture had before #1926.
+        let plain = all_pictures(&d)[5];
+        let (id, rid) = (6, inline_embed(plain).unwrap());
+        assert_eq!(
+            plain,
+            crate::image::inline_picture_run_described(
+                &rid,
+                120 * PX,
+                40 * PX,
+                id,
+                "a.png",
+                "",
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn border_radius_longhands_count_when_all_four_agree() {
+        use crate::image::PictureShape::{Ellipse, Rect, RoundRect};
+        let all = "border-top-left-radius:8px;border-top-right-radius:8px;\
+                   border-bottom-right-radius:8px;border-bottom-left-radius:8px 2px";
+        let (d, _, _) = with_images(&format!(
+            "<p><img src=a.png width=120 height=40 style='{all}'>\
+             <img src=a.png width=120 height=40 style='border-top-left-radius:8px'>\
+             <img src=a.png width=32 height=32 style='border-radius:50%;border-top-left-radius:0'>\
+             <img src=a.png width=32 height=32 style='border-radius:8px 8px 0 0'>\
+             <img src=a.png width=32 height=32 style='border-radius:6pt 8px'>\
+             <img src=a.png width=32 height=32 style='border-radius:50% / 10%'>\
+             <img src=a.png width=32 height=32 style='border-radius:0 0%'></p>"
+        ));
+        assert_eq!(
+            shapes(&d),
+            [
+                RoundRect { adj: 20_000 },
+                // One corner rounded alone: Word has no such crop here.
+                Rect,
+                Rect,
+                Rect,
+                // 6pt is 8px: the same corner.
+                RoundRect { adj: 25_000 },
+                // The vertical radii are dropped.
+                Ellipse,
+                Rect,
+            ]
+        );
+    }
+
+    #[test]
+    fn border_radius_is_the_images_own_and_em_takes_its_final_font() {
+        use crate::image::PictureShape::{Rect, RoundRect};
+        let (d, _, _) = with_images(
+            "<div style='border-radius:50%;background:#eee;padding:8px'>\
+             <p style='border-radius:50%'><img src=a.png width=32 height=32></p>\
+             <span style='border-radius:8px'><img src=a.png width=32 height=32></span>\
+             <img src=a.png width=32 height=32 style='border-radius:1em;font-size:8px'>\
+             <img src=a.png width=32 height=32 style='font-size:4px;border-radius:2em'>\
+             </div>",
+        );
+        // `1em` declared before `font-size:8px` is 8px (the default 16px
+        // font would make it a circle).
+        assert_eq!(
+            shapes(&d),
+            [
+                Rect,
+                Rect,
+                RoundRect { adj: 25_000 },
+                RoundRect { adj: 25_000 }
+            ]
+        );
+        // Never text.
+        for t in paragraph_texts(&d) {
+            assert!(!t.contains('%') && !t.contains("px"), "{t}");
+        }
+    }
+
+    #[test]
+    fn border_radius_crops_a_placeholder_and_a_picture_fitted_to_the_body() {
+        use crate::image::PictureShape::{Ellipse, RoundRect};
+        let (d, _, _) = with_images(
+            "<p><img src=missing.png width=32 height=32 alt=Ann style='border-radius:50%'>\
+             <img src=a.png width=1248 height=416 style='border-radius:8px'>\
+             <img src=a.png style='border-radius:4px'></p>",
+        );
+        assert_eq!(
+            shapes(&d),
+            // 8 of 416 px, though drawn at 624 x 208; 4 of the pixels' 20.
+            [Ellipse, RoundRect { adj: 1923 }, RoundRect { adj: 20_000 }]
+        );
+        let placeholder = all_pictures(&d)[0];
+        assert!(
+            placeholder
+                .contains(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom><a:ln w="9525">"#)
+        );
+        assert!(placeholder.contains(r#"descr="Ann""#));
+    }
+
     #[test]
     fn a_wide_picture_is_scaled_to_the_body() {
         let (d, _, _) = with_images("<p><img src=a.png width=1248 height=100></p>");
@@ -4304,7 +4511,7 @@ mod image_tests {
     }
 
     /// FIX r2b: an uncapped side over an extreme aspect overflowed u64 in
-    /// `picture_twips`.
+    /// `picture_twips` (now `declared_box` and `fit_to_body`).
     #[test]
     fn an_extreme_aspect_never_overflows() {
         let page = format!(
