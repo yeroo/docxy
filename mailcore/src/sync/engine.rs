@@ -330,6 +330,22 @@ pub enum SyncEvent {
     SignInRequired,
     /// Sign-in began; the UI opens `authorize_url` in the system browser.
     SignInStarted { authorize_url: String },
+    /// The scopes the signed-in token was granted (#1875), as the token
+    /// response spelled them, and the scopes of `AuthConfig::scope` it lacks
+    /// ([`crate::auth::missing_scopes`]: case-insensitive, without the
+    /// `https://graph.microsoft.com/` prefix, never `offline_access`,
+    /// `openid`, `profile`, `email` or a `.default` scope). Sent after the
+    /// token is loaded at startup, refreshed or redeemed at sign-in, only
+    /// when the grant is known and is not the one last sent (compared as a
+    /// set, case and prefix aside): an hourly refresh with the same grant
+    /// sends none. A sign-in-required (a sign-out, a failed refresh) forgets
+    /// the last one, so the next session sends it again. A token whose
+    /// grant is unknown (a cache from before #1875 and a refresh that names
+    /// no scopes) sends nothing.
+    Scopes {
+        granted: Vec<String>,
+        missing: Vec<String>,
+    },
 }
 
 /// The two channel endpoints the UI keeps: commands down, events up. Dropping
@@ -558,6 +574,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         hold_full: false,
         op_retry: None,
         op_backoff: BACKOFF_MIN,
+        announced_scopes: None,
     };
     engine.startup();
     engine.main_loop(cmd_rx);
@@ -612,6 +629,10 @@ struct Engine {
     /// The outbox's own back-off after a 5xx, doubled per consecutive 5xx
     /// (`BACKOFF_MIN`..`BACKOFF_MAX`), reset when an op goes through.
     op_backoff: Duration,
+    /// The grant the last [`SyncEvent::Scopes`] announced, as a sorted,
+    /// de-duplicated set of normalised scopes; `None` after
+    /// `enter_signin`, so a new session announces again.
+    announced_scopes: Option<Vec<String>>,
 }
 
 impl Engine {
@@ -625,6 +646,9 @@ impl Engine {
             Ok(Some(t)) => {
                 self.token = Some(t);
                 self.refresh_if_near_expiry();
+                // A refresh just now has announced already; then this is
+                // the same grant and sends nothing.
+                self.announce_scopes();
             }
             // No cache yet, or a cache that failed to decrypt/parse: either way
             // the user has to (re-)sign in.
@@ -2195,15 +2219,25 @@ impl Engine {
 
     /// Exchanges the refresh token for a fresh token set and persists it.
     /// Returns false on any failure (no token to refresh, or the endpoint
-    /// rejected it). Token values are never logged.
+    /// rejected it). Token values are never logged. A response that names
+    /// no scopes (omitted, or empty) keeps the previous token's grant: RFC
+    /// 6749 §5.1 says an omitted `scope` is the one requested (#1875).
     fn try_refresh(&mut self) -> bool {
-        let Some(refresh_token) = self.token.as_ref().map(|t| t.refresh_token.clone()) else {
+        let Some((refresh_token, previous_scopes)) = self
+            .token
+            .as_ref()
+            .map(|t| (t.refresh_token.clone(), t.scopes.clone()))
+        else {
             return false;
         };
         match auth::refresh(&self.config.cfg, &self.config.auth_base, &refresh_token) {
-            Ok(t) => {
+            Ok(mut t) => {
+                if t.scopes.is_none() {
+                    t.scopes = previous_scopes;
+                }
                 let _ = tokencache::save(&self.config.token_path, &t);
                 self.token = Some(t);
+                self.announce_scopes();
                 true
             }
             Err(_) => false,
@@ -2270,6 +2304,7 @@ impl Engine {
             Ok(t) => {
                 let _ = tokencache::save(&self.config.token_path, &t);
                 self.token = Some(t);
+                self.announce_scopes();
                 self.clear_backoff();
                 // Emit an explicit past-sign-in signal BEFORE the first sync
                 // pass. If that pass fails transiently it only emits `Offline`
@@ -2316,9 +2351,28 @@ impl Engine {
         }
     }
 
+    /// Sends [`SyncEvent::Scopes`] for the current token's grant when it is
+    /// known and differs (as a normalised set) from the last one sent.
+    fn announce_scopes(&mut self) {
+        let Some(granted) = self.token.as_ref().and_then(|t| t.scopes.clone()) else {
+            return;
+        };
+        let mut set: Vec<String> = granted.iter().map(|s| auth::normalise_scope(s)).collect();
+        set.sort();
+        set.dedup();
+        if self.announced_scopes.as_ref() == Some(&set) {
+            return;
+        }
+        self.announced_scopes = Some(set);
+        let missing = auth::missing_scopes(&self.config.cfg.scope, &granted);
+        self.emit(SyncEvent::Scopes { granted, missing });
+    }
+
     /// Drop to signed-out: clear the token and announce `SignInRequired`.
+    /// The announced grant is forgotten, so the next session announces it.
     fn enter_signin(&mut self) {
         self.token = None;
+        self.announced_scopes = None;
         self.emit(SyncEvent::SignInRequired);
         self.set_state(SyncState::SignInRequired);
     }
@@ -2411,7 +2465,8 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// `?error=...`, or a `state` that doesn't match `expected_state` (the
 /// anti-CSRF check `begin_auth` set up). Never logs the code or any secret;
 /// the returned `Err` messages are diagnostic text only (parse failures,
-/// the provider's own `error` value, or "timed out"), safe to surface via
+/// the provider's own `error` value with its `error_description` when the
+/// redirect's `state` matches, or "timed out"), safe to surface via
 /// `SyncEvent::Error`.
 ///
 /// Uses a non-blocking `accept` polled against a deadline rather than a
@@ -2518,12 +2573,25 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let params = parse_query(query);
 
-    if let Some(err) = params.iter().find(|(k, _)| k == "error").map(|(_, v)| v) {
+    let param = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let state_matches = param("state").map(String::as_str) == Some(expected_state);
+
+    if let Some(err) = param("error") {
         write_html_response(stream, SIGNIN_ERROR_HTML);
-        return Err(format!("authorization denied: {err}"));
+        // Microsoft's `error_description` (`AADSTSnnnnn: …`) says what to do,
+        // but anything can send the browser to this port during the sign-in
+        // window, so free text is shown only from the redirect that carries
+        // our `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
+        let desc = param("error_description")
+            .filter(|_| state_matches)
+            .map(|d| one_line(d))
+            .filter(|d| !d.is_empty());
+        return Err(match desc {
+            Some(desc) => format!("authorization denied: {err}: {desc}"),
+            None => format!("authorization denied: {err}"),
+        });
     }
-    let state = params.iter().find(|(k, _)| k == "state").map(|(_, v)| v);
-    if state.map(String::as_str) != Some(expected_state) {
+    if !state_matches {
         write_html_response(stream, SIGNIN_ERROR_HTML);
         return Err("redirect state did not match".to_string());
     }
@@ -2537,6 +2605,16 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
     };
     write_html_response(stream, SIGNIN_SUCCESS_HTML);
     Ok(code)
+}
+
+/// `s` on one line: every run of control characters and whitespace (Entra's
+/// description has `\r\n` before its `Trace ID:` and `Correlation ID:`
+/// lines) becomes one space, and the ends are trimmed.
+fn one_line(s: &str) -> String {
+    s.split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Writes a minimal `HTTP/1.1 200` HTML response and closes the connection
@@ -2756,6 +2834,23 @@ mod tests {
             refresh_token: "RT".into(),
             expires_at_unix: now + 10 * 365 * 86400,
             account: "me@epam.com".into(),
+            scopes: None,
+        };
+        tokencache::save(path, &t).unwrap();
+    }
+
+    /// A token that expires in `expires_in` seconds and was granted `scopes`.
+    fn seed_token_with_scopes(path: &std::path::Path, expires_in: u64, scopes: &[&str]) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let t = TokenSet {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at_unix: now + expires_in,
+            account: "me@epam.com".into(),
+            scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
         };
         tokencache::save(path, &t).unwrap();
     }
@@ -5445,6 +5540,359 @@ mod tests {
         );
     }
 
+    // --- Granted scopes and error_description (#1875) ---------------------
+
+    /// The `Scopes` events among `events`, as `(granted, missing)`.
+    fn scopes_events(events: &[SyncEvent]) -> Vec<(Vec<String>, Vec<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::Scopes { granted, missing } => Some((granted.clone(), missing.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn token_route(body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    fn empty_folders_route(status: u16) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status,
+            headers: vec![],
+            body: if status == 200 {
+                r#"{"value":[]}"#.into()
+            } else {
+                r#"{"error":{"code":"InvalidAuthenticationToken"}}"#.into()
+            },
+        }
+    }
+
+    const SEEDED: &[&str] = &[
+        "https://graph.microsoft.com/Mail.ReadWrite",
+        "offline_access",
+    ];
+
+    /// Starts an engine on `routes` with `token_path` already seeded, and
+    /// returns the events up to the startup pass's `FoldersUpdated`.
+    fn startup_events(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>)>,
+        cfg: AuthConfig,
+        seed: impl FnOnce(&std::path::Path),
+    ) -> (Vec<SyncEvent>, PathBuf, SyncHandle, FakeServer) {
+        let srv = FakeServer::start_limited(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        seed(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            cfg,
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        (events, dir, handle, srv)
+    }
+
+    fn finish(handle: SyncHandle, dir: PathBuf) {
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_announces_granted_scopes() {
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-startup",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), Vec::new())],
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn startup_announces_missing_scopes() {
+        let cfg = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            ..test_cfg()
+        };
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-missing",
+            vec![(empty_folders_route(200), None)],
+            cfg,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), strings(&["Mail.Send"]))],
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn startup_without_known_scopes_announces_nothing() {
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-unknown",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            seed_token,
+        );
+        assert!(scopes_events(&events).is_empty(), "{events:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn refresh_without_scope_keeps_previous_scopes() {
+        // Near expiry at startup: refreshed before the first pass, by a
+        // response that names no scopes, so the old grant still holds.
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-refresh-keep",
+            vec![
+                (
+                    token_route(
+                        r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#,
+                    ),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            |p| seed_token_with_scopes(p, 10, SEEDED),
+        );
+        // Loaded, then refreshed with the same grant: announced once.
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), Vec::new())],
+            "{events:?}"
+        );
+        let cached = tokencache::load(&dir.join("token.bin")).unwrap().unwrap();
+        assert_eq!(cached.access_token, "AT2");
+        assert_eq!(cached.scopes, Some(strings(SEEDED)));
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn refresh_on_401_with_same_grant_announces_nothing_new() {
+        // The folder list 401s once; the refresh answers the same grant,
+        // reordered and re-cased.
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-401-same",
+            vec![
+                (
+                    token_route(
+                        r#"{"access_token":"AT2","expires_in":3600,"scope":"OFFLINE_ACCESS mail.readwrite"}"#,
+                    ),
+                    None,
+                ),
+                (empty_folders_route(401), Some(1)),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), Vec::new())],
+            "{events:?}"
+        );
+        let cached = tokencache::load(&dir.join("token.bin")).unwrap().unwrap();
+        assert_eq!(
+            cached.access_token, "AT2",
+            "the 401 was retried after a refresh"
+        );
+        assert_eq!(
+            cached.scopes,
+            Some(strings(&["OFFLINE_ACCESS", "mail.readwrite"]))
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn refresh_on_401_with_wider_grant_announces_again() {
+        let cfg = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send People.Read offline_access".into(),
+            ..test_cfg()
+        };
+        let wider = [
+            "https://graph.microsoft.com/Mail.ReadWrite",
+            "https://graph.microsoft.com/Mail.Send",
+            "offline_access",
+        ];
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-401-wider",
+            vec![
+                (
+                    token_route(&format!(
+                        r#"{{"access_token":"AT2","expires_in":3600,"scope":"{}"}}"#,
+                        wider.join(" ")
+                    )),
+                    None,
+                ),
+                (empty_folders_route(401), Some(1)),
+                (empty_folders_route(200), None),
+            ],
+            cfg,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(
+            scopes_events(&events),
+            vec![
+                (strings(SEEDED), strings(&["Mail.Send", "People.Read"])),
+                (strings(&wider), strings(&["People.Read"])),
+            ],
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn sign_in_announces_and_caches_granted_scopes() {
+        let granted = "https://graph.microsoft.com/Mail.ReadWrite openid profile offline_access";
+        let srv = FakeServer::start(vec![
+            token_route(&format!(
+                r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{granted}"}}"#
+            )),
+            empty_folders_route(200),
+        ]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("scopes-signin");
+        let token_path = dir.join("token.bin");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        sign_in_through_loopback(&handle);
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let expected: Vec<String> = granted.split(' ').map(str::to_string).collect();
+        assert_eq!(
+            scopes_events(&events),
+            vec![(expected.clone(), Vec::new())],
+            "{events:?}"
+        );
+        let cached = tokencache::load(&token_path).unwrap().unwrap();
+        assert_eq!(cached.scopes, Some(expected));
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn sign_in_refused_reports_error_description() {
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        )]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("signin-refused");
+        let token_path = dir.join("token.bin");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let (_, response) = sign_in_through_loopback_with(&handle, |state| {
+            format!(
+                "error=consent_required&error_description=AADSTS65001%3A+The+user+or+administrator+has+not+consented%0D%0ATrace+ID%3A+abc&state={state}"
+            )
+        });
+        assert!(response.to_lowercase().contains("failed"));
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        assert!(
+            events.contains(&SyncEvent::Error(
+                "sign-in failed: authorization denied: consent_required: AADSTS65001: The user or administrator has not consented Trace ID: abc"
+                    .into()
+            )),
+            "{events:?}"
+        );
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        finish(handle, dir);
+    }
+
+    /// `handle_redirect` over a real loopback connection that sends
+    /// `GET /?<query>`.
+    fn redirect_result(query: &str, expected_state: &str) -> Result<String, String> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .unwrap();
+        let (stream, _addr) = listener.accept().unwrap();
+        let result = handle_redirect(stream, expected_state);
+        drop(client);
+        result
+    }
+
+    const REFUSED: &str = "error=consent_required&error_description=AADSTS65001%3A+The+user+or+administrator+has+not+consented%0D%0ATrace+ID%3A+abc%0D%0A";
+
+    #[test]
+    fn handle_redirect_reports_error_description() {
+        assert_eq!(
+            redirect_result(&format!("{REFUSED}&state=st"), "st"),
+            Err(
+                "authorization denied: consent_required: AADSTS65001: The user or administrator has not consented Trace ID: abc"
+                    .to_string()
+            )
+        );
+        // An empty (or blank) description keeps the bare error.
+        assert_eq!(
+            redirect_result(
+                "error=access_denied&error_description=+%0D%0A&state=st",
+                "st"
+            ),
+            Err("authorization denied: access_denied".to_string())
+        );
+        assert_eq!(
+            redirect_result("error=access_denied&state=st", "st"),
+            Err("authorization denied: access_denied".to_string())
+        );
+    }
+
+    #[test]
+    fn handle_redirect_drops_error_description_on_a_state_mismatch() {
+        // Anything can send the browser here: free text only with our state.
+        assert_eq!(
+            redirect_result(&format!("{REFUSED}&state=wrong"), "st"),
+            Err("authorization denied: consent_required".to_string())
+        );
+        assert_eq!(
+            redirect_result(REFUSED, "st"),
+            Err("authorization denied: consent_required".to_string())
+        );
+    }
+
     #[test]
     fn handle_redirect_errors_on_a_connection_closed_before_any_request_line() {
         // A client that connects and disappears without ever sending a
@@ -5519,6 +5967,14 @@ mod tests {
     /// `SignInStarted` with a code and its `state`. Returns that
     /// `redirect_uri` and the loopback listener's response.
     fn sign_in_through_loopback(handle: &SyncHandle) -> (String, String) {
+        sign_in_through_loopback_with(handle, |state| format!("code=THECODE&state={state}"))
+    }
+
+    /// [`sign_in_through_loopback`] landing on `/?<query(state)>`.
+    fn sign_in_through_loopback_with(
+        handle: &SyncHandle,
+        redirect_query: impl Fn(&str) -> String,
+    ) -> (String, String) {
         handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::SignInStarted { .. })
@@ -5546,8 +6002,10 @@ mod tests {
             .and_then(|p| p.parse().ok())
             .expect("redirect_uri ends with the loopback port");
         let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
-        let request =
-            format!("GET /?code=THECODE&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let request = format!(
+            "GET /?{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            redirect_query(&state)
+        );
         client.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();

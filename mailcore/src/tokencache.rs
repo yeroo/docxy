@@ -16,7 +16,7 @@ use std::path::Path;
 /// atomically to `path` (temp file + rename, so a concurrent reader or a
 /// crash mid-write never observes a partial file).
 pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
-    let v = Value::Object(vec![
+    let mut fields = vec![
         (
             "access_token".to_string(),
             Value::Str(t.access_token.clone()),
@@ -30,7 +30,16 @@ pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
             Value::Num(t.expires_at_unix as f64),
         ),
         ("account".to_string(), Value::Str(t.account.clone())),
-    ]);
+    ];
+    // Unknown scopes are saved by leaving the key out, so they load as
+    // unknown again (#1875).
+    if let Some(scopes) = &t.scopes {
+        fields.push((
+            "scopes".to_string(),
+            Value::Array(scopes.iter().cloned().map(Value::Str).collect()),
+        ));
+    }
+    let v = Value::Object(fields);
     let plaintext = v.to_string().into_bytes();
     let ciphertext = protect(&plaintext)?;
 
@@ -82,6 +91,8 @@ fn tmp_path(path: &Path) -> std::path::PathBuf {
 /// Loads and decrypts the token cache at `path`. `Ok(None)` if the file
 /// doesn't exist (the common case: no one has signed in yet); any other I/O
 /// failure, or a cache that fails to decrypt/parse, is returned as `Err`.
+/// A cache without `scopes` (saved before #1875), or whose `scopes` is not
+/// an array of strings, loads with `scopes: None` (unknown), never an error.
 pub fn load(path: &Path) -> io::Result<Option<TokenSet>> {
     let ciphertext = match fs::read(path) {
         Ok(b) => b,
@@ -113,12 +124,19 @@ pub fn load(path: &Path) -> io::Result<Option<TokenSet>> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let scopes = v.get("scopes").and_then(Value::as_array).and_then(|items| {
+        items
+            .iter()
+            .map(|s| s.as_str().map(str::to_string))
+            .collect::<Option<Vec<String>>>()
+    });
 
     Ok(Some(TokenSet {
         access_token,
         refresh_token,
         expires_at_unix,
         account,
+        scopes,
     }))
 }
 
@@ -277,6 +295,7 @@ mod tests {
             refresh_token: "RT".into(),
             expires_at_unix: 123,
             account: "me@epam.com".into(),
+            scopes: None,
         };
         save(&p, &t).unwrap();
         let got = load(&p).unwrap().unwrap();
@@ -303,6 +322,7 @@ mod tests {
             refresh_token: "RT".into(),
             expires_at_unix: 1,
             account: "".into(),
+            scopes: None,
         };
         save(&p, &t).unwrap();
         let raw = std::fs::read(&p).unwrap();
@@ -323,7 +343,70 @@ mod tests {
             refresh_token: "RT".into(),
             expires_at_unix: 123,
             account: "me@x".into(),
+            scopes: None,
         }
+    }
+
+    /// A fresh directory for one test's cache file.
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lookxy-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn scopes_roundtrip() {
+        let dir = test_dir("scopes");
+        let p = dir.join("token.bin");
+        let scopes = vec![
+            "https://graph.microsoft.com/Mail.ReadWrite".to_string(),
+            "https://graph.microsoft.com/People.Read".to_string(),
+            "openid".to_string(),
+        ];
+        let t = TokenSet {
+            scopes: Some(scopes.clone()),
+            ..sample()
+        };
+        save(&p, &t).unwrap();
+        assert_eq!(load(&p).unwrap().unwrap().scopes, Some(scopes));
+        // Unknown stays unknown: the key is left out.
+        save(&p, &sample()).unwrap();
+        assert_eq!(load(&p).unwrap().unwrap().scopes, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_without_scopes_loads_as_unknown() {
+        // The cache as written before #1875. Through `protect`, as `load`
+        // decrypts with DPAPI on Windows.
+        let dir = test_dir("old-cache");
+        let p = dir.join("token.bin");
+        let old =
+            r#"{"access_token":"AT","refresh_token":"RT","expires_at_unix":123,"account":"me@x"}"#;
+        std::fs::write(&p, protect(old.as_bytes()).unwrap()).unwrap();
+        let got = load(&p).unwrap().expect("an old cache still loads");
+        assert_eq!(got.access_token, "AT");
+        assert_eq!(got.refresh_token, "RT");
+        assert_eq!(got.expires_at_unix, 123);
+        assert_eq!(got.account, "me@x");
+        assert_eq!(got.scopes, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_with_malformed_scopes_loads_as_unknown() {
+        let dir = test_dir("bad-scopes");
+        let p = dir.join("token.bin");
+        for scopes in [r#""Mail.Read""#, r#"["Mail.Read",1]"#, "null"] {
+            let json = format!(
+                r#"{{"access_token":"AT","refresh_token":"RT","expires_at_unix":1,"account":"","scopes":{scopes}}}"#
+            );
+            std::fs::write(&p, protect(json.as_bytes()).unwrap()).unwrap();
+            let got = load(&p).unwrap().expect("loads");
+            assert_eq!(got.scopes, None, "scopes {scopes}");
+            assert_eq!(got.refresh_token, "RT");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
