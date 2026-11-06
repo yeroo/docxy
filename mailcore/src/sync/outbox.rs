@@ -1006,6 +1006,23 @@ mod tests {
             )),
             "Access is denied."
         );
+        // Graph's message is shown as one line, capped like `Display` (#1954).
+        assert_eq!(
+            send_error_text(&http(
+                400,
+                r#"{"error":{"code":"X","message":"Bad id.\r\n\tTry again."}}"#
+            )),
+            "Bad id. Try again."
+        );
+        let long = send_error_text(&http(
+            400,
+            &format!(
+                r#"{{"error":{{"code":"X","message":"{}"}}}}"#,
+                "é".repeat(HTTP_ERROR_TEXT_MAX * 2)
+            ),
+        ));
+        assert_eq!(long.chars().count(), HTTP_ERROR_TEXT_MAX);
+        assert!(long.ends_with('…'), "{long}");
         assert_eq!(send_error_text(&http(403, "<html>nope</html>")), "HTTP 403");
         assert_eq!(
             send_error_text(&http(400, r#"{"error":{"code":"X","message":"  "}}"#)),
