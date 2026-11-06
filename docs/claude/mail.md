@@ -403,10 +403,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   head, a small folder's inline full delta, a backfill page:
   `merge_delta_items` with `protect`): it skips every id a queued outbox op
   names (`Store::pending_message_ids`: an optimistic write waiting after a
-  5xx, and a deleted message is not put back) and every draft
-  (`Store::is_local_draft`: compose saves a draft's fields with no op until
-  `SaveDraft`, whose PATCH reads the row). A round on a stored link merges
-  everything, as Graph reports a change there. In window mode items
+  5xx, and a deleted message is not put back) and every draft with an
+  unsaved edit (`Store::locally_edited_ids`, below); everything else is
+  merged, drafts included (`Engine::protected_ids`). A round on a stored
+  link merges everything, as Graph reports a change there. In window mode items
   older than the cutoff are skipped, unless a reconverge is pending.
   `Store::set_backfill_progress` stores the `nextLink`, the count and the
   walk's scope (`backfill_scope`: `window` once a page ran with the
@@ -422,9 +422,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   the deltaLink replaces the folder's link in one statement that marks it
   complete (`Store::complete_backfill`, scope `window` when any page of the
   walk ran with the cutoff, else `all`), and `repair_headerless` runs. A
-  restart resumes from the stored link. Known limit: a draft older than the
-  head's 14 days edited on another device during the walk keeps its local
-  fields (a draft is never merged by a page, and no round reports it).
+  restart resumes from the stored link.
+- **Unsaved draft edits** (`messages.local_edit`, migrated in
+  `Store::init`). Compose saves a draft's fields into the store with no
+  outbox op until `SaveDraft`, whose PATCH reads the row, so a fresh delta
+  must not overwrite them, but must still merge a clean draft (one edited
+  on another device, or one a quarantined op left wrong). The column is a
+  generation: `update_draft_fields` bumps it. `ensure_draft_on_graph` reads
+  it (`Store::local_edit_generation`) before it reads the draft, and after
+  a successful create (plus `reconcile_id`) or update clears it
+  (`Store::clear_local_edit`) only if it is still that generation, in one
+  statement. An edit compose makes meanwhile stays unsaved, with no race
+  against lookxy's connection; a failed push or a store error on the clear
+  leaves the draft protected until its next push. Rows from before read as
+  clean.
 - **When a page runs.** `main_loop` waits zero while `next_backfill()` has a
   folder: signed in, outside `next_retry`, a folder list done
   (`backfill_done`), and the first folder in order with a delta link whose
@@ -470,13 +481,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - **Reconverge.** `clear_delta_links` also clears the backfill link, count
   and scope, so every folder runs both phases again. `reconverge_pending`
   turns off phase 2's window cutoff (its pages merge as always, to
-  correct rows the dropped op left wrong, still skipping the ids queued
-  ops name and every draft
-  (`Store::is_local_draft`)). It is cleared only when a pass ran
+  correct rows the dropped op left wrong, drafts included, still skipping
+  `protected_ids`). It is cleared only when a pass ran
   every folder's delta and no folder's backfill remains, else by the step
   that completes the last folder, or by the one that parks the last walk
   left: parked walks do not count (`backfill_remains`), so a page that
-  keeps failing cannot hold the reconverge, and the cutoff, off for good. It is persisted (`meta.reconverge_pending`,
+  fails (it is parked) cannot hold the reconverge, and the cutoff, off for
+  good. It is persisted (`meta.reconverge_pending`,
   set by `clear_delta_links` in the same transaction, loaded by `run`,
   cleared by `Engine::end_reconverge`), so an engine restarted in the
   middle still runs the walks without the cutoff.

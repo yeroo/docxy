@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS messages (
     -- the draft. NULL for every other row. Lives on the row, so it goes with
     -- the message on every delete path. Its unique index is created in
     -- `Store::init`, after the migration that adds the column to old files.
-    local_id        TEXT
+    local_id        TEXT,
+    -- A draft's unsaved-edit generation (#1871): `update_draft_fields`
+    -- bumps it, a successful push clears it back to 0 if no edit came
+    -- since. Non-zero: the row holds fields Graph has not seen, which a
+    -- fresh delta must not overwrite.
+    local_edit      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

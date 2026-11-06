@@ -707,6 +707,13 @@ impl Store {
         // come after the ALTER, not in `SCHEMA_SQL`: on an old database
         // `SCHEMA_SQL` runs before the column exists. NULLs never collide.
         let _ = conn.execute("ALTER TABLE messages ADD COLUMN local_id TEXT", []);
+        // Same idempotent-migration pattern, for `messages.local_edit` (#1871:
+        // a draft's unsaved-edit generation). A row from before reads as
+        // clean.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN local_edit INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Same idempotent-migration pattern, for `bodies.fetched_as` (#1901:
         // the format `FetchBody` asked for). Rows from before it stay NULL,
         // which `get_body_for` reads as "asked for text" for a text body,
@@ -951,30 +958,59 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the row `id` is a draft docxy may hold unsaved edits of
-    /// (#1871): `is_draft`, or filed under the Drafts folder or the local
-    /// sentinel, as `get_body_for` reads a draft. `false` for no row.
-    pub fn is_local_draft(&self, id: &str) -> Result<bool, StoreError> {
-        let draft = self
+    /// The ids of the rows holding a local edit Graph has not seen
+    /// (#1871): drafts compose changed (`update_draft_fields`) since their
+    /// last successful push (`local_edit > 0`), sorted. Every delta that
+    /// starts fresh leaves them alone.
+    pub fn locally_edited_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM messages WHERE local_edit > 0 ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The unsaved-edit generation of the draft `id` addresses (#1871; a
+    /// reconciled `local:` id still reaches it, #1884), 0 for a clean or
+    /// unknown row. Read before a push reads the draft, so an edit after it
+    /// bumps the generation past it.
+    pub fn local_edit_generation(&self, id: &str) -> Result<i64, StoreError> {
+        let generation = self
             .conn
             .query_row(
-                "SELECT m.is_draft = 1 OR f.well_known_name = 'drafts' OR m.folder_id = ?2
-                 FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
-                 WHERE m.id = ?1",
-                params![id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
-                |r| r.get::<_, Option<bool>>(0),
+                concat!("SELECT local_edit FROM messages WHERE ", draft_row_sql!()),
+                params![id],
+                |r| r.get::<_, i64>(0),
             )
             .or_else(|e| {
                 if e == rusqlite::Error::QueryReturnedNoRows {
-                    Ok(None)
+                    Ok(0)
                 } else {
                     Err(e)
                 }
             })?;
-        Ok(draft.unwrap_or(false))
+        Ok(generation)
     }
 
-    /// The message ids queued outbox ops name (#1871): a backfill page
+    /// Marks the draft `id` addresses clean after a push that sent
+    /// generation `generation` of its fields (#1871), only if no edit came
+    /// since (the generation is still that one), in one statement. Returns
+    /// whether it did.
+    pub fn clear_local_edit(&self, id: &str, generation: i64) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            concat!(
+                "UPDATE messages SET local_edit = 0 WHERE local_edit = ?2 AND ",
+                draft_row_sql!()
+            ),
+            params![id, generation],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The message ids queued outbox ops name (#1871): every delta that
+    /// starts fresh (a head, a small folder's full delta, a backfill page)
     /// leaves them alone, as their optimistic local write (a read flag, a
     /// move, a delete, a draft's fields) has not reached Graph yet. Calendar
     /// event ops name events, not messages, and are left out.
@@ -1620,6 +1656,9 @@ impl Store {
     /// in one transaction whose first statement is the write, so both see
     /// the same state.
     ///
+    /// The row's unsaved-edit generation goes up (`local_edit`, #1871): a
+    /// fresh delta does not overwrite it until a push clears it.
+    ///
     /// The body is html (compose writes html), so a draft whose stored body
     /// was fetched as text becomes `content_type = 'html'` with no fetch
     /// format (#1901): [`Store::get_body_for`] then keeps the user's edits
@@ -1636,7 +1675,8 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             concat!(
-                "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5
+                "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5,
+                                     local_edit = local_edit + 1
                  WHERE ",
                 draft_row_sql!()
             ),
@@ -3448,6 +3488,7 @@ mod tests {
             ("is_meeting_request", V::Integer(1)),
             ("categories", t(&encode_categories(&m.categories))),
             ("local_id", V::Null),
+            ("local_edit", V::Integer(0)),
         ];
         expect(&s, "13", &first);
 
@@ -3502,6 +3543,7 @@ mod tests {
                 ("is_meeting_request", V::Integer(0)),
                 ("categories", t(&encode_categories(&[]))),
                 ("local_id", V::Null),
+                ("local_edit", V::Integer(0)),
             ],
         );
     }
@@ -6117,53 +6159,58 @@ mod backfill_tests {
         assert!(s.folder_history("NOPE").unwrap().is_none());
     }
 
-    fn message(id: &str, subject: &str, read: bool) -> Message {
-        Message {
-            id: id.into(),
-            conversation_id: "C".into(),
-            subject: subject.into(),
-            from: Recipient {
-                name: "A".into(),
-                address: "a@x".into(),
-            },
-            to: vec![],
-            cc: vec![],
-            received: "2026-01-01T00:00:00Z".into(),
-            sent: "".into(),
-            is_read: read,
-            is_flagged: false,
-            has_attachments: false,
-            importance: "normal".into(),
-            preview: "p".into(),
-            is_draft: false,
-            is_meeting_request: false,
-            categories: Vec::new(),
-        }
+    #[test]
+    fn update_draft_fields_bumps_the_edit_generation_and_a_push_clears_it() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
+        assert_eq!(s.local_edit_generation(&local).unwrap(), 0);
+        s.update_draft_fields(&local, "a", "", "", "", "b").unwrap();
+        s.update_draft_fields(&local, "b", "", "", "", "b").unwrap();
+        let read = s.local_edit_generation(&local).unwrap();
+        assert_eq!(read, 2);
+        assert_eq!(
+            s.locally_edited_ids().unwrap(),
+            std::slice::from_ref(&local)
+        );
+        // The push reconciles the id; the local: id still reaches the row.
+        s.reconcile_id(&local, "G").unwrap();
+        assert_eq!(s.local_edit_generation(&local).unwrap(), 2);
+        assert_eq!(s.locally_edited_ids().unwrap(), ["G"]);
+        // An edit after the push read the draft: a stale clear keeps it dirty.
+        s.update_draft_fields(&local, "c", "", "", "", "b").unwrap();
+        assert!(!s.clear_local_edit(&local, read).unwrap());
+        assert_eq!(s.local_edit_generation("G").unwrap(), 3);
+        // A clear of the current generation makes it clean.
+        assert!(s.clear_local_edit(&local, 3).unwrap());
+        assert_eq!(s.local_edit_generation("G").unwrap(), 0);
+        assert!(s.locally_edited_ids().unwrap().is_empty());
+        assert_eq!(s.local_edit_generation("NOPE").unwrap(), 0);
     }
 
     #[test]
-    fn is_local_draft_by_flag_drafts_folder_or_sentinel() {
-        let s = Store::open_in_memory().unwrap();
-        folder(&s, "INBOX", 10, Some("inbox"));
-        folder(&s, "DRAFTS", 10, Some("drafts"));
-        s.upsert_message("INBOX", &message("PLAIN", "s", false))
+    fn a_database_from_before_local_edit_reads_clean() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-local-edit-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let local = {
+            let s = Store::open(&path).unwrap();
+            let local = s.create_local_draft("Old", "", "", "body").unwrap();
+            s.conn
+                .execute_batch("ALTER TABLE messages DROP COLUMN local_edit;")
+                .unwrap();
+            local
+        };
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.local_edit_generation(&local).unwrap(), 0);
+        s.update_draft_fields(&local, "new", "", "", "", "b")
             .unwrap();
-        s.upsert_message("DRAFTS", &message("FILED", "s", false))
-            .unwrap();
-        s.upsert_message(
-            "INBOX",
-            &Message {
-                is_draft: true,
-                ..message("FLAGGED", "s", false)
-            },
-        )
-        .unwrap();
-        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
-        assert!(!s.is_local_draft("PLAIN").unwrap());
-        assert!(s.is_local_draft("FILED").unwrap());
-        assert!(s.is_local_draft("FLAGGED").unwrap());
-        assert!(s.is_local_draft(&local).unwrap());
-        assert!(!s.is_local_draft("NOPE").unwrap());
+        assert_eq!(s.local_edit_generation(&local).unwrap(), 1);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -305,6 +305,12 @@ fn ensure_draft_on_graph(
     store: &Store,
     id: &str,
 ) -> Result<String, GraphError> {
+    // The unsaved-edit generation is read before the draft (#1871): an edit
+    // compose makes after this read bumps it past, so the clear below
+    // leaves that edit marked unsaved.
+    let generation = store
+        .local_edit_generation(id)
+        .map_err(|e| GraphError::Parse(e.to_string()))?;
     let (row, body) = store
         .draft(id)
         .map_err(|e| GraphError::Parse(e.to_string()))?
@@ -318,10 +324,22 @@ fn ensure_draft_on_graph(
         store
             .reconcile_id(&row.id, &created.id)
             .map_err(|e| GraphError::Parse(e.to_string()))?;
+        mark_pushed(store, &created.id, generation);
         Ok(created.id)
     } else {
         client.update_draft(&row.id, &body.content, &row.subject, &to, &cc, &bcc)?;
+        mark_pushed(store, &row.id, generation);
         Ok(row.id)
+    }
+}
+
+/// Graph now has generation `generation` of the draft stored under `id`'s
+/// fields (#1871): the row is clean unless compose edited it since. A store
+/// error is ignored: the draft stays protected from fresh deltas until its
+/// next push.
+fn mark_pushed(store: &Store, id: &str, generation: i64) {
+    if generation > 0 {
+        let _ = store.clear_local_edit(id, generation);
     }
 }
 
@@ -689,6 +707,89 @@ mod tests {
         let (row, body) = store.draft("GRAPH-1").unwrap().unwrap();
         assert_eq!(row.subject, "Hi");
         assert_eq!(body.content, "<p>hello</p>");
+    }
+
+    /// A draft compose edited, so its fields are unsaved (#1871).
+    fn edited_draft(store: &Store) -> String {
+        let local_id = store.create_local_draft("Old", "b@x", "", "old").unwrap();
+        store
+            .update_draft_fields(&local_id, "Edited", "b@x", "", "", "<p>new</p>")
+            .unwrap();
+        assert_eq!(store.local_edit_generation(&local_id).unwrap(), 1);
+        local_id
+    }
+
+    #[test]
+    fn a_successful_push_leaves_the_draft_clean() {
+        // The create path (a local draft) and the update path (synced).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-1", "Edited"),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/GRAPH-5".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let created = edited_draft(&store);
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SaveDraft {
+                id: created.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(store.current_id(&created).unwrap(), "GRAPH-1");
+        assert_eq!(store.local_edit_generation("GRAPH-1").unwrap(), 0);
+
+        let synced = edited_draft(&store);
+        store.reconcile_id(&synced, "GRAPH-5").unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SaveDraft {
+                id: "GRAPH-5".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(store.local_edit_generation("GRAPH-5").unwrap(), 0);
+        assert!(store.locally_edited_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_push_leaves_the_draft_unsaved() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/GRAPH-5".into(),
+            status: 500,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let synced = edited_draft(&store);
+        store.reconcile_id(&synced, "GRAPH-5").unwrap();
+        assert!(
+            apply_op(
+                &c,
+                &store,
+                &OutboxOp::SaveDraft {
+                    id: "GRAPH-5".into()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(store.locally_edited_ids().unwrap(), ["GRAPH-5"]);
     }
 
     #[test]

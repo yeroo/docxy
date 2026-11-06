@@ -663,8 +663,9 @@ struct Engine {
     /// removed locally — including messages that have since aged past the
     /// sliding window. Cleared once a pass ran every folder's delta and no
     /// folder's backfill remains (#1871: old mail comes back through the
-    /// backfill), else by the backfill step that completes the last folder
-    /// (`end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
+    /// backfill), else by the backfill step that completes the last folder,
+    /// or by the one that parks the last walk left (parked walks do not
+    /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
@@ -1156,8 +1157,9 @@ impl Engine {
         // Every folder's delta just completed without a hard failure, so a
         // pending reconverge (upsert-everything, cutoff ignored) is satisfied
         // once no folder's backfill remains either (#1871: the old mail comes
-        // back through it); else the step that completes the last folder
-        // clears it. Clear it before draining: if the drain quarantines a
+        // back through it); else the step that completes the last folder,
+        // or parks the last walk left (parked walks do not count,
+        // `backfill_remains`), clears it. Clear it before draining: if the drain quarantines a
         // fresh op it will re-arm reconverge for the next pass.
         if !self.backfill_remains() {
             self.end_reconverge();
@@ -1489,7 +1491,7 @@ impl Engine {
         // phase 1 while the user's state is live.
         let started_fresh = !matches!(cursor, DeltaCursor::Link(_));
         let pending = if started_fresh {
-            match self.store.pending_message_ids() {
+            match self.protected_ids() {
                 Ok(ids) => Some(ids),
                 Err(e) => {
                     self.emit(SyncEvent::Error(e.to_string()));
@@ -1572,15 +1574,13 @@ impl Engine {
     /// the cutoff, whatever became of them); a row that fails to write is
     /// skipped.
     ///
-    /// With `protect` (the ids queued outbox ops name,
-    /// `Store::pending_message_ids`) the page is a fresh delta's (#1871: a
-    /// head, a small folder's full delta, a backfill page), which carries
-    /// every message it covers, not only what changed: it never merges
-    /// over a local edit. It skips those ids (an optimistic write waiting
-    /// after a 5xx; a deleted message is not put back) and every draft
-    /// (`Store::is_local_draft`: compose saves a draft's fields with no op
-    /// until `SaveDraft`, whose PATCH reads the row). A round on a stored
-    /// link (`None`) merges everything, as Graph reports a change there.
+    /// With `protect` (`protected_ids`, sorted) the page is a fresh
+    /// delta's (#1871: a head, a small folder's full delta, a backfill
+    /// page), which carries every message it covers, not only what changed:
+    /// it never merges over a local edit, and skips those ids. Everything
+    /// else is merged, drafts included (a quarantine reconverge repairs a
+    /// draft a dropped op left wrong). A round on a stored link (`None`)
+    /// merges everything, as Graph reports a change there.
     fn merge_delta_items(
         &self,
         folder_id: &str,
@@ -1598,10 +1598,7 @@ impl Engine {
                         }
                     }
                     upserts += 1;
-                    let local = protect.is_some_and(|ids| {
-                        ids.binary_search(&m.id).is_ok()
-                            || self.store.is_local_draft(&m.id).unwrap_or(true)
-                    });
+                    let local = protect.is_some_and(|ids| ids.binary_search(&m.id).is_ok());
                     if !local {
                         let _ = self.store.merge_message(folder_id, m, fields);
                     }
@@ -1617,6 +1614,19 @@ impl Engine {
     }
 
     // --- Backfill (#1871) -------------------------------------------------
+
+    /// The ids a fresh delta must not merge over (#1871), sorted: those a
+    /// queued outbox op names (`Store::pending_message_ids`: an optimistic
+    /// write waiting after a 5xx; a deleted message is not put back), and
+    /// drafts with an unsaved edit (`Store::locally_edited_ids`: compose
+    /// saved fields Graph has not seen, which the next push sends).
+    fn protected_ids(&self) -> Result<Vec<String>, StoreError> {
+        let mut ids = self.store.pending_message_ids()?;
+        ids.extend(self.store.locally_edited_ids()?);
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
 
     /// The quarantine reconverge is over: the flag is cleared, in memory and
     /// in the store.
@@ -1796,7 +1806,7 @@ impl Engine {
         } else {
             SCOPE_ALL
         };
-        let pending = match self.store.pending_message_ids() {
+        let pending = match self.protected_ids() {
             Ok(ids) => ids,
             Err(e) => {
                 self.park_on_store_error(&id, e);
@@ -10953,7 +10963,8 @@ mod tests {
         fn a_backfill_page_never_overwrites_a_local_edit() {
             // F1 and Drafts were synced before #1871, so whole mode walks
             // both. R1 was marked read here and X deleted here, each op held
-            // by a 5xx; D1's subject was edited by compose (no op yet). The
+            // by a 5xx; D1's subject was edited by compose (no op yet, so
+            // marked unsaved by `update_draft_fields`). The
             // pages carry the server's old R1, X and D1, and a new row.
             let failing = |method: &str, path: &str| Route {
                 method: method.into(),
@@ -11005,11 +11016,10 @@ mod tests {
                 })
                 .unwrap();
                 s.enqueue_op(&OutboxOp::Delete { id: "X".into() }).unwrap();
-                seed_row(
-                    &s,
-                    "F3",
-                    &full_message_json("D1", "local edit", "2026-01-03T00:00:00Z"),
-                );
+                // Compose's edit: unsaved until a push (#1871).
+                seed_row(&s, "F3", &msg("D1", "2026-01-03T00:00:00Z"));
+                s.update_draft_fields("D1", "local edit", "", "", "", "<p>x</p>")
+                    .unwrap();
             }
             let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
             let mut done = (false, false);
@@ -11270,16 +11280,114 @@ mod tests {
                     well_known_name: Some("drafts".into()),
                 })
                 .unwrap();
-                seed_row(
-                    &s,
-                    "F3",
-                    &full_message_json("D1", "local edit", "2026-11-01T00:00:00Z"),
-                );
+                // Compose's edit: unsaved until a push (#1871).
+                seed_row(&s, "F3", &msg("D1", "2026-11-01T00:00:00Z"));
+                s.update_draft_fields("D1", "local edit", "", "", "", "<p>x</p>")
+                    .unwrap();
                 s.clear_delta_links().unwrap();
             }
             let handle = spawn_in(&srv, &dir, 30, HOUR, None);
             until_complete(&handle, "F3");
             assert_eq!(row(&dir, "F3", "D1").unwrap().subject, "local edit");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Drafts (F3), listed with `total` messages, as a store holds it.
+        fn seed_drafts(s: &Store, total: i64) {
+            s.upsert_folder(&MailFolder {
+                id: "F3".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: total,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        }
+
+        fn drafts_with(pages: Vec<Vec<String>>) -> Fold {
+            Fold {
+                total: 1,
+                pages,
+                ..fold("F3", "Drafts", Some("drafts"))
+            }
+        }
+
+        #[test]
+        fn a_clean_draft_whose_server_copy_changed_is_merged() {
+            // D1 has no unsaved edit (no `update_draft_fields` since its
+            // last push); the server's copy changed. Drafts never synced, so
+            // its first (full, small) delta carries it.
+            let srv = FakeServer::start_paced(mailbox(
+                &[drafts_with(vec![vec![msg("D1", "2026-11-01T00:00:00Z")]])],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-clean-draft");
+            {
+                let s = store_in(&dir);
+                seed_drafts(&s, 1);
+                seed_row(
+                    &s,
+                    "F3",
+                    &full_message_json("D1", "old", "2026-11-01T00:00:00Z"),
+                );
+            }
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F3");
+            assert_eq!(row(&dir, "F3", "D1").unwrap().subject, "D1");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reconverge_repairs_a_draft_a_quarantined_op_left_wrong() {
+            // MarkRead of the draft D1 is refused (400) until quarantined:
+            // the store keeps it read, Graph has it unread. The reconverge's
+            // fresh delta of Drafts repairs it: the op is gone and D1 holds
+            // no unsaved edit.
+            let srv = FakeServer::start_paced(mailbox(
+                &[drafts_with(vec![vec![msg("D1", "2026-11-01T00:00:00Z")]])],
+                vec![(
+                    Route {
+                        method: "PATCH".into(),
+                        path_prefix: "/me/messages/D1".into(),
+                        status: 400,
+                        headers: vec![],
+                        body: "{}".into(),
+                    },
+                    None,
+                )],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-draft-op");
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F3");
+            handle
+                .cmd_tx
+                .send(SyncCommand::MarkRead {
+                    id: "D1".into(),
+                    read: true,
+                })
+                .unwrap();
+            for _ in 0..4 {
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            }
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+            );
+            assert!(
+                row(&dir, "F3", "D1").unwrap().is_read,
+                "the dropped op's write"
+            );
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            until_complete(&handle, "F3");
+            assert!(
+                !row(&dir, "F3", "D1").unwrap().is_read,
+                "repaired from Graph"
+            );
             stop(handle);
             let _ = std::fs::remove_dir_all(&dir);
         }
