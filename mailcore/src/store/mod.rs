@@ -1623,7 +1623,7 @@ impl Store {
     /// header-less row is out), not a draft (`get_body_for`'s rule: marked
     /// `is_draft`, or filed in the Drafts folder, the synced one or the
     /// local sentinel), and whose stored body does not satisfy `format`
-    /// ([`body_satisfies`], the rule `get_body_for` uses). Ids in `skip`
+    /// (`body_satisfies`, the rule `get_body_for` uses). Ids in `skip`
     /// are left out.
     pub fn body_candidates(
         &self,
