@@ -1,0 +1,269 @@
+# An extension tab's embedded document view in its editing mode (#1947).
+# The script's `ext fixture` line has this instance draw Mail tabs with the
+# suite's test extension: a header line over a DocView of the fixture
+# document (heading "Embedded view", "Alpha Beta Gamma" with Beta bold, a
+# link paragraph, an indented link paragraph, a picture, three tables, then
+# Line 1..Line 80; see ext-doc-view.uit). The extension calls only the
+# view's public API: `ext-doc-set {"editable":...}` is `set_editable`,
+# `ext-doc-call` is `format` / `undo` / `redo`, `ext-doc-document` reads
+# `document()` and `package()`, and `ext-doc-read` adds the caret, its
+# formatting (`caret_format`), whether the caret's painted piece is inside
+# the view (`caret_in_view`), `can_undo` / `can_redo` and how many change
+# events the extension got (`change_calls`). Keys go through `real-key` /
+# `real-type`, as the OS delivers them. Each test opens its own Mail tab
+# and closes it at the end.
+ext fixture
+
+test issue 1947 typing, bold and bullets from the host, one undo, and the document read back
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  assert reply.editable is false
+  assert reply.can_undo is false
+  assert reply.change_calls is 0
+  call ext-doc-set {"editable":true}
+  assert reply.editable is true
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-type {"text":" Delta"}
+  call ext-doc-read {}
+  assert reply.focused is true
+  assert reply.caret.path.0 is 1
+  assert reply.can_undo is true
+  assert reply.change_calls is not 0
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma Delta
+  assert reply.package_has_numbering is false
+  # The host's Bold over the word just typed, the caret after it.
+  call real-key {"key":"ctrl+shift+left"}
+  call ext-doc-read {}
+  assert reply.selection is Delta
+  call ext-doc-call {"format":"bold"}
+  assert reply.done is true
+  call real-key {"key":"end"}
+  call ext-doc-read {}
+  assert reply.selection is empty
+  assert reply.caret_format.bold is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.runs.1.text is Beta
+  assert reply.paragraphs.1.runs.1.bold is true
+  assert reply.paragraphs.1.runs.2.bold is false
+  assert reply.paragraphs.1.runs.3.text is Delta
+  assert reply.paragraphs.1.runs.3.bold is true
+  # A plain word reads not bold.
+  call pointer-click {"region":"ext-doc-word:Alpha:start"}
+  call ext-doc-read {}
+  assert reply.caret_format.bold is false
+  assert reply.caret_format.bullets is false
+  # Center on a centred paragraph is a step that changes nothing: neither
+  # it nor the host's undo of it is a change event.
+  call ext-doc-call {"format":"align-center"}
+  call ext-doc-set {"editable":true}
+  call ext-doc-call {"format":"align-center"}
+  assert reply.done is true
+  call ext-doc-call {"undo":true}
+  assert reply.done is true
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.align is left
+  # Bullets from the host: the paragraph is in the bullet list, and the
+  # package gained the numbering part that defines it.
+  call ext-doc-call {"format":"bullets"}
+  assert reply.done is true
+  assert reply.caret_format.bullets is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.num_id is 1
+  assert reply.paragraphs.1.ilvl is 0
+  assert reply.package_has_numbering is true
+  shot window
+  # One undo takes back the bullets only; the bold typing stays. (The
+  # snapshot of the change count is ext-doc-set's reply.)
+  call ext-doc-set {"editable":true}
+  call ext-doc-call {"undo":true}
+  assert reply.done is true
+  assert reply.can_redo is true
+  call ext-doc-read {}
+  assert reply.change_calls is not {ext-doc-set.change_calls}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.num_id is nothing
+  assert reply.paragraphs.1.text is Alpha Beta Gamma Delta
+  assert reply.paragraphs.1.runs.3.text is Delta
+  assert reply.paragraphs.1.runs.3.bold is true
+  # Redo brings the list back.
+  call ext-doc-call {"redo":true}
+  assert reply.done is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.num_id is 1
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1947 Backspace, Enter, Shift+Right, Ctrl+Z and the list keys edit as in a document tab
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-key {"key":"backspace"}
+  call real-key {"key":"backspace"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gam
+  # Enter splits the paragraph: the text typed after it is a new one.
+  call real-key {"key":"enter"}
+  call real-type {"text":"Next"}
+  call ext-doc-document {}
+  assert reply.blocks is 89
+  assert reply.paragraphs.2.text is Next
+  # Shift+Right selects; typing replaces the selection.
+  call real-key {"key":"home"}
+  call real-key {"key":"shift+right"}
+  call real-key {"key":"shift+right"}
+  call ext-doc-read {}
+  assert reply.selection is Ne
+  call real-type {"text":"T"}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is Txt
+  # Ctrl+Z takes back the replacing typing.
+  call real-key {"key":"ctrl+z"}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is Next
+  # Ctrl+M takes a bullet a level in, Shift+Tab back out (a Decrease Indent,
+  # as in a document tab), and Tab types a tab there.
+  call ext-doc-call {"format":"bullets"}
+  call real-key {"key":"ctrl+m"}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.num_id is 1
+  assert reply.paragraphs.2.ilvl is 1
+  call real-key {"key":"shift+tab"}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.ilvl is 0
+  call ext-doc-set {"editable":true}
+  call real-key {"key":"tab"}
+  call ext-doc-read {}
+  assert reply.change_calls is not {ext-doc-set.change_calls}
+  assert reply.focused is true
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is not Next
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1947 the caret stays in view: typing scrolls back to it, and the text it adds at the bottom follows it
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  shot window
+  call ext-doc-read {}
+  assert reply.caret_in_view is true
+  # The wheel takes the caret out of sight; a typed character brings it
+  # back.
+  call pointer-wheel {"region":"ext-doc-view","dy":-2000}
+  shot window
+  call ext-doc-set {"editable":true}
+  assert reply.scroll_y is not 0
+  assert reply.caret_in_view is false
+  call real-type {"text":"x"}
+  shot window
+  call ext-doc-read {}
+  assert reply.caret_in_view is true
+  assert reply.scroll_y is not {ext-doc-set.scroll_y}
+  # Ctrl+End goes to the bottom; new lines typed there grow the document
+  # past it, and the view follows the caret down.
+  call real-key {"key":"ctrl+end"}
+  shot window
+  call ext-doc-set {"editable":true}
+  assert reply.scroll_y is {ext-doc-set.max_scroll_y}
+  assert reply.caret_in_view is true
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  call real-key {"key":"enter"}
+  call real-type {"text":"The end"}
+  shot window
+  call ext-doc-read {}
+  assert reply.caret_in_view is true
+  assert reply.max_scroll_y is not {ext-doc-set.max_scroll_y}
+  assert reply.scroll_y is not {ext-doc-set.scroll_y}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1947 read-only refuses typing and the host's calls, and a dialog over the tab keeps the keys
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  # Read-only (the default): typed keys bubble on, host calls do nothing.
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-type {"text":"zz"}
+  call ext-doc-call {"format":"bold"}
+  assert reply.done is false
+  call ext-doc-call {"undo":true}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is 0
+  assert reply.can_undo is false
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  # Editable, with the About dialog over the tab (opened from File, which
+  # then closes under it): the dialog has the keys, the view types nothing.
+  call ext-doc-set {"editable":true}
+  call backstage {"action":"open"}
+  call account {"action":"open"}
+  call account {"action":"about"}
+  call backstage {"action":"close"}
+  shot window
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is about
+  call real-type {"text":"qq"}
+  call ext-doc-read {}
+  assert reply.focused is false
+  assert reply.change_calls is 0
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  # Once it closes the view has the keys again.
+  call dialog-click {"button":"Close"}
+  assert reply.dialog.open is false
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-type {"text":"!"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1947 Ctrl+X in the editable view takes the text away and pastes into a document with its bold
+  # Last: the document it pastes into stays open (and edited).
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.selection is Alpha Beta Gamma
+  call real-key {"key":"ctrl+x"}
+  call ext-doc-read {}
+  assert reply.selection is empty
+  assert reply.change_calls is 1
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is empty
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha Beta Gamma
+  assert reply.rtf_bold is Beta
+  open copy:../fixtures/basic.docx
+  key ctrl+v
+  assert text is Alpha Beta Gamma
+  call selection-set {"start":8,"end":8}
+  assert run.bold is true
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false

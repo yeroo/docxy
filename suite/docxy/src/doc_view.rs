@@ -1,18 +1,25 @@
-//! A read-only document view an extension tab can embed (#1873): a
+//! A document view an extension tab can embed (#1873): a
 //! [`docxcore::model::Document`] drawn by the suite's own document renderer
 //! in its flow (web layout) style, wrapped to the view's width, with inline
 //! pictures from the package it came with. It selects (press, drag,
 //! Shift+press, Ctrl+A) and copies (Ctrl+C: text and RTF, as a document copy
 //! does), scrolls (wheel, Up/Down, Page Up/Down, Home/End) and zooms
-//! (Ctrl+wheel, Ctrl+=, Ctrl+-, Ctrl+0). It never edits and draws no caret.
-//! A hyperlink press goes to the extension's callback ([`DocView::on_link`]),
-//! never opened here. The chrome (scroll bar, selection) follows the suite's
+//! (Ctrl+wheel, Ctrl+=, Ctrl+-, Ctrl+0). Read-only by default: it then never
+//! edits and draws no caret. Its editing mode ([`DocView::set_editable`],
+//! #1947) types, deletes, moves the caret, undoes and takes a host ribbon's
+//! formatting commands ([`DocView::format`]); its decisions are
+//! [`edit`]'s. A hyperlink press goes to the extension's callback
+//! ([`DocView::on_link`]), never opened here. The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]).
 //!
 //! The renderer is the suite's (`block_el`): only its click target differs
 //! ([`crate::DocTarget::Embed`]), so a document reads here exactly as in a
 //! document tab's Web Layout.
+
+mod edit;
+
+pub use edit::{CaretFormat, DocFormat};
 
 use super::*;
 use docxcore::editor::{Caret, Editor};
@@ -61,10 +68,11 @@ pub enum LinkClick {
 }
 
 type LinkFn = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+type ChangeFn = Rc<dyn Fn(&mut App)>;
 
-/// An embeddable read-only view of a document. Make it with
-/// `cx.new(|cx| DocView::new(doc, Some(pkg), cx))` and place it anywhere in
-/// the extension's view: it fills its parent. Give its
+/// An embeddable view of a document, read-only unless made editable. Make
+/// it with `cx.new(|cx| DocView::new(doc, Some(pkg), cx))` and place it
+/// anywhere in the extension's view: it fills its parent. Give its
 /// [`DocView::focus_handle`] as the tab's [`crate::ext::TabSurface::focus_handle`]
 /// when it should have the keys; the keys it does not use bubble on.
 pub struct DocView {
@@ -94,6 +102,12 @@ pub struct DocView {
     held_scroll: Point<Pixels>,
     wheel_acc: f32,
     clipboard: ClipboardStore,
+    /// The editing mode (#1947): off, the view is read-only.
+    editable: bool,
+    on_change: Option<ChangeFn>,
+    /// A key or host command moved the caret or edited: the next frame
+    /// scrolls the caret into view, once it is painted.
+    reveal: bool,
 }
 
 impl DocView {
@@ -128,6 +142,9 @@ impl DocView {
             held_scroll: Point::default(),
             wheel_acc: 0.,
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
+            editable: false,
+            on_change: None,
+            reveal: false,
         }
     }
 
@@ -143,7 +160,135 @@ impl DocView {
         self.run_styles = RefCell::default();
         self.selecting = false;
         self.press_link = None;
+        self.reveal = false;
         self.scroll.set_offset(Point::default());
+        if self.editable {
+            self.seed_styles();
+        }
+        cx.notify();
+    }
+
+    /// Turn the editing mode on or off (#1947). Editable, the view draws a
+    /// caret while focused, types and edits by the keys, and takes the host's
+    /// commands ([`DocView::format`], [`DocView::undo`], ...); a hyperlink is
+    /// followed only by Ctrl+click (⌘ on macOS), whatever
+    /// [`DocView::set_link_click`] says, so a plain press places the caret.
+    /// Off (the default) it is the read-only view. The document, its undo
+    /// history and the selection stay either way.
+    pub fn set_editable(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.editable = on;
+        if on {
+            self.seed_styles();
+        }
+        cx.notify();
+    }
+
+    /// Whether the view is in its editing mode.
+    pub fn editable(&self) -> bool {
+        self.editable
+    }
+
+    /// Called after every change to the document: typing, a delete, a cut,
+    /// a formatting command, Undo and Redo, whether by the keys or the host.
+    /// Not for what changes no document: a move, a selection, a scroll, a
+    /// zoom, a format toggled at a collapsed caret for what is typed next,
+    /// [`DocView::set_document`] or [`DocView::set_editable`]. It runs
+    /// deferred, outside the view's update, so it may read or update the
+    /// view (to autosave its [`DocView::document`], say).
+    pub fn on_change(&mut self, f: impl Fn(&mut App) + 'static) {
+        self.on_change = Some(Rc::new(f));
+    }
+
+    /// Apply a formatting command from the host's ribbon to the selection
+    /// (or, for a toggle at a collapsed caret, to what is typed next), as
+    /// the document tab's ribbon applies it: one undo step. True when it ran;
+    /// false, changing nothing, on a read-only view or for a command it
+    /// cannot run (an empty font name, a size outside 1..1638 pt, a colour
+    /// that is not `RRGGBB`, a highlight that is not Word's). Pressing the
+    /// host's button may have taken the focus: give it back
+    /// ([`DocView::focus_handle`]), as the caret draws only while the view
+    /// is focused.
+    pub fn format(&mut self, f: DocFormat, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        self.seed_styles();
+        let done = edit::apply_format(&mut self.editor, self.pkg.as_mut(), &f);
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
+    }
+
+    /// Undo the newest step, as Ctrl+Z does. False, with nothing changed, on
+    /// a read-only view or with nothing to undo.
+    pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
+        self.history(false, cx)
+    }
+
+    /// Redo the newest undone step, as Ctrl+Y does.
+    pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
+        self.history(true, cx)
+    }
+
+    /// [`DocView::undo`] / [`DocView::redo`]: whether a step was taken;
+    /// the host hears of a change only when the document differs after it,
+    /// as for Ctrl+Z (a step may have changed nothing).
+    fn history(&mut self, redo: bool, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        let done = edit::history(&mut self.editor, redo);
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
+    }
+
+    /// Whether [`DocView::undo`] would undo something.
+    pub fn can_undo(&self) -> bool {
+        self.editable && self.editor.undo_serial().is_some()
+    }
+
+    /// Whether [`DocView::redo`] would redo something.
+    pub fn can_redo(&self) -> bool {
+        self.editable && self.editor.can_redo()
+    }
+
+    /// The formatting at the caret, for the host ribbon's pressed states:
+    /// see [`CaretFormat`].
+    pub fn caret_format(&self) -> CaretFormat {
+        edit::caret_format(&self.editor)
+    }
+
+    /// The document as it is now, edits included: what the host exports.
+    pub fn document(&self) -> Document {
+        self.editor.export_doc().into_owned()
+    }
+
+    /// The package the view draws from, with what editing added to it (the
+    /// numbering part a first list needs); `None` when it was given none.
+    pub fn package(&self) -> Option<Package> {
+        self.pkg.clone()
+    }
+
+    /// Bold and Italic toggle over what the package's styles give, and the
+    /// caret's formatting reads them (#1427), as a document tab's editor
+    /// is given them. Free while the styles part is unchanged.
+    fn seed_styles(&mut self) {
+        let xml = self.run_styles.borrow_mut().current(self.pkg.as_ref()).0;
+        self.editor.set_styles_xml(xml);
+    }
+
+    /// After a key or host command: the caret goes into view, and a change
+    /// tells the host.
+    fn after_edit(&mut self, changed: bool, cx: &mut Context<Self>) {
+        self.reveal = true;
+        if changed {
+            if let Some(f) = self.on_change.clone() {
+                cx.defer(move |cx| f(cx));
+            }
+        }
         cx.notify();
     }
 
@@ -225,7 +370,9 @@ impl DocView {
         }
         place_click_caret(&mut self.editor, Caret::at(path, off), mods.shift, true);
         self.selecting = true;
-        self.press_link = link.filter(|_| !mods.modified());
+        // Editable, a plain press places the caret on a link and never
+        // follows it (Word's editing behaviour).
+        self.press_link = link.filter(|_| !mods.modified() && !self.editable);
         cx.notify();
     }
 
@@ -283,6 +430,10 @@ impl DocView {
     // ---- keys, wheel ------------------------------------------------------
 
     fn key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editable && self.edit_key(ev, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let m = ev.keystroke.modifiers;
         let key = ev.keystroke.key.as_str();
         let handled = if m.secondary() && !m.alt && !m.function {
@@ -325,6 +476,55 @@ impl DocView {
             cx.notify();
         }
         let _ = window;
+    }
+
+    /// A key in the editing mode: whether the editing map took it. A key it
+    /// leaves is the read-only map's (Page Up/Down, zoom) or bubbles.
+    fn edit_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        self.seed_styles();
+        let out = edit::edit_key(
+            &mut self.editor,
+            self.pkg.as_mut(),
+            &ev.keystroke,
+            text_input::MACOS,
+        );
+        let changed = out.changed();
+        match out {
+            edit::KeyOutcome::Ignored => return false,
+            edit::KeyOutcome::Copy => self.copy(cx),
+            edit::KeyOutcome::Cut(clip) => {
+                let (text, rtf) = clip_payload(&clip, self.pkg.as_ref());
+                self.clipboard.write_rich(harness(), text, rtf, cx);
+            }
+            edit::KeyOutcome::Moved | edit::KeyOutcome::Changed => {}
+        }
+        // Ctrl+Home / Ctrl+End go to the very top and bottom, as read-only.
+        let m = ev.keystroke.modifiers;
+        if (m.control || m.platform) && !m.alt {
+            match ev.keystroke.key.as_str() {
+                "home" => {
+                    self.scroll_to(0.);
+                }
+                "end" => {
+                    self.scroll_to(f32::INFINITY);
+                }
+                _ => {}
+            }
+        }
+        self.after_edit(changed, cx);
+        true
+    }
+
+    /// Tab and Shift+Tab (action-bound, they never arrive as keys) in the
+    /// editing mode: [`edit::tab`]. Read-only, they pass on as before.
+    fn tab_action(&mut self, back: bool, cx: &mut Context<Self>) {
+        if !self.editable {
+            cx.propagate();
+            return;
+        }
+        self.seed_styles();
+        let out = edit::tab(&mut self.editor, self.pkg.as_mut(), back);
+        self.after_edit(out.changed(), cx);
     }
 
     fn zoom_step(&mut self, dir: i32) -> bool {
@@ -467,6 +667,37 @@ impl DocView {
             ),
             ("content_dark", Json::Bool(self.content_dark)),
             ("focused", Json::Bool(self.focus.is_focused(window))),
+            ("editable", Json::Bool(self.editable)),
+            (
+                "caret",
+                Json::obj(vec![
+                    (
+                        "path",
+                        Json::Arr(
+                            self.editor
+                                .caret
+                                .path
+                                .iter()
+                                .map(|&i| Json::Num(i as f64))
+                                .collect(),
+                        ),
+                    ),
+                    ("offset", Json::Num(self.editor.caret.offset as f64)),
+                ]),
+            ),
+            (
+                "caret_in_view",
+                match (
+                    caret_piece(&self.words, &self.editor.caret),
+                    self.viewport.get(),
+                ) {
+                    (Some(piece), Some(view)) => Json::Bool(reveal_dy(view, piece) == px(0.)),
+                    _ => Json::Null,
+                },
+            ),
+            ("caret_format", caret_format_json(&self.caret_format())),
+            ("can_undo", Json::Bool(self.can_undo())),
+            ("can_redo", Json::Bool(self.can_redo())),
         ])
     }
 
@@ -557,9 +788,16 @@ impl Render for DocView {
         let body = &self.editor.doc.body;
         let markers = list_markers(body);
         let target = DocTarget::Embed(cx.entity().downgrade(), self.words.clone());
+        // Editable, the caret draws while the view has the keys (#1947).
+        let caret: &[usize] = if self.editable && self.focus.is_focused(window) {
+            &self.editor.caret.path
+        } else {
+            &[]
+        };
+        let reveal = std::mem::take(&mut self.reveal).then(|| self.editor.caret.clone());
         let ctx = RenderCtx {
-            caret_path: &[],
-            caret_off: 0,
+            caret_path: caret,
+            caret_off: self.editor.caret.offset,
             spans: &spans,
             ent: &target,
             pal,
@@ -586,6 +824,7 @@ impl Render for DocView {
             .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
             .collect();
         let viewport = self.viewport.clone();
+        let (words, scroll) = (self.words.clone(), self.scroll.clone());
         let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
         div()
             .id("ext-doc-view")
@@ -596,6 +835,12 @@ impl Render for DocView {
             .min_h(px(0.))
             .bg(bg)
             .on_key_down(cx.listener(Self::key))
+            .on_action(
+                cx.listener(|this, _: &InsertTabAction, _window, cx| this.tab_action(false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OutdentAction, _window, cx| this.tab_action(true, cx)),
+            )
             .on_scroll_wheel(
                 cx.listener(|this, ev: &ScrollWheelEvent, window, cx| this.wheel(ev, window, cx)),
             )
@@ -647,7 +892,16 @@ impl Render for DocView {
             .child(
                 canvas(
                     move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| viewport.set(Some(b)),
-                    |_b, _s, _w, _a| {},
+                    // It paints after `ext-doc-scroll`, whose pieces this
+                    // frame has drawn by then: a paragraph an Enter just
+                    // made among them.
+                    move |b, _s, window, _a| {
+                        if let Some(caret) = reveal {
+                            if reveal_caret(&words, &scroll, b, &caret) {
+                                window.request_animation_frame();
+                            }
+                        }
+                    },
                 )
                 .absolute()
                 .top_0()
@@ -690,6 +944,104 @@ pub(crate) fn copy_payload(
     pkg: Option<&Package>,
 ) -> Option<(String, Option<String>)> {
     Some(clip_payload(&editor.copy()?, pkg))
+}
+
+/// [`CaretFormat`] for the harness's `ext-doc-read`.
+fn caret_format_json(f: &CaretFormat) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let text = |v: &Option<String>| v.clone().map_or(Json::Null, Json::Str);
+    Json::obj(vec![
+        ("bold", Json::Bool(f.bold)),
+        ("italic", Json::Bool(f.italic)),
+        ("underline", Json::Bool(f.underline)),
+        ("strike", Json::Bool(f.strike)),
+        ("font", text(&f.font)),
+        (
+            "size",
+            f.size.map_or(Json::Null, |s| Json::Num(f64::from(s))),
+        ),
+        ("color", text(&f.color)),
+        ("highlight", text(&f.highlight)),
+        ("bullets", Json::Bool(f.bullets)),
+        ("numbering", Json::Bool(f.numbering)),
+        ("align", Json::Str(align_name(f.align).into())),
+    ])
+}
+
+/// An alignment's name in the harness's replies and calls.
+pub(crate) fn align_name(a: Align) -> &'static str {
+    match a {
+        Align::Left => "left",
+        Align::Center => "center",
+        Align::Right => "right",
+        Align::Justify => "justify",
+    }
+}
+
+/// The painted bounds of the piece holding `caret` among `words` (the last
+/// frame's): [`piece_at`] over its paragraph's pieces. `None` when its
+/// paragraph painted none.
+fn caret_piece(words: &Words, caret: &Caret) -> Option<Bounds<Pixels>> {
+    let words = words.borrow();
+    let (_, spans) = words.iter().find(|(path, _)| *path == caret.path)?;
+    let pieces: Vec<_> = spans
+        .borrow()
+        .iter()
+        .map(|w| (w.off, w.len, w.bounds()))
+        .collect();
+    piece_at(&pieces, caret.offset)
+}
+
+/// Of a paragraph's painted pieces `(offset, length, bounds)`, the bounds of
+/// the one whose characters hold caret offset `off`, else the last one that
+/// ends at or before it (the caret after the paragraph's last character, or
+/// past a unit), else the first. A piece that drew nothing (a line break's
+/// empty bounds) is never one.
+fn piece_at(pieces: &[(usize, usize, Bounds<Pixels>)], off: usize) -> Option<Bounds<Pixels>> {
+    let drawn = || pieces.iter().filter(|(_, _, b)| b.size.height > px(0.));
+    drawn()
+        .find(|(o, l, _)| *o <= off && off < o + l)
+        .or_else(|| drawn().rfind(|(o, l, _)| o + l <= off))
+        .or_else(|| drawn().next())
+        .map(|(_, _, b)| *b)
+}
+
+/// The change of the scroll area's y offset that brings `piece` into `view`
+/// (both painted bounds): down to a piece above it, up to one below, none
+/// for one inside; a piece taller than the view shows its top.
+fn reveal_dy(view: Bounds<Pixels>, piece: Bounds<Pixels>) -> Pixels {
+    if piece.top() < view.top() || piece.size.height > view.size.height {
+        view.top() - piece.top()
+    } else if piece.bottom() > view.bottom() {
+        view.bottom() - piece.bottom()
+    } else {
+        px(0.)
+    }
+}
+
+/// Scroll the view so `caret` is in sight, from this frame's painted pieces,
+/// in y only (a wide table keeps its sideways scroll, #1895); a caret whose
+/// paragraph painted nothing has its top-level block followed instead, as a
+/// document tab's Web Layout follows it. Whether it moved (shown next frame).
+fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, caret: &Caret) -> bool {
+    let Some(piece) = caret_piece(words, caret) else {
+        return caret
+            .path
+            .first()
+            .is_some_and(|&b| follow_item_y(scroll, b));
+    };
+    let dy = reveal_dy(view, piece);
+    if dy == px(0.) {
+        return false;
+    }
+    let offset = scroll.offset();
+    let max = scroll.max_offset().y.max(px(0.));
+    let y = (offset.y + dy).clamp(-max, px(0.));
+    if y == offset.y {
+        return false;
+    }
+    scroll.set_offset(point(offset.x, y));
+    true
 }
 
 /// The page the document draws on and its palette. A light page (white, in
@@ -992,6 +1344,50 @@ mod tests {
                 ("b", 60., 70.)
             ]
         );
+    }
+
+    fn rows(top: f32, h: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.), px(top)),
+            size: size(px(10.), px(h)),
+        }
+    }
+
+    #[test]
+    fn the_caret_piece_holds_its_offset_or_ends_before_it_1947() {
+        let empty = Bounds::default();
+        // "ab cd" as two words, then a line break (drawn as nothing), then
+        // "ef" on the next row.
+        let pieces = [
+            (0, 3, rows(0., 20.)),
+            (3, 2, rows(0., 20.)),
+            (5, 1, empty),
+            (6, 2, rows(20., 20.)),
+        ];
+        assert_eq!(piece_at(&pieces, 0), Some(rows(0., 20.)));
+        assert_eq!(piece_at(&pieces, 4), Some(rows(0., 20.)));
+        // On the break: the word before it, not its empty bounds.
+        assert_eq!(piece_at(&pieces, 5), Some(rows(0., 20.)));
+        assert_eq!(piece_at(&pieces, 7), Some(rows(20., 20.)));
+        // After the last character: the last piece.
+        assert_eq!(piece_at(&pieces, 8), Some(rows(20., 20.)));
+        assert_eq!(piece_at(&[], 0), None);
+        assert_eq!(piece_at(&[(0, 0, empty)], 0), None);
+    }
+
+    #[test]
+    fn a_piece_out_of_view_is_scrolled_to_its_nearest_edge_1947() {
+        let view = rows(100., 300.);
+        // Inside: no scroll.
+        assert_eq!(reveal_dy(view, rows(150., 20.)), px(0.));
+        assert_eq!(reveal_dy(view, rows(100., 300.)), px(0.));
+        // Above: the content moves down until the piece's top is the view's.
+        assert_eq!(reveal_dy(view, rows(40., 20.)), px(60.));
+        // Below: up until its bottom is the view's.
+        assert_eq!(reveal_dy(view, rows(390., 20.)), px(-10.));
+        assert_eq!(reveal_dy(view, rows(900., 20.)), px(-520.));
+        // Taller than the view: its top.
+        assert_eq!(reveal_dy(view, rows(120., 400.)), px(-20.));
     }
 
     #[test]

@@ -14,11 +14,12 @@
 use gpui::{AnyView, App, FocusHandle, Global, actions};
 use std::rc::Rc;
 
-/// A read-only view of a document an extension's view may embed (#1873):
-/// the suite's own document renderer in web layout, with selection, copy,
-/// zoom, scrolling and hyperlinks handed to the extension. See
-/// [`DocView::new`].
-pub use crate::doc_view::{DocView, LinkClick};
+/// A view of a document an extension's view may embed (#1873): the suite's
+/// own document renderer in web layout, with selection, copy, zoom,
+/// scrolling and hyperlinks handed to the extension; read-only unless made
+/// editable ([`DocView::set_editable`], #1947), when it types and edits and
+/// takes the host ribbon's [`DocFormat`] commands. See [`DocView::new`].
+pub use crate::doc_view::{CaretFormat, DocFormat, DocView, LinkClick};
 
 actions!(
     docxy_ext,

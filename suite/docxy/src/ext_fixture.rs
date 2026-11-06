@@ -7,14 +7,15 @@
 //!
 //! It uses only what an extension crate can: the public items of
 //! [`crate::ext`] (`tests/ext_doc_view_api.rs` holds the same surface to that
-//! from outside the crate), and records every link the view hands it.
+//! from outside the crate), records every link the view hands it and counts
+//! its change events (#1947).
 
 use crate::ext::{self, DocView, TabSurface};
 use docxcore::model::Document;
 use docxcore::package::{Package, new_package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// The target of the fixture document's hyperlink.
@@ -42,6 +43,8 @@ pub(crate) struct FixtureView {
     pub(crate) doc: Entity<DocView>,
     /// Each link the view handed the extension, in order.
     pub(crate) link_calls: Rc<RefCell<Vec<String>>>,
+    /// How many change events the view sent (#1947).
+    pub(crate) change_calls: Rc<Cell<usize>>,
 }
 
 impl Render for FixtureView {
@@ -81,14 +84,18 @@ pub(crate) fn factory() -> ext::Factory {
     Rc::new(|cx: &mut App| {
         let (doc, pkg) = fixture_document();
         let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+        let changes: Rc<Cell<usize>> = Rc::default();
         let view = cx.new(|cx| DocView::new(doc, Some(pkg), cx));
         view.update(cx, |v, _| {
             let calls = calls.clone();
             v.on_link(move |url, _window, _cx| calls.borrow_mut().push(url.to_string()));
+            let changes = changes.clone();
+            v.on_change(move |_cx| changes.set(changes.get() + 1));
         });
         let root = cx.new(|_| FixtureView {
             doc: view,
             link_calls: calls,
+            change_calls: changes,
         });
         Ok(Box::new(FixtureMail { root }) as Box<dyn TabSurface>)
     })

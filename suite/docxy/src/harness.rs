@@ -32,7 +32,7 @@ use crate::windows;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
-use docxcore::model::{Align, VertAlign};
+use docxcore::model::VertAlign;
 use gpui::{
     App, AppContext as _, Bounds, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
@@ -1623,6 +1623,142 @@ fn ext_fixture_view(
         .map_err(|_| "the active tab is not the test extension's".to_string())
 }
 
+/// A host call `ext-doc-call` makes on the test extension's view (#1947).
+#[derive(Debug, PartialEq)]
+enum ExtDocCall {
+    Format(crate::ext::DocFormat),
+    Undo,
+    Redo,
+}
+
+/// `ext-doc-call`'s arguments: exactly one of `{"format": <command>}` (bold,
+/// italic, underline, bullets, numbering, indent, outdent, align-left,
+/// align-center, align-right, align-justify), `{"font": <name>}`,
+/// `{"size": <points>}`, `{"color": <RRGGBB or null>}`, `{"highlight":
+/// <name or null>}`, `{"undo": true}` or `{"redo": true}`.
+fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
+    use crate::ext::DocFormat as F;
+    use docxcore::model::Align;
+    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo' or 'redo'";
+    let keys = [
+        "format",
+        "font",
+        "size",
+        "color",
+        "highlight",
+        "undo",
+        "redo",
+    ];
+    let given: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|k| args.get(k).is_some())
+        .collect();
+    let [key] = given[..] else {
+        return Err(USAGE.into());
+    };
+    let value = args.get(key).expect("given");
+    let text_or_null = |v: &Json| match v {
+        Json::Null => Ok(None),
+        Json::Str(s) => Ok(Some(s.clone())),
+        _ => Err(format!("'{key}' must be a string or null")),
+    };
+    Ok(ExtDocCall::Format(match key {
+        "format" => match value.as_str() {
+            Some("bold") => F::Bold,
+            Some("italic") => F::Italic,
+            Some("underline") => F::Underline,
+            Some("bullets") => F::Bullets,
+            Some("numbering") => F::Numbering,
+            Some("indent") => F::Indent,
+            Some("outdent") => F::Outdent,
+            Some("align-left") => F::Align(Align::Left),
+            Some("align-center") => F::Align(Align::Center),
+            Some("align-right") => F::Align(Align::Right),
+            Some("align-justify") => F::Align(Align::Justify),
+            _ => return Err(format!("'format' is not a command: {value:?}")),
+        },
+        "font" => F::Font(value.as_str().ok_or("'font' must be a string")?.to_string()),
+        "size" => match value {
+            Json::Num(n) => F::Size(*n as f32),
+            _ => return Err("'size' must be a number of points".into()),
+        },
+        "color" => F::Color(text_or_null(value)?),
+        "highlight" => F::Highlight(text_or_null(value)?),
+        "undo" | "redo" => {
+            if *value != Json::Bool(true) {
+                return Err(format!("'{key}' must be true"));
+            }
+            return Ok(if key == "undo" {
+                ExtDocCall::Undo
+            } else {
+                ExtDocCall::Redo
+            });
+        }
+        _ => unreachable!("a listed key"),
+    }))
+}
+
+/// `ext-doc-document`'s reply: the document's top-level paragraphs (a table
+/// is `{"table": true}`), each with its text, list (`num_id`, `ilvl`),
+/// alignment and runs (text, bold, italic, underline; a link's runs among
+/// them), and whether the package has a numbering part.
+fn ext_doc_document_json(
+    doc: &docxcore::model::Document,
+    pkg: Option<&docxcore::package::Package>,
+) -> Json {
+    use docxcore::model::{Block, Inline, Run};
+    fn run_json(r: &Run) -> Json {
+        Json::obj(vec![
+            ("text", Json::Str(r.text.clone())),
+            ("bold", Json::Bool(r.props.bold)),
+            ("italic", Json::Bool(r.props.italic)),
+            ("underline", Json::Bool(r.props.underline)),
+        ])
+    }
+    let blocks = doc
+        .body
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(p) => {
+                let runs = p
+                    .content
+                    .iter()
+                    .flat_map(|c| match c {
+                        Inline::Run(r) => vec![run_json(r)],
+                        Inline::Hyperlink(h) => h.runs.iter().map(run_json).collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                Json::obj(vec![
+                    ("text", Json::Str(p.plain_text())),
+                    (
+                        "num_id",
+                        p.props
+                            .num_id
+                            .map_or(Json::Null, |n| Json::Num(f64::from(n))),
+                    ),
+                    ("ilvl", Json::Num(f64::from(p.props.ilvl))),
+                    (
+                        "align",
+                        Json::Str(crate::doc_view::align_name(p.props.align).into()),
+                    ),
+                    ("runs", Json::Arr(runs)),
+                ])
+            }
+            _ => Json::obj(vec![("table", Json::Bool(true))]),
+        })
+        .collect();
+    Json::obj(vec![
+        ("blocks", Json::Num(doc.body.len() as f64)),
+        ("paragraphs", Json::Arr(blocks)),
+        (
+            "package_has_numbering",
+            Json::Bool(pkg.is_some_and(|p| p.part("word/numbering.xml").is_some())),
+        ),
+    ])
+}
+
 /// A point of the test extension's document view: `view` (its middle),
 /// `link:<n>` (the n-th painted link span's middle; `link:<n>:left` 8 px left
 /// of it) or `word:<text>` (the
@@ -2009,12 +2145,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     let r = editor.caret_props();
     // Over the table, paragraph and character styles (#1427).
     let shown = editor.caret_props_shown();
-    let alignment = match p.align {
-        Align::Left => "left",
-        Align::Center => "center",
-        Align::Right => "right",
-        Align::Justify => "justify",
-    };
+    let alignment = crate::doc_view::align_name(p.align);
     let vert_align = match r.vert_align {
         VertAlign::Baseline => "baseline",
         VertAlign::Superscript => "superscript",
@@ -5226,7 +5357,39 @@ fn dispatch_verb(
             };
             reply.push(("links_followed".into(), Json::Num(calls.len() as f64)));
             reply.push(("link_calls".into(), Json::Arr(calls)));
+            reply.push((
+                "change_calls".into(),
+                Json::Num(f.change_calls.get() as f64),
+            ));
             Done::ok(Json::Obj(reply))
+        }
+        // The host's calls on the view (#1947): one formatting command, an
+        // undo or a redo, through the view's public API; the reply is what it
+        // returned (`done`) and `ext-doc-read`'s fields.
+        "ext-doc-call" => {
+            let fixture = ext_fixture_view(app)?;
+            let call = ext_doc_call(args)?;
+            let doc = fixture.read(cx).doc.clone();
+            let done = doc.update(cx, |v, cx| match call {
+                ExtDocCall::Format(f) => v.format(f, cx),
+                ExtDocCall::Undo => v.undo(cx),
+                ExtDocCall::Redo => v.redo(cx),
+            });
+            let mut reply = match doc.read(cx).harness_json(window) {
+                Json::Obj(fields) => fields,
+                _ => Vec::new(),
+            };
+            reply.insert(0, ("done".into(), Json::Bool(done)));
+            Done::ok(Json::Obj(reply))
+        }
+        // What the view's `document()` and `package()` hand the host (#1947).
+        "ext-doc-document" => {
+            let fixture = ext_fixture_view(app)?;
+            let view = fixture.read(cx).doc.read(cx);
+            Done::ok(ext_doc_document_json(
+                &view.document(),
+                view.package().as_ref(),
+            ))
         }
         "ext-doc-set" => {
             let fixture = ext_fixture_view(app)?;
@@ -5238,13 +5401,17 @@ fn dispatch_verb(
                     _ => return Err(r#"'link_click' must be "click" or "ctrl-click""#.into()),
                 }),
             };
-            let dark = match args.get("content_dark") {
-                None => None,
-                Some(Json::Bool(b)) => Some(*b),
-                Some(_) => return Err("'content_dark' must be true or false".into()),
+            let flag = |name: &str| match args.get(name) {
+                None => Ok(None),
+                Some(Json::Bool(b)) => Ok(Some(*b)),
+                Some(_) => Err(format!("'{name}' must be true or false")),
             };
-            if mode.is_none() && dark.is_none() {
-                return Err("ext-doc-set takes 'link_click' and/or 'content_dark'".into());
+            let dark = flag("content_dark")?;
+            let editable = flag("editable")?;
+            if mode.is_none() && dark.is_none() && editable.is_none() {
+                return Err(
+                    "ext-doc-set takes 'link_click', 'content_dark' and/or 'editable'".into(),
+                );
             }
             let doc = fixture.read(cx).doc.clone();
             doc.update(cx, |v, cx| {
@@ -5254,9 +5421,19 @@ fn dispatch_verb(
                 if let Some(dark) = dark {
                     v.set_content_dark(dark, cx);
                 }
+                if let Some(on) = editable {
+                    v.set_editable(on, cx);
+                }
             });
-            let reply = doc.read(cx).harness_json(window);
-            Done::ok(reply)
+            let mut reply = match doc.read(cx).harness_json(window) {
+                Json::Obj(fields) => fields,
+                _ => Vec::new(),
+            };
+            reply.push((
+                "change_calls".into(),
+                Json::Num(fixture.read(cx).change_calls.get() as f64),
+            ));
+            Done::ok(Json::Obj(reply))
         }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
@@ -7858,7 +8035,7 @@ mod tests {
     fn document_fields_read_editor_and_view_values() {
         let props = ParProps {
             style_id: Some("Heading2".into()),
-            align: Align::Center,
+            align: docxcore::model::Align::Center,
             indent: 720,
             indent_right: 240,
             first_line: -120,
@@ -8649,6 +8826,51 @@ mod tests {
         assert!(!closes_menu("ribbon-layout", &Json::obj(vec![])), "a read");
         let tab = Json::obj(vec![("tab", Json::Str("Data".into()))]);
         assert!(closes_menu("ribbon-layout", &tab));
+    }
+
+    /// #1947: `ext-doc-call` takes exactly one host call, and refuses what
+    /// the view has no command for.
+    #[test]
+    fn ext_doc_call_parses_one_host_call() {
+        use crate::ext::DocFormat as F;
+        use docxcore::model::Align;
+        let call = |text: &str| ext_doc_call(&Json::parse(text).unwrap());
+        assert_eq!(
+            call(r#"{"format":"bold"}"#),
+            Ok(ExtDocCall::Format(F::Bold))
+        );
+        assert_eq!(
+            call(r#"{"format":"align-justify"}"#),
+            Ok(ExtDocCall::Format(F::Align(Align::Justify)))
+        );
+        assert_eq!(
+            call(r#"{"font":"Georgia"}"#),
+            Ok(ExtDocCall::Format(F::Font("Georgia".into())))
+        );
+        assert_eq!(
+            call(r#"{"size":10.5}"#),
+            Ok(ExtDocCall::Format(F::Size(10.5)))
+        );
+        assert_eq!(
+            call(r#"{"color":null}"#),
+            Ok(ExtDocCall::Format(F::Color(None)))
+        );
+        assert_eq!(
+            call(r#"{"highlight":"yellow"}"#),
+            Ok(ExtDocCall::Format(F::Highlight(Some("yellow".into()))))
+        );
+        assert_eq!(call(r#"{"undo":true}"#), Ok(ExtDocCall::Undo));
+        assert_eq!(call(r#"{"redo":true}"#), Ok(ExtDocCall::Redo));
+        for bad in [
+            "{}",
+            r#"{"format":"bold","undo":true}"#,
+            r#"{"format":"sparkle"}"#,
+            r#"{"size":"big"}"#,
+            r#"{"color":3}"#,
+            r#"{"undo":false}"#,
+        ] {
+            assert!(call(bad).is_err(), "{bad}");
+        }
     }
 
     /// #1021: `last-url` reads the page Feedback opened and what its body says.

@@ -49,7 +49,7 @@ issue number to find its notes.
   lives (#1473).
 - `docs/claude/suite-extensions.md`: before changing the suite as a library
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
-  `ext::DocView` (#1873).
+  `ext::DocView` (#1873) and its editing mode (#1947).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
