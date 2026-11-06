@@ -6145,9 +6145,9 @@ mod card_tests {
 
     #[test]
     fn every_prefix_of_the_card_digest_imports() {
-        let page = include_str!("../../tests/fixtures/html/digest-cards.html");
-        for end in (0..=page.len()).filter(|&i| page.is_char_boundary(i)) {
-            let _ = import_html(page[..end].as_bytes());
+        let page = include_bytes!("../../tests/fixtures/html/digest-cards.html");
+        for end in 0..=page.len() {
+            let _ = import_html(&page[..end]);
         }
     }
 
