@@ -2214,17 +2214,57 @@ fn doc_copy_text(clip: &Clip) -> String {
         .join("\n")
 }
 
-/// What a document paste inserts (#755, #1074): the document clip while it
-/// is ours ([`doc_clip_ours`]), else the clipboard's RTF (another app's
-/// rich copy, or ours from another window), else its text. An RTF the
-/// importer cannot read pastes the text.
-fn doc_paste_clip(ours: Option<&DocClip>, now: &ClipRead, rtf: Option<&[u8]>) -> Option<Clip> {
-    match ours {
-        Some(ours) if doc_clip_ours(ours, now, rtf.is_some()) => Some(ours.clip.clone()),
-        _ => rtf
-            .and_then(|rtf| Clip::from_rtf(rtf, now.text()))
-            .or_else(|| now.text().map(Clip::from_text)),
+/// Where a document paste's clip comes from ([`doc_paste_from`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PasteFrom {
+    /// The window's own document clip, still what the clipboard holds.
+    Ours,
+    /// The clipboard's RTF.
+    Rtf,
+    /// The clipboard's HTML (#1950).
+    Html,
+    /// The clipboard's plain text.
+    Text,
+}
+
+/// What a document paste inserts (#755, #1074, #1950), and where it comes
+/// from: the document clip while it is ours ([`doc_clip_ours`]), else the
+/// clipboard's RTF (another app's rich copy, or ours from another window),
+/// else its HTML (a browser's copy has no RTF; a sheet copy's table too:
+/// its cells' display text, without the `'` its TSV gives a text cell),
+/// else its text. An RTF or HTML the importer cannot read falls through to
+/// the next. `html` reads the clipboard's HTML, only when neither our clip
+/// nor the RTF pastes.
+fn doc_paste_from(
+    ours: Option<&DocClip>,
+    now: &ClipRead,
+    rtf: Option<&[u8]>,
+    html: impl FnOnce() -> Option<String>,
+) -> Option<(PasteFrom, Clip)> {
+    if let Some(ours) = ours.filter(|ours| doc_clip_ours(ours, now, rtf.is_some())) {
+        return Some((PasteFrom::Ours, ours.clip.clone()));
     }
+    rtf.and_then(|rtf| Clip::from_rtf(rtf, now.text()))
+        .map(|clip| (PasteFrom::Rtf, clip))
+        .or_else(|| {
+            html()
+                .and_then(|html| Clip::from_html(html.as_bytes(), now.text()))
+                .map(|clip| (PasteFrom::Html, clip))
+        })
+        .or_else(|| {
+            now.text()
+                .map(|text| (PasteFrom::Text, Clip::from_text(text)))
+        })
+}
+
+/// The clip of [`doc_paste_from`].
+fn doc_paste_clip(
+    ours: Option<&DocClip>,
+    now: &ClipRead,
+    rtf: Option<&[u8]>,
+    html: impl FnOnce() -> Option<String>,
+) -> Option<Clip> {
+    doc_paste_from(ours, now, rtf, html).map(|(_, clip)| clip)
 }
 
 /// What the harness's private clipboard holds: a copy's text and, from a
@@ -25298,7 +25338,7 @@ impl Docxy {
 
     /// Paste at the caret: the document clip while it is still what the
     /// clipboard holds (formatting intact), else the clipboard's RTF, else
-    /// its text ([`doc_paste_clip`]).
+    /// its HTML, else its text ([`doc_paste_from`]).
     fn do_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cancel_pointer_modes();
         if self.protected_refused(cx) {
@@ -25306,13 +25346,12 @@ impl Docxy {
         }
         let now = self.clipboard_read(cx);
         let rtf = self.clipboard_read_rtf();
-        let clip = doc_paste_clip(self.clip.as_ref(), &now, rtf.as_deref());
-        if let Some(mut clip) = clip {
+        let from = doc_paste_from(self.clip.as_ref(), &now, rtf.as_deref(), || {
+            self.clipboard_read_html()
+        });
+        if let Some((from, mut clip)) = from {
             // The window's own clip carries its pictures' media (#1639).
-            let ours = self
-                .clip
-                .as_ref()
-                .filter(|ours| doc_clip_ours(ours, &now, rtf.is_some()));
+            let ours = self.clip.as_ref().filter(|_| from == PasteFrom::Ours);
             if let (Some(ours), Some(tab)) = (ours, self.tabs.get_mut(self.active)) {
                 carry_into_tab(tab, &ours.media, &mut clip);
             }
@@ -28336,8 +28375,8 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool
 #[cfg(test)]
 mod clipboard_tests {
     use super::{
-        ClipRead, ClipboardStore, DocClip, clip_still_ours, doc_copy_text, doc_paste_clip,
-        foreign_table, os_text, recorded_after_write, rtf_follows,
+        ClipRead, ClipboardStore, DocClip, PasteFrom, clip_still_ours, doc_copy_text,
+        doc_paste_clip, doc_paste_from, foreign_table, os_text, recorded_after_write, rtf_follows,
     };
     use gridcore::engine::Engine;
     use gridcore::sheet::{Cell, CellValue, Sheet, Workbook};
@@ -28883,36 +28922,130 @@ mod clipboard_tests {
         };
         let text = |t: &str| ClipRead::Text(t.into());
         // Ours, while the clipboard holds its text (the RTF there is ours).
-        let got = doc_paste_clip(Some(&ours), &text("mine"), Some(bold_rtf)).unwrap();
+        let got = doc_paste_clip(Some(&ours), &text("mine"), Some(bold_rtf), || None).unwrap();
         assert_eq!(got.to_text(), "mine");
         // Another app's rich copy.
-        let got = doc_paste_clip(Some(&ours), &text("Plain BOLD"), Some(bold_rtf)).unwrap();
+        let got =
+            doc_paste_clip(Some(&ours), &text("Plain BOLD"), Some(bold_rtf), || None).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD");
         assert_eq!(bold_of(&got), vec!["BOLD".to_string()]);
-        let got = doc_paste_clip(None, &text("Plain BOLD"), Some(bold_rtf)).unwrap();
+        let got = doc_paste_clip(None, &text("Plain BOLD"), Some(bold_rtf), || None).unwrap();
         assert_eq!(bold_of(&got), vec!["BOLD".to_string()]);
         // An RTF with no text beside it is not ours, whatever we hold.
-        let got = doc_paste_clip(Some(&ours), &ClipRead::Nothing, Some(bold_rtf)).unwrap();
+        let got = doc_paste_clip(Some(&ours), &ClipRead::Nothing, Some(bold_rtf), || None).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD");
         let image_only = DocClip {
             media: Default::default(),
             clip: Clip::default(),
             text: String::new(),
         };
-        let got = doc_paste_clip(Some(&image_only), &ClipRead::NotText, Some(bold_rtf));
+        let got = doc_paste_clip(
+            Some(&image_only),
+            &ClipRead::NotText,
+            Some(bold_rtf),
+            || None,
+        );
         assert_eq!(got.map(|c| c.to_text()).as_deref(), Some("Plain BOLD"));
         // Garbage or empty RTF: the text, never a lost paste.
-        let got = doc_paste_clip(None, &text("words"), Some(b"\xff not rtf")).unwrap();
+        let got = doc_paste_clip(None, &text("words"), Some(b"\xff not rtf"), || None).unwrap();
         assert_eq!(got.to_text(), "words");
         assert!(bold_of(&got).is_empty());
-        let got = doc_paste_clip(None, &text("words"), Some(b"{\\rtf1 }")).unwrap();
+        let got = doc_paste_clip(None, &text("words"), Some(b"{\\rtf1 }"), || None).unwrap();
         assert_eq!(got.to_text(), "words");
         // Plain text alone, and nothing at all.
         assert_eq!(
-            doc_paste_clip(None, &text("plain"), None).map(|c| c.to_text()),
+            doc_paste_clip(None, &text("plain"), None, || None).map(|c| c.to_text()),
             Some("plain".into())
         );
-        assert_eq!(doc_paste_clip(None, &ClipRead::Nothing, None), None);
+        assert_eq!(
+            doc_paste_clip(None, &ClipRead::Nothing, None, || None),
+            None
+        );
+    }
+
+    /// #1950: with no RTF, a document paste takes the clipboard's HTML (a
+    /// browser's copy), bold and links kept; an RTF beside it wins, and the
+    /// HTML is then not read; HTML the importer cannot read pastes the text.
+    #[test]
+    fn a_document_paste_takes_the_html_when_there_is_no_rtf_1950() {
+        use docxcore::editor::Clip;
+        use docxcore::model::Inline;
+        let html = "<p>Plain <b>BOLD</b> <a href=\"https://example.com/\">link</a></p>";
+        let text = |t: &str| ClipRead::Text(t.into());
+        let (from, got) =
+            doc_paste_from(None, &text("Plain BOLD link"), None, || Some(html.into())).unwrap();
+        assert_eq!(from, PasteFrom::Html);
+        assert_eq!(got.to_text(), "Plain BOLD link");
+        let flat: Vec<&Inline> = got.paras.iter().flatten().collect();
+        assert!(
+            flat.iter()
+                .any(|i| matches!(i, Inline::Run(r) if r.text == "BOLD" && r.props.bold)),
+            "{flat:?}"
+        );
+        assert!(
+            flat.iter().any(|i| matches!(i, Inline::Hyperlink(h)
+                if h.target.as_deref() == Some("https://example.com/"))),
+            "{flat:?}"
+        );
+        // An RTF there too: the RTF pastes, and the HTML is never read.
+        let rtf: &[u8] = b"{\\rtf1\\ansi From {\\b RTF}}";
+        let (from, got) = doc_paste_from(None, &text("From RTF"), Some(rtf), || {
+            panic!("the HTML is read only without a readable RTF")
+        })
+        .unwrap();
+        assert_eq!((from, got.to_text().as_str()), (PasteFrom::Rtf, "From RTF"));
+        // Our own clip: neither is read.
+        let ours = DocClip {
+            media: Default::default(),
+            clip: Clip::from_text("mine"),
+            text: "mine".into(),
+        };
+        let (from, _) =
+            doc_paste_from(Some(&ours), &text("mine"), None, || panic!("not read")).unwrap();
+        assert_eq!(from, PasteFrom::Ours);
+        // HTML with no text, or none at all: the text.
+        let (from, got) =
+            doc_paste_from(None, &text("words"), None, || Some("<img src=x>".into())).unwrap();
+        assert_eq!((from, got.to_text().as_str()), (PasteFrom::Text, "words"));
+        let (from, _) = doc_paste_from(None, &text("words"), None, || None).unwrap();
+        assert_eq!(from, PasteFrom::Text);
+        // An HTML-only copy, with no text beside it, still pastes.
+        let got = doc_paste_clip(None, &ClipRead::Nothing, None, || Some(html.into())).unwrap();
+        assert_eq!(got.to_text(), "Plain BOLD link");
+    }
+
+    /// #1950: a sheet copy pasted into a document (the document clip not
+    /// ours) takes docxy's own HTML table: the cells' display text,
+    /// tab-joined, with no `'` the TSV beside it gives a text cell like
+    /// `007`, non-ASCII intact through both pages' wrappers.
+    #[test]
+    fn a_sheet_copy_pastes_into_a_document_as_its_table_1950() {
+        let mut sheet = Sheet {
+            name: "S".into(),
+            ..Default::default()
+        };
+        sheet.set_cell(0, 0, Cell::text("007"));
+        sheet.set_cell(0, 1, Cell::text("M\u{fc}ller \u{4e2d}"));
+        sheet.set_cell(1, 0, Cell::text("x"));
+        let table = gridcore::clip_html::html_table(
+            &sheet,
+            &gridcore::sheet::Styles::default(),
+            false,
+            &[0, 1],
+            &[0, 1],
+        );
+        let tsv = "'007\tM\u{fc}ller \u{4e2d}\nx\t\n";
+        for page in [
+            table.clone(),
+            crate::rich_clip::html_page(&table),
+            crate::rich_clip::cf_html(&table),
+        ] {
+            let html = crate::rich_clip::html_fragment(page.as_bytes());
+            let (from, got) =
+                doc_paste_from(None, &ClipRead::Text(tsv.into()), None, || html).unwrap();
+            assert_eq!(from, PasteFrom::Html);
+            assert_eq!(got.to_text(), "007\tM\u{fc}ller \u{4e2d}\nx\t\n");
+        }
     }
 
     /// #1242: a copy of a picture alone writes its stand-in, so the paste
@@ -28939,8 +29072,14 @@ mod clipboard_tests {
             text: recorded_after_write(text, &now),
             clip: clip.clone(),
         };
-        assert_eq!(doc_paste_clip(Some(&ours), &now, None), Some(clip.clone()));
-        assert_eq!(doc_paste_clip(Some(&ours), &ClipRead::NotText, None), None);
+        assert_eq!(
+            doc_paste_clip(Some(&ours), &now, None, || None),
+            Some(clip.clone())
+        );
+        assert_eq!(
+            doc_paste_clip(Some(&ours), &ClipRead::NotText, None, || None),
+            None
+        );
         // A plain paste of the stand-in elsewhere in docxy types nothing.
         assert_eq!(Clip::from_text("\u{FFFC}\u{FFFC}").to_text(), "");
         // A linked picture copied alone: the clip keeps its link, and the

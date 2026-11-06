@@ -77,7 +77,7 @@ const CHARSET: &str = "<meta charset=\"utf-8\">";
 /// header's length does not depend on them) of the page, and of the fragment
 /// between its `<!--StartFragment-->` markers.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn cf_html(fragment: &str) -> String {
+pub(crate) fn cf_html(fragment: &str) -> String {
     const HEADER: usize = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\n".len();
     let before = format!("<html><head>{CHARSET}</head><body>\r\n<!--StartFragment-->");
     let after = "<!--EndFragment-->\r\n</body>\r\n</html>";
@@ -91,7 +91,7 @@ fn cf_html(fragment: &str) -> String {
 
 /// `fragment` as the macOS `public.html` page.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
-fn html_page(fragment: &str) -> String {
+pub(crate) fn html_page(fragment: &str) -> String {
     format!("<html><head>{CHARSET}</head><body>{fragment}</body></html>")
 }
 
