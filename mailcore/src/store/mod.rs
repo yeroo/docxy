@@ -99,14 +99,14 @@ pub struct FolderHistory {
     /// before #1871), [`SCOPE_HEAD`], [`SCOPE_WINDOW`] or [`SCOPE_ALL`].
     pub scope: Option<String>,
     /// Items the folder's full delta has walked past so far: its upserts
-    /// within the window, stored or already there (not `@removed`). It may
+    /// within the window, merged or kept as a local edit (not `@removed`). It may
     /// exceed `total_count`: a UI clamps.
     pub synced: i64,
     /// The full delta's next page, while a backfill is under way.
     pub backfill_link: Option<String>,
-    /// What the walk under way covers: [`SCOPE_WINDOW`] once a page skipped
-    /// items older than the window, else [`SCOPE_ALL`]; `None` before its
-    /// first page. A whole-mailbox engine restarts a `window` walk.
+    /// What the walk under way covers: [`SCOPE_WINDOW`] once a page ran with
+    /// the window's cutoff, else [`SCOPE_ALL`]; `None` before its first
+    /// page. A whole-mailbox engine restarts a `window` walk.
     pub backfill_scope: Option<String>,
     /// Whether the folder has a delta link (its phase 1 is done).
     pub has_delta_link: bool,
@@ -951,49 +951,6 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts a message row from a backfill page (#1871) only when no row
-    /// has its id, with what the item carried (empty otherwise, as
-    /// `merge_message` inserts it); an existing row is left as it is, so a
-    /// page never overwrites a local edit (a draft's unsaved fields, an
-    /// optimistic write whose op is still queued). The folder's delta
-    /// rounds keep existing rows fresh. Returns whether it inserted.
-    pub fn insert_message_if_absent(
-        &self,
-        folder_id: &str,
-        m: &Message,
-    ) -> Result<bool, StoreError> {
-        let n = self.conn.execute(
-            "INSERT INTO messages (
-                 id, folder_id, conversation_id, subject, from_name, from_addr,
-                 to_recipients, cc_recipients, received_at, sent_at,
-                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                 is_meeting_request, categories
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-             ON CONFLICT(id) DO NOTHING",
-            params![
-                m.id,
-                folder_id,
-                m.conversation_id,
-                m.subject,
-                m.from.name,
-                m.from.address,
-                encode_recipients(&m.to),
-                encode_recipients(&m.cc),
-                m.received,
-                m.sent,
-                m.is_read,
-                m.is_flagged,
-                m.has_attachments,
-                m.importance,
-                m.preview,
-                m.is_draft,
-                m.is_meeting_request,
-                encode_categories(&m.categories),
-            ],
-        )?;
-        Ok(n > 0)
-    }
-
     /// Whether the row `id` is a draft docxy may hold unsaved edits of
     /// (#1871): `is_draft`, or filed under the Drafts folder or the local
     /// sentinel, as `get_body_for` reads a draft. `false` for no row.
@@ -1330,13 +1287,43 @@ impl Store {
     ///
     /// It also clears every folder's backfill (#1871): its link, count and
     /// scope, so each folder runs its head and then its full delta again.
+    /// And it marks a reconverge pending (`meta.reconverge_pending`, read by
+    /// [`Store::reconverge_pending`]), in the same transaction, so an engine
+    /// restarted before the reconverge ends still runs it without the
+    /// window's cutoff.
     pub fn clear_delta_links(&self) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
                                 backfill_scope = NULL",
             [],
         )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('reconverge_pending', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether a quarantine reconverge `clear_delta_links` started is still
+    /// to finish (#1871): the engine loads it at startup.
+    pub fn reconverge_pending(&self) -> Result<bool, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'reconverge_pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The reconverge is over (#1871): every folder's delta ran and no
+    /// backfill remains.
+    pub fn clear_reconverge_pending(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'reconverge_pending'", [])?;
         Ok(())
     }
 
@@ -1352,9 +1339,9 @@ impl Store {
 
     /// Records a backfill page (#1871): the full delta's next page, the
     /// running count of items it has walked past, and what the page
-    /// covered (`page_scope`): the walk's scope becomes [`SCOPE_WINDOW`]
-    /// once any page is, else stays what it was ([`SCOPE_ALL`] for a
-    /// first page).
+    /// covered (`page_scope`: [`SCOPE_WINDOW`] when it ran with the
+    /// window's cutoff): the walk's scope becomes [`SCOPE_WINDOW`] once any
+    /// page is, else stays what it was ([`SCOPE_ALL`] for a first page).
     pub fn set_backfill_progress(
         &self,
         folder_id: &str,
@@ -6155,29 +6142,6 @@ mod backfill_tests {
     }
 
     #[test]
-    fn insert_message_if_absent_never_overwrites_a_row() {
-        let s = Store::open_in_memory().unwrap();
-        folder(&s, "F1", 10, None);
-        folder(&s, "F2", 10, None);
-        s.upsert_message("F1", &message("M1", "local", true))
-            .unwrap();
-        assert!(
-            !s.insert_message_if_absent("F2", &message("M1", "server", false))
-                .unwrap()
-        );
-        let row = &s.messages_in_folder("F1", 10, 0).unwrap()[0];
-        assert_eq!((row.subject.as_str(), row.is_read), ("local", true));
-        assert!(s.messages_in_folder("F2", 10, 0).unwrap().is_empty());
-
-        assert!(
-            s.insert_message_if_absent("F2", &message("M2", "new", false))
-                .unwrap()
-        );
-        let row = &s.messages_in_folder("F2", 10, 0).unwrap()[0];
-        assert_eq!((row.id.as_str(), row.subject.as_str()), ("M2", "new"));
-    }
-
-    #[test]
     fn is_local_draft_by_flag_drafts_folder_or_sentinel() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "INBOX", 10, Some("inbox"));
@@ -6232,7 +6196,21 @@ mod backfill_tests {
     }
 
     #[test]
-    fn a_walk_is_window_once_any_page_skipped_old_mail() {
+    fn clear_delta_links_marks_a_reconverge_until_it_is_cleared() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 10, None);
+        s.set_delta_link("F1", "LINK").unwrap();
+        assert!(!s.reconverge_pending().unwrap());
+        s.clear_delta_links().unwrap();
+        assert!(s.reconverge_pending().unwrap());
+        assert!(s.get_delta_link("F1").unwrap().is_none());
+        s.clear_delta_links().unwrap();
+        s.clear_reconverge_pending().unwrap();
+        assert!(!s.reconverge_pending().unwrap());
+    }
+
+    #[test]
+    fn a_walk_is_window_once_any_page_ran_with_the_cutoff() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         s.set_head_link("F1", "HEAD").unwrap();

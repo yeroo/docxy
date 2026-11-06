@@ -362,9 +362,9 @@ pub enum SyncEvent {
     /// A folder's backfill of older mail moved on (#1871): after every page
     /// of its full delta, and once when it completed (`complete: true`).
     /// `synced` is the persisted count of items that delta has walked past:
-    /// its upserts, inserted or already stored (not `@removed`; in window
-    /// mode not the items older than the window). `total` is the folder's `total_count` in
-    /// whole-mailbox mode and `None` in window mode (the window's size is
+    /// its upserts, merged or kept as a local edit (not `@removed`; in
+    /// window mode not the items older than the window). `total` is the
+    /// folder's `total_count` in whole-mailbox mode and `None` in window mode (the window's size is
     /// unknown). `synced` can exceed `total` (the full delta re-sends the
     /// head's mail, mail arrives meanwhile, delta can repeat an item), so a
     /// UI clamps. `Store::folder_history` holds the same state before any
@@ -407,6 +407,13 @@ const HEAD_WINDOW_DAYS: i64 = 14;
 /// A folder with at most this many messages (`total_count`, one delta page)
 /// skips the head: its first sync runs the full delta inline (#1871).
 const SMALL_FOLDER: i64 = 50;
+
+/// How `Engine::run_delta` ended: the last page's deltaLink, if it had one,
+/// and the upserts it walked past.
+struct DeltaRun {
+    delta_link: Option<String>,
+    walked: u64,
+}
 
 /// What `Engine::repair_headerless` did to a folder.
 struct Repair {
@@ -599,6 +606,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
             return;
         }
     };
+    // A quarantine reconverge an earlier run left unfinished (#1871).
+    let reconverge_pending = store.reconverge_pending().unwrap_or(false);
     let mut engine = Engine {
         store,
         token: None,
@@ -608,7 +617,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         next_retry: None,
         backoff: BACKOFF_MIN,
         backfill_done: false,
-        reconverge_pending: false,
+        reconverge_pending,
         parked: Vec::new(),
         expired: Vec::new(),
         next_tick: Instant::now(),
@@ -654,7 +663,9 @@ struct Engine {
     /// removed locally — including messages that have since aged past the
     /// sliding window. Cleared once a pass ran every folder's delta and no
     /// folder's backfill remains (#1871: old mail comes back through the
-    /// backfill), else by the backfill step that completes the last folder.
+    /// backfill), else by the backfill step that completes the last folder
+    /// (`end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
+    /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
@@ -1149,7 +1160,7 @@ impl Engine {
         // clears it. Clear it before draining: if the drain quarantines a
         // fresh op it will re-arm reconverge for the next pass.
         if !self.backfill_remains() {
-            self.reconverge_pending = false;
+            self.end_reconverge();
         }
         // A drain that a throttle, an offline error or a lost sign-in cut
         // short keeps its back-off: the pass stops here, as after a folder.
@@ -1458,7 +1469,7 @@ impl Engine {
             && self
                 .folder_total(folder_id)
                 .is_some_and(|n| n <= SMALL_FOLDER);
-        let (mut cursor, cutoff) = match stored {
+        let (cursor, cutoff) = match stored {
             Some(link) => (DeltaCursor::Link(link), None),
             None if small => (
                 DeltaCursor::Full(folder_id.to_string()),
@@ -1474,42 +1485,32 @@ impl Engine {
         };
         // A head or a small folder's full delta, not a round on a stored link.
         let started_fresh = !matches!(cursor, DeltaCursor::Link(_));
-        let mut upserts = 0u64;
-
-        loop {
-            let page = match self.with_auth(|c| c.delta(cursor.clone())) {
-                Ok(p) => p,
-                // `react` returns true when the pass must abort; a non-fatal
-                // error (a 4xx/parse on this folder) is surfaced there and we
-                // stop this folder but keep the pass going.
-                Err(e) => return !self.react(e),
-            };
-            upserts += self.merge_delta_items(folder_id, &page.items, cutoff.as_deref());
-            if let Some(next) = page.next_link {
-                cursor = DeltaCursor::Link(next);
-                continue;
-            }
-            if let Some(delta) = page.delta_link {
-                if !started_fresh {
-                    let _ = self.store.set_delta_link(folder_id, &delta);
-                } else if small {
-                    let scope = if cutoff.is_some() {
-                        SCOPE_WINDOW
-                    } else {
-                        SCOPE_ALL
-                    };
-                    if self
-                        .store
-                        .complete_backfill(folder_id, &delta, scope, upserts as i64)
-                        .is_ok()
-                    {
-                        self.emit_progress(folder_id, upserts, true);
-                    }
+        let run = match self.run_delta(folder_id, cursor, cutoff.as_deref()) {
+            Ok(run) => run,
+            // `react` returns true when the pass must abort; a non-fatal
+            // error (a 4xx/parse on this folder) is surfaced there and we
+            // stop this folder but keep the pass going.
+            Err(e) => return !self.react(e),
+        };
+        if let Some(delta) = run.delta_link {
+            if !started_fresh {
+                let _ = self.store.set_delta_link(folder_id, &delta);
+            } else if small {
+                let scope = if cutoff.is_some() {
+                    SCOPE_WINDOW
                 } else {
-                    let _ = self.store.set_head_link(folder_id, &delta);
+                    SCOPE_ALL
+                };
+                if self
+                    .store
+                    .complete_backfill(folder_id, &delta, scope, run.walked as i64)
+                    .is_ok()
+                {
+                    self.emit_progress(folder_id, run.walked, true);
                 }
+            } else {
+                let _ = self.store.set_head_link(folder_id, &delta);
             }
-            break;
         }
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: folder_id.to_string(),
@@ -1521,6 +1522,33 @@ impl Engine {
             });
         }
         !repair.abort
+    }
+
+    /// Pages a delta from `cursor` to its end into `folder_id`
+    /// (`merge_delta_items` with `cutoff`), returning its deltaLink (if the
+    /// last page had one) and how many upserts it walked past. A Graph
+    /// failure is returned as it is, for the caller to `react` to; the
+    /// pages before it stay merged.
+    fn run_delta(
+        &mut self,
+        folder_id: &str,
+        mut cursor: DeltaCursor,
+        cutoff: Option<&str>,
+    ) -> Result<DeltaRun, GraphError> {
+        let mut walked = 0;
+        loop {
+            let page = self.with_auth(|c| c.delta(cursor.clone()))?;
+            walked += self.merge_delta_items(folder_id, &page.items, cutoff);
+            match page.next_link {
+                Some(next) => cursor = DeltaCursor::Link(next),
+                None => {
+                    return Ok(DeltaRun {
+                        delta_link: page.delta_link,
+                        walked,
+                    });
+                }
+            }
+        }
     }
 
     /// Merges a delta page's items into `folder_id`: upserts (skipping one
@@ -1554,16 +1582,15 @@ impl Engine {
 
     /// Applies a backfill page's items to `folder_id` and returns how many
     /// upserts it walked past (within `cutoff`, whatever became of them).
-    /// A page re-sends every message of the folder for a long time, so it
-    /// never overwrites a row: it inserts one the store lacks
-    /// (`Store::insert_message_if_absent`), and the folder's delta rounds
-    /// keep existing rows fresh. A message a queued outbox op names is left
-    /// alone, so a deleted one is not put back while its op waits. During a
-    /// quarantine reconverge (`reconverge_pending`) a page merges instead,
-    /// to correct rows the dropped op left wrong, but still skips those
-    /// ids and every draft (`Store::is_local_draft`: its unsaved edits).
-    /// `@removed` deletes as in a delta round. Only reading the queued ops
-    /// can fail; a row that fails to write is skipped, as in a delta round.
+    /// A page carries the server's current state, and nothing else re-sends
+    /// an old row's (the head's link sees only recent mail), so it merges
+    /// (`merge_message`), but never over a local edit: it skips every id a
+    /// queued outbox op names (`Store::pending_message_ids`: its optimistic
+    /// write has not reached Graph, and a deleted message is not put back)
+    /// and every draft (`Store::is_local_draft`: compose saves its fields
+    /// with no op until `SaveDraft`, whose PATCH reads the row). `@removed`
+    /// deletes as in a delta round. Only reading the queued ops can fail; a
+    /// row that fails to write is skipped, as in a delta round.
     fn apply_backfill_items(
         &self,
         folder_id: &str,
@@ -1581,12 +1608,9 @@ impl Engine {
                         }
                     }
                     walked += 1;
-                    if pending.binary_search(&m.id).is_ok() {
-                        continue;
-                    }
-                    if !self.reconverge_pending {
-                        let _ = self.store.insert_message_if_absent(folder_id, m);
-                    } else if !self.store.is_local_draft(&m.id).unwrap_or(true) {
+                    let local = pending.binary_search(&m.id).is_ok()
+                        || self.store.is_local_draft(&m.id).unwrap_or(true);
+                    if !local {
                         let _ = self.store.merge_message(folder_id, m, fields);
                     }
                 }
@@ -1596,6 +1620,15 @@ impl Engine {
             }
         }
         Ok(walked)
+    }
+
+    /// The quarantine reconverge is over: the flag is cleared, in memory and
+    /// in the store.
+    fn end_reconverge(&mut self) {
+        if self.reconverge_pending {
+            self.reconverge_pending = false;
+            let _ = self.store.clear_reconverge_pending();
+        }
     }
 
     /// Whether `backfill_days` asks for the whole mailbox ([`WHOLE_MAILBOX`]).
@@ -1710,13 +1743,14 @@ impl Engine {
     /// One page of a folder's full delta (#1871, phase 2), from its
     /// persisted `nextLink` or a fresh `DeltaCursor::Full` (also when a
     /// walk a window engine began resumes in whole-mailbox mode: its pages
-    /// skipped old mail). Its items are applied by `apply_backfill_items`
-    /// (insert-only, older than the window skipped in window mode, unless a
-    /// reconverge is pending), then the next link, the running count and
-    /// the walk's scope are stored and `MessagesUpdated` and
-    /// `FolderProgress` sent. The
-    /// deltaLink, when it comes, becomes the folder's `delta_link` in the
-    /// same statement that marks it complete (`Store::complete_backfill`);
+    /// ran with the window's cutoff). Its items are applied by
+    /// `apply_backfill_items` (merged, never over a local edit; older than
+    /// the window skipped in window mode, unless a reconverge is pending),
+    /// then the next link, the running count and the walk's scope are
+    /// stored and `MessagesUpdated` and `FolderProgress` sent. When the
+    /// deltaLink comes, one last round on the folder's own link runs first,
+    /// then the deltaLink becomes the folder's `delta_link` in the same
+    /// statement that marks it complete (`Store::complete_backfill`);
     /// `repair_headerless` follows. Sets no state: a failed page keeps what
     /// `react` set. An expired sync state starts the folder over, once a
     /// pass (`is_expired_sync_state`); a second expiry, any other non-fatal
@@ -1768,10 +1802,10 @@ impl Engine {
             }
         };
         let synced = u64::try_from(h.synced).unwrap_or(0) + walked;
+        self.emit(SyncEvent::MessagesUpdated {
+            folder_id: id.clone(),
+        });
         if let Some(next) = page.next_link {
-            self.emit(SyncEvent::MessagesUpdated {
-                folder_id: id.clone(),
-            });
             match self
                 .store
                 .set_backfill_progress(&id, &next, synced as i64, page_scope)
@@ -1789,7 +1823,35 @@ impl Engine {
             self.park(&id);
             return;
         };
-        // A walk any page of which skipped old mail covers the window only.
+        // One last round on the folder's own link (the head's, or a link
+        // from before #1871) before the walk's deltaLink replaces it: it
+        // brings recent mail changed during the walk up to date, which the
+        // walk's link would not report. A round that fails does not
+        // complete: a fatal failure stops through `react`, any other parks
+        // the folder, and the next step fetches the last page again (its
+        // link is still the stored one).
+        match self.store.get_delta_link(&id) {
+            Ok(Some(link)) => match self.run_delta(&id, DeltaCursor::Link(link), None) {
+                Ok(run) => {
+                    if let Some(head) = run.delta_link {
+                        let _ = self.store.set_delta_link(&id, &head);
+                    }
+                }
+                Err(e) => {
+                    if !self.react(e) {
+                        self.park(&id);
+                    }
+                    return;
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+        }
+        // A walk any page of which ran with the window's cutoff covers the
+        // window only.
         let scope =
             if page_scope == SCOPE_WINDOW || h.backfill_scope.as_deref() == Some(SCOPE_WINDOW) {
                 SCOPE_WINDOW
@@ -1808,7 +1870,7 @@ impl Engine {
         });
         self.emit_progress(&id, synced, true);
         if !self.backfill_remains() {
-            self.reconverge_pending = false;
+            self.end_reconverge();
         }
         let repair = self.repair_headerless(&id);
         if repair.changed {
@@ -10970,6 +11032,136 @@ mod tests {
         }
 
         #[test]
+        fn a_backfill_page_corrects_stale_rows() {
+            // A1 was inserted by a walk that then expired, and O1 by an
+            // earlier sync; both are older than the head's 14 days, so only
+            // the walk carries their server state. Both were left stale.
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("A1", "2025-01-01T00:00:00Z")],
+                        vec![msg("P2", "2025-01-01T00:00:00Z")],
+                        vec![msg("O1", "2024-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 410, "{}"), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-stale");
+            seed_at_page_2(&dir);
+            {
+                let s = store_in(&dir);
+                seed_row(
+                    &s,
+                    "F1",
+                    &full_message_json("A1", "stale", "2025-01-01T00:00:00Z"),
+                );
+                seed_row(
+                    &s,
+                    "F1",
+                    &full_message_json("O1", "stale", "2024-01-01T00:00:00Z"),
+                );
+            }
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_eq!(row(&dir, "F1", "A1").unwrap().subject, "A1");
+            assert_eq!(row(&dir, "F1", "O1").unwrap().subject, "O1");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_last_round_brings_head_mail_changed_during_the_walk() {
+            // H1 came with the head; the server changed it during the walk,
+            // whose pages still carried the old one, and no tick came.
+            let changed = page(
+                &[full_message_json("H1", "changed", "2026-11-05T00:00:00Z")],
+                None,
+                Some(&head_link("F1")),
+            );
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![msg("H1", "2026-11-05T00:00:00Z")],
+                    pages: vec![
+                        vec![msg("H1", "2026-11-05T00:00:00Z")],
+                        vec![msg("P2", "2025-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 200, &changed), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-last-round");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_eq!(row(&dir, "F1", "H1").unwrap().subject, "changed");
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            let rounds = positions(&srv, |p| p == head_link("F1"));
+            assert_eq!(rounds.len(), 1, "{:?}", paths_from(&srv, 0));
+            assert!(rounds[0] > *pages.last().unwrap(), "after the last page");
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_failed_last_round_completes_on_a_later_step() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![(throttle(&head_link("F1"), 1), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-last-round-429");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            // The last page is asked again after the throttle, and counted once.
+            assert_eq!(count(&srv, |p| p == page_link("F1", 2)), 2);
+            assert_eq!(progress(&events, "F1").last(), Some(&(2, Some(BIG), true)));
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reconverge_an_earlier_run_left_keeps_the_cutoff_off() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("RECENT", &unix_to_iso8601(now_unix() - 86400))],
+                        vec![msg("ANCIENT", "2020-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-restart");
+            // The run before quarantined an op and stopped before the
+            // reconverge ended.
+            seed_legacy(&dir);
+            store_in(&dir).clear_delta_links().unwrap();
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F1");
+            assert!(row(&dir, "F1", "ANCIENT").is_some(), "no cutoff");
+            assert!(
+                !store_in(&dir).reconverge_pending().unwrap(),
+                "and it ended"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
         fn a_window_walk_resumed_in_whole_mode_starts_over() {
             let srv = FakeServer::start_paced(mailbox(
                 &[Fold {
@@ -11047,7 +11239,9 @@ mod tests {
             for k in 2..=15 {
                 assert_eq!(count(&srv, |p| p == page_link("F1", k)), 1, "page {k}");
             }
-            for t in &rounds {
+            // The round right after the last page is the walk's own last
+            // round, before it completes.
+            for t in rounds.iter().filter(|t| Some(*t) < pages.last()) {
                 assert!(
                     is_counts(&paths[t + 1], "F1"),
                     "a round is followed by its counts: {paths:?}"

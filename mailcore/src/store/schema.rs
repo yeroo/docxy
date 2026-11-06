@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS folders (
     -- `nextLink` (NULL: not started, or done), the items it returned so
     -- far, what `delta_link` covers (NULL: never synced, or a link from
     -- before #1871; 'head', 'window' or 'all'), and what the walk under way
-    -- covers ('window' once a page skipped old items, else 'all').
+    -- covers ('window' once a page ran with the window's cutoff, else 'all').
     backfill_link   TEXT,
     backfill_synced INTEGER NOT NULL DEFAULT 0,
     history_scope   TEXT,
