@@ -130,7 +130,9 @@ impl Numbering {
     ) -> Option<(&AbstractNum, usize, &'c [i32])> {
         let abs_id = *self.num_to_abstract.get(&num_id)?;
         let absn = self.abstracts.get(&abs_id)?;
-        let ilvl = ilvl.max(0) as usize;
+        // OOXML has nine levels: a larger `w:ilvl` must not grow the
+        // counters to it.
+        let ilvl = ilvl.clamp(0, 8) as usize;
 
         let c = counters.entry(abs_id).or_default();
         while c.len() <= ilvl {
@@ -781,5 +783,20 @@ mod tests {
         }
         let got = chapters(vec![off, styled("Heading1", Some(1))], OUTLINE_XML);
         assert_eq!(got, vec![bare(1), ch(1, "1")]);
+    }
+
+    /// A huge `w:ilvl` is level 8: the counters never grow past nine
+    /// levels (#1948 r3).
+    #[test]
+    fn a_huge_ilvl_is_the_last_level() {
+        let n = parse_numbering_xml(
+            "<w:numbering><w:abstractNum w:abstractNumId=\"1\"><w:lvl w:ilvl=\"0\">\
+             <w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/></w:lvl></w:abstractNum>\
+             <w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num></w:numbering>",
+        );
+        let mut counters = HashMap::new();
+        assert_eq!(n.step(1, 2_000_000_000, &mut counters), Some(1));
+        assert_eq!(n.step(1, i32::MAX, &mut counters), Some(2));
+        assert!(counters.values().all(|c| c.len() <= 9), "{counters:?}");
     }
 }
