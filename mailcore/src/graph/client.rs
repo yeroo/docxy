@@ -10,7 +10,7 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderListing, MailFolder,
-    MasterCategory, Message, MessageFields, OofStatus, Person, Recipient, Recurrence,
+    MasterCategory, Me, Message, MessageFields, OofStatus, Person, Recipient, Recurrence,
     ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
@@ -699,6 +699,58 @@ impl GraphClient {
         Ok(())
     }
 
+    /// GET `/me?$select=displayName,mail,userPrincipalName`: who is signed in.
+    /// Needs only `User.Read`.
+    pub fn me(&self) -> Result<Me, GraphError> {
+        let resp = self.send(
+            Method::Get,
+            "/me?$select=displayName,mail,userPrincipalName",
+            None,
+            &[],
+        )?;
+        Ok(Me::from_json(&parse_body(resp)?))
+    }
+
+    /// The signed-in user's photo as `(bytes, content type)`: GET
+    /// `/me/photo/$value`, and on a 404 `/me/photos/48x48/$value`. `Ok(None)`
+    /// when both are 404 (the user has no photo: the client draws initials).
+    /// Any other error, on either request, is returned as it is, with no
+    /// fallback. A photo over [`PHOTO_MAX`] bytes is refused as a `Parse`
+    /// error.
+    pub fn my_photo(&self) -> Result<Option<(Vec<u8>, String)>, GraphError> {
+        match self.get_photo("/me/photo/$value") {
+            Err(GraphError::NotFound) => {}
+            other => return other.map(Some),
+        }
+        match self.get_photo("/me/photos/48x48/$value") {
+            Err(GraphError::NotFound) => Ok(None),
+            other => other.map(Some),
+        }
+    }
+
+    /// One photo `$value` request: binary, so it asks for `image/*` (the
+    /// header replaces `send`'s JSON `Accept`), refuses a `Content-Length`
+    /// over [`PHOTO_MAX`] before reading, and reads at most `PHOTO_MAX` bytes
+    /// whatever the header said. The content type is the `Content-Type`
+    /// header without its parameters, `application/octet-stream` when absent.
+    fn get_photo(&self, path: &str) -> Result<(Vec<u8>, String), GraphError> {
+        let resp = self.send(Method::Get, path, None, &[("Accept", "image/*")])?;
+        let declared = resp
+            .header("Content-Length")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        if declared.is_some_and(|n| n > PHOTO_MAX as u64) {
+            return Err(photo_too_large(PHOTO_MAX));
+        }
+        let content_type = resp
+            .header("Content-Type")
+            .map(|v| v.split(';').next().unwrap_or("").trim())
+            .filter(|v| !v.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = read_capped(resp.into_reader(), PHOTO_MAX)?;
+        Ok((bytes, content_type))
+    }
+
     /// GET `/me/mailboxSettings` and parse its `automaticRepliesSetting` into
     /// an [`AutomaticReplies`].
     pub fn get_automatic_replies(&self) -> Result<AutomaticReplies, GraphError> {
@@ -974,6 +1026,29 @@ fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
         .into_string()
         .map_err(|e| GraphError::Transport(e.to_string()))?;
     json::parse(&text).map_err(|e| GraphError::Parse(e.to_string()))
+}
+
+/// The largest profile photo `GraphClient::my_photo` accepts (4 MiB). Graph's
+/// photos are a few kilobytes; anything near this is not a photo.
+pub const PHOTO_MAX: usize = 4 * 1024 * 1024;
+
+fn photo_too_large(max: usize) -> GraphError {
+    GraphError::Parse(format!("profile photo is larger than {max} bytes"))
+}
+
+/// Reads `r` to its end, refusing (`photo_too_large`: only photos use it)
+/// once it yields more than `max` bytes. At most `max + 1` bytes are ever
+/// read, so a chunked or lying response cannot make it buffer more.
+fn read_capped(r: impl std::io::Read, max: usize) -> Result<Vec<u8>, GraphError> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    r.take(max as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| GraphError::Transport(e.to_string()))?;
+    if buf.len() > max {
+        return Err(photo_too_large(max));
+    }
+    Ok(buf)
 }
 
 /// Reads `key` off `v` as a JSON array, erroring with a `Parse` when it's
@@ -2339,6 +2414,207 @@ mod tests {
         let arr = sent.get("categories").and_then(Value::as_array).unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("Work"));
+    }
+
+    fn photo_route(path: &str, status: u16, body: &str, headers: &[(&str, &str)]) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: path.into(),
+            status,
+            headers: headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            body: body.into(),
+        }
+    }
+
+    const PHOTO: &str = "/me/photo/$value";
+    const PHOTO_48: &str = "/me/photos/48x48/$value";
+
+    #[test]
+    fn me_parses_profile() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me?$select",
+            200,
+            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com"}"#,
+            &[],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let me = c.me().unwrap();
+        assert_eq!(me.display_name, "Ada Lovelace");
+        assert_eq!(me.address(), "ada@contoso.com");
+        assert_eq!(me.user_principal_name, "ada@contoso.onmicrosoft.com");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].path,
+            "/me?$select=displayName,mail,userPrincipalName"
+        );
+    }
+
+    #[test]
+    fn me_without_mail_uses_upn() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me?$select",
+            200,
+            r#"{"displayName":"Ada","mail":null,"userPrincipalName":"ada@outlook.com"}"#,
+            &[],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let me = c.me().unwrap();
+        assert_eq!(me.mail, "");
+        assert_eq!(me.address(), "ada@outlook.com");
+    }
+
+    #[test]
+    fn my_photo_returns_bytes_and_type() {
+        let srv = FakeServer::start(vec![photo_route(
+            PHOTO,
+            200,
+            "JPEGDATA",
+            &[("Content-Type", "image/jpeg; charset=binary")],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let photo = c.my_photo().unwrap();
+        assert_eq!(
+            photo,
+            Some((b"JPEGDATA".to_vec(), "image/jpeg".to_string()))
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, PHOTO);
+        let accepts: Vec<&str> = reqs[0]
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("accept"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(accepts, ["image/*"]);
+    }
+
+    #[test]
+    fn my_photo_without_content_type_is_octet_stream() {
+        let srv = FakeServer::start(vec![photo_route(PHOTO, 200, "RAW", &[])]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (_, ty) = c.my_photo().unwrap().unwrap();
+        assert_eq!(ty, "application/octet-stream");
+    }
+
+    #[test]
+    fn my_photo_falls_back_to_48x48() {
+        let srv = FakeServer::start(vec![
+            photo_route(PHOTO, 404, r#"{"error":{"code":"ImageNotFound"}}"#, &[]),
+            photo_route(PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let photo = c.my_photo().unwrap();
+        assert_eq!(photo, Some((b"SMALL".to_vec(), "image/png".to_string())));
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, [PHOTO, PHOTO_48]);
+    }
+
+    #[test]
+    fn my_photo_none_when_both_404() {
+        let srv = FakeServer::start(vec![
+            photo_route(PHOTO, 404, "{}", &[]),
+            photo_route(PHOTO_48, 404, "{}", &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.my_photo(), Ok(None));
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn my_photo_refuses_oversize() {
+        let big = "x".repeat(PHOTO_MAX + 1);
+        let srv = FakeServer::start(vec![photo_route(
+            PHOTO,
+            200,
+            &big,
+            &[("Content-Type", "image/jpeg")],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.my_photo() {
+            Err(GraphError::Parse(m)) => assert!(m.contains("larger than"), "{m}"),
+            other => panic!(
+                "expected a Parse error, got {:?}",
+                other.map(|p| p.map(|(b, t)| (b.len(), t)))
+            ),
+        }
+    }
+
+    #[test]
+    fn my_photo_accepts_exactly_the_cap() {
+        let max = "x".repeat(PHOTO_MAX);
+        let srv = FakeServer::start(vec![photo_route(
+            PHOTO,
+            200,
+            &max,
+            &[("Content-Type", "image/jpeg")],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (bytes, _) = c.my_photo().unwrap().unwrap();
+        assert_eq!(bytes.len(), PHOTO_MAX);
+    }
+
+    #[test]
+    fn my_photo_propagates_other_errors() {
+        // No fallback to 48x48 on anything but a 404.
+        for (status, want) in [
+            (
+                500,
+                GraphError::Http {
+                    status: 500,
+                    body: "boom".into(),
+                },
+            ),
+            (401, GraphError::Unauthorized),
+            (
+                503,
+                GraphError::Throttled {
+                    retry_after_secs: 30,
+                },
+            ),
+        ] {
+            let srv = FakeServer::start(vec![
+                photo_route(PHOTO, status, "boom", &[]),
+                photo_route(PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+            ]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            assert_eq!(c.my_photo(), Err(want));
+            assert_eq!(srv.requests().len(), 1, "status {status}");
+        }
+        // A 404 then any other error on 48x48 is that error, not `None`.
+        let srv = FakeServer::start(vec![
+            photo_route(PHOTO, 404, "{}", &[]),
+            photo_route(PHOTO_48, 500, "boom", &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.my_photo(),
+            Err(GraphError::Http {
+                status: 500,
+                body: "boom".into()
+            })
+        );
+    }
+
+    #[test]
+    fn read_capped_refuses_an_endless_body() {
+        // `repeat` never ends: only the cap stops the read.
+        match read_capped(std::io::repeat(b'x'), 1024) {
+            Err(GraphError::Parse(m)) => assert!(m.contains("larger than 1024"), "{m}"),
+            other => panic!("expected a Parse error, got {:?}", other.map(|b| b.len())),
+        }
+    }
+
+    #[test]
+    fn read_capped_accepts_exactly_max() {
+        use std::io::Read;
+        let bytes = read_capped(std::io::repeat(b'x').take(1024), 1024).unwrap();
+        assert_eq!(bytes.len(), 1024);
+        assert_eq!(read_capped(&b""[..], 1024).unwrap(), Vec::<u8>::new());
     }
 
     #[test]
