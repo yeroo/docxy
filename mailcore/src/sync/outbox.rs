@@ -767,6 +767,58 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_made_during_the_push_stays_unsaved() {
+        // The PATCH is held 600 ms; 200 ms in, compose saves again on its
+        // own connection. The push read generation 1 and sent it, so the
+        // clear must not match generation 2.
+        let srv = FakeServer::start_paced(vec![(
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/GRAPH-5".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            None,
+            std::time::Duration::from_millis(600),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-outbox-push-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let store = Store::open(&path).unwrap();
+        let synced = edited_draft(&store);
+        store.reconcile_id(&synced, "GRAPH-5").unwrap();
+        let compose = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Store::open(&path)
+                    .unwrap()
+                    .update_draft_fields("GRAPH-5", "Later", "b@x", "", "", "<p>later</p>")
+                    .unwrap();
+            })
+        };
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SaveDraft {
+                id: "GRAPH-5".into(),
+            },
+        )
+        .unwrap();
+        compose.join().unwrap();
+        assert_eq!(store.locally_edited_ids().unwrap(), ["GRAPH-5"]);
+        assert_eq!(store.local_edit_generation("GRAPH-5").unwrap(), 2);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_failed_push_leaves_the_draft_unsaved() {
         let srv = FakeServer::start(vec![Route {
             method: "PATCH".into(),

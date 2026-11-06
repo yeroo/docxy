@@ -69,8 +69,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   well-known name alone), with `FoldersUpdated` only when the counts
   changed (`Engine::refresh_folder`). An id not in the store is an `Error`
   with no Graph call; signed out or inside `next_retry` it does nothing. A
-  folder that never synced runs its head (phase 1 of #1871, below): the user
-  asked for it; its older mail follows in idle time.
+  folder that never synced runs its phase 1 (#1871, below): the head, or
+  for a small folder its full delta with the cutoff, which completes it; a
+  big folder's older mail follows in idle time.
 - The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
   old single tick, whose wait restarts on every command). With it the engine
   keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
@@ -402,10 +403,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   fresh and so carries every message it covers, not only what changed (a
   head, a small folder's inline full delta, a backfill page:
   `merge_delta_items` with `protect`): it skips every id a queued outbox op
-  names (`Store::pending_message_ids`: an optimistic write waiting after a
-  5xx, and a deleted message is not put back) and every draft with an
-  unsaved edit (`Store::locally_edited_ids`, below); everything else is
-  merged, drafts included (`Engine::protected_ids`). A round on a stored
+  names (`Store::pending_message_ids`, `Engine::protected_ids`: an
+  optimistic write waiting after a 5xx, and a deleted message is not put
+  back), and merges every other row with
+  `Store::merge_message_unless_edited`, which leaves a draft with an
+  unsaved edit (below) alone in the same statement as the write, so a
+  compose save on lookxy's connection during the fetch is never lost;
+  everything else is merged, drafts included. A round on a stored
   link merges everything, as Graph reports a change there. In window mode items
   older than the cutoff are skipped, unless a reconverge is pending.
   `Store::set_backfill_progress` stores the `nextLink`, the count and the
@@ -434,8 +438,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`Store::clear_local_edit`) only if it is still that generation, in one
   statement. An edit compose makes meanwhile stays unsaved, with no race
   against lookxy's connection; a failed push or a store error on the clear
-  leaves the draft protected until its next push. Rows from before read as
-  clean.
+  leaves the draft protected until its next push. A fresh delta reads the
+  marker in the statement that writes (`merge_message_unless_edited`:
+  `ON CONFLICT … DO UPDATE … WHERE local_edit = 0`), never from a list read
+  before the fetch. Rows from before read as clean.
 - **When a page runs.** `main_loop` waits zero while `next_backfill()` has a
   folder: signed in, outside `next_retry`, a folder list done
   (`backfill_done`), and the first folder in order with a delta link whose

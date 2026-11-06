@@ -90,7 +90,7 @@ pub(crate) fn graph_error_message(body: &str) -> Option<String> {
 /// `SyncStateNotFound`, `SyncStateInvalid` or `resyncRequired` (compared
 /// case-insensitively), as Exchange answers for an old or broken skip token.
 /// The delta then has to start again from a fresh cursor.
-pub fn is_expired_sync_state(e: &GraphError) -> bool {
+pub(crate) fn is_expired_sync_state(e: &GraphError) -> bool {
     match e {
         GraphError::Http { status: 410, .. } => true,
         GraphError::Http { status: 400, body } => json::parse(body)

@@ -894,7 +894,35 @@ impl Store {
         m: &Message,
         fields: &MessageFields,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        self.merge_message_guarded(folder_id, m, fields, false)
+            .map(|_| ())
+    }
+
+    /// [`Store::merge_message`] for a delta that starts fresh (#1871: a
+    /// head, a small folder's full delta, a backfill page), which carries
+    /// every message, not only what changed: an existing row holding an
+    /// unsaved edit (`local_edit > 0`, a draft compose saved since its last
+    /// push) is left as it is. The check is in the same statement as the
+    /// write (`DO UPDATE … WHERE`), so a compose save on another connection
+    /// can never land between them. A missing row is inserted. Returns
+    /// whether a row was written.
+    pub fn merge_message_unless_edited(
+        &self,
+        folder_id: &str,
+        m: &Message,
+        fields: &MessageFields,
+    ) -> Result<bool, StoreError> {
+        self.merge_message_guarded(folder_id, m, fields, true)
+    }
+
+    fn merge_message_guarded(
+        &self,
+        folder_id: &str,
+        m: &Message,
+        fields: &MessageFields,
+        guard: bool,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
             "INSERT INTO messages (
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
@@ -918,7 +946,8 @@ impl Store {
                  preview = CASE WHEN ?30 THEN excluded.preview ELSE messages.preview END,
                  is_draft = CASE WHEN ?31 THEN excluded.is_draft ELSE messages.is_draft END,
                  is_meeting_request = CASE WHEN ?32 THEN excluded.is_meeting_request ELSE messages.is_meeting_request END,
-                 categories = CASE WHEN ?33 THEN excluded.categories ELSE messages.categories END",
+                 categories = CASE WHEN ?33 THEN excluded.categories ELSE messages.categories END
+             WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
                 folder_id,
@@ -953,15 +982,17 @@ impl Store {
                 fields.writes_is_draft(),
                 fields.writes_meeting_request(),
                 fields.categories,
+                guard,
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// The ids of the rows holding a local edit Graph has not seen
     /// (#1871): drafts compose changed (`update_draft_fields`) since their
     /// last successful push (`local_edit > 0`), sorted. Every delta that
-    /// starts fresh leaves them alone.
+    /// starts fresh leaves them alone
+    /// ([`Store::merge_message_unless_edited`]).
     pub fn locally_edited_ids(&self) -> Result<Vec<String>, StoreError> {
         let mut stmt = self
             .conn
@@ -6185,6 +6216,72 @@ mod backfill_tests {
         assert_eq!(s.local_edit_generation("G").unwrap(), 0);
         assert!(s.locally_edited_ids().unwrap().is_empty());
         assert_eq!(s.local_edit_generation("NOPE").unwrap(), 0);
+    }
+
+    #[test]
+    fn merge_message_unless_edited_leaves_an_edited_row_alone() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 10, None);
+        folder(&s, "F2", 10, None);
+        let edited = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.reconcile_id(&edited, "E").unwrap();
+        s.update_draft_fields("E", "mine", "me@x", "cc@x", "", "b")
+            .unwrap();
+        let clean = s.create_local_draft("Old", "", "", "body").unwrap();
+        s.reconcile_id(&clean, "C").unwrap();
+        let server = |id: &str| Message {
+            id: id.into(),
+            conversation_id: "C".into(),
+            subject: "server".into(),
+            from: Recipient::default(),
+            to: vec![Recipient {
+                name: "S".into(),
+                address: "s@x".into(),
+            }],
+            cc: vec![],
+            received: "2026-01-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+        };
+        let all = MessageFields::all();
+        assert!(
+            !s.merge_message_unless_edited("F2", &server("E"), &all)
+                .unwrap()
+        );
+        let (row, _) = s.draft("E").unwrap().unwrap();
+        assert_eq!(
+            (
+                row.subject.as_str(),
+                row.to_recipients.as_str(),
+                row.cc_recipients.as_str()
+            ),
+            ("mine", "me@x", "cc@x")
+        );
+        assert_ne!(row.folder_id, "F2");
+        assert!(
+            s.merge_message_unless_edited("F2", &server("C"), &all)
+                .unwrap()
+        );
+        let (row, _) = s.draft("C").unwrap().unwrap();
+        assert_eq!(
+            (row.subject.as_str(), row.folder_id.as_str()),
+            ("server", "F2")
+        );
+        // A missing row is inserted.
+        assert!(
+            s.merge_message_unless_edited("F2", &server("NEW"), &all)
+                .unwrap()
+        );
+        // The plain merge still writes over the edit.
+        s.merge_message("F2", &server("E"), &all).unwrap();
+        assert_eq!(s.draft("E").unwrap().unwrap().0.subject, "server");
     }
 
     #[test]

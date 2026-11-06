@@ -1577,10 +1577,14 @@ impl Engine {
     /// With `protect` (`protected_ids`, sorted) the page is a fresh
     /// delta's (#1871: a head, a small folder's full delta, a backfill
     /// page), which carries every message it covers, not only what changed:
-    /// it never merges over a local edit, and skips those ids. Everything
-    /// else is merged, drafts included (a quarantine reconverge repairs a
-    /// draft a dropped op left wrong). A round on a stored link (`None`)
-    /// merges everything, as Graph reports a change there.
+    /// it never merges over a local edit. It skips those ids, and merges
+    /// every other row with `Store::merge_message_unless_edited`, which
+    /// leaves a draft holding an unsaved edit alone in the same statement
+    /// as the write (compose saves on lookxy's own connection, at any
+    /// time). Every other row is merged, drafts included (a quarantine
+    /// reconverge repairs a draft a dropped op left wrong). A round on a
+    /// stored link (`None`) merges everything, as Graph reports a change
+    /// there.
     fn merge_delta_items(
         &self,
         folder_id: &str,
@@ -1598,9 +1602,14 @@ impl Engine {
                         }
                     }
                     upserts += 1;
-                    let local = protect.is_some_and(|ids| ids.binary_search(&m.id).is_ok());
-                    if !local {
-                        let _ = self.store.merge_message(folder_id, m, fields);
+                    match protect {
+                        Some(ids) if ids.binary_search(&m.id).is_ok() => {}
+                        Some(_) => {
+                            let _ = self.store.merge_message_unless_edited(folder_id, m, fields);
+                        }
+                        None => {
+                            let _ = self.store.merge_message(folder_id, m, fields);
+                        }
                     }
                 }
                 // A `@removed` entry can carry an empty id; deleting "" is a
@@ -1617,15 +1626,13 @@ impl Engine {
 
     /// The ids a fresh delta must not merge over (#1871), sorted: those a
     /// queued outbox op names (`Store::pending_message_ids`: an optimistic
-    /// write waiting after a 5xx; a deleted message is not put back), and
-    /// drafts with an unsaved edit (`Store::locally_edited_ids`: compose
-    /// saved fields Graph has not seen, which the next push sends).
+    /// write waiting after a 5xx; a deleted message is not put back). Only
+    /// this thread queues ops, so the list cannot go stale during a fetch.
+    /// A draft with an unsaved edit is not listed: compose marks it on its
+    /// own connection at any time, so `merge_message_unless_edited` checks
+    /// it in the statement that writes.
     fn protected_ids(&self) -> Result<Vec<String>, StoreError> {
-        let mut ids = self.store.pending_message_ids()?;
-        ids.extend(self.store.locally_edited_ids()?);
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        self.store.pending_message_ids()
     }
 
     /// The quarantine reconverge is over: the flag is cleared, in memory and
@@ -1703,9 +1710,9 @@ impl Engine {
     }
 
     /// Whether some folder's backfill is still to run, not counting a
-    /// parked one (a page that keeps failing must not hold a reconverge,
-    /// and its persisted flag, open for good). A store error counts as
-    /// none.
+    /// parked one: a page that fails is parked, and a parked walk must not
+    /// hold a reconverge (and its persisted flag) open. A store error
+    /// counts as none.
     fn backfill_remains(&self) -> bool {
         self.incomplete_histories()
             .map(|h| h.iter().any(|h| !self.parked.contains(&h.folder_id)))
