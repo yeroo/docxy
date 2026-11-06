@@ -140,17 +140,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   font boxes' calls; Bullets/Numbering toggle with `all_in_list` and give a
   package without numbering `add_markdown_numbering`, whose ids 1 and 2
   are `NUM_BULLET`/`NUM_DECIMAL`) and `caret_format` (`caret_props_shown`,
-  pending toggles included, #854; the caret end's, no mixed state).
+  pending toggles included, #854; the caret end's, no mixed state; font,
+  size and colour over the seeded styles, `None` only when neither the run
+  nor its styles set one).
   Increase/Decrease Indent by any path repairs the package's list levels
   after a change (`repair_list_indents`, #1728). Every host command and
   Enter, Ctrl+B/I/U/M break the typing group first; moves end it
   (docxcore's `last`), so Ctrl+Z after a click takes back only the typing
   since.
-- A change is told by comparing the body before and after (typing and
-  deleting coalesce into one undo step, so the history cannot tell).
+- A change is told by comparing, before and after, the body's length and
+  the top-level blocks the selection spans with one on each side
+  (`edit_window`): typing and deleting coalesce into one undo step, and a
+  step may change nothing (`set_align` checkpoints on a paragraph already
+  aligned), so the history cannot tell. A key costs the blocks around the
+  caret. Undo and Redo (Ctrl+Z/Y and the host's) compare the whole body
+  (`edit::history`): undoing a step that changed nothing is no change.
   `on_change` fires deferred (`cx.defer`) only on a change: never for a
-  move, a selection, scroll, zoom, a toggle at a collapsed caret,
-  `set_document` or `set_editable`. Styles are seeded into the editor
+  move, a selection, scroll, zoom, a toggle at a collapsed caret, an undo
+  of a step that changed nothing, `set_document` or `set_editable`. Styles are seeded into the editor
   (`set_styles_xml`, as `sync_editor_styles`) on `set_editable(true)`,
   `set_document` while editable and before each edit.
 - The caret draws (`RenderCtx::caret_path`) while editable and focused.

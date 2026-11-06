@@ -32,7 +32,7 @@ use crate::windows;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
-use docxcore::model::{Align, VertAlign};
+use docxcore::model::VertAlign;
 use gpui::{
     App, AppContext as _, Bounds, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
@@ -2145,12 +2145,7 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     let r = editor.caret_props();
     // Over the table, paragraph and character styles (#1427).
     let shown = editor.caret_props_shown();
-    let alignment = match p.align {
-        Align::Left => "left",
-        Align::Center => "center",
-        Align::Right => "right",
-        Align::Justify => "justify",
-    };
+    let alignment = crate::doc_view::align_name(p.align);
     let vert_align = match r.vert_align {
         VertAlign::Baseline => "baseline",
         VertAlign::Superscript => "superscript",
@@ -8040,7 +8035,7 @@ mod tests {
     fn document_fields_read_editor_and_view_values() {
         let props = ParProps {
             style_id: Some("Heading2".into()),
-            align: Align::Center,
+            align: docxcore::model::Align::Center,
             indent: 720,
             indent_right: 240,
             first_line: -120,
