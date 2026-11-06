@@ -52370,6 +52370,11 @@ impl Docxy {
     /// While an extension tab is the active one, it has the keys: a focus
     /// the suite gave its own root (`refocus`) goes on to the surface, which
     /// hands back the keys it does not use (they bubble to `route_key`).
+    /// While a dialog takes the keys (a modal one, or a modeless one while
+    /// active, #1602) or the more-tabs list is open, they are its (#393), so
+    /// the root keeps the focus, and takes it back from a surface that had
+    /// it when one opened: an editable document view (#1947) would type
+    /// under the dialog what it sees first.
     fn focus_ext_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.backstage || self.menu.is_some() {
             return;
@@ -52377,8 +52382,14 @@ impl Docxy {
         let Some(Surface::Ext(e)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return;
         };
+        let handle = e.focus_handle(cx);
+        if self.tab_more_open || self.active_dialogs().is_some_and(|d| d.top_takes_keys()) {
+            if handle.contains_focused(window, cx) {
+                window.focus(&self.focus, cx);
+            }
+            return;
+        }
         if self.focus.is_focused(window) {
-            let handle = e.focus_handle(cx);
             window.focus(&handle, cx);
         }
     }
