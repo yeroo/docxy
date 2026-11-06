@@ -82,11 +82,15 @@ pub struct CaretFormat {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
-    /// The font family set on the run (`None`: the style's or the default).
+    /// The font family shown at the caret: the run's own over what its
+    /// paragraph, character and table styles give (#1427). `None` only when
+    /// neither the run nor its styles set one (the document's default).
     pub font: Option<String>,
-    /// The size in points set on the run (`None`: the style's or the default).
+    /// The size in points shown at the caret, the run's own over its
+    /// styles'; `None` only when neither sets one.
     pub size: Option<f32>,
-    /// Hex `RRGGBB` (`None`: Automatic).
+    /// The colour shown at the caret as hex `RRGGBB`, the run's own over its
+    /// styles'; `None` when neither sets one (Automatic).
     pub color: Option<String>,
     /// A Word highlight name.
     pub highlight: Option<String>,
@@ -98,17 +102,65 @@ pub struct CaretFormat {
     pub align: Align,
 }
 
-/// Run `f`, then say whether it changed the document: `Changed` when it
-/// did, `Moved` when it ran with nothing to do. The body is compared whole:
-/// an edit that coalesces into the newest undo step pushes no step, so the
-/// undo history cannot tell.
+/// The top-level blocks an edit at `ed`'s caret and selection can change:
+/// those the selection spans and one on each side (Backspace at a
+/// paragraph's start merges into the one before it, Delete at its end
+/// takes in the next). A block before or after the window moves only by
+/// the body's length changing, which [`edit`] compares too.
+fn edit_window(ed: &Editor) -> std::ops::Range<usize> {
+    let len = ed.doc.body.len();
+    let top = |c: &Caret| c.path.first().copied().unwrap_or(0);
+    let (a, b) = match &ed.anchor {
+        Some(anchor) => (
+            top(&ed.caret).min(top(anchor)),
+            top(&ed.caret).max(top(anchor)),
+        ),
+        None => (top(&ed.caret), top(&ed.caret)),
+    };
+    a.saturating_sub(1).min(len)..(b + 2).min(len)
+}
+
+/// Run `f`, an edit at the caret or over the selection, then say whether it
+/// changed the document: `Changed` when it did, `Moved` when it ran with
+/// nothing to do. It compares the body's length and the blocks of
+/// [`edit_window`] before and after: an edit that coalesces into the newest
+/// undo step pushes no step, and a step may change nothing (an alignment
+/// the paragraph had, a toggle at a collapsed caret), so the undo history
+/// cannot tell. A keystroke costs the blocks around the caret, never the
+/// document.
 fn edit(ed: &mut Editor, f: impl FnOnce(&mut Editor)) -> KeyOutcome {
-    let before = ed.doc.body.clone();
+    let window = edit_window(ed);
+    let (len, before) = (ed.doc.body.len(), ed.doc.body[window.clone()].to_vec());
     f(ed);
-    if ed.doc.body != before {
-        KeyOutcome::Changed
-    } else {
+    let same = ed.doc.body.len() == len && ed.doc.body[window] == before[..];
+    if same {
         KeyOutcome::Moved
+    } else {
+        KeyOutcome::Changed
+    }
+}
+
+/// Undo (`redo`: Redo) the newest step: `ran` when a step was taken back,
+/// `changed` when the document differs after it. A step restores any block,
+/// so this one compares the whole body; it runs once per Ctrl+Z, never per
+/// typed character. A step that changed nothing (an alignment the
+/// paragraph had) undoes with no change, so the host hears of none.
+pub(crate) fn history(ed: &mut Editor, redo: bool) -> Formatted {
+    let before = ed.doc.body.clone();
+    let ran = if redo { ed.redo() } else { ed.undo() };
+    Formatted {
+        ran,
+        changed: ran && ed.doc.body != before,
+    }
+}
+
+impl From<Formatted> for KeyOutcome {
+    fn from(f: Formatted) -> Self {
+        if f.changed {
+            KeyOutcome::Changed
+        } else {
+            KeyOutcome::Moved
+        }
     }
 }
 
@@ -194,15 +246,8 @@ pub(crate) fn edit_key(
                     _ => ed.toggle_underline(),
                 }
             }),
-            "z" if !shift => edit(ed, |ed| {
-                ed.undo();
-            }),
-            "y" if !shift => edit(ed, |ed| {
-                ed.redo();
-            }),
-            "z" => edit(ed, |ed| {
-                ed.redo();
-            }),
+            "z" if !shift => history(ed, false).into(),
+            "y" | "z" => history(ed, true).into(),
             "a" if !shift => {
                 ed.select_all();
                 KeyOutcome::Moved
@@ -490,6 +535,53 @@ mod tests {
         // Backspace at the document's start changes nothing.
         press(&mut ed, "ctrl-home");
         assert!(matches!(press(&mut ed, "backspace")[0], KeyOutcome::Moved));
+    }
+
+    #[test]
+    fn a_change_is_told_from_the_blocks_around_the_caret_and_the_length() {
+        let mut ed = editor(&["one", "two", "three", "four"]);
+        // Backspace at the document's start: nothing to take.
+        assert!(matches!(press(&mut ed, "backspace")[0], KeyOutcome::Moved));
+        // At a paragraph's start it merges into the one before.
+        ed.set_caret(Caret::at(vec![2], 0));
+        assert!(press(&mut ed, "backspace")[0].changed());
+        assert_eq!(text(&ed, 1), "twothree");
+        // Delete at a paragraph's end takes in the next.
+        press(&mut ed, "end");
+        assert!(press(&mut ed, "delete")[0].changed());
+        assert_eq!(text(&ed, 1), "twothreefour");
+        // Delete at the document's end: nothing.
+        press(&mut ed, "ctrl-end");
+        assert!(matches!(press(&mut ed, "delete")[0], KeyOutcome::Moved));
+        // A selection from the first paragraph to the last, deleted.
+        press(&mut ed, "ctrl-home ctrl-shift-end");
+        assert!(press(&mut ed, "delete")[0].changed());
+        assert_eq!(ed.doc.body.len(), 1);
+        assert_eq!(text(&ed, 0), "");
+        // A window at either end of the body stays inside it.
+        let ed = editor(&["only"]);
+        assert_eq!(edit_window(&ed), 0..1);
+    }
+
+    #[test]
+    fn undoing_a_step_that_changed_nothing_is_no_change() {
+        let mut ed = editor(&["centred"]);
+        assert!(apply_format(&mut ed, None, &DocFormat::Align(Align::Center)).changed);
+        // Center again on the centred paragraph still makes a step.
+        let serial = ed.undo_serial();
+        let f = apply_format(&mut ed, None, &DocFormat::Align(Align::Center));
+        assert!(f.ran && !f.changed);
+        assert_ne!(ed.undo_serial(), serial, "a step to undo");
+        let undone = history(&mut ed, false);
+        assert!(undone.ran && !undone.changed);
+        let redone = history(&mut ed, true);
+        assert!(redone.ran && !redone.changed);
+        // Ctrl+Z on it, likewise: taken, no change; the next takes back the
+        // first Center, which is one.
+        assert!(matches!(press(&mut ed, "ctrl-z")[0], KeyOutcome::Moved));
+        assert!(press(&mut ed, "ctrl-z")[0].changed());
+        // With nothing left to undo nothing runs.
+        assert_eq!(history(&mut ed, false), Formatted::default());
     }
 
     #[test]

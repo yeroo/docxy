@@ -56,6 +56,19 @@ test issue 1947 typing, bold and bullets from the host, one undo, and the docume
   call ext-doc-read {}
   assert reply.caret_format.bold is false
   assert reply.caret_format.bullets is false
+  # Center on a centred paragraph is a step that changes nothing: neither
+  # it nor the host's undo of it is a change event.
+  call ext-doc-call {"format":"align-center"}
+  call ext-doc-set {"editable":true}
+  call ext-doc-call {"format":"align-center"}
+  assert reply.done is true
+  call ext-doc-call {"undo":true}
+  assert reply.done is true
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.align is left
   # Bullets from the host: the paragraph is in the bullet list, and the
   # package gained the numbering part that defines it.
   call ext-doc-call {"format":"bullets"}

@@ -223,20 +223,26 @@ impl DocView {
     /// Undo the newest step, as Ctrl+Z does. False, with nothing changed, on
     /// a read-only view or with nothing to undo.
     pub fn undo(&mut self, cx: &mut Context<Self>) -> bool {
-        let done = self.editable && self.editor.undo();
-        if done {
-            self.after_edit(true, cx);
-        }
-        done
+        self.history(false, cx)
     }
 
     /// Redo the newest undone step, as Ctrl+Y does.
     pub fn redo(&mut self, cx: &mut Context<Self>) -> bool {
-        let done = self.editable && self.editor.redo();
-        if done {
-            self.after_edit(true, cx);
+        self.history(true, cx)
+    }
+
+    /// [`DocView::undo`] / [`DocView::redo`]: whether a step was taken;
+    /// the host hears of a change only when the document differs after it,
+    /// as for Ctrl+Z (a step may have changed nothing).
+    fn history(&mut self, redo: bool, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
         }
-        done
+        let done = edit::history(&mut self.editor, redo);
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
     }
 
     /// Whether [`DocView::undo`] would undo something.
