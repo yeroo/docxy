@@ -20,7 +20,9 @@
 //! `CreateEvent` reconciles a `local:` id to its Graph id afterward exactly
 //! like `SaveDraft`/`SendDraft` do for drafts.
 
-use crate::graph::client::{GraphClient, GraphError, RsvpKind};
+use crate::graph::client::{
+    GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind, graph_error_message, one_line,
+};
 use crate::graph::model::Recipient;
 use crate::store::{OutboxOp, Store};
 
@@ -184,20 +186,14 @@ pub(crate) fn apply_send(
 }
 
 /// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's
-/// own `error.message` for an HTTP error whose body carries a non-empty one,
-/// else `HTTP {status}`; a `Parse` failure's message as is (a missing
+/// own `error.message` for an HTTP error whose body carries a non-empty one
+/// (as one line, capped like `GraphError`'s `Display`, #1954), else
+/// `HTTP {status}`; a `Parse` failure's message as is (a missing
 /// attachment file, a store error); any other error's `Display`.
 pub(crate) fn send_error_text(err: &GraphError) -> String {
     match err {
-        GraphError::Http { status, body } => crate::json::parse(body)
-            .ok()
-            .and_then(|v| {
-                v.get("error")?
-                    .get("message")?
-                    .as_str()
-                    .map(|m| m.trim().to_string())
-            })
-            .filter(|m| !m.is_empty())
+        GraphError::Http { status, body } => graph_error_message(body)
+            .map(|m| one_line(&m, HTTP_ERROR_TEXT_MAX))
             .unwrap_or_else(|| format!("HTTP {status}")),
         GraphError::Parse(m) => m.clone(),
         other => other.to_string(),

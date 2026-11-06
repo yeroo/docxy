@@ -50,11 +50,85 @@ impl fmt::Display for GraphError {
                 write!(f, "throttled, retry after {retry_after_secs}s")
             }
             GraphError::NotFound => write!(f, "not found (404)"),
-            GraphError::Http { status, body } => write!(f, "HTTP {status}: {body}"),
+            GraphError::Http { status, body } => f.write_str(&http_error_text(*status, body)),
             GraphError::Parse(m) => write!(f, "failed to parse response: {m}"),
             GraphError::Transport(m) => write!(f, "transport error: {m}"),
         }
     }
+}
+
+/// The most characters `GraphError::Http`'s `Display` shows: a host status
+/// line has room for one line, not a server's error page (#1954).
+pub(crate) const HTTP_ERROR_TEXT_MAX: usize = 200;
+
+/// `GraphError::Http`'s `Display` (#1954): `HTTP {status}: {message}` when
+/// the body is Graph JSON with a non-empty `error.message`, else
+/// `HTTP {status} {reason}` (the standard reason phrase, from
+/// `reason_phrase`'s table), else `HTTP {status}`. Never the body itself (an
+/// IIS 411 page is four lines of HTML); always one line, at most
+/// `HTTP_ERROR_TEXT_MAX` characters. The body stays in the error for `Debug`.
+fn http_error_text(status: u16, body: &str) -> String {
+    let text = match (graph_error_message(body), reason_phrase(status)) {
+        (Some(message), _) => format!("HTTP {status}: {message}"),
+        (None, Some(reason)) => format!("HTTP {status} {reason}"),
+        (None, None) => format!("HTTP {status}"),
+    };
+    one_line(&text, HTTP_ERROR_TEXT_MAX)
+}
+
+/// Graph's own `error.message` from a JSON error body, trimmed; `None` when
+/// the body is not JSON, has none, or it is blank. Shared by `Display` and
+/// the outbox's `send_error_text`, so the two never disagree on it.
+pub(crate) fn graph_error_message(body: &str) -> Option<String> {
+    let v = json::parse(body).ok()?;
+    let message = v.get("error")?.get("message")?.as_str()?.trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
+/// `s` as one line: every run of whitespace (newlines and tabs included)
+/// becomes one space, other control characters are dropped, the ends are
+/// trimmed, and past `max` characters it is cut (on a `char`) to end in `…`
+/// within `max`.
+pub(crate) fn one_line(s: &str, max: usize) -> String {
+    let words: Vec<String> = s
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let joined = words.join(" ");
+    if joined.chars().count() <= max {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The standard reason phrase for the error statuses Graph and its front
+/// ends answer with; `None` for any other status.
+fn reason_phrase(status: u16) -> Option<&'static str> {
+    Some(match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        411 => "Length Required",
+        412 => "Precondition Failed",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => return None,
+    })
 }
 
 impl std::error::Error for GraphError {}
@@ -975,9 +1049,15 @@ impl GraphClient {
             req = req.set(name, value);
         }
 
-        let result = match &body {
-            Some(b) => req.set("Content-Type", "application/json").send_string(b),
-            None => req.call(),
+        // A POST (`createReply`, `createForward`, `send`) or PATCH with no
+        // body still sends an empty one: ureq's `call()` writes no
+        // `Content-Length` at all, and Exchange Online front ends answer such
+        // a POST with `411 Length Required` (#1954). `send_bytes(&[])` is
+        // framed by ureq as `Content-Length: 0`. GET and DELETE stay bodiless.
+        let result = match (&body, method) {
+            (Some(b), _) => req.set("Content-Type", "application/json").send_string(b),
+            (None, Method::Post | Method::Patch) => req.send_bytes(&[]),
+            (None, Method::Get | Method::Delete) => req.call(),
         };
 
         match result {
@@ -2100,6 +2180,206 @@ mod tests {
         assert_eq!(draft.id, "DRAFT3");
         let reqs = srv.requests();
         assert!(reqs[0].path.ends_with("/createForward"));
+    }
+
+    /// A recorded request's `Content-Length`, the name matched in any case.
+    fn content_length(req: &crate::testserver::RecordedRequest) -> Option<&str> {
+        req.headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The bodiless POSTs frame an empty body, `Content-Length: 0`: without
+    /// it an Exchange Online front end answers `411 Length Required` (#1954).
+    #[test]
+    fn bodiless_posts_send_content_length_zero() {
+        let post = |path: &str, status: u16, body: String| Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body,
+        };
+        // `path_prefix` matches by prefix: `createReplyAll` before `createReply`.
+        let srv = FakeServer::start(vec![
+            post(
+                "/me/messages/M1/createReplyAll",
+                200,
+                sample_message_json("D2"),
+            ),
+            post(
+                "/me/messages/M1/createReply",
+                200,
+                sample_message_json("D1"),
+            ),
+            post(
+                "/me/messages/M1/createForward",
+                200,
+                sample_message_json("D3"),
+            ),
+            post("/me/messages/D1/send", 202, String::new()),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.create_reply("M1", false).unwrap();
+        c.create_reply("M1", true).unwrap();
+        c.create_forward("M1").unwrap();
+        c.send_draft("D1").unwrap();
+        let reqs = srv.requests();
+        let paths: Vec<&str> = reqs.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/me/messages/M1/createReply",
+                "/me/messages/M1/createReplyAll",
+                "/me/messages/M1/createForward",
+                "/me/messages/D1/send",
+            ]
+        );
+        for req in &reqs {
+            assert_eq!(req.method, "POST");
+            assert_eq!(content_length(req), Some("0"), "{}", req.path);
+            assert_eq!(req.body, "", "{}", req.path);
+        }
+    }
+
+    /// GET and DELETE stay bodiless: no `Content-Length` header (#1954).
+    #[test]
+    fn get_and_delete_send_no_content_length() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"isDraft":true}"#.into(),
+            },
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 204,
+                headers: vec![],
+                body: String::new(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.is_draft("M1").unwrap());
+        c.delete_message("M1").unwrap();
+        let reqs = srv.requests();
+        let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["GET", "DELETE"]);
+        for req in &reqs {
+            assert_eq!(content_length(req), None, "{} {}", req.method, req.path);
+        }
+    }
+
+    /// The IIS page an Exchange Online front end answers a bodiless POST
+    /// with (#1954), as the issue quotes it.
+    const IIS_411_HTML: &str = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\r\n<HTML><HEAD><TITLE>Length Required</TITLE>\r\n<META HTTP-EQUIV=\"Content-Type\" Content=\"text/html; charset=us-ascii\"></HEAD>\r\n<BODY><h2>Length Required</h2>\r\n<hr><p>HTTP Error 411. The request must be chunked or have a content length.</p>\r\n</BODY></HTML>\r\n";
+
+    /// A 411 HTML page keeps its body in the error but displays as one line
+    /// without markup (#1954).
+    #[test]
+    fn http_411_html_displays_one_line() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/createReplyAll".into(),
+            status: 411,
+            headers: vec![("Content-Type".into(), "text/html".into())],
+            body: IIS_411_HTML.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let err = c.create_reply("M1", true).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::Http {
+                status: 411,
+                body: IIS_411_HTML.into(),
+            }
+        );
+        let text = err.to_string();
+        assert_eq!(text, "HTTP 411 Length Required");
+        assert!(!text.contains('<') && !text.contains('\n'), "{text}");
+    }
+
+    fn http(status: u16, body: &str) -> GraphError {
+        GraphError::Http {
+            status,
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn http_error_display_uses_graphs_own_message() {
+        assert_eq!(
+            http(
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied","message":"  Access is denied.  "}}"#
+            )
+            .to_string(),
+            "HTTP 403: Access is denied."
+        );
+        // A multi-line message becomes one line; tabs and control characters
+        // go too.
+        assert_eq!(
+            http(
+                400,
+                r#"{"error":{"code":"X","message":"Bad id.\r\n\tTry\u0007 again."}}"#
+            )
+            .to_string(),
+            "HTTP 400: Bad id. Try again."
+        );
+    }
+
+    #[test]
+    fn http_error_display_without_a_message_uses_the_reason_phrase() {
+        // Blank or missing `error.message`: no code fallback.
+        assert_eq!(
+            http(400, r#"{"error":{"code":"X","message":"  "}}"#).to_string(),
+            "HTTP 400 Bad Request"
+        );
+        assert_eq!(
+            http(400, r#"{"error":{"code":"X"}}"#).to_string(),
+            "HTTP 400 Bad Request"
+        );
+        assert_eq!(
+            http(500, "boom").to_string(),
+            "HTTP 500 Internal Server Error"
+        );
+        assert_eq!(http(502, "").to_string(), "HTTP 502 Bad Gateway");
+    }
+
+    #[test]
+    fn http_error_display_of_an_unlisted_status_is_the_bare_status() {
+        let text = http(
+            599,
+            "<html><head><title>Odd\r\nThing</title></head>\n<body>x</body></html>",
+        )
+        .to_string();
+        assert_eq!(text, "HTTP 599");
+        assert!(!text.contains('<') && !text.contains('\n'), "{text}");
+    }
+
+    #[test]
+    fn http_error_display_caps_a_long_message() {
+        let long = "é".repeat(500);
+        let text = http(400, &format!(r#"{{"error":{{"message":"{long}"}}}}"#)).to_string();
+        assert_eq!(text.chars().count(), HTTP_ERROR_TEXT_MAX);
+        assert!(text.starts_with("HTTP 400: éé"), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        // At the cap exactly: nothing is cut.
+        let fits = "a".repeat(HTTP_ERROR_TEXT_MAX - "HTTP 400: ".len());
+        let text = http(400, &format!(r#"{{"error":{{"message":"{fits}"}}}}"#)).to_string();
+        assert_eq!(text, format!("HTTP 400: {fits}"));
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_and_cuts_on_a_char() {
+        assert_eq!(one_line("  a \r\n\t b  ", 10), "a b");
+        assert_eq!(one_line("a\u{0}b c", 10), "ab c");
+        assert_eq!(one_line("abcdef", 4), "abc…");
+        assert_eq!(one_line("ééééé", 3), "éé…");
+        assert_eq!(one_line("", 3), "");
     }
 
     #[test]
