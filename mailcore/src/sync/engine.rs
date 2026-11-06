@@ -27,7 +27,7 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
 pub use crate::graph::model::BodyFormat;
-use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Message, ScheduleEntry};
+use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Me, Message, ScheduleEntry};
 use crate::store::{
     LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, OutboxRow, Store, StoreError,
 };
@@ -139,6 +139,19 @@ pub enum SyncCommand {
     /// (`GraphClient::set_automatic_replies`) and emit
     /// [`SyncEvent::AutomaticRepliesUpdated`]. Direct call, no outbox.
     SetAutomaticReplies { replies: AutomaticReplies },
+    /// Fetch who is signed in (`GraphClient::me`) and emit
+    /// [`SyncEvent::ProfileFetched`]. Direct call, no outbox.
+    FetchProfile,
+    /// Fetch the signed-in user's photo (`GraphClient::my_photo`) and emit
+    /// [`SyncEvent::PhotoFetched`] (`None` when the user has none). Direct
+    /// call, no outbox.
+    FetchPhoto,
+    /// Sign out: drop the in-memory token and delete the saved one
+    /// (`tokencache::clear`), then emit [`SyncEvent::SignInRequired`] (and
+    /// `State(SignInRequired)`), so the next `SignIn` starts a fresh sign-in.
+    /// The mail store and the outbox are kept: queued ops drain after the next
+    /// sign-in. Signed out already, it still clears the file and says so.
+    SignOut,
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
     /// `SaveAttachment`, which writes to disk. `content_id` is echoed back on
@@ -251,6 +264,13 @@ pub enum SyncEvent {
     /// The automatic-replies config was written (from
     /// [`SyncCommand::SetAutomaticReplies`]); the UI closes its OOF form.
     AutomaticRepliesUpdated,
+    /// Who is signed in (from [`SyncCommand::FetchProfile`]); the UI shows
+    /// `me.display_name` and `me.address()`.
+    ProfileFetched { me: Me },
+    /// The signed-in user's photo as `(bytes, content type)`, or `None` when
+    /// the user has none (from [`SyncCommand::FetchPhoto`]); the UI then
+    /// draws initials.
+    PhotoFetched { photo: Option<(Vec<u8>, String)> },
     /// The master category list changed; the UI re-reads `Store::master_categories`.
     CategoriesUpdated,
     /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
@@ -863,6 +883,9 @@ impl Engine {
             ),
             SyncCommand::FetchAutomaticReplies => self.fetch_automatic_replies(),
             SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
+            SyncCommand::FetchProfile => self.fetch_profile(),
+            SyncCommand::FetchPhoto => self.fetch_photo(),
+            SyncCommand::SignOut => self.sign_out(),
             SyncCommand::FetchInlineImage {
                 message_id,
                 attachment_id,
@@ -1914,6 +1937,52 @@ impl Engine {
                 self.react(e);
             }
         }
+    }
+
+    /// Fetch the signed-in user's profile and emit `ProfileFetched`; a Graph
+    /// failure goes through `react`. Same signed-in guard as `fetch_body`.
+    fn fetch_profile(&mut self) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.me()) {
+            Ok(me) => self.emit(SyncEvent::ProfileFetched { me }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch the signed-in user's photo and emit `PhotoFetched` (`None`: no
+    /// photo); a Graph failure goes through `react`. Same signed-in guard as
+    /// `fetch_body`.
+    fn fetch_photo(&mut self) {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.my_photo()) {
+            Ok(photo) => self.emit(SyncEvent::PhotoFetched { photo }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Sign out: delete the saved token and drop the in-memory one. A file
+    /// that cannot be deleted is reported, but the engine still signs out:
+    /// keeping the token because of it would make Sign out do nothing. A
+    /// throttle or offline deadline belonged to the old session and goes; the
+    /// outbox's own back-off stays with the outbox, which is kept.
+    fn sign_out(&mut self) {
+        if let Err(e) = tokencache::clear(&self.config.token_path) {
+            self.emit(SyncEvent::Error(format!(
+                "could not delete the saved sign-in ({e}); it may be used again at the next start"
+            )));
+        }
+        self.clear_backoff();
+        self.enter_signin();
     }
 
     /// Write the mailbox's automatic-replies config and emit
@@ -4164,6 +4233,201 @@ mod tests {
                     && replies.internal_message == "hi")
         });
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Spawns an engine signed in with `seed_token` against `routes` placed
+    /// ahead of `backfill_routes`, and waits for its first backfill.
+    fn spawn_signed_in(tag: &str, routes: Vec<Route>) -> (FakeServer, SyncHandle, PathBuf) {
+        let mut all = routes;
+        all.extend(backfill_routes());
+        let srv = FakeServer::start(all);
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessagesUpdated { .. })
+        });
+        (srv, handle, dir)
+    }
+
+    #[test]
+    fn fetch_profile_emits_profile_fetched() {
+        let (srv, handle, dir) = spawn_signed_in(
+            "fetch-profile",
+            vec![get_route(
+                "/me?$select",
+                200,
+                r#"{"displayName":"Ada Lovelace","mail":null,"userPrincipalName":"ada@outlook.com"}"#,
+            )],
+        );
+        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ProfileFetched { me }
+                if me.display_name == "Ada Lovelace" && me.address() == "ada@outlook.com")
+        });
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me?$select=displayName,mail,userPrincipalName")
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_photo_emits_photo_fetched() {
+        let (_srv, handle, dir) = spawn_signed_in(
+            "fetch-photo",
+            vec![Route {
+                method: "GET".into(),
+                path_prefix: "/me/photo/$value".into(),
+                status: 200,
+                headers: vec![("Content-Type".into(), "image/jpeg".into())],
+                body: "JPEGDATA".into(),
+            }],
+        );
+        handle.cmd_tx.send(SyncCommand::FetchPhoto).unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::PhotoFetched { .. })
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::PhotoFetched {
+                photo: Some((b"JPEGDATA".to_vec(), "image/jpeg".to_string()))
+            })
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_photo_none_when_no_photo() {
+        let (srv, handle, dir) = spawn_signed_in(
+            "fetch-no-photo",
+            vec![
+                get_route("/me/photo/$value", 404, "{}"),
+                get_route("/me/photos/48x48/$value", 404, "{}"),
+            ],
+        );
+        handle.cmd_tx.send(SyncCommand::FetchPhoto).unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::PhotoFetched { .. })
+        });
+        assert_eq!(seen.last(), Some(&SyncEvent::PhotoFetched { photo: None }));
+        // A missing photo is not an error.
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me/photos/48x48/$value")
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_profile_and_photo_signed_out_report_not_signed_in() {
+        let srv = FakeServer::start(vec![]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("profile-signed-out");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        for cmd in [SyncCommand::FetchProfile, SyncCommand::FetchPhoto] {
+            handle.cmd_tx.send(cmd).unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+            );
+        }
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_out_removes_token_keeps_store() {
+        let (srv, handle, dir) = spawn_signed_in(
+            "sign-out",
+            vec![get_route(
+                "/me?$select",
+                200,
+                r#"{"displayName":"Ada","mail":"ada@x","userPrincipalName":"ada@x"}"#,
+            )],
+        );
+        let token_path = dir.join("token.bin");
+        let store_path = dir.join("mail.db");
+        assert!(token_path.exists());
+
+        handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::SignInRequired))
+        });
+        assert!(
+            seen.iter().any(|e| matches!(e, SyncEvent::SignInRequired)),
+            "{seen:?}"
+        );
+        assert!(!token_path.exists());
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+
+        // The mail store and its rows are kept.
+        let store = Store::open(&store_path).unwrap();
+        let msgs = store.messages_in_folder("F1", 50, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "M1");
+
+        // A later direct call reports sign-in required, with no request.
+        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+        );
+        assert!(!srv.requests().iter().any(|r| r.path.starts_with("/me?")));
+
+        // Signing out again is harmless: still signed out, still says so.
+        handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        // The next start on the same paths finds no saved sign-in.
+        let base = srv.base_url.clone();
+        let again = spawn_with_bases(
+            store_path.clone(),
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        let seen = wait_for(&again.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::FoldersUpdated)),
+            "{seen:?}"
+        );
+        let _ = again.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
