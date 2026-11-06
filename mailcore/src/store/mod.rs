@@ -89,6 +89,48 @@ pub struct FolderRow {
     pub is_expanded: bool,
 }
 
+/// What a folder's history sync has reached (#1871): the persisted state of
+/// its whole-mailbox backfill, read by [`Store::folder_history`] and
+/// [`Store::folder_histories`], so a UI can show progress before any event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderHistory {
+    pub folder_id: String,
+    /// What `delta_link` covers: `None` (never synced, or a link stored
+    /// before #1871), [`SCOPE_HEAD`], [`SCOPE_WINDOW`] or [`SCOPE_ALL`].
+    pub scope: Option<String>,
+    /// Items the folder's full delta has returned so far (upserts only).
+    /// It may exceed `total_count`: a UI clamps.
+    pub synced: i64,
+    /// The full delta's next page, while a backfill is under way.
+    pub backfill_link: Option<String>,
+    /// Whether the folder has a delta link (its phase 1 is done).
+    pub has_delta_link: bool,
+    /// The folder's `total_count` from its last listing.
+    pub total_count: i64,
+}
+
+/// `history_scope` of a folder whose `delta_link` is a filtered head delta:
+/// its recent mail only, the backfill still to come (#1871).
+pub const SCOPE_HEAD: &str = "head";
+/// `history_scope` of a folder whose full delta ran with the
+/// `backfill_days` cutoff: complete in window mode.
+pub const SCOPE_WINDOW: &str = "window";
+/// `history_scope` of a folder whose full delta ran with no cutoff: complete
+/// in every mode.
+pub const SCOPE_ALL: &str = "all";
+
+/// `Store::folders`' order: well-known folders first (Inbox, Drafts, Sent,
+/// Deleted, Junk, Archive), then by name.
+const FOLDER_ORDER: &str = "ORDER BY CASE
+                 WHEN well_known_name = 'inbox' OR LOWER(display_name) = 'inbox' THEN 0
+                 WHEN well_known_name = 'drafts' THEN 1
+                 WHEN well_known_name = 'sentitems' THEN 2
+                 WHEN well_known_name = 'deleteditems' THEN 3
+                 WHEN well_known_name = 'junkemail' THEN 4
+                 WHEN well_known_name = 'archive' THEN 5
+                 ELSE 99
+             END, display_name";
+
 /// A `messages` row, as read back from the store.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageRow {
@@ -644,6 +686,16 @@ impl Store {
             "ALTER TABLE folders ADD COLUMN is_expanded INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Same idempotent-migration pattern, for the whole-mailbox backfill
+        // columns (#1871). A folder synced before them reads as a legacy
+        // link (`history_scope` NULL): complete in window mode, backfilled
+        // in whole-mailbox mode.
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN backfill_link TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE folders ADD COLUMN backfill_synced INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE folders ADD COLUMN history_scope TEXT", []);
         // Same idempotent-migration pattern, for `messages.local_id` (#1884:
         // the `local:` id a reconciled draft had). Its unique index has to
         // come after the ALTER, not in `SCHEMA_SQL`: on an old database
@@ -774,19 +826,11 @@ impl Store {
     /// All folders, well-known ones first (Inbox, Drafts, Sent, Deleted,
     /// Junk, Archive, in that order), then everything else alphabetically.
     pub fn folders(&self) -> Result<Vec<FolderRow>, StoreError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT id, parent_id, display_name, total_count, unread_count, delta_link, well_known_name, sort_order, is_expanded
              FROM folders
-             ORDER BY CASE
-                 WHEN well_known_name = 'inbox' OR LOWER(display_name) = 'inbox' THEN 0
-                 WHEN well_known_name = 'drafts' THEN 1
-                 WHEN well_known_name = 'sentitems' THEN 2
-                 WHEN well_known_name = 'deleteditems' THEN 3
-                 WHEN well_known_name = 'junkemail' THEN 4
-                 WHEN well_known_name = 'archive' THEN 5
-                 ELSE 99
-             END, display_name",
-        )?;
+             {FOLDER_ORDER}"
+        ))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(FolderRow {
@@ -1180,14 +1224,107 @@ impl Store {
     }
 
     /// Clears every folder's stored delta link, so the next sync re-fetches
-    /// each folder from scratch (a fresh `DeltaCursor::Folder`) rather than
+    /// each folder from scratch (a fresh head delta) rather than
     /// resuming from a token. Used by the sync engine to reconverge the local
     /// store with server truth after it has quarantined a bad outbox op (whose
     /// optimistic local write would otherwise linger).
+    ///
+    /// It also clears every folder's backfill (#1871): its link, count and
+    /// scope, so each folder runs its head and then its full delta again.
     pub fn clear_delta_links(&self) -> Result<(), StoreError> {
-        self.conn
-            .execute("UPDATE folders SET delta_link = NULL", [])?;
+        self.conn.execute(
+            "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                                backfill_synced = 0, history_scope = NULL",
+            [],
+        )?;
         Ok(())
+    }
+
+    /// Stores a folder's head delta link (#1871: its recent mail, run in
+    /// the sync pass), marking what it covers as [`SCOPE_HEAD`].
+    pub fn set_head_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET delta_link = ?2, history_scope = ?3 WHERE id = ?1",
+            params![folder_id, link, SCOPE_HEAD],
+        )?;
+        Ok(())
+    }
+
+    /// Records a backfill page (#1871): the full delta's next page and the
+    /// running count of items it has returned.
+    pub fn set_backfill_progress(
+        &self,
+        folder_id: &str,
+        next_link: &str,
+        synced: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET backfill_link = ?2, backfill_synced = ?3 WHERE id = ?1",
+            params![folder_id, next_link, synced],
+        )?;
+        Ok(())
+    }
+
+    /// Ends a folder's backfill (#1871), in one statement: the full
+    /// delta's `deltaLink` becomes the folder's `delta_link` (replacing the
+    /// head's), `scope` records what it covers, the backfill link is
+    /// cleared and `synced` is set to the final count.
+    pub fn complete_backfill(
+        &self,
+        folder_id: &str,
+        delta_link: &str,
+        scope: &str,
+        synced: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                backfill_link = NULL, backfill_synced = ?4
+             WHERE id = ?1",
+            params![folder_id, delta_link, scope, synced],
+        )?;
+        Ok(())
+    }
+
+    /// Restarts a folder's backfill from a fresh full delta (#1871: its
+    /// page link expired): clears the link and the count, and keeps the
+    /// head's `delta_link`.
+    pub fn reset_backfill(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET backfill_link = NULL, backfill_synced = 0 WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
+    }
+
+    /// One folder's history state (#1871), `None` for an unknown id.
+    pub fn folder_history(&self, folder_id: &str) -> Result<Option<FolderHistory>, StoreError> {
+        Ok(self
+            .folder_histories()?
+            .into_iter()
+            .find(|h| h.folder_id == folder_id))
+    }
+
+    /// Every folder's history state (#1871), in [`Store::folders`]' order.
+    pub fn folder_histories(&self) -> Result<Vec<FolderHistory>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, history_scope, backfill_synced, backfill_link,
+                    delta_link IS NOT NULL, total_count
+             FROM folders
+             {FOLDER_ORDER}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(FolderHistory {
+                    folder_id: row.get(0)?,
+                    scope: row.get(1)?,
+                    synced: row.get(2)?,
+                    backfill_link: row.get(3)?,
+                    has_delta_link: row.get::<_, i64>(4)? != 0,
+                    total_count: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Inserts or replaces the body of a message, as a body that was not
@@ -5687,5 +5824,189 @@ mod folder_retain_tests {
         assert_eq!(s.retain_folders(&keep).unwrap(), 1);
         assert_eq!(folder_ids(&s), vec!["DRAFTS", "INBOX"]);
         assert_eq!(s.messages_in_folder("DRAFTS", 50, 0).unwrap()[0].id, id);
+    }
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    //! The whole-mailbox backfill's folder state (#1871).
+    use super::*;
+
+    fn folder(s: &Store, id: &str, total: i64, well_known: Option<&str>) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: total,
+            unread_count: 0,
+            well_known_name: well_known.map(str::to_string),
+        })
+        .unwrap();
+    }
+
+    fn history(s: &Store, id: &str) -> FolderHistory {
+        s.folder_history(id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn init_adds_the_backfill_columns_to_an_old_folders_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-backfill-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F1", 7, None);
+            s.set_delta_link("F1", "OLD").unwrap();
+            // Take the database back to before the columns existed.
+            s.conn
+                .execute_batch(
+                    "ALTER TABLE folders DROP COLUMN backfill_link;
+                     ALTER TABLE folders DROP COLUMN backfill_synced;
+                     ALTER TABLE folders DROP COLUMN history_scope;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // A folder synced before #1871: a legacy link, no scope, no backfill.
+        assert_eq!(
+            history(&s, "F1"),
+            FolderHistory {
+                folder_id: "F1".into(),
+                scope: None,
+                synced: 0,
+                backfill_link: None,
+                has_delta_link: true,
+                total_count: 7,
+            }
+        );
+        s.set_backfill_progress("F1", "NEXT", 3).unwrap();
+        assert_eq!(history(&s, "F1").backfill_link.as_deref(), Some("NEXT"));
+        drop(s);
+        // Opening again (columns already there) keeps the state.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(history(&s, "F1").synced, 3);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_progress_and_complete_backfill_record_the_folder_history() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        let h = history(&s, "F1");
+        assert_eq!((h.scope, h.has_delta_link), (None, false));
+
+        s.set_head_link("F1", "HEAD").unwrap();
+        assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
+        assert_eq!(history(&s, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+
+        s.set_backfill_progress("F1", "PAGE2", 50).unwrap();
+        let h = history(&s, "F1");
+        assert_eq!((h.backfill_link.as_deref(), h.synced), (Some("PAGE2"), 50));
+        // The head link stays the folder's link while the backfill runs.
+        assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn complete_backfill_sets_link_and_scope_and_clears_the_cursor() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_ALL, 120).unwrap();
+        assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("FULL"));
+        assert_eq!(
+            history(&s, "F1"),
+            FolderHistory {
+                folder_id: "F1".into(),
+                scope: Some(SCOPE_ALL.into()),
+                synced: 120,
+                backfill_link: None,
+                has_delta_link: true,
+                total_count: 120,
+            }
+        );
+    }
+
+    #[test]
+    fn reset_backfill_keeps_the_head_and_restarts_the_count() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.reset_backfill("F1").unwrap();
+        let h = history(&s, "F1");
+        assert_eq!((h.backfill_link, h.synced), (None, 0));
+        assert_eq!(h.scope.as_deref(), Some(SCOPE_HEAD));
+        assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn clear_delta_links_clears_backfill_state() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        folder(&s, "F2", 10, None);
+        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_backfill_progress("F1", "PAGE3", 100).unwrap();
+        s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10).unwrap();
+        s.clear_delta_links().unwrap();
+        for id in ["F1", "F2"] {
+            let h = history(&s, id);
+            assert_eq!(
+                (h.scope, h.synced, h.backfill_link, h.has_delta_link),
+                (None, 0, None, false),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_folder_leaves_the_backfill_state_alone() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_backfill_progress("F1", "PAGE2", 50).unwrap();
+        // The next listing renames it and changes its count.
+        s.upsert_folder(&MailFolder {
+            id: "F1".into(),
+            display_name: "Renamed".into(),
+            parent_id: None,
+            total_count: 130,
+            unread_count: 2,
+            well_known_name: None,
+        })
+        .unwrap();
+        let h = history(&s, "F1");
+        assert_eq!(
+            (
+                h.scope.as_deref(),
+                h.backfill_link.as_deref(),
+                h.synced,
+                h.total_count
+            ),
+            (Some(SCOPE_HEAD), Some("PAGE2"), 50, 130)
+        );
+    }
+
+    #[test]
+    fn folder_histories_follow_the_folder_order() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "A-other", 1, None);
+        folder(&s, "B-inbox", 1, Some("inbox"));
+        folder(&s, "C-sent", 1, Some("sentitems"));
+        let ids: Vec<String> = s
+            .folder_histories()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.folder_id)
+            .collect();
+        let order: Vec<String> = s.folders().unwrap().into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, order);
+        assert_eq!(ids, ["B-inbox", "C-sent", "A-other"]);
+        assert!(s.folder_history("NOPE").unwrap().is_none());
     }
 }

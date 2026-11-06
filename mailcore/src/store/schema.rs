@@ -21,7 +21,14 @@ CREATE TABLE IF NOT EXISTS folders (
     delta_link      TEXT,
     well_known_name TEXT,
     sort_order      INTEGER,
-    is_expanded     INTEGER NOT NULL DEFAULT 0
+    is_expanded     INTEGER NOT NULL DEFAULT 0,
+    -- The whole-mailbox backfill (#1871): the full delta's in-progress
+    -- `nextLink` (NULL: not started, or done), the items it returned so
+    -- far, and what `delta_link` covers (NULL: never synced, or a link
+    -- from before #1871; 'head', 'window' or 'all').
+    backfill_link   TEXT,
+    backfill_synced INTEGER NOT NULL DEFAULT 0,
+    history_scope   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
