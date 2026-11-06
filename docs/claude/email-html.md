@@ -22,13 +22,17 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   computed **on the final view**: its keys are tree paths, and accepting a deleted paragraph mark shifts
   them.
 - **Runs.** Each run is a `<span>` of its *effective* look, resolved as the RTF writer resolves it
-  (`effective_run`, with the user's underline and strike). A highlight is written as
+  (`export_context::effective_run`, with the user's underline and strike; the two writers also share
+  `text_box_paragraphs` and `marker_format`). A highlight is written as
   `background-color:#RGB;mso-highlight:name`: Outlook and the HTML import read the second, every other
   client the first. Because of the `background-color`, a round trip also adds run shading (`w:shd`).
   A `code` run with no font of its own is `'Courier New',monospace`, over the default font. Inside
   `<hN>` a run that is not bold says `font-weight:normal`. Hidden text is decided by
   `StyleSheet::effective_vanish`, so a style's `w:vanish` hides too: hidden text must never leave in a
-  sent message.
+  sent message. That includes what the model keeps as a raw run: a picture (neither shown nor
+  attached), a text box, a note reference, SmartArt, a chart or a run-based equation. Their run's own
+  `w:rPr` is read by `load::raw_run_props`; an OMML equation is no run and is never hidden. The text
+  of SmartArt, a chart or an equation takes that run's look too.
 - **Spaces.** A space that would collapse is `&nbsp;`: one at a line's start or end, or after another
   space. Imported back, these come as U+00A0.
 - **Tabs.** A tab is Word's tab span, `<span style="mso-tab-count:1;white-space:pre">\t</span>`. The HTML
@@ -55,23 +59,26 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   - A plain paragraph or a table ends every open list.
   - Numbering goes on as in Word: `Numbering::step` advances the same counters as `compute_markers`
     (per abstract list, deeper levels restart). An `<ol>` opened for an item whose number is not 1
-    says `start`. The HTML import ignores `start`, so `numbered_list_continues_after_a_paragraph`
+    says `start`. A list opened between levels has no `start` and shows 1 next: when an item reuses
+    it, or any other list, and its number is not the one the browser would show next, the item says
+    `<li value="N">`. The HTML import ignores `start`, so `numbered_list_continues_after_a_paragraph`
     tests it on the string.
   - The import maps every bullet list to numId 1 and every numbered list to numId 2.
   - An item's left and first-line indent are the client's list padding: they are not written.
   - Lists that only a paragraph style numbers (`StyleSheet::style_num_pr`) are plain paragraphs, as in
     RTF.
 - **Links.** A target whose scheme is `http`, `https`, `ftp` or `mailto` (any case, trimmed) is the
-  `href`. Otherwise the in-document anchor (`#name`) is used, otherwise no `<a>` and the text alone:
+  `href`, from the HTML import's own allow-list (`import::html::LINK_SCHEMES`). Otherwise the in-document anchor (`#name`) is used, otherwise no `<a>` and the text alone:
   `javascript:`, `data:`, `file:` and relative targets are never links. The import turns a `"` in an
   `href` into `%22`.
 - **Pictures.**
   - An inline DrawingML picture (`image::inline_embed`) resolves its rid against `word/document.xml`.
     It is written as `<img src="cid:ID" width height alt style="width:Wpx;height:Hpx;border:0">`, with W and H
     being its extent / `EMU_PER_PX`, at least 1.
-  - The Content-ID is `image<n>.<FNV-1a 64 of the bytes, hex>@docxy`: distinct per picture, and the
-    same on every export (the same picture has the same id in every message, which is harmless). The
-    same part used twice is one medium.
+  - The Content-ID is `image<n>.<FNV-1a 64 of the bytes, hex>@docxy`, `n` being the order of first
+    use. It is the same on every export of the same document, and never shared by two different
+    pictures; the same picture can still get a different id in another document. The same part used
+    twice is one medium.
   - Without a package, a relationship or the part, the picture is its Alt Text (`wp:docPr descr`).
   - Floating pictures are not written. Image formats are not converted: EMF, WMF and TIFF go out as
     they are.
