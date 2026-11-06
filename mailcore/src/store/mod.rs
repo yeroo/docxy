@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, Row, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, MailFolder, MasterCategory,
@@ -117,9 +117,15 @@ pub struct MessageRow {
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
-/// name + size), not bytes; the bytes are read from disk at send time.
+/// name + size), not bytes; the bytes are read from disk at send time. Or,
+/// for a pasted picture (#1949), bytes kept in the row (`from_bytes`), whose
+/// `path` is then only its key, `cid:<content_id>`; load them with
+/// `Store::outbound_attachment_bytes`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OutboundAttachment {
+    /// The file's path, or a bytes row's key (`cid:<content_id>`): what
+    /// `remove_outbound_attachment` and `mark_outbound_attachment_uploaded`
+    /// take.
     pub path: String,
     pub name: String,
     pub size: i64,
@@ -129,6 +135,14 @@ pub struct OutboundAttachment {
     /// or whose marker could not be written, is not marked and is uploaded
     /// again. Removing it locally would not remove it from the Graph draft.
     pub uploaded: bool,
+    /// Set for an inline attachment (#1949): uploaded with `isInline` and
+    /// this `contentId`, so an html body's `<img src="cid:…">` finds it.
+    pub content_id: Option<String>,
+    /// The MIME type given when it was attached; `None` derives it from the
+    /// name at send time (every plain file row).
+    pub content_type: Option<String>,
+    /// The bytes are in the row, not in a file (#1949).
+    pub from_bytes: bool,
 }
 
 /// A `contacts` row — one per normalized (lowercased) email address, the
@@ -646,6 +660,17 @@ impl Store {
             "ALTER TABLE outbound_attachments ADD COLUMN uploaded INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Same idempotent-migration pattern, for the inline outbound
+        // attachment columns (#1949). Older rows read as plain file rows.
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN content_id TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN content_type TEXT",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE outbound_attachments ADD COLUMN data BLOB", []);
         // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
         // a `SendDraft` op's `/send` POST went out). On the open that adds
         // the column, every `SendDraft` an older engine left queued reads
@@ -1417,16 +1442,117 @@ impl Store {
         Ok(())
     }
 
+    /// Records the file `path` attached inline to draft `draft_id` with
+    /// `content_id` (#1949), so an html body's `cid:` reference finds it.
+    /// `content_type` `None` is derived from the name at send time. Keyed by
+    /// its path. The same path already attached as a pending plain file is
+    /// made inline in place (its attach position holds, a `None` type keeps
+    /// the row's); an uploaded plain row stays plain (Graph has it
+    /// non-inline). An inline row is left as it is: the file is read at send
+    /// time, so a re-add needs no update, and the same file under a second
+    /// content id is ignored.
+    pub fn add_inline_outbound_attachment_file(
+        &self,
+        draft_id: &str,
+        path: &str,
+        name: &str,
+        size: i64,
+        content_type: Option<&str>,
+        content_id: &str,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "INSERT INTO outbound_attachments
+                     (draft_id, path, name, size, content_type, content_id) VALUES (",
+                current_id_sql!(),
+                ", ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(draft_id, path) DO UPDATE SET
+                     content_id = excluded.content_id,
+                     content_type = COALESCE(excluded.content_type,
+                                             outbound_attachments.content_type)
+                 WHERE outbound_attachments.uploaded = 0
+                   AND outbound_attachments.content_id IS NULL"
+            ),
+            params![draft_id, path, name, size, content_type, content_id],
+        )?;
+        Ok(())
+    }
+
+    /// Records a picture with no file (a pasted one, #1949), attached inline
+    /// to draft `draft_id` with `content_id`: its bytes are kept in the row,
+    /// keyed `cid:<content_id>` (returned; the `cid:` key namespace is
+    /// reserved, never a file path), `size` = `bytes.len()`. Re-adding a
+    /// content id replaces a pending row's name, type and bytes in place
+    /// (its attach position holds); an uploaded one is left alone, as the
+    /// Graph draft already has its bytes.
+    pub fn add_outbound_attachment_bytes(
+        &self,
+        draft_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        content_id: &str,
+    ) -> Result<String, StoreError> {
+        let key = format!("cid:{content_id}");
+        self.conn.execute(
+            concat!(
+                "INSERT INTO outbound_attachments
+                     (draft_id, path, name, size, content_type, content_id, data) VALUES (",
+                current_id_sql!(),
+                ", ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(draft_id, path) DO UPDATE SET
+                     name = excluded.name, size = excluded.size,
+                     content_type = excluded.content_type, data = excluded.data
+                 WHERE outbound_attachments.uploaded = 0"
+            ),
+            params![
+                draft_id,
+                key,
+                name,
+                bytes.len() as i64,
+                content_type,
+                content_id,
+                bytes
+            ],
+        )?;
+        Ok(key)
+    }
+
+    /// The bytes of the attachment `path` (its key) of `draft_id` when they
+    /// are kept in the row (#1949); `None` for a file row or a missing one.
+    pub fn outbound_attachment_bytes(
+        &self,
+        draft_id: &str,
+        path: &str,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let found = self
+            .conn
+            .query_row(
+                concat!(
+                    "SELECT data FROM outbound_attachments WHERE draft_id = ",
+                    current_id_sql!(),
+                    " AND path = ?2"
+                ),
+                params![draft_id, path],
+                |r| r.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?;
+        Ok(found.flatten())
+    }
+
     /// The files attached to `draft_id`, in attach (insertion) order — SQLite's
     /// implicit `rowid` tracks insertion order, and callers (compose's
     /// attachment list, Ctrl+R's LIFO removal) rely on the last element being
-    /// the most-recently-added attachment.
+    /// the most-recently-added attachment. A bytes row's bytes are not
+    /// loaded (compose lists these on every redraw): see
+    /// `outbound_attachment_bytes`.
     pub fn outbound_attachments(
         &self,
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
         let mut stmt = self.conn.prepare(concat!(
-            "SELECT path, name, size, uploaded FROM outbound_attachments WHERE draft_id = ",
+            "SELECT path, name, size, uploaded, content_id, content_type, data IS NOT NULL
+             FROM outbound_attachments WHERE draft_id = ",
             current_id_sql!(),
             " ORDER BY rowid"
         ))?;
@@ -1437,6 +1563,9 @@ impl Store {
                     name: r.get(1)?,
                     size: r.get(2)?,
                     uploaded: r.get(3)?,
+                    content_id: r.get(4)?,
+                    content_type: r.get(5)?,
+                    from_bytes: r.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -4579,6 +4708,242 @@ mod draft_tests {
         assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 1);
         // ... and the local id still lists it (#1884).
         assert_eq!(s.outbound_attachments(&id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inline_and_bytes_outbound_attachments_round_trip() {
+        // #1949: a plain file row, an inline file row and a bytes row.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "<p>x</p>").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 3)
+            .unwrap();
+        s.add_inline_outbound_attachment_file(&id, "/tmp/logo.png", "logo.png", 7, None, "logo")
+            .unwrap();
+        let key = s
+            .add_outbound_attachment_bytes(&id, "pic.png", "image/png", b"\x89PNG", "pic1")
+            .unwrap();
+        assert_eq!(key, "cid:pic1");
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(
+            (&got[0].content_id, &got[0].content_type, got[0].from_bytes),
+            (&None, &None, false),
+            "a plain file row"
+        );
+        assert_eq!(got[1].path, "/tmp/logo.png");
+        assert_eq!(got[1].content_id.as_deref(), Some("logo"));
+        assert_eq!(got[1].content_type, None);
+        assert!(!got[1].from_bytes);
+        assert_eq!(got[2].path, "cid:pic1");
+        assert_eq!(got[2].name, "pic.png");
+        assert_eq!(got[2].size, 4, "a bytes row's size is its length");
+        assert_eq!(got[2].content_id.as_deref(), Some("pic1"));
+        assert_eq!(got[2].content_type.as_deref(), Some("image/png"));
+        assert!(got[2].from_bytes);
+        assert!(!got[2].uploaded);
+        assert_eq!(
+            s.outbound_attachment_bytes(&id, "cid:pic1").unwrap(),
+            Some(b"\x89PNG".to_vec())
+        );
+        assert_eq!(
+            s.outbound_attachment_bytes(&id, "/tmp/logo.png").unwrap(),
+            None
+        );
+        assert_eq!(s.outbound_attachment_bytes(&id, "cid:nope").unwrap(), None);
+        // An inline file row with a given type keeps it.
+        s.add_inline_outbound_attachment_file(&id, "/tmp/x", "x", 1, Some("image/gif"), "x1")
+            .unwrap();
+        assert_eq!(
+            s.outbound_attachments(&id).unwrap()[3]
+                .content_type
+                .as_deref(),
+            Some("image/gif")
+        );
+        // The same file inline under a second content id is ignored.
+        s.add_inline_outbound_attachment_file(&id, "/tmp/logo.png", "logo.png", 7, None, "other")
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[1].content_id.as_deref(), Some("logo"));
+        // A bytes row is removed by its key.
+        s.remove_outbound_attachment(&id, &key).unwrap();
+        assert!(s.outbound_attachment_bytes(&id, &key).unwrap().is_none());
+        assert_eq!(s.outbound_attachments(&id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_inline_add_makes_a_pending_plain_file_inline_in_place() {
+        // #1949 r1: the same path attached plain, then inline: one row, same
+        // position, now inline (else `cid:logo` would find nothing).
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "<p>x</p>").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/logo.png", "logo.png", 7)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/z.pdf", "z.pdf", 1)
+            .unwrap();
+        s.add_inline_outbound_attachment_file(
+            &id,
+            "/tmp/logo.png",
+            "logo.png",
+            7,
+            Some("image/x-logo"),
+            "logo",
+        )
+        .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, "/tmp/logo.png", "same attach position");
+        assert_eq!(got[0].content_id.as_deref(), Some("logo"));
+        assert_eq!(got[0].content_type.as_deref(), Some("image/x-logo"));
+        // Now inline: a second content id is ignored, and so is a plain add.
+        s.add_inline_outbound_attachment_file(&id, "/tmp/logo.png", "logo.png", 7, None, "other")
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/logo.png", "logo.png", 7)
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got[0].content_id.as_deref(), Some("logo"));
+        assert_eq!(got[0].content_type.as_deref(), Some("image/x-logo"));
+        // An uploaded plain row stays plain: Graph has it non-inline.
+        s.mark_outbound_attachment_uploaded(&id, "/tmp/z.pdf")
+            .unwrap();
+        s.add_inline_outbound_attachment_file(&id, "/tmp/z.pdf", "z.pdf", 1, None, "z")
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].content_id, None);
+        assert!(got[1].uploaded);
+    }
+
+    #[test]
+    fn re_adding_a_content_id_replaces_pending_bytes_in_place() {
+        // #1949: a re-pasted picture under the same content id sends the new
+        // bytes, keeps its attach position, and never touches an uploaded row.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "<p>x</p>").unwrap();
+        s.add_outbound_attachment_bytes(&id, "a.png", "image/png", b"AAAA", "pic1")
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/z.pdf", "z.pdf", 1)
+            .unwrap();
+        s.add_outbound_attachment_bytes(&id, "b.jpg", "image/jpeg", b"BB", "pic1")
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2, "one row per content id");
+        assert_eq!(got[0].path, "cid:pic1", "same attach position");
+        assert_eq!(got[0].name, "b.jpg");
+        assert_eq!(got[0].size, 2);
+        assert_eq!(got[0].content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            s.outbound_attachment_bytes(&id, "cid:pic1").unwrap(),
+            Some(b"BB".to_vec())
+        );
+        s.mark_outbound_attachment_uploaded(&id, "cid:pic1")
+            .unwrap();
+        s.add_outbound_attachment_bytes(&id, "c.gif", "image/gif", b"CCCCCC", "pic1")
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].uploaded);
+        assert_eq!(got[0].name, "b.jpg", "an uploaded row is left alone");
+        assert_eq!(
+            s.outbound_attachment_bytes(&id, "cid:pic1").unwrap(),
+            Some(b"BB".to_vec())
+        );
+    }
+
+    #[test]
+    fn reconcile_id_carries_inline_bytes_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.add_outbound_attachment_bytes(&id, "p.png", "image/png", b"PNG", "pic1")
+            .unwrap();
+        s.add_inline_outbound_attachment_file(&id, "/tmp/l.png", "l.png", 1, None, "logo")
+            .unwrap();
+        s.reconcile_id(&id, "GRAPH-1").unwrap();
+        for draft in ["GRAPH-1", id.as_str()] {
+            let got = s.outbound_attachments(draft).unwrap();
+            assert_eq!(got.len(), 2, "{draft}");
+            assert_eq!(got[0].content_id.as_deref(), Some("pic1"));
+            assert!(got[0].from_bytes);
+            assert_eq!(got[1].content_id.as_deref(), Some("logo"));
+            assert_eq!(
+                s.outbound_attachment_bytes(draft, "cid:pic1").unwrap(),
+                Some(b"PNG".to_vec()),
+                "{draft}"
+            );
+        }
+        // Added by the reconciled local id, it lands on the Graph id.
+        s.add_outbound_attachment_bytes(&id, "q.png", "image/png", b"Q", "pic2")
+            .unwrap();
+        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn discard_pending_removes_pending_inline_rows() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        s.add_outbound_attachment_bytes(&id, "up.png", "image/png", b"U", "up")
+            .unwrap();
+        s.add_outbound_attachment_bytes(&id, "new.png", "image/png", b"N", "new")
+            .unwrap();
+        s.add_inline_outbound_attachment_file(&id, "/tmp/f.png", "f.png", 1, None, "f")
+            .unwrap();
+        s.reconcile_id(&id, "G").unwrap();
+        s.mark_outbound_attachment_uploaded(&id, "cid:up").unwrap();
+        s.discard_pending_outbound_attachments(&id).unwrap();
+        let left = s.outbound_attachments("G").unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, "cid:up");
+        assert_eq!(
+            s.outbound_attachment_bytes("G", "cid:up").unwrap(),
+            Some(b"U".to_vec())
+        );
+        s.clear_outbound_attachments(&id).unwrap();
+        assert!(s.outbound_attachments("G").unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbound_attachments_without_the_1949_columns_migrate() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-1949-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE outbound_attachments (
+                     draft_id TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
+                     size INTEGER NOT NULL DEFAULT 0, uploaded INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (draft_id, path));
+                 INSERT INTO outbound_attachments VALUES ('G', '/tmp/a.pdf', 'a.pdf', 1, 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let got = s.outbound_attachments("G").unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content_id, None);
+        assert_eq!(got[0].content_type, None);
+        assert!(!got[0].from_bytes);
+        assert!(got[0].uploaded, "the old flag is kept");
+        // The new columns are usable on the migrated table.
+        s.add_outbound_attachment_bytes("G", "p.png", "image/png", b"P", "pic1")
+            .unwrap();
+        assert_eq!(
+            s.outbound_attachment_bytes("G", "cid:pic1").unwrap(),
+            Some(b"P".to_vec())
+        );
+        drop(s);
+        // A reopen (columns already there) changes nothing.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.outbound_attachments("G").unwrap().len(), 2);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

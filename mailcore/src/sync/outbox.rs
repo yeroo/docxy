@@ -153,9 +153,31 @@ pub(crate) fn apply_send(
         if att.uploaded {
             continue;
         }
-        let bytes = std::fs::read(&att.path)
-            .map_err(|e| GraphError::Parse(format!("cannot read attachment {}: {e}", att.path)))?;
-        client.add_attachment(&graph_id, &att.name, &content_type_for(&att.name), &bytes)?;
+        let bytes = if att.from_bytes {
+            // A row removed between the listing and here fails like a
+            // missing file.
+            store
+                .outbound_attachment_bytes(&graph_id, &att.path)
+                .map_err(store_err)?
+                .ok_or_else(|| {
+                    GraphError::Parse(format!("attachment {} is no longer there", att.name))
+                })?
+        } else {
+            std::fs::read(&att.path).map_err(|e| {
+                GraphError::Parse(format!("cannot read attachment {}: {e}", att.path))
+            })?
+        };
+        let content_type = att
+            .content_type
+            .clone()
+            .unwrap_or_else(|| content_type_for(&att.name));
+        client.add_attachment_with(
+            &graph_id,
+            &att.name,
+            &content_type,
+            &bytes,
+            att.content_id.as_deref(),
+        )?;
         store
             .mark_outbound_attachment_uploaded(&graph_id, &att.path)
             .map_err(store_err)?;
@@ -951,6 +973,313 @@ mod tests {
                 .any(|r| r.path == "/me/messages/GRAPH-3/send")
         );
         assert!(store.outbound_attachments(&local_id).unwrap().is_empty());
+    }
+
+    /// The JSON bodies of the requests to exactly `path` (#1949 tests).
+    fn bodies_to(srv: &FakeServer, method: &str, path: &str) -> Vec<Value> {
+        srv.requests()
+            .iter()
+            .filter(|r| r.method == method && r.path == path)
+            .map(|r| json::parse(&r.body).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn send_draft_uploads_an_inline_picture_from_bytes_with_its_content_id() {
+        // #1949: an html body's `cid:pic1` and a pasted picture (bytes, no
+        // file) attached inline as `pic1`.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-5/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-5/attachments".into(),
+                status: 201,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-5", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", r#"<p><img src="cid:pic1"></p>"#)
+            .unwrap();
+        store
+            // A name whose extension says nothing: the type sent must be the row's.
+            .add_outbound_attachment_bytes(&local_id, "pasted", "image/png", b"\x89PNG", "pic1")
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let created = bodies_to(&srv, "POST", "/me/messages");
+        assert_eq!(created.len(), 1);
+        assert!(
+            created[0].to_string().contains("cid:pic1"),
+            "the body refers to it"
+        );
+        let atts = bodies_to(&srv, "POST", "/me/messages/GRAPH-5/attachments");
+        assert_eq!(atts.len(), 1);
+        let a = &atts[0];
+        assert_eq!(a.get("isInline").and_then(Value::as_bool), Some(true));
+        assert_eq!(a.get("contentId").and_then(Value::as_str), Some("pic1"));
+        assert_eq!(a.get("name").and_then(Value::as_str), Some("pasted"));
+        assert_eq!(
+            a.get("contentType").and_then(Value::as_str),
+            Some("image/png")
+        );
+        assert_eq!(
+            a.get("contentBytes").and_then(Value::as_str),
+            Some(crate::graph::client::base64_encode(b"\x89PNG").as_str())
+        );
+        let reqs = srv.requests();
+        let att_at = reqs.iter().position(|r| r.path.ends_with("/attachments"));
+        let send_at = reqs.iter().position(|r| r.path.ends_with("/send"));
+        assert!(
+            att_at.unwrap() < send_at.unwrap(),
+            "uploaded before the send"
+        );
+        assert!(store.outbound_attachments("GRAPH-5").unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_draft_uploads_a_large_inline_file_through_an_upload_session_with_its_content_id() {
+        // #1949: an inline file over the small-upload limit goes through an
+        // upload session whose AttachmentItem carries both fields. The
+        // upload target is its own server, as its URL goes in the session
+        // answer (see `add_attachment_routes_small_inline_and_large_to_upload_session`).
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-1949-large-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("big.png");
+        let big = vec![7u8; 3 * 1024 * 1024 + 100];
+        std::fs::write(&file, &big).unwrap();
+
+        let upload_srv = FakeServer::start(vec![Route {
+            method: "PUT".into(),
+            path_prefix: "/upload/xyz".into(),
+            status: 201,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-8/send".into(),
+                status: 202,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages/GRAPH-8/attachments/createUploadSession".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(r#"{{"uploadUrl":"{}/upload/xyz"}}"#, upload_srv.base_url),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/messages".into(),
+                status: 201,
+                headers: vec![],
+                body: draft_json("GRAPH-8", "Hi"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", r#"<p><img src="cid:pic1"></p>"#)
+            .unwrap();
+        store
+            .add_inline_outbound_attachment_file(
+                &local_id,
+                file.to_str().unwrap(),
+                "big.png",
+                big.len() as i64,
+                None,
+                "pic1",
+            )
+            .unwrap();
+
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SendDraft {
+                id: local_id.clone(),
+            },
+        )
+        .unwrap();
+
+        let sessions = bodies_to(
+            &srv,
+            "POST",
+            "/me/messages/GRAPH-8/attachments/createUploadSession",
+        );
+        assert_eq!(sessions.len(), 1);
+        let item = sessions[0]
+            .get("AttachmentItem")
+            .expect("an AttachmentItem");
+        assert_eq!(item.get("isInline").and_then(Value::as_bool), Some(true));
+        assert_eq!(item.get("contentId").and_then(Value::as_str), Some("pic1"));
+        assert_eq!(item.get("name").and_then(Value::as_str), Some("big.png"));
+        assert_eq!(
+            item.get("contentType").and_then(Value::as_str),
+            Some("image/png"),
+            "derived from the name"
+        );
+        // The PUTs cover the whole file (FakeServer bodies are lossy UTF-8,
+        // so the ranges are checked, not the bytes).
+        let mut covered = 0usize;
+        for r in upload_srv.requests() {
+            assert_eq!(r.method, "PUT");
+            let range = r
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                .map(|(_, v)| v.clone())
+                .expect("a Content-Range");
+            let (span, total) = range
+                .strip_prefix("bytes ")
+                .and_then(|r| r.split_once('/'))
+                .unwrap();
+            assert_eq!(total.parse::<usize>().unwrap(), big.len());
+            let (start, end) = span.split_once('-').unwrap();
+            assert_eq!(start.parse::<usize>().unwrap(), covered);
+            covered = end.parse::<usize>().unwrap() + 1;
+        }
+        assert_eq!(covered, big.len(), "the PUTs cover the file");
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me/messages/GRAPH-8/send")
+        );
+        assert!(store.outbound_attachments("GRAPH-8").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_send_keeps_an_inline_bytes_row_and_the_resend_skips_it() {
+        // #1949 with #1874: `/send` refused once (403), then accepted. The
+        // inline picture is uploaded by the first attempt only, and kept
+        // (content id, bytes, marked uploaded) in between.
+        let srv = FakeServer::start_limited(vec![
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-9/send".into(),
+                    status: 403,
+                    headers: vec![],
+                    body: r#"{"error":{"code":"ErrorAccessDenied","message":"no"}}"#.into(),
+                },
+                Some(1),
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-9/send".into(),
+                    status: 202,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages/GRAPH-9/attachments".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: "{}".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/GRAPH-9".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: "{}".into(),
+                },
+                None,
+            ),
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/messages".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: draft_json("GRAPH-9", "Hi"),
+                },
+                None,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", r#"<p><img src="cid:pic1"></p>"#)
+            .unwrap();
+        store
+            .add_outbound_attachment_bytes(&local_id, "pic.png", "image/png", b"PIC", "pic1")
+            .unwrap();
+        let send = OutboxOp::SendDraft {
+            id: local_id.clone(),
+        };
+
+        assert!(
+            apply_op(&c, &store, &send).is_err(),
+            "the 403 fails the send"
+        );
+        let kept = store.outbound_attachments(&local_id).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].content_id.as_deref(), Some("pic1"));
+        assert!(kept[0].from_bytes);
+        assert!(kept[0].uploaded, "Graph confirmed the upload");
+        assert_eq!(
+            store
+                .outbound_attachment_bytes("GRAPH-9", "cid:pic1")
+                .unwrap(),
+            Some(b"PIC".to_vec())
+        );
+
+        apply_op(&c, &store, &send).unwrap();
+        let uploads = bodies_to(&srv, "POST", "/me/messages/GRAPH-9/attachments");
+        assert_eq!(uploads.len(), 1, "never uploaded twice");
+        assert_eq!(
+            uploads[0].get("contentId").and_then(Value::as_str),
+            Some("pic1")
+        );
+        let sends = srv
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/me/messages/GRAPH-9/send")
+            .count();
+        assert_eq!(sends, 2);
+        assert!(store.outbound_attachments("GRAPH-9").unwrap().is_empty());
     }
 
     #[test]
