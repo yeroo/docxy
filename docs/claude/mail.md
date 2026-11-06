@@ -317,3 +317,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   <error>`, anything else the fixed `authorization denied (redirect state
   did not match)`. An error still wins over a state mismatch. The loopback
   page stays the generic error page.
+
+## Bodiless POSTs and one-line HTTP error text (#1954)
+
+- `GraphClient::send` sends a POST or PATCH with no body as an empty one
+  (`send_bytes(&[])`, which ureq frames as `Content-Length: 0`). ureq's
+  `call()` writes no `Content-Length` at all, and Exchange Online front ends
+  answer such a POST (`createReply`, `createReplyAll`, `createForward`,
+  `send`) with an IIS `411 Length Required` page, now and then. GET and
+  DELETE still go through `call()`, with no `Content-Length`.
+- `GraphError::Http`'s `Display` never shows the body: `HTTP {status}:
+  {message}` when the body is Graph JSON with a non-empty `error.message`
+  (`client::graph_error_message`, which the outbox's `send_error_text`
+  shares), else `HTTP {status} {reason}`, the reason phrase from
+  `reason_phrase`'s fixed table (no HTML `<title>` scraping), else
+  `HTTP {status}`. It is one line (`one_line`: whitespace runs become one
+  space, control characters are dropped) of at most `HTTP_ERROR_TEXT_MAX`
+  (200) characters, ending in `…` when cut. The engine's `react` emits it as
+  `SyncEvent::Error`, which is what a host's status line shows. The body
+  stays in the error (`Debug`, matches). `send_error_text` keeps `HTTP
+  {status}` without a message, and caps the message the same way.
