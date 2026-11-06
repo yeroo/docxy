@@ -40,6 +40,9 @@ issue number to find its notes.
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
   nested cards (#1927), page margins (#1928).
+- `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
+  e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
+  their media, the import round trip (#1948).
 - `docs/claude/clipboard.md`: before changing copy and paste with other apps: rich (RTF)
   document copy (#1074), sheet HTML tables (#1248).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
