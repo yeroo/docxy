@@ -5805,6 +5805,38 @@ mod tests {
     }
 
     #[test]
+    fn a_new_session_announces_the_same_grant_again() {
+        // Sign out and back in with the very grant announced before: the
+        // sign-in-required forgot it, so the new session announces it.
+        let granted = SEEDED.join(" ");
+        let (events, dir, handle, _srv) = startup_events(
+            "scopes-new-session",
+            vec![
+                (
+                    token_route(&format!(
+                        r#"{{"access_token":"AT2","refresh_token":"RT2","expires_in":3600,"scope":"{granted}"}}"#
+                    )),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(scopes_events(&events).len(), 1, "{events:?}");
+        handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        sign_in_through_loopback(&handle);
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), Vec::new())],
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
     fn sign_in_refused_reports_error_description() {
         let srv = FakeServer::start(vec![token_route(
             r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
