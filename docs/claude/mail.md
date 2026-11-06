@@ -69,8 +69,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   well-known name alone), with `FoldersUpdated` only when the counts
   changed (`Engine::refresh_folder`). An id not in the store is an `Error`
   with no Graph call; signed out or inside `next_retry` it does nothing. A
-  folder that never synced runs its initial delta (with the cutoff): the user
-  asked for it.
+  folder that never synced runs its head (phase 1 of #1871, below): the user
+  asked for it; its older mail follows in idle time.
 - The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
   old single tick, whose wait restarts on every command). With it the engine
   keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
@@ -375,3 +375,88 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: a lookxy UI for inline pictures, turning an html body's `data:`
   images into `cid:` attachments, checking that body references and content
   ids agree.
+
+## Whole mailbox, newest first (#1871)
+
+- `spawn`'s `backfill_days` keeps its type: `<= 0` (`engine::WHOLE_MAILBOX`)
+  is the whole mailbox, a positive value the last that many days (window
+  mode, what lookxy runs with 180). `cutoff_iso` already read it so.
+- **Phase 1, in the sync pass.** A folder with no `delta_link` gets a *head*
+  delta: `/messages/delta?$filter=receivedDateTime ge <since>&$orderby=
+  receivedDateTime desc&$select=…` (`DeltaCursor::Head`), `since` being 14
+  days ago (`HEAD_WINDOW_DAYS`), or the window when it is shorter. The
+  server filters it, so no cutoff. Its deltaLink becomes the folder's
+  (`Store::set_head_link`, scope `head`), so ticks, fast ticks and
+  `SyncFolder` keep it fresh: new mail arrives during phase 2.
+  `Store::folders` order makes it Inbox first. A folder whose listed
+  `total_count` is at most 50 (`SMALL_FOLDER`, one page) skips the head:
+  its full delta runs inline and completes it (an empty folder costs one
+  request, not two).
+- **Phase 2, one page per idle step.** `DeltaCursor::Full`
+  (`$orderby=receivedDateTime desc`, no filter), from the folder's
+  persisted `backfill_link`, else a fresh first call; one folder to its end
+  before the next. Each page is merged (`merge_message`); in window mode
+  items older than the cutoff are skipped, unless a reconverge is pending.
+  `Store::set_backfill_progress` stores the `nextLink` and the count, then
+  `MessagesUpdated` and `FolderProgress` go out. The deltaLink replaces the
+  head's in one statement that marks the folder complete
+  (`Store::complete_backfill`, scope `all` or `window`), then
+  `repair_headerless` runs. A restart resumes from the stored link.
+- **When a page runs.** `main_loop` waits zero while `next_backfill()` has a
+  folder: signed in, outside `next_retry`, a folder list done
+  (`backfill_done`), and the first folder in order with a delta link whose
+  history is not complete (`history_complete`) and that is not parked. A
+  queued command runs first (it waits for at most the page in flight), then
+  a due timed wake (`Engine::due`), and only then one page. Without a fast
+  tick, `due` is the tick (`next_tick`), a passed `next_retry` or a passed
+  `op_retry` while signed in, so a throttled pass and a 5xx-deferred op are
+  retried on time; with one, either deadline outside a back-off.
+  `next_tick` moves with ticks and commands, never with pages. After a timed
+  wake a passed `next_retry`/`op_retry` is dropped (`on_timer`), so one a
+  tick left behind cannot run a pass at every zero wait.
+- **Complete per mode** (`history_complete(scope, has_delta_link, whole)`):
+  no delta link never (phase 1 first); a link from before #1871 (scope
+  NULL) and `window` are complete in window mode only, and whole mode
+  backfills such a folder, its old link serving as the head meanwhile;
+  `head` never; `all` always. Known limit: a folder completed as `window`
+  stays complete when a caller later raises `backfill_days`, so the older
+  mail never comes (as before #1871).
+- **Failures of a page.** Auth, throttle (429/503 with `Retry-After`) and
+  transport go through `react` (sign-in, `next_retry`, Offline), and the
+  same link is asked for again after. An expired sync state
+  (`client::is_expired_sync_state`: a 410, or a 400 whose `error.code` is
+  `SyncStateNotFound`, `SyncStateInvalid` or `resyncRequired`) starts the
+  folder over from a fresh full delta (`Store::reset_backfill`, count 0),
+  once a pass (`Engine::expired`). A second expiry, any other non-fatal
+  failure (another 4xx, a 404, a parse error, a page with neither link) or
+  a store error is surfaced as an `Error` and parks the folder
+  (`Engine::parked`) until the next sync pass: one request per park.
+- **State.** A backfill step sets no `SyncState` (a 1,000-page backfill
+  would send 2,000 `State` events); a failed page keeps what `react` set,
+  and the next tick recovers it. It never calls `clear_backoff`.
+- **Progress.** `SyncEvent::FolderProgress { folder_id, synced, total,
+  complete }` after every page and once at completion. `synced` counts the
+  full delta's stored upserts (not `@removed`, not items the window
+  skipped); `total` is the listed `total_count` in whole mode, `None` in
+  window mode. `synced` may exceed `total` (the full delta re-sends the
+  head's mail, mail arrives meanwhile, delta can repeat an item): a UI
+  clamps. `Store::folder_history`/`folder_histories` hold the same
+  persisted state (`folders.backfill_link`, `backfill_synced`,
+  `history_scope`, migrated in `Store::init`; `upsert_folder` never writes
+  them) for a UI's first draw. lookxy ignores the event.
+- **Reconverge.** `clear_delta_links` also clears the backfill link, count
+  and scope, so every folder runs both phases again. `reconverge_pending`
+  turns off phase 2's window cutoff, and is cleared only when a pass ran
+  every folder's delta and no folder's backfill remains, else by the step
+  that completes the last folder.
+- One request at a time (the engine is one thread). Bodies stay lazy
+  (`FetchBody`); headers and `bodyPreview` come for everything
+  (`MESSAGE_SELECT`). Pages stay at 50 (`odata.maxpagesize=50`).
+- Tests: `FakeServer::start_paced` gives a route a delay (a slow page, so a
+  test can act while a backfill runs), and `RecordedRequest::at` is the
+  arrival time. Most older engine fixtures list folders of 0 or 1 message,
+  so they take the small-folder path: one full delta at startup, no phase 2.
+- Not done: a 410 on a folder's `delta_link` itself (not a backfill page)
+  still surfaces an `Error` every tick; rows a full enumeration did not
+  return are not swept (a delete during the backfill comes through the full
+  deltaLink's later rounds).
