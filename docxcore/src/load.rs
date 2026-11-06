@@ -1698,21 +1698,65 @@ pub fn field_result_props(raw: &str) -> RunProps {
     RunProps::default()
 }
 
+/// Whether raw XML the model keeps opaque (a field, an equation, a
+/// picture's run) holds content that does not show (#1948): a tracked
+/// deletion or move-away (`w:del`, `w:moveFrom`, `w:delText`,
+/// `w:delInstrText`) or a run whose `w:rPr` has an active `w:vanish` (no
+/// `w:val`, or not `0` / `false` / `off`), an OMML `m:r`'s included. A
+/// paragraph mark's `w:vanish` (`w:pPr/w:rPr`) hides no content. Lenient:
+/// a scan of the elements, never an error.
+pub(crate) fn raw_hides_content(raw: &str) -> bool {
+    let mut p = XmlParser::new(raw);
+    let mut names: Vec<&str> = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name();
+                match name {
+                    "w:del" | "w:moveFrom" | "w:delText" | "w:delInstrText" => return true,
+                    "w:vanish" => {
+                        let in_rpr = names.last() == Some(&"w:rPr");
+                        let mark = names.len() >= 2 && names[names.len() - 2] == "w:pPr";
+                        if in_rpr && !mark && !matches!(p.attr("w:val"), "0" | "false" | "off") {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                names.push(name);
+            }
+            Event::End => {
+                names.pop();
+            }
+            Event::Eof => return false,
+            Event::Text => {}
+        }
+    }
+}
+
 /// A field's cached result run by run (#1948: an e-mail writes each with
 /// its own formatting, so a hidden result run stays hidden): each result
-/// run's direct `w:rPr` and its text (`w:t` / `w:delText`, a tab as `\t`,
-/// a break as `\n`, Word's hyphens as U+2011 / U+00AD). The runs are a
-/// `w:fldSimple`'s, or a complex field's after its outermost `separate`
-/// (a nested field's result included, as [`Inline::Field`]'s text has it).
-/// A run that shows no text is left out.
+/// run's direct `w:rPr` and its text (`w:t`, a tab as `\t`, a break as
+/// `\n`, Word's hyphens as U+2011 / U+00AD). The runs are a
+/// `w:fldSimple`'s (the outermost element says which), or a complex
+/// field's after its outermost `separate` (a nested field's result
+/// included, as [`Inline::Field`]'s text has it). A run inside a tracked
+/// deletion or move-away (`w:del`, `w:moveFrom`) and deleted text
+/// (`w:delText`) are left out, as is a run that shows no text.
 pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
     use crate::field::FieldEvent;
-    let simple = !raw.contains("<w:fldChar");
+    let simple = raw.trim_start().starts_with("<w:fldSimple");
     let mut p = XmlParser::new(raw);
     let (mut separated, mut depth) = (false, 0usize);
+    // Open `w:del` / `w:moveFrom` elements round the runs read next.
+    let mut removed = 0usize;
     let mut out = Vec::new();
     loop {
         match p.next() {
+            Event::Start if matches!(p.name(), "w:del" | "w:moveFrom") => removed += 1,
+            Event::End if matches!(p.name(), "w:del" | "w:moveFrom") => {
+                removed = removed.saturating_sub(1);
+            }
             Event::Start if p.name() == "w:r" => {
                 let start = p.start_pos();
                 let mut props = RunProps::default();
@@ -1721,7 +1765,7 @@ pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
                     match p.next() {
                         Event::Start => match p.name() {
                             "w:rPr" => parse_rpr(&mut p, &mut props),
-                            "w:t" | "w:delText" => text.push_str(&read_text(&mut p)),
+                            "w:t" => text.push_str(&read_text(&mut p)),
                             name => {
                                 match name {
                                     "w:tab" => text.push('\t'),
@@ -1739,7 +1783,7 @@ pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
                 }
                 let events = crate::field::field_events(p.raw_slice(start, p.pos()));
                 if events.is_empty() {
-                    if (simple || (separated && depth >= 1)) && !text.is_empty() {
+                    if (simple || (separated && depth >= 1)) && removed == 0 && !text.is_empty() {
                         out.push((props, text));
                     }
                     continue;
@@ -3590,6 +3634,59 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    /// What content kept as raw XML hides (#1948): a tracked deletion or
+    /// move-away, deleted text, or an active `w:vanish` in a run's
+    /// properties (an OMML run's too); a paragraph mark's does not.
+    #[test]
+    fn raw_hides_content_finds_deletions_and_active_vanish() {
+        for raw in [
+            "<w:fldSimple><w:del w:id=\"1\"><w:r><w:t>x</w:t></w:r></w:del></w:fldSimple>",
+            "<w:moveFrom w:id=\"1\"><w:r><w:t>x</w:t></w:r></w:moveFrom>",
+            "<w:r><w:delText>x</w:delText></w:r>",
+            "<w:r><w:delInstrText> PAGE </w:delInstrText></w:r>",
+            "<w:r><w:rPr><w:vanish/></w:rPr><w:t>x</w:t></w:r>",
+            "<w:r><w:rPr><w:vanish w:val=\"true\"/></w:rPr><w:t>x</w:t></w:r>",
+            "<m:oMath><m:r><w:rPr><w:vanish w:val=\"1\"/></w:rPr><m:t>x</m:t></m:r></m:oMath>",
+        ] {
+            assert!(raw_hides_content(raw), "{raw}");
+        }
+        for raw in [
+            "<w:r><w:t>x</w:t></w:r>",
+            "<w:r><w:rPr><w:vanish w:val=\"0\"/></w:rPr><w:t>x</w:t></w:r>",
+            "<w:r><w:rPr><w:vanish w:val=\"false\"/></w:rPr><w:t>x</w:t></w:r>",
+            "<w:r><w:rPr><w:vanish w:val=\"off\"/></w:rPr><w:t>x</w:t></w:r>",
+            "<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>",
+            "<w:ins w:id=\"1\"><w:r><w:t>x</w:t></w:r></w:ins>",
+            "<m:oMath><m:r><m:t>x</m:t></m:r></m:oMath>",
+            "",
+            "<w:r><w:rPr><w:vanish",
+        ] {
+            assert!(!raw_hides_content(raw), "{raw}");
+        }
+    }
+
+    /// A field's result runs skip tracked deletions and moves, whether the
+    /// field holds a nested complex field or not.
+    #[test]
+    fn field_result_runs_skip_deleted_and_moved_runs() {
+        let texts = |raw: &str| -> Vec<String> {
+            field_result_runs(raw).into_iter().map(|(_, t)| t).collect()
+        };
+        let raw = "<w:fldSimple w:instr=\" REF A \"><w:r><w:t>keep</w:t></w:r>\
+                   <w:del w:id=\"1\"><w:r><w:delText>gone</w:delText></w:r></w:del>\
+                   <w:moveFrom w:id=\"2\"><w:r><w:t>moved</w:t></w:r></w:moveFrom>\
+                   <w:r><w:t>end</w:t></w:r></w:fldSimple>";
+        assert_eq!(texts(raw), ["keep", "end"]);
+        // A fldSimple holding a complex field is still read as a fldSimple.
+        let nested = "<w:fldSimple w:instr=\" REF A \"><w:r><w:t>a</w:t></w:r>\
+                      <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                      <w:r><w:instrText> PAGE </w:instrText></w:r>\
+                      <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                      <w:r><w:t>7</w:t></w:r>\
+                      <w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:fldSimple>";
+        assert_eq!(texts(nested), ["a", "7"]);
     }
 
     #[test]

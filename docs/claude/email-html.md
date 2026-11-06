@@ -29,11 +29,22 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   A `code` run with no font of its own is `'Courier New',monospace`, over the default font. Inside
   `<hN>` a run that is not bold says `font-weight:normal`. Hidden text is decided by
   `StyleSheet::effective_vanish`, so a style's `w:vanish` hides too: hidden text must never leave in a
-  sent message. That includes what the model keeps as a raw run: a picture (neither shown nor
-  attached), a text box, a note reference, SmartArt, a chart or a run-based equation. Their run's own
-  `w:rPr` is read by `load::raw_run_props`; an OMML equation has no run of its own: only its
-  paragraph's style can hide it. The text
-  of SmartArt, a chart or an equation takes that run's look too.
+  sent message.
+- **The rule for raw XML.** Content the model keeps opaque (a picture's run, a field, an equation,
+  SmartArt, a chart, a note reference) is written only when it is known to show
+  (`Writer::opaque_hidden`). It is left out whole when anything in it is deleted, moved away or hidden
+  (`load::raw_hides_content`: a `w:del`, `w:moveFrom`, `w:delText` or `w:delInstrText`, or an active
+  `w:vanish` in a run's `w:rPr`, an OMML `m:r`'s included; a paragraph mark's does not count), when
+  its own run is hidden (`load::raw_run_props`, directly or by a style), or when a character style
+  it names hides. Losing a rare visible object beats sending hidden text: add any new opaque inline
+  under this rule.
+  - A hidden picture is neither shown nor attached.
+  - The text of SmartArt, a chart or an equation takes its run's look.
+  - SmartArt's node text and a chart's title come from DrawingML parts (`a:t`), which have no hidden
+    text: only their host run, checked by the rule, can hide them.
+  - A text box is not under the rule. Its content is the model's own paragraphs: `final_view` accepts
+    their tracked changes (review walks text-box blocks) and each run is checked as it is written. Only
+    its host run can hide it whole.
 - **Spaces.** A space that would collapse is `&nbsp;`: one at a line's start or end, or after another
   space. Imported back, these come as U+00A0.
 - **Tabs.** A tab is Word's tab span, `<span style="mso-tab-count:1;white-space:pre">\t</span>`. The HTML
@@ -92,12 +103,16 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   `vertical-align:top;padding:0 5.4pt`, `colspan` from `grid_span`, and `rowspan` counted over a
   `VMerge::Restart` and the `Continue` cells below it at the same grid column (`GridMap`).
   Continuation cells are skipped. Borders, widths and shading are not written.
-- **Fields.** A field's cached result is written run by run from its XML (`load::field_result_runs`:
-  a `w:fldSimple`'s runs, or a complex field's after its outermost `separate`). Each run is shown or
-  hidden, and styled, by its own formatting, because `Inline::Field.text` joins every result run's
-  text, hidden ones included. When the runs' text is not the field's text (a formula the model
-  computes, a `w:sym`), the field is that text in its first result run's look, and nothing at all if
-  any result run is hidden.
+- **Fields.**
+  - A cached result (any field the model does not compute) is written run by run from its XML
+    (`load::field_result_runs`). Its runs are a `w:fldSimple`'s, decided by the outermost element so a
+    nested complex field does not change the mode, or a complex field's after its outermost `separate`.
+    Runs inside `w:del` or `w:moveFrom`, and `w:delText`, are left out. Each run is shown or hidden, and
+    styled, by its own formatting. `Inline::Field.text` is never written for such a field: it joins
+    every result run's text, hidden and deleted ones included.
+  - A computed result (a formula, decided by `field::instr_of` + `eval_field`), or a field whose XML
+    spells out no result run (a `w:sym`), is the field's text in its first result run's look, under
+    the raw-XML rule.
 - **Other content.** Equations, SmartArt and charts are written as their text, a text box as its
   paragraphs with a `<br>` only between two that show something (a paragraph that shows nothing is
   taken back with its break, and so is the `&nbsp;` the break made of the space before it), a note

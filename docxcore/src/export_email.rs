@@ -22,6 +22,15 @@
 //! note reference as its number. Tracked changes are their final view, and
 //! hidden text (direct or from a style) is never written.
 //!
+//! Content the model keeps as raw XML (a picture's run, a field, an
+//! equation, SmartArt, a chart, a note reference) follows one rule: what is
+//! not known to show is not written (`Writer::opaque_hidden`). Anything in
+//! it deleted, moved away or hidden (`load::raw_hides_content`), its run
+//! hidden, or a character style it names hiding, and the object is left
+//! out whole. Losing a rare visible object beats sending hidden text. A
+//! field's cached result is the exception that is read more finely: run by
+//! run, each kept or left out by its own formatting.
+//!
 //! Not written: floating pictures, headers and footers, note bodies,
 //! comments, a paragraph style's spacing and indent (only the paragraph's
 //! own), lists that only a paragraph style numbers, and content the model
@@ -444,9 +453,13 @@ impl Writer<'_> {
                         self.shown_solid();
                     }
                 }
-                // An object's text in its run's own formatting, which can
-                // hide it. An OMML equation has no run of its own: only its
-                // paragraph's style can hide it.
+                // An object kept as raw XML is written only when nothing in
+                // it is hidden or deleted (`opaque_hidden`), its text in its
+                // run's own formatting (an OMML equation has none).
+                Inline::SmartArt { raw, .. }
+                | Inline::Chart { raw, .. }
+                | Inline::Equation { raw, .. }
+                    if self.opaque_hidden(raw, pstyle) => {}
                 Inline::SmartArt { raw, text } => {
                     self.run(&text.join("\n"), &raw_run_props(raw), pstyle)
                 }
@@ -457,6 +470,9 @@ impl Writer<'_> {
                 ),
                 Inline::Equation { raw, text, .. } => self.run(text, &raw_run_props(raw), pstyle),
                 Inline::Field { raw, text } => self.field(raw, text, pstyle),
+                // A text box's content is the model's own paragraphs, each run
+                // checked as it is written (and its tracked changes accepted
+                // by `final_view`): only its host run can hide it whole.
                 Inline::TextBox { raw, .. } if self.hidden(&raw_run_props(raw), pstyle) => {}
                 Inline::TextBox { blocks, .. } => self.text_box(blocks),
                 Inline::Revision {
@@ -469,7 +485,7 @@ impl Writer<'_> {
                     ..
                 } => {}
                 Inline::UnsupportedRevision { .. } => {}
-                Inline::FootnoteRef { raw, .. } if self.hidden(&raw_run_props(raw), pstyle) => {}
+                Inline::FootnoteRef { raw, .. } if self.opaque_hidden(raw, pstyle) => {}
                 Inline::FootnoteRef { id, .. } => {
                     let _ = write!(self.out, "<sup>{id}</sup>");
                     self.shown_solid();
@@ -477,7 +493,7 @@ impl Writer<'_> {
                 Inline::Raw(raw) => {
                     // A hidden picture is neither shown nor attached.
                     if let Some(rid) = crate::image::inline_embed(raw) {
-                        if !self.hidden(&raw_run_props(raw), pstyle) {
+                        if !self.opaque_hidden(raw, pstyle) {
                             self.picture(raw, &rid);
                         }
                     }
@@ -486,24 +502,46 @@ impl Writer<'_> {
         }
     }
 
-    /// A field's result: run by run from its XML, each shown or hidden and
-    /// styled by its own formatting. A result the model computed (a
-    /// formula), or one its XML does not spell out, is the field's text in
-    /// its first result run's formatting, and nothing at all when any result
-    /// run is hidden: hidden text never leaves.
+    /// The rule for content the model keeps as raw XML (#1948): what is not
+    /// known to show is not written. Its own run hidden (directly or by a
+    /// style), or anything in it deleted, moved away or hidden
+    /// (`load::raw_hides_content`), or a character style it names hiding
+    /// it. Losing a rare visible object beats sending hidden text.
+    fn opaque_hidden(&self, raw: &str, pstyle: Option<&str>) -> bool {
+        crate::load::raw_hides_content(raw)
+            || self.hidden(&raw_run_props(raw), pstyle)
+            || crate::load::start_tags(raw, "w:rStyle")
+                .iter()
+                .filter_map(|(_, el)| crate::load::xml_attr_value(el, "w:val"))
+                .any(|id| {
+                    self.styles
+                        .effective_vanish(pstyle, Some(&id), &RunProps::default())
+                })
+    }
+
+    /// A field's result. A cached one (any field the model does not
+    /// compute) is written run by run from its XML, each shown or hidden and
+    /// styled by its own formatting, deleted runs left out; never its whole
+    /// text, which joins every result run, hidden and deleted ones included.
+    /// A computed one (a formula), or one whose XML spells out no result
+    /// run (a `w:sym`), is the field's text in its first result run's look,
+    /// under [`Writer::opaque_hidden`]'s rule.
     fn field(&mut self, raw: &str, text: &str, pstyle: Option<&str>) {
-        let runs = crate::load::field_result_runs(raw);
-        let cached: String = runs.iter().map(|(_, t)| t.as_str()).collect();
-        if !runs.is_empty() && cached == text {
-            for (props, t) in &runs {
-                self.run(t, props, pstyle);
+        let computed = crate::field::instr_of(raw)
+            .and_then(|instr| crate::field::eval_field(&instr))
+            .is_some();
+        if !computed {
+            let runs = crate::load::field_result_runs(raw);
+            if !runs.is_empty() {
+                for (props, t) in &runs {
+                    self.run(t, props, pstyle);
+                }
+                return;
             }
-            return;
         }
-        if runs.iter().any(|(props, _)| self.hidden(props, pstyle)) {
-            return;
+        if !self.opaque_hidden(raw, pstyle) {
+            self.run(text, &crate::load::field_result_props(raw), pstyle);
         }
-        self.run(text, &crate::load::field_result_props(raw), pstyle);
     }
 
     /// A text box's paragraphs, a `<br>` between two that show something
@@ -2317,5 +2355,116 @@ mod tests {
         )]));
         assert!(h.contains(">only </span><span"), "{h}");
         assert!(!h.contains("<br>"), "{h}");
+    }
+
+    #[test]
+    fn a_field_s_deleted_or_moved_result_run_is_not_written() {
+        for removed in [
+            "<w:del w:id=\"1\" w:author=\"a\"><w:r><w:delText>old confidential figure</w:delText></w:r></w:del>",
+            "<w:moveFrom w:id=\"1\" w:author=\"a\"><w:r><w:t>old confidential figure</w:t></w:r></w:moveFrom>",
+        ] {
+            let h = field_html(&simple_field(&format!("{VISIBLE}{removed}")));
+            assert!(h.contains("Public"), "{h}");
+            assert!(!h.contains("confidential"), "{h}");
+        }
+    }
+
+    /// A `w:fldSimple` holding a complex field is read as a `w:fldSimple`:
+    /// its hidden run stays hidden.
+    #[test]
+    fn a_field_with_a_nested_field_keeps_its_hidden_run_hidden() {
+        let nested = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+                      <w:r><w:instrText xml:space=\"preserve\"> PAGE </w:instrText></w:r>\
+                      <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                      <w:r><w:t>7</w:t></w:r>\
+                      <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let hidden = "<w:r><w:rPr><w:vanish/></w:rPr><w:t>secret</w:t></w:r>";
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![Inline::Field {
+                raw: simple_field(&format!("{hidden}{nested}")),
+                text: "secret7".into(),
+            }],
+        )]));
+        assert!(h.contains(">7</span>") && !h.contains("secret"), "{h}");
+    }
+
+    fn equation(raw: &str, text: &str) -> Inline {
+        Inline::Equation {
+            raw: raw.into(),
+            text: text.into(),
+            latex: None,
+        }
+    }
+
+    #[test]
+    fn a_hidden_or_deleted_math_run_hides_its_equation() {
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![
+                plain("text"),
+                equation(
+                    "<m:oMath><m:r><w:rPr><w:vanish/></w:rPr><m:t>hid</m:t></m:r></m:oMath>",
+                    "hid",
+                ),
+                equation(
+                    "<m:oMath><w:del w:id=\"1\" w:author=\"a\"><m:r><m:t>gone</m:t></m:r></w:del>\
+                     <m:r><m:t>y</m:t></m:r></m:oMath>",
+                    "goney",
+                ),
+                equation("<m:oMath><m:r><m:t>z</m:t></m:r></m:oMath>", "zed"),
+            ],
+        )]));
+        assert!(!h.contains("hid") && !h.contains("gone"), "{h}");
+        assert!(
+            h.contains(">zed</span>"),
+            "a plain equation is written: {h}"
+        );
+    }
+
+    /// A character style that hides, named inside raw XML (an OMML run's),
+    /// hides the object too.
+    #[test]
+    fn a_style_hidden_math_run_hides_its_equation() {
+        let mut pkg = new_markdown_package(Document::default());
+        let styles = pkg.part_text("word/styles.xml").expect("styles");
+        let styles = styles.replace(
+            "</w:styles>",
+            "<w:style w:type=\"character\" w:styleId=\"Secret\"><w:name w:val=\"Secret\"/>\
+             <w:rPr><w:vanish/></w:rPr></w:style></w:styles>",
+        );
+        assert!(pkg.set_part_text("word/styles.xml", &styles));
+        let d = doc(vec![para(
+            ParProps::default(),
+            vec![
+                plain("text"),
+                equation(
+                    "<m:oMath><m:r><w:rPr><w:rStyle w:val=\"Secret\"/></w:rPr><m:t>q</m:t></m:r></m:oMath>",
+                    "styled-secret",
+                ),
+            ],
+        )]);
+        let h = to_email_html(&d, Some(&pkg)).html;
+        assert!(!h.contains("styled-secret"), "{h}");
+    }
+
+    /// A text box's paragraphs are the model's own: a tracked deletion in
+    /// one is accepted away, a hidden run left out, the rest written.
+    #[test]
+    fn a_text_box_drops_its_deleted_and_hidden_runs() {
+        let deleted = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: Default::default(),
+            raw: String::new(),
+            content: vec![plain("struck")],
+            content_changed: false,
+        };
+        let boxed = text_box(vec![para(
+            ParProps::default(),
+            vec![plain("kept "), deleted, Inline::Run(hidden_run("veiled"))],
+        )]);
+        let h = html(&doc(vec![para(ParProps::default(), vec![boxed])]));
+        assert!(h.contains("kept"), "{h}");
+        assert!(!h.contains("struck") && !h.contains("veiled"), "{h}");
     }
 }
