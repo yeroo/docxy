@@ -107,6 +107,38 @@ test another app's rich copy pastes with its formatting
   call selection-set {"start":8,"end":8}
   assert run.bold is true
 
+# #1950: a browser's copy carries HTML and no RTF; a document paste takes
+# the HTML (bold and links kept), and an RTF beside it still wins.
+test another app's HTML copy pastes into a document with its bold and link
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"Plain BOLD link","html":"<p>Plain <b>BOLD</b> <a href=\"https://example.com/x\">link</a></p>"}
+  assert reply.app.kind is none
+  key ctrl+v
+  assert text is Plain BOLD link
+  call selection-set {"start":2,"end":2}
+  assert run.bold is false
+  assert run.link is nothing
+  call selection-set {"start":8,"end":8}
+  assert run.bold is true
+  call selection-set {"start":12,"end":12}
+  assert run.link is https://example.com/x
+  key ctrl+alt+v
+  assert dialog is doc-paste-special
+  call dialog-read {}
+  assert reply.controls.0.items.0 is HTML Format
+  assert reply.controls.0.items.1 is Unformatted Text
+  call dialog-click {"button":"Cancel"}
+
+test an RTF beside another app's HTML is what a document paste takes
+  open copy:../fixtures/basic.docx
+  call clipboard {"action":"write","text":"From RTF","rtf":"{\\rtf1\\ansi From {\\b RTF}}","html":"<p><i>From</i> RTF</p>"}
+  key ctrl+v
+  assert text is From RTF
+  call selection-set {"start":2,"end":2}
+  assert run.italic is false
+  call selection-set {"start":7,"end":7}
+  assert run.bold is true
+
 test text copied after a rich copy leaves no RTF behind
   open copy:../fixtures/basic.docx
   call clipboard {"action":"write","text":"x","rtf":"{\\rtf1 {\\b x}}"}
