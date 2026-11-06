@@ -397,12 +397,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   persisted `backfill_link`, else a fresh first call; one folder to its end
   before the next. A page carries the server's current state, and nothing
   else re-sends an old row's (the head's link sees only recent mail, the
-  walk's deltaLink only later changes), so it merges (`merge_message`,
-  `apply_backfill_items`), but never over a local edit: it skips every id
-  a queued outbox op names (`Store::pending_message_ids`: an optimistic
-  write waiting after a 5xx, and a deleted message is not put back) and
-  every draft (`Store::is_local_draft`: compose saves a draft's fields with
-  no op until `SaveDraft`, whose PATCH reads the row). In window mode items
+  walk's deltaLink only later changes), so it merges (`merge_message`),
+  but never over a local edit. That rule holds for every delta that starts
+  fresh and so carries every message it covers, not only what changed (a
+  head, a small folder's inline full delta, a backfill page:
+  `merge_delta_items` with `protect`): it skips every id a queued outbox op
+  names (`Store::pending_message_ids`: an optimistic write waiting after a
+  5xx, and a deleted message is not put back) and every draft
+  (`Store::is_local_draft`: compose saves a draft's fields with no op until
+  `SaveDraft`, whose PATCH reads the row). A round on a stored link merges
+  everything, as Graph reports a change there. In window mode items
   older than the cutoff are skipped, unless a reconverge is pending.
   `Store::set_backfill_progress` stores the `nextLink`, the count and the
   walk's scope (`backfill_scope`: `window` once a page ran with the
@@ -410,7 +414,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   go out. A walk recorded `window` that resumes in whole mode starts over
   (`reset_backfill`). When the deltaLink comes, one last round on the
   folder's own link (the head's, or a link from before #1871) runs first,
-  so recent mail changed during the walk is up to date; a round that fails
+  so recent mail changed during the walk is up to date. A link whose sync
+  state expired (`is_expired_sync_state`) is skipped, and the walk's
+  deltaLink heals the folder by replacing it; any other round that fails
   does not complete (a fatal failure stops through `react`, any other
   parks the folder), and the next step fetches the last page again. Then
   the deltaLink replaces the folder's link in one statement that marks it
@@ -468,7 +474,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   ops name and every draft
   (`Store::is_local_draft`)). It is cleared only when a pass ran
   every folder's delta and no folder's backfill remains, else by the step
-  that completes the last folder. It is persisted (`meta.reconverge_pending`,
+  that completes the last folder, or by the one that parks the last walk
+  left: parked walks do not count (`backfill_remains`), so a page that
+  keeps failing cannot hold the reconverge, and the cutoff, off for good. It is persisted (`meta.reconverge_pending`,
   set by `clear_delta_links` in the same transaction, loaded by `run`,
   cleared by `Engine::end_reconverge`), so an engine restarted in the
   middle still runs the walks without the cutoff.
