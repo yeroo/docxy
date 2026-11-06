@@ -93,7 +93,9 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
     use. It is the same on every export of the same document, and never shared by two different
     pictures; the same picture can still get a different id in another document. The same part used
     twice is one medium.
-  - Without a package, a relationship or the part, the picture is its Alt Text (`wp:docPr descr`).
+  - Without a package, a relationship or the part, the picture is its Alt Text (`wp:docPr descr`,
+    character references decoded by `load::decode_attr`: a line break or tab is a space in `alt=`, a
+    `<br>` or tab in the fallback text).
   - Floating pictures are not written. Image formats are not converted: EMF, WMF and TIFF go out as
     they are.
   - Round-trip tests need a picture narrower than the import's body width (the import scales a wider
@@ -110,9 +112,13 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
     Runs inside `w:del` or `w:moveFrom`, and `w:delText`, are left out. Each run is shown or hidden, and
     styled, by its own formatting. `Inline::Field.text` is never written for such a field: it joins
     every result run's text, hidden and deleted ones included.
-  - A computed result (a formula, decided by `field::instr_of` + `eval_field`), or a field whose XML
-    spells out no result run (a `w:sym`), is the field's text in its first result run's look, under
-    the raw-XML rule.
+  - The run-by-run path holds only while the XML still stores the result the field shows: its runs'
+    text, or `load::field_stored_text` (deleted runs included, as the loader caches it), equals
+    `Inline::Field.text`. A field refreshed in memory (`field::recompute`: DATE, AUTHOR, …) keeps its
+    old result runs in `raw`, so it is written as its text, as every other exporter writes it.
+  - A computed result (a formula, decided by `field::instr_of` + `eval_field`), a refreshed one, or a
+    field whose XML spells out no result run (a `w:sym`), is the field's text in its first result
+    run's look, under the raw-XML rule.
 - **Other content.** Equations, SmartArt and charts are written as their text, a text box as its
   paragraphs with a `<br>` only between two that show something (a paragraph that shows nothing is
   taken back with its break, and so is the `&nbsp;` the break made of the space before it), a note

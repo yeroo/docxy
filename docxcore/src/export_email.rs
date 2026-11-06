@@ -523,16 +523,22 @@ impl Writer<'_> {
     /// compute) is written run by run from its XML, each shown or hidden and
     /// styled by its own formatting, deleted runs left out; never its whole
     /// text, which joins every result run, hidden and deleted ones included.
-    /// A computed one (a formula), or one whose XML spells out no result
-    /// run (a `w:sym`), is the field's text in its first result run's look,
-    /// under [`Writer::opaque_hidden`]'s rule.
+    /// A computed one (a formula), one refreshed in memory since it was
+    /// loaded (its text no longer the result its XML stores), or one whose
+    /// XML spells out no result run (a `w:sym`), is the field's text in its
+    /// first result run's look, under [`Writer::opaque_hidden`]'s rule.
     fn field(&mut self, raw: &str, text: &str, pstyle: Option<&str>) {
         let computed = crate::field::instr_of(raw)
             .and_then(|instr| crate::field::eval_field(&instr))
             .is_some();
         if !computed {
             let runs = crate::load::field_result_runs(raw);
-            if !runs.is_empty() {
+            // Only while the XML still holds the result the field shows: a
+            // field refreshed in memory (`field::recompute`: a DATE, an
+            // AUTHOR) is its text, as every other exporter writes it.
+            let shown: String = runs.iter().map(|(_, t)| t.as_str()).collect();
+            let current = shown == text || crate::load::field_stored_text(raw) == text;
+            if !runs.is_empty() && current {
                 for (props, t) in &runs {
                     self.run(t, props, pstyle);
                 }
@@ -773,7 +779,8 @@ impl Writer<'_> {
             "<img src=\"cid:{}\" width=\"{w}\" height=\"{h}\" alt=\"{}\" \
              style=\"width:{w}px;height:{h}px;border:0\">",
             attr(&id),
-            attr(&alt)
+            // A line break or tab in Alt Text is a space in the attribute.
+            attr(&alt.replace(['\n', '\r', '\t'], " "))
         );
         self.shown_solid();
     }
@@ -858,7 +865,7 @@ fn alt_text(raw: &str) -> String {
     crate::load::start_tags(raw, "wp:docPr")
         .first()
         .and_then(|(_, el)| crate::load::xml_attr_value(el, "descr"))
-        .map(|d| crate::field::xml_unescape(&d))
+        .map(|d| crate::load::decode_attr(&d))
         .unwrap_or_default()
 }
 
@@ -2466,5 +2473,68 @@ mod tests {
         let h = html(&doc(vec![para(ParProps::default(), vec![boxed])]));
         assert!(h.contains("kept"), "{h}");
         assert!(!h.contains("struck") && !h.contains("veiled"), "{h}");
+    }
+
+    /// Alt Text's character references (`&#10;`, `&#xA;`, `&#9;`) are
+    /// decoded: a space in the attribute, a break or tab in the fallback.
+    #[test]
+    fn alt_text_character_references_are_decoded() {
+        let alt = "line1\nline2\tend";
+        let pkg = with_picture(&png(5, 5), |rid| {
+            vec![para(ParProps::default(), vec![picture(rid, 5, 5, alt)])]
+        });
+        assert!(
+            matches!(&pkg.document.body[0], Block::Paragraph(p)
+                if matches!(&p.content[0], Inline::Raw(r) if r.contains("&#10;"))),
+            "the picture stores a reference"
+        );
+        let h = to_email_html(&pkg.document, Some(&pkg)).html;
+        assert!(!h.contains("&#") && !h.contains("&amp;#"), "{h}");
+        assert!(h.contains("alt=\"line1 line2 end\""), "{h}");
+        // Word's hexadecimal spelling, with no package: the fallback text.
+        let d = doc(vec![para(
+            ParProps::default(),
+            vec![Inline::Raw(
+                crate::image::inline_picture_run("rId9", 9525, 9525, 1, "a.png").replace(
+                    "name=\"Picture 1\"",
+                    "name=\"Picture 1\" descr=\"up&#xA;down\"",
+                ),
+            )],
+        )]);
+        let h = html(&d);
+        assert!(!h.contains("&#") && !h.contains("&amp;#"), "{h}");
+        assert!(h.contains("up<br>down"), "{h}");
+    }
+
+    /// A field refreshed in memory (`field::recompute`) since it was loaded
+    /// is its text, as every other exporter writes it; any hidden content in
+    /// its XML still drops it.
+    #[test]
+    fn a_refreshed_field_is_its_text() {
+        let raw = simple_field_instr(" DATE ", "<w:r><w:t>1/1/2020</w:t></w:r>");
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![Inline::Field {
+                raw,
+                text: "11/6/2026".into(),
+            }],
+        )]));
+        assert!(
+            h.contains(">11/6/2026</span>") && !h.contains("2020"),
+            "{h}"
+        );
+        let raw = simple_field_instr(" DATE ", &format!("<w:r><w:t>1/1/2020</w:t></w:r>{HIDDEN}"));
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![Inline::Field {
+                raw,
+                text: "11/6/2026".into(),
+            }],
+        )]));
+        assert!(!h.contains("2026") && !h.contains("internal-only"), "{h}");
+    }
+
+    fn simple_field_instr(instr: &str, result: &str) -> String {
+        format!("<w:fldSimple w:instr=\"{instr}\">{result}</w:fldSimple>")
     }
 }

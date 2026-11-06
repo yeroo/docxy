@@ -131,7 +131,7 @@ pub fn load(data: &[u8]) -> Result<Document, LoadError> {
 
 // ---- small helpers ----
 
-fn decode_attr(raw: &str) -> String {
+pub(crate) fn decode_attr(raw: &str) -> String {
     let mut s = String::new();
     XmlParser::append_decoded(raw, &mut s);
     s
@@ -1744,6 +1744,20 @@ pub(crate) fn raw_hides_content(raw: &str) -> bool {
 /// deletion or move-away (`w:del`, `w:moveFrom`) and deleted text
 /// (`w:delText`) are left out, as is a run that shows no text.
 pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
+    result_runs(raw, false)
+}
+
+/// The result a field's XML stores, every result run's text joined, deleted
+/// ones included (`w:delText`), as the loader caches it in
+/// [`Inline::Field`]'s text. A field whose text differs was refreshed in
+/// memory (`field::recompute`).
+pub(crate) fn field_stored_text(raw: &str) -> String {
+    result_runs(raw, true).into_iter().map(|(_, t)| t).collect()
+}
+
+/// [`field_result_runs`], the runs a tracked deletion or move-away holds
+/// and deleted text kept when `keep_removed`.
+fn result_runs(raw: &str, keep_removed: bool) -> Vec<(RunProps, String)> {
     use crate::field::FieldEvent;
     let simple = raw.trim_start().starts_with("<w:fldSimple");
     let mut p = XmlParser::new(raw);
@@ -1766,6 +1780,7 @@ pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
                         Event::Start => match p.name() {
                             "w:rPr" => parse_rpr(&mut p, &mut props),
                             "w:t" => text.push_str(&read_text(&mut p)),
+                            "w:delText" if keep_removed => text.push_str(&read_text(&mut p)),
                             name => {
                                 match name {
                                     "w:tab" => text.push('\t'),
@@ -1783,7 +1798,10 @@ pub(crate) fn field_result_runs(raw: &str) -> Vec<(RunProps, String)> {
                 }
                 let events = crate::field::field_events(p.raw_slice(start, p.pos()));
                 if events.is_empty() {
-                    if (simple || (separated && depth >= 1)) && removed == 0 && !text.is_empty() {
+                    if (simple || (separated && depth >= 1))
+                        && (keep_removed || removed == 0)
+                        && !text.is_empty()
+                    {
                         out.push((props, text));
                     }
                     continue;
