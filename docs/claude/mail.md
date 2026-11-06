@@ -57,7 +57,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   filled as text upgrades one message per `FetchBody`, and a native text
   answer to `Html` is not refetched. `FetchBody` itself always goes to
   Graph: the caller gates on `get_body_for` (`get_body` still shows
-  whatever is stored).
+  whatever is stored). Since #1978 the engine also fetches bodies on its
+  own (below), through the same store path and the same rule
+  (`store::body_satisfies`).
 - Not done: FTS indexes an html body's markup (the triggers copy `content`).
 
 ## Sync one folder, the fast cycle, Sent Items after a send (#1885)
@@ -498,8 +500,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   cleared by `Engine::end_reconverge`), so an engine restarted in the
   middle still runs the walks without the cutoff.
 - One request at a time (the engine is one thread). Bodies stay lazy
-  (`FetchBody`); headers and `bodyPreview` come for everything
-  (`MESSAGE_SELECT`). Pages stay at 50 (`odata.maxpagesize=50`).
+  (`FetchBody`) beyond `prefetch_body_days` (#1978, below); headers and
+  `bodyPreview` come for everything (`MESSAGE_SELECT`). Pages stay at 50
+  (`odata.maxpagesize=50`).
 - Tests: `FakeServer::start_paced` gives a route a delay (a slow page, so a
   test can act while a backfill runs), and `RecordedRequest::at` is the
   arrival time. Most older engine fixtures list folders of 0 or 1 message,
@@ -508,3 +511,71 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   still surfaces an `Error` every tick; rows a full enumeration did not
   return are not swept (a delete during the backfill comes through the full
   deltaLink's later rounds).
+
+## New mail with its body, prefetch, FetchBody first (#1978)
+
+- `EngineOptions::prefetch_body_days` (`u32`, default `PREFETCH_BODY_DAYS`
+  = 14; `Default` is a manual impl now) is how many days of the newest mail
+  get bodies without a `FetchBody`. `0` turns every body fetch the engine
+  makes on its own off: then bodies come only from `FetchBody`, as before.
+  lookxy keeps `spawn`, so it runs the default.
+- **Which messages.** `Store::body_candidates(format, since, limit, skip)`:
+  received at `since` or later (header-less rows are out), not a draft
+  (`is_draft`, the Drafts folder, the local sentinel: `get_body_for`'s
+  rule), whose stored body does not satisfy `format` under
+  `store::body_satisfies` (the rule `get_body_for` uses, written once),
+  newest first. `Store::needs_body(id, format, since)` is the same rule for
+  one row (a missing row: no). `idx_messages_received` keeps the
+  cross-folder query cheap on a whole-mailbox store.
+- **New mail.** Only a round on a stored delta link (`sync_folder_delta`
+  with `DeltaCursor::Link`, and the backfill's last round on the folder's
+  own link) collects the ids it adds: `merge_delta_items` with no
+  `protect` notes an upsert that was not stored before
+  (`Store::message_exists`) into `DeltaRun::new_ids`. After the repair,
+  `fetch_new_bodies` fetches at most 50 of them (`NEW_BODY_LIMIT`), in the
+  pass, fast tick or `SyncFolder`. A fresh delta (a head, a small folder's
+  inline full delta, a backfill page) carries history, not new mail: the
+  prefetch takes its rows, so a first sync is no longer than before.
+- **Prefetch.** One idle step of the main loop fetches up to 10 bodies
+  (`PREFETCH_BATCH`, `next_prefetch`/`prefetch_step`), signed in, outside a
+  back-off, after a folder list succeeded, before any backfill page (the
+  window bounds it). One `GET /me/messages/{id}?$select=body` each, the
+  call `FetchBody` makes (`fetch_and_store_body` is shared: `fetched_as`
+  recorded, `BodyReady` sent, so `BodyReady` may name a message nobody
+  opened).
+- **Failures** (`background_body`). Auth, throttle or transport goes through
+  `react` and stops the caller: a 429/503 sets `next_retry`, which the
+  prefetch waits out. Any other Graph failure (404, other 4xx, parse) is not
+  reported, as the user asked for nothing, and puts the id in
+  `Engine::body_skip` for this run. A store failure parks these fetches
+  until the next pass (`body_parked`), so a store that keeps failing costs
+  one request a pass, not a loop. A row deleted since (its body fails the
+  foreign key) is not a store failure. Note that `Store::open`'s
+  connections keep rusqlite's default 5 s busy timeout, so a write lock
+  held for a moment by the UI's own connection only delays the write.
+- **FetchBody first.** The engine owns `cmd_rx`. `Engine::checkpoint` runs
+  between two requests of long work: before each folder's delta in a pass
+  and a fast tick, between delta pages (`run_delta`, which then returns
+  `stopped` with no deltaLink: nothing records the walk complete), before
+  each repair `get_message`, before each body fetch, before the drain,
+  before people/categories, and before the tick's calendar. It serves a
+  `FetchBody` at once and keeps every other command in `deferred`, in
+  order, which the main loop runs before reading the channel again. It says
+  stop only on a `Shutdown` (or a dropped handle) or when the `FetchBody`
+  it served got an auth, throttle or transport failure, never because of a
+  back-off set before it: `Refresh` runs a pass during one. A `Shutdown`
+  stops the work at the next checkpoint; the commands that came before it
+  still run. So a click costs one round trip plus the request in flight.
+  A served `FetchBody` overtakes the commands queued before it, which do
+  not depend on a body read.
+- Tests (`engine.rs` `tests::backfill::bodies`): the engine tests from
+  before #1978 run `EngineOptions::without_prefetch` (`spawn_with_bases`,
+  `spawn_in`, `spawn_fast`, `html_options`, the body tests): their fixtures
+  are dated, some inside any recent window, so with prefetch on what they
+  assert would change with the day they run. The #1978 tests opt in and
+  date their mail relative to now. They read the store only after the
+  engine stopped.
+- Not done: no checkpoint inside the outbox drain (a send with big
+  attachments still holds a click), the folder-tree listing or the
+  calendar's pages; no `$batch`; pictures and attachments are not
+  prefetched; no lookxy setting for the window.
