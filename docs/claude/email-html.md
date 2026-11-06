@@ -31,7 +31,8 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
   `StyleSheet::effective_vanish`, so a style's `w:vanish` hides too: hidden text must never leave in a
   sent message. That includes what the model keeps as a raw run: a picture (neither shown nor
   attached), a text box, a note reference, SmartArt, a chart or a run-based equation. Their run's own
-  `w:rPr` is read by `load::raw_run_props`; an OMML equation is no run and is never hidden. The text
+  `w:rPr` is read by `load::raw_run_props`; an OMML equation has no run of its own: only its
+  paragraph's style can hide it. The text
   of SmartArt, a chart or an equation takes that run's look too.
 - **Spaces.** A space that would collapse is `&nbsp;`: one at a line's start or end, or after another
   space. Imported back, these come as U+00A0.
@@ -69,7 +70,9 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
     RTF.
 - **Links.** A target whose scheme is `http`, `https`, `ftp` or `mailto` (any case, trimmed) is the
   `href`, from the HTML import's own allow-list (`import::html::LINK_SCHEMES`). Otherwise the in-document anchor (`#name`) is used, otherwise no `<a>` and the text alone:
-  `javascript:`, `data:`, `file:` and relative targets are never links. The import turns a `"` in an
+  `javascript:`, `data:`, `file:` and relative targets are never links. A link that shows nothing (all its
+  text hidden, by its runs or a style, or deleted) writes nothing at all, so its URL never leaves in the
+  message source (`Writer::hyperlink` takes the `<a>` back when `Writer::shown` did not move). The import turns a `"` in an
   `href` into `%22`.
 - **Pictures.**
   - An inline DrawingML picture (`image::inline_embed`) resolves its rid against `word/document.xml`.

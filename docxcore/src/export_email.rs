@@ -90,6 +90,7 @@ pub fn to_email_html(doc: &Document, pkg: Option<&Package>) -> EmailHtml {
         counters: HashMap::new(),
         text: TextState::default(),
         in_heading: false,
+        shown: 0,
     };
     w.out
         .push_str("<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n</head>\n<body>\n");
@@ -123,7 +124,7 @@ struct OpenList {
 
 /// Where the text of the paragraph being written stands, so runs of spaces
 /// and the paragraph's edge spaces survive a browser's white-space collapse.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TextState {
     /// Nothing shown yet on this line, or the last character was a space: a
     /// space now would collapse.
@@ -151,6 +152,9 @@ struct Writer<'a> {
     text: TextState,
     /// The paragraph being written is an `<hN>`, which browsers make bold.
     in_heading: bool,
+    /// How many visible things have been written: a link that adds none
+    /// is taken back.
+    shown: u64,
 }
 
 impl Writer<'_> {
@@ -441,7 +445,8 @@ impl Writer<'_> {
                     }
                 }
                 // An object's text in its run's own formatting, which can
-                // hide it (an OMML equation is no run: never hidden).
+                // hide it. An OMML equation has no run of its own: only its
+                // paragraph's style can hide it.
                 Inline::SmartArt { raw, text } => {
                     self.run(&text.join("\n"), &raw_run_props(raw), pstyle)
                 }
@@ -491,18 +496,31 @@ impl Writer<'_> {
         }
     }
 
+    /// A link: `<a href>` round its content, or its content alone when its
+    /// target is not safe. A link that shows nothing (its text hidden or
+    /// deleted) writes nothing, so its URL never leaves in the message.
     fn hyperlink(&mut self, h: &Hyperlink, pstyle: Option<&str>) {
-        let href = link_href(h);
-        if let Some(href) = &href {
-            let _ = write!(self.out, "<a href=\"{}\">", attr(href));
+        let Some(href) = link_href(h) else {
+            self.link_content(h, pstyle);
+            return;
+        };
+        let (mark, text, shown) = (self.out.len(), self.text.clone(), self.shown);
+        let _ = write!(self.out, "<a href=\"{}\">", attr(&href));
+        self.link_content(h, pstyle);
+        if self.shown == shown {
+            // Every index `text` holds is before `mark`.
+            self.out.truncate(mark);
+            self.text = text;
+            return;
         }
+        self.out.push_str("</a>");
+    }
+
+    fn link_content(&mut self, h: &Hyperlink, pstyle: Option<&str>) {
         for r in &h.runs {
             self.run(&r.text, &r.props, pstyle);
         }
         self.inlines(&h.content, pstyle);
-        if href.is_some() {
-            self.out.push_str("</a>");
-        }
     }
 
     /// Whether a run is hidden text, by its direct formatting or a style:
@@ -602,13 +620,13 @@ impl Writer<'_> {
                 ' ' if self.text.after_space => {
                     self.out.push_str("&nbsp;");
                     self.text.trailing_space = None;
-                    self.text.shown = true;
+                    self.mark_shown();
                 }
                 ' ' => {
                     self.text.trailing_space = Some(self.out.len());
                     self.out.push(' ');
                     self.text.after_space = true;
-                    self.text.shown = true;
+                    self.mark_shown();
                 }
                 '\n' => self.line_break(),
                 '\t' => {
@@ -630,11 +648,18 @@ impl Writer<'_> {
         }
     }
 
+    /// Something visible was written: the paragraph is not empty, and
+    /// [`Writer::shown`] counts it.
+    fn mark_shown(&mut self) {
+        self.text.shown = true;
+        self.shown += 1;
+    }
+
     /// Something that is not a space was shown.
     fn shown_solid(&mut self) {
         self.text.after_space = false;
         self.text.trailing_space = None;
-        self.text.shown = true;
+        self.mark_shown();
     }
 
     fn line_break(&mut self) {
@@ -643,7 +668,7 @@ impl Writer<'_> {
         }
         self.out.push_str("<br>");
         self.text.after_space = true;
-        self.text.shown = true;
+        self.mark_shown();
     }
 
     /// An inline picture: an `<img>` of its media part's `cid:`, at its
@@ -1545,6 +1570,125 @@ mod tests {
         for i in 0..targets.len() {
             assert!(h.contains(&format!("text{i}")), "{h}");
         }
+    }
+
+    fn link_of(runs: Vec<Run>, content: Vec<Inline>) -> Inline {
+        Inline::Hyperlink(Hyperlink {
+            target: Some("https://secret.test/x".into()),
+            runs,
+            content,
+            ..Default::default()
+        })
+    }
+
+    fn hidden_run(text: &str) -> Run {
+        Run {
+            text: text.into(),
+            props: RunProps {
+                vanish: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Its text hidden, a link writes nothing: its URL never leaves.
+    #[test]
+    fn a_hidden_link_writes_no_url() {
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![
+                plain("before "),
+                link_of(vec![hidden_run("x")], vec![]),
+                plain("after"),
+            ],
+        )]));
+        assert!(!h.contains("secret.test") && !h.contains("<a "), "{h}");
+        // The text around it is as it was: the space before stays a space.
+        assert!(h.contains(">before </span><span"), "{h}");
+        // An anchor-only link too.
+        let anchor = Inline::Hyperlink(Hyperlink {
+            anchor: Some("hidden_place".into()),
+            runs: vec![hidden_run("y")],
+            ..Default::default()
+        });
+        let h = html(&doc(vec![para(ParProps::default(), vec![anchor])]));
+        assert!(!h.contains("hidden_place"), "{h}");
+        assert!(h.contains(">&nbsp;</p>"), "the paragraph is empty: {h}");
+    }
+
+    #[test]
+    fn a_style_hidden_link_writes_no_url() {
+        let mut pkg = new_markdown_package(Document::default());
+        let styles = pkg.part_text("word/styles.xml").expect("styles");
+        let styles = styles.replace(
+            "</w:styles>",
+            "<w:style w:type=\"character\" w:styleId=\"Secret\"><w:name w:val=\"Secret\"/>\
+             <w:rPr><w:vanish/></w:rPr></w:style></w:styles>",
+        );
+        assert!(pkg.set_part_text("word/styles.xml", &styles));
+        let styled = Run {
+            text: "x".into(),
+            props: RunProps {
+                style_id: Some("Secret".into()),
+                ..Default::default()
+            },
+        };
+        let d = doc(vec![para(
+            ParProps::default(),
+            vec![plain("text"), link_of(vec![styled], vec![])],
+        )]);
+        let h = to_email_html(&d, Some(&pkg)).html;
+        assert!(!h.contains("secret.test"), "{h}");
+    }
+
+    #[test]
+    fn a_deleted_link_writes_no_url() {
+        let deleted = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: Default::default(),
+            raw: String::new(),
+            content: vec![plain("gone")],
+            content_changed: false,
+        };
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![plain("text"), link_of(vec![], vec![deleted])],
+        )]));
+        assert!(!h.contains("secret.test") && !h.contains("gone"), "{h}");
+        // Accepting the deletion above drops the link whole; a tracked move
+        // is left in place and writes nothing, so its link shows nothing.
+        let moved = Inline::UnsupportedRevision {
+            kind: crate::model::UnsupportedRevisionKind::MoveFrom,
+            metadata: Default::default(),
+            raw: "<w:moveFrom><w:r><w:t>moved</w:t></w:r></w:moveFrom>".into(),
+        };
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![plain("text"), link_of(vec![], vec![moved])],
+        )]));
+        assert!(!h.contains("secret.test") && !h.contains("moved"), "{h}");
+    }
+
+    #[test]
+    fn a_link_with_some_hidden_text_shows_the_rest() {
+        let h = html(&doc(vec![para(
+            ParProps::default(),
+            vec![link_of(
+                vec![
+                    hidden_run("secret"),
+                    Run {
+                        text: "shown".into(),
+                        props: RunProps::default(),
+                    },
+                ],
+                vec![],
+            )],
+        )]));
+        assert!(h.contains("<a href=\"https://secret.test/x\">"), "{h}");
+        assert!(
+            h.contains("shown</span></a>") && !h.contains(">secret<"),
+            "{h}"
+        );
     }
 
     // ---- pictures ----
