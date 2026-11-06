@@ -485,7 +485,11 @@ table sits across `text_column`, `left`, `center`, `right` or `other`
 its blocks draw in), `null` with no column. `text_column` is that column,
 `left` (from the view's left) and `width`: Web Layout's text column, else
 Print Layout's first page's first band; `null` before either has drawn
-(`docs/claude/suite-document.md` "Table placement by `w:jc`"). A table is
+(`docs/claude/suite-document.md` "Table placement by `w:jc`"). `pictures`
+(#1926) is one object per body inline picture the last frame built, in
+order, cells included (not headers and footers): `width`, `height` and the
+clip `radius` (px, to 0.1), `shape` (`rect`, `ellipse`, `roundRect`, its
+crop) and `round` (the radius is half the shorter side). A table is
 fitted to the
 width the frame before measured, so read it after a `shot`, which waits for
 the frame after the change. The embedded view's `ext-doc-read` reports
