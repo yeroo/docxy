@@ -46942,6 +46942,12 @@ pub fn run(extensions: ext::Extensions) {
         .with_quit_mode(quit_mode());
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        // The last copy's RTF/HTML to the X11 clipboard manager (#1950).
+        cx.on_app_quit(|_| {
+            rich_clip::hand_over();
+            async {}
+        })
+        .detach();
         // Fonts resolved once, and the theme's families made loadable: on
         // Linux `.SystemUIFont` is IBM Plex Sans, which the suite does not
         // embed (#1900).
