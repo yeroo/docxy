@@ -542,12 +542,12 @@ mod tests {
         assert_eq!(picture_twips(None, None, None), None);
         // Capped at the body width, aspect kept, placeholders too.
         assert_eq!(
-            picture_twips(None, None, Some((1248, 100))),
-            Some((9360, 750))
+            picture_twips(None, None, Some((1572, 100))),
+            Some((11_790, 750))
         );
         assert_eq!(
-            picture_twips(Some(18_720), Some(600), None),
-            Some((9360, 300))
+            picture_twips(Some(23_580), Some(600), None),
+            Some((11_790, 300))
         );
         assert_eq!(twips_emu((15, 30)), (9525, 19_050));
         assert_eq!(twips_emu((0, 1)), (1, 635));

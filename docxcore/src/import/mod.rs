@@ -7,8 +7,9 @@
 //! [`crate::package::new_markdown_package`] defines) and simple tables. The
 //! result has no package of its own; it is saved through a fresh Markdown
 //! package, which defines every style and list it uses. Fields, notes,
-//! comments and section layout are not converted; images only by
-//! [`html::import_html_with`] (#1880), whose [`html::HtmlImport`] carries
+//! comments and section layout are not converted (an HTML import gets one
+//! fixed page, Letter with Outlook-like 15 px margins, #1928); images only
+//! by [`html::import_html_with`] (#1880), whose [`html::HtmlImport`] carries
 //! their media into the package it builds.
 //!
 //! Format is decided by content first ([`sniff`]), so an RTF or HTML file
