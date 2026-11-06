@@ -52,7 +52,7 @@ use crate::store::{
 };
 use crate::sync::outbox::{apply_op, apply_send, send_error_text};
 use crate::tokencache;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -449,10 +449,11 @@ enum BackgroundBody {
     /// An auth, throttle or transport failure (`react` has run), or a
     /// checkpoint said stop: the caller stops.
     Stop,
-    /// The store failed (it may be busy: the UI writes on its own
-    /// connection): the engine's own body fetches are parked until the next
-    /// pass (`body_parked`), and the caller's other work goes on.
-    StoreFailed,
+    /// The store failed, or Graph answered a 5xx other than a throttle's
+    /// 503: the engine's own body fetches are parked until the next pass
+    /// (`body_parked`), the id is not skipped, and the caller's other work
+    /// goes on.
+    Parked,
 }
 
 /// What `Engine::repair_headerless` did to a folder.
@@ -704,7 +705,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         cmd_rx,
         deferred: VecDeque::new(),
         shutting_down: false,
-        body_skip: Vec::new(),
+        body_skip: HashSet::new(),
         body_parked: false,
     };
     engine.startup();
@@ -795,10 +796,10 @@ struct Engine {
     /// for a reason a retry would not fix (a 404, another 4xx, a parse
     /// error): neither the new-mail fetch nor the prefetch asks for them
     /// again in this run. A `FetchBody` still does.
-    body_skip: Vec<String>,
-    /// A store failure stopped the engine's own body fetches (#1978) until
-    /// the next sync pass, which clears it: one try a pass, never a loop,
-    /// and a store that was only busy heals.
+    body_skip: HashSet<String>,
+    /// A store failure or a Graph 5xx stopped the engine's own body
+    /// fetches (#1978) until the next sync pass, which clears it: one try a
+    /// pass, never a loop, and a store or a service that recovered heals.
     body_parked: bool,
 }
 
@@ -836,8 +837,10 @@ impl Engine {
     /// While a folder's backfill is ready (#1871), or recent bodies are to
     /// prefetch (#1978), the wait is zero: a queued command runs first, then
     /// a due deadline (`due`), then one prefetch batch, and only when there
-    /// is none one backfill page. So a command waits for at most the request
-    /// in flight, and a tick runs between two steps.
+    /// is none one backfill page. A `FetchBody` waits for at most the
+    /// request in flight (`checkpoint`); any other command, and a due tick,
+    /// for at most the request in flight of an idle step (one prefetch body,
+    /// as the batch then ends, or one backfill page).
     ///
     /// The commands a `checkpoint` kept (`deferred`) run first, in order,
     /// before the channel is read again; then a `Shutdown` a checkpoint saw
@@ -2578,7 +2581,7 @@ impl Engine {
                 BackgroundBody::NotNeeded => {}
                 BackgroundBody::Fetched => fetched += 1,
                 BackgroundBody::Stop => return false,
-                BackgroundBody::StoreFailed => break,
+                BackgroundBody::Parked => break,
             }
         }
         true
@@ -2612,14 +2615,19 @@ impl Engine {
     }
 
     /// One prefetch batch (#1978): each id after a checkpoint, if it still
-    /// needs a body (`background_body`). A failure that stops it keeps what
+    /// needs a body (`background_body`). It ends early when a checkpoint
+    /// kept a command or a timed wake is due, so those wait for one body at
+    /// most, as for one backfill page. A failure that stops it keeps what
     /// `react` set: a throttle's `next_retry` holds the prefetch until
     /// `Retry-After` ends. Sets no state, like a backfill step.
     fn prefetch_step(&mut self, since: &str, ids: &[String]) {
         for id in ids {
-            if let BackgroundBody::Stop | BackgroundBody::StoreFailed =
-                self.background_body(id, since)
-            {
+            // A command a checkpoint kept, or a tick come due, ends the
+            // batch: the main loop runs it, then the rest of the window.
+            if !self.checkpoint() || !self.deferred.is_empty() || self.due() {
+                return;
+            }
+            if let BackgroundBody::Stop | BackgroundBody::Parked = self.background_body(id, since) {
                 return;
             }
         }
@@ -2630,16 +2638,18 @@ impl Engine {
     /// re-check (`Store::needs_body`: a draft, a row deleted or a body
     /// stored since needs none), then `fetch_and_store_body`. An auth,
     /// throttle or transport failure goes through `react` and stops the
-    /// caller. Any other Graph failure (a 404: moved or deleted since,
-    /// another 4xx, a parse error) is not reported, as the user asked for
-    /// nothing, and puts the id in `body_skip`, so it is not asked for
-    /// again in this run: never a loop. A store failure parks these fetches
-    /// until the next pass (`body_parked`): a busy store heals then.
+    /// caller. A 404 (moved or deleted since), another 4xx or a parse error
+    /// is not reported, as the user asked for nothing, and puts the id in
+    /// `body_skip`, so it is not asked for again in this run: never a loop.
+    /// A 5xx (other than a throttle's 503) or a store failure parks these
+    /// fetches until the next pass (`body_parked`), the id not skipped: one
+    /// request a pass while Graph or the store is failing, and the id is
+    /// fetched once it works again.
     fn background_body(&mut self, id: &str, since: &str) -> BackgroundBody {
         if !self.checkpoint() {
             return BackgroundBody::Stop;
         }
-        if self.body_skip.iter().any(|s| s == id) {
+        if self.body_skip.contains(id) {
             return BackgroundBody::NotNeeded;
         }
         match self
@@ -2650,7 +2660,7 @@ impl Engine {
             Ok(false) => return BackgroundBody::NotNeeded,
             Err(_) => {
                 self.body_parked = true;
-                return BackgroundBody::StoreFailed;
+                return BackgroundBody::Parked;
             }
         }
         match self.fetch_and_store_body(id) {
@@ -2660,7 +2670,7 @@ impl Engine {
             Ok(false) if !self.store.message_exists(id).unwrap_or(true) => BackgroundBody::Fetched,
             Ok(false) => {
                 self.body_parked = true;
-                BackgroundBody::StoreFailed
+                BackgroundBody::Parked
             }
             Err(
                 e @ (GraphError::Unauthorized
@@ -2670,8 +2680,12 @@ impl Engine {
                 self.react(e);
                 BackgroundBody::Stop
             }
+            Err(GraphError::Http { status, .. }) if status >= 500 => {
+                self.body_parked = true;
+                BackgroundBody::Parked
+            }
             Err(GraphError::NotFound | GraphError::Http { .. } | GraphError::Parse(_)) => {
-                self.body_skip.push(id.to_string());
+                self.body_skip.insert(id.to_string());
                 BackgroundBody::Fetched
             }
         }
@@ -12565,6 +12579,213 @@ mod tests {
                 assert_eq!(body_get_ids(&srv), ["R1", "R1", "R2"]);
                 stop(handle);
                 assert!(has_body(&dir, "R1", BodyFormat::Text));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn a_5xx_on_a_prefetch_body_parks_until_the_next_pass_and_is_fetched_then() {
+                // A Graph 500 is a failing service, not a bad id: the
+                // prefetch parks (R2 waits, no loop), R1 is not skipped, and
+                // the next pass fetches both.
+                let mut extra = vec![(route(&body_path("R1"), 500, "{}"), Some(1))];
+                extra.extend(bodies(&["R1", "R2"]));
+                let srv = FakeServer::start_paced(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("R1", &ago(3600)), msg("R2", &ago(7200))]],
+                        ..inbox()
+                    })],
+                    extra,
+                    Duration::ZERO,
+                ));
+                let dir = new_dir("bodies-5xx");
+                let handle = spawn_with(&srv, &dir, EngineOptions::default());
+                assert!(wait_until(ENGINE_WAIT, || body_get_ids(&srv) == ["R1"]));
+                std::thread::sleep(Duration::from_millis(500));
+                assert_eq!(body_get_ids(&srv), ["R1"], "parked: no R2, no retry loop");
+                refresh(&handle);
+                wait_ready(&handle, &["R1", "R2"], None);
+                assert_eq!(body_get_ids(&srv), ["R1", "R1", "R2"]);
+                stop(handle);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn a_command_sent_during_a_prefetch_batch_runs_before_the_rest_of_it() {
+                // R1's body is slow; a MarkRead sent meanwhile is kept by the
+                // checkpoint before R2, which ends the batch: its PATCH goes
+                // out before R2's and R3's GETs.
+                let mut routes: Vec<Paced> =
+                    vec![(body_route("R1"), None, Duration::from_millis(500))];
+                routes.extend(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![
+                            msg("R1", &ago(3600)),
+                            msg("R2", &ago(7200)),
+                            msg("R3", &ago(10800)),
+                        ]],
+                        ..inbox()
+                    })],
+                    bodies(&["R2", "R3"]),
+                    Duration::ZERO,
+                ));
+                let srv = FakeServer::start_paced(routes);
+                let dir = new_dir("bodies-command-in-batch");
+                let handle = spawn_with(&srv, &dir, EngineOptions::default());
+                assert!(wait_until(ENGINE_WAIT, || body_get_ids(&srv) == ["R1"]));
+                handle
+                    .cmd_tx
+                    .send(SyncCommand::MarkRead {
+                        id: "R3".into(),
+                        read: true,
+                    })
+                    .unwrap();
+                wait_ready(&handle, &["R1", "R2", "R3"], None);
+                let order: Vec<String> = srv
+                    .requests()
+                    .into_iter()
+                    .filter(|r| r.path.ends_with("?$select=body") || r.method == "PATCH")
+                    .map(|r| format!("{} {}", r.method, r.path))
+                    .collect();
+                assert_eq!(
+                    order,
+                    [
+                        "GET /me/messages/R1?$select=body",
+                        "PATCH /me/messages/R3",
+                        "GET /me/messages/R2?$select=body",
+                        "GET /me/messages/R3?$select=body",
+                    ]
+                );
+                stop(handle);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            /// Sends `Shutdown` and returns every event until the engine's
+            /// thread ends.
+            fn shut_down(handle: SyncHandle) -> Vec<SyncEvent> {
+                handle.cmd_tx.send(SyncCommand::Shutdown).unwrap();
+                let deadline = Instant::now() + ENGINE_WAIT;
+                let mut seen = Vec::new();
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match handle.evt_rx.recv_timeout(left) {
+                        Ok(e) => seen.push(e),
+                        Err(RecvTimeoutError::Disconnected) => return seen,
+                        Err(RecvTimeoutError::Timeout) => panic!("engine did not stop"),
+                    }
+                }
+            }
+
+            #[test]
+            fn a_backfill_whose_last_round_is_stopped_between_pages_is_not_complete() {
+                // The walk's only page brings the deltaLink; the last round
+                // on the folder's own (head) link has two pages, the first
+                // slow. A Shutdown during it stops the round at the
+                // checkpoint between its pages: the backfill must not be
+                // recorded complete, and the head's link stays.
+                let second = "/me/mailFolders/F1/messages/delta?token=HN-F1";
+                let mut routes: Vec<Paced> = vec![
+                    (
+                        route(&head_link("F1"), 200, &page(&[], Some(second), None)),
+                        Some(1),
+                        Duration::from_millis(600),
+                    ),
+                    (
+                        route(second, 200, &page(&[], None, Some(&head_link("F1")))),
+                        None,
+                        Duration::ZERO,
+                    ),
+                ];
+                routes.extend(mailbox(
+                    &[Fold {
+                        pages: vec![vec![msg("A", "2020-01-01T00:00:00Z")]],
+                        ..inbox()
+                    }],
+                    vec![],
+                    Duration::ZERO,
+                ));
+                let srv = FakeServer::start_paced(routes);
+                let dir = new_dir("bodies-stopped-last-round");
+                let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                assert!(wait_until(ENGINE_WAIT, || {
+                    paths_from(&srv, 0).iter().any(|p| p == &head_link("F1"))
+                }));
+                let events = shut_down(handle);
+                assert!(
+                    !events.iter().any(|e| is_complete(e, "F1")),
+                    "not complete: {events:?}"
+                );
+                assert!(!paths_from(&srv, 0).iter().any(|p| p == second));
+                assert_eq!(
+                    store_in(&dir).get_delta_link("F1").unwrap(),
+                    Some(head_link("F1"))
+                );
+                assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn a_round_on_a_stored_link_stopped_between_pages_stores_no_link() {
+                // After startup F1 holds its full delta's link. The next
+                // round has two pages, the first slow and bringing N1; a
+                // Shutdown during it stops the round between its pages: N1
+                // is merged and shown, the link is not replaced.
+                let second = "/me/mailFolders/F1/messages/delta?token=NX-F1";
+                let mut routes: Vec<Paced> = vec![
+                    (
+                        route(
+                            &full_link("F1"),
+                            200,
+                            &page(&[msg("N1", "2020-01-02T00:00:00Z")], Some(second), None),
+                        ),
+                        Some(1),
+                        Duration::from_millis(600),
+                    ),
+                    (
+                        route(
+                            second,
+                            200,
+                            &page(
+                                &[],
+                                None,
+                                Some("/me/mailFolders/F1/messages/delta?token=NEW"),
+                            ),
+                        ),
+                        None,
+                        Duration::ZERO,
+                    ),
+                ];
+                routes.extend(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("A", "2020-01-01T00:00:00Z")]],
+                        ..inbox()
+                    })],
+                    vec![],
+                    Duration::ZERO,
+                ));
+                let srv = FakeServer::start_paced(routes);
+                let dir = new_dir("bodies-stopped-round");
+                let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                wait_for(&handle.evt_rx, is_idle);
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                assert!(wait_until(ENGINE_WAIT, || {
+                    paths_from(&srv, 0).iter().any(|p| p == &full_link("F1"))
+                }));
+                let events = shut_down(handle);
+                assert!(
+                    events.iter().any(|e| matches!(
+                        e,
+                        SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"
+                    )),
+                    "{events:?}"
+                );
+                assert!(!paths_from(&srv, 0).iter().any(|p| p == second));
+                assert_eq!(
+                    store_in(&dir).get_delta_link("F1").unwrap(),
+                    Some(full_link("F1"))
+                );
+                let mut ids = stored_ids(&dir, "F1");
+                ids.sort();
+                assert_eq!(ids, ["A", "N1"]);
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }

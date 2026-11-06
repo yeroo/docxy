@@ -7,6 +7,7 @@
 //! attachments, full-text search, and the outbox queue (triage mutations
 //! queued here for `sync::outbox::apply_op` to push to Graph later).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1630,7 +1631,7 @@ impl Store {
         format: BodyFormat,
         since: &str,
         limit: usize,
-        skip: &[String],
+        skip: &HashSet<String>,
     ) -> Result<Vec<String>, StoreError> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -3002,9 +3003,6 @@ fn drafts_folder_id_on(conn: &Connection) -> Result<String, StoreError> {
     }
 }
 
-/// The local `folders.id` a new draft is filed under when the real Drafts
-/// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
-/// See `Store::drafts_folder_id`.
 /// Whether a stored body satisfies `format` (#1901), the one rule
 /// [`Store::get_body_for`] and the engine's own fetches (#1978,
 /// [`Store::body_candidates`], [`Store::needs_body`]) share. A body
@@ -3024,6 +3022,9 @@ fn body_satisfies(
     }
 }
 
+/// The local `folders.id` a new draft is filed under when the real Drafts
+/// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
+/// See `Store::drafts_folder_id`.
 pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
@@ -5968,18 +5969,22 @@ mod body_format_tests {
             ("C", "INBOX", "2026-07-01T00:00:00Z", false),
             ("HEADERLESS", "INBOX", "", false),
         ]);
-        let all = s.body_candidates(BodyFormat::Text, SINCE, 10, &[]).unwrap();
+        let all = s
+            .body_candidates(BodyFormat::Text, SINCE, 10, &HashSet::new())
+            .unwrap();
         assert_eq!(all, vec!["B", "A", "C"]);
         // The limit takes the newest.
-        let two = s.body_candidates(BodyFormat::Text, SINCE, 2, &[]).unwrap();
+        let two = s
+            .body_candidates(BodyFormat::Text, SINCE, 2, &HashSet::new())
+            .unwrap();
         assert_eq!(two, vec!["B", "A"]);
         assert!(
-            s.body_candidates(BodyFormat::Text, SINCE, 0, &[])
+            s.body_candidates(BodyFormat::Text, SINCE, 0, &HashSet::new())
                 .unwrap()
                 .is_empty()
         );
         // Skipped ids are left out, and the limit counts what is kept.
-        let skip = vec!["B".to_string()];
+        let skip = HashSet::from(["B".to_string()]);
         let kept = s
             .body_candidates(BodyFormat::Text, SINCE, 2, &skip)
             .unwrap();
@@ -6011,7 +6016,9 @@ mod body_format_tests {
         s.conn
             .execute("DELETE FROM bodies WHERE message_id = ?1", params![local])
             .unwrap();
-        let all = s.body_candidates(BodyFormat::Html, SINCE, 10, &[]).unwrap();
+        let all = s
+            .body_candidates(BodyFormat::Html, SINCE, 10, &HashSet::new())
+            .unwrap();
         assert_eq!(all, vec!["MAIL"]);
         for id in ["FLAGGED", "FILED", local.as_str()] {
             assert!(!s.needs_body(id, BodyFormat::Html, SINCE).unwrap(), "{id}");
@@ -6057,7 +6064,9 @@ mod body_format_tests {
             "RTF",
         ];
         for format in [BodyFormat::Text, BodyFormat::Html] {
-            let candidates = s.body_candidates(format, SINCE, 100, &[]).unwrap();
+            let candidates = s
+                .body_candidates(format, SINCE, 100, &HashSet::new())
+                .unwrap();
             for id in ids {
                 let lacking = s.get_body_for(id, format).unwrap().is_none();
                 assert_eq!(
@@ -6074,12 +6083,12 @@ mod body_format_tests {
         }
         // The cases themselves, so the rule cannot drift unnoticed.
         assert_eq!(
-            s.body_candidates(BodyFormat::Text, SINCE, 100, &[])
+            s.body_candidates(BodyFormat::Text, SINCE, 100, &HashSet::new())
                 .unwrap(),
             vec!["RTF", "NATIVE", "HTML", "NONE"]
         );
         assert_eq!(
-            s.body_candidates(BodyFormat::Html, SINCE, 100, &[])
+            s.body_candidates(BodyFormat::Html, SINCE, 100, &HashSet::new())
                 .unwrap(),
             vec!["RTF", "OLDTEXT", "TEXT", "NONE"]
         );

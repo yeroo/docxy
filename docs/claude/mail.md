@@ -539,17 +539,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - **Prefetch.** One idle step of the main loop fetches up to 10 bodies
   (`PREFETCH_BATCH`, `next_prefetch`/`prefetch_step`), signed in, outside a
   back-off, after a folder list succeeded, before any backfill page (the
-  window bounds it). One `GET /me/messages/{id}?$select=body` each, the
+  window bounds it). A command a checkpoint kept, or a tick come due, ends
+  the batch, so they wait for one body at most, as for one backfill page. One `GET /me/messages/{id}?$select=body` each, the
   call `FetchBody` makes (`fetch_and_store_body` is shared: `fetched_as`
   recorded, `BodyReady` sent, so `BodyReady` may name a message nobody
   opened).
 - **Failures** (`background_body`). Auth, throttle or transport goes through
   `react` and stops the caller: a 429/503 sets `next_retry`, which the
-  prefetch waits out. Any other Graph failure (404, other 4xx, parse) is not
-  reported, as the user asked for nothing, and puts the id in
-  `Engine::body_skip` for this run. A store failure parks these fetches
-  until the next pass (`body_parked`), so a store that keeps failing costs
-  one request a pass, not a loop. A row deleted since (its body fails the
+  prefetch waits out. A 404, another 4xx or a parse error is not reported,
+  as the user asked for nothing, and puts the id in `Engine::body_skip` for
+  this run. A 5xx (other than a throttle's 503: `classify_status` makes
+  500/502/504 `Http`) or a store failure parks these fetches until the next
+  pass (`body_parked`), the id not skipped, so a failing service or store
+  costs one request a pass, not a loop, and the body comes once it works. A row deleted since (its body fails the
   foreign key) is not a store failure. Note that `Store::open`'s
   connections keep rusqlite's default 5 s busy timeout, so a write lock
   held for a moment by the UI's own connection only delays the write.
