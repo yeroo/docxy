@@ -192,6 +192,9 @@ pub(crate) fn import_html_within(
         h.images = Some(Images::new(resolve));
     }
     h.run();
+    // Cards left open at the end of the page end as `</div>` would end them
+    // (#1927): an empty one is dropped.
+    h.end_cards(0, true);
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
@@ -433,6 +436,10 @@ struct Look {
     /// An image is `display: block` (not inherited, #1922): a paragraph of
     /// its own, placed by `own_place`.
     own_block: bool,
+    /// A `div` with its own background in a table cell is a card (not
+    /// inherited, #1927): a one-cell table of its fill, padding, width and
+    /// place ([`Html::begin_card`]).
+    own_card: bool,
     /// A cell's own `padding`, in twips, top, right, bottom, left (not
     /// inherited): its `tcMar`.
     own_padding: [Option<i32>; 4],
@@ -457,6 +464,25 @@ struct Elem {
     /// when it is not on them itself (#1872 r2).
     blocks_at: usize,
     lists_at: usize,
+    /// Whether it may be, is, or was a card (#1927): `Yes` while its
+    /// table is open in the builder, ended once by [`Html::end_cards_from`].
+    card: CardMode,
+}
+
+/// Whether an element may be a card (#1927), decided once, when it opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardMode {
+    /// Not a candidate.
+    No,
+    /// A `div` opening in a cell: a card if its look has a background and
+    /// is shown as a block.
+    Maybe,
+    /// Opened as a card, its table at this `table_depth` in the builder:
+    /// a restyle keeps it one.
+    Yes(usize),
+    /// A candidate that is no card (or a card that has ended): `none`
+    /// still clears its background, but it never becomes one.
+    Declined,
 }
 
 /// The HTML formatting elements: a block end reopens those left open in it
@@ -557,12 +583,19 @@ struct Cascade {
     /// The parent's [`Look::block_align`]: what places this element's box
     /// when it is block-level and its margins are not auto.
     parent_block_align: Option<Align>,
-    /// A block's own absolute CSS `width` (#1922).
+    /// A block's own CSS `width`, resolved in `finish` with its final font:
+    /// absolute, the fixed-width centring (#1922); a percentage too, a
+    /// card's table width (#1927).
     block_width: Option<Len>,
     /// An image's corner radii, top left, top right, bottom right, bottom
     /// left (#1926): kept until its font size is known, then one
     /// [`Look::own_radius`].
     radius: [Option<Len>; 4],
+    /// Whether it may be, or is, a card (#1927).
+    card: CardMode,
+    /// Its own `display` is neither `block` nor unset (nor `none`): an
+    /// inline or inline-block `div` is no card.
+    not_block: bool,
 }
 
 /// A twips sum kept in Word's range.
@@ -746,7 +779,7 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
 }
 
 impl Cascade {
-    fn new(parent: Option<&Look>, kind: Kind) -> Self {
+    fn new(parent: Option<&Look>, kind: Kind, card: CardMode) -> Self {
         let mut look = parent.cloned().unwrap_or_default();
         look.before = None;
         look.after = None;
@@ -757,6 +790,7 @@ impl Cascade {
         look.own_padding = [None; 4];
         look.own_place = None;
         look.own_block = false;
+        look.own_card = false;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -785,6 +819,8 @@ impl Cascade {
             parent_block_align,
             block_width: None,
             radius: [None; 4],
+            card,
+            not_block: false,
         }
     }
 
@@ -933,8 +969,9 @@ impl Cascade {
             "background" | "background-color" => {
                 if let Some(c) = css::background(v) {
                     self.background = Some(c);
-                } else if self.kind.table() && clears_background(v) {
-                    // A cell's `none` shows its row's or table's (#1878).
+                } else if (self.kind.table() || self.card != CardMode::No) && clears_background(v) {
+                    // A cell's `none` shows its row's or table's (#1878); a
+                    // card candidate's is no card (#1927).
                     self.background = None;
                 }
             }
@@ -977,15 +1014,15 @@ impl Cascade {
                 }
             }
             "width" if self.kind == Kind::Block => {
-                // An absolute, non-negative width only (#1922): `auto` or a
-                // percentage leaves the block as wide as its container; an
-                // invalid value (a negative one, `600` without a unit)
-                // leaves the width as it was.
+                // A non-negative width (#1922): `auto` leaves the block as
+                // wide as its container; an invalid value (a negative one,
+                // `600` without a unit) leaves the width as it was. Only a
+                // card reads a percentage (#1927).
                 let w = v.trim();
                 if w.eq_ignore_ascii_case("auto") {
                     self.block_width = None;
                 } else if let Some(len) = css::length(w).filter(|l| l.v >= 0.0) {
-                    self.block_width = (len.unit != css::Unit::Percent).then_some(len);
+                    self.block_width = Some(len);
                 }
             }
             "font-family" => {
@@ -1104,6 +1141,11 @@ impl Cascade {
                 let v = v.trim();
                 if v.eq_ignore_ascii_case("none") {
                     run.vanish = true;
+                } else if self.card != CardMode::No
+                    && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+                {
+                    // An inline or inline-block `div` is no card (#1927).
+                    self.not_block = !v.eq_ignore_ascii_case("block");
                 } else if self.is_img && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
                     // A block image is a paragraph of its own (#1922); any
                     // other display (`inline`, `inline-block`) undoes it.
@@ -1142,7 +1184,24 @@ impl Cascade {
     /// The look, the lengths resolved against the element's own font size.
     fn finish(mut self) -> Look {
         let pt = font_pt(&self.look.run);
+        let card = self.kind == Kind::Block
+            && match self.card {
+                CardMode::Yes(_) => true,
+                CardMode::Maybe => {
+                    self.background.is_some() && !self.look.run.vanish && !self.not_block
+                }
+                CardMode::No | CardMode::Declined => false,
+            };
         let look = &mut self.look;
+        if card {
+            // A card is a cell (#1927): a fresh block look, as a `td`
+            // starts; a `text-indent` it declares still applies below.
+            look.in_cell = true;
+            look.indent = 0;
+            look.indent_right = 0;
+            look.first_line = 0;
+            look.shade = None;
+        }
         match self.line {
             None => {}
             Some(LineHeight::Normal) => look.line = None,
@@ -1165,6 +1224,20 @@ impl Cascade {
             )),
         };
         match self.kind {
+            Kind::Block if card => {
+                // Its box is its table's (#1927): the fill, the padding as
+                // the cell's margins, the width and place as the table's.
+                look.own_card = true;
+                look.own_fill = self.background;
+                for (side, p) in self.padding.iter().enumerate() {
+                    look.own_padding[side] = tw(*p).map(|t| t.max(0));
+                }
+                look.own_width = self.block_width.and_then(|l| match l.unit {
+                    css::Unit::Percent => Some(Width::Pct(l.v)),
+                    _ => l.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
+                });
+                look.own_place = block_position(self.margin_auto, self.parent_block_align);
+            }
             Kind::Block => {
                 // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
                 look.before = sum(self.margin[0], self.padding[0]).map(|t| t.max(0));
@@ -1178,7 +1251,11 @@ impl Cascade {
                 // A fixed-width box with both side margins auto is centred
                 // in the body (#1922): its content box, so its own padding
                 // (in the indents now) is outside the width.
-                let width = self.block_width.and_then(|l| l.twips(pt));
+                // A percentage leaves the block as wide as its container.
+                let width = self
+                    .block_width
+                    .filter(|l| l.unit != css::Unit::Percent)
+                    .and_then(|l| l.twips(pt));
                 if let Some(width) = width.filter(|_| self.margin_auto[1] && self.margin_auto[3]) {
                     if !look.in_cell {
                         let room = i64::from(html_table::BODY_TWIPS)
@@ -1263,8 +1340,15 @@ struct Ctx<'c> {
 /// The look of an element opening on top of `below`: its parent's, then the
 /// user agent's, the presentational attributes, the matched rules, the
 /// inline style, the important rules and the important inline style.
-fn look_of(ctx: Ctx, below: &[Elem], key: &ElemKey, kind: Kind, attrs: &Attrs) -> Look {
-    let mut c = Cascade::new(below.last().map(|e| &e.look), kind);
+fn look_of(
+    ctx: Ctx,
+    below: &[Elem],
+    key: &ElemKey,
+    kind: Kind,
+    attrs: &Attrs,
+    card: CardMode,
+) -> Look {
+    let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card);
     c.user_agent(key);
     c.presentational(&key.tag, attrs);
     let hits = ctx.sheet.matching(
@@ -1369,6 +1453,10 @@ struct Html<'a> {
     /// one with content, so `<p><img style="display:block"></p>` makes no
     /// empty paragraph after the picture's.
     after_block_object: bool,
+    /// The `table_depth`s of cards whose `div` has closed while a table
+    /// with no `Elem` (opened past `MAX_DEPTH`) was open in them (#1927
+    /// r2): each ends when that table's own close brings the depth back.
+    orphan_cards: Vec<usize>,
 }
 
 impl<'a> Html<'a> {
@@ -1392,6 +1480,7 @@ impl<'a> Html<'a> {
             in_not_vml: false,
             images: None,
             after_block_object: false,
+            orphan_cards: Vec::new(),
         }
     }
 
@@ -1595,7 +1684,7 @@ impl<'a> Html<'a> {
         {
             // Word's tab: the spaces inside stand for it.
             if self.visible() {
-                let props = look_of(self.ctx(), &self.elems, &key, kind, &attrs).run;
+                let props = look_of(self.ctx(), &self.elems, &key, kind, &attrs, CardMode::No).run;
                 self.out.tab(&props);
                 self.space = None;
                 self.para_start = false;
@@ -1663,7 +1752,34 @@ impl<'a> Html<'a> {
         }
         let pushed = self.elems.len() < MAX_DEPTH && self.budget.work(1 + key.heap() / 16);
         if pushed {
-            let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs);
+            // A `div` in a cell may be a card (#1927): only with its blocks
+            // entry on `blocks`, room for one more table, and a cell as the
+            // innermost open table part (a `div` straight in a `table`,
+            // row group or row, which a browser moves out, is none: the
+            // builder's innermost table there has no cell open).
+            let candidate = name == "div"
+                && self.blocks.len() > blocks_at
+                && self.visible()
+                && self.kept_table()
+                && self.table_depth < MAX_TABLE_NESTING
+                && self
+                    .elems
+                    .iter()
+                    .rev()
+                    .find(|e| e.kind.table())
+                    .is_some_and(|e| e.kind == Kind::Cell);
+            let mode = if candidate {
+                CardMode::Maybe
+            } else {
+                CardMode::No
+            };
+            let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs, mode);
+            // A card's table opens one level down (`begin_card`).
+            let card = match mode {
+                CardMode::Maybe if look.own_card => CardMode::Yes(self.table_depth + 1),
+                CardMode::Maybe => CardMode::Declined,
+                m => m,
+            };
             self.elems.push(Elem {
                 key,
                 kind,
@@ -1671,7 +1787,11 @@ impl<'a> Html<'a> {
                 attrs: attrs_at,
                 blocks_at,
                 lists_at,
+                card,
             });
+            if matches!(card, CardMode::Yes(_)) {
+                self.begin_card();
+            }
         }
         let kept = self.table_depth <= MAX_TABLE_NESTING;
         match name {
@@ -1771,6 +1891,7 @@ impl<'a> Html<'a> {
                 &e.key,
                 e.kind,
                 &attrs,
+                e.card,
             );
         }
     }
@@ -1787,6 +1908,10 @@ impl<'a> Html<'a> {
         if i >= self.elems.len() {
             return;
         }
+        // Every card still open in it ends first, the stacks intact:
+        // `implicit_close` cuts them after this, `close_elem` has already
+        // ended its own (before its cut), so here it finds none.
+        self.end_cards_from(i);
         let mut reopen: Vec<Elem> = Vec::new();
         if !self.elems[i].kind.table() {
             let s = self.s;
@@ -1819,6 +1944,7 @@ impl<'a> Html<'a> {
                         attrs: e.attrs,
                         blocks_at: 0,
                         lists_at: 0,
+                        card: CardMode::No,
                     });
                 }
             }
@@ -1879,6 +2005,25 @@ impl<'a> Html<'a> {
     fn close_tag(&mut self, name: &str) {
         if self.out_of_scope(name) {
             return;
+        }
+        // A table part's close acts on the innermost real table: the cards
+        // open in its innermost cell end first (#1927), as a browser's
+        // `</td>` closes a `div` left open.
+        // A builder table above the innermost card with no `Elem` (one
+        // opened past `MAX_DEPTH`) owns this close instead (#1927 r2).
+        if Kind::of(name).table() {
+            let from = self
+                .elems
+                .iter()
+                .rposition(|e| e.kind.table())
+                .map_or(0, |t| t + 1);
+            let innermost = self.elems[from..].iter().rev().find_map(|e| match e.card {
+                CardMode::Yes(depth) => Some(depth),
+                _ => None,
+            });
+            if innermost.is_some_and(|depth| depth >= self.table_depth) {
+                self.end_cards_from(from);
+            }
         }
         match name {
             // A `</li>` whose `li` is below an open list is not in list-item
@@ -1965,7 +2110,7 @@ impl<'a> Html<'a> {
                         self.out.end_table();
                         self.reset_para();
                     }
-                    self.table_depth -= 1;
+                    self.table_closed();
                 }
             }
             "ul" | "ol" | "dir" | "menu" => {
@@ -2011,6 +2156,7 @@ impl<'a> Html<'a> {
         // The blocks and lists opened inside it end with it (#1872 r3: a
         // `</div>` or `</td>` over an unclosed `ul` ended no list).
         let (blocks_at, lists_at) = (self.elems[i].blocks_at, self.elems[i].lists_at);
+        self.end_cards_from(i);
         self.blocks.truncate(blocks_at);
         self.lists.truncate(lists_at);
         self.recount_pre();
@@ -2062,6 +2208,123 @@ impl<'a> Html<'a> {
         !self.in_downlevel && !self.in_marker
     }
 
+    /// Open the card on top of `elems` (#1927): a one-cell table, as wide
+    /// as its `width` (else its container), placed by its auto margins or
+    /// its container's `-webkit-` alignment, no borders or cell spacing,
+    /// and a cell of its fill and padding (a side not given is 0, as in a
+    /// browser), its content at the top. What is in it starts a fresh
+    /// block structure, as in a `td`.
+    fn begin_card(&mut self) {
+        let Some(e) = self.elems.last_mut() else {
+            return;
+        };
+        if let Some((_, block)) = self.blocks.last_mut() {
+            *block = Block::default();
+        }
+        self.table_depth += 1;
+        let look = &e.look;
+        let table = TableSpec {
+            width: Some(look.own_width.unwrap_or(Width::Pct(100.0))),
+            border: 0,
+            cellpadding: Some(0),
+            cellspacing: None,
+            jc: match look.own_place {
+                Some(Align::Center) => Some("center"),
+                Some(Align::Right) => Some("right"),
+                _ => None,
+            },
+        };
+        let cell = CellSpec {
+            fill: look.own_fill.clone(),
+            padding: look.own_padding.map(|p| Some(p.unwrap_or(0))),
+            valign: VAlign::Top,
+            ..CellSpec::default()
+        };
+        self.out.begin_table(table);
+        self.out.begin_cell(cell);
+    }
+
+    /// End every card still open in `elems[i..]`, innermost first (#1927):
+    /// its open paragraph (the stacks as they still are), then its row and
+    /// table, into the enclosing cell; a card with nothing in it is dropped
+    /// (an e-mail's divider). A real table left open inside a card (a
+    /// malformed page) ends with it, so the builder's innermost table is
+    /// the card's.
+    fn end_cards_from(&mut self, i: usize) {
+        self.end_cards(i, false);
+    }
+
+    /// [`Self::end_cards_from`]; `at_end` at the end of the page, where a
+    /// table left open in a card ends with it. Before that, a builder table
+    /// above a card whose `div` closes has no `Elem` (one opened past
+    /// `MAX_DEPTH`: a table with one closes before what is below it) and
+    /// owns its own close: the card's table waits for it as an orphan
+    /// ([`Self::table_closed`]).
+    fn end_cards(&mut self, i: usize, at_end: bool) {
+        while let Some((j, depth)) = self.elems.get(i..).and_then(|above| {
+            above
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(j, e)| match e.card {
+                    CardMode::Yes(depth) => Some((i + j, depth)),
+                    _ => None,
+                })
+        }) {
+            self.elems[j].card = CardMode::Declined;
+            if self.table_depth < depth {
+                // Its table has already ended (a stray `</table>`).
+                continue;
+            }
+            if self.table_depth > depth && !at_end {
+                self.orphan_cards.push(depth);
+                continue;
+            }
+            self.end_para_if_any();
+            self.after_block_object = false;
+            while self.table_depth > depth {
+                // Only a table the builder holds (one past the nesting
+                // limit is its cell's text).
+                if self.kept_table() {
+                    let props = self.par_props();
+                    self.out.end_row(props);
+                    self.out.end_table();
+                    self.reset_para();
+                }
+                self.table_closed();
+            }
+            if self.table_depth == depth {
+                let props = self.par_props();
+                self.out.end_card(props);
+                self.reset_para();
+                self.table_closed();
+            }
+        }
+    }
+
+    /// One table level has ended: `table_depth` goes down, and the orphan
+    /// cards ([`Self::end_cards`]) it brings back to their own level end
+    /// in turn.
+    fn table_closed(&mut self) {
+        self.table_depth = self.table_depth.saturating_sub(1);
+        while self.orphan_cards.last() == Some(&self.table_depth) && self.table_depth > 0 {
+            self.orphan_cards.pop();
+            self.end_para_if_any();
+            let props = self.par_props();
+            self.out.end_card(props);
+            self.reset_para();
+            self.table_depth -= 1;
+        }
+        // One left above the depth has lost its table (a stray close).
+        while self
+            .orphan_cards
+            .last()
+            .is_some_and(|&d| d > self.table_depth)
+        {
+            self.orphan_cards.pop();
+        }
+    }
+
     /// An `<img>` (#1880), with images on: an inline picture, a sized
     /// placeholder, its `alt` text, or nothing (out of view, hidden, a side
     /// of 0, or unsized and unresolved with no `alt`).
@@ -2076,7 +2339,14 @@ impl<'a> Html<'a> {
         if !self.budget.work(1 + key.heap() / 16) {
             return;
         }
-        let look = look_of(self.ctx(), &self.elems, &key, Kind::Other, &attrs);
+        let look = look_of(
+            self.ctx(),
+            &self.elems,
+            &key,
+            Kind::Other,
+            &attrs,
+            CardMode::No,
+        );
         if look.run.vanish {
             return;
         }
@@ -5645,5 +5915,553 @@ mod centering_tests {
         ] {
             assert_eq!(indents(html), [("x".into(), 0, 0)], "{html}");
         }
+    }
+}
+
+/// Nested cards (#1927): a `div` with its own background in a table cell is
+/// a one-cell table of its fill and padding.
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use crate::model::{Block as DocBlock, Paragraph, Table};
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    fn first_table(blocks: &[DocBlock]) -> &Table {
+        blocks
+            .iter()
+            .find_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no table: {blocks:?}"))
+    }
+
+    fn tables(blocks: &[DocBlock]) -> Vec<&Table> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cell(t: &Table, row: usize, col: usize) -> &[DocBlock] {
+        &t.rows[row].cells[col].blocks
+    }
+
+    fn tcpr(t: &Table) -> &str {
+        t.rows[0].cells[0].raw_tcpr.as_deref().unwrap_or("")
+    }
+
+    fn tblpr(t: &Table) -> &str {
+        t.raw_tblpr.as_deref().unwrap_or("")
+    }
+
+    /// The outer table's first cell.
+    fn outer_cell(d: &Document) -> &[DocBlock] {
+        cell(first_table(&d.body), 0, 0)
+    }
+
+    /// The card (first table) in the outer table's first cell.
+    fn card(d: &Document) -> &Table {
+        first_table(outer_cell(d))
+    }
+
+    /// Blocks as text: a paragraph's text, a table as `[cell|cell/row…]`.
+    fn sketch(blocks: &[DocBlock]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Paragraph(p) => Some(p.plain_text()),
+                DocBlock::Table(t) => Some(format!(
+                    "[{}]",
+                    t.rows
+                        .iter()
+                        .map(|r| r
+                            .cells
+                            .iter()
+                            .map(|c| sketch(&c.blocks).join(","))
+                            .collect::<Vec<_>>()
+                            .join("|"))
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn all_paras(blocks: &[DocBlock]) -> Vec<&Paragraph> {
+        let mut out = Vec::new();
+        for b in blocks {
+            match b {
+                DocBlock::Paragraph(p) => out.push(p),
+                DocBlock::Table(t) => {
+                    for r in &t.rows {
+                        for c in &r.cells {
+                            out.extend(all_paras(&c.blocks));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn para<'d>(d: &'d Document, text: &str) -> &'d Paragraph {
+        all_paras(&d.body)
+            .into_iter()
+            .find(|p| p.plain_text() == text)
+            .unwrap_or_else(|| panic!("no paragraph {text:?}: {:?}", d.body))
+    }
+
+    fn shaded(p: &Paragraph) -> bool {
+        p.props.raw_props.iter().any(|r| r.starts_with("<w:shd"))
+    }
+
+    fn table_count(blocks: &[DocBlock]) -> usize {
+        tables(blocks)
+            .iter()
+            .map(|t| {
+                1 + t
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.cells.iter())
+                    .map(|c| table_count(&c.blocks))
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_background_div_in_a_cell_is_a_one_cell_card() {
+        let d = doc(
+            "<table><tr><td>before<div style='background:#eee;padding:8px 12px'>\
+             <p>a</p><p>b</p></div>after</td></tr></table>",
+        );
+        assert_eq!(sketch(outer_cell(&d)), ["before", "[a,b]", "after"]);
+        let c = card(&d);
+        assert_eq!((c.rows.len(), c.rows[0].cells.len()), (1, 1));
+        let pr = tcpr(c);
+        assert!(pr.contains(r#"w:fill="EEEEEE""#), "{pr}");
+        assert!(
+            pr.contains(
+                "<w:tcMar><w:top w:w=\"120\" w:type=\"dxa\"/><w:left w:w=\"180\" w:type=\"dxa\"/>\
+                 <w:bottom w:w=\"120\" w:type=\"dxa\"/><w:right w:w=\"180\" w:type=\"dxa\"/></w:tcMar>"
+            ),
+            "{pr}"
+        );
+        assert!(pr.contains(r#"<w:vAlign w:val="top"/>"#), "{pr}");
+        let tp = tblpr(c);
+        assert!(tp.contains(r#"<w:tblW w:w="5000" w:type="pct"/>"#), "{tp}");
+        assert!(tp.contains(
+            "<w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"0\" w:type=\"dxa\"/>\
+             <w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar>"
+        ));
+        assert!(!tp.contains("tblBorders") && !tp.contains("<w:jc"), "{tp}");
+        for text in ["a", "b"] {
+            let p = para(&d, text);
+            assert!(!shaded(p), "{:?}", p.props);
+            assert_eq!((p.props.indent, p.props.indent_right), (0, 0));
+        }
+        // A side not given is 0.
+        let d = doc(
+            "<table><tr><td><div style='background:#eee;padding-left:4px'>x</div>\
+             </td></tr></table>",
+        );
+        assert!(tcpr(card(&d)).contains(
+            "<w:tcMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"60\" w:type=\"dxa\"/>\
+             <w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"0\" w:type=\"dxa\"/></w:tcMar>"
+        ));
+        // A `bgcolor`-less style-sheet background, through a class.
+        let d = doc(
+            "<style>.card{background-color:#F4F6F8;padding:16px}</style>\
+             <table><tr><td><div class=card>x</div></td></tr></table>",
+        );
+        assert!(tcpr(card(&d)).contains(r#"w:fill="F4F6F8""#));
+    }
+
+    #[test]
+    fn cards_nest_with_their_own_fills() {
+        let d = doc("<table width=600><tr><td>\
+             <div style='background:#aaaaaa;padding:16px'>one\
+             <div style='background:#bbbbbb;padding:8px'>two\
+             <div style='background:#cccccc'>three</div></div></div></td></tr></table>");
+        assert_eq!(sketch(outer_cell(&d)), ["[one,[two,[three],],]", ""]);
+        let one = card(&d);
+        assert!(tcpr(one).contains(r#"w:fill="AAAAAA""#));
+        let two = first_table(cell(one, 0, 0));
+        assert!(tcpr(two).contains(r#"w:fill="BBBBBB""#));
+        let three = first_table(cell(two, 0, 0));
+        assert!(tcpr(three).contains(r#"w:fill="CCCCCC""#));
+        // Each laid out in its card's width less its padding: 600 px is
+        // 9000 twips, less 2 x 16 px, less 2 x 8 px.
+        assert_eq!(one.grid.iter().sum::<u32>(), 9000);
+        assert_eq!(two.grid.iter().sum::<u32>(), 9000 - 480);
+        assert_eq!(three.grid.iter().sum::<u32>(), 9000 - 480 - 240);
+
+        // A table in a card is in the card's cell; a fill-less cell of it
+        // has no shading of its own (the card's shows through).
+        let d = doc(
+            "<table width=600><tr><td><div style='background:#dddddd;padding:16px'>\
+             <table width=100%><tr><td>plain</td></tr></table></div></td></tr></table>",
+        );
+        let c = card(&d);
+        let inner = first_table(cell(c, 0, 0));
+        assert_eq!(inner.grid.iter().sum::<u32>(), 9000 - 480);
+        assert!(!tcpr(inner).contains("<w:shd"), "{}", tcpr(inner));
+        assert_eq!(sketch(outer_cell(&d)), ["[[plain],]", ""]);
+    }
+
+    #[test]
+    fn a_card_ends_where_its_div_does() {
+        let bg = "style='background:#eee'";
+        let cases: [(&str, Vec<&str>); 6] = [
+            (
+                "<table><tr><td><div BG>in</div>after</td></tr></table>",
+                vec!["[in]", "after"],
+            ),
+            (
+                "<table><tr><td><div BG>in</td><td>next</td></tr></table>",
+                vec!["[in]", ""],
+            ),
+            ("<table><tr><td>x<div BG>in", vec!["x", "[in]", ""]),
+            (
+                "<table><tr><td><ul><li>one<div BG>in<li>two</ul></td></tr></table>",
+                vec!["one", "[in]", "two"],
+            ),
+            (
+                "<table><tr><td><div BG><h2>x</td></tr></table>",
+                vec!["[x]", ""],
+            ),
+            (
+                "<table><tr><td><h2><div BG>x</h2>tail</td></tr></table>",
+                vec!["[x]", "tail"],
+            ),
+        ];
+        for (html, want) in cases {
+            let html = html.replace("BG", bg);
+            let d = doc(&html);
+            assert_eq!(sketch(outer_cell(&d)), want, "{html}");
+        }
+        // Implied and explicit table-part ends: the outer table's shape.
+        let shapes = [
+            (
+                "<table><tr><td><div BG>in<td>next</table>",
+                vec!["[[in],|next]"],
+            ),
+            (
+                "<table><tr><td><div BG>in</tr><tr><td>next</table>",
+                vec!["[[in],/next]"],
+            ),
+            (
+                "<table><tr><td><div BG>in<tr><td>next</table>",
+                vec!["[[in],/next]"],
+            ),
+            (
+                "<table><tbody><tr><td><div BG>in</tbody><tr><td>next</table>",
+                vec!["[[in],/next]"],
+            ),
+            (
+                "<table><tr><td><div BG>in</table>after",
+                vec!["[[in],]", "after"],
+            ),
+            // The page ends inside a table in the card.
+            (
+                "<table><tr><td><div BG><table><tr><td>in",
+                vec!["[[[in],],]"],
+            ),
+        ];
+        for (html, want) in shapes {
+            let html = html.replace("BG", bg);
+            let d = doc(&html);
+            assert_eq!(sketch(&d.body), want, "{html}");
+        }
+    }
+
+    #[test]
+    fn a_page_ending_deep_inside_a_card_keeps_the_builder_in_step() {
+        // A card one level under the limit, then tables past it, all left
+        // open: the ones past the limit are text, and nothing else ends.
+        let open = "<table><tr><td>".repeat(MAX_TABLE_NESTING - 1);
+        let deeper = "<table><tr><td>".repeat(3);
+        let d = doc(&format!("{open}<div style='background:#eee'>{deeper}x"));
+        assert_eq!(table_count(&d.body), MAX_TABLE_NESTING);
+        assert_eq!(d.body.len(), 1, "{:?}", d.body);
+        para(&d, "x");
+        // With nothing in them, the card is dropped as empty: the tables past
+        // the limit were never the builder's to end.
+        let d = doc(&format!("{open}y<div style='background:#eee'>{deeper}"));
+        assert_eq!(table_count(&d.body), MAX_TABLE_NESTING - 1);
+        para(&d, "y");
+    }
+
+    #[test]
+    fn a_table_past_max_depth_in_a_card_owns_its_close() {
+        // The card is the last element pushed: a table opened in it has no
+        // `Elem` (past `MAX_DEPTH`) but is the builder's. Its `</table>`
+        // (or `</td>`) ends it, not the card and then the outer table:
+        // `after` stays in the outer cell and `tail` is in the body.
+        let spans = "<span>".repeat(MAX_DEPTH - 4);
+        for inner in [
+            "<table><tr><td>x</table>",
+            "<table><tr><td>x</td></tr></table>",
+        ] {
+            let html = format!(
+                "<table><tr><td>{spans}<div style='background:#eee'>{inner}after\
+                 </td></tr></table>tail"
+            );
+            let d = doc(&html);
+            assert_eq!(sketch(&d.body[1..]), ["tail"], "{inner}: {:?}", d.body);
+            assert!(
+                sketch(outer_cell(&d)).iter().any(|t| t.contains("after")),
+                "{inner}: {:?}",
+                sketch(outer_cell(&d))
+            );
+        }
+    }
+
+    #[test]
+    fn every_prefix_of_the_card_digest_imports() {
+        let page = include_bytes!("../../tests/fixtures/html/digest-cards.html");
+        for end in 0..=page.len() {
+            let _ = import_html(&page[..end]);
+        }
+    }
+
+    #[test]
+    fn a_div_straight_in_a_table_part_is_no_card() {
+        // A `div` in a nested `table`, row group or row (which a browser
+        // moves out of the table) has no cell to be a card in: its text
+        // stays where it went before, and the outer table ends where it
+        // did, `tail` in the body.
+        for html in [
+            "<table><tr><td><table><div style='background:#eee'><tr><td>y</table>after\
+             </td></tr></table>tail",
+            "<table><tr><td><table><div style='background:#eee'><tbody><tr><td>y</td></tr>\
+             </table>after</td></tr></table>tail",
+            "<table><tr><td><table><tbody><div style='background:#eee'><tr><td>y</td></tr>\
+             </tbody></table>after</td></tr></table>tail",
+        ] {
+            let d = doc(html);
+            assert_eq!(table_count(&d.body), 2, "{html}: {:?}", d.body);
+            assert_eq!(d.body.len(), 2, "{html}: {:?}", d.body);
+            assert_eq!(sketch(&d.body[1..]), ["tail"], "{html}");
+            let outer = outer_cell(&d);
+            assert_eq!(sketch(outer).last().map(String::as_str), Some("after"));
+            assert_eq!(sketch(cell(first_table(outer), 0, 0)), ["y"], "{html}");
+        }
+        // In a nested row: `x` keeps its paragraph shading beside `y`, in
+        // the nested table's cell.
+        let d = doc(
+            "<table><tr><td><table><tr><div style='background:#eee'>x<td>y</td></tr>\
+             </table></td></tr></table>",
+        );
+        assert_eq!(table_count(&d.body), 2, "{:?}", d.body);
+        let nested = first_table(outer_cell(&d));
+        assert_eq!(sketch(cell(nested, 0, 0)), ["x", "y"]);
+        assert!(shaded(para(&d, "x")));
+        assert!(!shaded(para(&d, "y")));
+    }
+
+    #[test]
+    fn a_restyle_keeps_a_card_a_card() {
+        // `</b>` over the card takes the `b` out alone and restyles the card:
+        // it stays one even when the rule that made it no longer matches.
+        let d = doc("<style>b div{background:#eee}</style>\
+             <table><tr><td><b><div>x</b>y</div>after</td></tr></table>");
+        assert_eq!(sketch(outer_cell(&d)), ["[xy]", "after"]);
+        // And a div that is no card stays none: its `none` still clears.
+        let d = doc("<style>div{background:#eee}</style>\
+             <table><tr><td><b><div style='background:none'>x</b>y</div></td></tr></table>");
+        assert_eq!(table_count(&d.body), 1);
+        assert!(!shaded(para(&d, "xy")));
+    }
+
+    #[test]
+    fn a_card_takes_its_width_and_place() {
+        let jc_w = |html: &str| {
+            let d = doc(html);
+            let tp = tblpr(card(&d)).to_string();
+            let jc = tp
+                .split("<w:jc w:val=\"")
+                .nth(1)
+                .map(|j| j[..j.find('"').unwrap()].to_string());
+            let w = tp
+                .split("<w:tblW ")
+                .nth(1)
+                .map(|w| w[..w.find("/>").unwrap()].to_string())
+                .unwrap();
+            (jc, w)
+        };
+        let center = Some("center".to_string());
+        assert_eq!(
+            jc_w(
+                "<table width=600><tr><td><div style='width:300px;margin:0 auto;\
+                  background:#eee'>x</div></td></tr></table>"
+            ),
+            (center.clone(), r#"w:w="4500" w:type="dxa""#.into())
+        );
+        // An `em` width takes the card's final font size: 20 x 20 px.
+        assert_eq!(
+            jc_w(
+                "<table><tr><td><div style='width:20em;font-size:20px;background:#eee'>x\
+                  </div></td></tr></table>"
+            )
+            .1,
+            r#"w:w="6000" w:type="dxa""#
+        );
+        assert_eq!(
+            jc_w("<table><tr><td><div style='width:50%;background:#eee'>x</div></td></tr></table>"),
+            (None, r#"w:w="2500" w:type="pct""#.into())
+        );
+        assert_eq!(
+            jc_w(
+                "<table><tr><td align=center><div style='width:300px;background:#eee'>x</div>\
+                  </td></tr></table>"
+            )
+            .0,
+            center
+        );
+        // `align=center` on the card centres what is in it, not the card
+        // (`-webkit-center`, #1922): a browser leaves a 300 px div at the
+        // left.
+        assert_eq!(
+            jc_w(
+                "<table><tr><td><div align=center style='width:300px;background:#eee'>x</div>\
+                  </td></tr></table>"
+            )
+            .0,
+            None
+        );
+        assert_eq!(
+            jc_w(
+                "<table><tr><td><div style='width:300px;margin-left:auto;background:#eee'>x\
+                  </div></td></tr></table>"
+            )
+            .0,
+            Some("right".into())
+        );
+    }
+
+    #[test]
+    fn stacked_cards_are_kept_apart() {
+        for html in [
+            "<table><tr><td><div BG>a</div><div BG>b</div></td></tr></table>",
+            "<table><tr><td><div BG>a</div>\n  <div BG>b</div>\n</td></tr></table>",
+            "<table><tr><td><div BG>a</div><table><tr><td>b</td></tr></table></td></tr></table>",
+            "<table><tr><td><table><tr><td>a</td></tr></table><div BG>b</div></td></tr></table>",
+            // Two plain nested tables back to back are kept apart too.
+            "<table><tr><td><table><tr><td>a</td></tr></table>\
+             <table><tr><td>b</td></tr></table></td></tr></table>",
+        ] {
+            let html = html.replace("BG", "style='background:#eee'");
+            let d = doc(&html);
+            assert_eq!(sketch(outer_cell(&d)), ["[a]", "", "[b]", ""], "{html}");
+        }
+    }
+
+    #[test]
+    fn an_empty_background_div_is_no_card() {
+        for div in [
+            "<div style='background:#eee'></div>",
+            "<div style='background:#eee;height:8px'> </div>",
+            "<div style='height:1px;line-height:1px;font-size:1px;background:#e0e0e0'>&nbsp;</div>",
+            "<div style='background:#eee'><p>&nbsp;</p></div>",
+            "<div style='background:#eee'><div style='background:#ddd'></div></div>",
+        ] {
+            let d = doc(&format!("<table><tr><td>x{div}y</td></tr></table>"));
+            assert_eq!(sketch(outer_cell(&d)), ["x", "y"], "{div}");
+        }
+        // Between two cards it leaves them apart by one paragraph only.
+        let d = doc("<table><tr><td><div style='background:#eee'>a</div>\
+             <div style='background:#ccc'></div><div style='background:#eee'>b</div>\
+             </td></tr></table>");
+        assert_eq!(sketch(outer_cell(&d)), ["[a]", "", "[b]", ""]);
+    }
+
+    #[test]
+    fn divs_that_are_not_cards() {
+        // In a cell, no table: padding alone, `none`, `none` over a sheet's
+        // background, hidden, under a hidden ancestor, inline-block, a `p`.
+        let in_cell = [
+            ("", "<div style='padding:8px'>x</div>", None),
+            ("", "<div style='background:none;padding:8px'>x</div>", None),
+            ("", "<div style='background:transparent'>x</div>", None),
+            (
+                "<style>div{background:#eee}</style>",
+                "<div style='background:none'>x</div>",
+                None,
+            ),
+            // Hidden: paragraph shading on vanished text, as before.
+            (
+                "",
+                "<div style='display:none;background:#eee'>x</div>",
+                Some("EEEEEE"),
+            ),
+            (
+                "",
+                "<div style='mso-hide:all;background:#eee'>x</div>",
+                Some("EEEEEE"),
+            ),
+            (
+                "",
+                "<span style='display:none'><div style='background:#eee'>x</div></span>",
+                Some("EEEEEE"),
+            ),
+            (
+                "",
+                "<div style='display:inline-block;background:#eee'>x</div>",
+                Some("EEEEEE"),
+            ),
+            ("", "<p style='background:#eee'>x</p>", Some("EEEEEE")),
+            (
+                "",
+                "<blockquote style='background:#eee'>x</blockquote>",
+                Some("EEEEEE"),
+            ),
+        ];
+        for (head, body, shade) in in_cell {
+            let d = doc(&format!("{head}<table><tr><td>{body}</td></tr></table>"));
+            assert_eq!(table_count(&d.body), 1, "{body}");
+            let p = para(&d, "x");
+            assert_eq!(
+                shaded(p),
+                shade.is_some(),
+                "{body}: {:?}",
+                p.props.raw_props
+            );
+            if let Some(fill) = shade {
+                assert!(p.props.raw_props.iter().any(|r| r.contains(fill)));
+            }
+        }
+        // Padding alone is still indent, as before.
+        let d = doc("<table><tr><td><div style='padding:8px'>x</div></td></tr></table>");
+        assert_eq!(para(&d, "x").props.indent, 120);
+        // Outside any table: paragraph shading, as before.
+        let d = doc("<div style='background:#eee;padding:8px'>x</div>");
+        assert_eq!(table_count(&d.body), 0);
+        assert!(shaded(para(&d, "x")));
+        // At the nesting limit: paragraph shading in the innermost cell.
+        let open = "<table><tr><td>".repeat(MAX_TABLE_NESTING);
+        let d = doc(&format!("{open}<div style='background:#eee'>x</div>"));
+        assert_eq!(table_count(&d.body), MAX_TABLE_NESTING);
+        assert!(shaded(para(&d, "x")));
+        // One level under it, a card still fits.
+        let open = "<table><tr><td>".repeat(MAX_TABLE_NESTING - 1);
+        let d = doc(&format!("{open}<div style='background:#eee'>x</div>"));
+        assert_eq!(table_count(&d.body), MAX_TABLE_NESTING);
+        assert!(!shaded(para(&d, "x")));
+        // Past MAX_DEPTH open elements: no card, and nothing breaks.
+        let spans = "<span>".repeat(MAX_DEPTH);
+        let d = doc(&format!(
+            "<table><tr><td>{spans}<div style='background:#eee'>x</div>y</td></tr></table>"
+        ));
+        assert_eq!(table_count(&d.body), 1);
     }
 }

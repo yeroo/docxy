@@ -765,6 +765,28 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// End the innermost table, an HTML card (#1927): its row and table as
+    /// `</table>` ends them, or, with nothing in it (no text, object or
+    /// table; only empty paragraphs), nothing at all: an e-mail's coloured
+    /// divider `div` leaves no empty shaded row behind.
+    pub(crate) fn end_card(&mut self, props: ParProps) {
+        let empty = self.para.is_empty()
+            && self.tables.last().is_some_and(|t| {
+                t.html
+                    .as_ref()
+                    .is_some_and(|h| h.rows.is_empty() && h.cells.is_empty() && h.nested.is_empty())
+                    && t.blocks
+                        .iter()
+                        .all(|b| matches!(b, Block::Paragraph(p) if p.content.is_empty()))
+            });
+        if empty {
+            self.tables.pop();
+            return;
+        }
+        self.end_row(props);
+        self.end_table();
+    }
+
     /// Close every open table, innermost first.
     fn end_tables(&mut self) {
         while !self.tables.is_empty() {
@@ -861,6 +883,13 @@ impl<'b> Builder<'b> {
         };
         match self.tables.last_mut() {
             Some(outer) if outer.html.is_some() => {
+                // Two tables back to back in a cell are kept apart by an
+                // empty paragraph, or Word joins them (#1927).
+                if outer.blocks.last().is_some_and(html_table::is_placeholder)
+                    && self.budget.keep::<Block>(0)
+                {
+                    outer.blocks.push(Block::Paragraph(Paragraph::default()));
+                }
                 let at = outer.blocks.len();
                 outer.blocks.push(html_table::placeholder());
                 outer.cell_has_para = true;
