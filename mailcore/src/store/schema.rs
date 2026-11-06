@@ -21,7 +21,16 @@ CREATE TABLE IF NOT EXISTS folders (
     delta_link      TEXT,
     well_known_name TEXT,
     sort_order      INTEGER,
-    is_expanded     INTEGER NOT NULL DEFAULT 0
+    is_expanded     INTEGER NOT NULL DEFAULT 0,
+    -- The whole-mailbox backfill (#1871): the full delta's in-progress
+    -- `nextLink` (NULL: not started, or done), the items it returned so
+    -- far, what `delta_link` covers (NULL: never synced, or a link from
+    -- before #1871; 'head', 'window' or 'all'), and what the walk under way
+    -- covers ('window' once a page ran with the window's cutoff, else 'all').
+    backfill_link   TEXT,
+    backfill_synced INTEGER NOT NULL DEFAULT 0,
+    history_scope   TEXT,
+    backfill_scope  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -49,7 +58,12 @@ CREATE TABLE IF NOT EXISTS messages (
     -- the draft. NULL for every other row. Lives on the row, so it goes with
     -- the message on every delete path. Its unique index is created in
     -- `Store::init`, after the migration that adds the column to old files.
-    local_id        TEXT
+    local_id        TEXT,
+    -- A draft's unsaved-edit generation (#1871): `update_draft_fields`
+    -- bumps it, a successful push clears it back to 0 if no edit came
+    -- since. Non-zero: the row holds fields Graph has not seen, which a
+    -- fresh delta must not overwrite.
+    local_edit      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

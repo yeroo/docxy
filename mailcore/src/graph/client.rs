@@ -85,6 +85,32 @@ pub(crate) fn graph_error_message(body: &str) -> Option<String> {
     (!message.is_empty()).then(|| message.to_string())
 }
 
+/// Whether `e` says a delta link's sync state expired or became invalid
+/// (#1871): a 410 Gone, or a 400 whose Graph `error.code` is
+/// `SyncStateNotFound`, `SyncStateInvalid` or `resyncRequired` (compared
+/// case-insensitively), as Exchange answers for an old or broken skip token.
+/// The delta then has to start again from a fresh cursor.
+pub(crate) fn is_expired_sync_state(e: &GraphError) -> bool {
+    match e {
+        GraphError::Http { status: 410, .. } => true,
+        GraphError::Http { status: 400, body } => json::parse(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")?
+                    .get("code")?
+                    .as_str()
+                    .map(|c| c.trim().to_ascii_lowercase())
+            })
+            .is_some_and(|code| {
+                matches!(
+                    code.as_str(),
+                    "syncstatenotfound" | "syncstateinvalid" | "resyncrequired"
+                )
+            }),
+        _ => false,
+    }
+}
+
 /// `s` as one line: every run of whitespace (newlines and tabs included)
 /// becomes one space, other control characters are dropped, the ends are
 /// trimmed, and past `max` characters it is cut (on a `char`) to end in `…`
@@ -133,12 +159,21 @@ fn reason_phrase(status: u16) -> Option<&'static str> {
 
 impl std::error::Error for GraphError {}
 
-/// Where a delta query starts from: the first call for a folder, or a
-/// `nextLink`/`deltaLink` URL carried over from a previous page.
+/// Where a delta query starts from: a first call for a folder (its recent
+/// mail, or all of it), or a `nextLink`/`deltaLink` URL carried over from a
+/// previous page. Both first calls ask for the newest mail first
+/// (`$orderby=receivedDateTime desc`, the one order Graph's message delta
+/// supports, #1871).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DeltaCursor {
-    /// First delta call for this mail folder id.
-    Folder(String),
+    /// First call of a folder's *head* delta (#1871): only the mail received
+    /// at or after `since` (an ISO-8601 UTC instant), with the server-side
+    /// `$filter=receivedDateTime ge {since}` Graph supports on message delta.
+    /// Its deltaLink keeps that filter.
+    Head { folder_id: String, since: String },
+    /// First call of a folder's *full* delta (#1871): every message, newest
+    /// first, with no filter.
+    Full(String),
     /// A `@odata.nextLink` (more pages) or `@odata.deltaLink` (resume point
     /// for the next sync) from a prior `DeltaPage`. Already a complete URL,
     /// so it's sent as-is rather than joined with `base`.
@@ -385,14 +420,26 @@ impl GraphClient {
         Ok((count("totalItemCount"), count("unreadItemCount")))
     }
 
-    /// GET a folder's `/messages/delta` (first call, `DeltaCursor::Folder`)
-    /// or a stored `nextLink`/`deltaLink` (`DeltaCursor::Link`), requesting
-    /// pages of 50 via `Prefer: odata.maxpagesize=50`.
+    /// GET a folder's `/messages/delta` (a first call, `DeltaCursor::Head`
+    /// or `DeltaCursor::Full`) or a stored `nextLink`/`deltaLink`
+    /// (`DeltaCursor::Link`), requesting pages of 50 via
+    /// `Prefer: odata.maxpagesize=50`.
     pub fn delta(&self, cursor: DeltaCursor) -> Result<DeltaPage, GraphError> {
         let target = match cursor {
-            DeltaCursor::Folder(folder_id) => {
+            DeltaCursor::Head { folder_id, since } => {
                 let folder_id = encode_path_segment(&folder_id);
-                format!("/me/mailFolders/{folder_id}/messages/delta?$select={MESSAGE_SELECT}")
+                format!(
+                    "/me/mailFolders/{folder_id}/messages/delta\
+                     ?$filter=receivedDateTime%20ge%20{since}\
+                     &$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+                )
+            }
+            DeltaCursor::Full(folder_id) => {
+                let folder_id = encode_path_segment(&folder_id);
+                format!(
+                    "/me/mailFolders/{folder_id}/messages/delta\
+                     ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+                )
             }
             DeltaCursor::Link(url) => url,
         };
@@ -1732,26 +1779,89 @@ mod tests {
         assert_eq!(reqs[0].method, "DELETE");
     }
 
-    #[test]
-    fn delta_folder_first_call_sends_maxpagesize_prefer_and_parses() {
-        let srv = FakeServer::start(vec![Route {
+    fn delta_route() -> Route {
+        Route {
             method: "GET".into(),
             path_prefix: "/me/mailFolders/F1/messages/delta".into(),
             status: 200,
             headers: vec![],
             body: r#"{"value":[],"@odata.deltaLink":"http://x/delta?token=abc"}"#.into(),
-        }]);
+        }
+    }
+
+    fn sends_maxpagesize(r: &crate::testserver::RecordedRequest) -> bool {
+        r.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("prefer") && v == "odata.maxpagesize=50")
+    }
+
+    #[test]
+    fn delta_head_first_call_filters_and_orders_newest_first() {
+        let srv = FakeServer::start(vec![delta_route()]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        let page = c.delta(DeltaCursor::Folder("F1".to_string())).unwrap();
+        let page = c
+            .delta(DeltaCursor::Head {
+                folder_id: "F1".to_string(),
+                since: "2026-10-23T00:00:00Z".to_string(),
+            })
+            .unwrap();
         assert_eq!(page.delta_link.as_deref(), Some("http://x/delta?token=abc"));
         let reqs = srv.requests();
-        assert!(reqs[0].path.contains("$select="));
-        assert!(
-            reqs[0]
-                .headers
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("prefer") && v == "odata.maxpagesize=50")
+        assert_eq!(
+            reqs[0].path,
+            format!(
+                "/me/mailFolders/F1/messages/delta\
+                 ?$filter=receivedDateTime%20ge%202026-10-23T00:00:00Z\
+                 &$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+            )
         );
+        assert!(sends_maxpagesize(&reqs[0]));
+    }
+
+    #[test]
+    fn delta_full_first_call_orders_newest_first_without_filter() {
+        let srv = FakeServer::start(vec![delta_route()]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        assert_eq!(page.delta_link.as_deref(), Some("http://x/delta?token=abc"));
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs[0].path,
+            format!(
+                "/me/mailFolders/F1/messages/delta\
+                 ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+            )
+        );
+        assert!(!reqs[0].path.contains("$filter"));
+        assert!(sends_maxpagesize(&reqs[0]));
+    }
+
+    #[test]
+    fn is_expired_sync_state_classifies_410_and_400_codes() {
+        let http = |status: u16, body: &str| GraphError::Http {
+            status,
+            body: body.to_string(),
+        };
+        assert!(is_expired_sync_state(&http(410, "")));
+        assert!(is_expired_sync_state(&http(410, "<html>gone</html>")));
+        for code in ["SyncStateNotFound", "syncStateInvalid", "resyncRequired"] {
+            let body = format!(r#"{{"error":{{"code":"{code}","message":"m"}}}}"#);
+            assert!(is_expired_sync_state(&http(400, &body)), "{code}");
+        }
+        assert!(!is_expired_sync_state(&http(
+            400,
+            r#"{"error":{"code":"ErrorInvalidRequest","message":"m"}}"#
+        )));
+        assert!(!is_expired_sync_state(&http(400, "not json")));
+        // Only a 400 carries the codes: a 403 with one is not an expiry.
+        assert!(!is_expired_sync_state(&http(
+            403,
+            r#"{"error":{"code":"SyncStateNotFound"}}"#
+        )));
+        assert!(!is_expired_sync_state(&GraphError::NotFound));
+        assert!(!is_expired_sync_state(&GraphError::Throttled {
+            retry_after_secs: 1
+        }));
     }
 
     #[test]

@@ -16,6 +16,16 @@
 //! failures drop to `Offline` with exponential back-off while the UI keeps
 //! reading the store.
 //!
+//! A folder's first sync is in two phases (#1871). In the sync pass it gets
+//! a *head* delta, only its recent mail (`HEAD_WINDOW_DAYS`), newest first,
+//! whose deltaLink keeps the folder fresh from then on. Then, one page per
+//! idle step of the main loop (no command queued, no deadline due), a *full*
+//! delta walks the rest of the folder newest first, persisting its next page
+//! so a restart resumes; its deltaLink replaces the head's when it ends.
+//! `backfill_days <= 0` ([`WHOLE_MAILBOX`]) downloads everything; a positive
+//! value keeps that window (older items of the full delta are skipped).
+//! Requests are one at a time: the engine is one thread.
+//!
 //! An opt-in fast cycle (`EngineOptions::fast_tick`, #1885) syncs only the
 //! folders a caller names (`SyncCommand::SetFastFolders`) between two normal
 //! ticks, and `SyncCommand::SyncFolder` syncs one folder on demand.
@@ -25,11 +35,12 @@
 //! Secrets (access/refresh tokens) are never logged.
 
 use crate::auth::{self, AuthConfig, TokenSet};
-use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind};
+use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind, is_expired_sync_state};
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Me, Message, ScheduleEntry};
 use crate::store::{
-    LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, OutboxRow, Store, StoreError,
+    FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, OutboxRow,
+    SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
 };
 use crate::sync::outbox::{apply_op, apply_send, send_error_text};
 use crate::tokencache;
@@ -46,8 +57,9 @@ pub enum SyncCommand {
     /// Re-enumerate folders, re-run every folder's delta, and drain the outbox.
     Refresh,
     /// Sync one folder now (#1885, "Update Folder"): drain the outbox, run
-    /// that folder's delta (its initial one, with the `backfill_days`
-    /// cutoff, when it never synced), and re-read its counts
+    /// that folder's delta (its head, phase 1 of #1871, when it never
+    /// synced; the backfill of older mail follows in idle time), and re-read
+    /// its counts
     /// (`GET /me/mailFolders/{id}`). Emits `MessagesUpdated { folder_id }`
     /// and, when the counts changed, `FoldersUpdated`. No other folder is
     /// touched. Signed out or inside a throttle/back-off window it does
@@ -58,7 +70,8 @@ pub enum SyncCommand {
     /// whole (duplicates dropped, order kept): a UI sends its Inbox and the
     /// folder it has open, and again when the open folder changes. Each
     /// fast tick drains the outbox and syncs these folders as `SyncFolder`
-    /// does, skipping one that never synced (the normal pass backfills it).
+    /// does, skipping one that never synced (the normal pass runs its head;
+    /// a fast tick never runs a backfill page, #1871).
     /// Without [`EngineOptions::fast_tick`] the set is kept but has no
     /// effect.
     SetFastFolders { ids: Vec<String> },
@@ -346,6 +359,22 @@ pub enum SyncEvent {
         granted: Vec<String>,
         missing: Vec<String>,
     },
+    /// A folder's backfill of older mail moved on (#1871): after every page
+    /// of its full delta, and once when it completed (`complete: true`).
+    /// `synced` is the persisted count of items that delta has walked past:
+    /// its upserts, merged or kept as a local edit (not `@removed`; in
+    /// window mode not the items older than the window). `total` is the
+    /// folder's `total_count` in whole-mailbox mode and `None` in window mode (the window's size is
+    /// unknown). `synced` can exceed `total` (the full delta re-sends the
+    /// head's mail, mail arrives meanwhile, delta can repeat an item), so a
+    /// UI clamps. `Store::folder_history` holds the same state before any
+    /// event.
+    FolderProgress {
+        folder_id: String,
+        synced: u64,
+        total: Option<i64>,
+        complete: bool,
+    },
 }
 
 /// The two channel endpoints the UI keeps: commands down, events up. Dropping
@@ -368,6 +397,23 @@ const MAX_OP_ATTEMPTS: i64 = 5;
 /// At most this many header-less rows of a folder are fetched from Graph per
 /// sync pass (`Engine::repair_headerless`, #1899); the rest wait for the next.
 const REPAIR_LIMIT: usize = 50;
+/// `backfill_days` for the whole mailbox (#1871): every value `<= 0` means
+/// no age limit, and the engine downloads every folder's whole history (the
+/// recent mail first, the rest in the background).
+pub const WHOLE_MAILBOX: i64 = 0;
+/// How many days of recent mail a folder's head delta asks for (#1871): the
+/// window's own size when `backfill_days` is smaller.
+const HEAD_WINDOW_DAYS: i64 = 14;
+/// A folder with at most this many messages (`total_count`, one delta page)
+/// skips the head: its first sync runs the full delta inline (#1871).
+const SMALL_FOLDER: i64 = 50;
+
+/// How `Engine::run_delta` ended: the last page's deltaLink, if it had one,
+/// and the upserts it walked past.
+struct DeltaRun {
+    delta_link: Option<String>,
+    walked: u64,
+}
 
 /// What `Engine::repair_headerless` did to a folder.
 struct Repair {
@@ -412,7 +458,9 @@ const SIGNIN_TIMEOUT: Duration = Duration::from_secs(180);
 const SIGNIN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawns the sync thread with production Graph/auth endpoints, returning
-/// the channels to drive it. `tick` is how long the thread waits for a
+/// the channels to drive it. `backfill_days` is the age limit of the mail
+/// downloaded: [`WHOLE_MAILBOX`] (any value `<= 0`) for everything, else
+/// the last that many days (#1871). `tick` is how long the thread waits for a
 /// command before running a periodic sync pass on its own (an explicit
 /// [`SyncCommand::Refresh`] also runs one immediately, regardless of how
 /// much of the tick has elapsed) — lookxy passes its `Config::refresh_secs`
@@ -558,6 +606,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
             return;
         }
     };
+    // A quarantine reconverge an earlier run left unfinished (#1871).
+    let reconverge_pending = store.reconverge_pending().unwrap_or(false);
     let mut engine = Engine {
         store,
         token: None,
@@ -567,7 +617,10 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         next_retry: None,
         backoff: BACKOFF_MIN,
         backfill_done: false,
-        reconverge_pending: false,
+        reconverge_pending,
+        parked: Vec::new(),
+        expired: Vec::new(),
+        next_tick: Instant::now(),
         fast_folders: Vec::new(),
         next_full: Instant::now(),
         next_fast: Instant::now(),
@@ -608,8 +661,24 @@ struct Engine {
     /// re-fetch *all* current server messages regardless of age (ignore the
     /// `backfill_days` cutoff) so it re-adds anything the dropped op wrongly
     /// removed locally — including messages that have since aged past the
-    /// sliding window. Cleared once that reconverge pass completes.
+    /// sliding window. Cleared once a pass ran every folder's delta and no
+    /// folder's backfill remains (#1871: old mail comes back through the
+    /// backfill), else by the backfill step that completes the last folder,
+    /// or by the one that parks the last walk left (parked walks do not
+    /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
+    /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
+    /// Folders whose backfill a failure stopped until the next sync pass
+    /// (#1871): one request per park, never a hot loop.
+    parked: Vec<String>,
+    /// Folders whose backfill found its sync state expired and started
+    /// over since the last pass: a second expiry parks the folder instead,
+    /// so a link that keeps expiring costs two requests a pass, not a loop.
+    expired: Vec<String>,
+    /// Without a fast tick: when the next tick is due (`tick` after the
+    /// last tick, the startup pass or a command). Backfill steps do not move
+    /// it.
+    next_tick: Instant,
     /// The fast cycle's folders (`SyncCommand::SetFastFolders`), in order.
     fast_folders: Vec<String>,
     /// With a fast tick only: when the normal pass is next due.
@@ -665,16 +734,32 @@ impl Engine {
     /// Blocks on the command channel, running a sync tick whenever the wait
     /// times out (or a back-off deadline elapses). Returns when a `Shutdown`
     /// arrives or the command channel is dropped.
+    ///
+    /// While a folder's backfill is ready (#1871) the wait is zero: a queued
+    /// command runs first, then a due deadline (`due`), and only then one
+    /// backfill page. So a command waits for at most the page in flight,
+    /// and a tick runs between two pages.
     fn main_loop(&mut self, cmd_rx: Receiver<SyncCommand>) {
         // The startup pass schedules the deadlines like any other.
         self.after_pass_if_fast();
+        self.next_tick = Instant::now() + self.config.tick;
         loop {
-            match cmd_rx.recv_timeout(self.recv_timeout()) {
+            let backfill = self.next_backfill();
+            let wait = if backfill.is_some() {
+                Duration::ZERO
+            } else {
+                self.recv_timeout()
+            };
+            match cmd_rx.recv_timeout(wait) {
                 Ok(SyncCommand::Shutdown) => return,
-                Ok(cmd) => self.handle_command(cmd),
-                Err(RecvTimeoutError::Timeout) => match self.fast_tick() {
-                    None => self.on_tick(),
-                    Some(fast) => self.on_deadline(fast),
+                Ok(cmd) => {
+                    self.handle_command(cmd);
+                    // Without a fast tick the wait restarts on every command.
+                    self.next_tick = Instant::now() + self.config.tick;
+                }
+                Err(RecvTimeoutError::Timeout) => match backfill {
+                    Some(h) if !self.due() => self.backfill_step(h),
+                    _ => self.on_timer(),
                 },
                 // The UI dropped its `SyncHandle`: no one is listening anymore.
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -682,8 +767,53 @@ impl Engine {
         }
     }
 
+    /// A timed wake: the tick (`on_tick`), or with a fast tick a deadline
+    /// (`on_deadline`). Then a `next_retry` or `op_retry` that has passed
+    /// is dropped, as the tick consumed its wake: one the tick left in the
+    /// past (a pass that ended early, a signed-out engine) would otherwise
+    /// keep `due` true and run a pass at every zero wait of a backfill. A
+    /// passed instant and none mean the same everywhere else.
+    fn on_timer(&mut self) {
+        match self.fast_tick() {
+            None => {
+                self.on_tick();
+                self.next_tick = Instant::now() + self.config.tick;
+            }
+            Some(fast) => self.on_deadline(fast),
+        }
+        let now = Instant::now();
+        if self.next_retry.is_some_and(|t| t <= now) {
+            self.next_retry = None;
+        }
+        if self.op_retry.is_some_and(|t| t <= now) {
+            self.op_retry = None;
+        }
+    }
+
+    /// Whether a timed wake is due now (#1871), checked before a backfill
+    /// page: the instants `recv_timeout` would wake at. Without a fast tick:
+    /// the tick, a passed back-off (`next_retry`: a throttled or offline
+    /// pass is retried at its end) or a passed `op_retry` while signed in (a
+    /// 5xx-deferred op is resent at its back-off). With one: either
+    /// deadline, never inside a back-off.
+    fn due(&self) -> bool {
+        let now = Instant::now();
+        match self.fast_tick() {
+            None => {
+                now >= self.next_tick
+                    || self.next_retry.is_some_and(|t| now >= t)
+                    || (self.token.is_some() && self.op_retry.is_some_and(|t| now >= t))
+            }
+            Some(_) => {
+                !self.next_retry.is_some_and(|t| now < t)
+                    && now >= self.next_full.min(self.next_fast)
+            }
+        }
+    }
+
     /// How long to block for the next command: until the back-off deadline if
-    /// one is pending, otherwise the configured tick, and no later than a
+    /// one is pending, otherwise the next tick (`next_tick`: the configured
+    /// tick after the last tick or command), and no later than a
     /// deferred op's `op_retry`. With a fast tick: until the nearer of the
     /// two deadlines, but never before a back-off deadline.
     fn recv_timeout(&self) -> Duration {
@@ -697,7 +827,7 @@ impl Engine {
         let now = Instant::now();
         let wait = match self.next_retry {
             Some(t) => t.saturating_duration_since(now),
-            None => self.config.tick,
+            None => self.next_tick.saturating_duration_since(now),
         };
         // Also wake for an op deferred by a 5xx (`op_retry`): the tick at
         // that instant drains it, as a back-off deadline did before #1885.
@@ -1004,6 +1134,9 @@ impl Engine {
             return;
         }
         self.set_state(SyncState::Syncing);
+        // A pass gives every parked backfill another try (#1871).
+        self.parked.clear();
+        self.expired.clear();
 
         if !self.sync_folders(full) {
             return;
@@ -1021,11 +1154,16 @@ impl Engine {
                 return;
             }
         }
-        // Every folder's delta just completed without a hard failure, so any
-        // pending reconverge (upsert-everything, cutoff ignored) is satisfied.
-        // Clear it before draining: if the drain quarantines a fresh op it will
-        // re-arm reconverge for the next pass.
-        self.reconverge_pending = false;
+        // Every folder's delta just completed without a hard failure, so a
+        // pending reconverge (upsert-everything, cutoff ignored) is satisfied
+        // once no folder's backfill remains either (#1871: the old mail comes
+        // back through it); else the step that completes the last folder,
+        // or parks the last walk left (parked walks do not count,
+        // `backfill_remains`), clears it. Clear it before draining: if the drain quarantines a
+        // fresh op it will re-arm reconverge for the next pass.
+        if !self.backfill_remains() {
+            self.end_reconverge();
+        }
         // A drain that a throttle, an offline error or a lost sign-in cut
         // short keeps its back-off: the pass stops here, as after a folder.
         // An op deferred by a 5xx does not stop the pass; it waits for the
@@ -1299,14 +1437,18 @@ impl Engine {
         (keep, carry_on)
     }
 
-    /// Delta-sync one folder: page through from the stored `deltaLink` (or a
-    /// fresh folder cursor on first sync), upserting/deleting messages and
-    /// saving the new `deltaLink`. On the initial backfill, messages older
-    /// than the `backfill_days` cutoff are skipped — except during a
-    /// quarantine reconverge (`reconverge_pending`), which upserts every item
-    /// regardless of age so a wrongly-removed message is restored even if it
-    /// has aged past the sliding window. Returns `false` if the whole pass
-    /// should abort.
+    /// Delta-sync one folder, in a sync pass, `SyncFolder` or a fast tick.
+    /// A folder with a stored `deltaLink` (a head, a full or a pre-#1871
+    /// link) runs a round on it, upserting/deleting every item with no age
+    /// cutoff, and saves the new `deltaLink`. A folder that never synced
+    /// gets its phase 1 (#1871): the *head* delta, only its recent mail
+    /// (`head_since`, filtered by the server, newest first), whose
+    /// deltaLink becomes the folder's (`Store::set_head_link`); its older
+    /// mail follows in idle time (`backfill_step`). A folder of at most
+    /// `SMALL_FOLDER` messages skips the head: its full delta runs here to
+    /// the end, with the `backfill_days` cutoff unless a quarantine
+    /// reconverge (`reconverge_pending`) asks for every item, and completes
+    /// the folder. Returns `false` if the whole pass should abort.
     ///
     /// A delta item may be partial (#1899): Graph can return only what
     /// changed (`{id, isRead}`), or a bare `{id}` for an item created and
@@ -1324,50 +1466,67 @@ impl Engine {
     /// repair that changed a row.
     fn sync_folder_delta(&mut self, folder_id: &str) -> bool {
         let stored = self.store.get_delta_link(folder_id).ok().flatten();
-        let is_backfill = stored.is_none();
-        let cutoff = if is_backfill && !self.reconverge_pending {
-            self.cutoff_iso()
+        // An unreadable count gets the head, like a big folder.
+        let small = stored.is_none()
+            && self
+                .folder_total(folder_id)
+                .is_some_and(|n| n <= SMALL_FOLDER);
+        let (cursor, cutoff) = match stored {
+            Some(link) => (DeltaCursor::Link(link), None),
+            None if small => (
+                DeltaCursor::Full(folder_id.to_string()),
+                self.backfill_cutoff(),
+            ),
+            None => (
+                DeltaCursor::Head {
+                    folder_id: folder_id.to_string(),
+                    since: self.head_since(),
+                },
+                None,
+            ),
+        };
+        // A head or a small folder's full delta, not a round on a stored link.
+        // A fresh delta carries every message it covers, so it must not
+        // overwrite a local edit (`merge_delta_items`): a reconverge re-runs
+        // phase 1 while the user's state is live.
+        let started_fresh = !matches!(cursor, DeltaCursor::Link(_));
+        let pending = if started_fresh {
+            match self.protected_ids() {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    self.emit(SyncEvent::Error(e.to_string()));
+                    return true;
+                }
+            }
         } else {
             None
         };
-        let mut cursor = match stored {
-            Some(link) => DeltaCursor::Link(link),
-            None => DeltaCursor::Folder(folder_id.to_string()),
+        let run = match self.run_delta(folder_id, cursor, cutoff.as_deref(), pending.as_deref()) {
+            Ok(run) => run,
+            // `react` returns true when the pass must abort; a non-fatal
+            // error (a 4xx/parse on this folder) is surfaced there and we
+            // stop this folder but keep the pass going.
+            Err(e) => return !self.react(e),
         };
-
-        loop {
-            let page = match self.with_auth(|c| c.delta(cursor.clone())) {
-                Ok(p) => p,
-                // `react` returns true when the pass must abort; a non-fatal
-                // error (a 4xx/parse on this folder) is surfaced there and we
-                // stop this folder but keep the pass going.
-                Err(e) => return !self.react(e),
-            };
-            for item in &page.items {
-                match item {
-                    DeltaItem::Upsert(m, fields) => {
-                        if let Some(cut) = &cutoff {
-                            if !m.received.is_empty() && m.received.as_str() < cut.as_str() {
-                                continue;
-                            }
-                        }
-                        let _ = self.store.merge_message(folder_id, m, fields);
-                    }
-                    // A `@removed` entry can carry an empty id; deleting "" is a
-                    // safe no-op in the store.
-                    DeltaItem::Delete(id) => {
-                        let _ = self.store.delete_message(id);
-                    }
-                }
-            }
-            if let Some(next) = page.next_link {
-                cursor = DeltaCursor::Link(next);
-                continue;
-            }
-            if let Some(delta) = page.delta_link {
+        if let Some(delta) = run.delta_link {
+            if !started_fresh {
                 let _ = self.store.set_delta_link(folder_id, &delta);
+            } else if small {
+                let scope = if cutoff.is_some() {
+                    SCOPE_WINDOW
+                } else {
+                    SCOPE_ALL
+                };
+                if self
+                    .store
+                    .complete_backfill(folder_id, &delta, scope, run.walked as i64)
+                    .is_ok()
+                {
+                    self.emit_progress(folder_id, run.walked, true);
+                }
+            } else {
+                let _ = self.store.set_head_link(folder_id, &delta);
             }
-            break;
         }
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: folder_id.to_string(),
@@ -1379,6 +1538,367 @@ impl Engine {
             });
         }
         !repair.abort
+    }
+
+    /// Pages a delta from `cursor` to its end into `folder_id`
+    /// (`merge_delta_items` with `cutoff` and `protect`), returning its
+    /// deltaLink (if the last page had one) and how many upserts it walked
+    /// past. A Graph failure is returned as it is, for the caller to
+    /// `react` to; the pages before it stay merged.
+    fn run_delta(
+        &mut self,
+        folder_id: &str,
+        mut cursor: DeltaCursor,
+        cutoff: Option<&str>,
+        protect: Option<&[String]>,
+    ) -> Result<DeltaRun, GraphError> {
+        let mut walked = 0;
+        loop {
+            let page = self.with_auth(|c| c.delta(cursor.clone()))?;
+            walked += self.merge_delta_items(folder_id, &page.items, cutoff, protect);
+            match page.next_link {
+                Some(next) => cursor = DeltaCursor::Link(next),
+                None => {
+                    return Ok(DeltaRun {
+                        delta_link: page.delta_link,
+                        walked,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Merges a delta page's items into `folder_id`: upserts (skipping one
+    /// received before `cutoff`, when its `receivedDateTime` is known) and
+    /// `@removed` deletes. Returns how many upserts it walked past (within
+    /// the cutoff, whatever became of them); a row that fails to write is
+    /// skipped.
+    ///
+    /// With `protect` (`protected_ids`, sorted) the page is a fresh
+    /// delta's (#1871: a head, a small folder's full delta, a backfill
+    /// page), which carries every message it covers, not only what changed:
+    /// it never merges over a local edit. It skips those ids, and merges
+    /// every other row with `Store::merge_message_unless_edited`, which
+    /// leaves a draft holding an unsaved edit alone in the same statement
+    /// as the write (compose saves on lookxy's own connection, at any
+    /// time). Every other row is merged, drafts included (a quarantine
+    /// reconverge repairs a draft a dropped op left wrong). A round on a
+    /// stored link (`None`) merges everything, as Graph reports a change
+    /// there.
+    fn merge_delta_items(
+        &self,
+        folder_id: &str,
+        items: &[DeltaItem],
+        cutoff: Option<&str>,
+        protect: Option<&[String]>,
+    ) -> u64 {
+        let mut upserts = 0;
+        for item in items {
+            match item {
+                DeltaItem::Upsert(m, fields) => {
+                    if let Some(cut) = cutoff {
+                        if !m.received.is_empty() && m.received.as_str() < cut {
+                            continue;
+                        }
+                    }
+                    upserts += 1;
+                    match protect {
+                        Some(ids) if ids.binary_search(&m.id).is_ok() => {}
+                        Some(_) => {
+                            let _ = self.store.merge_message_unless_edited(folder_id, m, fields);
+                        }
+                        None => {
+                            let _ = self.store.merge_message(folder_id, m, fields);
+                        }
+                    }
+                }
+                // A `@removed` entry can carry an empty id; deleting "" is a
+                // safe no-op in the store.
+                DeltaItem::Delete(id) => {
+                    let _ = self.store.delete_message(id);
+                }
+            }
+        }
+        upserts
+    }
+
+    // --- Backfill (#1871) -------------------------------------------------
+
+    /// The ids a fresh delta must not merge over (#1871), sorted: those a
+    /// queued outbox op names (`Store::pending_message_ids`: an optimistic
+    /// write waiting after a 5xx; a deleted message is not put back). Only
+    /// this thread queues ops, so the list cannot go stale during a fetch.
+    /// A draft with an unsaved edit is not listed: compose marks it on its
+    /// own connection at any time, so `merge_message_unless_edited` checks
+    /// it in the statement that writes.
+    fn protected_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.store.pending_message_ids()
+    }
+
+    /// The quarantine reconverge is over: the flag is cleared, in memory and
+    /// in the store.
+    fn end_reconverge(&mut self) {
+        if self.reconverge_pending {
+            self.reconverge_pending = false;
+            let _ = self.store.clear_reconverge_pending();
+        }
+    }
+
+    /// Whether `backfill_days` asks for the whole mailbox ([`WHOLE_MAILBOX`]).
+    fn whole_mailbox(&self) -> bool {
+        self.config.backfill_days <= 0
+    }
+
+    /// The age cutoff for a full delta's items: the window's
+    /// (`cutoff_iso`, `None` in whole-mailbox mode), and none while a
+    /// quarantine reconverge must restore every message.
+    fn backfill_cutoff(&self) -> Option<String> {
+        if self.reconverge_pending {
+            None
+        } else {
+            self.cutoff_iso()
+        }
+    }
+
+    /// The head delta's lower bound: `HEAD_WINDOW_DAYS` ago, or the window's
+    /// own size when `backfill_days` is smaller.
+    fn head_since(&self) -> String {
+        let days = if self.whole_mailbox() {
+            HEAD_WINDOW_DAYS
+        } else {
+            self.config.backfill_days.min(HEAD_WINDOW_DAYS)
+        };
+        unix_to_iso8601(now_unix().saturating_sub(days as u64 * 86400))
+    }
+
+    /// A folder's stored `total_count` (from the pass's listing), `None`
+    /// when it cannot be read.
+    fn folder_total(&self, folder_id: &str) -> Option<i64> {
+        self.store
+            .folder_history(folder_id)
+            .ok()
+            .flatten()
+            .map(|h| h.total_count)
+    }
+
+    /// Sends `FolderProgress` for `folder_id` with `synced` items so far.
+    fn emit_progress(&self, folder_id: &str, synced: u64, complete: bool) {
+        let total = if self.whole_mailbox() {
+            self.folder_total(folder_id)
+        } else {
+            None
+        };
+        self.emit(SyncEvent::FolderProgress {
+            folder_id: folder_id.to_string(),
+            synced,
+            total,
+            complete,
+        });
+    }
+
+    /// The folders whose history is not complete for this mode, in
+    /// `Store::folders` order: phase 1 done (a delta link), and the scope
+    /// short of what the mode asks for (`history_complete`).
+    fn incomplete_histories(&self) -> Result<Vec<FolderHistory>, StoreError> {
+        let whole = self.whole_mailbox();
+        Ok(self
+            .store
+            .folder_histories()?
+            .into_iter()
+            .filter(|h| h.has_delta_link && !history_complete(h.scope.as_deref(), whole))
+            .collect())
+    }
+
+    /// Whether some folder's backfill is still to run, not counting a
+    /// parked one: a page that fails is parked, and a parked walk must not
+    /// hold a reconverge (and its persisted flag) open. A store error
+    /// counts as none.
+    fn backfill_remains(&self) -> bool {
+        self.incomplete_histories()
+            .map(|h| h.iter().any(|h| !self.parked.contains(&h.folder_id)))
+            .unwrap_or(false)
+    }
+
+    /// The folder whose backfill page runs next, if one may run now: signed
+    /// in, outside a back-off, after a folder list succeeded
+    /// (`backfill_done`), and the first incomplete folder that is not
+    /// parked. The main loop and `backfill_step` share it, so a ready
+    /// backfill always makes a request or parks (never a spin). A store
+    /// error stops the backfill until the next pass reads it again.
+    fn next_backfill(&self) -> Option<FolderHistory> {
+        if self.token.is_none()
+            || !self.backfill_done
+            || self.next_retry.is_some_and(|t| Instant::now() < t)
+        {
+            return None;
+        }
+        self.incomplete_histories()
+            .ok()?
+            .into_iter()
+            .find(|h| !self.parked.contains(&h.folder_id))
+    }
+
+    /// Parks `folder_id`'s backfill until the next pass. A reconverge whose
+    /// only walks left are parked ends here (`backfill_remains`).
+    fn park(&mut self, folder_id: &str) {
+        if !self.parked.iter().any(|f| f == folder_id) {
+            self.parked.push(folder_id.to_string());
+        }
+        if self.reconverge_pending && !self.backfill_remains() {
+            self.end_reconverge();
+        }
+    }
+
+    /// Reports a store failure of a backfill step and parks the folder, so
+    /// the page is not fetched again at once.
+    fn park_on_store_error(&mut self, folder_id: &str, e: StoreError) {
+        self.emit(SyncEvent::Error(format!(
+            "mail sync: cannot record the download of folder {}: {e}",
+            self.folder_label(folder_id)
+        )));
+        self.park(folder_id);
+    }
+
+    /// One page of a folder's full delta (#1871, phase 2), from its
+    /// persisted `nextLink` or a fresh `DeltaCursor::Full` (also when a
+    /// walk a window engine began resumes in whole-mailbox mode: its pages
+    /// ran with the window's cutoff). Its items are applied by
+    /// `merge_delta_items` (merged, never over a local edit; older than
+    /// the window skipped in window mode, unless a reconverge is pending),
+    /// then the next link, the running count and the walk's scope are
+    /// stored and `MessagesUpdated` and `FolderProgress` sent. When the
+    /// deltaLink comes, one last round on the folder's own link runs first,
+    /// then the deltaLink becomes the folder's `delta_link` in the same
+    /// statement that marks it complete (`Store::complete_backfill`);
+    /// `repair_headerless` follows. Sets no state: a failed page keeps what
+    /// `react` set. An expired sync state starts the folder over, once a
+    /// pass (`is_expired_sync_state`); a second expiry, any other non-fatal
+    /// failure or a store error parks the folder until the next pass.
+    fn backfill_step(&mut self, mut h: FolderHistory) {
+        let id = h.folder_id.clone();
+        if self.whole_mailbox() && h.backfill_scope.as_deref() == Some(SCOPE_WINDOW) {
+            if let Err(e) = self.store.reset_backfill(&id) {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+            h.backfill_link = None;
+            h.synced = 0;
+            h.backfill_scope = None;
+        }
+        let cursor = match h.backfill_link {
+            Some(link) => DeltaCursor::Link(link),
+            None => DeltaCursor::Full(id.clone()),
+        };
+        let page = match self.with_auth(|c| c.delta(cursor.clone())) {
+            Ok(p) => p,
+            Err(e) => {
+                if is_expired_sync_state(&e) && !self.expired.contains(&id) {
+                    self.expired.push(id.clone());
+                    if let Err(se) = self.store.reset_backfill(&id) {
+                        self.park_on_store_error(&id, se);
+                    }
+                    return;
+                }
+                // Auth, throttle and transport stop the backfill through
+                // `react` (sign-in, `next_retry`); the rest park the folder.
+                if !self.react(e) {
+                    self.park(&id);
+                }
+                return;
+            }
+        };
+        let cutoff = self.backfill_cutoff();
+        let page_scope = if cutoff.is_some() {
+            SCOPE_WINDOW
+        } else {
+            SCOPE_ALL
+        };
+        let pending = match self.protected_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+        };
+        let walked = self.merge_delta_items(&id, &page.items, cutoff.as_deref(), Some(&pending));
+        let synced = u64::try_from(h.synced).unwrap_or(0) + walked;
+        self.emit(SyncEvent::MessagesUpdated {
+            folder_id: id.clone(),
+        });
+        if let Some(next) = page.next_link {
+            match self
+                .store
+                .set_backfill_progress(&id, &next, synced as i64, page_scope)
+            {
+                Ok(()) => self.emit_progress(&id, synced, false),
+                Err(e) => self.park_on_store_error(&id, e),
+            }
+            return;
+        }
+        let Some(delta) = page.delta_link else {
+            // Graph sent a page with neither link: nothing to resume from.
+            self.react(GraphError::Parse(
+                "delta page without a next or delta link".to_string(),
+            ));
+            self.park(&id);
+            return;
+        };
+        // One last round on the folder's own link (the head's, or a link
+        // from before #1871) before the walk's deltaLink replaces it: it
+        // brings recent mail changed during the walk up to date, which the
+        // walk's link would not report. A link whose sync state expired
+        // (`is_expired_sync_state`) is skipped: the walk's deltaLink replaces
+        // it, so the folder heals. Any other failed round does not complete:
+        // a fatal failure stops through `react`, any other parks the folder,
+        // and the next step fetches the last page again (its link is still
+        // the stored one).
+        match self.store.get_delta_link(&id) {
+            Ok(Some(link)) => match self.run_delta(&id, DeltaCursor::Link(link), None, None) {
+                Ok(run) => {
+                    if let Some(head) = run.delta_link {
+                        let _ = self.store.set_delta_link(&id, &head);
+                    }
+                }
+                Err(e) if is_expired_sync_state(&e) => {}
+                Err(e) => {
+                    if !self.react(e) {
+                        self.park(&id);
+                    }
+                    return;
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+        }
+        // A walk any page of which ran with the window's cutoff covers the
+        // window only.
+        let scope =
+            if page_scope == SCOPE_WINDOW || h.backfill_scope.as_deref() == Some(SCOPE_WINDOW) {
+                SCOPE_WINDOW
+            } else {
+                SCOPE_ALL
+            };
+        if let Err(e) = self
+            .store
+            .complete_backfill(&id, &delta, scope, synced as i64)
+        {
+            self.park_on_store_error(&id, e);
+            return;
+        }
+        self.emit(SyncEvent::MessagesUpdated {
+            folder_id: id.clone(),
+        });
+        self.emit_progress(&id, synced, true);
+        if !self.backfill_remains() {
+            self.end_reconverge();
+        }
+        let repair = self.repair_headerless(&id);
+        if repair.changed {
+            self.emit(SyncEvent::MessagesUpdated { folder_id: id });
+        }
     }
 
     /// Completes up to `REPAIR_LIMIT` of `folder_id`'s header-less rows
@@ -2747,6 +3267,19 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+/// Whether a folder's history is complete for the mode (#1871), from what
+/// its `delta_link` covers (`Store::folder_history`'s `scope`), for a
+/// folder that has one (phase 1 done): a link from before #1871 (`None`)
+/// or a `window` one is complete in window mode only; an `all` one always;
+/// a `head` one never.
+fn history_complete(scope: Option<&str>, whole: bool) -> bool {
+    match scope {
+        None => !whole,
+        Some(s) if s == SCOPE_WINDOW => !whole,
+        Some(s) => s == SCOPE_ALL,
     }
 }
 
@@ -8019,12 +8552,14 @@ mod tests {
     }
 
     /// F1/F2 routes where F2's first (initial) delta is throttled once for
-    /// 2 s, so a full pass is cut short after the folder list and F1.
+    /// 2 s, so a full pass is cut short after the folder list and F1. F2
+    /// lists no messages, so its first delta is the full one (#1871: a small
+    /// folder skips the head).
     fn f2_initial_delta_throttled_routes() -> Vec<(Route, Option<usize>)> {
         let mut routes = vec![(
             Route {
                 method: "GET".into(),
-                path_prefix: "/me/mailFolders/F2/messages/delta?$select".into(),
+                path_prefix: "/me/mailFolders/F2/messages/delta?$orderby".into(),
                 status: 429,
                 headers: vec![("Retry-After".into(), "2".into())],
                 body: "{}".into(),
@@ -9516,5 +10051,1535 @@ mod tests {
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole-mailbox download (#1871): a head delta per folder in the
+    /// pass, then the full delta one page per idle step.
+    mod backfill {
+        use super::*;
+        use crate::store::{FolderHistory, SCOPE_HEAD};
+
+        /// Above `SMALL_FOLDER`, so a folder gets a head first.
+        const BIG: i64 = 500;
+
+        /// A folder of the fake mailbox: listed with `total`, its head
+        /// answering `head`, and its full delta paged as `pages`.
+        struct Fold {
+            id: &'static str,
+            name: &'static str,
+            well_known: Option<&'static str>,
+            total: i64,
+            head: Vec<String>,
+            pages: Vec<Vec<String>>,
+        }
+
+        fn fold(id: &'static str, name: &'static str, well_known: Option<&'static str>) -> Fold {
+            Fold {
+                id,
+                name,
+                well_known,
+                total: BIG,
+                head: Vec::new(),
+                pages: vec![Vec::new()],
+            }
+        }
+
+        fn inbox() -> Fold {
+            fold("F1", "Inbox", Some("inbox"))
+        }
+
+        /// `n` pages of one message each (`P{id}-{k}`), all received on
+        /// 2025-06-01 (the fake server does not order them).
+        fn pages_of(id: &str, n: usize) -> Vec<Vec<String>> {
+            (1..=n)
+                .map(|k| vec![msg(&format!("P{id}-{k}"), "2025-06-01T00:00:00Z")])
+                .collect()
+        }
+
+        fn msg(id: &str, received: &str) -> String {
+            full_message_json(id, id, received)
+        }
+
+        fn head_link(id: &str) -> String {
+            format!("/me/mailFolders/{id}/messages/delta?token=H-{id}")
+        }
+
+        /// The full delta's page `k` (2-based: page 1 is the first call).
+        fn page_link(id: &str, k: usize) -> String {
+            format!("/me/mailFolders/{id}/messages/delta?skiptoken={id}_{k:03}")
+        }
+
+        fn full_link(id: &str) -> String {
+            format!("/me/mailFolders/{id}/messages/delta?token=A-{id}")
+        }
+
+        fn legacy_link(id: &str) -> String {
+            format!("/me/mailFolders/{id}/messages/delta?token=L-{id}")
+        }
+
+        fn page(items: &[String], next: Option<&str>, delta: Option<&str>) -> String {
+            let mut body = format!(r#"{{"value":[{}]"#, items.join(","));
+            if let Some(n) = next {
+                body.push_str(&format!(r#","@odata.nextLink":"{n}""#));
+            }
+            if let Some(d) = delta {
+                body.push_str(&format!(r#","@odata.deltaLink":"{d}""#));
+            }
+            body.push('}');
+            body
+        }
+
+        type Paced = (Route, Option<usize>, Duration);
+
+        fn route(prefix: &str, status: u16, body: &str) -> Route {
+            get_route(prefix, status, body)
+        }
+
+        fn throttle(prefix: &str, secs: u64) -> Route {
+            Route {
+                method: "GET".into(),
+                path_prefix: prefix.into(),
+                status: 429,
+                headers: vec![("Retry-After".into(), secs.to_string())],
+                body: "{}".into(),
+            }
+        }
+
+        /// Every route of the fake mailbox, `extra` first (so they win). A
+        /// full delta page waits `delay` before it answers.
+        fn mailbox(
+            folders: &[Fold],
+            extra: Vec<(Route, Option<usize>)>,
+            delay: Duration,
+        ) -> Vec<Paced> {
+            let mut routes: Vec<Paced> = extra
+                .into_iter()
+                .map(|(r, n)| (r, n, Duration::ZERO))
+                .collect();
+            let now = |r: Route| (r, None, Duration::ZERO);
+            let slow = |r: Route| (r, None, delay);
+            let mut listed = Vec::new();
+            for f in folders {
+                let id = f.id;
+                let delta = format!("/me/mailFolders/{id}/messages/delta");
+                routes.push(now(route(
+                    &format!("/me/mailFolders/{id}/childFolders"),
+                    200,
+                    r#"{"value":[]}"#,
+                )));
+                routes.push(now(route(
+                    &format!("{delta}?$filter"),
+                    200,
+                    &page(&f.head, None, Some(&head_link(id))),
+                )));
+                for link in [head_link(id), full_link(id), legacy_link(id)] {
+                    routes.push(now(route(&link, 200, &page(&[], None, Some(&link)))));
+                }
+                let n = f.pages.len();
+                for (i, items) in f.pages.iter().enumerate() {
+                    let k = i + 1;
+                    let (next, last) = if k < n {
+                        (Some(page_link(id, k + 1)), None)
+                    } else {
+                        (None, Some(full_link(id)))
+                    };
+                    let body = page(items, next.as_deref(), last.as_deref());
+                    let prefix = if k == 1 {
+                        format!("{delta}?$orderby")
+                    } else {
+                        page_link(id, k)
+                    };
+                    routes.push(slow(route(&prefix, 200, &body)));
+                }
+                routes.push(now(route(
+                    &format!("/me/mailFolders/{id}?"),
+                    200,
+                    &format!(r#"{{"totalItemCount":{},"unreadItemCount":0}}"#, f.total),
+                )));
+                let wk = f
+                    .well_known
+                    .map_or("null".to_string(), |w| format!("\"{w}\""));
+                listed.push(format!(
+                    r#"{{"id":"{id}","displayName":"{}","parentFolderId":null,"totalItemCount":{},"unreadItemCount":0,"wellKnownName":{wk}}}"#,
+                    f.name, f.total
+                ));
+            }
+            routes.push(now(route(
+                "/me/mailFolders?",
+                200,
+                &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+            )));
+            routes
+        }
+
+        /// A fresh engine directory with a signed-in token.
+        fn new_dir(tag: &str) -> PathBuf {
+            let dir = unique_dir(tag);
+            seed_token(&dir.join("token.bin"));
+            dir
+        }
+
+        fn store_in(dir: &std::path::Path) -> Store {
+            Store::open(&dir.join("mail.db")).unwrap()
+        }
+
+        fn spawn_in(
+            srv: &FakeServer,
+            dir: &std::path::Path,
+            days: i64,
+            tick: Duration,
+            fast_tick: Option<Duration>,
+        ) -> SyncHandle {
+            spawn_with_bases_and_options(
+                dir.join("mail.db"),
+                dir.join("token.bin"),
+                test_cfg(),
+                days,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                tick,
+                EngineOptions {
+                    fast_tick,
+                    ..Default::default()
+                },
+            )
+        }
+
+        /// Stops the engine and waits for its thread to end (its event
+        /// channel closes), so a second engine can open the same store.
+        fn stop(handle: SyncHandle) {
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let deadline = Instant::now() + ENGINE_WAIT;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match handle.evt_rx.recv_timeout(left) {
+                    Ok(_) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => panic!("engine did not stop"),
+                }
+            }
+        }
+
+        fn is_complete(e: &SyncEvent, id: &str) -> bool {
+            matches!(e, SyncEvent::FolderProgress { folder_id, complete: true, .. } if folder_id == id)
+        }
+
+        /// Events until `id`'s backfill completes.
+        fn until_complete(handle: &SyncHandle, id: &str) -> Vec<SyncEvent> {
+            wait_for(&handle.evt_rx, |e| is_complete(e, id))
+        }
+
+        /// `(synced, total, complete)` of every `FolderProgress` of `id`.
+        fn progress(events: &[SyncEvent], id: &str) -> Vec<(u64, Option<i64>, bool)> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    SyncEvent::FolderProgress {
+                        folder_id,
+                        synced,
+                        total,
+                        complete,
+                    } if folder_id == id => Some((*synced, *total, *complete)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn is_head(p: &str, id: &str) -> bool {
+            p.starts_with(&format!("/me/mailFolders/{id}/messages/delta?$filter"))
+        }
+
+        /// A request of `id`'s full delta: its first call or a page link.
+        fn is_backfill(p: &str, id: &str) -> bool {
+            p.starts_with(&format!("/me/mailFolders/{id}/messages/delta?$orderby"))
+                || p.starts_with(&format!("/me/mailFolders/{id}/messages/delta?skiptoken="))
+        }
+
+        fn is_full_first(p: &str, id: &str) -> bool {
+            p.starts_with(&format!("/me/mailFolders/{id}/messages/delta?$orderby"))
+        }
+
+        fn positions(srv: &FakeServer, pred: impl Fn(&str) -> bool) -> Vec<usize> {
+            paths_from(srv, 0)
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| pred(p))
+                .map(|(i, _)| i)
+                .collect()
+        }
+
+        fn history(dir: &std::path::Path, id: &str) -> FolderHistory {
+            store_in(dir).folder_history(id).unwrap().unwrap()
+        }
+
+        fn stored_ids(dir: &std::path::Path, id: &str) -> Vec<String> {
+            store_in(dir)
+                .messages_in_folder(id, 1000, 0)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        }
+
+        #[test]
+        fn history_complete_by_mode() {
+            // scope → (complete in window mode, in whole mode), for a folder
+            // with a delta link (`incomplete_histories` asks only then).
+            let cases: &[(Option<&str>, bool, bool)] = &[
+                (None, true, false),
+                (Some(SCOPE_HEAD), false, false),
+                (Some(SCOPE_WINDOW), true, false),
+                (Some(SCOPE_ALL), true, true),
+                (Some("other"), false, false),
+            ];
+            for &(scope, window, whole) in cases {
+                assert_eq!(history_complete(scope, false), window, "{scope:?} window");
+                assert_eq!(history_complete(scope, true), whole, "{scope:?} whole");
+            }
+        }
+
+        #[test]
+        fn whole_mailbox_heads_every_folder_inbox_first_before_any_backfill_page() {
+            // Graph lists Projects before the Inbox.
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        pages: pages_of("F2", 2),
+                        ..fold("F2", "Projects", None)
+                    },
+                    Fold {
+                        pages: pages_of("F1", 2),
+                        ..inbox()
+                    },
+                ],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-order");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let mut done = (false, false);
+            wait_for(&handle.evt_rx, |e| {
+                done.0 |= is_complete(e, "F1");
+                done.1 |= is_complete(e, "F2");
+                done.0 && done.1
+            });
+            let paths = paths_from(&srv, 0);
+            let heads = positions(&srv, |p| is_head(p, "F1") || is_head(p, "F2"));
+            let pages = positions(&srv, |p| is_backfill(p, "F1") || is_backfill(p, "F2"));
+            assert_eq!(heads.len(), 2, "{paths:?}");
+            assert_eq!(pages.len(), 4, "{paths:?}");
+            assert!(
+                heads.iter().all(|h| *h < pages[0]),
+                "every head before any page: {paths:?}"
+            );
+            assert!(
+                is_head(&paths[heads[0]], "F1"),
+                "the Inbox head first: {paths:?}"
+            );
+            // The Inbox's backfill runs to its end before the next folder's.
+            let f1 = positions(&srv, |p| is_backfill(p, "F1"));
+            let f2 = positions(&srv, |p| is_backfill(p, "F2"));
+            assert!(f1.last() < f2.first(), "{paths:?}");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn whole_mailbox_backfill_pages_newest_first_to_completion_with_progress() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![msg("NEW", "2026-11-05T00:00:00Z")],
+                    pages: vec![
+                        vec![
+                            msg("NEW", "2026-11-05T00:00:00Z"),
+                            msg("A", "2026-01-01T00:00:00Z"),
+                        ],
+                        vec![msg("B", "2015-01-01T00:00:00Z")],
+                        vec![msg("OLD", "2001-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-pages");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert_eq!(
+                progress(&events, "F1"),
+                vec![
+                    (2, Some(BIG), false),
+                    (3, Some(BIG), false),
+                    (4, Some(BIG), true)
+                ]
+            );
+            // The first full-delta call asks for the newest first.
+            let firsts = positions(&srv, |p| is_full_first(p, "F1"));
+            assert_eq!(firsts.len(), 1);
+            assert!(paths_from(&srv, 0)[firsts[0]].contains("$orderby=receivedDateTime%20desc"));
+            let mut ids = stored_ids(&dir, "F1");
+            ids.sort();
+            assert_eq!(ids, ["A", "B", "NEW", "OLD"]);
+            let h = history(&dir, "F1");
+            assert_eq!(
+                (h.scope.as_deref(), h.synced, h.backfill_link),
+                (Some(SCOPE_ALL), 4, None)
+            );
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_resumes_from_the_persisted_link_after_restart() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(throttle(&page_link("F1", 2), 3600), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-resume");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| p
+                == page_link("F1", 2))
+                >= 1));
+            stop(handle);
+            let h = history(&dir, "F1");
+            assert_eq!((h.backfill_link, h.synced), (Some(page_link("F1", 2)), 1));
+
+            let restart = srv.requests().len();
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert_eq!(progress(&events, "F1").last(), Some(&(3, Some(BIG), true)));
+            let after: Vec<String> = paths_from(&srv, restart);
+            let first_page = after.iter().find(|p| is_backfill(p, "F1")).unwrap();
+            assert_eq!(*first_page, page_link("F1", 2), "{after:?}");
+            assert_eq!(
+                count(&srv, |p| is_full_first(p, "F1")),
+                1,
+                "the first call once"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_retries_a_429_after_retry_after() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(throttle(&page_link("F1", 2), 1), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-429");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert_eq!(progress(&events, "F1").last(), Some(&(3, Some(BIG), true)));
+            let tries: Vec<Instant> = srv
+                .requests()
+                .into_iter()
+                .filter(|r| r.path == page_link("F1", 2))
+                .map(|r| r.at)
+                .collect();
+            assert_eq!(tries.len(), 2);
+            assert!(
+                tries[1] - tries[0] >= Duration::from_secs(1),
+                "retried after {:?}",
+                tries[1] - tries[0]
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_throttled_pass_is_retried_at_expiry_while_a_backfill_waits() {
+            // The startup pass stops at F2's head (429, 1 s). At its expiry
+            // both the pass and F1's 30 slow pages are ready: the pass runs
+            // first, not after the backfill (an hour-long tick).
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        pages: pages_of("F1", 30),
+                        ..inbox()
+                    },
+                    fold("F2", "Projects", None),
+                ],
+                vec![(
+                    throttle("/me/mailFolders/F2/messages/delta?$filter", 1),
+                    Some(1),
+                )],
+                Duration::from_millis(100),
+            ));
+            let dir = new_dir("bf-retry-pass");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| is_head(
+                p, "F2"
+            )) >= 2));
+            let heads = positions(&srv, |p| is_head(p, "F2"));
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            assert!(
+                pages.iter().filter(|i| **i < heads[1]).count() < 30,
+                "F2's head retried before F1's backfill ended: {:?}",
+                paths_from(&srv, 0)
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_deferred_op_is_resent_at_its_back_off_while_a_backfill_runs() {
+            // The op's 5xx back-off is 5 s; the backfill takes about 9 s and
+            // the tick an hour, so only the due `op_retry` resends it in time.
+            let patch = |status: u16| Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status,
+                headers: vec![],
+                body: "{}".into(),
+            };
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 60),
+                    ..inbox()
+                }],
+                vec![(patch(500), Some(1)), (patch(200), None)],
+                Duration::from_millis(150),
+            ));
+            let dir = new_dir("bf-op-retry");
+            seed_mark_read(&store_in(&dir));
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 2));
+            let patches: Vec<usize> = srv
+                .requests()
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.method == "PATCH")
+                .map(|(i, _)| i)
+                .collect();
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            assert!(
+                !pages.is_empty() && pages[0] < patches[1],
+                "the backfill ran first"
+            );
+            assert!(
+                pages.iter().filter(|i| **i < patches[1]).count() < 60,
+                "the op was resent while the backfill ran"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_backfill_step_sets_no_syncing_state() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 4),
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-state");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            let first = events
+                .iter()
+                .position(|e| matches!(e, SyncEvent::FolderProgress { .. }))
+                .unwrap();
+            assert!(
+                !events[first..]
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::State(_))),
+                "no state change during the backfill: {events:?}"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_small_folder_gets_one_full_delta_and_is_complete() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    total: 0,
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-small");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let mut events = until_complete(&handle, "F1");
+            // Give a backfill step the time to run, if one would.
+            std::thread::sleep(Duration::from_millis(300));
+            events.extend(handle.evt_rx.try_iter());
+            let deltas: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_delta(p, "F1"))
+                .collect();
+            assert_eq!(deltas.len(), 1, "{deltas:?}");
+            assert!(is_full_first(&deltas[0], "F1"), "{deltas:?}");
+            assert_eq!(progress(&events, "F1"), vec![(0, Some(0), true)]);
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_command_preempts_the_remaining_backfill_pages() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![msg("M1", "2026-11-05T00:00:00Z")],
+                    pages: pages_of("F1", 20),
+                    ..inbox()
+                }],
+                vec![(body_route("text", "hello"), None)],
+                Duration::from_millis(200),
+            ));
+            let dir = new_dir("bf-preempt");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(&handle.evt_rx, |e| {
+                matches!(
+                    e,
+                    SyncEvent::FolderProgress {
+                        complete: false,
+                        ..
+                    }
+                )
+            });
+            let sent = Instant::now();
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchBody { id: "M1".into() })
+                .unwrap();
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::BodyReady { .. }));
+            let reqs = srv.requests();
+            let body = reqs
+                .iter()
+                .position(|r| r.path.starts_with("/me/messages/M1"))
+                .unwrap();
+            let between = reqs[..body]
+                .iter()
+                .filter(|r| r.at >= sent && is_backfill(&r.path, "F1"))
+                .count();
+            assert!(between <= 1, "{between} pages ran before the command");
+            assert!(
+                !reqs[..body].iter().any(|r| r.path.contains("token=A-F1"))
+                    && reqs[..body]
+                        .iter()
+                        .filter(|r| is_backfill(&r.path, "F1"))
+                        .count()
+                        < 20,
+                "pages remained when the command ran"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn new_mail_arrives_during_a_backfill() {
+            let new = page(
+                &[msg("NEW", "2026-11-06T00:00:00Z")],
+                None,
+                Some(&head_link("F1")),
+            );
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 15),
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 200, &new), Some(1))],
+                Duration::from_millis(100),
+            ));
+            let dir = new_dir("bf-new-mail");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, Duration::from_millis(300), None);
+            until_complete(&handle, "F1");
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            let ticks = positions(&srv, |p| p == head_link("F1"));
+            assert!(
+                ticks
+                    .iter()
+                    .any(|t| pages.first() < Some(t) && Some(t) < pages.last()),
+                "a tick's head round between two pages: {:?}",
+                paths_from(&srv, 0)
+            );
+            assert!(stored_ids(&dir, "F1").contains(&"NEW".to_string()));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn window_mode_skips_old_items_and_keeps_the_head_at_14_days() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![vec![
+                        msg("RECENT", &unix_to_iso8601(now_unix() - 86400)),
+                        msg("OLD", "2001-01-01T00:00:00Z"),
+                    ]],
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-window");
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert_eq!(progress(&events, "F1"), vec![(1, None, true)]);
+            assert_eq!(stored_ids(&dir, "F1"), ["RECENT"]);
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_WINDOW));
+            assert_since_days_ago(&srv, 14);
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The head request's `since` is `days` ago (within two minutes).
+        fn assert_since_days_ago(srv: &FakeServer, days: u64) {
+            let head = paths_from(srv, 0)
+                .into_iter()
+                .find(|p| is_head(p, "F1"))
+                .unwrap();
+            let since = head
+                .split("ge%20")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+                .to_string();
+            let at = now_unix() - days * 86400;
+            assert!(
+                unix_to_iso8601(at - 120) <= since && since <= unix_to_iso8601(at + 120),
+                "{since}"
+            );
+        }
+
+        #[test]
+        fn a_window_shorter_than_14_days_is_the_head() {
+            let srv = FakeServer::start_paced(mailbox(&[inbox()], vec![], Duration::ZERO));
+            let dir = new_dir("bf-short-window");
+            let handle = spawn_in(&srv, &dir, 3, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_since_days_ago(&srv, 3);
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A store holding F1 as synced before #1871: a delta link, no scope.
+        fn seed_legacy(dir: &std::path::Path) {
+            let s = store_in(dir);
+            s.upsert_folder(&MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: BIG,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            s.set_delta_link("F1", &legacy_link("F1")).unwrap();
+        }
+
+        #[test]
+        fn window_mode_keeps_a_legacy_folder_complete() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-legacy-window");
+            seed_legacy(&dir);
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            let deltas: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_delta(p, "F1"))
+                .collect();
+            assert_eq!(deltas, [legacy_link("F1")]);
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn whole_mode_backfills_a_legacy_folder_using_its_link_as_head() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 10),
+                    ..inbox()
+                }],
+                vec![],
+                Duration::from_millis(100),
+            ));
+            let dir = new_dir("bf-legacy-whole");
+            seed_legacy(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, Duration::from_millis(300), None);
+            until_complete(&handle, "F1");
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            let legacy = positions(&srv, |p| p == legacy_link("F1"));
+            assert_eq!(pages.len(), 10);
+            assert_eq!(
+                count(&srv, |p| is_head(p, "F1")),
+                0,
+                "the legacy link is the head"
+            );
+            assert!(
+                legacy
+                    .iter()
+                    .any(|t| pages.first() < Some(t) && Some(t) < pages.last()),
+                "ticks keep the legacy link fresh during the backfill: {:?}",
+                paths_from(&srv, 0)
+            );
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A store where F1's head ran and its backfill reached page 2.
+        fn seed_at_page_2(dir: &std::path::Path) {
+            seed_legacy(dir);
+            let s = store_in(dir);
+            s.set_head_link("F1", &head_link("F1")).unwrap();
+            s.set_backfill_progress("F1", &page_link("F1", 2), 50, SCOPE_ALL)
+                .unwrap();
+        }
+
+        #[test]
+        fn an_expired_backfill_link_restarts_from_a_fresh_full_delta() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 410, "{}"), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-410");
+            seed_at_page_2(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            let backfill: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_backfill(p, "F1"))
+                .collect();
+            assert_eq!(backfill.len(), 4, "{backfill:?}");
+            assert_eq!(backfill[0], page_link("F1", 2));
+            assert!(is_full_first(&backfill[1], "F1"), "{backfill:?}");
+            // The count started over.
+            assert_eq!(
+                progress(&events, "F1"),
+                vec![
+                    (1, Some(BIG), false),
+                    (2, Some(BIG), false),
+                    (3, Some(BIG), true)
+                ]
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_second_expiry_parks_the_folder() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 410, "{}"), None)],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-410-twice");
+            seed_at_page_2(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("410")),
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let backfill: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_backfill(p, "F1"))
+                .collect();
+            // page 2 (expired), the fresh first call, page 2 (expired): parked.
+            assert_eq!(backfill.len(), 3, "{backfill:?}");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_failing_backfill_page_parks_until_the_next_pass() {
+            let bad = r#"{"error":{"code":"ErrorInvalidRequest","message":"bad page"}}"#;
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 400, bad), None)],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-park");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("bad page")),
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let hits = |srv: &FakeServer| count(srv, |p| p == page_link("F1", 2));
+            assert_eq!(hits(&srv), 1, "one request per park");
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            assert!(
+                wait_until(ENGINE_WAIT, || hits(&srv) >= 2),
+                "a pass unparks it"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(hits(&srv), 2);
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Stores `json` (a Graph message) as a row of `folder`.
+        fn seed_row(s: &Store, folder: &str, json: &str) {
+            let m = Message::from_json(&crate::json::parse(json).unwrap()).unwrap();
+            s.upsert_message(folder, &m).unwrap();
+        }
+
+        fn row(dir: &std::path::Path, folder: &str, id: &str) -> Option<crate::store::MessageRow> {
+            store_in(dir)
+                .messages_in_folder(folder, 1000, 0)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == id)
+        }
+
+        #[test]
+        fn a_backfill_page_never_overwrites_a_local_edit() {
+            // F1 and Drafts were synced before #1871, so whole mode walks
+            // both. R1 was marked read here and X deleted here, each op held
+            // by a 5xx; D1's subject was edited by compose (no op yet, so
+            // marked unsaved by `update_draft_fields`). The
+            // pages carry the server's old R1, X and D1, and a new row.
+            let failing = |method: &str, path: &str| Route {
+                method: method.into(),
+                path_prefix: path.into(),
+                status: 500,
+                headers: vec![],
+                body: "{}".into(),
+            };
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        pages: vec![vec![
+                            msg("R1", "2026-01-02T00:00:00Z"),
+                            msg("X", "2026-01-01T00:00:00Z"),
+                            msg("NEWROW", "2025-01-01T00:00:00Z"),
+                        ]],
+                        ..inbox()
+                    },
+                    Fold {
+                        pages: vec![vec![msg("D1", "2026-01-03T00:00:00Z")]],
+                        ..fold("F3", "Drafts", Some("drafts"))
+                    },
+                ],
+                vec![
+                    (failing("PATCH", "/me/messages/R1"), None),
+                    (failing("DELETE", "/me/messages/X"), None),
+                ],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-local-edits");
+            seed_legacy(&dir);
+            {
+                let s = store_in(&dir);
+                s.upsert_folder(&MailFolder {
+                    id: "F3".into(),
+                    display_name: "Drafts".into(),
+                    parent_id: None,
+                    total_count: BIG,
+                    unread_count: 0,
+                    well_known_name: Some("drafts".into()),
+                })
+                .unwrap();
+                s.set_delta_link("F3", &legacy_link("F3")).unwrap();
+                seed_row(&s, "F1", &msg("R1", "2026-01-02T00:00:00Z"));
+                s.set_read("R1", true);
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "R1".into(),
+                    read: true,
+                })
+                .unwrap();
+                s.enqueue_op(&OutboxOp::Delete { id: "X".into() }).unwrap();
+                // Compose's edit: unsaved until a push (#1871).
+                seed_row(&s, "F3", &msg("D1", "2026-01-03T00:00:00Z"));
+                s.update_draft_fields("D1", "local edit", "", "", "", "<p>x</p>")
+                    .unwrap();
+            }
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let mut done = (false, false);
+            let events = wait_for(&handle.evt_rx, |e| {
+                done.0 |= is_complete(e, "F1");
+                done.1 |= is_complete(e, "F3");
+                done.0 && done.1
+            });
+            assert!(
+                row(&dir, "F1", "R1").unwrap().is_read,
+                "R1's local read flag kept"
+            );
+            assert!(
+                row(&dir, "F1", "X").is_none(),
+                "X stays deleted while its op waits"
+            );
+            assert!(
+                row(&dir, "F1", "NEWROW").is_some(),
+                "a missing row is inserted"
+            );
+            assert_eq!(row(&dir, "F3", "D1").unwrap().subject, "local edit");
+            // Every item walked past counts, kept or inserted.
+            assert_eq!(progress(&events, "F1").last(), Some(&(3, Some(BIG), true)));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_backfill_page_corrects_stale_rows() {
+            // A1 was inserted by a walk that then expired, and O1 by an
+            // earlier sync; both are older than the head's 14 days, so only
+            // the walk carries their server state. Both were left stale.
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("A1", "2025-01-01T00:00:00Z")],
+                        vec![msg("P2", "2025-01-01T00:00:00Z")],
+                        vec![msg("O1", "2024-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 410, "{}"), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-stale");
+            seed_at_page_2(&dir);
+            {
+                let s = store_in(&dir);
+                seed_row(
+                    &s,
+                    "F1",
+                    &full_message_json("A1", "stale", "2025-01-01T00:00:00Z"),
+                );
+                seed_row(
+                    &s,
+                    "F1",
+                    &full_message_json("O1", "stale", "2024-01-01T00:00:00Z"),
+                );
+            }
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_eq!(row(&dir, "F1", "A1").unwrap().subject, "A1");
+            assert_eq!(row(&dir, "F1", "O1").unwrap().subject, "O1");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_last_round_brings_head_mail_changed_during_the_walk() {
+            // H1 came with the head; the server changed it during the walk,
+            // whose pages still carried the old one, and no tick came.
+            let changed = page(
+                &[full_message_json("H1", "changed", "2026-11-05T00:00:00Z")],
+                None,
+                Some(&head_link("F1")),
+            );
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![msg("H1", "2026-11-05T00:00:00Z")],
+                    pages: vec![
+                        vec![msg("H1", "2026-11-05T00:00:00Z")],
+                        vec![msg("P2", "2025-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 200, &changed), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-last-round");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_eq!(row(&dir, "F1", "H1").unwrap().subject, "changed");
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            let rounds = positions(&srv, |p| p == head_link("F1"));
+            assert_eq!(rounds.len(), 1, "{:?}", paths_from(&srv, 0));
+            assert!(rounds[0] > *pages.last().unwrap(), "after the last page");
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_failed_last_round_completes_on_a_later_step() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![(throttle(&head_link("F1"), 1), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-last-round-429");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            // The last page is asked again after the throttle, and counted once.
+            assert_eq!(count(&srv, |p| p == page_link("F1", 2)), 2);
+            assert_eq!(progress(&events, "F1").last(), Some(&(2, Some(BIG), true)));
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reconverge_an_earlier_run_left_keeps_the_cutoff_off() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("RECENT", &unix_to_iso8601(now_unix() - 86400))],
+                        vec![msg("ANCIENT", "2020-01-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-restart");
+            // The run before quarantined an op and stopped before the
+            // reconverge ended.
+            seed_legacy(&dir);
+            store_in(&dir).clear_delta_links().unwrap();
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F1");
+            assert!(row(&dir, "F1", "ANCIENT").is_some(), "no cutoff");
+            assert!(
+                !store_in(&dir).reconverge_pending().unwrap(),
+                "and it ended"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_expired_head_link_on_the_last_round_is_replaced_by_the_walk() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 410, "{}"), None)],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-last-round-410");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert_eq!(progress(&events, "F1").last(), Some(&(2, Some(BIG), true)));
+            assert_eq!(count(&srv, |p| p == head_link("F1")), 1);
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_expired_legacy_link_is_replaced_when_the_walk_ends() {
+            let expired = r#"{"error":{"code":"SyncStateNotFound","message":"gone"}}"#;
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![(route(&legacy_link("F1"), 400, expired), None)],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-legacy-expired");
+            seed_legacy(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_parked_walk_does_not_hold_a_reconverge_open() {
+            let bad = r#"{"error":{"code":"ErrorInvalidRequest","message":"bad page"}}"#;
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 400, bad), None)],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-parked");
+            seed_legacy(&dir);
+            store_in(&dir).clear_delta_links().unwrap();
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("bad page")),
+            );
+            assert!(
+                wait_until(ENGINE_WAIT, || !store_in(&dir)
+                    .reconverge_pending()
+                    .unwrap()),
+                "the reconverge ended with only a parked walk left"
+            );
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reconverge_keeps_a_compose_edit_in_a_small_drafts_folder() {
+            // A quarantine cleared the links: Drafts (one message, so no
+            // head) runs its full delta inline, which carries D1 as the
+            // server has it, while compose's edit has no op yet.
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    total: 1,
+                    pages: vec![vec![msg("D1", "2026-11-01T00:00:00Z")]],
+                    ..fold("F3", "Drafts", Some("drafts"))
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-draft");
+            {
+                let s = store_in(&dir);
+                s.upsert_folder(&MailFolder {
+                    id: "F3".into(),
+                    display_name: "Drafts".into(),
+                    parent_id: None,
+                    total_count: 1,
+                    unread_count: 0,
+                    well_known_name: Some("drafts".into()),
+                })
+                .unwrap();
+                // Compose's edit: unsaved until a push (#1871).
+                seed_row(&s, "F3", &msg("D1", "2026-11-01T00:00:00Z"));
+                s.update_draft_fields("D1", "local edit", "", "", "", "<p>x</p>")
+                    .unwrap();
+                s.clear_delta_links().unwrap();
+            }
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F3");
+            assert_eq!(row(&dir, "F3", "D1").unwrap().subject, "local edit");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Drafts (F3), listed with `total` messages, as a store holds it.
+        fn seed_drafts(s: &Store, total: i64) {
+            s.upsert_folder(&MailFolder {
+                id: "F3".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: total,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        }
+
+        fn drafts_with(pages: Vec<Vec<String>>) -> Fold {
+            Fold {
+                total: 1,
+                pages,
+                ..fold("F3", "Drafts", Some("drafts"))
+            }
+        }
+
+        #[test]
+        fn a_clean_draft_whose_server_copy_changed_is_merged() {
+            // D1 has no unsaved edit (no `update_draft_fields` since its
+            // last push); the server's copy changed. Drafts never synced, so
+            // its first (full, small) delta carries it.
+            let srv = FakeServer::start_paced(mailbox(
+                &[drafts_with(vec![vec![msg("D1", "2026-11-01T00:00:00Z")]])],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-clean-draft");
+            {
+                let s = store_in(&dir);
+                seed_drafts(&s, 1);
+                seed_row(
+                    &s,
+                    "F3",
+                    &full_message_json("D1", "old", "2026-11-01T00:00:00Z"),
+                );
+            }
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F3");
+            assert_eq!(row(&dir, "F3", "D1").unwrap().subject, "D1");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reconverge_repairs_a_draft_a_quarantined_op_left_wrong() {
+            // MarkRead of the draft D1 is refused (400) until quarantined:
+            // the store keeps it read, Graph has it unread. The reconverge's
+            // fresh delta of Drafts repairs it: the op is gone and D1 holds
+            // no unsaved edit.
+            let srv = FakeServer::start_paced(mailbox(
+                &[drafts_with(vec![vec![msg("D1", "2026-11-01T00:00:00Z")]])],
+                vec![(
+                    Route {
+                        method: "PATCH".into(),
+                        path_prefix: "/me/messages/D1".into(),
+                        status: 400,
+                        headers: vec![],
+                        body: "{}".into(),
+                    },
+                    None,
+                )],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge-draft-op");
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F3");
+            handle
+                .cmd_tx
+                .send(SyncCommand::MarkRead {
+                    id: "D1".into(),
+                    read: true,
+                })
+                .unwrap();
+            for _ in 0..4 {
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            }
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+            );
+            assert!(
+                row(&dir, "F3", "D1").unwrap().is_read,
+                "the dropped op's write"
+            );
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            until_complete(&handle, "F3");
+            assert!(
+                !row(&dir, "F3", "D1").unwrap().is_read,
+                "repaired from Graph"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_window_walk_resumed_in_whole_mode_starts_over() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![
+                            msg("RECENT", &unix_to_iso8601(now_unix() - 86400)),
+                            msg("OLD1", "2001-01-01T00:00:00Z"),
+                        ],
+                        vec![msg("P2", "2025-06-01T00:00:00Z")],
+                        vec![msg("P3", "2025-06-01T00:00:00Z")],
+                    ],
+                    ..inbox()
+                }],
+                vec![(throttle(&page_link("F1", 2), 3600), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-mode-switch");
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| p
+                == page_link("F1", 2))
+                >= 1));
+            stop(handle);
+            let h = history(&dir, "F1");
+            assert_eq!(
+                (h.backfill_link, h.backfill_scope.as_deref()),
+                (Some(page_link("F1", 2)), Some(SCOPE_WINDOW))
+            );
+            assert!(row(&dir, "F1", "OLD1").is_none(), "the window skipped it");
+
+            let restart = srv.requests().len();
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            let after = paths_from(&srv, restart);
+            let first_page = after.iter().find(|p| is_backfill(p, "F1")).unwrap();
+            assert!(is_full_first(first_page, "F1"), "started over: {after:?}");
+            assert!(row(&dir, "F1", "OLD1").is_some());
+            assert_eq!(progress(&events, "F1").last(), Some(&(4, Some(BIG), true)));
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn the_fast_cycle_keeps_a_folder_fresh_during_a_backfill_and_never_backfills() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 15),
+                    ..inbox()
+                }],
+                vec![],
+                Duration::from_millis(100),
+            ));
+            let dir = new_dir("bf-fast");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, Some(FAST));
+            handle
+                .cmd_tx
+                .send(SyncCommand::SetFastFolders {
+                    ids: vec!["F1".into()],
+                })
+                .unwrap();
+            until_complete(&handle, "F1");
+            let paths = paths_from(&srv, 0);
+            let pages = positions(&srv, |p| is_backfill(p, "F1"));
+            let rounds = positions(&srv, |p| p == head_link("F1"));
+            // The hour-long tick never came: these rounds are fast ticks.
+            assert!(
+                rounds
+                    .iter()
+                    .any(|t| pages.first() < Some(t) && Some(t) < pages.last()),
+                "a fast tick between two pages: {paths:?}"
+            );
+            // A fast tick is its folder's round and counts, never a page:
+            // each page was asked for once, by the idle steps.
+            assert_eq!(pages.len(), 15, "{paths:?}");
+            for k in 2..=15 {
+                assert_eq!(count(&srv, |p| p == page_link("F1", k)), 1, "page {k}");
+            }
+            // The round right after the last page is the walk's own last
+            // round, before it completes.
+            for t in rounds.iter().filter(|t| Some(*t) < pages.last()) {
+                assert!(
+                    is_counts(&paths[t + 1], "F1"),
+                    "a round is followed by its counts: {paths:?}"
+                );
+            }
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn reconverge_in_window_mode_restores_an_old_message_through_the_backfill() {
+            // F1's full delta holds a 2020 message a 30-day window skips. A
+            // quarantined op (a Delete Graph keeps refusing) clears every
+            // link; the reconverge's backfill ignores the cutoff and stores
+            // it. It merges, so it also corrects MID (read here with no op,
+            // as a dropped op would leave it), but not MID2, whose MarkRead
+            // is still queued (held by a 5xx).
+            let mid = unix_to_iso8601(now_unix() - 20 * 86400);
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("RECENT", &unix_to_iso8601(now_unix() - 86400))],
+                        vec![
+                            msg("MID", &mid),
+                            msg("MID2", &mid),
+                            msg("ANCIENT", "2020-01-01T00:00:00Z"),
+                        ],
+                    ],
+                    ..inbox()
+                }],
+                vec![
+                    (
+                        Route {
+                            method: "DELETE".into(),
+                            path_prefix: "/me/messages/GONE".into(),
+                            status: 404,
+                            headers: vec![],
+                            body: "{}".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        Route {
+                            method: "PATCH".into(),
+                            path_prefix: "/me/messages/MID2".into(),
+                            status: 500,
+                            headers: vec![],
+                            body: "{}".into(),
+                        },
+                        None,
+                    ),
+                ],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reconverge");
+            let handle = spawn_in(&srv, &dir, 30, HOUR, None);
+            until_complete(&handle, "F1");
+            let mut ids = stored_ids(&dir, "F1");
+            ids.sort();
+            assert_eq!(ids, ["MID", "MID2", "RECENT"]);
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Delete { id: "GONE".into() })
+                .unwrap();
+            for _ in 0..4 {
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            }
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+            );
+            store_in(&dir).set_read("MID", true);
+            handle
+                .cmd_tx
+                .send(SyncCommand::MarkRead {
+                    id: "MID2".into(),
+                    read: true,
+                })
+                .unwrap();
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            until_complete(&handle, "F1");
+            let mut ids = stored_ids(&dir, "F1");
+            ids.sort();
+            assert_eq!(ids, ["ANCIENT", "MID", "MID2", "RECENT"]);
+            assert!(
+                !row(&dir, "F1", "MID").unwrap().is_read,
+                "corrected from the server"
+            );
+            assert!(
+                row(&dir, "F1", "MID2").unwrap().is_read,
+                "its queued op kept"
+            );
+            assert_eq!(
+                count(&srv, |p| is_head(p, "F1")),
+                2,
+                "a head again after the quarantine"
+            );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
