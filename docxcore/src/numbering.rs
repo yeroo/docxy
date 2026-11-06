@@ -105,6 +105,20 @@ impl Numbering {
         Some(fill(absn, &level.text, c))
     }
 
+    /// Advance list `num_id`'s counters for a paragraph at `ilvl`, as
+    /// [`compute_markers`] does, and return that level's number (#1948: an
+    /// e-mail `<ol>`'s `start`). `None` when the numbering does not define
+    /// `num_id`.
+    pub(crate) fn step(
+        &self,
+        num_id: i32,
+        ilvl: i32,
+        counters: &mut HashMap<i32, Vec<i32>>,
+    ) -> Option<i32> {
+        let (_, ilvl, c) = self.count(num_id, ilvl, counters)?;
+        c.get(ilvl).copied()
+    }
+
     /// Advance list `num_id`'s counters for a paragraph at `ilvl`: that
     /// level counts one more and every deeper level starts over. The list's
     /// definition, the level, and its counters after the step.
