@@ -413,8 +413,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   margins (#1895, `docs/claude/docx-editing.md`).
   `uiharness/cases/html-page-margins.uit` reads the ruler's insets after
   View > Print Layout.
-- A later Page Setup > Margins change goes through `set_page_margins`,
-  which keeps header, footer and gutter.
+- A later margin change (Page Setup > Margins via `apply_page_setup`,
+  Layout > Margins via `edit_section_setups`, a ruler drag via
+  `set_page_margins`) keeps header, footer and gutter: `SectionSetup::apply`
+  writes all seven `w:pgMar` attributes from the parsed margins, and only
+  Page Setup's own fields change those three.
 - Known limits: 15 px is inside most printers' unprintable band (about
   0.17-0.25"), so Word warns about the margins when printing; a page's own
   `@page` margins (Word-saved HTML's `@page WordSection1 {margin: ...}`)
