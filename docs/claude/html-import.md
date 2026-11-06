@@ -1,6 +1,6 @@
 # HTML import
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images, nested cards and links. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images, nested cards, links and the page. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## HTML import tables (#1878)
 
@@ -27,7 +27,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   table, scaled down to 100 in all); a spanned cell's width spreads what its
   columns lack over those without one; the rest share what is left, each at
   least 15 twips. The table is its own width, else its columns' when all
-  are known, else the room it has (6.5" outermost). Declared columns
+  are known, else the room it has (outermost, the page's 11790-twip body,
+  #1928). Declared columns
   narrower than a declared table grow to it; wider ones widen the grid
   (tblW stays as declared). `tblW` is dxa, pct (fiftieths) or auto; every
   cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
@@ -197,7 +198,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Size (twips, ×635 to EMU): CSS `width`/`height` lengths over the
   attributes, `auto` clears a side, a CSS percentage leaves the attribute's,
   an attribute percentage is ignored; one side gives the other by the
-  pixels' aspect, none the pixels; scaled down to the body (9360 twips).
+  pixels' aspect, none the pixels; scaled down to the body (11790 twips,
+  #1928).
   Only `img` reads `height`.
 - Unresolved (refused, no room, not an image): sized, a picture over one
   shared 1×1 `#F2F2F2` PNG with an `A6A6A6` 1 px line and the `alt` as
@@ -387,3 +389,34 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   Markdown package defines none), no `<base href>` or relative links, no
   hyperlinked pictures, no `title` (`w:tooltip`) or `target`
   (`w:tgtFrame`).
+
+## HTML import page margins (#1928)
+
+- An HTML import ends in its own final section
+  (`html_table::page_section`, set in `import_html_within` after
+  `Builder::finish`, so every caller gets it: `import_html`,
+  `import_html_with`, the converting child): US Letter written out
+  (`w:pgSz` 12240 x 15840, so no reader's locale makes it A4) and
+  Outlook-like margins, 15 px (`PAGE_MARGIN_TWIPS`, 225 twips) on every
+  side instead of Word's 1": `w:pgMar` with all seven attributes, header and
+  footer 225, gutter 0. A browser's body margin is 8 px; Outlook's reading
+  pane is about 10-15.
+- `BODY_TWIPS` is that page's body, `PAGE_W_TWIPS - 2 * PAGE_MARGIN_TWIPS`
+  (11790, 786 px): outermost tables, wide pictures and fixed-width
+  centring are laid out in exactly the body the section gives, so a 600 px
+  card sits in a 786 px body as in a mail client. RTF keeps its own even
+  6.5" grid (`import/mod.rs`) and, like PDF and recovered text, no section
+  of its own: the package's default page.
+- Where it shows: Print Layout (`final_page_geom`). A Web Page still opens
+  in Web Layout (`page_view` is off by default), which, like
+  `ext::DocView`, keeps its fixed 48 / 28 px padding and never reads page
+  margins (#1895, `docs/claude/docx-editing.md`).
+  `uiharness/cases/html-page-margins.uit` reads the ruler's insets after
+  View > Print Layout.
+- A later Page Setup > Margins change goes through `set_page_margins`,
+  which keeps header, footer and gutter.
+- Known limits: 15 px is inside most printers' unprintable band (about
+  0.17-0.25"), so Word warns about the margins when printing; a page's own
+  `@page` margins (Word-saved HTML's `@page WordSection1 {margin: ...}`)
+  are not read, as `css.rs` skips every at-rule; every import gets the same
+  fixed page.

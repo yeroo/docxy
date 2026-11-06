@@ -1,0 +1,22 @@
+# An imported HTML page sits on a Letter page with Outlook-like margins
+# (#1928): 15 px (225 twips) on every side, not Word's 1" (96 px). A Web
+# Page still opens in Web Layout, which keeps its own padding and never
+# reads page margins; View > Print Layout draws the page with the
+# section's margins. The ruler probe reads the text's inset from the
+# page's left and top edges in px at 100%, one more than the margin (as
+# `doc-rulers.uit` reads a 144 px margin as 145): 16 here, 97 with 1".
+# The text column is the 786 px body less the same px on each side.
+
+test issue 1928 an imported html page has outlook like margins
+  open copy:../fixtures/rounded-images.html
+  call doc {}
+  assert reply.view.layout is web
+  call ribbon-click {"tab":"View","command":"ruler"}
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.view.layout is print
+  assert reply.view.zoom is 1
+  assert reply.ruler.text_inset is 16
+  assert reply.ruler.vtop_inset is 16
+  assert reply.flow.text_column.width is 784
