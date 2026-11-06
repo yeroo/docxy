@@ -540,7 +540,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`PREFETCH_BATCH`, `next_prefetch`/`prefetch_step`), signed in, outside a
   back-off, after a folder list succeeded, before any backfill page (the
   window bounds it). A command a checkpoint kept, or a tick come due, ends
-  the batch, so they wait for one body at most, as for one backfill page. One `GET /me/messages/{id}?$select=body` each, the
+  the batch, so they wait for one body at most, as for one backfill page; a
+  kept command also ends a round's new-mail bodies (the prefetch takes the
+  rest). One `GET /me/messages/{id}?$select=body` each, the
   call `FetchBody` makes (`fetch_and_store_body` is shared: `fetched_as`
   recorded, `BodyReady` sent, so `BodyReady` may name a message nobody
   opened).
@@ -551,7 +553,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   this run. A 5xx (other than a throttle's 503: `classify_status` makes
   500/502/504 `Http`) or a store failure parks these fetches until the next
   pass (`body_parked`), the id not skipped, so a failing service or store
-  costs one request a pass, not a loop, and the body comes once it works. A row deleted since (its body fails the
+  costs one request a pass, not a loop, and the body comes once it works;
+  while parked, new-mail rounds fetch no body either. A response over its
+  cap is a `Parse` error, not `Transport` (`parse_body_capped`: 32 MiB for
+  a body, `BODY_MAX`; 10 MiB for any other JSON, ureq's old
+  `into_string` limit), so a body too big to hold is skipped, never an
+  offline loop; a `FetchBody` of one gets an `Error`. A row deleted since (its body fails the
   foreign key) is not a store failure. Note that `Store::open`'s
   connections keep rusqlite's default 5 s busy timeout, so a write lock
   held for a moment by the UI's own connection only delays the write.
@@ -567,7 +574,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   it served got an auth, throttle or transport failure, never because of a
   back-off set before it: `Refresh` runs a pass during one. A `Shutdown`
   stops the work at the next checkpoint; the commands that came before it
-  still run. So a click costs one round trip plus the request in flight.
+  still run. So a click costs one round trip plus the request in flight;
+  any other command waits for the idle step in flight (one prefetch body,
+  one backfill page, or a backfill's last step: its last round, repair and
+  new-mail bodies).
   A served `FetchBody` overtakes the commands queued before it, which do
   not depend on a body read.
 - Tests (`engine.rs` `tests::backfill::bodies`): the engine tests from

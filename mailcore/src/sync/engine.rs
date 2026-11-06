@@ -839,8 +839,9 @@ impl Engine {
     /// a due deadline (`due`), then one prefetch batch, and only when there
     /// is none one backfill page. A `FetchBody` waits for at most the
     /// request in flight (`checkpoint`); any other command, and a due tick,
-    /// for at most the request in flight of an idle step (one prefetch body,
-    /// as the batch then ends, or one backfill page).
+    /// for the idle step in flight: one prefetch body (the batch then ends),
+    /// one backfill page, or a backfill's last step (its last round on the
+    /// folder's own link, the repair, and new-mail bodies, which end early).
     ///
     /// The commands a `checkpoint` kept (`deferred`) run first, in order,
     /// before the channel is read again; then a `Shutdown` a checkpoint saw
@@ -1289,7 +1290,8 @@ impl Engine {
         }
         self.set_state(SyncState::Syncing);
         // A pass gives every parked backfill another try (#1871), and the
-        // engine's own body fetches after a store failure (#1978).
+        // engine's own body fetches after a store failure or a Graph 5xx
+        // (#1978).
         self.parked.clear();
         self.expired.clear();
         self.body_parked = false;
@@ -2566,15 +2568,24 @@ impl Engine {
     /// Fetches the bodies of the messages a delta round on a stored link
     /// added (#1978): at most `NEW_BODY_LIMIT` requests, each after a
     /// checkpoint and only for an id that still needs one
-    /// (`background_body`); the rest are the prefetch's. Returns `false`
-    /// when the caller must stop.
+    /// (`background_body`); the rest are the prefetch's, as are all of them
+    /// while the fetches are parked (`body_parked`) or once a checkpoint
+    /// kept a command, so the work the command waits for ends sooner. (Not
+    /// on a due tick: a tick's own pass runs while its deadline is past.)
+    /// Returns `false` when the caller must stop.
     fn fetch_new_bodies(&mut self, ids: &[String]) -> bool {
         let Some(since) = self.body_window_since() else {
             return true;
         };
         let mut fetched = 0;
         for id in ids {
-            if fetched == NEW_BODY_LIMIT {
+            if fetched == NEW_BODY_LIMIT || self.body_parked {
+                break;
+            }
+            if !self.checkpoint() {
+                return false;
+            }
+            if !self.deferred.is_empty() {
                 break;
             }
             match self.background_body(id, &since) {
@@ -12653,6 +12664,143 @@ mod tests {
                         "PATCH /me/messages/R3",
                         "GET /me/messages/R2?$select=body",
                         "GET /me/messages/R3?$select=body",
+                    ]
+                );
+                stop(handle);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn an_oversize_prefetch_body_is_skipped_without_going_offline() {
+                // A body over `BODY_MAX` is one the client refuses (`Parse`),
+                // not a lost connection: asked for once, no Offline, and the
+                // next id is fetched.
+                let big = format!(
+                    r#"{{"body":{{"contentType":"text","content":"{}"}}}}"#,
+                    "x".repeat(crate::graph::client::BODY_MAX)
+                );
+                let mut extra = vec![(route(&body_path("R1"), 200, &big), None)];
+                extra.extend(bodies(&["R2"]));
+                let srv = FakeServer::start_paced(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("R1", &ago(3600)), msg("R2", &ago(7200))]],
+                        ..inbox()
+                    })],
+                    extra,
+                    Duration::ZERO,
+                ));
+                let dir = new_dir("bodies-oversize");
+                let handle = spawn_with(&srv, &dir, EngineOptions::default());
+                let mut events = wait_ready(&handle, &["R2"], None);
+                events.extend(refresh(&handle));
+                std::thread::sleep(Duration::from_millis(300));
+                assert_eq!(body_get_ids(&srv), ["R1", "R2"]);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, SyncEvent::State(SyncState::Offline))),
+                    "{events:?}"
+                );
+                stop(handle);
+                assert!(!has_body(&dir, "R1", BodyFormat::Text));
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn parked_body_fetches_hold_new_mail_rounds_until_the_next_pass() {
+                // R1's body answers 500 once: the fetches park. A SyncFolder
+                // round that brings N1 then fetches no body (a single-folder
+                // sync is not a pass); the next pass ends the park, and the
+                // prefetch takes both, newest first.
+                let mut extra = vec![
+                    next_round("F1", &[msg("N1", &ago(60))]),
+                    (route(&body_path("R1"), 500, "{}"), Some(1)),
+                ];
+                extra.extend(bodies(&["R1", "N1"]));
+                let srv = FakeServer::start_paced(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("R1", &ago(3600))]],
+                        ..inbox()
+                    })],
+                    extra,
+                    Duration::ZERO,
+                ));
+                let dir = new_dir("bodies-parked-new-mail");
+                let handle = spawn_with(&srv, &dir, EngineOptions::default());
+                // The startup pass's events first, so the wait below sees
+                // the SyncFolder's own.
+                wait_for(&handle.evt_rx, is_idle);
+                assert!(wait_until(ENGINE_WAIT, || body_get_ids(&srv) == ["R1"]));
+                handle
+                    .cmd_tx
+                    .send(SyncCommand::SyncFolder { id: "F1".into() })
+                    .unwrap();
+                let events = wait_for(&handle.evt_rx, is_idle);
+                assert!(
+                    events.iter().any(|e| matches!(
+                        e,
+                        SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"
+                    )),
+                    "the SyncFolder round ran: {events:?}"
+                );
+                assert_eq!(body_get_ids(&srv), ["R1"], "parked: no new-mail body");
+                refresh(&handle);
+                wait_ready(&handle, &["R1", "N1"], None);
+                assert_eq!(body_get_ids(&srv), ["R1", "N1", "R1"]);
+                stop(handle);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn a_command_sent_during_new_mail_bodies_ends_them() {
+                // A round brings N1..N3; N1's body is slow, and a MarkRead
+                // comes meanwhile. The checkpoint before N2 keeps it and ends
+                // the new-mail bodies: the pass finishes, the MarkRead's
+                // PATCH goes out, and the prefetch takes N2 and N3.
+                let new: Vec<String> = ["N1", "N2", "N3"]
+                    .iter()
+                    .zip(1..)
+                    .map(|(id, k)| msg(id, &ago(60 * k)))
+                    .collect();
+                let mut routes: Vec<Paced> =
+                    vec![(body_route("N1"), None, Duration::from_millis(500))];
+                let mut extra = vec![next_round("F1", &new)];
+                extra.extend(bodies(&["N2", "N3"]));
+                routes.extend(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("OLD", "2020-01-01T00:00:00Z")]],
+                        ..inbox()
+                    })],
+                    extra,
+                    Duration::ZERO,
+                ));
+                let srv = FakeServer::start_paced(routes);
+                let dir = new_dir("bodies-command-in-new-mail");
+                let handle = spawn_with(&srv, &dir, EngineOptions::default());
+                wait_for(&handle.evt_rx, is_idle);
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                assert!(wait_until(ENGINE_WAIT, || body_get_ids(&srv) == ["N1"]));
+                handle
+                    .cmd_tx
+                    .send(SyncCommand::MarkRead {
+                        id: "N3".into(),
+                        read: true,
+                    })
+                    .unwrap();
+                wait_ready(&handle, &["N1", "N2", "N3"], None);
+                let order: Vec<String> = srv
+                    .requests()
+                    .into_iter()
+                    .filter(|r| r.path.ends_with("?$select=body") || r.method == "PATCH")
+                    .map(|r| format!("{} {}", r.method, r.path))
+                    .collect();
+                assert_eq!(
+                    order,
+                    [
+                        "GET /me/messages/N1?$select=body",
+                        "PATCH /me/messages/N3",
+                        "GET /me/messages/N2?$select=body",
+                        "GET /me/messages/N3?$select=body",
                     ]
                 );
                 stop(handle);
