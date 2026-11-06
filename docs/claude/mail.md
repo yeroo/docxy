@@ -237,3 +237,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - lookxy shows a `SendFailed` as `Send failed: <error>` in `App::send_failure`,
   which no sync event clears: the engine settles to `State(Idle)` right after
   it, and that clears `error_notice`. The next key press clears it.
+
+## The signed-in user's profile, photo and Sign out (#1920)
+
+- `GraphClient::me()` is `GET /me?$select=displayName,mail,userPrincipalName`
+  (only `User.Read`), giving a `model::Me`. `mail` is `""` when Graph sends
+  `null` or leaves it out (personal accounts, some tenants), and
+  `Me::address()` then falls back to `user_principal_name`.
+- `GraphClient::my_photo()` is `GET /me/photo/$value`, then on a 404
+  `/me/photos/48x48/$value`. Both 404 is `Ok(None)` (no photo: the client
+  draws initials), not an error. Any other error, on either request, comes
+  back as it is, with no fallback. Each request sends `Accept: image/*`, which
+  replaces `send`'s JSON `Accept` (ureq's `set` replaces a header of the same
+  name). The content type is the `Content-Type` header without its parameters,
+  or `application/octet-stream`. A photo over `PHOTO_MAX` (4 MiB) is a `Parse`
+  error: refused by `Content-Length` before reading, and `read_capped` reads at
+  most `PHOTO_MAX + 1` bytes whatever the header says. The fake server always
+  sends a true `Content-Length`, so `read_capped`'s own tests cover the second
+  check.
+- The engine's `SyncCommand::FetchProfile` / `FetchPhoto` are direct calls like
+  `FetchAutomaticReplies`. They emit `ProfileFetched { me }` /
+  `PhotoFetched { photo }`, or `Error("not signed in")` with no request, and
+  Graph failures go through `with_auth` and `react`.
+- `SyncCommand::SignOut` deletes the token file (`tokencache::clear`, which
+  also removes the `.tmp` sibling `save` writes, through the shared
+  `tmp_path`), clears the throttle/offline back-off (not the outbox's
+  `op_retry`), and goes through `enter_signin`: it always emits
+  `SignInRequired`, but `State(SignInRequired)` only when the state changes
+  (`set_state`), so a repeated SignOut emits just `SignInRequired`, and
+  clients key on that. A file it cannot delete is reported as an
+  `Error`, but the engine still signs out in memory. The store and the outbox
+  are kept: queued ops drain after the next `SignIn`, whose `prompt=select_account`
+  lets another account sign in. That account would then get the old
+  account's store and queued ops; this is a known gap, recorded as a
+  follow-up.
+- lookxy ignores `ProfileFetched` / `PhotoFetched` (it never asks for them).

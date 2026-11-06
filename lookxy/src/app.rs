@@ -745,10 +745,14 @@ impl App {
                 self.inline_images.insert(content_id, bytes);
             }
             SyncEvent::InlineImageReady { .. } => {} // for a message no longer open — drop
+            // The profile and photo (#1920) are for a client's title bar;
+            // lookxy never asks for them.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. }
-            | SyncEvent::Sending { .. } => {}
+            | SyncEvent::Sending { .. }
+            | SyncEvent::ProfileFetched { .. }
+            | SyncEvent::PhotoFetched { .. } => {}
         }
     }
 

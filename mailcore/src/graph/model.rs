@@ -461,6 +461,37 @@ impl AutomaticReplies {
     }
 }
 
+/// The signed-in user's profile (`GET /me?$select=displayName,mail,userPrincipalName`,
+/// `GraphClient::me`). `mail` is `""` when Graph sends `null` or leaves it
+/// out, as it does for personal accounts and some tenants; [`Me::address`]
+/// then falls back to the user principal name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Me {
+    pub display_name: String,
+    pub mail: String,
+    pub user_principal_name: String,
+}
+
+impl Me {
+    /// Reads a `/me` response; a missing or non-string field is `""`.
+    pub fn from_json(v: &Value) -> Me {
+        Me {
+            display_name: str_field(v, "displayName"),
+            mail: str_field(v, "mail"),
+            user_principal_name: str_field(v, "userPrincipalName"),
+        }
+    }
+
+    /// The address to show: `mail` when set, else `userPrincipalName`.
+    pub fn address(&self) -> &str {
+        if self.mail.trim().is_empty() {
+            &self.user_principal_name
+        } else {
+            &self.mail
+        }
+    }
+}
+
 /// Best-effort conversion of an OOF HTML reply message to plain text: `<br>`,
 /// `<p>`/`</p>`, and `<div>`/`</div>` become newlines; every other tag is
 /// dropped; the common entities are decoded; runs of 3+ newlines collapse to
@@ -1516,5 +1547,31 @@ mod tests {
         assert_eq!(f.display_name, "Inbox");
         assert_eq!(f.unread_count, 3);
         assert_eq!(f.well_known_name.as_deref(), Some("inbox"));
+    }
+
+    #[test]
+    fn me_from_json_prefers_mail() {
+        let v = parse(
+            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com"}"#,
+        )
+        .unwrap();
+        let me = Me::from_json(&v);
+        assert_eq!(me.display_name, "Ada Lovelace");
+        assert_eq!(me.mail, "ada@contoso.com");
+        assert_eq!(me.user_principal_name, "ada@contoso.onmicrosoft.com");
+        assert_eq!(me.address(), "ada@contoso.com");
+    }
+
+    #[test]
+    fn me_address_falls_back_to_upn() {
+        for body in [
+            r#"{"displayName":"Ada","mail":null,"userPrincipalName":"ada@outlook.com"}"#,
+            r#"{"displayName":"Ada","userPrincipalName":"ada@outlook.com"}"#,
+            r#"{"displayName":"Ada","mail":"","userPrincipalName":"ada@outlook.com"}"#,
+        ] {
+            let me = Me::from_json(&parse(body).unwrap());
+            assert_eq!(me.mail, "", "{body}");
+            assert_eq!(me.address(), "ada@outlook.com", "{body}");
+        }
     }
 }
