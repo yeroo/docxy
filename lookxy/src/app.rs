@@ -748,13 +748,16 @@ impl App {
             // The profile and photo (#1920) are for a client's title bar;
             // lookxy never asks for them. The granted scopes (#1875) are for
             // a client that asks for more than it may have been granted.
+            // lookxy shows no backfill progress (#1871): its list reloads on
+            // each page's `MessagesUpdated`.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. }
             | SyncEvent::Sending { .. }
             | SyncEvent::ProfileFetched { .. }
             | SyncEvent::PhotoFetched { .. }
-            | SyncEvent::Scopes { .. } => {}
+            | SyncEvent::Scopes { .. }
+            | SyncEvent::FolderProgress { .. } => {}
         }
     }
 

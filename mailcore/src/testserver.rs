@@ -10,6 +10,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// A canned response served for requests whose method matches exactly and
 /// whose path starts with `path_prefix`.
@@ -32,6 +33,9 @@ pub struct RecordedRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// When the request arrived (its headers and body read), before any
+    /// route delay: the gap between two requests (#1871's `Retry-After`).
+    pub at: Instant,
 }
 
 /// An in-process HTTP server for tests. Bind address is ephemeral
@@ -55,6 +59,19 @@ impl FakeServer {
     /// limit is skipped, so the next matching route answers: a request can
     /// fail once and then succeed (#1881's retried send).
     pub fn start_limited(routes: Vec<(Route, Option<usize>)>) -> FakeServer {
+        FakeServer::start_paced(
+            routes
+                .into_iter()
+                .map(|(r, left)| (r, left, Duration::ZERO))
+                .collect(),
+        )
+    }
+
+    /// Like [`FakeServer::start_limited`], but each route waits the given
+    /// time before it answers (#1871: a slow page, so a test can act while
+    /// a backfill is under way). The server answers one request at a time,
+    /// so a delay holds every request behind it too.
+    pub fn start_paced(routes: Vec<(Route, Option<usize>, Duration)>) -> FakeServer {
         let mut routes = routes;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback port");
         let port = listener.local_addr().expect("local_addr").port();
@@ -105,7 +122,7 @@ impl Drop for FakeServer {
 /// and record the request.
 fn handle_connection(
     stream: TcpStream,
-    routes: &mut [(Route, Option<usize>)],
+    routes: &mut [(Route, Option<usize>, Duration)],
     requests: &Arc<Mutex<Vec<RecordedRequest>>>,
 ) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -155,23 +172,27 @@ fn handle_connection(
             path: path.clone(),
             headers,
             body,
+            at: Instant::now(),
         });
 
     let route = routes
         .iter_mut()
-        .find(|(r, left)| {
+        .find(|(r, left, _)| {
             *left != Some(0) && r.method == method && path.starts_with(r.path_prefix.as_str())
         })
-        .map(|(r, left)| {
+        .map(|(r, left, delay)| {
             if let Some(n) = left {
                 *n -= 1;
             }
-            &*r
+            (&*r, *delay)
         });
 
     let mut stream = stream;
     match route {
-        Some(route) => {
+        Some((route, delay)) => {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
             let mut response = format!(
                 "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n",
                 route.status,
@@ -208,6 +229,8 @@ fn reason_phrase(status: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        410 => "Gone",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Unknown",
