@@ -37,7 +37,7 @@ pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
     // note: assumes a single writer — a concurrent `save` would race on
     // this deterministic tmp name; `rename` below is still atomic, so a
     // race can only lose an update, never corrupt the file.
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = tmp_path(path);
     #[cfg(unix)]
     {
         // On unix `protect` is the identity transform (see `unprotect`
@@ -59,6 +59,24 @@ pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
     fs::write(&tmp_path, &ciphertext)?;
     fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Deletes the token cache at `path` (signing out), and the `.tmp` sibling a
+/// `save` that died mid-write may have left. A cache that is already gone is
+/// `Ok`; only a failure to remove the cache itself is an error.
+pub fn clear(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let _ = fs::remove_file(tmp_path(path));
+    Ok(())
+}
+
+/// The temp file `save` writes before renaming it over `path`.
+fn tmp_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("tmp")
 }
 
 /// Loads and decrypts the token cache at `path`. `Ok(None)` if the file
@@ -296,6 +314,41 @@ mod tests {
         assert!(!raw.windows(18).any(|w| w == b"SECRET_TOKEN_VALUE"));
         #[cfg(not(windows))]
         assert!(raw.windows(18).any(|w| w == b"SECRET_TOKEN_VALUE"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample() -> TokenSet {
+        TokenSet {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at_unix: 123,
+            account: "me@x".into(),
+        }
+    }
+
+    #[test]
+    fn clear_removes_saved_token() {
+        let dir = std::env::temp_dir().join(format!("lookxy-test-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("token.bin");
+        save(&p, &sample()).unwrap();
+        // A leftover temp file from an interrupted save goes too.
+        std::fs::write(tmp_path(&p), b"partial").unwrap();
+        assert_eq!(tmp_path(&p), dir.join("token.tmp"));
+        clear(&p).unwrap();
+        assert!(!p.exists());
+        assert!(!tmp_path(&p).exists());
+        assert!(load(&p).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_missing_is_ok() {
+        let dir = std::env::temp_dir().join(format!("lookxy-test-clear2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("token.bin");
+        clear(&p).unwrap();
+        clear(&p).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
