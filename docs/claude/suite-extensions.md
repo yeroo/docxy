@@ -32,8 +32,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 
 ## Embedded document view (#1873)
 
-- `ext::DocView` (`suite/docxy/src/doc_view.rs`, with `ext::LinkClick`) is a
-  public gpui entity an extension's view embeds: `cx.new(|cx|
+- `ext::DocView` (`suite/docxy/src/doc_view.rs`, with `ext::LinkClick`; its
+  editing mode is below, #1947) is a public gpui entity an extension's view embeds: `cx.new(|cx|
   DocView::new(doc, Some(pkg), cx))`, `set_document`, `set_link_click`,
   `on_link`, `set_content_dark`, `zoom`/`set_zoom`, `selected_text`,
   `focus_handle` (give it as the tab's `TabSurface::focus_handle`). It fills
@@ -44,7 +44,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   and `DOC_ROWS`) or `Embed(view, words)`, whose painted pieces go to the
   view's own `Words`. The shared renderer records no links: the view
   derives its link spans from its words (`link_at`, `resolve_para`).
-- Read-only: no caret is drawn (`caret_path` empty), nothing edits.
+- Read-only (the default; editable, see "Editing mode (#1947)"): no caret
+  is drawn (`caret_path` empty), nothing edits.
   Press, drag and Shift+press select (`place_click_caret`); Ctrl+A selects
   all; Ctrl+C writes the text and RTF through the document tabs' own path
   (`clip_payload`, `ClipboardStore::write_rich` with its `rtf_follows`
@@ -110,7 +111,76 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The fixture adds, after the 2x2 table, a 100% table imported from HTML
   (`fitted_html`, with a link to `CELL_URL`; in the model only) and a fixed
   12000-twip table.
-- Out of scope: Find (#1887), Print Layout (#1888), a caret and keyboard
-  selection, table selection zones, a context menu, anchor links scrolling
-  inside the view (they reach the callback as `#name`), macOS ⌘-key
-  routing for the view (untested).
+- Out of scope: Find (#1887), Print Layout (#1888), keyboard selection in
+  read-only mode (the editing mode has it), table selection zones, a
+  context menu, anchor links scrolling inside the view (they reach the
+  callback as `#name`), macOS ⌘-key routing for the view (untested).
+
+## Editing mode (#1947)
+
+- `DocView::set_editable(true)` turns the view into an editor (read-only
+  stays the default, and its key path is exactly #1873's). Public:
+  `set_editable`, `editable`, `format(ext::DocFormat)`, `undo`, `redo`,
+  `can_undo`, `can_redo`, `caret_format() -> ext::CaretFormat`,
+  `on_change(Fn(&mut App))`, `document()` (`export_doc`), `package()` (a
+  clone, with the numbering part a first list added). Host calls on a
+  read-only view return false and change nothing. `DocFormat` and
+  `CaretFormat` are `#[non_exhaustive]` (#1952 adds links).
+- The decisions are `doc_view/edit.rs`, over a plain `Editor` and
+  `Option<&mut Package>` (unit-tested without a window): `edit_key` (the
+  document tab's `on_key` editing map: navigation with Shift extending,
+  Ctrl word/document moves, macOS ⌘/⌥ through `mac_nav`, Backspace,
+  Delete, Enter, Shift+Enter, Ctrl+B/I/U/Z/Y/Shift+Z/A/C/X/M, Ctrl+Tab in
+  a cell, Ctrl+Shift+Space, typed text with AltGr allowed and plain Alt
+  never text off macOS; no AutoCorrect, Repeat, fields or breaks), `tab`
+  (the action-bound Tab and Shift+Tab, taken by the view's root div:
+  `tab_key` / `shift_tab_key`'s document rule, so cells move, Tab types a
+  tab and Shift+Tab is Decrease Indent; Tab does not change a list's
+  level, as in a document tab), `apply_format` (`apply_doc_act` and the
+  font boxes' calls; Bullets/Numbering toggle with `all_in_list` and give a
+  package without numbering `add_markdown_numbering`, whose ids 1 and 2
+  are `NUM_BULLET`/`NUM_DECIMAL`) and `caret_format` (`caret_props_shown`,
+  pending toggles included, #854; the caret end's, no mixed state).
+  Increase/Decrease Indent by any path repairs the package's list levels
+  after a change (`repair_list_indents`, #1728). Every host command and
+  Enter, Ctrl+B/I/U/M break the typing group first; moves end it
+  (docxcore's `last`), so Ctrl+Z after a click takes back only the typing
+  since.
+- A change is told by comparing the body before and after (typing and
+  deleting coalesce into one undo step, so the history cannot tell).
+  `on_change` fires deferred (`cx.defer`) only on a change: never for a
+  move, a selection, scroll, zoom, a toggle at a collapsed caret,
+  `set_document` or `set_editable`. Styles are seeded into the editor
+  (`set_styles_xml`, as `sync_editor_styles`) on `set_editable(true)`,
+  `set_document` while editable and before each edit.
+- The caret draws (`RenderCtx::caret_path`) while editable and focused.
+  After a key or host command (`reveal`) the `viewport` canvas's paint,
+  which runs after `ext-doc-scroll` has painted this frame's `Words`,
+  scrolls the caret's piece (`caret_piece`) into view in y (`reveal_dy`),
+  one frame late; a caret whose paragraph painted no piece follows its
+  top-level block (`follow_item_y`). Piece-level, not block-level: a
+  paragraph taller than a short compose pane would otherwise show its top
+  on every key. Ctrl+Home/End also scroll to the very top and bottom.
+- Links: editable, a plain press places the caret (never follows, whatever
+  `LinkClick`); Ctrl+click follows.
+- Dialogs: while a dialog takes the keys (`top_takes_keys`) or the
+  more-tabs list is open, `focus_ext_surface` keeps the suite root focused
+  and takes the focus back from the surface, so an editable view never
+  types under a dialog; it gets the focus back when the dialog closes.
+- Harness: `ext-doc-set {editable}`; `ext-doc-read` (and `ext-doc-set`) add
+  `editable`, `caret` (`path`, `offset`), `caret_in_view` (null with no
+  painted piece), `caret_format` (all fields, `align` by name),
+  `can_undo`, `can_redo`, `change_calls` (the fixture's `on_change`
+  count); `ext-doc-call` takes one of `format` (bold, italic, underline,
+  bullets, numbering, indent, outdent, align-left/center/right/justify),
+  `font`, `size`, `color`, `highlight` (null clears), `undo`, `redo`, and
+  replies `done` plus `ext-doc-read`'s view fields; `ext-doc-document`
+  replies `document()`'s top-level paragraphs (`text`, `num_id`, `ilvl`,
+  `align`, `runs` with `text`/`bold`/`italic`/`underline`) and
+  `package_has_numbering`. `uiharness/cases/ext-doc-edit.uit` drives it.
+- Not done here: hyperlinks (#1952); pictures from bytes and paste of
+  pictures or the suite's formatted clipboard (#1953), so Ctrl+V bubbles
+  as before; line-wise Up/Down (paragraph-wise, `move_vert`, as a document
+  tab); AutoCorrect, Repeat; IME, dead keys and Windows' WM_CHAR packet
+  text (the suite's input handler is the root's, so a focused view gets
+  plain key-downs only).
