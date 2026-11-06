@@ -308,6 +308,73 @@ impl<'a> Pictures<'a> {
 pub struct Scope<'a> {
     pub pictures: &'a Pictures<'a>,
     pub part: &'a str,
+    /// Where each picture drawn goes, for the harness (#1926); `None`
+    /// records none.
+    pub drawn: Option<&'a DrawnPictures>,
+}
+
+/// One inline picture as the view drew it (#1926): its frame (px) and the
+/// corner radius its crop shape gave the image's clip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawnPicture {
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+    pub shape: docxcore::image::PictureShape,
+}
+
+/// The body's inline pictures built in the frame last drawn, in order
+/// (#1926); cleared at the frame's start, like the painted tables.
+pub type DrawnPictures = Rc<RefCell<Vec<DrawnPicture>>>;
+
+/// The corner radius (px) a picture of `w` x `h` px is clipped to by its
+/// crop `shape` (#1926): an ellipse is drawn as corners of half the
+/// shorter side (gpui's corners are circular, so a non-square oval is a
+/// stadium), a rounded rectangle as `min(w, h) * adj / 100000`, at most
+/// that half; a rectangle is 0.
+pub fn picture_radius(shape: docxcore::image::PictureShape, w: f32, h: f32) -> f32 {
+    use docxcore::image::{PictureShape, ROUND_RECT_MAX_ADJ};
+    let half = w.min(h).max(0.0) / 2.0;
+    match shape {
+        PictureShape::Rect => 0.0,
+        PictureShape::Ellipse => half,
+        PictureShape::RoundRect { adj } => {
+            let adj = adj.min(ROUND_RECT_MAX_ADJ) as f32;
+            (w.min(h).max(0.0) * adj / 100_000.0).min(half)
+        }
+    }
+}
+
+/// The harness's view of [`DrawnPictures`] (#1926): each picture's
+/// `width`, `height` and clip `radius` in px (to 0.1), its `shape`
+/// (`rect`, `ellipse`, `roundRect`) and `round`, whether its clip is a
+/// circle's or a stadium's (the radius is half the shorter side).
+pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let tenth = |v: f32| Json::Num((f64::from(v) * 10.0).round() / 10.0);
+    Json::Arr(
+        drawn
+            .borrow()
+            .iter()
+            .map(|p| {
+                let shape = match p.shape {
+                    docxcore::image::PictureShape::Rect => "rect",
+                    docxcore::image::PictureShape::Ellipse => "ellipse",
+                    docxcore::image::PictureShape::RoundRect { .. } => "roundRect",
+                };
+                Json::obj(vec![
+                    ("width", tenth(p.width)),
+                    ("height", tenth(p.height)),
+                    ("radius", tenth(p.radius)),
+                    ("shape", Json::Str(shape.into())),
+                    (
+                        "round",
+                        Json::Bool(p.radius > 0.0 && p.radius * 2.0 >= p.width.min(p.height) - 0.1),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// The scope of `part` in `pictures`; `None` when either is absent.
@@ -315,12 +382,28 @@ pub fn scope<'a>(pictures: Option<&'a Pictures<'a>>, part: Option<&'a str>) -> O
     Some(Scope {
         pictures: pictures?,
         part: part?,
+        drawn: None,
     })
 }
 
-impl Scope<'_> {
+impl<'a> Scope<'a> {
     pub fn image(&self, raw: &str) -> Option<Arc<Image>> {
         self.pictures.image(self.part, raw)
+    }
+
+    /// This scope, recording each picture it draws in `drawn` (#1926).
+    pub fn recording(self, drawn: &'a DrawnPictures) -> Self {
+        Scope {
+            drawn: Some(drawn),
+            ..self
+        }
+    }
+
+    /// Note a picture drawn in this scope, when it records.
+    pub fn record(&self, picture: DrawnPicture) {
+        if let Some(drawn) = self.drawn {
+            drawn.borrow_mut().push(picture);
+        }
     }
 }
 
@@ -767,5 +850,44 @@ mod tests {
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].id, img.id);
         assert!(take_queued().is_empty());
+    }
+
+    #[test]
+    fn a_crop_shape_is_a_clip_radius() {
+        use docxcore::image::PictureShape::{Ellipse, Rect, RoundRect};
+        assert_eq!(picture_radius(Rect, 32.0, 32.0), 0.0);
+        assert_eq!(picture_radius(Ellipse, 32.0, 32.0), 16.0);
+        // A non-square oval: a stadium, half the shorter side.
+        assert_eq!(picture_radius(Ellipse, 120.0, 40.0), 20.0);
+        assert_eq!(picture_radius(RoundRect { adj: 20_000 }, 120.0, 40.0), 8.0);
+        assert_eq!(picture_radius(RoundRect { adj: 0 }, 120.0, 40.0), 0.0);
+        // Never past half the shorter side, whatever the adj.
+        assert_eq!(picture_radius(RoundRect { adj: 50_000 }, 120.0, 40.0), 20.0);
+        assert_eq!(picture_radius(RoundRect { adj: 90_000 }, 120.0, 40.0), 20.0);
+    }
+
+    #[test]
+    fn drawn_pictures_read_as_the_harness_reports_them() {
+        use docxcore::image::PictureShape::{Ellipse, Rect, RoundRect};
+        let drawn = DrawnPictures::default();
+        for (shape, w, h) in [
+            (Ellipse, 32.0, 32.0),
+            (RoundRect { adj: 20_000 }, 120.04, 40.0),
+            (Rect, 200.0, 100.0),
+        ] {
+            drawn.borrow_mut().push(DrawnPicture {
+                width: w,
+                height: h,
+                radius: picture_radius(shape, w, h),
+                shape,
+            });
+        }
+        let json = drawn_pictures_json(&drawn).to_string();
+        assert_eq!(
+            json,
+            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true},\
+             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false},\
+             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false}]"
+        );
     }
 }
