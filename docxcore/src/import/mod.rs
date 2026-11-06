@@ -642,6 +642,54 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// Whether a paragraph is in progress (anything since the last end).
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.para.is_empty()
+    }
+
+    /// The blocks a paragraph ended now goes after: the open cell's (the
+    /// innermost table's) when `in_table`, else the body's, `None` when
+    /// tables are left open there (a body paragraph closes them first).
+    fn flow(&self, in_table: bool) -> Option<&Vec<Block>> {
+        match self.tables.last() {
+            Some(t) if in_table => Some(&t.blocks),
+            None if !in_table => Some(&self.body),
+            _ => None,
+        }
+    }
+
+    /// Whether a paragraph ended now would be the first block of its flow
+    /// ([`Builder::flow`]): its cell's or the body's (#1979).
+    pub(crate) fn flow_is_empty(&self, in_table: bool) -> bool {
+        match self.flow(in_table) {
+            Some(blocks) => blocks.is_empty(),
+            // A body paragraph after tables left open follows them.
+            None => in_table,
+        }
+    }
+
+    /// The properties of the block a paragraph ended now follows in its
+    /// flow, when that is a paragraph (#1979).
+    pub(crate) fn flow_last(&self, in_table: bool) -> Option<&ParProps> {
+        match self.flow(in_table)?.last()? {
+            Block::Paragraph(p) => Some(&p.props),
+            _ => None,
+        }
+    }
+
+    /// [`Builder::flow_last`], to change.
+    pub(crate) fn flow_last_mut(&mut self, in_table: bool) -> Option<&mut ParProps> {
+        let blocks = match self.tables.last_mut() {
+            Some(t) if in_table => &mut t.blocks,
+            None if !in_table => &mut self.body,
+            _ => return None,
+        };
+        match blocks.last_mut()? {
+            Block::Paragraph(p) => Some(&mut p.props),
+            _ => None,
+        }
+    }
+
     /// End the paragraph in progress only when it has content.
     pub(crate) fn end_para_if_any(&mut self, props: ParProps, in_table: bool) {
         if !self.para.is_empty() {

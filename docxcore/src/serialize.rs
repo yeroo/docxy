@@ -1588,6 +1588,14 @@ pub(crate) fn rpr_rank(local: &str) -> u32 {
         .map_or(u32::MAX - 1, |index| index as u32)
 }
 
+/// `p` as a `w:rPr` element (empty when it sets nothing): what the HTML
+/// import writes as a paragraph mark's properties (#1979).
+pub(crate) fn rpr_xml(p: &RunProps) -> String {
+    let mut s = String::new();
+    write_rpr(&mut s, p);
+    s
+}
+
 fn write_rpr(s: &mut String, p: &RunProps) {
     // Revision underline/strike are renderer cues, never direct OOXML
     // properties. Preserve a genuine direct value, but omit a cue that was

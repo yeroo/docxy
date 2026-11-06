@@ -221,7 +221,7 @@ fn import_decoded(
         return Err("the HTML file holds no text".into());
     }
     let media = h.images.take().map(Images::into_media).unwrap_or_default();
-    let props = h.par_props();
+    let props = h.flow_end_props();
     let mut doc = h.out.finish(props);
     // The page the layout above assumed (#1928): Outlook-like margins.
     doc.set_trailing_section_properties(html_table::page_section());
@@ -320,12 +320,11 @@ struct Block {
     mso_list: bool,
     /// Inside an `li`: (numbered, level).
     item: Option<(bool, i32)>,
-    /// On an `li`'s own entry (#1922): the item has ended a numbered
-    /// paragraph, and a block image split its text, so its paragraphs past
-    /// the numbered one are continuations. Per item, so a nested list's
-    /// items leave their parent's alone.
+    /// On an `li`'s own entry (#1922, #1979): the item has ended its
+    /// numbered paragraph (one with a line), so its paragraphs past it are
+    /// continuations. Per item, so a nested list's items leave their
+    /// parent's alone.
     item_numbered: bool,
-    item_split: bool,
 }
 
 /// How an element takes part in the page, for its look.
@@ -440,6 +439,11 @@ struct Look {
     /// The element's own top and bottom box, in twips (not inherited).
     before: Option<i32>,
     after: Option<i32>,
+    /// What of `before` and `after` is the user agent's margin, in twips
+    /// (not inherited, #1979): what quirks mode drops at a body's or
+    /// cell's edge.
+    ua_before: i32,
+    ua_after: i32,
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
@@ -617,6 +621,17 @@ struct Cascade {
     /// Its own `display` is neither `block` nor unset (nor `none`): an
     /// inline or inline-block `div` is no card.
     not_block: bool,
+    /// The sides of its margin a declaration set, top, right, bottom, left:
+    /// the others keep the user agent's (#1979).
+    margin_declared: [bool; 4],
+    /// The user agent's top and bottom margin, in `em` of [`Self::ua_em`]
+    /// (#1979): `p` 1, a heading its own, else none.
+    ua_vmargin: Option<f64>,
+    /// A heading's user-agent font size, in `em` of its parent's: what its
+    /// user-agent margins are in when no font size is declared on it.
+    ua_font: f64,
+    /// A font size was declared on the element itself.
+    own_size: bool,
 }
 
 /// A twips sum kept in Word's range.
@@ -648,11 +663,35 @@ fn align_attr(v: &str) -> Option<Align> {
     align_value(v)
 }
 
-/// A list item paragraph's left indent at `level` (0-based) inside
-/// enclosing boxes summing `boxes` twips: the level's own 720 per level,
-/// as the Markdown package's numbering has it (#1872 9b, #1922).
-fn item_indent(level: i32, boxes: i32) -> i32 {
-    (720 * (level + 1) + boxes).max(0)
+/// A browser's outside list marker with its space, in `em` of the item's
+/// font (#1979, measured in Chrome): `"1. "` and `"• "`. A list item's
+/// hanging indent.
+const DECIMAL_HANG: f64 = 1.1125;
+const BULLET_HANG: f64 = 1.375;
+
+/// The paragraph-mark `w:rPr` of a run's look (#1979): its font, size,
+/// colour, bold and italic, what Word and LibreOffice draw a list marker
+/// and an empty paragraph's line in. No decoration: a browser's marker
+/// takes none. `None` when none is set.
+fn mark_rpr(run: &RunProps) -> Option<String> {
+    let mark = RunProps {
+        bold: run.bold,
+        italic: run.italic,
+        color: run.color.clone(),
+        size_half_pts: run.size_half_pts,
+        font: run.font.clone(),
+        ..RunProps::default()
+    };
+    (mark != RunProps::default()).then(|| crate::serialize::rpr_xml(&mark))
+}
+
+/// A paragraph's user-agent margins, and whether its block sits straight
+/// in the body or a cell, where quirks mode drops them at the edge (#1979).
+#[derive(Clone, Copy, Default)]
+struct Edges {
+    ua_before: i32,
+    ua_after: i32,
+    straight: bool,
 }
 
 /// Whether a `text-align` value is a vendor one (`-webkit-center`,
@@ -804,6 +843,8 @@ impl Cascade {
         let mut look = parent.cloned().unwrap_or_default();
         look.before = None;
         look.after = None;
+        look.ua_before = 0;
+        look.ua_after = 0;
         look.own_fill = None;
         look.own_width = None;
         look.own_height = None;
@@ -842,6 +883,10 @@ impl Cascade {
             radius: [None; 4],
             card,
             not_block: false,
+            margin_declared: [false; 4],
+            ua_vmargin: None,
+            ua_font: 1.0,
+            own_size: false,
         }
     }
 
@@ -891,8 +936,30 @@ impl Cascade {
                 self.margin[1] = m;
                 self.margin[3] = m;
             }
+            // A list's 40 px left padding (#1979): its items' text indent.
+            "ul" | "ol" | "dir" | "menu" => {
+                self.padding[3] = Some(Len {
+                    v: 40.0,
+                    unit: css::Unit::Px,
+                });
+            }
             _ => {}
         }
+        // The user agent's vertical margins (#1979), as a browser's sheet:
+        // `p`, `blockquote` and `pre` 1em, a heading its own in its own
+        // font size; every other block (`div`, `li`) none.
+        let (margin, font) = match tag {
+            "p" | "blockquote" | "pre" => (1.0, 1.0),
+            "h1" => (0.67, 2.0),
+            "h2" => (0.83, 1.5),
+            "h3" => (1.0, 1.17),
+            "h4" => (1.33, 1.0),
+            "h5" => (1.67, 0.83),
+            "h6" => (2.33, 0.67),
+            _ => return,
+        };
+        self.ua_vmargin = Some(margin);
+        self.ua_font = font;
     }
 
     /// Presentational attributes: `align` on a block, cell, row or row
@@ -1054,6 +1121,7 @@ impl Cascade {
             "font-size" => {
                 if let Some(pt) = css::font_size_pt(v, self.parent_pt) {
                     run.size_half_pts = Some(css::half_points(pt));
+                    self.own_size = true;
                 }
             }
             "font-weight" => {
@@ -1070,6 +1138,7 @@ impl Cascade {
                 if let Some(f) = css::font_shorthand(v, self.parent_pt) {
                     run.italic = f.italic;
                     run.size_half_pts = Some(css::half_points(f.size_pt));
+                    self.own_size = true;
                     if let Some(family) = f.family {
                         run.font = Some(family);
                     }
@@ -1125,6 +1194,7 @@ impl Cascade {
                     if d.name == "margin" {
                         self.margin = sides;
                         self.margin_auto = css::box_autos(v).unwrap_or_default();
+                        self.margin_declared = [true; 4];
                     } else {
                         self.padding = sides;
                     }
@@ -1193,6 +1263,7 @@ impl Cascade {
                         if margin {
                             self.margin[i] = len;
                             self.margin_auto[i] = v.trim().eq_ignore_ascii_case("auto");
+                            self.margin_declared[i] = true;
                         } else {
                             self.padding[i] = len;
                         }
@@ -1260,6 +1331,28 @@ impl Cascade {
                 look.own_place = block_position(self.margin_auto, self.parent_block_align);
             }
             Kind::Block => {
+                // The user agent's top and bottom margin where none is
+                // declared (#1979), in the element's own font size, or a
+                // heading's user-agent one.
+                if let Some(em) = self.ua_vmargin {
+                    let font = if self.own_size {
+                        pt
+                    } else {
+                        self.parent_pt * self.ua_font
+                    };
+                    let ua = Len {
+                        v: em * font,
+                        unit: css::Unit::Pt,
+                    };
+                    for side in [0, 2] {
+                        if !self.margin_declared[side] {
+                            self.margin[side] = Some(ua);
+                        }
+                    }
+                    let twips = ua.twips(pt).unwrap_or(0).max(0);
+                    look.ua_before = if self.margin_declared[0] { 0 } else { twips };
+                    look.ua_after = if self.margin_declared[2] { 0 } else { twips };
+                }
                 // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
                 look.before = sum(self.margin[0], self.padding[0]).map(|t| t.max(0));
                 look.after = sum(self.margin[2], self.padding[2]).map(|t| t.max(0));
@@ -1309,7 +1402,17 @@ impl Cascade {
                     }
                 }
             }
-            Kind::List | Kind::Container | Kind::Other => {
+            Kind::List => {
+                // Its left and right box indent its items (#1979: the user
+                // agent's 40 px left padding).
+                if let Some(l) = sum(self.margin[3], self.padding[3]) {
+                    look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
+                }
+                if let Some(r) = sum(self.margin[1], self.padding[1]) {
+                    look.indent_right = clamp_twips(i64::from(look.indent_right) + i64::from(r));
+                }
+            }
+            Kind::Container | Kind::Other => {
                 if self.is_img && look.own_block {
                     look.own_place = block_position(self.margin_auto, self.parent_block_align);
                 }
@@ -1401,6 +1504,102 @@ fn look_of(
     c.finish()
 }
 
+/// Whether the page is in quirks mode, as the HTML Standard decides it
+/// from the doctype (#1979): none before the first element (a mail's,
+/// Word's and Outlook's pages), one not named `html`, or one of the old
+/// public identifiers. `<!DOCTYPE html>` and the rest are standards mode
+/// (limited quirks has no margin quirk). A byte-order mark, white space,
+/// comments and `<?…>` before it are skipped.
+fn quirks_mode(s: &str) -> bool {
+    let mut rest = s.trim_start_matches('\u{feff}');
+    loop {
+        rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("<!--") {
+            match after.find("-->") {
+                Some(e) => rest = &after[e + 3..],
+                None => return true,
+            }
+        } else if rest.starts_with("<?") {
+            match rest.find('>') {
+                Some(e) => rest = &rest[e + 1..],
+                None => return true,
+            }
+        } else {
+            break;
+        }
+    }
+    const DOCTYPE: &str = "<!doctype";
+    if !rest
+        .get(..DOCTYPE.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(DOCTYPE))
+    {
+        return true;
+    }
+    let body = &rest[DOCTYPE.len()..];
+    let body = &body[..body.find('>').unwrap_or(body.len())];
+    let mut words = body.split_ascii_whitespace();
+    if !words.next().is_some_and(|n| n.eq_ignore_ascii_case("html")) {
+        return true;
+    }
+    // The quoted identifiers after `PUBLIC`: public, then system.
+    let lower = body.to_ascii_lowercase();
+    let Some(at) = lower.find("public") else {
+        return false;
+    };
+    let mut ids = Vec::new();
+    let mut tail = &lower[at + "public".len()..];
+    while ids.len() < 2 {
+        let t = tail.trim_start();
+        let Some(q) = t.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            break;
+        };
+        let Some(end) = t[1..].find(q) else {
+            ids.push(&t[1..]);
+            break;
+        };
+        ids.push(&t[1..1 + end]);
+        tail = &t[1 + end + 1..];
+    }
+    let Some(public) = ids.first() else {
+        return false;
+    };
+    let no_system = ids.len() < 2;
+    QUIRKS_PUBLIC.iter().any(|p| public.starts_with(p))
+        || (no_system
+            && QUIRKS_PUBLIC_NO_SYSTEM
+                .iter()
+                .any(|p| public.starts_with(p)))
+        || matches!(
+            *public,
+            "-//w3o//dtd w3 html strict 3.0//en//" | "-/w3c/dtd html 4.0 transitional/en" | "html"
+        )
+}
+
+/// Public identifier prefixes that put a page in quirks mode (the HTML
+/// Standard's list, its common entries), lowercase.
+const QUIRKS_PUBLIC: [&str; 13] = [
+    "+//silmaril//dtd html pro v0r11 19970101//",
+    "-//as//dtd html 3.0 aswedit + extensions//",
+    "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+    "-//ietf//dtd html",
+    "-//microsoft//dtd internet explorer",
+    "-//netscape comm. corp.//dtd",
+    "-//w3c//dtd html 3",
+    "-//w3c//dtd html 4.0 frameset//",
+    "-//w3c//dtd html 4.0 transitional//",
+    "-//w3c//dtd html experimental",
+    "-//w3c//dtd w3 html//",
+    "-//w3o//dtd w3 html 3.0//",
+    "-//webtechs//dtd mozilla html",
+];
+
+/// Public identifier prefixes that are quirks mode without a system
+/// identifier (with one, limited quirks), lowercase.
+const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
+    "-//w3c//dtd html 4.01 frameset//",
+    "-//w3c//dtd html 4.01 transitional//",
+];
+
 /// The CSS text of every `<style>` element of the page, in order: one
 /// forward scan, skipping comments and the contents of elements whose text
 /// is not markup (a `<style>` inside a comment or a script does not apply).
@@ -1478,6 +1677,12 @@ struct Html<'a> {
     /// with no `Elem` (opened past `MAX_DEPTH`) was open in them (#1927
     /// r2): each ends when that table's own close brings the depth back.
     orphan_cards: Vec<usize>,
+    /// The page is in quirks mode ([`quirks_mode`], #1979): a block's
+    /// user-agent margins at its body's or cell's edge are dropped.
+    quirks: bool,
+    /// The user-agent bottom margin quirks mode drops from the last
+    /// paragraph ended, should it be its flow's last ([`Self::flow_end_props`]).
+    last_bottom: Option<i32>,
 }
 
 impl<'a> Html<'a> {
@@ -1502,6 +1707,8 @@ impl<'a> Html<'a> {
             images: None,
             after_block_object: false,
             orphan_cards: Vec::new(),
+            quirks: quirks_mode(s),
+            last_bottom: None,
         }
     }
 
@@ -1738,11 +1945,16 @@ impl<'a> Html<'a> {
                     {
                         block.heading = Some(level);
                     }
-                    block.mso_list = class.starts_with("msolist");
+                    // An `li` is an HTML item whatever its class (#1979:
+                    // classic Outlook's `<li class=MsoListParagraph>`), and
+                    // so are the blocks in it: only Filtered HTML's typed
+                    // markers make a Word list paragraph.
+                    block.mso_list =
+                        class.starts_with("msolist") && name != "li" && block.item.is_none();
                 }
                 if name == "li" {
+                    block.mso_list = false;
                     block.item_numbered = false;
-                    block.item_split = false;
                     let numbered = self.lists.last().copied().unwrap_or(false);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
@@ -2106,7 +2318,7 @@ impl<'a> Html<'a> {
                     .rposition(|(n, _)| n == "td" || n == "th")
                 {
                     if self.kept_table() {
-                        let props = self.par_props();
+                        let props = self.flow_end_props();
                         self.out.end_cell(props);
                         self.reset_para();
                     } else {
@@ -2118,7 +2330,7 @@ impl<'a> Html<'a> {
             }
             "tr" => {
                 if self.kept_table() {
-                    let props = self.par_props();
+                    let props = self.flow_end_props();
                     self.out.end_row(props);
                     self.reset_para();
                 }
@@ -2126,7 +2338,7 @@ impl<'a> Html<'a> {
             "table" => {
                 if self.table_depth > 0 {
                     if self.kept_table() {
-                        let props = self.par_props();
+                        let props = self.flow_end_props();
                         self.out.end_row(props);
                         self.out.end_table();
                         self.reset_para();
@@ -2307,7 +2519,7 @@ impl<'a> Html<'a> {
                 // Only a table the builder holds (one past the nesting
                 // limit is its cell's text).
                 if self.kept_table() {
-                    let props = self.par_props();
+                    let props = self.flow_end_props();
                     self.out.end_row(props);
                     self.out.end_table();
                     self.reset_para();
@@ -2315,7 +2527,7 @@ impl<'a> Html<'a> {
                 self.table_closed();
             }
             if self.table_depth == depth {
-                let props = self.par_props();
+                let props = self.flow_end_props();
                 self.out.end_card(props);
                 self.reset_para();
                 self.table_closed();
@@ -2331,7 +2543,7 @@ impl<'a> Html<'a> {
         while self.orphan_cards.last() == Some(&self.table_depth) && self.table_depth > 0 {
             self.orphan_cards.pop();
             self.end_para_if_any();
-            let props = self.par_props();
+            let props = self.flow_end_props();
             self.out.end_card(props);
             self.reset_para();
             self.table_depth -= 1;
@@ -2437,9 +2649,6 @@ impl<'a> Html<'a> {
         if block.is_some() {
             self.end_para_if_any();
             self.space = None;
-            if let Some(item) = self.open_item() {
-                item.item_split = true;
-            }
         }
     }
 
@@ -2548,12 +2757,44 @@ impl<'a> Html<'a> {
     /// The innermost paragraph-making element's look, else the innermost
     /// element's (text straight in `body`).
     fn para_look(&self) -> Option<&Look> {
+        self.para_elem()
+            .or(self.elems.len().checked_sub(1))
+            .map(|i| &self.elems[i].look)
+    }
+
+    /// Where the innermost paragraph-making element (a block or a cell) is
+    /// on `elems`.
+    fn para_elem(&self) -> Option<usize> {
+        self.elems
+            .iter()
+            .rposition(|e| matches!(e.kind, Kind::Block | Kind::Cell))
+    }
+
+    /// The open list item's own element, not across a cell.
+    fn item_elem(&self) -> Option<&Elem> {
         self.elems
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, Kind::Block | Kind::Cell))
-            .or(self.elems.last())
-            .map(|e| &e.look)
+            .take_while(|e| e.kind != Kind::Cell)
+            .find(|e| e.key.tag == "li")
+    }
+
+    /// The paragraph's user-agent margins and whether quirks mode may drop
+    /// them (#1979): its block sits straight in the body or a cell.
+    fn para_edges(&self) -> Edges {
+        let Some(i) = self.para_elem() else {
+            return Edges::default();
+        };
+        let e = &self.elems[i];
+        let straight = e.kind == Kind::Block
+            && self.elems[..i]
+                .last()
+                .is_none_or(|p| matches!(p.key.tag.as_str(), "html" | "body" | "td" | "th"));
+        Edges {
+            ua_before: e.look.ua_before,
+            ua_after: e.look.ua_after,
+            straight,
+        }
     }
 
     fn par_props(&self) -> ParProps {
@@ -2566,16 +2807,21 @@ impl<'a> Html<'a> {
             Some(level) => heading_props(level),
             None => ParProps::default(),
         };
+        // Spacing is the CSS's alone, single by default (#1979): a
+        // browser's `line-height: normal`, no space a style adds.
+        p.spacing.before = Some(0);
+        p.spacing.after = Some(0);
+        p.spacing.line = Some(240);
+        p.spacing.line_rule = Some("auto".into());
         let Some(look) = self.para_look() else {
             return p;
         };
         p.align = look.align.unwrap_or_default();
-        p.spacing.before = look.before;
-        p.spacing.after = look.after;
+        p.spacing.before = Some(look.before.unwrap_or(0));
+        p.spacing.after = Some(look.after.unwrap_or(0));
         match look.line {
             Some(Line::Auto(n)) => {
                 p.spacing.line = Some(n);
-                p.spacing.line_rule = Some("auto".into());
             }
             Some(Line::Twips(n)) => {
                 p.spacing.line = Some(n);
@@ -2585,13 +2831,17 @@ impl<'a> Html<'a> {
             None => {}
         }
         match block.item {
-            // An HTML list item keeps the level's hanging indent; enclosing
-            // boxes move it as a whole (#1872 9b).
-            Some((_, level)) if !block.mso_list => {
-                if look.indent != 0 {
-                    p.indent = item_indent(level, look.indent);
-                    p.first_line = -360;
-                }
+            // An HTML list item's text is at its lists' boxes (40 px each
+            // by default), its marker hanging before it as wide as a
+            // browser's in the item's font (#1979).
+            Some((numbered, _)) if !block.mso_list => {
+                p.indent = look.indent.max(0);
+                let em = self
+                    .item_elem()
+                    .map_or(css::BASE_PT, |e| font_pt(&e.look.run))
+                    * 20.0;
+                let hang = (em * if numbered { DECIMAL_HANG } else { BULLET_HANG }).round();
+                p.first_line = -(hang.clamp(0.0, 31_680.0) as i32).min(p.indent);
             }
             _ => {
                 p.indent = look.indent.max(0);
@@ -2601,6 +2851,9 @@ impl<'a> Html<'a> {
         p.indent_right = look.indent_right.max(0);
         if let Some(fill) = &look.shade {
             p.raw_props.push(shd(fill));
+        }
+        if let Some(rpr) = mark_rpr(&look.run) {
+            p.raw_props.push(rpr);
         }
         p
     }
@@ -2638,24 +2891,33 @@ impl<'a> Html<'a> {
         if marker.is_none() && block.mso_list && block.heading.is_none() {
             marker = self.out.take_leading_marker();
         }
+        // A line box (text, a break, an object or a typed marker): what a
+        // browser draws an item's marker beside (#1979).
+        let has_line =
+            marker.is_some() || self.out.has_object() || !self.out.para_text().is_empty();
         if block.heading.is_none() {
             if let Some(m) = &marker {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
             } else if let Some((numbered, level)) = block.item {
-                let (done, split) = self
-                    .open_item()
-                    .map_or((false, false), |i| (i.item_numbered, i.item_split));
-                if split && done && !block.mso_list {
-                    // Past a block image, the item's text goes on in
-                    // unnumbered paragraphs at its level's indent (#1922).
-                    let boxes = self.para_look().map_or(0, |l| l.indent);
-                    props.indent = item_indent(level, boxes);
+                let done = self.open_item().is_some_and(|i| i.item_numbered);
+                if done && !block.mso_list {
+                    // Past the item's numbered paragraph, its text goes on
+                    // in unnumbered paragraphs at its text indent (#1922,
+                    // #1979).
                     props.first_line = 0;
                 } else {
                     props.num_id = Some(if numbered { 2 } else { 1 });
                     props.ilvl = level;
-                    if let Some(item) = self.open_item() {
-                        item.item_numbered = true;
+                    // The marker takes the item's look (#1979), as a
+                    // browser's `::marker` does.
+                    props.raw_props.retain(|r| !r.starts_with("<w:rPr"));
+                    if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
+                        props.raw_props.push(rpr);
+                    }
+                    if has_line {
+                        if let Some(item) = self.open_item() {
+                            item.item_numbered = true;
+                        }
                     }
                 }
             }
@@ -2665,8 +2927,59 @@ impl<'a> Html<'a> {
         if !self.out.has_object() && self.out.para_text().chars().all(|c| c.is_whitespace()) {
             self.out.clear_para();
         }
-        self.out.end_para(props, self.table_depth > 0);
+        let in_table = self.table_depth > 0;
+        let edges = self.para_edges();
+        self.flow_spacing(&mut props, edges, in_table);
+        self.out.end_para(props, in_table);
+        self.last_bottom = self.quirk_bottom(edges);
         self.reset_para();
+    }
+
+    /// A paragraph's top spacing in its flow (#1979): in quirks mode a
+    /// block straight in the body or a cell loses its user-agent top margin
+    /// when nothing comes before it there, and its top collapses with the
+    /// bottom of the paragraph before it, as a browser's adjacent margins
+    /// do (Word and LibreOffice add the two).
+    fn flow_spacing(&self, p: &mut ParProps, edges: Edges, in_table: bool) {
+        let mut before = p.spacing.before.unwrap_or(0);
+        if self.quirks && edges.straight && self.out.flow_is_empty(in_table) {
+            before = (before - edges.ua_before).max(0);
+        }
+        if let Some(prev) = self.out.flow_last(in_table) {
+            before = (before - prev.spacing.after.unwrap_or(0).max(0)).max(0);
+        }
+        p.spacing.before = Some(before);
+    }
+
+    /// The user-agent bottom margin quirks mode drops from a paragraph of
+    /// these `edges` when it turns out to be its body's or cell's last.
+    fn quirk_bottom(&self, edges: Edges) -> Option<i32> {
+        (self.quirks && edges.straight && edges.ua_after > 0).then_some(edges.ua_after)
+    }
+
+    /// The properties of the paragraph a flow's end (a cell's, a card's,
+    /// the page's) may still make of the text in progress: its spacing in
+    /// the flow, and, as its last, no user-agent bottom margin in quirks
+    /// mode. With none in progress, the flow's last paragraph loses that
+    /// margin instead (#1979).
+    fn flow_end_props(&mut self) -> ParProps {
+        let in_table = self.table_depth > 0;
+        let edges = self.para_edges();
+        let mut props = self.par_props();
+        self.flow_spacing(&mut props, edges, in_table);
+        let last = self.last_bottom.take();
+        if self.out.has_pending() {
+            if let Some(ua) = self.quirk_bottom(edges) {
+                let after = props.spacing.after.unwrap_or(0);
+                props.spacing.after = Some((after - ua).max(0));
+            }
+        } else if let Some(ua) = last {
+            if let Some(p) = self.out.flow_last_mut(in_table) {
+                let after = p.spacing.after.unwrap_or(0);
+                p.spacing.after = Some((after - ua).max(0));
+            }
+        }
+        props
     }
 }
 
@@ -3440,13 +3753,14 @@ mod tests {
         let quoted = para_of(&d, "quoted");
         assert_eq!(quoted.props.indent, 450 + 600);
         assert_eq!(quoted.props.indent_right, 1440 + 600);
-        assert_eq!(quoted.props.spacing.before, None);
+        // Its 1em top collapses into the 12pt bottom above it (#1979).
+        assert_eq!(quoted.props.spacing.before, Some(0));
         let deeper = para_of(&d, "deeper");
         assert_eq!(deeper.props.indent, 450 + 600);
         assert_eq!(deeper.props.indent_right, 1440 + 600 + 600);
         assert_eq!(para_of(&d, "negative").props.indent, 0);
         let pc = para_of(&d, "percent");
-        assert_eq!((pc.props.indent, pc.props.spacing.before), (0, None));
+        assert_eq!((pc.props.indent, pc.props.spacing.before), (0, Some(0)));
     }
 
     #[test]
@@ -3456,9 +3770,11 @@ mod tests {
         );
         let p = para_of(&d, "text");
         assert_eq!((p.props.indent, p.props.indent_right), (0, 0));
+        // Its user-agent 1em, dropped at the body's edges in quirks mode
+        // (#1979).
         assert_eq!(
             (p.props.spacing.before, p.props.spacing.after),
-            (None, None)
+            (Some(0), Some(0))
         );
     }
 
@@ -3479,7 +3795,8 @@ mod tests {
         assert_eq!(sp("mult"), (Some(360), Some("auto".into())));
         assert_eq!(sp("least"), (Some(360), Some("atLeast".into())));
         assert_eq!(sp("exact"), (Some(240), Some("exact".into())));
-        assert_eq!(sp("normal"), (None, None));
+        // Single, a browser's `normal` (#1979).
+        assert_eq!(sp("normal"), (Some(240), Some("auto".into())));
         assert_eq!(sp("inherited"), (Some(480), Some("auto".into())));
         assert_eq!(sp("short"), (Some(280), Some("atLeast".into())));
         let r = run_of(&d, "short");
@@ -3499,7 +3816,8 @@ mod tests {
         let d = doc("<p style='margin-bottom:20px'>one<p>two");
         assert_eq!(paragraph_texts(&d), ["one", "two"]);
         assert_eq!(para_of(&d, "one").props.spacing.after, Some(300));
-        assert_eq!(para_of(&d, "two").props.spacing.after, None);
+        // The body's last: quirks mode drops its user-agent 1em (#1979).
+        assert_eq!(para_of(&d, "two").props.spacing.after, Some(0));
     }
 
     #[test]
@@ -3526,23 +3844,26 @@ mod tests {
              <ul style='padding-left:0;margin-left:0'><li>unpadded</li></ul>\
              <div style='margin-left:-100px'><ul><li>pulled</li></ul></div>",
         );
+        // Each list's 40 px left padding, a browser's marker as the hang
+        // (#1979): a bullet 1.375em, a number 1.1125em of 12pt.
         let plain = para_of(&d, "plain");
-        assert_eq!((plain.props.indent, plain.props.first_line), (0, 0));
+        assert_eq!((plain.props.indent, plain.props.first_line), (600, -330));
         let quoted = para_of(&d, "quoted");
         assert_eq!(
             (quoted.props.indent, quoted.props.first_line),
-            (720 + 600, -360)
+            (600 + 600, -330)
         );
         let nested = para_of(&d, "nested");
         assert_eq!(
             (nested.props.indent, nested.props.first_line),
-            (1440 + 600, -360)
+            (600 + 1200, -267)
         );
+        // No padding: no room for the hang.
         let unpadded = para_of(&d, "unpadded");
         assert_eq!((unpadded.props.indent, unpadded.props.first_line), (0, 0));
         let pulled = para_of(&d, "pulled");
-        // 720 - 1500 clamps at the margin; the hanging indent stays.
-        assert_eq!((pulled.props.indent, pulled.props.first_line), (0, -360));
+        // 600 - 1500 clamps at the margin, and the hang with it.
+        assert_eq!((pulled.props.indent, pulled.props.first_line), (0, 0));
     }
 
     #[test]
@@ -3561,7 +3882,7 @@ mod tests {
         assert_eq!(cell.props.spacing.line, Some(360), "line height inherits");
         let bare = para_of(&d, "bare");
         assert_eq!(bare.props.indent, 0);
-        assert_eq!(bare.props.spacing.before, None);
+        assert_eq!(bare.props.spacing.before, Some(0));
         let outside = para_of(&d, "outside");
         assert!(has_shd(&outside.props.raw_props, "CCCCCC"));
         assert_eq!(outside.props.indent, 450);
@@ -3583,7 +3904,7 @@ mod tests {
         let z = run_of(&d, "z");
         assert!(!z.props.bold);
         assert_eq!(z.props.color, None);
-        assert_eq!(para_of(&d, "z").props.spacing.after, None);
+        assert_eq!(para_of(&d, "z").props.spacing.after, Some(0));
         let d = doc("<span style='color:red'><p>a</span>b</p><p>c</p>");
         assert_eq!(run_of(&d, "a").props.color.as_deref(), Some("FF0000"));
         assert_eq!(run_of(&d, "b").props.color, None);
@@ -3750,7 +4071,9 @@ mod tests {
             })
             .collect();
         assert!(in_cell.iter().any(|t| t == "cell"), "{in_cell:?}");
-        assert_eq!(para_of(&d, "x").props.num_id, Some(1));
+        // The item goes on after the table, unnumbered past "a" (#1979).
+        let x = para_of(&d, "x");
+        assert_eq!((x.props.num_id, x.props.indent), (None, 600));
     }
 
     /// The cells of the first table of `d`, row by row, as their text.
@@ -3914,8 +4237,9 @@ mod tests {
             (Some(0), Some(0))
         );
         assert_eq!(para_of(&d, "sum").props.spacing.before, Some(75));
-        assert_eq!(para_of(&d, "line").props.spacing.line, None);
-        assert_eq!(para_of(&d, "zero").props.spacing.line, None);
+        // Not written: single, as `normal` (#1979).
+        assert_eq!(para_of(&d, "line").props.spacing.line, Some(240));
+        assert_eq!(para_of(&d, "zero").props.spacing.line, Some(240));
     }
 
     #[test]
@@ -3934,7 +4258,9 @@ mod tests {
         let d = doc("<ul><li>a<li>b</ul><p>after</p>");
         assert_eq!(para_of(&d, "after").props.num_id, None);
         let d = doc("<ol><li>a<ol></ol>still</li></ol><p>after</p>");
-        assert_eq!(para_of(&d, "still").props.num_id, Some(2));
+        // Still in the item: its continuation (#1979).
+        let still = para_of(&d, "still");
+        assert_eq!((still.props.num_id, still.props.indent), (None, 600));
         assert_eq!(para_of(&d, "after").props.num_id, None);
         let d = doc("<ul><li><table><tr><td><ul></ul>cell</td></tr></table>x</li></ul>");
         assert_eq!(para_of(&d, "x").props.num_id, Some(1));
@@ -5791,10 +6117,11 @@ mod centering_tests {
         assert_eq!(
             num(&d),
             [
-                ("a".to_string(), Some(1), 0, 0),
-                (String::new(), None, 720, 0),
-                ("b".to_string(), None, 720, 0),
-                ("c".to_string(), Some(1), 0, 0),
+                // The list's 40 px, a bullet's hang (#1979).
+                ("a".to_string(), Some(1), 600, -330),
+                (String::new(), None, 600, 0),
+                ("b".to_string(), None, 600, 0),
+                ("c".to_string(), Some(1), 600, -330),
             ]
         );
         // The picture opening its item carries the item's number.
@@ -5802,9 +6129,9 @@ mod centering_tests {
         assert_eq!(
             num(&d),
             [
-                (String::new(), Some(2), 0, 0),
-                ("c".to_string(), None, 720, 0),
-                ("d".to_string(), Some(2), 0, 0),
+                (String::new(), Some(2), 600, -267),
+                ("c".to_string(), None, 600, 0),
+                ("d".to_string(), Some(2), 600, -267),
             ]
         );
     }
@@ -6577,5 +6904,384 @@ mod page_tests {
             "{:?}",
             text.body
         );
+    }
+}
+
+#[cfg(test)]
+mod outlook_tests {
+    //! A simple mail as Outlook writes it, laid out as a browser does
+    //! (#1979): spacing from CSS only at single line spacing, an item's
+    //! later blocks its continuations, list text at the lists' 40 px with
+    //! a browser's marker hanging before it, the marker in the item's look
+    //! on the paragraph mark, and quirks mode's margins at the edges.
+    use super::*;
+    use crate::model::{Block as DocBlock, Paragraph};
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    /// The same page in standards mode.
+    fn standards(html: &str) -> Document {
+        doc(&format!("<!DOCTYPE html>{html}"))
+    }
+
+    fn all_paras(d: &Document) -> Vec<Paragraph> {
+        fn walk(blocks: &[DocBlock], out: &mut Vec<Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p.clone()),
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    fn para_of(d: &Document, text: &str) -> Paragraph {
+        all_paras(d)
+            .into_iter()
+            .find(|p| p.plain_text() == text)
+            .unwrap_or_else(|| panic!("no paragraph is {text:?}"))
+    }
+
+    /// Before and after spacing.
+    fn gaps(p: &Paragraph) -> (Option<i32>, Option<i32>) {
+        (p.props.spacing.before, p.props.spacing.after)
+    }
+
+    /// The paragraph mark's `w:rPr`, if any.
+    fn mark(p: &Paragraph) -> Option<String> {
+        p.props
+            .raw_props
+            .iter()
+            .find(|r| r.starts_with("<w:rPr>"))
+            .cloned()
+    }
+
+    const STYLE: &str = "direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)";
+
+    /// The issue's mail, its `…` filled with the first `div`'s style.
+    fn outlook_mail() -> String {
+        let li = "font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); \
+                  margin-top:0px; margin-bottom:0px";
+        format!(
+            r#"<body>
+<div style="{STYLE}">Hi</div>
+<div style="{STYLE}">Line two</div>
+<ol start="1" style="direction:ltr; margin-top:0px; margin-bottom:0px; list-style-type:decimal">
+  <li style="{li}"><div role="presentation">Item one</div></li>
+  <li style="{li}"><div role="presentation">Item two</div></li>
+  <li style="{li}"><div role="presentation">Item three</div><div role="presentation">More text that belongs to item three</div></li>
+</ol>
+<div style="margin-top:0px; margin-bottom:0px; {STYLE}"><br></div>
+<div style="margin-top:0px; margin-bottom:0px; {STYLE}">Closing line</div>
+<div style="{STYLE}"><br></div>
+<div style="{STYLE}">Name</div>
+</body>"#
+        )
+    }
+
+    #[test]
+    fn outlook_simple_mail_imports_as_a_browser_lays_it_out() {
+        let d = doc(&outlook_mail());
+        let p = all_paras(&d);
+        let texts: Vec<String> = p.iter().map(|p| p.plain_text()).collect();
+        // A `<br>` alone is an empty line.
+        let br = |t: &str| t.chars().all(char::is_whitespace);
+        assert_eq!(texts.len(), 10, "{texts:?}");
+        assert_eq!(
+            texts.iter().filter(|t| !br(t)).collect::<Vec<_>>(),
+            [
+                "Hi",
+                "Line two",
+                "Item one",
+                "Item two",
+                "Item three",
+                "More text that belongs to item three",
+                "Closing line",
+                "Name"
+            ]
+        );
+        assert!(br(&texts[6]) && br(&texts[8]), "{texts:?}");
+        // 1, 2: no space between paragraphs, single line spacing.
+        for q in &p {
+            assert_eq!(gaps(q), (Some(0), Some(0)), "{:?}", q.plain_text());
+            assert_eq!(
+                (q.props.spacing.line, q.props.spacing.line_rule.as_deref()),
+                (Some(240), Some("auto")),
+                "{:?}",
+                q.plain_text()
+            );
+        }
+        // 3, 4: three numbers at the list's 40 px, each hanging a
+        // browser's "1. " (1.1125em of 12pt); item three's second block
+        // is its continuation.
+        let numbered: Vec<&Paragraph> = p.iter().filter(|q| q.props.num_id.is_some()).collect();
+        assert_eq!(numbered.len(), 3);
+        for q in &numbered {
+            assert_eq!((q.props.num_id, q.props.ilvl), (Some(2), 0));
+            assert_eq!((q.props.indent, q.props.first_line), (600, -267));
+        }
+        let more = para_of(&d, "More text that belongs to item three");
+        assert_eq!(
+            (more.props.num_id, more.props.indent, more.props.first_line),
+            (None, 600, 0)
+        );
+        // 5: the marker in the item's font, size and colour.
+        for q in &numbered {
+            let m = mark(q).expect("a mark rPr");
+            assert!(m.contains(r#"<w:rFonts w:ascii="Aptos""#), "{m}");
+            assert!(m.contains(r#"<w:sz w:val="24"/>"#), "{m}");
+            assert!(m.contains(r#"<w:color w:val="000000"/>"#), "{m}");
+        }
+        // 6: an empty line is one of the div's font.
+        for q in [&p[6], &p[8]] {
+            let m = mark(q).expect("a mark rPr");
+            assert!(m.contains(r#"<w:sz w:val="24"/>"#), "{m}");
+            assert!(m.contains("Aptos"), "{m}");
+        }
+    }
+
+    #[test]
+    fn mark_and_spacing_survive_a_save_and_a_load() {
+        let imported = doc(&outlook_mail());
+        let reload = |d: Document| {
+            let pkg = crate::package::new_markdown_package(d);
+            crate::package::load_package(&crate::package::save_package(&pkg))
+                .unwrap()
+                .document
+        };
+        let once = reload(imported.clone());
+        let twice = reload(once.clone());
+        for d in [&once, &twice] {
+            let p = all_paras(d);
+            assert_eq!(p.len(), 10);
+            for (q, src) in p.iter().zip(all_paras(&imported)) {
+                assert_eq!(q.props.spacing, src.props.spacing, "{:?}", q.plain_text());
+                assert_eq!(
+                    (q.props.num_id, q.props.indent, q.props.first_line),
+                    (src.props.num_id, src.props.indent, src.props.first_line)
+                );
+                let m = mark(q).unwrap_or_default();
+                assert!(m.contains(r#"w:val="24""#), "{:?}: {m}", q.plain_text());
+                assert!(m.contains("Aptos"), "{m}");
+            }
+        }
+    }
+
+    #[test]
+    fn ua_margins_and_sibling_collapse() {
+        let d = standards("<p>a</p><p>b</p>");
+        // 1em each; the gap between is the larger, as in a browser, not
+        // the sum (Word and LibreOffice add the two).
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(240), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(240)));
+        let d = standards("<p style='margin:0'>z</p>");
+        assert_eq!(gaps(&para_of(&d, "z")), (Some(0), Some(0)));
+        // A heading's in its own user-agent size: h1 0.67em of 2em.
+        let d = standards("<h1>t</h1><h3>u</h3>");
+        let h1 = para_of(&d, "t");
+        assert_eq!(h1.props.style_id.as_deref(), Some("Heading1"));
+        assert_eq!(gaps(&h1), (Some(322), Some(322)));
+        // h3: 1em of 1.17em; its top collapses into the h1's bottom.
+        assert_eq!(gaps(&para_of(&d, "u")), (Some(0), Some(281)));
+        // A heading with a size of its own: 0.67em of 20pt.
+        let d = standards("<h1 style='font-size:20pt'>t</h1>");
+        assert_eq!(gaps(&para_of(&d, "t")), (Some(268), Some(268)));
+        // A div has none.
+        let d = standards("<div>a</div><div>b</div>");
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(0), Some(0)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(0)));
+        // A declared side replaces only its own: 20px over the 1em above.
+        let d = standards("<p>a</p><p style='margin-top:20px'>b</p>");
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(60), Some(240)));
+        // A blockquote's 1em too, and a padding adds to the margin.
+        let d = standards("<blockquote style='padding-bottom:10px'>q</blockquote>");
+        assert_eq!(gaps(&para_of(&d, "q")), (Some(240), Some(390)));
+        // No collapse across a table.
+        let d = standards("<p>a</p><table><tr><td>c</td></tr></table><p>b</p>");
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(240), Some(240)));
+    }
+
+    #[test]
+    fn quirks_mode_drops_ua_margins_at_cell_and_body_edges() {
+        let page = "<p>first</p><p>mid</p><table><tr><td><p>a</p><p>b</p></td>\
+                    <td><div><p>inner</p></div></td>\
+                    <td><p style='margin-top:10px'>declared</p>tail</td></tr></table><p>last</p>";
+        // Quirks (no doctype): a block straight in the body or a cell
+        // loses its user-agent margin at the edge.
+        let d = doc(page);
+        assert_eq!(gaps(&para_of(&d, "first")), (Some(0), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "mid")), (Some(0), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(0), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(0)));
+        // Not straight in the cell: the quirk is for its children only.
+        assert_eq!(gaps(&para_of(&d, "inner")), (Some(240), Some(240)));
+        // A declared top stays; text after the block makes it no last.
+        assert_eq!(gaps(&para_of(&d, "declared")), (Some(150), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "last")), (Some(240), Some(0)));
+        // Standards mode keeps them.
+        let d = standards(page);
+        assert_eq!(gaps(&para_of(&d, "first")), (Some(240), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "a")), (Some(240), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(240)));
+        assert_eq!(gaps(&para_of(&d, "last")), (Some(240), Some(240)));
+        // The last paragraph of a cell ended by `</td>` with its text in
+        // progress (an unclosed `p`).
+        let d = doc("<table><tr><td><p>open</td></tr></table>");
+        assert_eq!(gaps(&para_of(&d, "open")), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn the_doctype_decides_quirks_mode() {
+        for (page, quirks) in [
+            ("<html><body>x", true),
+            ("<!DOCTYPE html><p>x", false),
+            (
+                "\u{feff}  <!-- c --><?xml version=\"1.0\"?>\n<!doctype HTML>",
+                false,
+            ),
+            ("<!DOCTYPE html SYSTEM \"about:legacy-compat\">", false),
+            (
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\">",
+                true,
+            ),
+            (
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\">",
+                false,
+            ),
+            (
+                "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.0 Transitional//EN\" \"http://www.w3.org/TR/REC-html40/loose.dtd\">",
+                true,
+            ),
+            (
+                "<!DOCTYPE HTML PUBLIC '-//W3C//DTD HTML 3.2 Final//EN'>",
+                true,
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"x\">",
+                false,
+            ),
+            ("<!DOCTYPE foo>", true),
+            ("<p>x</p><!DOCTYPE html>", true),
+        ] {
+            assert_eq!(quirks_mode(page), quirks, "{page}");
+        }
+    }
+
+    #[test]
+    fn every_block_in_an_item_after_the_first_continues_it() {
+        let d = doc("<ol><li><p>a</p><p>b</p></li><li>c<ul><li>d</li></ul>e</li></ol>");
+        let a = para_of(&d, "a");
+        assert_eq!((a.props.num_id, a.props.indent), (Some(2), 600));
+        let b = para_of(&d, "b");
+        assert_eq!(
+            (b.props.num_id, b.props.indent, b.props.first_line),
+            (None, 600, 0)
+        );
+        assert_eq!(para_of(&d, "c").props.num_id, Some(2));
+        let dd = para_of(&d, "d");
+        assert_eq!((dd.props.num_id, dd.props.ilvl), (Some(1), 1));
+        // Text after a nested list goes on in its item.
+        let e = para_of(&d, "e");
+        assert_eq!(
+            (e.props.num_id, e.props.indent, e.props.first_line),
+            (None, 600, 0)
+        );
+    }
+
+    #[test]
+    fn an_empty_p_opening_an_item_does_not_take_its_number() {
+        let d = doc("<ol><li><p></p><p>x</p></li></ol>");
+        assert_eq!(para_of(&d, "x").props.num_id, Some(2));
+        // A `<br>` is a line: the number is beside it, as in a browser.
+        let d = doc("<ol><li><div><br></div><div>y</div></li></ol>");
+        assert_eq!(para_of(&d, "y").props.num_id, None);
+        assert_eq!(all_paras(&d)[0].props.num_id, Some(2));
+    }
+
+    #[test]
+    fn classic_outlook_li_is_an_html_item() {
+        let d = doc(
+            "<ul type=disc style=\"margin-top:0in\"><li class=MsoListParagraph \
+             style=\"margin-left:0in;mso-list:l0 level1 lfo1\">x</li></ul>",
+        );
+        let x = para_of(&d, "x");
+        assert_eq!(
+            (x.props.num_id, x.props.indent, x.props.first_line),
+            (Some(1), 600, -330)
+        );
+        // Filtered HTML's typed marker is still a Word list paragraph.
+        let d = doc(
+            "<p class=MsoListParagraph style='margin-left:.5in;text-indent:-.25in'>\
+             <![if !supportLists]>1.<span> </span><![endif]>y</p>",
+        );
+        let y = para_of(&d, "y");
+        assert_eq!(
+            (y.props.num_id, y.props.indent, y.props.first_line),
+            (Some(2), 720, -360)
+        );
+    }
+
+    #[test]
+    fn list_indents_follow_the_lists_padding() {
+        let ind = |d: &Document, t: &str| {
+            let p = para_of(d, t);
+            (p.props.indent, p.props.first_line)
+        };
+        let d = doc("<ol><li>one<ol><li>two</li></ol></li></ol>\
+             <ul style='padding-left:20px'><li>pad</li></ul>\
+             <ul style='margin-left:10px'><li>margin</li></ul>\
+             <style>ol.s{padding-left:30px}</style><ol class=s><li>sheet</li></ol>");
+        assert_eq!(ind(&d, "one"), (600, -267));
+        assert_eq!(ind(&d, "two"), (1200, -267));
+        assert_eq!(ind(&d, "pad"), (300, -300), "the hang clamps to the indent");
+        assert_eq!(ind(&d, "margin"), (750, -330));
+        assert_eq!(ind(&d, "sheet"), (450, -267));
+        // The hang is the item's font: 20px is 300 twips an em.
+        let d = doc(
+            "<ol><li style='font-size:20px'>big</li></ol><ul><li style='font-size:20px'>dot</li></ul>\
+             <ol><li style='font-size:20px'><div style='font-size:10px'>inner</div></li></ol>",
+        );
+        assert_eq!(ind(&d, "big"), (600, -334));
+        assert_eq!(ind(&d, "dot"), (600, -413));
+        // The item's, not the div's inside it.
+        assert_eq!(ind(&d, "inner"), (600, -334));
+        let m = mark(&para_of(&d, "inner")).unwrap();
+        assert!(m.contains(r#"<w:sz w:val="30"/>"#), "{m}");
+        // Where the room is short.
+        let d = doc("<ul style='padding-left:10px'><li>tight</li></ul>");
+        assert_eq!(ind(&d, "tight"), (150, -150));
+    }
+
+    #[test]
+    fn marker_takes_the_li_look_on_the_paragraph_mark() {
+        let d = doc(
+            "<ol><li style='color:red;font-family:Georgia'><div style='color:blue'>x</div><div style='color:blue'>y</div></li></ol>\
+             <u><ol><li style='font-size:10pt'>z</li></ol></u>\
+             <ol><li><span style='color:green'>plain</span></li></ol>",
+        );
+        let m = mark(&para_of(&d, "x")).unwrap();
+        assert!(m.contains(r#"<w:color w:val="FF0000"/>"#), "{m}");
+        assert!(m.contains("Georgia"), "{m}");
+        // A continuation's mark is its own paragraph's.
+        let m = mark(&para_of(&d, "y")).unwrap();
+        assert!(m.contains(r#"<w:color w:val="0000FF"/>"#), "{m}");
+        // No decoration on the marker.
+        let m = mark(&para_of(&d, "z")).unwrap();
+        assert!(
+            m.contains(r#"<w:sz w:val="20"/>"#) && !m.contains("<w:u "),
+            "{m}"
+        );
+        // An item with no look of its own: no mark, whatever its text's.
+        assert_eq!(mark(&para_of(&d, "plain")), None);
     }
 }
