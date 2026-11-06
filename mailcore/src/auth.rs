@@ -39,6 +39,12 @@ pub struct TokenSet {
     pub refresh_token: String,
     pub expires_at_unix: u64,
     pub account: String,
+    /// The scopes the token was granted, as the token response's `scope`
+    /// spelled them (Graph scopes usually carry the
+    /// `https://graph.microsoft.com/` prefix). `None` is unknown: a response
+    /// without `scope` (or an empty one), or a cache saved before #1875.
+    /// Compare them with [`missing_scopes`].
+    pub scopes: Option<Vec<String>>,
 }
 
 /// Everything needed to drive the browser through `/authorize` and match up
@@ -233,13 +239,76 @@ fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<Toke
         .and_then(|x| x.as_str())
         .and_then(preferred_username)
         .unwrap_or_default();
+    let scopes = v
+        .get("scope")
+        .and_then(|x| x.as_str())
+        .and_then(split_scopes);
 
     Ok(TokenSet {
         access_token,
         refresh_token,
         expires_at_unix,
         account,
+        scopes,
     })
+}
+
+/// The granted scopes of a token response's `scope` (space-separated).
+/// Empty or whitespace only is `None`, like an absent `scope`: nothing is
+/// known. On a refresh the engine then keeps the previous grant: Entra
+/// always names the granted scopes, so the last grant it did name stands,
+/// rather than assuming everything requested was granted (RFC 6749 §5.1's
+/// reading of an omitted `scope`), which would hide a missing scope.
+fn split_scopes(scope: &str) -> Option<Vec<String>> {
+    let scopes: Vec<String> = scope.split_ascii_whitespace().map(str::to_string).collect();
+    (!scopes.is_empty()).then_some(scopes)
+}
+
+/// The prefix Microsoft puts on the Graph scopes it grants.
+const GRAPH_RESOURCE: &str = "https://graph.microsoft.com/";
+
+/// A scope as compared: ASCII-lowercased, without a leading
+/// `https://graph.microsoft.com/` (matched case-insensitively), so
+/// `Mail.ReadWrite` and `https://graph.microsoft.com/Mail.ReadWrite` are
+/// the same scope.
+pub(crate) fn normalise_scope(scope: &str) -> String {
+    let lower = scope.to_ascii_lowercase();
+    match lower.strip_prefix(GRAPH_RESOURCE) {
+        Some(rest) => rest.to_string(),
+        None => lower,
+    }
+}
+
+/// The OpenID Connect and meta scopes, which Entra does not list as granted
+/// (or lists as it likes) and which name no Graph permission: never missing.
+/// Takes a normalised scope.
+fn is_meta_scope(normalised: &str) -> bool {
+    matches!(
+        normalised,
+        "offline_access" | "openid" | "profile" | "email"
+    ) || normalised == ".default"
+        || normalised.ends_with("/.default")
+}
+
+/// The scopes of `requested` (space-separated, as in [`AuthConfig::scope`])
+/// that `granted` lacks, spelled as `requested` writes them, each once, in
+/// `requested`'s order. Compared case-insensitively and without the
+/// `https://graph.microsoft.com/` prefix Microsoft puts on granted Graph
+/// scopes; `offline_access`, `openid`, `profile`, `email` and any `.default`
+/// scope are never missing.
+pub fn missing_scopes(requested: &str, granted: &[String]) -> Vec<String> {
+    let granted: Vec<String> = granted.iter().map(|s| normalise_scope(s)).collect();
+    let mut missing: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for scope in requested.split_ascii_whitespace() {
+        let n = normalise_scope(scope);
+        if is_meta_scope(&n) || granted.contains(&n) || seen.contains(&n) {
+            continue;
+        }
+        seen.push(n);
+        missing.push(scope.to_string());
+    }
+    missing
 }
 
 /// Extracts the `preferred_username` claim from a JWT's (unverified)
@@ -331,6 +400,85 @@ mod tests {
         let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
         assert_eq!(t.access_token, "AT2");
         assert_eq!(t.refresh_token, "RT1");
+    }
+
+    const GRANTED: &str = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/People.Read openid profile offline_access";
+
+    fn granted() -> Vec<String> {
+        GRANTED.split(' ').map(str::to_string).collect()
+    }
+
+    fn token_route(body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn redeem_code_keeps_granted_scopes() {
+        let srv = FakeServer::start(vec![token_route(&format!(
+            r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{GRANTED}"}}"#
+        ))]);
+        let req = begin_auth(&cfg(), "http://localhost:8400");
+        let t = redeem_code(&cfg(), &srv.base_url, &req, "THECODE").unwrap();
+        assert_eq!(t.scopes, Some(granted()));
+    }
+
+    #[test]
+    fn refresh_keeps_granted_scopes() {
+        let srv = FakeServer::start(vec![token_route(&format!(
+            r#"{{"access_token":"AT2","expires_in":3600,"scope":"{GRANTED}"}}"#
+        ))]);
+        let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
+        assert_eq!(t.scopes, Some(granted()));
+    }
+
+    #[test]
+    fn token_without_scope_has_unknown_scopes() {
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        )]);
+        let req = begin_auth(&cfg(), "http://localhost:8400");
+        let t = redeem_code(&cfg(), &srv.base_url, &req, "THECODE").unwrap();
+        assert_eq!(t.scopes, None);
+        // Present but blank is unknown too.
+        let t = parse_token_response(r#"{"access_token":"AT","scope":"  "}"#, "").unwrap();
+        assert_eq!(t.scopes, None);
+    }
+
+    #[test]
+    fn missing_scopes_ignores_case_prefix_and_meta_scopes() {
+        assert!(missing_scopes("Mail.ReadWrite People.Read offline_access", &granted()).is_empty());
+        assert!(missing_scopes("mail.readwrite PEOPLE.READ", &granted()).is_empty());
+        assert!(
+            missing_scopes(
+                "https://GRAPH.microsoft.com/mail.readwrite",
+                &["Mail.ReadWrite".to_string()]
+            )
+            .is_empty()
+        );
+        assert!(missing_scopes("openid profile email offline_access", &[]).is_empty());
+        assert!(missing_scopes("https://graph.microsoft.com/.default .default", &[]).is_empty());
+    }
+
+    #[test]
+    fn missing_scopes_reports_an_ungranted_scope() {
+        assert_eq!(
+            missing_scopes("Mail.ReadWrite Mail.Send offline_access", &granted()),
+            vec!["Mail.Send".to_string()]
+        );
+        // Each once, as `requested` spells it, in its order.
+        assert_eq!(
+            missing_scopes(
+                "Calendars.Read Mail.Send mail.send Calendars.Read",
+                &granted()
+            ),
+            vec!["Calendars.Read".to_string(), "Mail.Send".to_string()]
+        );
     }
 
     #[test]

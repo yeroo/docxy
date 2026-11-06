@@ -746,13 +746,15 @@ impl App {
             }
             SyncEvent::InlineImageReady { .. } => {} // for a message no longer open — drop
             // The profile and photo (#1920) are for a client's title bar;
-            // lookxy never asks for them.
+            // lookxy never asks for them. The granted scopes (#1875) are for
+            // a client that asks for more than it may have been granted.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. }
             | SyncEvent::Sending { .. }
             | SyncEvent::ProfileFetched { .. }
-            | SyncEvent::PhotoFetched { .. } => {}
+            | SyncEvent::PhotoFetched { .. }
+            | SyncEvent::Scopes { .. } => {}
         }
     }
 

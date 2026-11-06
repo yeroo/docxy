@@ -95,7 +95,7 @@ issue number to find its notes.
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
   a failed send back to Drafts (#1874), the signed-in user's profile, photo and Sign
-  out (#1920).
+  out (#1920), granted scopes and a refused sign-in's `error_description` (#1875).
 
 ## Build and test
 
