@@ -857,19 +857,13 @@ impl GraphClient {
     /// header without its parameters, `application/octet-stream` when absent.
     fn get_photo(&self, path: &str) -> Result<(Vec<u8>, String), GraphError> {
         let resp = self.send(Method::Get, path, None, &[("Accept", "image/*")])?;
-        let declared = resp
-            .header("Content-Length")
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        if declared.is_some_and(|n| n > PHOTO_MAX as u64) {
-            return Err(photo_too_large(PHOTO_MAX));
-        }
         let content_type = resp
             .header("Content-Type")
             .map(|v| v.split(';').next().unwrap_or("").trim())
             .filter(|v| !v.is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = read_capped(resp.into_reader(), PHOTO_MAX, photo_too_large)?;
+        let bytes = read_response_capped(resp, PHOTO_MAX, photo_too_large)?;
         Ok((bytes, content_type))
     }
 
@@ -1200,14 +1194,25 @@ fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
 /// failure (offline, back-off) and retried for ever. A read that fails
 /// mid-body is still `Transport`.
 fn parse_body_capped(resp: ureq::Response, max: usize) -> Result<Value, GraphError> {
+    let bytes = read_response_capped(resp, max, response_too_large)?;
+    json::parse(&String::from_utf8_lossy(&bytes)).map_err(|e| GraphError::Parse(e.to_string()))
+}
+
+/// Reads a response's body, at most `max` bytes: a `Content-Length` over
+/// `max` is refused before reading (`too_large(max)`), and `read_capped`
+/// stops a body that yields more than it declared, or declares nothing.
+fn read_response_capped(
+    resp: ureq::Response,
+    max: usize,
+    too_large: fn(usize) -> GraphError,
+) -> Result<Vec<u8>, GraphError> {
     let declared = resp
         .header("Content-Length")
         .and_then(|v| v.trim().parse::<u64>().ok());
     if declared.is_some_and(|n| n > max as u64) {
-        return Err(response_too_large(max));
+        return Err(too_large(max));
     }
-    let bytes = read_capped(resp.into_reader(), max, response_too_large)?;
-    json::parse(&String::from_utf8_lossy(&bytes)).map_err(|e| GraphError::Parse(e.to_string()))
+    read_capped(resp.into_reader(), max, too_large)
 }
 
 fn response_too_large(max: usize) -> GraphError {
