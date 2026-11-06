@@ -992,7 +992,9 @@ impl Store {
     /// (#1871): drafts compose changed (`update_draft_fields`) since their
     /// last successful push (`local_edit > 0`), sorted. Every delta that
     /// starts fresh leaves them alone
-    /// ([`Store::merge_message_unless_edited`]).
+    /// ([`Store::merge_message_unless_edited`]). Tests read it; the engine
+    /// checks the marker in the statement that writes.
+    #[cfg(test)]
     pub fn locally_edited_ids(&self) -> Result<Vec<String>, StoreError> {
         let mut stmt = self
             .conn
