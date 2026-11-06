@@ -1400,9 +1400,6 @@ pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Standard base64 (RFC 4648 §4: `+`/`/` alphabet, `=` padding) — the encoding
-/// Graph expects for `fileAttachment.contentBytes`. The `pkce` module's
-/// base64*url* encoder can't be reused (different alphabet, no padding).
 /// Appends `isInline: true` and `contentId` to an attachment's JSON fields
 /// when `content_id` is `Some` (#1949); with `None` adds nothing, so a plain
 /// attachment's body is unchanged.
@@ -1413,6 +1410,9 @@ fn push_inline_fields(fields: &mut Vec<(String, Value)>, content_id: Option<&str
     }
 }
 
+/// Standard base64 (RFC 4648 §4: `+`/`/` alphabet, `=` padding) — the encoding
+/// Graph expects for `fileAttachment.contentBytes`. The `pkce` module's
+/// base64*url* encoder can't be reused (different alphabet, no padding).
 /// Used by `add_file_attachment` to encode inline attachment bytes.
 pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

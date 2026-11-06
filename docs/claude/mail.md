@@ -348,9 +348,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   time, every plain file row) and `data` (set = the bytes are in the row).
   A row from before reads as a plain file row.
 - `add_outbound_attachment` is unchanged (lookxy's calls). An inline file:
-  `add_inline_outbound_attachment_file`, keyed by its path and `INSERT OR
-  IGNORE` like a plain file (the file is read at send time), so the same
-  file inline under a second content id is ignored. Bytes:
+  `add_inline_outbound_attachment_file`, keyed by its path and
+  upserted: it makes a pending plain row of the same path inline in place
+  (rowid kept); an uploaded plain row stays plain (Graph has it
+  non-inline), and an inline row is left alone (the file is read at send
+  time), so the same file under a second content id is ignored, as is a
+  plain `add_outbound_attachment` over an inline row. Bytes:
   `add_outbound_attachment_bytes`, always inline, keyed `cid:<content_id>`
   (a reserved key namespace, never a file path; the key is returned for
   `remove_*`/`mark_*`), `size` = `bytes.len()`, content type required. A

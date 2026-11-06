@@ -1445,9 +1445,12 @@ impl Store {
     /// Records the file `path` attached inline to draft `draft_id` with
     /// `content_id` (#1949), so an html body's `cid:` reference finds it.
     /// `content_type` `None` is derived from the name at send time. Keyed by
-    /// its path and idempotent like `add_outbound_attachment` (the file is
-    /// read at send time, so a re-add needs no update): the same file inline
-    /// under a second content id is ignored.
+    /// its path. The same path already attached as a pending plain file is
+    /// made inline in place (its attach position holds, a `None` type keeps
+    /// the row's); an uploaded plain row stays plain (Graph has it
+    /// non-inline). An inline row is left as it is: the file is read at send
+    /// time, so a re-add needs no update, and the same file under a second
+    /// content id is ignored.
     pub fn add_inline_outbound_attachment_file(
         &self,
         draft_id: &str,
@@ -1459,10 +1462,16 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
-                "INSERT OR IGNORE INTO outbound_attachments
+                "INSERT INTO outbound_attachments
                      (draft_id, path, name, size, content_type, content_id) VALUES (",
                 current_id_sql!(),
-                ", ?2, ?3, ?4, ?5, ?6)"
+                ", ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(draft_id, path) DO UPDATE SET
+                     content_id = excluded.content_id,
+                     content_type = COALESCE(excluded.content_type,
+                                             outbound_attachments.content_type)
+                 WHERE outbound_attachments.uploaded = 0
+                   AND outbound_attachments.content_id IS NULL"
             ),
             params![draft_id, path, name, size, content_type, content_id],
         )?;
@@ -4760,6 +4769,49 @@ mod draft_tests {
         s.remove_outbound_attachment(&id, &key).unwrap();
         assert!(s.outbound_attachment_bytes(&id, &key).unwrap().is_none());
         assert_eq!(s.outbound_attachments(&id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_inline_add_makes_a_pending_plain_file_inline_in_place() {
+        // #1949 r1: the same path attached plain, then inline: one row, same
+        // position, now inline (else `cid:logo` would find nothing).
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Hi", "b@x", "", "<p>x</p>").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/logo.png", "logo.png", 7)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/z.pdf", "z.pdf", 1)
+            .unwrap();
+        s.add_inline_outbound_attachment_file(
+            &id,
+            "/tmp/logo.png",
+            "logo.png",
+            7,
+            Some("image/x-logo"),
+            "logo",
+        )
+        .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, "/tmp/logo.png", "same attach position");
+        assert_eq!(got[0].content_id.as_deref(), Some("logo"));
+        assert_eq!(got[0].content_type.as_deref(), Some("image/x-logo"));
+        // Now inline: a second content id is ignored, and so is a plain add.
+        s.add_inline_outbound_attachment_file(&id, "/tmp/logo.png", "logo.png", 7, None, "other")
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/logo.png", "logo.png", 7)
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got[0].content_id.as_deref(), Some("logo"));
+        assert_eq!(got[0].content_type.as_deref(), Some("image/x-logo"));
+        // An uploaded plain row stays plain: Graph has it non-inline.
+        s.mark_outbound_attachment_uploaded(&id, "/tmp/z.pdf")
+            .unwrap();
+        s.add_inline_outbound_attachment_file(&id, "/tmp/z.pdf", "z.pdf", 1, None, "z")
+            .unwrap();
+        let got = s.outbound_attachments(&id).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].content_id, None);
+        assert!(got[1].uploaded);
     }
 
     #[test]

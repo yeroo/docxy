@@ -1017,7 +1017,8 @@ mod tests {
             .create_local_draft("Hi", "bob@x", "", r#"<p><img src="cid:pic1"></p>"#)
             .unwrap();
         store
-            .add_outbound_attachment_bytes(&local_id, "pic.png", "image/png", b"\x89PNG", "pic1")
+            // A name whose extension says nothing: the type sent must be the row's.
+            .add_outbound_attachment_bytes(&local_id, "pasted", "image/png", b"\x89PNG", "pic1")
             .unwrap();
 
         apply_op(
@@ -1040,7 +1041,7 @@ mod tests {
         let a = &atts[0];
         assert_eq!(a.get("isInline").and_then(Value::as_bool), Some(true));
         assert_eq!(a.get("contentId").and_then(Value::as_str), Some("pic1"));
-        assert_eq!(a.get("name").and_then(Value::as_str), Some("pic.png"));
+        assert_eq!(a.get("name").and_then(Value::as_str), Some("pasted"));
         assert_eq!(
             a.get("contentType").and_then(Value::as_str),
             Some("image/png")
