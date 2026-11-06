@@ -145,8 +145,8 @@ impl Docxy {
         let read = std::cell::OnceCell::new();
         let html = || read.get_or_init(|| self.clipboard_read_html()).clone();
         let items = as_items(
-            rich_source(ours, &now, rtf.as_deref(), &html),
-            text_only_text(ours, &now, rtf.as_deref(), &html).is_some(),
+            rich_source(ours, &now, rtf.as_deref(), html),
+            text_only_text(ours, &now, rtf.as_deref(), html).is_some(),
         );
         if items.is_empty() {
             self.set_status("There is nothing to paste");

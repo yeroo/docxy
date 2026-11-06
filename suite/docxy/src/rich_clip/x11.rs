@@ -485,12 +485,14 @@ fn latin1(text: &str) -> Vec<u8> {
 fn utf8_page(bytes: Vec<u8>) -> Vec<u8> {
     let utf16 = |rest: &[u8], big: bool| {
         let units: Vec<u16> = rest
-            .chunks_exact(2)
-            .map(|p| {
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| {
                 if big {
-                    u16::from_be_bytes([p[0], p[1]])
+                    u16::from_be_bytes(p)
                 } else {
-                    u16::from_le_bytes([p[0], p[1]])
+                    u16::from_le_bytes(p)
                 }
             })
             .collect();
@@ -551,8 +553,10 @@ impl Reader {
         let bytes = self.convert(self.atoms.TARGETS, 1 << 20)?;
         Some(
             bytes
-                .chunks_exact(4)
-                .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_ne_bytes(c))
                 .collect(),
         )
     }
