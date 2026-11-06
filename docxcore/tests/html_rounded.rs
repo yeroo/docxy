@@ -98,8 +98,8 @@ fn table(d: &Document) -> &Table {
 }
 
 /// Regression guard (passes before #1926 too): a card's `border-radius`
-/// is dropped; its background and padding import as before, and no radius
-/// value shows as text.
+/// is dropped; its background and padding import (a `div` card's as its
+/// own one-cell table since #1927), and no radius value shows as text.
 #[test]
 fn a_cards_border_radius_is_never_text_and_its_shading_stays() {
     let got = digest();
@@ -108,12 +108,18 @@ fn a_cards_border_radius_is_never_text_and_its_shading_stays() {
     assert!(tcpr(1).contains(r#"w:fill="F4F6F8""#), "{}", tcpr(1));
     assert!(tcpr(1).contains("<w:tcMar>"), "{}", tcpr(1));
     assert!(tcpr(2).contains(r#"w:fill="FFF8E1""#), "{}", tcpr(2));
-    // The div card: paragraph shading in its cell.
-    let div_shaded = t.rows[3].cells[0].blocks.iter().any(|b| match b {
-        Block::Paragraph(p) => p.props.raw_props.iter().any(|r| r.contains("E8F5E9")),
-        _ => false,
-    });
-    assert!(div_shaded, "{:?}", t.rows[3].cells[0].blocks);
+    // The div card: a one-cell table of its fill in its cell (#1927).
+    let card = t.rows[3].cells[0]
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Table(c) => Some(c),
+            _ => None,
+        })
+        .expect("the div card's table");
+    let card_tcpr = card.rows[0].cells[0].raw_tcpr.clone().unwrap_or_default();
+    assert!(card_tcpr.contains(r#"w:fill="E8F5E9""#), "{card_tcpr}");
+    assert!(!card_tcpr.contains("radius"), "{card_tcpr}");
     let text = docxcore::import::paragraph_texts(&got.document).join("\n");
     let cells: Vec<String> = t
         .rows

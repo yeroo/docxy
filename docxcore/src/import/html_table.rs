@@ -133,6 +133,11 @@ pub(crate) fn placeholder() -> Block {
     Block::Raw(String::new())
 }
 
+/// Whether `b` is a nested table's [`placeholder`].
+pub(crate) fn is_placeholder(b: &Block) -> bool {
+    matches!(b, Block::Raw(s) if s.is_empty())
+}
+
 /// px as twips, saturating.
 pub(crate) fn px_twips(px: u32) -> u32 {
     px.saturating_mul(15).min(MAX_TWIPS)
