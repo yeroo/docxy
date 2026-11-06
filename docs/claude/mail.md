@@ -337,3 +337,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `SyncEvent::Error`, which is what a host's status line shows. The body
   stays in the error (`Debug`, matches). `send_error_text` keeps `HTTP
   {status}` without a message, and caps the message the same way.
+
+## Inline outbound attachments (#1949)
+
+- An outbound draft attachment may be inline with a content id (an html
+  body's `<img src="cid:pic1">`), from a file or from bytes (a pasted
+  picture). `outbound_attachments` has three nullable columns (in
+  `SCHEMA_SQL` and as idempotent ALTERs in `Store::init`): `content_id`
+  (set = inline), `content_type` (NULL = `content_type_for(name)` at send
+  time, every plain file row) and `data` (set = the bytes are in the row).
+  A row from before reads as a plain file row.
+- `add_outbound_attachment` is unchanged (lookxy's calls). An inline file:
+  `add_inline_outbound_attachment_file`, keyed by its path and `INSERT OR
+  IGNORE` like a plain file (the file is read at send time), so the same
+  file inline under a second content id is ignored. Bytes:
+  `add_outbound_attachment_bytes`, always inline, keyed `cid:<content_id>`
+  (a reserved key namespace, never a file path; the key is returned for
+  `remove_*`/`mark_*`), `size` = `bytes.len()`, content type required. A
+  re-add of a content id replaces a pending row's name, type and bytes in
+  place (`ON CONFLICT DO UPDATE`, not `INSERT OR REPLACE`, so the rowid and
+  attach order hold); an uploaded row is left alone (Graph has its bytes).
+- `outbound_attachments()` does not load `data` (compose lists on every
+  redraw): `from_bytes` says it is there, `outbound_attachment_bytes` reads
+  it for the send. `reconcile_id`, `discard_pending_*`, `clear_*`, `remove_*`
+  and `mark_*` move or delete whole rows, so inline and bytes rows follow
+  the #1884 and #1874 rules unchanged.
+- `GraphClient::add_attachment_with(.., content_id)`: with `Some`, both the
+  small `fileAttachment` POST and the upload session's `AttachmentItem` get
+  `isInline: true` and `contentId` after the other keys. `add_attachment`
+  and `add_file_attachment` keep their signatures and pass `None`: a plain
+  attachment's request body is unchanged (no `isInline: false`).
+  `apply_send` reads a bytes row's data (none left is a `Parse` error, like a
+  missing file) and uploads with the row's content id and type.
+- Not done: a lookxy UI for inline pictures, turning an html body's `data:`
+  images into `cid:` attachments, checking that body references and content
+  ids agree.
