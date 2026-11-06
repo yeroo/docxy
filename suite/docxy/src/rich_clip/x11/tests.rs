@@ -430,7 +430,15 @@ fn manager(display: &str) -> JoinHandle<Vec<(String, Vec<u8>)>> {
     let atoms = Atoms::new(&conn).unwrap().reply().unwrap();
     conn.set_selection_owner(win, atoms.CLIPBOARD_MANAGER, CURRENT_TIME)
         .unwrap();
-    conn.flush().unwrap();
+    // A round trip, so the server has made it the owner before the test
+    // asks from another connection (a flush alone leaves a race).
+    let owner = conn
+        .get_selection_owner(atoms.CLIPBOARD_MANAGER)
+        .unwrap()
+        .reply()
+        .unwrap()
+        .owner;
+    assert_eq!(owner, win);
     let display = display.to_string();
     std::thread::spawn(move || {
         loop {
