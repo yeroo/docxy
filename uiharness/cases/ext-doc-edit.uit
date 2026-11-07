@@ -5,10 +5,11 @@
 # link paragraph, an indented link paragraph, a picture, three tables, then
 # Line 1..Line 80; see ext-doc-view.uit). The extension calls only the
 # view's public API: `ext-doc-set {"editable":...}` is `set_editable`,
-# `ext-doc-call` is `format` / `undo` / `redo`, `ext-doc-document` reads
+# `ext-doc-call` is `format` / `undo` / `redo` / `insert_text` / `copy` /
+# `cut` (#1977), `ext-doc-document` reads
 # `document()` and `package()`, and `ext-doc-read` adds the caret, its
 # formatting (`caret_format`), whether the caret's painted piece is inside
-# the view (`caret_in_view`), `can_undo` / `can_redo` and how many change
+# the view (`caret_in_view`), `can_undo` / `can_redo` / `can_copy` and how many change
 # events the extension got (`change_calls`). Keys go through `real-key` /
 # `real-type`, as the OS delivers them. Each test opens its own Mail tab
 # and closes it at the end.
@@ -238,6 +239,92 @@ test issue 1947 read-only refuses typing and the host's calls, and a dialog over
   call real-type {"text":"!"}
   call ext-doc-document {}
   assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1977 the host inserts text at the caret, and copies and cuts the selection
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.can_copy is false
+  assert reply.change_calls is 0
+  # Insert: a newline splits the paragraph, the caret ends after the text.
+  call ext-doc-call {"insert_text":"!\nNew para"}
+  assert reply.done is true
+  assert reply.caret.path.0 is 2
+  call ext-doc-read {}
+  assert reply.change_calls is 1
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  assert reply.paragraphs.2.text is New para
+  call real-type {"text":"x"}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is New parax
+  shot window
+  # One undo takes back the typing, the next the whole insert.
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is New para
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.paragraphs.2.text is Follow the docxy link here.
+  # Copy: the clipboard gets the selection, the document stays.
+  call pointer-drag {"from":"ext-doc-word:Beta:start","to":"ext-doc-word:Beta:end"}
+  call ext-doc-read {}
+  assert reply.selection is Beta
+  assert reply.can_copy is true
+  call ext-doc-set {"editable":true}
+  call ext-doc-call {"copy":true}
+  assert reply.done is true
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  call clipboard {"action":"read"}
+  assert reply.text is Beta
+  assert reply.rtf_bold is Beta
+  # Cut: the clipboard's text can only be the cut's.
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call ext-doc-call {"cut":true}
+  assert reply.done is true
+  assert reply.can_copy is false
+  call ext-doc-read {}
+  assert reply.change_calls is not {ext-doc-set.change_calls}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is empty
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha Beta Gamma
+  assert reply.rtf_bold is Beta
+  # Nothing selected: nothing to cut or copy.
+  call ext-doc-call {"cut":true}
+  assert reply.done is false
+  call ext-doc-call {"copy":true}
+  assert reply.done is false
+  call ext-doc-call {"undo":true}
+  assert reply.done is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  # Read-only: no insert and no cut, but Copy copies as Ctrl+C does.
+  call ext-doc-set {"editable":false}
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Alpha:end"}
+  call ext-doc-call {"insert_text":"No"}
+  assert reply.done is false
+  call ext-doc-call {"cut":true}
+  assert reply.done is false
+  assert reply.can_copy is true
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  call ext-doc-call {"copy":true}
+  assert reply.done is true
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
