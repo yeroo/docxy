@@ -2548,14 +2548,20 @@ impl Engine {
     }
 
     /// The one body fetch `FetchBody` and the engine's own fetches (#1978)
-    /// share, so a reader cannot tell their bodies apart: `get_body` in the
-    /// engine's format, `Store::put_fetched_body` (the format asked for in
-    /// `fetched_as`), then `BodyReady`. `Ok(false)`: the store refused the
+    /// share, so a reader cannot tell their bodies apart: `get_body_with_headers`
+    /// in the engine's format, `Store::put_fetched_body_with_headers` (the
+    /// format asked for in `fetched_as`, and the Exchange headers that came
+    /// with the body, #1933), then `BodyReady`. `Ok(false)`: the store refused the
     /// body (no `BodyReady` sent).
     fn fetch_and_store_body(&mut self, id: &str) -> Result<bool, GraphError> {
         let format = self.config.options.body_format;
-        let body = self.with_auth(|c| c.get_body(id, format == BodyFormat::Text))?;
-        if self.store.put_fetched_body(id, &body, format).is_err() {
+        let (body, headers) =
+            self.with_auth(|c| c.get_body_with_headers(id, format == BodyFormat::Text))?;
+        if self
+            .store
+            .put_fetched_body_with_headers(id, &body, format, &headers)
+            .is_err()
+        {
             return Ok(false);
         }
         self.emit(SyncEvent::BodyReady { id: id.to_string() });
@@ -3745,6 +3751,17 @@ mod tests {
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
     use std::sync::Arc;
+
+    /// The query of a body GET: `get_body_with_headers`'s `$select`
+    /// (`BODY_SELECT`, #1933).
+    fn body_query() -> String {
+        format!("?$select={}", crate::graph::client::BODY_SELECT)
+    }
+
+    /// `id`'s body GET path.
+    fn body_get_path(id: &str) -> String {
+        format!("/me/messages/{id}{}", body_query())
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -5870,7 +5887,7 @@ mod tests {
     /// M1's body GET (`get_body`'s path), answering `content_type`/`content`.
     fn body_route(content_type: &str, content: &str) -> Route {
         get_route(
-            "/me/messages/M1?$select=body",
+            &body_get_path("M1"),
             200,
             &format!(r#"{{"body":{{"contentType":"{content_type}","content":"{content}"}}}}"#),
         )
@@ -5891,7 +5908,7 @@ mod tests {
     fn m1_body_gets(srv: &FakeServer) -> Vec<crate::testserver::RecordedRequest> {
         srv.requests()
             .into_iter()
-            .filter(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select=body"))
+            .filter(|r| r.method == "GET" && r.path.starts_with(&body_get_path("M1")))
             .collect()
     }
 
@@ -5932,6 +5949,40 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_body_stores_exchange_auth_as_header() {
+        // #1933: the body GET carries `internetMessageHeaders`; the engine
+        // stores the ones the store keeps with the body, the rest not.
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-headers",
+            vec![get_route(
+                &body_get_path("M1"),
+                200,
+                r#"{"body":{"contentType":"text","content":"hi"},"internetMessageHeaders":[
+                    {"name":"Received","value":"from x"},
+                    {"name":"X-MS-Exchange-Organization-AuthAs","value":"Internal"}
+                ]}"#,
+            )],
+            EngineOptions::without_prefetch(),
+        );
+        fetch_m1_body(&handle);
+
+        assert_eq!(m1_body_gets(&srv).len(), 1);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.get_body("M1").unwrap().unwrap().content, "hi");
+        assert_eq!(
+            store
+                .message_header("M1", "X-MS-Exchange-Organization-AuthAs")
+                .unwrap()
+                .as_deref(),
+            Some("Internal")
+        );
+        assert_eq!(store.message_header("M1", "Received").unwrap(), None);
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6057,7 +6108,7 @@ mod tests {
                     body: r#"{"id":"DRAFT1","conversationId":"C1","subject":"Re: Hello","from":{"emailAddress":{"name":"Alice","address":"alice@x"}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":""}"#.into(),
                 },
                 get_route(
-                    "/me/messages/DRAFT1?$select=body",
+                    &body_get_path("DRAFT1"),
                     200,
                     r#"{"body":{"contentType":"text","content":"> quoted"}}"#,
                 ),
@@ -12150,7 +12201,7 @@ mod tests {
             }
 
             fn body_path(id: &str) -> String {
-                format!("/me/messages/{id}?$select=body")
+                body_get_path(id)
             }
 
             fn body_route(id: &str) -> Route {
@@ -12184,10 +12235,9 @@ mod tests {
             fn body_gets(srv: &FakeServer) -> Vec<(String, Instant)> {
                 srv.requests()
                     .into_iter()
-                    .filter(|r| r.method == "GET" && r.path.ends_with("?$select=body"))
+                    .filter(|r| r.method == "GET" && r.path.ends_with(&body_query()))
                     .map(|r| {
-                        let id = r.path
-                            ["/me/messages/".len()..r.path.len() - "?$select=body".len()]
+                        let id = r.path["/me/messages/".len()..r.path.len() - body_query().len()]
                             .to_string();
                         (id, r.at)
                     })
@@ -12704,7 +12754,7 @@ mod tests {
                 let body_at: Vec<usize> = paths
                     .iter()
                     .enumerate()
-                    .filter(|(_, p)| p.ends_with("?$select=body"))
+                    .filter(|(_, p)| p.ends_with(&body_query()))
                     .map(|(i, _)| i)
                     .collect();
                 assert!(body_at.iter().all(|&i| i < first_page), "{paths:?}");
@@ -12815,16 +12865,16 @@ mod tests {
                 let order: Vec<String> = srv
                     .requests()
                     .into_iter()
-                    .filter(|r| r.path.ends_with("?$select=body") || r.method == "PATCH")
+                    .filter(|r| r.path.ends_with(&body_query()) || r.method == "PATCH")
                     .map(|r| format!("{} {}", r.method, r.path))
                     .collect();
                 assert_eq!(
                     order,
                     [
-                        "GET /me/messages/R1?$select=body",
-                        "PATCH /me/messages/R3",
-                        "GET /me/messages/R2?$select=body",
-                        "GET /me/messages/R3?$select=body",
+                        format!("GET {}", body_get_path("R1")),
+                        "PATCH /me/messages/R3".to_string(),
+                        format!("GET {}", body_get_path("R2")),
+                        format!("GET {}", body_get_path("R3")),
                     ]
                 );
                 stop(handle);
@@ -12952,16 +13002,16 @@ mod tests {
                 let order: Vec<String> = srv
                     .requests()
                     .into_iter()
-                    .filter(|r| r.path.ends_with("?$select=body") || r.method == "PATCH")
+                    .filter(|r| r.path.ends_with(&body_query()) || r.method == "PATCH")
                     .map(|r| format!("{} {}", r.method, r.path))
                     .collect();
                 assert_eq!(
                     order,
                     [
-                        "GET /me/messages/N1?$select=body",
-                        "PATCH /me/messages/N3",
-                        "GET /me/messages/N2?$select=body",
-                        "GET /me/messages/N3?$select=body",
+                        format!("GET {}", body_get_path("N1")),
+                        "PATCH /me/messages/N3".to_string(),
+                        format!("GET {}", body_get_path("N2")),
+                        format!("GET {}", body_get_path("N3")),
                     ]
                 );
                 stop(handle);

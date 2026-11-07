@@ -15,7 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use crate::graph::client::{AttendeeInput, EventFieldSet};
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
-    MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link_in,
+    MasterCategory, Message, MessageFields, MessageHeader, Recipient, Recurrence, is_stored_header,
+    meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -1737,37 +1738,73 @@ impl Store {
     /// `schema.rs`) keep `messages_fts` in step with this automatically, so
     /// `search` sees the new content right away.
     pub fn put_body(&self, message_id: &str, b: &Body) -> Result<(), StoreError> {
-        self.write_body(message_id, b, None)
+        write_body_on(&self.conn, message_id, b, None)
     }
 
     /// Inserts or replaces the body of a message as `FetchBody` fetched it,
     /// recording the format it asked Graph for (`fetched_as`, #1901), which
     /// for `Html` can differ from the content type that came back (a
-    /// plain-text message's native body is text).
+    /// plain-text message's native body is text). Leaves the message's
+    /// stored headers as they are, an earlier fetch's included: the engine
+    /// stores a fetched body with [`Store::put_fetched_body_with_headers`].
     pub fn put_fetched_body(
         &self,
         message_id: &str,
         b: &Body,
         asked: BodyFormat,
     ) -> Result<(), StoreError> {
-        self.write_body(message_id, b, Some(asked))
+        write_body_on(&self.conn, message_id, b, Some(asked))
     }
 
-    fn write_body(
+    /// [`Store::put_fetched_body`] and the internet headers that came with
+    /// the body (#1933), in one transaction: the message's stored headers
+    /// are replaced by those of `headers` named in `STORED_HEADERS` (a
+    /// header Graph no longer sends reads `None` after a refetch), names
+    /// lowercased, values trimmed, the first of a name kept. Read them with
+    /// [`Store::message_header`].
+    pub fn put_fetched_body_with_headers(
         &self,
         message_id: &str,
         b: &Body,
-        asked: Option<BodyFormat>,
+        asked: BodyFormat,
+        headers: &[MessageHeader],
     ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO bodies (message_id, content_type, content, fetched_as) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(message_id) DO UPDATE SET
-                 content_type = excluded.content_type,
-                 content = excluded.content,
-                 fetched_as = excluded.fetched_as",
-            params![message_id, b.content_type, b.content, asked.map(BodyFormat::as_str)],
+        let tx = self.conn.unchecked_transaction()?;
+        write_body_on(&tx, message_id, b, Some(asked))?;
+        tx.execute(
+            "DELETE FROM message_headers WHERE message_id = ?1",
+            params![message_id],
         )?;
+        for h in headers.iter().filter(|h| is_stored_header(&h.name)) {
+            tx.execute(
+                "INSERT OR IGNORE INTO message_headers (message_id, name, value) VALUES (?1, ?2, ?3)",
+                params![message_id, h.name.to_ascii_lowercase(), h.value.trim()],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    /// The value of the internet header `name` stored with the message's
+    /// fetched body (#1933), matched ignoring ASCII case: `None` when the
+    /// body came without that header, the header is not one the store keeps
+    /// (`STORED_HEADERS`), or the message was stored before headers were
+    /// (old mail is never refetched for them). Deciding on it is the
+    /// caller's.
+    pub fn message_header(
+        &self,
+        message_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM message_headers WHERE message_id = ?1 AND name = ?2",
+                params![message_id, name.to_ascii_lowercase()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value)
     }
 
     /// The stored body of a message when it satisfies `format`, else `None`
@@ -2282,7 +2319,8 @@ impl Store {
         Ok(())
     }
 
-    /// Rewrites every row keyed by `local_id` (the message, its body, and —
+    /// Rewrites every row keyed by `local_id` (the message, its body and
+    /// stored headers, and —
     /// via the `messages`/`bodies` triggers described in `schema.rs` — the
     /// `messages_fts` index) to `graph_id`, once `create_draft` has pushed
     /// the local draft to Graph and gotten back its real id. Runs as one
@@ -2311,6 +2349,10 @@ impl Store {
         )?;
         tx.execute(
             "UPDATE bodies SET message_id = ?2 WHERE message_id = ?1",
+            params![local_id, graph_id],
+        )?;
+        tx.execute(
+            "UPDATE message_headers SET message_id = ?2 WHERE message_id = ?1",
             params![local_id, graph_id],
         )?;
         tx.execute(
@@ -3313,6 +3355,31 @@ pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
 /// an id as not-yet-synced-to-Graph throughout the store and sync engine.
 fn local_draft_id() -> String {
     format!("local:{}", to_hex(&crate::pkce::random_bytes(16)))
+}
+
+/// Inserts or replaces a message's body on `conn` (the store's connection or
+/// a transaction on it), with the format it was fetched in (`None`: a local
+/// write).
+fn write_body_on(
+    conn: &Connection,
+    message_id: &str,
+    b: &Body,
+    asked: Option<BodyFormat>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO bodies (message_id, content_type, content, fetched_as) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(message_id) DO UPDATE SET
+             content_type = excluded.content_type,
+             content = excluded.content,
+             fetched_as = excluded.fetched_as",
+        params![
+            message_id,
+            b.content_type,
+            b.content,
+            asked.map(BodyFormat::as_str)
+        ],
+    )?;
+    Ok(())
 }
 
 /// `Store::event_for_send` on `conn` (a transaction in
@@ -7575,6 +7642,231 @@ mod body_format_tests {
                 .unwrap(),
             vec!["RTF", "OLDTEXT", "TEXT", "NONE"]
         );
+    }
+
+    // --- Exchange headers with a fetched body (#1933) --------------------
+
+    const AUTH_AS: &str = "X-MS-Exchange-Organization-AuthAs";
+    const DIRECTIONALITY: &str = "X-MS-Exchange-Organization-MessageDirectionality";
+
+    fn header(name: &str, value: &str) -> MessageHeader {
+        MessageHeader {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    fn headers_rows(s: &Store) -> i64 {
+        s.conn
+            .query_row("SELECT COUNT(*) FROM message_headers", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn message_header_stored_with_fetched_body() {
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[
+                header(AUTH_AS, " Internal "),
+                header(DIRECTIONALITY, "Originating"),
+                // Not one the store keeps, whatever a caller passes.
+                header("Received", "from x"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.get_body("M").unwrap().unwrap().content, "hi");
+        assert!(s.get_body_for("M", BodyFormat::Text).unwrap().is_some());
+        assert_eq!(
+            s.message_header("M", AUTH_AS).unwrap().as_deref(),
+            Some("Internal")
+        );
+        assert_eq!(
+            s.message_header("M", DIRECTIONALITY).unwrap().as_deref(),
+            Some("Originating")
+        );
+        assert_eq!(s.message_header("M", "Received").unwrap(), None);
+        assert_eq!(headers_rows(&s), 2);
+    }
+
+    #[test]
+    fn message_header_absent_is_none() {
+        let s = store_with_message();
+        // No body stored at all, and no such message.
+        assert_eq!(s.message_header("M", AUTH_AS).unwrap(), None);
+        assert_eq!(s.message_header("nope", AUTH_AS).unwrap(), None);
+        // A body fetched without the header.
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[header(DIRECTIONALITY, "Incoming")],
+        )
+        .unwrap();
+        assert_eq!(s.message_header("M", AUTH_AS).unwrap(), None);
+        // An empty value is a value (as Graph sent it, trimmed).
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[header(AUTH_AS, "  ")],
+        )
+        .unwrap();
+        assert_eq!(s.message_header("M", AUTH_AS).unwrap().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn message_header_name_ignores_case() {
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[
+                header("x-ms-exchange-organization-AUTHAS", "Anonymous"),
+                // A second of the same name (another case): the first wins.
+                header(AUTH_AS, "Internal"),
+            ],
+        )
+        .unwrap();
+        for name in [
+            AUTH_AS,
+            "x-ms-exchange-organization-authas",
+            "X-MS-EXCHANGE-ORGANIZATION-AUTHAS",
+        ] {
+            assert_eq!(
+                s.message_header("M", name).unwrap().as_deref(),
+                Some("Anonymous"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn refetch_replaces_message_headers() {
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("v1"),
+            BodyFormat::Text,
+            &[
+                header(AUTH_AS, "Internal"),
+                header(DIRECTIONALITY, "Originating"),
+            ],
+        )
+        .unwrap();
+        s.put_fetched_body_with_headers(
+            "M",
+            &html_body("<p>v2</p>"),
+            BodyFormat::Html,
+            &[header(AUTH_AS, "Anonymous")],
+        )
+        .unwrap();
+        assert_eq!(s.get_body("M").unwrap().unwrap().content, "<p>v2</p>");
+        assert_eq!(
+            s.message_header("M", AUTH_AS).unwrap().as_deref(),
+            Some("Anonymous")
+        );
+        assert_eq!(s.message_header("M", DIRECTIONALITY).unwrap(), None);
+    }
+
+    #[test]
+    fn a_refused_body_stores_no_headers() {
+        // No message row: the body's foreign key refuses it, and the
+        // headers go with it (one transaction).
+        let s = store_with_message();
+        assert!(
+            s.put_fetched_body_with_headers(
+                "nope",
+                &text_body("hi"),
+                BodyFormat::Text,
+                &[header(AUTH_AS, "Internal")],
+            )
+            .is_err()
+        );
+        assert_eq!(headers_rows(&s), 0);
+    }
+
+    #[test]
+    fn message_headers_go_with_a_deleted_message() {
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[header(AUTH_AS, "Internal")],
+        )
+        .unwrap();
+        s.delete_message("M").unwrap();
+        assert_eq!(s.message_header("M", AUTH_AS).unwrap(), None);
+        assert_eq!(headers_rows(&s), 0);
+    }
+
+    #[test]
+    fn reconcile_id_moves_message_headers() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("Subj", "a@x", "", "body").unwrap();
+        s.put_fetched_body_with_headers(
+            &local,
+            &text_body("body"),
+            BodyFormat::Text,
+            &[header(AUTH_AS, "Internal")],
+        )
+        .unwrap();
+        s.reconcile_id(&local, "G").unwrap();
+        assert_eq!(
+            s.message_header("G", AUTH_AS).unwrap().as_deref(),
+            Some("Internal")
+        );
+        assert_eq!(s.message_header(&local, AUTH_AS).unwrap(), None);
+    }
+
+    #[test]
+    fn message_header_of_a_store_from_before_the_table_is_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-headers-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            // Take the database back to before the table existed, then
+            // store mail the way an older build did.
+            s.conn.execute_batch("DROP TABLE message_headers;").unwrap();
+            s.upsert_folder(&MailFolder {
+                id: "INBOX".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            s.upsert_message("INBOX", &message("M", false)).unwrap();
+            s.put_fetched_body("M", &text_body("old"), BodyFormat::Text)
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.message_header("M", AUTH_AS).unwrap(), None);
+        assert_eq!(s.get_body("M").unwrap().unwrap().content, "old");
+        // The table is there now: a later fetch stores its headers.
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("new"),
+            BodyFormat::Text,
+            &[header(AUTH_AS, "Internal")],
+        )
+        .unwrap();
+        assert_eq!(
+            s.message_header("M", AUTH_AS).unwrap().as_deref(),
+            Some("Internal")
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
