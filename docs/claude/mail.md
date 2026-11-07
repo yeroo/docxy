@@ -42,7 +42,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   unchanged); `Html` sends no `Prefer`, so a body comes back native (html,
   or text for a plain-text message).
 - `bodies.fetched_as` records the format `FetchBody` *asked for*
-  (`Store::put_fetched_body`), not the content type that came back. NULL is
+  (`Store::put_fetched_body_with_headers`), not the content type that came back. NULL is
   a body not fetched by `FetchBody`: `put_body` (a `createReply` draft),
   `create_local_draft`, `update_draft_fields` (which also makes the body
   html, as compose writes html), or a row from before the column.
@@ -542,7 +542,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   window bounds it). A command a checkpoint kept, or a tick come due, ends
   the batch, so they wait for one body at most, as for one backfill page; a
   kept command also ends a round's new-mail bodies (the prefetch takes the
-  rest). One `GET /me/messages/{id}?$select=body` each, the
+  rest). One `GET /me/messages/{id}?$select=body,internetMessageHeaders`
+  (`BODY_SELECT`, #1933) each, the
   call `FetchBody` makes (`fetch_and_store_body` is shared: `fetched_as`
   recorded, `BodyReady` sent, so `BodyReady` may name a message nobody
   opened).
@@ -591,6 +592,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   attachments still holds a click), the folder-tree listing or the
   calendar's pages; no `$batch`; pictures and attachments are not
   prefetched; no lookxy setting for the window.
+
+## Exchange headers with a body (#1933)
+
+- The body GET (`GraphClient::get_body_with_headers`) is
+  `/me/messages/{id}?$select=body,internetMessageHeaders` (`BODY_SELECT`): the
+  headers come in the same request, never in a second one. `get_body` is that
+  call with the headers dropped (a fresh draft's, `store_composed_draft`).
+- Only `graph::model::STORED_HEADERS` are kept: `X-MS-Exchange-Organization-AuthAs`
+  (`Internal` inside the tenant, `Anonymous` from outside) and
+  `X-MS-Exchange-Organization-MessageDirectionality` (`Originating` /
+  `Incoming`), never the whole block. Names match ignoring ASCII case, the
+  first of a name wins, values are trimmed (an empty one stays `Some("")`).
+  Parsing is lenient: no field, a null one or a malformed entry gives no
+  header, never an error.
+- `SyncEngine::fetch_and_store_body` (FetchBody and the engine's own fetches)
+  stores them with `Store::put_fetched_body_with_headers`: body and headers in
+  one transaction, the message's earlier headers replaced. `put_fetched_body`
+  leaves headers alone; it is `#[cfg(test)]`, tests use it.
+- They live in `message_headers` (`message_id`, lowercased `name`, `value`),
+  a new table, so an older database gets it empty at `open` and its mail
+  reads `None`; old mail is never refetched for them. Rows go with their
+  message (FK cascade) and follow `reconcile_id`.
+- `Store::message_header(id, name)` reads one; `None`: no such header came,
+  it is not a kept one, or the body was stored before #1933. Deciding on it is
+  the caller's.
+- Tests: `client.rs` `get_body_selects_internet_message_headers`,
+  `get_body_without_usable_headers_yields_none`; `store`
+  `body_format_tests::message_header_*`, `refetch_replaces_message_headers`,
+  `a_failed_header_write_keeps_the_earlier_body_and_headers`,
+  `a_missing_message_stores_no_headers`, `message_headers_go_with_a_deleted_message`,
+  `reconcile_id_moves_message_headers`; `engine.rs`
+  `fetch_body_stores_exchange_auth_as_header`.
 
 ## Calendar sync keeps reminder settings (#1937)
 

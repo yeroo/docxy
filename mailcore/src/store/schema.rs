@@ -99,6 +99,20 @@ CREATE TABLE IF NOT EXISTS bodies (
     fetched_as   TEXT
 );
 
+-- A few internet headers of a fetched body (#1933): only
+-- `graph::model::STORED_HEADERS` (Exchange's AuthAs and
+-- MessageDirectionality stamps), written with the body by
+-- `Store::put_fetched_body_with_headers`, which replaces the message's
+-- rows. `name` is ASCII-lowercased, `value` trimmed. A new table, so an
+-- older database gets it empty at the next `open`: its mail reads `None`
+-- from `Store::message_header`.
+CREATE TABLE IF NOT EXISTS message_headers (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    PRIMARY KEY (message_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS attachments (
     id           TEXT NOT NULL,
     message_id   TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,

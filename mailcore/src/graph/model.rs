@@ -248,6 +248,60 @@ impl Body {
     }
 }
 
+/// The internet headers a fetched body brings along that the store keeps
+/// with the message (#1933): Exchange's own stamps of where a message came
+/// from, so a caller can tell mail from inside the tenant (`AuthAs:
+/// Internal`, `MessageDirectionality: Originating`) from outside mail
+/// (`Anonymous`, `Incoming`) without trusting the sender's domain. Matched
+/// ignoring ASCII case. Only these, never the whole header block.
+pub const STORED_HEADERS: &[&str] = &[
+    "X-MS-Exchange-Organization-AuthAs",
+    "X-MS-Exchange-Organization-MessageDirectionality",
+];
+
+/// Whether `name` is one of [`STORED_HEADERS`], ignoring ASCII case.
+pub fn is_stored_header(name: &str) -> bool {
+    STORED_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+/// One internet message header (`internetMessageHeaders` entry) of a
+/// fetched body (#1933): the name as Graph sent it, the value trimmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageHeader {
+    pub name: String,
+    pub value: String,
+}
+
+impl MessageHeader {
+    /// The [`STORED_HEADERS`] in a message response's
+    /// `internetMessageHeaders`, values trimmed, the first of each name
+    /// (ignoring case) kept. Lenient: no field, a null or non-array one, or
+    /// an entry without a string `name` and `value` gives no header for it,
+    /// never an error, so a body still stores without them.
+    pub fn list_from_json(v: &Value) -> Vec<MessageHeader> {
+        let mut out: Vec<MessageHeader> = Vec::new();
+        let Some(items) = v.get("internetMessageHeaders").and_then(Value::as_array) else {
+            return out;
+        };
+        for item in items {
+            let (Some(name), Some(value)) = (
+                item.get("name").and_then(Value::as_str),
+                item.get("value").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if !is_stored_header(name) || out.iter().any(|h| h.name.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            out.push(MessageHeader {
+                name: name.to_string(),
+                value: value.trim().to_string(),
+            });
+        }
+        out
+    }
+}
+
 /// Which body format the sync engine asks Graph for on a `FetchBody`
 /// (#1901). `Text` sends `Prefer: outlook.body-content-type="text"`, so
 /// every body comes back as plain text (lookxy, a terminal client). `Html`

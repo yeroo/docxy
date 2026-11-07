@@ -10,8 +10,8 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderListing, MailFolder,
-    MasterCategory, Me, Message, MessageFields, OofStatus, Person, Recipient, Recurrence,
-    ScheduleEntry, plain_to_html,
+    MasterCategory, Me, Message, MessageFields, MessageHeader, OofStatus, Person, Recipient,
+    Recurrence, ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -596,14 +596,28 @@ impl GraphClient {
         Ok((m, MessageFields::of(&v)))
     }
 
-    /// GET `/me/messages/{id}?$select=body`. When `prefer_text` is set,
-    /// asks Graph to convert the body to plain text via
+    /// [`GraphClient::get_body_with_headers`] with the headers dropped: the
+    /// body alone (a fresh draft's, whose headers mean nothing).
+    pub fn get_body(&self, message_id: &str, prefer_text: bool) -> Result<Body, GraphError> {
+        self.get_body_with_headers(message_id, prefer_text)
+            .map(|(body, _)| body)
+    }
+
+    /// GET `/me/messages/{id}?$select=body,internetMessageHeaders`
+    /// ([`BODY_SELECT`]): the body, and in the same request the message's
+    /// [`STORED_HEADERS`](crate::graph::model::STORED_HEADERS) (#1933, see [`MessageHeader::list_from_json`]:
+    /// none when Graph sent none). When `prefer_text` is set, asks Graph to
+    /// convert the body to plain text via
     /// `Prefer: outlook.body-content-type="text"`; otherwise Graph returns
     /// its native HTML. A response over [`BODY_MAX`] is refused as a `Parse`
     /// error (#1978): the client will not hold it, which no retry changes.
-    pub fn get_body(&self, message_id: &str, prefer_text: bool) -> Result<Body, GraphError> {
+    pub fn get_body_with_headers(
+        &self,
+        message_id: &str,
+        prefer_text: bool,
+    ) -> Result<(Body, Vec<MessageHeader>), GraphError> {
         let message_id = encode_path_segment(message_id);
-        let path = format!("/me/messages/{message_id}?$select=body");
+        let path = format!("/me/messages/{message_id}?$select={BODY_SELECT}");
         let headers: &[(&str, &str)] = if prefer_text {
             &[("Prefer", "outlook.body-content-type=\"text\"")]
         } else {
@@ -614,7 +628,9 @@ impl GraphClient {
         let body = v
             .get("body")
             .ok_or_else(|| GraphError::Parse("response has no body field".to_string()))?;
-        Body::from_json(body).ok_or_else(|| GraphError::Parse("malformed body".to_string()))
+        let body =
+            Body::from_json(body).ok_or_else(|| GraphError::Parse("malformed body".to_string()))?;
+        Ok((body, MessageHeader::list_from_json(&v)))
     }
 
     /// GET `/me/messages/{id}/attachments` — metadata only, no bytes.
@@ -1315,6 +1331,11 @@ const JSON_MAX: usize = 10 * 1024 * 1024;
 /// html body with `data:` pictures can be far bigger than any listing.
 pub const BODY_MAX: usize = 32 * 1024 * 1024;
 
+/// The `$select` of a body fetch ([`GraphClient::get_body_with_headers`]):
+/// the body and, in the same request, the internet headers the store keeps
+/// a few of (#1933).
+pub const BODY_SELECT: &str = "body,internetMessageHeaders";
+
 /// Reads a successful response's body and parses it as JSON, at most
 /// [`JSON_MAX`] bytes ([`parse_body_capped`]).
 fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
@@ -1918,6 +1939,82 @@ mod tests {
                 .any(|(k, v)| k.eq_ignore_ascii_case("prefer")
                     && v == "outlook.body-content-type=\"text\"")
         );
+    }
+
+    #[test]
+    fn get_body_selects_internet_message_headers() {
+        // #1933: the body GET asks for the headers in the same request and
+        // keeps only `STORED_HEADERS`, the first of a name (ignoring case),
+        // values trimmed (an empty one stays, as Graph sent it).
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"body":{"contentType":"text","content":"hi"},"internetMessageHeaders":[
+                {"name":"Received","value":"from x"},
+                {"name":"X-MS-Exchange-Organization-AuthAs","value":"  Internal\r\n"},
+                {"name":"x-ms-exchange-organization-authas","value":"Anonymous"},
+                {"name":"X-MS-Exchange-Organization-MessageDirectionality","value":" "}
+            ]}"#
+            .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (body, headers) = c.get_body_with_headers("M1", false).unwrap();
+        assert_eq!(body.content, "hi");
+        assert_eq!(
+            headers,
+            [
+                MessageHeader {
+                    name: "X-MS-Exchange-Organization-AuthAs".into(),
+                    value: "Internal".into(),
+                },
+                MessageHeader {
+                    name: "X-MS-Exchange-Organization-MessageDirectionality".into(),
+                    value: String::new(),
+                },
+            ]
+        );
+        assert_eq!(c.get_body("M1", false).unwrap().content, "hi");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        for r in &reqs {
+            assert_eq!(
+                r.path,
+                "/me/messages/M1?$select=body,internetMessageHeaders"
+            );
+        }
+    }
+
+    #[test]
+    fn get_body_without_usable_headers_yields_none() {
+        // No field, a null one, or malformed entries: the body still parses
+        // and no header comes back (#1933).
+        let cases = [
+            r#"{"body":{"contentType":"text","content":"hi"}}"#,
+            r#"{"body":{"contentType":"text","content":"hi"},"internetMessageHeaders":null}"#,
+            r#"{"body":{"contentType":"text","content":"hi"},"internetMessageHeaders":{"name":"X-MS-Exchange-Organization-AuthAs","value":"Internal"}}"#,
+            r#"{"body":{"contentType":"text","content":"hi"},"internetMessageHeaders":[
+                {"name":"X-MS-Exchange-Organization-AuthAs"},
+                {"name":"X-MS-Exchange-Organization-AuthAs","value":7},
+                {"value":"Internal"},
+                "X-MS-Exchange-Organization-AuthAs: Internal",
+                null
+            ]}"#,
+        ];
+        for json in cases {
+            let srv = FakeServer::start(vec![Route {
+                method: "GET".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status: 200,
+                headers: vec![],
+                body: json.into(),
+            }]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            let (body, headers) = c.get_body_with_headers("M1", true).unwrap();
+            assert_eq!(body.content, "hi", "{json}");
+            assert!(headers.is_empty(), "{json}: {headers:?}");
+        }
     }
 
     #[test]
