@@ -4115,6 +4115,7 @@ pub(crate) mod tests {
             series_master_id: None,
             reminder_minutes: minutes,
             is_reminder_on: on,
+            ..Default::default()
         }
     }
 
@@ -6974,6 +6975,7 @@ pub(crate) mod tests {
             body_html: "<p>agenda</p>".into(),
             reminder_minutes: 0,
             is_reminder_on: false,
+            ..Default::default()
         }
     }
 

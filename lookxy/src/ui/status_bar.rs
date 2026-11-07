@@ -156,6 +156,7 @@ mod tests {
                 body_html: "".into(),
                 reminder_minutes: 0,
                 is_reminder_on: false,
+                ..Default::default()
             })
             .unwrap();
         // Directly populate `agenda` — this module doesn't own the reload
