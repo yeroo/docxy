@@ -2373,49 +2373,7 @@ impl Store {
     /// comment for why this takes that stand-in type rather than a
     /// Task-2 `Event` (which doesn't exist yet).
     pub fn upsert_event(&self, e: &NewEvent) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO events (
-                 id, subject, start_utc, end_utc, is_all_day, location,
-                 organizer_name, organizer_addr, response_status,
-                 series_master_id, body_preview, web_link, last_modified,
-                 body_html, reminder_minutes, is_reminder_on
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-             ON CONFLICT(id) DO UPDATE SET
-                 subject = excluded.subject,
-                 start_utc = excluded.start_utc,
-                 end_utc = excluded.end_utc,
-                 is_all_day = excluded.is_all_day,
-                 location = excluded.location,
-                 organizer_name = excluded.organizer_name,
-                 organizer_addr = excluded.organizer_addr,
-                 response_status = excluded.response_status,
-                 series_master_id = excluded.series_master_id,
-                 body_preview = excluded.body_preview,
-                 web_link = excluded.web_link,
-                 last_modified = excluded.last_modified,
-                 body_html = excluded.body_html,
-                 reminder_minutes = excluded.reminder_minutes,
-                 is_reminder_on = excluded.is_reminder_on",
-            params![
-                e.id,
-                e.subject,
-                e.start_utc,
-                e.end_utc,
-                e.is_all_day,
-                e.location,
-                e.organizer_name,
-                e.organizer_addr,
-                e.response_status,
-                e.series_master_id,
-                e.body_preview,
-                e.web_link,
-                e.last_modified,
-                e.body_html,
-                e.reminder_minutes,
-                e.is_reminder_on,
-            ],
-        )?;
-        Ok(())
+        upsert_event_on(&self.conn, e)
     }
 
     /// Replaces the full set of attendees stored for an event. See
@@ -2472,17 +2430,19 @@ impl Store {
     /// and attendee replace) so a crash mid-refresh can't leave the window
     /// emptied without ever refilling it: either the whole replacement
     /// commits, or none of it does and the prior window contents are
-    /// untouched. Deliberately does NOT call `upsert_event`/
-    /// `put_event_attendees` (each opens its own transaction via
+    /// untouched. Each event goes through `upsert_event_on`, the same
+    /// statement `upsert_event` runs, here on the transaction. It does NOT
+    /// call `put_event_attendees` (that opens its own transaction via
     /// `unchecked_transaction`; nesting a second `BEGIN` on the same
-    /// connection while this one is still open would error) — the same SQL
-    /// is inlined here instead. The per-event attendee `DELETE` before each
-    /// insert is technically redundant with `events`' `ON DELETE CASCADE`
-    /// for an event this call's own window-delete just removed, but not for
-    /// one that instead takes the `ON CONFLICT` update path (a boundary
-    /// mismatch between this window and the row's stored dates) — cheap
-    /// insurance against a duplicate attendee row in that edge case, and
-    /// the same delete-then-insert `put_event_attendees` itself always does.
+    /// connection while this one is still open would error), so the
+    /// attendee SQL is inlined here instead. The per-event attendee
+    /// `DELETE` before each insert is technically redundant with `events`'
+    /// `ON DELETE CASCADE` for an event this call's own window-delete just
+    /// removed, but not for one that instead takes the `ON CONFLICT` update
+    /// path (a boundary mismatch between this window and the row's stored
+    /// dates) — cheap insurance against a duplicate attendee row in that
+    /// edge case, and the same delete-then-insert `put_event_attendees`
+    /// itself always does.
     pub fn replace_events_in_window(
         &self,
         from_utc: &str,
@@ -2496,44 +2456,7 @@ impl Store {
             params![from_utc, to_utc],
         )?;
         for e in events {
-            tx.execute(
-                "INSERT INTO events (
-                     id, subject, start_utc, end_utc, is_all_day, location,
-                     organizer_name, organizer_addr, response_status,
-                     series_master_id, body_preview, web_link, last_modified,
-                     body_html
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-                 ON CONFLICT(id) DO UPDATE SET
-                     subject = excluded.subject,
-                     start_utc = excluded.start_utc,
-                     end_utc = excluded.end_utc,
-                     is_all_day = excluded.is_all_day,
-                     location = excluded.location,
-                     organizer_name = excluded.organizer_name,
-                     organizer_addr = excluded.organizer_addr,
-                     response_status = excluded.response_status,
-                     series_master_id = excluded.series_master_id,
-                     body_preview = excluded.body_preview,
-                     web_link = excluded.web_link,
-                     last_modified = excluded.last_modified,
-                     body_html = excluded.body_html",
-                params![
-                    e.id,
-                    e.subject,
-                    e.start_utc,
-                    e.end_utc,
-                    e.is_all_day,
-                    e.location,
-                    e.organizer_name,
-                    e.organizer_addr,
-                    e.response_status,
-                    e.series_master_id,
-                    e.body_preview,
-                    e.web_link,
-                    e.last_modified,
-                    e.body_html,
-                ],
-            )?;
+            upsert_event_on(&tx, e)?;
         }
         for (id, atts) in attendees {
             tx.execute(
@@ -3159,6 +3082,58 @@ fn sanitize_fts_query(query: &str) -> String {
         .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The one `INSERT ... ON CONFLICT(id) DO UPDATE` that writes an `events`
+/// row from a `NewEvent`, shared by `Store::upsert_event` and
+/// `Store::replace_events_in_window` (on its transaction, which derefs to a
+/// `Connection`) so every column `NewEvent` carries is written by both:
+/// the calendar sync once wrote its own copy without `reminder_minutes`/
+/// `is_reminder_on` and lost every synced event's reminder (#1937).
+fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO events (
+             id, subject, start_utc, end_utc, is_all_day, location,
+             organizer_name, organizer_addr, response_status,
+             series_master_id, body_preview, web_link, last_modified,
+             body_html, reminder_minutes, is_reminder_on
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+         ON CONFLICT(id) DO UPDATE SET
+             subject = excluded.subject,
+             start_utc = excluded.start_utc,
+             end_utc = excluded.end_utc,
+             is_all_day = excluded.is_all_day,
+             location = excluded.location,
+             organizer_name = excluded.organizer_name,
+             organizer_addr = excluded.organizer_addr,
+             response_status = excluded.response_status,
+             series_master_id = excluded.series_master_id,
+             body_preview = excluded.body_preview,
+             web_link = excluded.web_link,
+             last_modified = excluded.last_modified,
+             body_html = excluded.body_html,
+             reminder_minutes = excluded.reminder_minutes,
+             is_reminder_on = excluded.is_reminder_on",
+        params![
+            e.id,
+            e.subject,
+            e.start_utc,
+            e.end_utc,
+            e.is_all_day,
+            e.location,
+            e.organizer_name,
+            e.organizer_addr,
+            e.response_status,
+            e.series_master_id,
+            e.body_preview,
+            e.web_link,
+            e.last_modified,
+            e.body_html,
+            e.reminder_minutes,
+            e.is_reminder_on,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4428,6 +4403,59 @@ mod calendar_tests {
         // The local event is still fully readable for its pending
         // `CreateEvent` op to send.
         assert!(s.event_for_send(&local_id).unwrap().is_some());
+    }
+
+    /// #1937: the calendar sync's writer keeps an event's reminder settings,
+    /// on insert and when a later refresh changes them.
+    #[test]
+    fn replace_events_in_window_writes_reminder_fields() {
+        let s = Store::open_in_memory().unwrap();
+        let (from, to) = ("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z");
+        let mut e = ev("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        e.reminder_minutes = 15;
+        e.is_reminder_on = true;
+        s.replace_events_in_window(from, to, std::slice::from_ref(&e), &[])
+            .unwrap();
+        let rows = s.events_in_window(from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reminder_minutes, 15);
+        assert!(rows[0].is_reminder_on);
+
+        e.reminder_minutes = 30;
+        e.is_reminder_on = false;
+        s.replace_events_in_window(from, to, std::slice::from_ref(&e), &[])
+            .unwrap();
+        let rows = s.events_in_window(from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reminder_minutes, 30);
+        assert!(!rows[0].is_reminder_on);
+    }
+
+    /// #1937: an event whose stored dates lie outside the replaced window
+    /// survives the window delete and takes the `ON CONFLICT` update path;
+    /// that path writes the reminder settings too.
+    #[test]
+    fn replace_events_in_window_conflict_path_updates_reminder_fields() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("E1", "2026-08-01T09:00:00Z", "2026-08-01T10:00:00Z"))
+            .unwrap();
+        let mut moved = ev("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        moved.reminder_minutes = 30;
+        moved.is_reminder_on = true;
+        s.replace_events_in_window(
+            "2026-07-20T00:00:00Z",
+            "2026-07-21T00:00:00Z",
+            &[moved],
+            &[],
+        )
+        .unwrap();
+        let rows = s
+            .events_in_window("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].start_utc, "2026-07-20T09:00:00Z");
+        assert_eq!(rows[0].reminder_minutes, 30);
+        assert!(rows[0].is_reminder_on);
     }
 
     #[test]
