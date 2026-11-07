@@ -127,16 +127,7 @@ impl Message {
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
                 == Some("#microsoft.graph.eventMessageRequest"),
-            categories: v
-                .get("categories")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            categories: string_list(v, "categories"),
         })
     }
 }
@@ -793,16 +784,7 @@ impl Recurrence {
         let range = v.get("range")?;
         let kind = RecurrenceKind::from_wire(pattern.get("type")?.as_str()?)?;
         let interval = pattern.get("interval").and_then(Value::as_i64).unwrap_or(1) as u32;
-        let days_of_week = pattern
-            .get("daysOfWeek")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let days_of_week = string_list(pattern, "daysOfWeek");
         let day_of_month = pattern
             .get("dayOfMonth")
             .and_then(Value::as_i64)
@@ -1170,18 +1152,43 @@ fn meeting_link(text: &str) -> Option<String> {
 }
 
 /// The byte offset where the link whose scheme ends at `from` ends: the
-/// first quote, `<`, `>`, whitespace or escaped bracket/quote at or after
-/// `from`, else `text.len()`.
+/// first quote, `<`, `>`, whitespace or HTML entity other than `&amp;`
+/// (`is_entity_end`) at or after `from`, else `text.len()`.
 fn link_end(text: &str, from: usize) -> usize {
-    const ESCAPED_ENDS: [&str; 5] = ["&lt;", "&gt;", "&quot;", "&#39;", "&#x27;"];
     text[from..]
         .char_indices()
         .find(|&(i, c)| {
             matches!(c, '"' | '\'' | '<' | '>')
                 || c.is_whitespace()
-                || (c == '&' && ESCAPED_ENDS.iter().any(|e| text[from + i..].starts_with(e)))
+                || (c == '&' && is_entity_end(&text[from + i..]))
         })
         .map_or(text.len(), |(i, _)| from + i)
+}
+
+/// `at` (text starting at a `&`) starts an HTML entity that ends a link:
+/// a numeric one (`&#…`: `&#160;`, `&#x27;`, `&#34;`) or a named one (an
+/// ASCII letter, then up to 31 letters or digits, then `;`: `&nbsp;`,
+/// `&lt;`, `&quot;`), except `&amp;`, which a link's query holds and
+/// `meeting_link` decodes. A raw `&` not shaped like an entity
+/// (`?pwd=x&y=1` in a plain-text location) stays in the link. The lookahead
+/// is bounded, so the scan stays linear.
+fn is_entity_end(at: &str) -> bool {
+    let rest = &at.as_bytes()[1..];
+    if at.starts_with("&amp;") {
+        return false;
+    }
+    if rest.first() == Some(&b'#') {
+        return true;
+    }
+    if !rest.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let name = rest
+        .iter()
+        .take(33)
+        .take_while(|b| b.is_ascii_alphanumeric())
+        .count();
+    name <= 32 && rest.get(name) == Some(&b';')
 }
 
 /// `after_scheme` (a link without its `https://`) is a meeting link: its
@@ -2152,6 +2159,20 @@ mod tests {
                 "https://zoom.us/j/11?a=1&amp;b=2&gt;",
                 "https://zoom.us/j/11?a=1&b=2",
             ),
+            // Other named and numeric entities end a link too.
+            ("Join: https://zoom.us/j/1&nbsp;</p>", "https://zoom.us/j/1"),
+            (
+                "https://aka.ms/x&nbsp;https://zoom.us/j/1",
+                "https://zoom.us/j/1",
+            ),
+            ("&#34;https://zoom.us/j/2&#34;", "https://zoom.us/j/2"),
+            ("https://zoom.us/j/3&#xa0;more", "https://zoom.us/j/3"),
+            // A raw & not shaped like an entity stays in the link.
+            (
+                "https://zoom.us/j/4?pwd=x&y=1 next",
+                "https://zoom.us/j/4?pwd=x&y=1",
+            ),
+            ("https://zoom.us/j/5?a&b;c", "https://zoom.us/j/5?a"),
         ] {
             let e = ev(&format!(r#","body":{{"content":"{body}"}}"#));
             assert_eq!(e.join_url, want, "{body}");
