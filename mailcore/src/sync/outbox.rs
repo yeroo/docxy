@@ -125,14 +125,10 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             if id.starts_with("local:") {
                 return Ok(());
             }
-            match client.cancel_event(id, comment.as_deref()) {
-                // Graph deletes the organizer's copy on a cancel, so a retry
-                // after a lost 202 finds it gone: the cancel went out, or
-                // the meeting was deleted elsewhere. Either way there is
-                // nothing left to send.
-                Err(GraphError::NotFound) => Ok(()),
-                other => other,
-            }
+            // A 404 is returned as is: the drain drops the op and resets
+            // the calendars (#1985), as only Graph knows whether the cancel
+            // went out.
+            client.cancel_event(id, comment.as_deref())
         }
         // Nothing local to reconcile. A retry after a lost 202 forwards
         // twice: Graph has nothing to ask whether the first one went out.
@@ -1987,9 +1983,9 @@ mod tests {
     }
 
     #[test]
-    fn cancel_event_404_is_ok() {
-        // A retry after a lost 202: Graph already deleted the organizer's
-        // copy. Any other refusal stays an error for the drain's policy.
+    fn cancel_event_404_and_refusals_are_errors() {
+        // `apply_op` reports a 404 as is: the drain, not this layer, drops
+        // the op and resets the calendars (#1985).
         let srv = FakeServer::start(vec![
             Route {
                 method: "POST".into(),
@@ -2012,7 +2008,10 @@ mod tests {
             id: id.into(),
             comment: None,
         };
-        assert_eq!(apply_op(&c, &store, &cancel("GONE")), Ok(()));
+        assert_eq!(
+            apply_op(&c, &store, &cancel("GONE")),
+            Err(GraphError::NotFound)
+        );
         assert!(matches!(
             apply_op(&c, &store, &cancel("MINE")),
             Err(GraphError::Http { status: 400, .. })

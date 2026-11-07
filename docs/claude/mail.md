@@ -1183,8 +1183,14 @@ dismiss and snooze on the server (#2025).
   the op **before** it deletes the row, as `SendDraft` does: a failed queue after the
   delete would hide a meeting every attendee keeps, with no op whose quarantine could
   bring it back. A host must not delete the row itself first.
-- A cancel answered 404 is `Ok`: Graph deletes the organizer's copy, so a retry after a
-  lost 202 finds it gone. A `local:` cancel sends nothing (nobody was invited), as
+- A cancel answered 404 is dropped by the drain at once, with no retry and no quarantine
+  `Error`, and resets the calendars (`reset_calendars`: delta state cleared, then a
+  refresh of initial rounds). A 404 is a retry after a lost 202 (Graph deleted the
+  organizer's copy on the first attempt; a lost 202 is a `Transport` error, which bumps no
+  attempt, so the attempt count cannot tell) or a cancel Graph could never do: a stale id,
+  or an event `/me/events` does not hold, such as a shared calendar's. Only Graph knows
+  which, so the reset asks it: the row stays gone when Graph deleted the event, and comes
+  back when Graph still has it. `apply_op` returns the 404 as is. A `local:` cancel sends nothing (nobody was invited), as
   `DeleteEvent`. A quarantined `CancelEvent` is an event op: the calendar reset brings
   the row back, as for `DeleteEvent`.
 - The engine does not refuse a cancel of an event without attendees: the stored attendee
@@ -1204,8 +1210,10 @@ dismiss and snooze on the server (#2025).
   `forward_event_without_comment_sends_empty`; `store`
   `outbox_op_cancel_and_forward_round_trip`, `event_by_id_returns_the_row`; `outbox.rs`
   `cancel_event_local_id_makes_no_request`, `cancel_event_posts_cancel`,
-  `cancel_event_404_is_ok`, `forward_event_posts_forward`; `engine.rs`
+  `cancel_event_404_and_refusals_are_errors`, `forward_event_posts_forward`; `engine.rs`
   `cancel_event_deletes_and_posts_cancel`, `cancel_event_refuses_an_attendee_or_unknown_id`,
   `cancel_event_of_a_local_event_deletes_it_and_sends_nothing`,
-  `cancel_event_quarantine_restores_the_event`, `forward_event_posts_forward`,
+  `cancel_event_quarantine_restores_the_event`,
+  `cancel_event_404_brings_back_an_event_graph_still_has`,
+  `cancel_event_404_after_a_lost_202_leaves_the_event_gone`, `forward_event_posts_forward`,
   `forward_event_refuses_local_id_and_no_recipients`.

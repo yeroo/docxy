@@ -308,6 +308,10 @@ pub enum SyncCommand {
     /// delete the row first, unlike `DeleteEvent`: the check would then
     /// find nothing. A cancel quarantined after repeated refusals brings the
     /// row back with the calendar reset, as a quarantined `DeleteEvent`.
+    /// A cancel answered 404 (a retry after a lost `202`, or an event
+    /// `/me/events` does not hold) is dropped at once, with no quarantine
+    /// `Error`, and gets the same reset: the row stays gone when Graph
+    /// deleted the event, and comes back when Graph still has it.
     /// A `local:` event (the user's, never on Graph) is deleted and sends
     /// nothing. The host decides whether to offer Cancel (the meeting has
     /// attendees) or Delete: the engine does not refuse a cancel of an
@@ -2361,8 +2365,6 @@ impl Engine {
 
     // --- Outbox ----------------------------------------------------------
 
-    /// Optimistic local write already applied by the caller: persist the op,
-    /// reflect the pending count, and (if signed in) try to push it now.
     /// [`SyncCommand::CancelEvent`].
     fn cancel_event(&mut self, id: String, comment: Option<String>) {
         let refusal = match self.store.event(&id) {
@@ -2411,6 +2413,8 @@ impl Engine {
         self.enqueue_and_drain(OutboxOp::ForwardEvent { id, to, comment });
     }
 
+    /// Optimistic local write already applied by the caller: persist the op,
+    /// reflect the pending count, and (if signed in) try to push it now.
     fn enqueue_and_drain(&mut self, op: OutboxOp) {
         if let Err(e) = self.store.enqueue_op(&op) {
             self.emit(SyncEvent::Error(e.to_string()));
@@ -2515,6 +2519,21 @@ impl Engine {
                         deferred = true;
                         break;
                     }
+                    // A cancel answered 404 (#1985) is either a retry after
+                    // a lost 202 (Graph deleted the organizer's copy on the
+                    // first attempt) or a cancel Graph could never do: a
+                    // stale id, or an event `/me/events` does not hold.
+                    // Neither is helped by a retry, and only Graph knows
+                    // which: drop the op without a quarantine `Error`, and
+                    // reset the calendars as a quarantined event op does,
+                    // so the row comes back if Graph still has the event.
+                    if matches!(row.op, OutboxOp::CancelEvent { .. })
+                        && matches!(other, GraphError::NotFound)
+                    {
+                        self.store.drop_op(row.seq);
+                        self.reset_calendars();
+                        continue;
+                    }
                     if let OutboxOp::SendDraft { id } = &row.op {
                         // Retrying a 403 changes nothing: the first such
                         // failure is final for a send whose `/send` never
@@ -2569,10 +2588,7 @@ impl Engine {
                         // `CreateEvent`'s `local:` row is never replaced
                         // either way.
                         if is_event_op {
-                            if let Err(e) = self.store.clear_calendar_deltas() {
-                                self.emit(SyncEvent::Error(e.to_string()));
-                            }
-                            self.refresh_calendar();
+                            self.reset_calendars();
                         }
                     } else {
                         self.store.bump_op_attempts(row.seq, &other.to_string());
@@ -2692,6 +2708,17 @@ impl Engine {
     /// A `SendDraft` goes through `apply_send` with the row's `seq`, so its
     /// `/send` POST is recorded and a later attempt checks delivery first
     /// (#1874).
+    /// Forgets every calendar's delta state and refreshes, so the rounds
+    /// are initial ones that replace each window with Graph's truth: what
+    /// undoes a dropped event op's optimistic local write, which no delta
+    /// round from a kept link would name (#2013).
+    fn reset_calendars(&mut self) {
+        if let Err(e) = self.store.clear_calendar_deltas() {
+            self.emit(SyncEvent::Error(e.to_string()));
+        }
+        self.refresh_calendar();
+    }
+
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<(), GraphError> {
         let apply = |client: &GraphClient, store: &Store| match &row.op {
             OutboxOp::SendDraft { id } => apply_send(client, store, id.as_str(), Some(row.seq)),
@@ -9229,6 +9256,86 @@ mod tests {
             srv.requests()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancel answered 404 (#1985) is dropped at once, with no
+    /// quarantine `Error`, and resets the calendars: the initial round puts
+    /// the row back when Graph still has the event (`on_graph`), and leaves
+    /// it gone when Graph deleted it (a retry after a lost 202).
+    fn cancel_event_404_resets_the_calendars(on_graph: bool) {
+        let (from, to) = today_window();
+        let held: Vec<String> = if on_graph {
+            vec![event_from_now("E1", 3600)]
+        } else {
+            vec![]
+        };
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&held))],
+        );
+        routes.insert(
+            0,
+            post_route(
+                "/me/events/E1/cancel",
+                404,
+                r#"{"error":{"code":"ErrorItemNotFound"}}"#,
+            ),
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("cancel-event-404", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![meeting("E1", true)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: "E1".into(),
+                comment: None,
+            })
+            .unwrap();
+        // Commands run in order: this one's `Error` comes after the cancel's
+        // drain, and the reset's refresh, are done.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined"))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty(), "the op is dropped");
+        assert_eq!(
+            posts_to(&srv, "/me/events/E1/cancel").len(),
+            1,
+            "not retried"
+        );
+        assert_eq!(
+            view_paths(&srv, "CAL-A").last(),
+            Some(&initial_delta_path("CAL-A", &from, &to)),
+        );
+        let expected: &[&str] = if on_graph { &["E1"] } else { &[] };
+        assert_eq!(ids_in(&store, "CAL-A"), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_event_404_brings_back_an_event_graph_still_has() {
+        cancel_event_404_resets_the_calendars(true);
+    }
+
+    #[test]
+    fn cancel_event_404_after_a_lost_202_leaves_the_event_gone() {
+        cancel_event_404_resets_the_calendars(false);
     }
 
     #[test]
