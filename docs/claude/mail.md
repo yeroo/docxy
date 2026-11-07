@@ -628,9 +628,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`meeting_link_in`, the one helper the store uses too): the location goes
   first because it is a field someone set, while a body can quote an old
   invite. A link starts at `https://` (any case) and ends at a quote, `<`,
-  `>`, whitespace or an escaped bracket or quote (`&lt;`, `&gt;`, `&quot;`,
-  `&#39;`, `&#x27;`: lookxy's `escape_html` writes them); `&amp;` is decoded
-  and trailing `.,;:)]!` trimmed. After a rejected link the scan resumes at
+  `>`, whitespace or an HTML entity other than `&amp;` (`is_entity_end`: `&#`
+  then anything, or `&`, a letter, up to 31 letters or digits and `;`).
+  lookxy's `escape_html` writes `&lt;`, `&gt;` and `&quot;`; other HTML
+  bodies also use `&nbsp;` and numeric entities (`&#160;`, `&#34;`). A raw
+  `&` not shaped like an entity (`?pwd=x&y=1` in a plain-text location)
+  stays in the link. `&amp;` is decoded and trailing `.,;:)]!` trimmed. After a rejected link the scan resumes at
   that link's end, so a meeting link nested in it is not taken and each byte
   is scanned once: a body is sender-controlled, and resuming just past the
   `https://` made a long run of them quadratic. Only the host a browser would open decides
