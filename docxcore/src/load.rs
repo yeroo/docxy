@@ -2957,6 +2957,18 @@ pub(crate) fn rpr_of_children(children: &[String]) -> RunProps {
     props
 }
 
+/// The run properties a whole `<w:rPr>` element parses to, as a run's do
+/// (a paragraph mark's, #1986); `None` when `xml` is not one.
+pub(crate) fn rpr_of_element(xml: &str) -> Option<RunProps> {
+    let mut p = XmlParser::new(xml);
+    if p.next() != Event::Start || p.name() != "w:rPr" {
+        return None;
+    }
+    let mut props = RunProps::default();
+    parse_rpr(&mut p, &mut props);
+    Some(props)
+}
+
 /// The paragraph properties `children` (verbatim `w:pPr` children) parse to.
 pub(crate) fn ppr_of_children(children: &[String]) -> ParProps {
     let xml = format!("<w:pPr>{}</w:pPr>", children.concat());
