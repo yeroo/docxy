@@ -56,8 +56,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   tenth; the Project chart's `project::wheel_px` / `wheel_step`: a whole
   line steps, a fractional line counts as its pixels, pixels sum to 40). gpui's scroll
   area has already moved by a Ctrl+wheel, so the offset of the last render
-  is put back (as the Project chart does). Table selection zones do
-  nothing. Every other key bubbles to the suite; Tab and Shift+Tab (global
+  is put back (as the Project chart does). The view draws no table
+  selection zones (`table_el`'s `selects` needs `DocTarget::is_suite`,
+  #2003). Every other key bubbles to the suite; Tab and Shift+Tab (global
   actions) do nothing on an extension tab.
 - Hyperlinks: a secondary press (Ctrl, ⌘ on macOS) on a link calls
   `on_link` with the URL (or `#bookmark`) and selects nothing, in either
@@ -245,7 +246,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   body with its own header in fixed pixels. The `w_full` width probe sits
   inside the padding, so `text_w` (what tables fit) and `column` follow it;
   the root's `on_mouse_down` covers the padding, so a press there focuses
-  the view. The 12 px scroll-bar strips overlay the right and bottom
+  the view. That holds beside a table row too because the view draws no
+  row-selection strips. Each strip is 12 px left of its row and stops its
+  press; in the view they did nothing, so a press on one never focused it.
+  CI's fonts wrapped the fitted table's cell and put its row under the
+  mid-height press. The 12 px scroll-bar strips overlay the right and bottom
   padding: an edge under 12 px lets them cover the text's edge.
 - `DocView::set_page_background(Option<Hsla>)` / `page_background()`: the
   dark page's colour (`content_look`'s `page_bg`, used only when content
@@ -261,8 +266,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   (resolved), `page_background` (`rrggbb` or null), `page_color` (what the
   last frame painted) and `column_left` (the text column's left from the
   view's left), the last two read after a `shot`. Colours have no `#`: a
-  case's `#` starts a comment. Regions `ext-doc-inset:left` (middle of the
-  left padding at mid-height) and `ext-doc-header` (the fixture's header
+  case's `#` starts a comment. Regions `ext-doc-inset:left[:<word>]`
+  (middle of the left padding, at mid-height or beside the painted word's
+  row: the case presses beside `Alpha` and the table's `A1`, which do not
+  depend on fonts) and `ext-doc-header` (the fixture's header
   line, 6 px above the view). The fixture's header has its own focus
   handle and takes it on a press. With nothing else focusable on a Mail tab,
   `focus_ext_surface` hands the root's focus straight back to the view, so

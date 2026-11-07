@@ -1837,14 +1837,26 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             .map(|b| point(b.left() + px(20.), b.top() - px(6.)))
             .ok_or_else(|| "the view is not drawn yet".to_string());
     }
-    if part == "inset:left" {
-        // The middle of the left padding at the view's mid-height (#2003),
-        // clear of the scroll bars along the right and bottom edges.
+    if let Some(at) = part.strip_prefix("inset:left") {
+        // The middle of the left padding (#2003), clear of the scroll bars
+        // along the right and bottom edges: at the view's mid-height, or
+        // (`:<word>`) beside the painted word `<word>`'s row.
         let left = crate::doc_view::resolve_page_inset(view.page_inset()).left;
-        return view
+        let b = view
             .viewport()
-            .map(|b| point(b.left() + left / 2., b.center().y))
-            .ok_or_else(|| "the view is not drawn yet".to_string());
+            .ok_or_else(|| "the view is not drawn yet".to_string())?;
+        let y = match at.strip_prefix(':') {
+            Some(word) => {
+                view.word_bounds(word.trim())
+                    .ok_or_else(|| format!("no painted word '{}'", word.trim()))?
+                    .0
+                    .center()
+                    .y
+            }
+            None if at.is_empty() => b.center().y,
+            None => return Err(format!("unknown region part 'inset:left{at}'")),
+        };
+        return Ok(point(b.left() + left / 2., y));
     }
     if let Some(n) = part.strip_prefix("link:") {
         // `:left`: 8 px left of the span, at mid-height (the blank beside a
@@ -1885,7 +1897,7 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             None => b.center(),
         });
     }
-    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
+    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left[:<word>], ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its

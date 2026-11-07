@@ -249,11 +249,19 @@ test issue 2003 the host sets the view's page inset and its dark page's colour, 
   assert reply.page_color is 262626
   assert reply.text_width is 956
   # A press on the fixture's header takes the keys from the view; one in
-  # the narrower left padding gives them back.
+  # the narrower left padding gives them back, beside a paragraph and
+  # beside a table row (the view draws no row-selection strip there to
+  # swallow the press).
   call pointer-click {"region":"ext-doc-header"}
   call ext-doc-read {}
   assert reply.focused is false
-  call pointer-click {"region":"ext-doc-inset:left"}
+  call pointer-click {"region":"ext-doc-inset:left:Alpha"}
+  call ext-doc-read {}
+  assert reply.focused is true
+  call pointer-click {"region":"ext-doc-header"}
+  call ext-doc-read {}
+  assert reply.focused is false
+  call pointer-click {"region":"ext-doc-inset:left:A1"}
   call ext-doc-read {}
   assert reply.focused is true
   assert reply.selection is empty
