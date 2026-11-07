@@ -3098,16 +3098,12 @@ impl Editor {
                 (fallback != IndentFallback::None && direct).then_some(0)
             } else {
                 match fallback {
-                    // A numbered item that had a loaded left keeps it: the
-                    // suite draws a loaded left with no level step, so
-                    // forgetting it would move the item (#1986).
-                    IndentFallback::StyleNum | IndentFallback::Level => {
-                        pr.has_loaded_left_indent().then_some(left)
-                    }
+                    // A style-numbered item that had a loaded left keeps it.
+                    IndentFallback::StyleNum => pr.has_loaded_left_indent().then_some(left),
                     // A value the dialog or ruler set over a style's indent
                     // is explicit, as a reload would see it (#1815).
                     IndentFallback::StyleLeft { .. } => Some(left),
-                    IndentFallback::None => None,
+                    IndentFallback::None | IndentFallback::Level => None,
                 }
             };
             pr.indent = left.max(0);
@@ -4228,11 +4224,10 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
     }
     // A style item's in-session indent cannot be told from nothing once
     // Increase wrote it, so only a loaded (or pinned) left counts there.
-    let loaded = pr.has_loaded_left_indent();
     let direct = if fallback == IndentFallback::Level {
         had_direct_left(pr)
     } else {
-        loaded
+        pr.has_loaded_left_indent()
     };
     pr.indent = (pr.indent + delta).max(0);
     if delta == 0 {
@@ -4242,16 +4237,13 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
         // No `w:left` would hand the paragraph back to its level's (or
         // style's) indent.
         pin_left(pr, 0, fallback);
-    } else if (matches!(
+    } else if matches!(
         fallback,
         IndentFallback::StyleNum | IndentFallback::StyleLeft { .. }
-    ) && direct)
-        || (fallback == IndentFallback::Level && loaded)
+    ) && direct
     {
         // A style item keeps a loaded left while it moves, so a later
-        // Decrease to the margin still pins (as after a reload); so does
-        // a numbered item, which the suite draws with no level step while
-        // its left is loaded (#1986).
+        // Decrease to the margin still pins (as after a reload).
         pin_left(pr, pr.indent, fallback);
     } else {
         // The loaded left indent goes, character units included: a
@@ -7422,31 +7414,6 @@ mod tests {
         ed.change_indent(-720);
         assert_eq!(first_props(&ed).indent, 0);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
-    }
-
-    /// #1986: a numbered item with a loaded left keeps it loaded as the
-    /// ruler, the dialog or Increase/Decrease Indent moves it (the suite
-    /// draws a loaded left with no level step), and saves what it shows.
-    #[test]
-    fn a_list_items_loaded_left_stays_loaded_as_it_moves() {
-        let mut ed = loaded_list_item(1, "<w:ind w:left=\"1200\" w:hanging=\"267\"/>");
-        ed.set_indent(1300, -267);
-        assert_eq!(first_props(&ed).indent, 1300);
-        assert!(first_props(&ed).has_loaded_left_indent());
-        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1300\" w:hanging=\"267\"/>");
-        ed.change_indent(720);
-        assert_eq!((first_props(&ed).indent, first_props(&ed).ilvl), (2020, 1));
-        assert!(first_props(&ed).has_loaded_left_indent());
-        ed.change_indent(-720);
-        assert_eq!(first_props(&ed).indent, 1300);
-        assert!(first_props(&ed).has_loaded_left_indent());
-        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1300\" w:hanging=\"267\"/>");
-        // An item given its indent in session keeps no loaded one.
-        let mut ed = Editor::new(doc(&["a"]));
-        ed.set_list(Some(42));
-        ed.select_all();
-        ed.set_indent(720, 0);
-        assert!(!first_props(&ed).has_loaded_left_indent());
     }
 
     /// #1728: at the margin the item keeps its own indent in session, as it

@@ -346,12 +346,11 @@ fn paragraph_edits_keep_what_they_do_not_change() {
 
     // A left-indent change (Increase Indent: 420 -> 720 twips) drops the
     // character-unit left indent (it would override the new twips) and keeps
-    // the first-line indent as loaded. The list item's loaded left stays
-    // loaded, pinned in place of the first left attribute (#1986).
+    // the first-line indent as loaded.
     let xml = edited(RICH_PARAGRAPH, |e| e.change_indent(300));
     let ppr = &xml[xml.find("<w:pPr>").unwrap()..xml.find("</w:pPr>").unwrap()];
     assert!(
-        ppr.contains("<w:ind w:left=\"720\" w:firstLineChars=\"100\" w:firstLine=\"210\"/>"),
+        ppr.contains("<w:ind w:firstLineChars=\"100\" w:firstLine=\"210\" w:left=\"720\"/>"),
         "{ppr}"
     );
     // Setting the indents explicitly (the Paragraph dialog) replaces both it
