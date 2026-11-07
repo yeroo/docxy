@@ -709,7 +709,9 @@ impl DeltaPage {
 
 /// One entry of a calendarView delta page (#2013): an added or changed
 /// occurrence, or the id of one removed since the last round (an item
-/// with `@removed`; a series master's id removes its occurrences).
+/// with `@removed`). What a removal deletes is the store's rule
+/// (`apply_calendar_delta_on`): only rows in the window, and a series
+/// master's occurrences unless the round names some of them.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventDeltaItem {
     Upsert(Event),

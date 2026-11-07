@@ -8634,32 +8634,58 @@ mod tests {
                 1,
             )
         };
+        let initial = "/me/calendars/CAL-A/calendarView/delta?";
         let routes = vec![
-            get_route(
-                "/me/calendars/CAL-A/calendarView/delta?",
-                200,
-                &calendar_delta_page(
-                    &[
-                        occurrence("O1", 3600),
-                        occurrence("O2", 86400 + 3600),
-                        event_from_now("SINGLE", 7200),
-                    ],
-                    "/cal-delta/CAL-A?token=1",
+            (
+                get_route(
+                    initial,
+                    200,
+                    &calendar_delta_page(
+                        &[
+                            occurrence("O1", 3600),
+                            occurrence("O2", 86400 + 3600),
+                            event_from_now("SINGLE", 7200),
+                        ],
+                        "/cal-delta/CAL-A?token=1",
+                    ),
                 ),
+                Some(1),
             ),
-            get_route(
-                "/cal-delta/CAL-A?token=1",
-                200,
-                &calendar_delta_page(&[removed_json("MASTER")], "/cal-delta/CAL-A?token=2"),
+            // The series is gone at Graph by the next initial round.
+            (
+                get_route(
+                    initial,
+                    200,
+                    &calendar_delta_page(
+                        &[event_from_now("SINGLE", 7200)],
+                        "/cal-delta/CAL-A?token=3",
+                    ),
+                ),
+                None,
             ),
-            get_route(
-                "/me/calendars?",
-                200,
-                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            (
+                get_route(
+                    "/cal-delta/CAL-A?token=1",
+                    200,
+                    &calendar_delta_page(&[removed_json("MASTER")], "/cal-delta/CAL-A?token=2"),
+                ),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
             ),
         ];
-        let (_srv, handle, store_path, dir) =
-            spawn_calendar_engine("calendar-delta-series", routes, |_| {});
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "calendar-delta-series",
+            routes,
+            |_| {},
+            EngineOptions::without_prefetch(),
+        );
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
         wait_for_calendar_updates(&handle.evt_rx, 1);
         let mut ids = ids_in(&Store::open(&store_path).unwrap(), "CAL-A");
@@ -8668,10 +8694,29 @@ mod tests {
 
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
         wait_for_calendar_updates(&handle.evt_rx, 1);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["SINGLE"]);
+        // The cascade drops the delta state: the master may only have
+        // changed, so the next pass checks with an initial round.
+        assert_eq!(store.calendar_delta("CAL-A").unwrap(), None);
+
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let (from, to) = today_window();
+        let initial_path = initial_delta_path("CAL-A", &from, &to);
         assert_eq!(
-            ids_in(&Store::open(&store_path).unwrap(), "CAL-A"),
-            ["SINGLE"]
+            view_paths(&srv, "CAL-A"),
+            [
+                initial_path.clone(),
+                "/cal-delta/CAL-A?token=1".to_string(),
+                initial_path
+            ]
+        );
+        assert_eq!(ids_in(&store, "CAL-A"), ["SINGLE"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            "/cal-delta/CAL-A?token=3"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

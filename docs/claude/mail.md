@@ -1031,7 +1031,14 @@ wider window fresh without downloading it again.
   not a removed series: only the row with that id goes, and the engine
   keeps the round's occurrences of it. Both
   record the window as fetched (#2014's freshness) and store the window
-  and deltaLink, in the pass's one transaction.
+  and deltaLink, in the pass's one transaction. Except after a series
+  cascade (a delta round's removed master took occurrence rows other than
+  its own id's): Graph may list a master that only changed (its series end
+  moved past the window, say) with no in-window occurrence in the round,
+  so the calendar's delta state is deleted and the window not recorded
+  again; the next pass's initial round restores what Graph still has, or
+  confirms it is gone. Until then the earlier window record (an hour
+  fresh) still serves a `FetchCalendarRange` inside it from the store.
 - Errors: an expired link (`is_expired_sync_state`, as mail's #1871: a
   410, or a 400 `syncStateNotFound`/`syncStateInvalid`/`resyncRequired`)
   runs that calendar's initial round at once, in the same pass, once, with
@@ -1068,6 +1075,8 @@ wider window fresh without downloading it again.
   `apply_calendar_sync_delta_keeps_local_rows`,
   `apply_calendar_sync_delta_removes_only_rows_in_the_window`,
   `apply_calendar_sync_delta_keeps_a_series_the_round_names_occurrences_of`,
+  `apply_calendar_sync_delta_cascade_drops_the_delta_state_and_records_no_range`,
+  `apply_calendar_sync_delta_plain_removal_stores_the_link`,
   `apply_calendar_sync_stores_and_forgets_delta_state`,
   `clear_calendar_deltas_clears_every_calendar`; `engine.rs`
   `calendar_window_defaults_to_30_days_back_and_180_days_forward`,

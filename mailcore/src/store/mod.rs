@@ -585,8 +585,9 @@ pub enum CalendarRound {
     /// which replaces the calendar's rows overlapping it.
     Window,
     /// A round from the stored deltaLink: `fetched`'s events (and their
-    /// attendees) are added or changed, and each `removed` id goes, with
-    /// every occurrence whose `series_master_id` it is.
+    /// attendees) are added or changed, and each `removed` id goes, within
+    /// the window, with its occurrences when the round upserts none of
+    /// them (`apply_calendar_delta_on` has the rule).
     Delta { removed: Vec<String> },
 }
 
@@ -3354,12 +3355,18 @@ impl Store {
     ///    the window (`events_in_window`'s rule; `local:` rows excluded, as
     ///    in `replace_events_in_window`) with the fetched ones; a delta
     ///    round (`CalendarRound::Delta`, #2013) upserts the fetched ones and
-    ///    deletes each removed id's row and the rows whose
-    ///    `series_master_id` it is (that calendar's, non-`local:`). Either
-    ///    way each event is stored under that calendar's id, with its
-    ///    attendees, the window is recorded as fetched at `stamp` (#2014,
-    ///    `calendar_range_gaps`), and the window and deltaLink become the
-    ///    calendar's delta state. A synced calendar missing from `fetched`
+    ///    deletes, of that calendar's non-`local:` rows overlapping the
+    ///    window, each removed id's row and, unless the round upserts
+    ///    occurrences of it, the rows whose `series_master_id` it is
+    ///    (`apply_calendar_delta_on`). Either way each event is stored
+    ///    under that calendar's id, with its attendees, the window is
+    ///    recorded as fetched at `stamp` (#2014, `calendar_range_gaps`),
+    ///    and the window and deltaLink become the calendar's delta state.
+    ///    Except when a delta round's series cascade deleted occurrences:
+    ///    then the calendar's delta state is deleted and the window not
+    ///    recorded, so the next pass runs an initial round, which restores
+    ///    occurrences Graph still has (a master listed as removed may only
+    ///    have changed). A synced calendar missing from `fetched`
     ///    (its view failed) keeps its rows, its delta state, and records
     ///    nothing.
     /// 3. Every synced event, of any date, whose non-empty `calendar_id` is
@@ -3378,13 +3385,21 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         adopt_blank_calendar_rows_on(&tx)?;
         for c in fetched {
-            match &c.round {
+            let cascaded = match &c.round {
                 CalendarRound::Window => {
-                    replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp)?
+                    replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp)?;
+                    false
                 }
                 CalendarRound::Delta { removed } => {
                     apply_calendar_delta_on(&tx, from_utc, to_utc, &c.fetched, removed, stamp)?
                 }
+            };
+            if cascaded {
+                tx.execute(
+                    "DELETE FROM calendar_deltas WHERE calendar_id = ?1",
+                    params![c.fetched.calendar_id],
+                )?;
+                continue;
             }
             tx.execute(
                 "INSERT INTO calendar_deltas (calendar_id, from_utc, to_utc, delta_link)
@@ -4028,6 +4043,13 @@ fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<()
 /// occurrences of is not a removed series: a series master that starts
 /// before the window is "outside the range" when it is edited, and its
 /// occurrences stay; only the row with that id goes.
+///
+/// Returns whether a series cascade deleted any row other than the removed
+/// id's own. Then the window is not recorded as fetched, and the caller
+/// drops the calendar's delta state: a master Graph lists as removed may
+/// only have changed (its series end moved past the window, say), so the
+/// next pass's initial round restores the occurrences Graph still has,
+/// or confirms they are gone.
 fn apply_calendar_delta_on(
     conn: &Connection,
     from_utc: &str,
@@ -4035,26 +4057,35 @@ fn apply_calendar_delta_on(
     f: &FetchedCalendar,
     removed: &[String],
     stamp: RangeStamp,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let named_masters: HashSet<&str> = f
         .events
         .iter()
         .filter_map(|e| e.series_master_id.as_deref())
         .collect();
+    let mut cascaded = false;
     for id in removed {
-        let sql = if named_masters.contains(id.as_str()) {
+        conn.execute(
             "DELETE FROM events
              WHERE calendar_id = ?1 AND id = ?2
-                   AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'"
-        } else {
-            "DELETE FROM events
-             WHERE calendar_id = ?1 AND (id = ?2 OR series_master_id = ?2)
-                   AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'"
-        };
-        conn.execute(sql, params![f.calendar_id, id, from_utc, to_utc])?;
+                   AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'",
+            params![f.calendar_id, id, from_utc, to_utc],
+        )?;
+        if !named_masters.contains(id.as_str()) {
+            let occurrences = conn.execute(
+                "DELETE FROM events
+                 WHERE calendar_id = ?1 AND series_master_id = ?2
+                       AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'",
+                params![f.calendar_id, id, from_utc, to_utc],
+            )?;
+            cascaded |= occurrences > 0;
+        }
     }
     upsert_fetched_events_on(conn, f)?;
-    record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)
+    if !cascaded {
+        record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)?;
+    }
+    Ok(cascaded)
 }
 
 /// Records `[from_utc, to_utc)` of `calendar_id` as fetched at `stamp.at`,
@@ -7815,6 +7846,77 @@ mod calendar_tests {
             .unwrap();
         assert_eq!(sorted_ids_of(&s, "A"), ["other", "single"]);
         assert_eq!(ids_of(&s, "B"), ["b-o1"], "another calendar's series stays");
+    }
+
+    #[test]
+    fn apply_calendar_sync_delta_cascade_drops_the_delta_state_and_records_no_range() {
+        // A master Graph lists as removed may only have changed: after the
+        // cascade the next pass must run an initial round.
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[window("A", vec![])], stamp(1000, 0))
+            .unwrap();
+        s.upsert_event(&NewEvent {
+            series_master_id: Some("M".into()),
+            ..in_cal("o1", "A", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z")
+        })
+        .unwrap();
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[delta(
+                "A",
+                vec![in_cal(
+                    "new",
+                    "A",
+                    "2026-07-21T09:00:00Z",
+                    "2026-07-21T10:00:00Z",
+                )],
+                &["M"],
+                "LA2",
+            )],
+            stamp(2000, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            sorted_ids_of(&s, "A"),
+            ["new"],
+            "the round's own writes land"
+        );
+        assert_eq!(s.calendar_delta("A").unwrap(), None);
+        assert_eq!(
+            range_rows(&s, "A"),
+            [(FROM.to_string(), TO.to_string(), 1000)],
+            "the window is not recorded again"
+        );
+    }
+
+    #[test]
+    fn apply_calendar_sync_delta_plain_removal_stores_the_link() {
+        // A removed id with no occurrences stored is no cascade, even if it
+        // names a master: the link and the window are stored.
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.upsert_event(&in_cal(
+            "gone",
+            "A",
+            "2026-07-20T09:00:00Z",
+            "2026-07-20T10:00:00Z",
+        ))
+        .unwrap();
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[delta("A", vec![], &["gone", "M-without-rows"], "LA2")],
+            stamp(2000, 0),
+        )
+        .unwrap();
+        assert!(ids_of(&s, "A").is_empty());
+        assert_eq!(s.calendar_delta("A").unwrap().unwrap().delta_link, "LA2");
+        assert_eq!(
+            range_rows(&s, "A"),
+            [(FROM.to_string(), TO.to_string(), 2000)]
+        );
     }
 
     #[test]
