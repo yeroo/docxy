@@ -9,9 +9,10 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, FolderContact,
-    FolderListing, MailFolder, MasterCategory, Me, Message, MessageFields, MessageHeader,
-    OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
+    AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
+    EventDeltaPage, FolderContact, FolderListing, MailFolder, MasterCategory, Me, Message,
+    MessageFields, MessageHeader, OofStatus, Person, Recipient, Recurrence, ScheduleEntry,
+    plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -177,6 +178,22 @@ pub enum DeltaCursor {
     /// A `@odata.nextLink` (more pages) or `@odata.deltaLink` (resume point
     /// for the next sync) from a prior `DeltaPage`. Already a complete URL,
     /// so it's sent as-is rather than joined with `base`.
+    Link(String),
+}
+
+/// The `Prefer` header of every calendarView delta request (#2013).
+const CALENDAR_DELTA_PREFER: &str = "outlook.timezone=\"UTC\", odata.maxpagesize=50";
+
+/// Where a calendarView delta round's page comes from (#2013): the first
+/// page of an initial round over a calendar's window, or a `nextLink` or
+/// `deltaLink` from an earlier page, sent as is (`DeltaCursor::Link`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CalendarDeltaCursor {
+    Start {
+        calendar_id: String,
+        from_utc: String,
+        to_utc: String,
+    },
     Link(String),
 }
 
@@ -838,6 +855,61 @@ impl GraphClient {
             e.calendar_id = calendar_id.to_string();
         }
         Ok(events)
+    }
+
+    /// GET one page of a calendar's `calendarView/delta` (#2013): for
+    /// `Start`, `/me/calendars/{encoded id}/calendarView/delta?startDateTime=
+    /// &endDateTime=` (no `$top` or `$select`: Graph's calendarView delta
+    /// refuses both), and each upserted event's `calendar_id` is that
+    /// calendar (the URL decides, as in `calendar_view_in`); for `Link`, the
+    /// URL as is, and `calendar_id` is left for the caller to set. Every
+    /// request, a link's too, sends `Prefer: outlook.timezone="UTC",
+    /// odata.maxpagesize=50`: a deltaLink does not keep the time zone. A
+    /// page without a `value` array, or with neither a `nextLink` nor a
+    /// `deltaLink` (a round that could never finish), is a `Parse` error.
+    pub fn calendar_delta(
+        &self,
+        cursor: CalendarDeltaCursor,
+    ) -> Result<EventDeltaPage, GraphError> {
+        let (target, calendar_id) = match cursor {
+            CalendarDeltaCursor::Start {
+                calendar_id,
+                from_utc,
+                to_utc,
+            } => {
+                let id = encode_path_segment(&calendar_id);
+                (
+                    format!(
+                        "/me/calendars/{id}/calendarView/delta\
+                         ?startDateTime={from_utc}&endDateTime={to_utc}"
+                    ),
+                    Some(calendar_id),
+                )
+            }
+            CalendarDeltaCursor::Link(url) => (url, None),
+        };
+        let resp = self.send(
+            Method::Get,
+            &target,
+            None,
+            &[("Prefer", CALENDAR_DELTA_PREFER)],
+        )?;
+        let v = parse_body(resp)?;
+        let mut page = EventDeltaPage::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed calendar delta page".to_string()))?;
+        if page.next_link.is_none() && page.delta_link.is_none() {
+            return Err(GraphError::Parse(
+                "calendar delta page without a nextLink or deltaLink".to_string(),
+            ));
+        }
+        if let Some(calendar_id) = calendar_id {
+            for item in &mut page.items {
+                if let EventDeltaItem::Upsert(e) = item {
+                    e.calendar_id = calendar_id.clone();
+                }
+            }
+        }
+        Ok(page)
     }
 
     /// Sends `Prefer: outlook.timezone="UTC"` so every returned event's
@@ -3313,6 +3385,100 @@ mod tests {
                     .any(|(k, v)| k.eq_ignore_ascii_case("prefer")
                         && v == "outlook.timezone=\"UTC\"")
             );
+        }
+    }
+
+    fn sends_calendar_delta_prefer(r: &crate::testserver::RecordedRequest) -> bool {
+        r.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("prefer")
+                && v == "outlook.timezone=\"UTC\", odata.maxpagesize=50"
+        })
+    }
+
+    #[test]
+    fn calendar_delta_start_encodes_id_window_and_prefer_headers() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/calendars/A%2Fb%2B%3D/calendarView/delta?".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(
+                r#"{{"value":[{},{{"id":"GONE","@removed":{{"reason":"deleted"}}}}],"@odata.nextLink":"/cal-delta/A?page=2"}}"#,
+                sample_event_json("E1", "2026-07-18T09:00:00"),
+            ),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c
+            .calendar_delta(CalendarDeltaCursor::Start {
+                calendar_id: "A/b+=".to_string(),
+                from_utc: "2026-07-18T00:00:00Z".to_string(),
+                to_utc: "2026-07-19T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let EventDeltaItem::Upsert(e) = &page.items[0] else {
+            panic!("an upsert first")
+        };
+        assert_eq!((e.id.as_str(), e.calendar_id.as_str()), ("E1", "A/b+="));
+        assert_eq!(page.items[1], EventDeltaItem::Removed("GONE".to_string()));
+        assert_eq!(page.next_link.as_deref(), Some("/cal-delta/A?page=2"));
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs[0].path,
+            "/me/calendars/A%2Fb%2B%3D/calendarView/delta\
+             ?startDateTime=2026-07-18T00:00:00Z&endDateTime=2026-07-19T00:00:00Z"
+        );
+        assert!(sends_calendar_delta_prefer(&reqs[0]));
+    }
+
+    #[test]
+    fn calendar_delta_link_cursor_uses_url_as_is() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/cal-delta/A?token=2".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(
+                r#"{{"value":[{}],"@odata.deltaLink":"/cal-delta/A?token=3"}}"#,
+                sample_event_json("E1", "2026-07-18T09:00:00"),
+            ),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let link = format!("{}/cal-delta/A?token=2", srv.base_url);
+        let page = c.calendar_delta(CalendarDeltaCursor::Link(link)).unwrap();
+        let EventDeltaItem::Upsert(e) = &page.items[0] else {
+            panic!("an upsert")
+        };
+        // A link knows no calendar: the caller sets it.
+        assert_eq!(e.calendar_id, "");
+        assert_eq!(page.delta_link.as_deref(), Some("/cal-delta/A?token=3"));
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].path, "/cal-delta/A?token=2");
+        // The time zone preference is not in the link: it is sent again.
+        assert!(sends_calendar_delta_prefer(&reqs[0]));
+    }
+
+    #[test]
+    fn calendar_delta_page_without_any_link_is_a_parse_error() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/no-link".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/no-value".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"@odata.deltaLink":"/x"}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        for path in ["/no-link", "/no-value"] {
+            let got = c.calendar_delta(CalendarDeltaCursor::Link(path.to_string()));
+            assert!(matches!(got, Err(GraphError::Parse(_))), "{path}: {got:?}");
         }
     }
 
