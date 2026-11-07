@@ -52,7 +52,7 @@ pub(crate) fn set_harness(on: bool) {
     HARNESS.store(on, Ordering::Relaxed);
 }
 
-fn harness() -> bool {
+pub(crate) fn harness() -> bool {
     HARNESS.load(Ordering::Relaxed)
 }
 
@@ -683,11 +683,9 @@ impl DocView {
     pub(crate) fn layout_json(&self) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         match self.column.get() {
-            Some(col) if self.painted_gen.get() == Some(self.doc_gen) => painted_layout_json(
-                &self.paras.borrow(),
-                &self.editor.doc.body,
-                f32::from(col.origin.x),
-            ),
+            Some(col) if self.painted_gen.get() == Some(self.doc_gen) => {
+                painted_layout_json(&self.paras.borrow(), f32::from(col.origin.x))
+            }
             _ => Json::obj(vec![
                 ("painted", Json::Bool(false)),
                 ("paragraphs", Json::Arr(Vec::new())),
@@ -1080,16 +1078,15 @@ struct LaidLine {
 }
 
 /// The lines `para` painted: its words in order, joined with the run
-/// holding each by offset (`runs_text`: those runs' texts, in order); a
-/// word left of the one before it starts a line, as the row wrapped.
-fn painted_lines(para: &PaintedPara, runs_text: &[&str]) -> Vec<LaidLine> {
+/// holding each by offset; a word left of the one before it starts a line,
+/// as the row wrapped.
+fn painted_lines(para: &PaintedPara) -> Vec<LaidLine> {
     let mut lines: Vec<LaidLine> = Vec::new();
     for w in para.words.borrow().iter() {
-        let Some((i, run)) = para
+        let Some(run) = para
             .runs
             .iter()
-            .enumerate()
-            .find(|(_, r)| r.off <= w.off && w.off < r.off + r.len)
+            .find(|r| r.off <= w.off && w.off < r.off + r.len)
         else {
             continue;
         };
@@ -1099,10 +1096,7 @@ fn painted_lines(para: &PaintedPara, runs_text: &[&str]) -> Vec<LaidLine> {
             f32::from(b.origin.y),
             f32::from(b.origin.x + b.size.width),
         );
-        let text: String = runs_text
-            .get(i)
-            .map(|t| t.chars().skip(w.off - run.off).take(w.len).collect())
-            .unwrap_or_default();
+        let text: String = run.text.chars().skip(w.off - run.off).take(w.len).collect();
         match lines.last_mut() {
             Some(line) if x >= line.right - 0.5 => {
                 line.right = right;
@@ -1125,19 +1119,15 @@ fn painted_lines(para: &PaintedPara, runs_text: &[&str]) -> Vec<LaidLine> {
     lines
 }
 
-/// The harness's `ext-doc-layout` (#1986) of the paragraphs a frame
-/// painted (`paras`) over `body`: per paragraph its block, top and height,
+/// The harness's `ext-doc-layout` and `doc`'s `flow.layout` (#1986) of
+/// the paragraphs a frame painted (`paras`): per paragraph its block, top and height,
 /// its text's left (`text_x`), its list number and its lines, px rounded,
 /// x from the text column's left (`column_x`) and y from the first
 /// paragraph's top; `marker_matches_text` (the number's ink is its first
 /// line's) and `marker_fits` (it ends left of the text), null without a
 /// number; and the least and greatest pitch between consecutive lines of
 /// the document, an empty paragraph counting as one line at its top.
-fn painted_layout_json(
-    paras: &[PaintedPara],
-    body: &[Block],
-    column_x: f32,
-) -> ctlcore::json::Json {
+pub(crate) fn painted_layout_json(paras: &[PaintedPara], column_x: f32) -> ctlcore::json::Json {
     use ctlcore::json::Json;
     let num = |v: f32| Json::Num(f64::from(v.round()));
     let y0 = paras
@@ -1148,18 +1138,7 @@ fn painted_layout_json(
         .iter()
         .map(|para| {
             let root = para.root.get();
-            let texts: Vec<String> = match body.get(para.block) {
-                Some(Block::Paragraph(p)) => flat_inlines(&p.content)
-                    .iter()
-                    .filter_map(|(i, _)| match &**i {
-                        Inline::Run(r) => Some(r.text.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
-            let lines = painted_lines(para, &texts);
+            let lines = painted_lines(para);
             let top = f32::from(root.origin.y) - y0;
             if lines.is_empty() {
                 tops.push(top.round());
@@ -1457,13 +1436,6 @@ mod tests {
     fn layout_dump_reads_lines_markers_and_pitch() {
         use ctlcore::json::Json;
         let ink = hsla_u(0x112233);
-        let body = vec![
-            Block::Paragraph(Paragraph {
-                content: vec![run("Item one wraps")],
-                ..Default::default()
-            }),
-            Block::Paragraph(Paragraph::default()),
-        ];
         let at = |x: f32, y: f32, w: f32, h: f32| {
             let c = UnitCell::default();
             c.set(Bounds::new(point(px(x), px(y)), size(px(w), px(h))));
@@ -1490,6 +1462,7 @@ mod tests {
                     len: 14,
                     size: 16.,
                     ink,
+                    text: "Item one wraps".into(),
                 }],
                 words,
             },
@@ -1501,7 +1474,7 @@ mod tests {
                 words: WordSpans::default(),
             },
         ];
-        let j = painted_layout_json(&paras, &body, 100.);
+        let j = painted_layout_json(&paras, 100.);
         let get = |path: &str| {
             path.split('.')
                 .try_fold(&j, |v, k| match k.parse::<usize>() {

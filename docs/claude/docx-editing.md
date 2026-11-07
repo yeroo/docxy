@@ -56,7 +56,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   sees only `w:left`). The ruler's Left drag (`RulerChange::Left { indent:
   marker }`) moves each selected paragraph by the drag from where it was
   drawn at the drag start, never left of its own level step:
-  `max(start_left + marker − caret_start_left, step)` (`ruler_left_for`,
+  `max(start_left + marker − caret_start_left, step)`, its own first-line
+  delta clamped to that left (#1986 r4) (`ruler_left_for`,
   `Editor::set_indents_from`; the starts are `RulerIndentBase::starts`,
   aligned with its paths by index, #1986 r2/r3). One paragraph gets the
   marker; a selection keeps its nesting and its differences (an imported
@@ -278,8 +279,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   column, y from the first paragraph; colours `rrggbb` with no `#` (a
   case's `#` starts a comment). Words join their runs by caret offset. It
   says `painted: false` until a frame of the document last loaded has
-  painted. `uiharness/cases/ext-doc-outlook-mail.uit` drives it, and opens
-  the same mail (`fixtures/outlook-mail.html`) in a document tab.
+  painted. The document tab's flow view records the same
+  (`Docxy::painted_paras`, a harness instance only) for `doc`'s
+  `flow.layout` (`null` in Print Layout; x from `draft_column`).
+  `uiharness/cases/ext-doc-outlook-mail.uit` drives both: the view, and the
+  same mail (`fixtures/outlook-mail.html`) opened in a document tab.
 - Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`), and
   now its numbers, stay black on a dark page; Outlook lightens them. Style
   spacing (docDefaults, Normal, the style chain) is still not resolved, so

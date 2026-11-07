@@ -5616,6 +5616,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
+    /// The document tab's top-level paragraphs as its flow view last painted
+    /// them, in a harness instance (#1986), for `doc`'s `flow.layout`.
+    painted_paras: PaintedParas,
     /// The document tab's body pictures as last drawn (#1926), for the
     /// harness's `doc` read.
     drawn_pictures: pictures::DrawnPictures,
@@ -7455,6 +7458,44 @@ mod flow_view_tests {
         assert_eq!(reloaded_lefts(&ed), [600, 0]);
     }
 
+    /// #1986 r4 m1: a drag over a hanging list item and a plain paragraph,
+    /// the caret on the item, keeps each paragraph's own first line.
+    #[test]
+    fn a_multi_paragraph_drag_keeps_each_first_line() {
+        let para = |props: ParProps| {
+            Block::Paragraph(Paragraph {
+                props,
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "a".into(),
+                    ..Default::default()
+                })],
+            })
+        };
+        let body = vec![
+            para(ParProps {
+                num_id: Some(NUM_DECIMAL),
+                indent: 720,
+                first_line: -330,
+                ..ParProps::default()
+            }),
+            para(ParProps::default()),
+        ];
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.select_all();
+        drag_selection(&mut ed, 0, 180);
+        let firsts: Vec<(i32, i32)> = ed
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some((p.props.indent, p.props.first_line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(firsts, [(900, -330), (180, 0)]);
+        assert_eq!(reloaded_lefts(&ed), [900, 180]);
+    }
+
     /// #1986 r3 M1: an imported nested list (600 / 1200 twips, lefts of
     /// their own) keeps its nesting under a drag, the caret on either item.
     #[test]
@@ -7487,19 +7528,27 @@ mod flow_view_tests {
     }
 
     /// `ruler_left_for`: moved by the drag from its start, at or right of
-    /// its level, the first line clamped to its own left; no start, the
-    /// marker.
+    /// its level, its own first line clamped to its new left; no start, the
+    /// marker and the caret's first line.
     #[test]
     fn ruler_left_for_moves_by_the_drag() {
-        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0))), (360, 0));
-        assert_eq!(ruler_left_for(960, 0, 600, Some((600, 600))), (960, 0));
-        assert_eq!(ruler_left_for(960, -720, 600, Some((0, 0))), (360, -360));
-        assert_eq!(ruler_left_for(300, 0, 600, Some((600, 600))), (600, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0, 0))), (360, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((600, 600, 0))), (960, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0, -720))), (360, -360));
+        // A plain paragraph keeps its own first line, not the caret's hang.
+        assert_eq!(ruler_left_for(960, -330, 600, Some((0, 0, 0))), (360, 0));
+        assert_eq!(ruler_left_for(300, 0, 600, Some((600, 600, 0))), (600, 0));
         assert_eq!(ruler_left_for(960, -720, 600, None), (960, -720));
         let paras = vec![(vec![0], false), (vec![3], true)];
-        let starts = vec![Some((0, 0)), Some((720, 0))];
-        assert_eq!(ruler_start_at(&paras, &starts, 1, &[3]), Some((720, 0)));
-        assert_eq!(ruler_start_at(&paras, &starts, 0, &[3]), Some((720, 0)));
+        let starts = vec![Some((0, 0, 0)), Some((720, 0, -360))];
+        assert_eq!(
+            ruler_start_at(&paras, &starts, 1, &[3]),
+            Some((720, 0, -360))
+        );
+        assert_eq!(
+            ruler_start_at(&paras, &starts, 0, &[3]),
+            Some((720, 0, -360))
+        );
         assert_eq!(ruler_start_at(&paras, &starts, 0, &[9]), None);
     }
 
@@ -8235,11 +8284,11 @@ mod ruler_geom_tests {
         let base = RulerIndentBase {
             hf: true,
             paras: vec![(vec![0], true)],
-            starts: vec![Some((300, 300))],
+            starts: vec![Some((300, 300, 0))],
         };
         assert_eq!(
             base.for_editor(true),
-            (&[(vec![0], true)][..], &[Some((300, 300))][..])
+            (&[(vec![0], true)][..], &[Some((300, 300, 0))][..])
         );
         assert!(base.for_editor(false).0.is_empty());
         assert!(base.for_editor(false).1.is_empty());
@@ -8668,9 +8717,9 @@ struct RulerDrag {
     sect_checkpointed: bool,
 }
 
-/// A paragraph's drawn left and level step (`eff_indent`) at a drag's
-/// start (#1986); `None` where it was not found.
-type RulerStart = Option<(i32, i32)>;
+/// A paragraph's drawn left, level step and first-line delta
+/// (`eff_indent`) at a drag's start (#1986); `None` where it was not found.
+type RulerStart = Option<(i32, i32, i32)>;
 
 /// A Left-marker drag's paragraphs at its start (`Editor::indent_base`),
 /// and whether they came from the open header or footer's editor (#1814).
@@ -8692,7 +8741,7 @@ impl RulerIndentBase {
             .map(|(path, _)| {
                 docxcore::editor::resolve_para(&ed.doc.body, path).map(|p| {
                     let eff = eff_indent(&p.props);
-                    (eff.left, eff.list_step)
+                    (eff.left, eff.list_step, eff.first)
                 })
             })
             .collect();
@@ -8730,23 +8779,22 @@ fn ruler_start_at(
 /// The left indent and first-line delta a Left drag to `marker` (with the
 /// caret paragraph's clamped `first`, the caret paragraph drawn at
 /// `caret_left` at the start) writes to a paragraph drawn at `start`
-/// (its left and level step, #1986): it moves by the drag from where it
-/// was, never left of its own level, so a selection keeps its nesting and
-/// its differences, and one paragraph gets the marker. A paragraph with no
-/// start gets the marker.
-fn ruler_left_for(
-    marker: i32,
-    first: i32,
-    caret_left: i32,
-    start: Option<(i32, i32)>,
-) -> (i32, i32) {
-    let left = match start {
-        Some((left, step)) => left
-            .saturating_add(marker.saturating_sub(caret_left))
-            .max(step),
-        None => marker,
-    };
-    (left, first.max(-left))
+/// (its left, level step and first-line delta, #1986): it moves by the
+/// drag from where it was, never left of its own level, keeping its own
+/// first line clamped to its new left, so a selection keeps its nesting
+/// and its differences, and one paragraph gets the marker (its own first
+/// line clamped so is the caret's `first`). A paragraph with no start
+/// gets the marker and `first`.
+fn ruler_left_for(marker: i32, first: i32, caret_left: i32, start: RulerStart) -> (i32, i32) {
+    match start {
+        Some((left, step, own_first)) => {
+            let left = left
+                .saturating_add(marker.saturating_sub(caret_left))
+                .max(step);
+            (left, own_first.max(-left))
+        }
+        None => (marker, first.max(-marker)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -9672,12 +9720,14 @@ struct PaintedMarker {
     at: UnitCell,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PaintedRun {
     off: usize,
     len: usize,
     size: f32,
     ink: Hsla,
+    /// Its text, as drawn (a markup view's may not be the editor's).
+    text: String,
 }
 
 /// The [`PaintedPara`]s of the frame last drawn.
@@ -16349,6 +16399,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             painted_tables: PaintedTables::default(),
+            painted_paras: PaintedParas::default(),
             drawn_pictures: pictures::DrawnPictures::default(),
             doc_follow: std::rc::Rc::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
@@ -35861,6 +35912,7 @@ fn paragraph_el(
                         len: idx - idx_before,
                         size: run_look::run_size_px(&shown, base, zoom),
                         ink: run_ink(&shown, in_link, &pal),
+                        text: r.text.clone(),
                     });
                 }
                 x += run_w(r);
@@ -42448,6 +42500,9 @@ impl Render for Docxy {
                         .map(|pkg| pictures::Pictures::new(pkg, &tab.pictures));
                     let painted_tables = self.painted_tables.clone();
                     painted_tables.borrow_mut().clear();
+                    // The flow view's paragraphs, for the harness (#1986).
+                    let painted_paras = self.painted_paras.clone();
+                    painted_paras.borrow_mut().clear();
                     // The body's pictures as drawn, for the harness (#1926).
                     let drawn_pictures = self.drawn_pictures.clone();
                     drawn_pictures.borrow_mut().clear();
@@ -43219,6 +43274,7 @@ impl Render for Docxy {
                         let flow_ctx = RenderCtx {
                             fit_width: used_w,
                             flow: true,
+                            paras: doc_view::harness().then_some(&painted_paras),
                             ..ctx
                         };
                         // The column puts 4 px between blocks as each

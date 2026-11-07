@@ -2568,7 +2568,9 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// `place` across `text_column`, `null` without one:
 /// `crate::painted_tables_json`), and `pictures`, each body inline picture
 /// the last frame built (`width`, `height`, clip `radius`, `shape`, `round`:
-/// `crate::pictures::drawn_pictures_json`, #1926).
+/// `crate::pictures::drawn_pictures_json`, #1926), and `layout`, the flow
+/// view's paragraphs (`crate::doc_view::painted_layout_json`, #1986; `null`
+/// in Print Layout).
 fn flow_state(app: &crate::Docxy) -> Json {
     let probe = app.ruler_probe.borrow();
     let num = |v: f32| Json::Num(f64::from(v.round()));
@@ -2604,6 +2606,18 @@ fn flow_state(app: &crate::Docxy) -> Json {
         (
             "pictures",
             crate::pictures::drawn_pictures_json(&app.drawn_pictures),
+        ),
+        // The flow view's paragraphs as last painted (#1986), as the test
+        // extension's `ext-doc-layout` reads them; `null` in Print Layout
+        // or before Web Layout has drawn.
+        (
+            "layout",
+            match (probe.draft, probe.draft_column) {
+                (true, Some(column)) => {
+                    crate::doc_view::painted_layout_json(&app.painted_paras.borrow(), column.x)
+                }
+                _ => Json::Null,
+            },
         ),
     ])
 }

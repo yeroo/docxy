@@ -9,7 +9,8 @@
 # px from the text column's left and the first paragraph's top. Font
 # independent: positions come from indents and line heights, colours from
 # the model. The last test opens the same mail (`fixtures/outlook-mail.html`)
-# in a document tab, whose Web Layout draws it the same way.
+# in a document tab, whose Web Layout draws it the same way (`doc`'s
+# `flow.layout` reads it as `ext-doc-layout` does).
 ext fixture
 
 test issue 1986 an imported Outlook mail draws its lines, empty lines and list numbers as a browser does, light and dark
@@ -149,8 +150,23 @@ test issue 1986 a mail with no colour draws its numbers in the text's ink, never
 test issue 1986 the same mail opened as a web page draws in a document tab's web layout
   call theme-set {"theme":"light"}
   open copy:../fixtures/outlook-mail.html
+  shot window
   call doc {}
   assert reply.view.layout is web
-  shot window
+  assert reply.flow.layout.painted is true
+  assert reply.flow.layout.pitch_min is 18
+  assert reply.flow.layout.pitch_max is 18
+  assert reply.flow.layout.paragraphs.0.top is 0
+  assert reply.flow.layout.paragraphs.0.lines.0.text is Hi
+  assert reply.flow.layout.paragraphs.0.lines.0.x is 0
+  assert reply.flow.layout.paragraphs.2.top is 36
+  assert reply.flow.layout.paragraphs.2.marker.text is 1.
+  assert reply.flow.layout.paragraphs.2.marker.x is 22
+  assert reply.flow.layout.paragraphs.2.text_x is 40
+  assert reply.flow.layout.paragraphs.2.marker_matches_text is true
+  assert reply.flow.layout.paragraphs.5.text_x is 40
+  assert reply.flow.layout.paragraphs.6.top is 108
+  assert reply.flow.layout.paragraphs.6.height is 18
+  assert reply.flow.layout.paragraphs.9.top is 162
   call theme-set {"theme":"auto"}
   call real-key {"key":"ctrl+w"}
