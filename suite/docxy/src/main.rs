@@ -7300,6 +7300,7 @@ mod flow_view_tests {
                 page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
                 sect_checkpointed: false,
             };
+            let steps = RulerIndentBase::of(ed, false).steps;
             for &delta in moves {
                 let marker = dragged_left_marker(start, delta);
                 let RulerChange::Left { indent, first } =
@@ -7307,7 +7308,9 @@ mod flow_view_tests {
                 else {
                     panic!("not a left change");
                 };
-                ed.set_indent_from(indent, first, &base);
+                ed.set_indents_from(&base, |path| {
+                    ruler_left_for(indent, first, start.list_step, &steps, path)
+                });
                 let p = first_props(ed);
                 assert_eq!(eff_indent(&p).left, marker, "move {delta}: {p:?}");
                 assert_eq!(reloaded_left(ed), marker, "move {delta} reloaded");
@@ -7320,6 +7323,134 @@ mod flow_view_tests {
         let mut ed = session_item();
         ed.set_indent(360, 0);
         drag(&mut ed, &[-720, 240, 600]);
+    }
+
+    /// Lefts as drawn, by paragraph.
+    fn lefts(ed: &docxcore::editor::Editor) -> Vec<i32> {
+        ed.doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The same, once saved and opened again.
+    fn reloaded_lefts(ed: &docxcore::editor::Editor) -> Vec<i32> {
+        let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
+        let back = docxcore::package::load_package(&docxcore::package::save_package(&pkg))
+            .unwrap()
+            .document;
+        back.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A selected list of items at `(ilvl, indent)`.
+    fn selected_list(items: &[(i32, i32)]) -> docxcore::editor::Editor {
+        let body = items
+            .iter()
+            .map(|&(ilvl, indent)| {
+                Block::Paragraph(Paragraph {
+                    props: ParProps {
+                        num_id: Some(NUM_DECIMAL),
+                        ilvl,
+                        indent,
+                        ..ParProps::default()
+                    },
+                    content: vec![Inline::Run(docxcore::model::Run {
+                        text: "a".into(),
+                        ..Default::default()
+                    })],
+                })
+            })
+            .collect();
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.select_all();
+        ed
+    }
+
+    /// One Left-drag move of `delta` twips over the whole selection, the
+    /// caret on paragraph `caret`, as `ruler_drag_move` applies it.
+    fn drag_selection(ed: &mut docxcore::editor::Editor, caret: usize, delta: i32) {
+        let Some(Block::Paragraph(p)) = ed.doc.body.get(caret) else {
+            panic!("no paragraph {caret}");
+        };
+        let start = eff_indent(&p.props);
+        let base = RulerIndentBase::of(ed, false);
+        let d = RulerDrag {
+            handle: RulerHandle::Left,
+            start_x: 200.0,
+            zoom: 1.0,
+            indent: start,
+            page: docxcore::model::PageGeom::default(),
+            content_x: 300.0,
+            content_right: 900.0,
+            page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+            sect_checkpointed: false,
+        };
+        let RulerChange::Left { indent, first } =
+            ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change
+        else {
+            panic!("not a left change");
+        };
+        let steps = base.steps.clone();
+        ed.set_indents_from(&base.paras, |path| {
+            ruler_left_for(indent, first, start.list_step, &steps, path)
+        });
+    }
+
+    /// #1986 r2 M1: a Left drag over several list items keeps their
+    /// nesting: each moves by the drag, as before #1986, on screen and
+    /// after a save and reload.
+    #[test]
+    fn a_multi_item_ruler_drag_keeps_the_nesting() {
+        let level_only = [(0, 0), (1, 0), (2, 0)];
+        let mut ed = selected_list(&level_only);
+        assert_eq!(lefts(&ed), [0, 300, 600]);
+        drag_selection(&mut ed, 0, 360);
+        assert_eq!(lefts(&ed), [360, 660, 960]);
+        assert_eq!(reloaded_lefts(&ed), [360, 660, 960]);
+        // The caret on the deepest item (600 + 300 = 900, on the ruler's
+        // 180 tw grid).
+        let mut ed = selected_list(&level_only);
+        drag_selection(&mut ed, 2, 300);
+        assert_eq!(lefts(&ed), [300, 600, 900]);
+        assert_eq!(reloaded_lefts(&ed), [300, 600, 900]);
+        // Leftward, it clamps at the caret's level: none goes left of its own.
+        let mut ed = selected_list(&level_only);
+        drag_selection(&mut ed, 2, -720);
+        assert_eq!(lefts(&ed), [0, 300, 600]);
+        assert_eq!(reloaded_lefts(&ed), [0, 300, 600]);
+        // A left of its own beside a level-only item: the caret's own left
+        // is the marker, the other keeps its step over the shared value.
+        let mixed = [(1, 720), (1, 0)];
+        let mut ed = selected_list(&mixed);
+        assert_eq!(lefts(&ed), [720, 300]);
+        drag_selection(&mut ed, 1, 360); // 300 + 360 snaps to 720
+        assert_eq!(lefts(&ed), [420, 720]);
+        assert_eq!(reloaded_lefts(&ed), [420, 720]);
+        let mut ed = selected_list(&mixed);
+        drag_selection(&mut ed, 0, 360);
+        assert_eq!(lefts(&ed), [1080, 1380]);
+        assert_eq!(reloaded_lefts(&ed), [1080, 1380]);
+    }
+
+    /// `ruler_left_for`: the caret's step off, the paragraph's own on (the
+    /// caret's when unnamed), the first line clamped to its own left.
+    #[test]
+    fn ruler_left_for_keeps_each_items_step() {
+        let steps = vec![(vec![0], 0), (vec![1], 300), (vec![2], 600)];
+        assert_eq!(ruler_left_for(960, 0, 600, &steps, &[0]), (360, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, &steps, &[2]), (960, 0));
+        assert_eq!(ruler_left_for(960, -720, 600, &steps, &[0]), (360, -360));
+        assert_eq!(ruler_left_for(960, -720, 600, &steps, &[7]), (960, -720));
     }
 
     /// #1986 r1 M3: Decrease to the margin, then Increase, on an item
@@ -8054,12 +8185,16 @@ mod ruler_geom_tests {
         let base = RulerIndentBase {
             hf: true,
             paras: vec![(vec![0], true)],
+            steps: vec![(vec![0], 300)],
         };
         assert_eq!(base.for_editor(true), &[(vec![0], true)]);
         assert!(base.for_editor(false).is_empty());
+        assert_eq!(base.steps_for(true), &[(vec![0], 300)]);
+        assert!(base.steps_for(false).is_empty());
         let body = RulerIndentBase {
             hf: false,
             paras: vec![(vec![2], false)],
+            steps: Vec::new(),
         };
         assert_eq!(body.for_editor(false), &[(vec![2], false)]);
         assert!(body.for_editor(true).is_empty());
@@ -8487,15 +8622,59 @@ struct RulerDrag {
 struct RulerIndentBase {
     hf: bool,
     paras: Vec<(Vec<usize>, bool)>,
+    /// Each selected paragraph's level step at the drag start
+    /// (`eff_indent`'s `list_step`, #1986), by path.
+    steps: Vec<(Vec<usize>, i32)>,
 }
 
 impl RulerIndentBase {
+    /// The base of a Left drag in `ed`: [`Editor::indent_base`] and each
+    /// selected paragraph's level step.
+    fn of(ed: &Editor, hf: bool) -> Self {
+        let paras = ed.indent_base();
+        let steps = paras
+            .iter()
+            .filter_map(|(path, _)| {
+                docxcore::editor::resolve_para(&ed.doc.body, path)
+                    .map(|p| (path.clone(), eff_indent(&p.props).list_step))
+            })
+            .collect();
+        RulerIndentBase { hf, paras, steps }
+    }
+
     /// The base for a move that edits the header or footer (`hf_now`) or the
     /// body: empty (the live paragraphs decide) when that is not the editor
     /// it was taken from, as its paths name another story's paragraphs.
     fn for_editor(&self, hf_now: bool) -> &[(Vec<usize>, bool)] {
         if self.hf == hf_now { &self.paras } else { &[] }
     }
+
+    /// [`Self::steps`] for a move in that editor, as [`Self::for_editor`].
+    fn steps_for(&self, hf_now: bool) -> &[(Vec<usize>, i32)] {
+        if self.hf == hf_now { &self.steps } else { &[] }
+    }
+}
+
+/// The left indent and first-line delta a Left drag to `marker` (with the
+/// caret paragraph's clamped `first`) writes to the paragraph at `path`
+/// (#1986): the caret paragraph's level step `caret_step` taken off and the
+/// paragraph's own (`steps`, at the drag start; the caret's when it is not
+/// named) put on, so each list item keeps its nesting, an item with no left
+/// of its own draws where it did before, and one paragraph gets the marker.
+/// The clamp at `caret_step` keeps each at or right of its own level.
+fn ruler_left_for(
+    marker: i32,
+    first: i32,
+    caret_step: i32,
+    steps: &[(Vec<usize>, i32)],
+    path: &[usize],
+) -> (i32, i32) {
+    let step = steps
+        .iter()
+        .find(|(p, _)| p.as_slice() == path)
+        .map_or(caret_step, |(_, s)| *s);
+    let left = marker.saturating_sub(caret_step).saturating_add(step);
+    (left, first.max(-left))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -26641,12 +26820,16 @@ impl Docxy {
         // The editor the moves edit (`with_editor`): the open header or
         // footer, else the body.
         self.ruler_indent_base = match (handle, self.tabs.get(self.active)) {
-            (RulerHandle::Left, Some(tab)) => RulerIndentBase {
-                hf: tab.hf_edit.is_some(),
-                paras: tab_edit_target_ref(tab)
-                    .map(Editor::indent_base)
-                    .unwrap_or_default(),
-            },
+            (RulerHandle::Left, Some(tab)) => {
+                let hf = tab.hf_edit.is_some();
+                tab_edit_target_ref(tab).map_or(
+                    RulerIndentBase {
+                        hf,
+                        ..Default::default()
+                    },
+                    |ed| RulerIndentBase::of(ed, hf),
+                )
+            }
             _ => RulerIndentBase::default(),
         };
         self.ruler_drag = Some(RulerDrag {
@@ -26683,7 +26866,13 @@ impl Docxy {
                     .get(self.active)
                     .is_some_and(|t| t.hf_edit.is_some());
                 let paras = base.for_editor(hf_now);
-                self.with_editor(window, cx, |e| e.set_indent_from(indent, first, paras));
+                // Each list item keeps its own level step (#1986).
+                let (steps, caret_step) = (base.steps_for(hf_now), d.indent.list_step);
+                self.with_editor(window, cx, |e| {
+                    e.set_indents_from(paras, |path| {
+                        ruler_left_for(indent, first, caret_step, steps, path)
+                    })
+                });
                 self.ruler_indent_base = base;
             }
             RulerChange::Right(right) => {

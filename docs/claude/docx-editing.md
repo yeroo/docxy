@@ -48,15 +48,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
 - The suite's `eff_indent` adds the level step `ilvl × 300` only to a list
   item with no left indent of its own: an explicit numId 0 takes none, nor
   does an item with a direct left (`ParProps::has_direct_left_indent`:
-  `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included, the
-  editor's `had_direct_left`). A direct `w:left` replaces the level's
+  `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included). A
+  direct `w:left` replaces the level's
   indent, as Word reads the file, and the session follows it, so an item
   draws where a save and reload puts it (#1986 r1: a rule telling a
   session-written left from a loaded one cannot survive the reload, which
-  sees only `w:left`). The ruler's Left drag writes the marker itself
-  (`RulerChange::Left { indent: marker }`): after the first move the item
-  has a left of its own; `dragged_left_marker` still clamps an item with
-  none at the drag start to its level's indent.
+  sees only `w:left`). The ruler's Left drag (`RulerChange::Left { indent:
+  marker }`) writes each selected paragraph `marker − caret step + its own
+  step` (`ruler_left_for`, `Editor::set_indents_from`; the steps are
+  `RulerIndentBase::steps`, taken at the drag start, #1986 r2): one
+  paragraph gets the marker, and a selection of list items keeps its
+  nesting, each moving by the drag as before #1986. `dragged_left_marker`
+  still clamps at the caret's level step, so none goes left of its own
+  level. Paragraphs with different lefts of their own still all get the
+  same one, as before.
 
 ## Manual hyphenation (#1266)
 
