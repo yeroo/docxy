@@ -7300,7 +7300,7 @@ mod flow_view_tests {
                 page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
                 sect_checkpointed: false,
             };
-            let steps = RulerIndentBase::of(ed, false).steps;
+            let starts = RulerIndentBase::of(ed, false).starts;
             for &delta in moves {
                 let marker = dragged_left_marker(start, delta);
                 let RulerChange::Left { indent, first } =
@@ -7308,8 +7308,9 @@ mod flow_view_tests {
                 else {
                     panic!("not a left change");
                 };
-                ed.set_indents_from(&base, |path| {
-                    ruler_left_for(indent, first, start.list_step, &steps, path)
+                ed.set_indents_from(&base, |i, path| {
+                    let at = ruler_start_at(&base, &starts, i, path);
+                    ruler_left_for(indent, first, start.left, at)
                 });
                 let p = first_props(ed);
                 assert_eq!(eff_indent(&p).left, marker, "move {delta}: {p:?}");
@@ -7400,17 +7401,22 @@ mod flow_view_tests {
         else {
             panic!("not a left change");
         };
-        let steps = base.steps.clone();
-        ed.set_indents_from(&base.paras, |path| {
-            ruler_left_for(indent, first, start.list_step, &steps, path)
+        let (paras, starts) = base.for_editor(false);
+        ed.set_indents_from(paras, |i, path| {
+            ruler_left_for(
+                indent,
+                first,
+                start.left,
+                ruler_start_at(paras, starts, i, path),
+            )
         });
     }
 
-    /// #1986 r2 M1: a Left drag over several list items keeps their
-    /// nesting: each moves by the drag, as before #1986, on screen and
-    /// after a save and reload.
+    /// #1986 r2 M1, r3 M1: a Left drag over several paragraphs moves each
+    /// by the drag from where it was drawn, never left of its own level, so
+    /// a list keeps its nesting, on screen and after a save and reload.
     #[test]
-    fn a_multi_item_ruler_drag_keeps_the_nesting() {
+    fn a_multi_item_ruler_drag_moves_each_by_the_drag() {
         let level_only = [(0, 0), (1, 0), (2, 0)];
         let mut ed = selected_list(&level_only);
         assert_eq!(lefts(&ed), [0, 300, 600]);
@@ -7428,29 +7434,73 @@ mod flow_view_tests {
         drag_selection(&mut ed, 2, -720);
         assert_eq!(lefts(&ed), [0, 300, 600]);
         assert_eq!(reloaded_lefts(&ed), [0, 300, 600]);
-        // A left of its own beside a level-only item: the caret's own left
-        // is the marker, the other keeps its step over the shared value.
+        // A left of its own beside a level-only item: each moves by the
+        // drag (300 + 360 snaps to 720: by 420).
         let mixed = [(1, 720), (1, 0)];
         let mut ed = selected_list(&mixed);
         assert_eq!(lefts(&ed), [720, 300]);
-        drag_selection(&mut ed, 1, 360); // 300 + 360 snaps to 720
-        assert_eq!(lefts(&ed), [420, 720]);
-        assert_eq!(reloaded_lefts(&ed), [420, 720]);
+        drag_selection(&mut ed, 1, 360);
+        assert_eq!(lefts(&ed), [1140, 720]);
+        assert_eq!(reloaded_lefts(&ed), [1140, 720]);
         let mut ed = selected_list(&mixed);
         drag_selection(&mut ed, 0, 360);
-        assert_eq!(lefts(&ed), [1080, 1380]);
-        assert_eq!(reloaded_lefts(&ed), [1080, 1380]);
+        assert_eq!(lefts(&ed), [1080, 660]);
+        assert_eq!(reloaded_lefts(&ed), [1080, 660]);
+        // Leftward, the level-only item stops at its level while the other
+        // goes on to the margin.
+        let mut ed = selected_list(&[(2, 0), (0, 720)]);
+        assert_eq!(lefts(&ed), [600, 720]);
+        drag_selection(&mut ed, 1, -720);
+        assert_eq!(lefts(&ed), [600, 0]);
+        assert_eq!(reloaded_lefts(&ed), [600, 0]);
     }
 
-    /// `ruler_left_for`: the caret's step off, the paragraph's own on (the
-    /// caret's when unnamed), the first line clamped to its own left.
+    /// #1986 r3 M1: an imported nested list (600 / 1200 twips, lefts of
+    /// their own) keeps its nesting under a drag, the caret on either item.
     #[test]
-    fn ruler_left_for_keeps_each_items_step() {
-        let steps = vec![(vec![0], 0), (vec![1], 300), (vec![2], 600)];
-        assert_eq!(ruler_left_for(960, 0, 600, &steps, &[0]), (360, 0));
-        assert_eq!(ruler_left_for(960, 0, 600, &steps, &[2]), (960, 0));
-        assert_eq!(ruler_left_for(960, -720, 600, &steps, &[0]), (360, -360));
-        assert_eq!(ruler_left_for(960, -720, 600, &steps, &[7]), (960, -720));
+    fn an_imported_nested_list_keeps_its_nesting_under_a_drag() {
+        let imported = || {
+            let d = docxcore::import::html::import_html(
+                b"<ol><li><div>one</div><ol><li><div>two</div></li></ol></li></ol>",
+            )
+            .unwrap();
+            let mut ed = docxcore::editor::Editor::new(d);
+            ed.select_all();
+            assert_eq!(lefts(&ed), [600, 1200]);
+            ed
+        };
+        // On "one": 600 + 300 = 900.
+        let mut ed = imported();
+        drag_selection(&mut ed, 0, 300);
+        assert_eq!(lefts(&ed), [900, 1500]);
+        assert_eq!(reloaded_lefts(&ed), [900, 1500]);
+        // On "two": 1200 + 300 snaps to 1440, so by 240.
+        let mut ed = imported();
+        drag_selection(&mut ed, 1, 300);
+        assert_eq!(lefts(&ed), [840, 1440]);
+        assert_eq!(reloaded_lefts(&ed), [840, 1440]);
+        // On "two", leftward: "one" moves left too, and stops at the margin.
+        let mut ed = imported();
+        drag_selection(&mut ed, 1, -900);
+        assert_eq!(lefts(&ed), [0, 360]);
+        assert_eq!(reloaded_lefts(&ed), [0, 360]);
+    }
+
+    /// `ruler_left_for`: moved by the drag from its start, at or right of
+    /// its level, the first line clamped to its own left; no start, the
+    /// marker.
+    #[test]
+    fn ruler_left_for_moves_by_the_drag() {
+        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0))), (360, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((600, 600))), (960, 0));
+        assert_eq!(ruler_left_for(960, -720, 600, Some((0, 0))), (360, -360));
+        assert_eq!(ruler_left_for(300, 0, 600, Some((600, 600))), (600, 0));
+        assert_eq!(ruler_left_for(960, -720, 600, None), (960, -720));
+        let paras = vec![(vec![0], false), (vec![3], true)];
+        let starts = vec![Some((0, 0)), Some((720, 0))];
+        assert_eq!(ruler_start_at(&paras, &starts, 1, &[3]), Some((720, 0)));
+        assert_eq!(ruler_start_at(&paras, &starts, 0, &[3]), Some((720, 0)));
+        assert_eq!(ruler_start_at(&paras, &starts, 0, &[9]), None);
     }
 
     /// #1986 r1 M3: Decrease to the margin, then Increase, on an item
@@ -8185,19 +8235,21 @@ mod ruler_geom_tests {
         let base = RulerIndentBase {
             hf: true,
             paras: vec![(vec![0], true)],
-            steps: vec![(vec![0], 300)],
+            starts: vec![Some((300, 300))],
         };
-        assert_eq!(base.for_editor(true), &[(vec![0], true)]);
-        assert!(base.for_editor(false).is_empty());
-        assert_eq!(base.steps_for(true), &[(vec![0], 300)]);
-        assert!(base.steps_for(false).is_empty());
+        assert_eq!(
+            base.for_editor(true),
+            (&[(vec![0], true)][..], &[Some((300, 300))][..])
+        );
+        assert!(base.for_editor(false).0.is_empty());
+        assert!(base.for_editor(false).1.is_empty());
         let body = RulerIndentBase {
             hf: false,
             paras: vec![(vec![2], false)],
-            steps: Vec::new(),
+            starts: Vec::new(),
         };
-        assert_eq!(body.for_editor(false), &[(vec![2], false)]);
-        assert!(body.for_editor(true).is_empty());
+        assert_eq!(body.for_editor(false).0, &[(vec![2], false)]);
+        assert!(body.for_editor(true).0.is_empty());
     }
 
     #[test]
@@ -8616,64 +8668,84 @@ struct RulerDrag {
     sect_checkpointed: bool,
 }
 
+/// A paragraph's drawn left and level step (`eff_indent`) at a drag's
+/// start (#1986); `None` where it was not found.
+type RulerStart = Option<(i32, i32)>;
+
 /// A Left-marker drag's paragraphs at its start (`Editor::indent_base`),
 /// and whether they came from the open header or footer's editor (#1814).
 #[derive(Default)]
 struct RulerIndentBase {
     hf: bool,
     paras: Vec<(Vec<usize>, bool)>,
-    /// Each selected paragraph's level step at the drag start
-    /// (`eff_indent`'s `list_step`, #1986), by path.
-    steps: Vec<(Vec<usize>, i32)>,
+    /// Each of `paras`' [`RulerStart`], by index.
+    starts: Vec<RulerStart>,
 }
 
 impl RulerIndentBase {
-    /// The base of a Left drag in `ed`: [`Editor::indent_base`] and each
-    /// selected paragraph's level step.
+    /// The base of a Left drag in `ed`: [`Editor::indent_base`] and where
+    /// each selected paragraph is drawn.
     fn of(ed: &Editor, hf: bool) -> Self {
         let paras = ed.indent_base();
-        let steps = paras
+        let starts = paras
             .iter()
-            .filter_map(|(path, _)| {
-                docxcore::editor::resolve_para(&ed.doc.body, path)
-                    .map(|p| (path.clone(), eff_indent(&p.props).list_step))
+            .map(|(path, _)| {
+                docxcore::editor::resolve_para(&ed.doc.body, path).map(|p| {
+                    let eff = eff_indent(&p.props);
+                    (eff.left, eff.list_step)
+                })
             })
             .collect();
-        RulerIndentBase { hf, paras, steps }
+        RulerIndentBase { hf, paras, starts }
     }
 
     /// The base for a move that edits the header or footer (`hf_now`) or the
-    /// body: empty (the live paragraphs decide) when that is not the editor
-    /// it was taken from, as its paths name another story's paragraphs.
-    fn for_editor(&self, hf_now: bool) -> &[(Vec<usize>, bool)] {
-        if self.hf == hf_now { &self.paras } else { &[] }
-    }
-
-    /// [`Self::steps`] for a move in that editor, as [`Self::for_editor`].
-    fn steps_for(&self, hf_now: bool) -> &[(Vec<usize>, i32)] {
-        if self.hf == hf_now { &self.steps } else { &[] }
+    /// body, and its paragraphs' starts: empty (the live paragraphs decide)
+    /// when that is not the editor it was taken from, as its paths name
+    /// another story's paragraphs.
+    fn for_editor(&self, hf_now: bool) -> (&[(Vec<usize>, bool)], &[RulerStart]) {
+        if self.hf == hf_now {
+            (&self.paras, &self.starts)
+        } else {
+            (&[], &[])
+        }
     }
 }
 
+/// The start of the `i`th paragraph a move edits, at `path`: `starts[i]`
+/// when `paras` lists the same paths in order, else found by path.
+fn ruler_start_at(
+    paras: &[(Vec<usize>, bool)],
+    starts: &[RulerStart],
+    i: usize,
+    path: &[usize],
+) -> RulerStart {
+    let at = match paras.get(i) {
+        Some((p, _)) if p.as_slice() == path => Some(i),
+        _ => paras.iter().position(|(p, _)| p.as_slice() == path),
+    };
+    at.and_then(|j| starts.get(j).copied().flatten())
+}
+
 /// The left indent and first-line delta a Left drag to `marker` (with the
-/// caret paragraph's clamped `first`) writes to the paragraph at `path`
-/// (#1986): the caret paragraph's level step `caret_step` taken off and the
-/// paragraph's own (`steps`, at the drag start; the caret's when it is not
-/// named) put on, so each list item keeps its nesting, an item with no left
-/// of its own draws where it did before, and one paragraph gets the marker.
-/// The clamp at `caret_step` keeps each at or right of its own level.
+/// caret paragraph's clamped `first`, the caret paragraph drawn at
+/// `caret_left` at the start) writes to a paragraph drawn at `start`
+/// (its left and level step, #1986): it moves by the drag from where it
+/// was, never left of its own level, so a selection keeps its nesting and
+/// its differences, and one paragraph gets the marker. A paragraph with no
+/// start gets the marker.
 fn ruler_left_for(
     marker: i32,
     first: i32,
-    caret_step: i32,
-    steps: &[(Vec<usize>, i32)],
-    path: &[usize],
+    caret_left: i32,
+    start: Option<(i32, i32)>,
 ) -> (i32, i32) {
-    let step = steps
-        .iter()
-        .find(|(p, _)| p.as_slice() == path)
-        .map_or(caret_step, |(_, s)| *s);
-    let left = marker.saturating_sub(caret_step).saturating_add(step);
+    let left = match start {
+        Some((left, step)) => left
+            .saturating_add(marker.saturating_sub(caret_left))
+            .max(step),
+        None => marker,
+    };
     (left, first.max(-left))
 }
 
@@ -26865,12 +26937,14 @@ impl Docxy {
                     .tabs
                     .get(self.active)
                     .is_some_and(|t| t.hf_edit.is_some());
-                let paras = base.for_editor(hf_now);
-                // Each list item keeps its own level step (#1986).
-                let (steps, caret_step) = (base.steps_for(hf_now), d.indent.list_step);
+                // Each paragraph moves by the drag from where it was
+                // drawn (#1986).
+                let (paras, starts) = base.for_editor(hf_now);
+                let caret_left = d.indent.left;
                 self.with_editor(window, cx, |e| {
-                    e.set_indents_from(paras, |path| {
-                        ruler_left_for(indent, first, caret_step, steps, path)
+                    e.set_indents_from(paras, |i, path| {
+                        let start = ruler_start_at(paras, starts, i, path);
+                        ruler_left_for(indent, first, caret_left, start)
                     })
                 });
                 self.ruler_indent_base = base;

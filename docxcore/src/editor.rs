@@ -3079,21 +3079,22 @@ impl Editor {
     /// live paragraph, so an earlier move of the same drag does not count
     /// (#1814). A paragraph `base` does not name reads the live one.
     pub fn set_indent_from(&mut self, left: i32, first_line: i32, base: &[(Vec<usize>, bool)]) {
-        self.set_indents_from(base, |_| (left, first_line));
+        self.set_indents_from(base, |_, _| (left, first_line));
     }
 
     /// [`Self::set_indent_from`], each selected paragraph taking its own
-    /// left indent and first-line delta from `each` by path (the suite's
-    /// ruler drag keeps each list item's own level step, #1986).
+    /// left indent and first-line delta from `each` by its index among the
+    /// selected paragraphs and its path (the suite's ruler drag moves each
+    /// from where it was drawn, #1986).
     pub fn set_indents_from(
         &mut self,
         base: &[(Vec<usize>, bool)],
-        each: impl Fn(&[usize]) -> (i32, i32),
+        each: impl Fn(usize, &[usize]) -> (i32, i32),
     ) {
         let styles = self.styles.clone();
         self.checkpoint(EditKind::Structural);
         for (i, path) in self.selected_para_paths().into_iter().enumerate() {
-            let (left, first_line) = each(&path);
+            let (left, first_line) = each(i, &path);
             let Some(p) = para_mut(&mut self.doc.body, &path) else {
                 continue;
             };
