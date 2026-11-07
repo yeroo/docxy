@@ -805,3 +805,64 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: lookxy's form has no controls for the new fields (the host API
   has them). Recurring series stay create-only. Reading the calendar's
   `defaultOnlineMeetingProvider` / `allowedOnlineMeetingProviders`.
+
+## Contacts folder and is_contact (#1934)
+
+- `Store::is_contact(address)` answers whether an address is in the user's
+  own Contacts folder, for a "Trust email from my contacts" setting. It
+  reads `folder_contacts` only. It never reads `contacts`, which holds
+  `/me/people` (anyone the user corresponded with) and mined senders and
+  recipients for autocomplete: a trust decision on those would trust anyone
+  who ever mailed the user. The match is exact (`=`, never `LIKE`), ignoring
+  case and surrounding whitespace (`folder_contact_key`: Rust's
+  `to_lowercase`, as `upsert_contact`). A blank address is `false`.
+- A table of its own, not a `source` value in `contacts`: there any two
+  sources merge into `both`, which loses which ones, and removing a contact
+  would have to strip one source off a merged row. `upsert_contact`,
+  `refresh_local_contacts` and `search_contacts` never touch
+  `folder_contacts`. It is `CREATE TABLE IF NOT EXISTS` in `SCHEMA_SQL`, so
+  an older database gets it empty at `open`.
+- `GraphClient::contacts()` GETs
+  `/me/contacts?$top=200&$select=displayName,emailAddresses` (Graph's
+  default page is 10) and follows `@odata.nextLink`. It returns one
+  `FolderContact` per non-blank address (a contact holds up to three), each
+  with the contact's `displayName`. Any page's error is an `Err`, never a
+  partial list.
+- `Store::replace_folder_contacts` replaces the whole set in one
+  transaction (as `replace_master_categories`), so a contact removed from
+  the folder stops counting. Blank addresses and addresses without an `@`
+  are dropped; duplicates collapse, the first non-empty name winning.
+- The engine's full pass runs `sync_people`, then `sync_folder_contacts`,
+  then `refresh_master_categories`. A successful fetch replaces the set and
+  sends `SyncEvent::ContactsUpdated`, changed or not. Any error (403 without
+  `Contacts.Read`, Conditional Access, offline, parse) is swallowed: no
+  `Error`, no event, the pass carries on, and the stored set is kept, as a
+  failed fetch says nothing about the folder. A revoked scope therefore
+  leaves the last set trusted until a fetch succeeds.
+- Full passes only (startup, `Refresh`, sign-in, a pass `needs_full_pass`
+  asks for). Periodic and fast ticks never fetch it, so in a long-running
+  session a removal can take days to count: the `is_contact` doc says so.
+- Scope: `AuthConfig::default()` does not ask for `Contacts.Read`. Adding it
+  would make every existing refresh ask for an unconsented scope. A host
+  that wants `is_contact` adds it to its `AuthConfig::scope`, and #1875's
+  `Scopes { missing }` tells it when the grant lacks it. lookxy ignores
+  `ContactsUpdated`.
+- Tests: `client.rs` `contacts_follows_next_links_and_keeps_every_address`,
+  `contacts_propagates_a_403`, `contacts_later_page_error_is_an_error`,
+  `contacts_page_without_value_is_an_error`; `store`
+  `is_contact_matches_only_folder_contacts`,
+  `replace_folder_contacts_drops_absent_and_blank`,
+  `is_contact_on_a_database_from_before_the_table`; `engine.rs`
+  `full_pass_syncs_the_contacts_folder_apart_from_people_and_mined`,
+  `contacts_403_keeps_the_stored_set_and_does_not_fail_the_pass`,
+  `contact_removed_from_the_folder_stops_counting_after_the_next_full_pass`,
+  `only_a_full_pass_fetches_the_contacts_folder`, and the request order in
+  `normal_tick_without_fast_option_is_unchanged` and
+  `fast_tick_syncs_only_the_fast_folders`.
+- Not done: a periodic refresh of the set (a normal tick, or
+  `/me/contacts/delta`). Contacts in other contact folders
+  (`/me/contactFolders/{id}/contacts`). A contact saved from the directory
+  (GAL) whose address Graph returns as an Exchange X500 DN
+  (`/o=ExchangeLabs/...`) is not matched: resolving it needs `/users`.
+  Feeding the folder into autocomplete. Clearing the set on sign-out (the
+  store is kept across sign-out, #1920).

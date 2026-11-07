@@ -108,7 +108,8 @@ issue number to find its notes.
   new mail with its body, recent bodies prefetched, FetchBody served between folders (#1978),
   Exchange's AuthAs header stored with a fetched body (#1933),
   calendar sync keeps events' reminder settings (#1937), event fields a calendar client
-  shows (#1983), creating and updating them, an update PATCHes only what changed (#1994).
+  shows (#1983), creating and updating them, an update PATCHes only what changed (#1994),
+  the Contacts folder and `is_contact` (#1934).
 
 ## Build and test
 
