@@ -1,12 +1,13 @@
 //! The editing mode of the embedded document view (#1947): what a key, a
-//! Tab or a host's formatting command does to the view's [`Editor`], and
+//! Tab, a host's formatting command or its insert and cut (#1977) does to
+//! the view's [`Editor`], and
 //! what the caret's formatting reads. It is the document tab's own map
 //! (`Docxy::on_key`, `apply_doc_act`, `tab_key` / `shift_tab_key`) without
 //! the suite's extras (AutoCorrect, Repeat, fields, breaks, paste), over a
 //! plain editor and package, so it is tested without a window.
 
 use super::*;
-use docxcore::editor::Clip;
+use docxcore::editor::{Clip, FIELD_CHAR, LINE_BREAK};
 use gpui::Keystroke;
 
 /// What a key did to the editor.
@@ -154,6 +155,72 @@ pub(crate) fn history(ed: &mut Editor, redo: bool) -> Formatted {
     }
 }
 
+/// What a host's text keeps on its way into the document
+/// ([`insert_text`]): line ends made `\n` (`\r\n` and a lone `\r`, which
+/// [`Clip::from_text`] would drop), and only the characters a `w:t` can
+/// hold. The writer escapes `& < >` alone, so a C0 control other than tab,
+/// newline and [`LINE_BREAK`] (Word's plain-text manual line break), or
+/// U+FFFE / U+FFFF, would make the saved part ill-formed XML. A field's
+/// stand-in ([`FIELD_CHAR`]) is not text either.
+fn insertable(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&ch| match ch {
+            '\t' | '\n' | LINE_BREAK => true,
+            '\u{0}'..='\u{1F}' | '\u{FFFE}' | '\u{FFFF}' | FIELD_CHAR => false,
+            _ => true,
+        })
+        .collect()
+}
+
+/// A host's Insert (a signature, a quick part) at the caret, replacing the
+/// selection: [`Editor::paste_text_only`], Paste Text Only's own path, so
+/// newlines split paragraphs, tabs become tab inlines, every run takes the
+/// formatting typing at the caret would (a format toggled there for what is
+/// typed next too) and the caret ends after it. A [`LINE_BREAK`] is a line
+/// break, as Shift+Enter makes it, inside the same step. One undo step of
+/// its own: [`Editor::one_step`] ends the typing run before and after it,
+/// so neither the typing before nor the typing after joins it. Nothing runs
+/// for a text with nothing [`insertable`] (the selection stays).
+pub(crate) fn insert_text(ed: &mut Editor, text: &str) -> Formatted {
+    let text = insertable(text);
+    if text.is_empty() {
+        return Formatted::default();
+    }
+    let out = edit(ed, |ed| {
+        if !text.contains(LINE_BREAK) {
+            ed.paste_text_only(&text);
+            return;
+        }
+        // Inside the outer step the pieces' own steps are its: the first
+        // piece (or the break, when the text starts with one) replaces the
+        // selection, and each lands after the one before.
+        ed.one_step("Paste", |ed| {
+            for (i, piece) in text.split(LINE_BREAK).enumerate() {
+                if i > 0 {
+                    ed.insert_line_break();
+                }
+                if !piece.is_empty() {
+                    ed.paste_text_only(piece);
+                }
+            }
+        });
+    });
+    Formatted {
+        ran: true,
+        changed: out.changed(),
+    }
+}
+
+/// Cut, by Ctrl+X or the host's [`DocView::cut`]: the selection's clip,
+/// deleted as one undo step of its own; `None`, and nothing done, with
+/// nothing to cut.
+pub(crate) fn cut(ed: &mut Editor) -> Option<Clip> {
+    ed.break_undo_group();
+    ed.cut()
+}
+
 impl From<Formatted> for KeyOutcome {
     fn from(f: Formatted) -> Self {
         if f.changed {
@@ -253,7 +320,7 @@ pub(crate) fn edit_key(
                 KeyOutcome::Moved
             }
             "c" if !shift => KeyOutcome::Copy,
-            "x" if !shift => match ed.cut() {
+            "x" if !shift => match cut(ed) {
                 Some(clip) => KeyOutcome::Cut(clip),
                 None => KeyOutcome::Moved,
             },
@@ -893,5 +960,196 @@ mod tests {
             KeyOutcome::Moved
         ));
         assert_eq!(ed.caret.offset, 0);
+    }
+
+    fn texts(ed: &Editor) -> Vec<String> {
+        (0..ed.doc.body.len()).map(|i| text(ed, i)).collect()
+    }
+
+    /// A selection from `from` to `to` in the first paragraph.
+    fn select(ed: &mut Editor, from: usize, to: usize) {
+        ed.anchor = Some(Caret::at(vec![0], from));
+        ed.caret = Caret::at(vec![0], to);
+    }
+
+    #[test]
+    fn insert_text_at_a_caret_splits_paragraphs_and_one_undo_takes_it_back_1977() {
+        for given in ["a\nb", "a\r\nb", "a\rb"] {
+            let mut ed = editor(&["xy"]);
+            ed.caret = Caret::at(vec![0], 1);
+            let done = insert_text(&mut ed, given);
+            assert_eq!(
+                done,
+                Formatted {
+                    ran: true,
+                    changed: true
+                },
+                "{given:?}"
+            );
+            assert_eq!(texts(&ed), ["xa", "by"], "{given:?}");
+            assert_eq!(ed.caret, Caret::at(vec![1], 1), "{given:?}");
+            assert_eq!(
+                history(&mut ed, false),
+                Formatted {
+                    ran: true,
+                    changed: true
+                }
+            );
+            assert_eq!(texts(&ed), ["xy"], "{given:?}");
+        }
+    }
+
+    #[test]
+    fn insert_text_replaces_the_selection_1977() {
+        let mut ed = editor(&["Alpha Beta"]);
+        select(&mut ed, 6, 10);
+        assert!(insert_text(&mut ed, "Gamma").changed);
+        assert_eq!(texts(&ed), ["Alpha Gamma"]);
+        assert!(!ed.has_selection());
+        assert_eq!(ed.caret, Caret::at(vec![0], 11));
+        history(&mut ed, false);
+        assert_eq!(texts(&ed), ["Alpha Beta"]);
+    }
+
+    #[test]
+    fn insert_text_takes_the_typing_format_1977() {
+        // Inside a bold run it is bold.
+        let mut ed = editor(&["ab"]);
+        press(&mut ed, "ctrl-a ctrl-b");
+        ed.clear_selection();
+        ed.set_caret(Caret::at(vec![0], 1));
+        insert_text(&mut ed, "Q\nR");
+        assert_eq!(texts(&ed), ["aQ", "Rb"]);
+        for i in 0..2 {
+            assert!(
+                runs(&ed, i).iter().all(|(_, bold)| *bold),
+                "{:?}",
+                runs(&ed, i)
+            );
+        }
+        // A Bold toggled at a collapsed caret, for what is typed next.
+        let mut ed = editor(&["ab"]);
+        ed.set_caret(Caret::at(vec![0], 1));
+        press(&mut ed, "ctrl-b");
+        insert_text(&mut ed, "Q");
+        assert_eq!(
+            runs(&ed, 0),
+            [("a".into(), false), ("Q".into(), true), ("b".into(), false)]
+        );
+    }
+
+    #[test]
+    fn insert_text_is_its_own_step_between_typing_1977() {
+        let mut ed = editor(&[""]);
+        type_text(&mut ed, "zz");
+        insert_text(&mut ed, "Q");
+        type_text(&mut ed, "w");
+        assert_eq!(texts(&ed), ["zzQw"]);
+        for want in ["zzQ", "zz", ""] {
+            assert!(history(&mut ed, false).changed);
+            assert_eq!(texts(&ed), [want]);
+        }
+    }
+
+    #[test]
+    fn insert_text_of_nothing_runs_nothing_1977() {
+        let mut ed = editor(&["Alpha Beta"]);
+        select(&mut ed, 6, 10);
+        for nothing in ["", "\u{1}", "\u{FFFF}\u{0C}"] {
+            assert_eq!(insert_text(&mut ed, nothing), Formatted::default());
+            assert_eq!(texts(&ed), ["Alpha Beta"]);
+            assert!(ed.has_selection());
+        }
+        assert!(ed.undo_serial().is_none(), "no step");
+    }
+
+    #[test]
+    fn insert_text_drops_what_xml_cannot_hold_1977() {
+        let mut ed = editor(&[""]);
+        insert_text(&mut ed, "a\u{1}b\u{0C}c\u{FFFF}\u{FFFE}\u{1F}d\u{FFFC}e");
+        assert_eq!(texts(&ed), ["abcde"]);
+        // A tab stays a tab inline.
+        insert_text(&mut ed, "\tf");
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("a paragraph")
+        };
+        assert!(
+            p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+            "{:?}",
+            p.content
+        );
+        assert_eq!(p.plain_text(), "abcde\tf");
+    }
+
+    #[test]
+    fn insert_text_makes_a_vertical_tab_a_line_break_1977() {
+        use docxcore::model::BreakKind;
+        let mut ed = editor(&["xy"]);
+        ed.caret = Caret::at(vec![0], 1);
+        press(&mut ed, "ctrl-b");
+        let steps = ed.undo_serial();
+        assert!(insert_text(&mut ed, "a\u{0B}b").changed);
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("a paragraph")
+        };
+        let shape: Vec<_> = p
+            .content
+            .iter()
+            .map(|i| match i {
+                Inline::Run(r) => format!("{}{}", r.text, if r.props.bold { "*" } else { "" }),
+                Inline::Break(BreakKind::Line, props) => {
+                    format!("|{}", if props.bold { "*" } else { "" })
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(shape, ["x", "a*", "|*", "b*", "y"]);
+        assert_eq!(ed.caret.offset, 4, "after the b");
+        // One step, and over a selection a leading break replaces it.
+        history(&mut ed, false);
+        assert_eq!(texts(&ed), ["xy"]);
+        assert_eq!(ed.undo_serial(), steps, "one step");
+        select(&mut ed, 0, 2);
+        insert_text(&mut ed, "\u{0B}c");
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("a paragraph")
+        };
+        assert!(
+            matches!(p.content[0], Inline::Break(BreakKind::Line, _)),
+            "{:?}",
+            p.content
+        );
+        assert_eq!(p.plain_text().chars().last(), Some('c'));
+        assert_eq!(p.content.len(), 2, "{:?}", p.content);
+        history(&mut ed, false);
+        assert_eq!(texts(&ed), ["xy"]);
+    }
+
+    #[test]
+    fn host_cut_takes_the_selection_as_one_step_1977() {
+        let mut ed = editor(&["Alpha Beta"]);
+        type_text(&mut ed, "z");
+        select(&mut ed, 0, 6);
+        let clip = cut(&mut ed).expect("a selection");
+        assert_eq!(clip.to_text(), "zAlpha");
+        assert_eq!(texts(&ed), [" Beta"]);
+        // Ctrl+X takes the same clip.
+        let mut keyed = editor(&["Alpha Beta"]);
+        type_text(&mut keyed, "z");
+        select(&mut keyed, 0, 6);
+        let KeyOutcome::Cut(key_clip) = press(&mut keyed, "ctrl-x").remove(0) else {
+            panic!("a cut")
+        };
+        assert_eq!(key_clip.to_text(), clip.to_text());
+        assert_eq!(texts(&keyed), texts(&ed));
+        // One undo restores the cut, not the typing before it.
+        history(&mut ed, false);
+        assert_eq!(texts(&ed), ["zAlpha Beta"]);
+        // Nothing selected: nothing cut, no step.
+        ed.clear_selection();
+        let steps = ed.undo_serial();
+        assert!(cut(&mut ed).is_none());
+        assert_eq!(texts(&ed), ["zAlpha Beta"]);
+        assert_eq!(ed.undo_serial(), steps);
     }
 }

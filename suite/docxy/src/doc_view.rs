@@ -7,8 +7,9 @@
 //! (Ctrl+wheel, Ctrl+=, Ctrl+-, Ctrl+0). Read-only by default: it then never
 //! edits and draws no caret. Its editing mode ([`DocView::set_editable`],
 //! #1947) types, deletes, moves the caret, undoes and takes a host ribbon's
-//! formatting commands ([`DocView::format`]); its decisions are
-//! [`edit`]'s. A hyperlink press goes to the extension's callback
+//! formatting commands ([`DocView::format`]) and its Insert, Copy and Cut
+//! ([`DocView::insert_text`], [`DocView::copy`], [`DocView::cut`], #1977);
+//! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
 //! ([`DocView::on_link`]), never opened here. The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]).
@@ -22,7 +23,7 @@ mod edit;
 pub use edit::{CaretFormat, DocFormat};
 
 use super::*;
-use docxcore::editor::{Caret, Editor};
+use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::package::Package;
 use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use std::cell::{Cell, RefCell};
@@ -189,8 +190,9 @@ impl DocView {
     }
 
     /// Called after every change to the document: typing, a delete, a cut,
-    /// a formatting command, Undo and Redo, whether by the keys or the host.
-    /// Not for what changes no document: a move, a selection, a scroll, a
+    /// an insert, a formatting command, Undo and Redo, whether by the keys
+    /// or the host.
+    /// Not for what changes no document: a move, a selection, a copy, a scroll, a
     /// zoom, a format toggled at a collapsed caret for what is typed next,
     /// [`DocView::set_document`] or [`DocView::set_editable`]. It runs
     /// deferred, outside the view's update, so it may read or update the
@@ -218,6 +220,59 @@ impl DocView {
             self.after_edit(done.changed, cx);
         }
         done.ran
+    }
+
+    /// Insert `text` at the caret, replacing the selection, as a host's
+    /// Insert Signature or Quick Part does (#1977): newlines split
+    /// paragraphs, a tab is a tab, `\u{0B}` (Word's plain-text manual line
+    /// break) is a line break, and it all takes the formatting typing at the
+    /// caret would give. One undo step of its own; the caret ends after it
+    /// and [`DocView::on_change`] hears of it. Characters a document cannot
+    /// hold (other control characters, U+FFFE, U+FFFF) are left out. True
+    /// when it ran; false, changing nothing, on a read-only view or for a
+    /// text with nothing left to insert. Give the focus back after a host's
+    /// button, as for [`DocView::format`].
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        self.seed_styles();
+        let done = edit::insert_text(&mut self.editor, text);
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
+    }
+
+    /// Copy the selection, as Ctrl+C does: its text and RTF on the
+    /// clipboard. In either mode, as Ctrl+C copies in the read-only view
+    /// too. Whether there was a selection; the document never changes.
+    pub fn copy(&mut self, cx: &mut Context<Self>) -> bool {
+        self.write_copy(cx)
+    }
+
+    /// Cut the selection, as Ctrl+X does: the clipboard gets what a copy
+    /// would, and the selection is deleted as one undo step, which
+    /// [`DocView::on_change`] hears of. False, changing nothing, on a
+    /// read-only view or with nothing to cut.
+    pub fn cut(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        self.seed_styles();
+        let Some(clip) = edit::cut(&mut self.editor) else {
+            return false;
+        };
+        self.write_clip(&clip, cx);
+        self.after_edit(true, cx);
+        true
+    }
+
+    /// Whether there is a selection, so [`DocView::copy`] would copy: for a
+    /// host's Copy button, in either mode; its Cut button is
+    /// `can_copy() && editable()`. Cheap enough to ask on every render.
+    pub fn can_copy(&self) -> bool {
+        self.editor.has_selection()
     }
 
     /// Undo the newest step, as Ctrl+Z does. False, with nothing changed, on
@@ -439,7 +494,7 @@ impl DocView {
         let handled = if m.secondary() && !m.alt && !m.function {
             match key {
                 "c" if !m.shift => {
-                    self.copy(cx);
+                    self.write_copy(cx);
                     true
                 }
                 "a" if !m.shift => {
@@ -491,11 +546,10 @@ impl DocView {
         let changed = out.changed();
         match out {
             edit::KeyOutcome::Ignored => return false,
-            edit::KeyOutcome::Copy => self.copy(cx),
-            edit::KeyOutcome::Cut(clip) => {
-                let (text, rtf) = clip_payload(&clip, self.pkg.as_ref());
-                self.clipboard.write_rich(harness(), text, rtf, cx);
+            edit::KeyOutcome::Copy => {
+                self.write_copy(cx);
             }
+            edit::KeyOutcome::Cut(clip) => self.write_clip(&clip, cx),
             edit::KeyOutcome::Moved | edit::KeyOutcome::Changed => {}
         }
         // Ctrl+Home / Ctrl+End go to the very top and bottom, as read-only.
@@ -586,10 +640,19 @@ impl DocView {
 
     /// Ctrl+C: the selection as text and RTF, on the clipboard (the run's
     /// private one in a harness), as a document tab's copy writes it.
-    fn copy(&mut self, cx: &mut App) {
+    /// Whether there was a selection to write.
+    fn write_copy(&mut self, cx: &mut App) -> bool {
         let Some((text, rtf)) = copy_payload(&self.editor, self.pkg.as_ref()) else {
-            return;
+            return false;
         };
+        self.clipboard.write_rich(harness(), text, rtf, cx);
+        true
+    }
+
+    /// What a cut took, on the clipboard as [`DocView::write_copy`] writes a
+    /// copy.
+    fn write_clip(&mut self, clip: &Clip, cx: &mut App) {
+        let (text, rtf) = clip_payload(clip, self.pkg.as_ref());
         self.clipboard.write_rich(harness(), text, rtf, cx);
     }
 
@@ -698,6 +761,7 @@ impl DocView {
             ("caret_format", caret_format_json(&self.caret_format())),
             ("can_undo", Json::Bool(self.can_undo())),
             ("can_redo", Json::Bool(self.can_redo())),
+            ("can_copy", Json::Bool(self.can_copy())),
         ])
     }
 
