@@ -12,7 +12,10 @@
 //! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
 //! ([`DocView::on_link`]), never opened here. The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
-//! extension turns on dark mode for content ([`DocView::set_content_dark`]).
+//! extension turns on dark mode for content ([`DocView::set_content_dark`]),
+//! whose dark page the host may paint in its own colour
+//! ([`DocView::set_page_background`], #2003). The padding around the
+//! document is the host's to set too ([`DocView::set_page_inset`]).
 //!
 //! The renderer is the suite's (`block_el`): only its click target differs
 //! ([`crate::DocTarget::Embed`]), so a document reads here exactly as in a
@@ -43,6 +46,15 @@ const ZOOM_MAX: f32 = 3.0;
 
 /// A line's scroll by the arrow keys, at zoom 1.
 const LINE_PX: f32 = 24.;
+
+/// The padding around the document inside the scroll area when the host
+/// sets none (#2003): 48 px beside it, 28 px above and below.
+pub(crate) const DEFAULT_PAGE_INSET: Edges<Pixels> = Edges {
+    top: px(28.),
+    right: px(48.),
+    bottom: px(28.),
+    left: px(48.),
+};
 
 static HARNESS: AtomicBool = AtomicBool::new(false);
 
@@ -92,6 +104,14 @@ pub struct DocView {
     link_click: LinkClick,
     on_link: Option<LinkFn>,
     content_dark: bool,
+    /// The host's padding around the document (#2003); `None`:
+    /// [`DEFAULT_PAGE_INSET`].
+    page_inset: Option<Edges<Pixels>>,
+    /// The host's colour for the dark page (#2003); `None`: the theme's
+    /// background.
+    page_bg: Option<Hsla>,
+    /// The page colour the last frame painted, for the harness.
+    painted_bg: Option<Hsla>,
     words: Words,
     viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The text width (px) as last painted, which tables fit to (#1895).
@@ -146,6 +166,9 @@ impl DocView {
             link_click: LinkClick::default(),
             on_link: None,
             content_dark: false,
+            page_inset: None,
+            page_bg: None,
+            painted_bg: None,
             words: Words::default(),
             viewport: Rc::default(),
             text_w: Rc::default(),
@@ -385,6 +408,43 @@ impl DocView {
     pub fn set_content_dark(&mut self, on: bool, cx: &mut Context<Self>) {
         self.content_dark = on;
         cx.notify();
+    }
+
+    /// The padding around the document inside the scroll area, all four
+    /// edges, in logical pixels (#2003): a host lines the text up with its
+    /// own chrome this way. `None` keeps the default, 48 px left and right
+    /// and 28 px top and bottom. It does not scale with the zoom, as the
+    /// default does not; a negative edge counts as 0. The scroll bars (12 px
+    /// strips along the right and bottom edges) draw over the padding, so
+    /// an edge under 12 px lets them cover the text's edge.
+    pub fn set_page_inset(&mut self, inset: Option<Edges<Pixels>>, cx: &mut Context<Self>) {
+        if set_if_changed(&mut self.page_inset, inset) {
+            cx.notify();
+        }
+    }
+
+    /// The padding the host set with [`DocView::set_page_inset`] (`None`:
+    /// the default).
+    pub fn page_inset(&self) -> Option<Edges<Pixels>> {
+        self.page_inset
+    }
+
+    /// The colour of the dark page, the one dark mode for content draws on
+    /// a dark theme (#2003): a host whose chrome around the view is in
+    /// another colour paints the page to match. `None` keeps the theme's
+    /// background. The light page stays white, and the document's colours
+    /// do not change: a host that wants other text colours for its page
+    /// sets them in the document.
+    pub fn set_page_background(&mut self, bg: Option<Hsla>, cx: &mut Context<Self>) {
+        if set_if_changed(&mut self.page_bg, bg) {
+            cx.notify();
+        }
+    }
+
+    /// The dark page's colour the host set with
+    /// [`DocView::set_page_background`] (`None`: the theme's background).
+    pub fn page_background(&self) -> Option<Hsla> {
+        self.page_bg
     }
 
     /// The zoom, 1.0 for 100%.
@@ -764,6 +824,34 @@ impl DocView {
                 ),
             ),
             ("content_dark", Json::Bool(self.content_dark)),
+            ("page_inset", {
+                let e = resolve_page_inset(self.page_inset);
+                let n = |p: Pixels| Json::Num(f64::from(f32::from(p).round()));
+                Json::obj(vec![
+                    ("top", n(e.top)),
+                    ("right", n(e.right)),
+                    ("bottom", n(e.bottom)),
+                    ("left", n(e.left)),
+                ])
+            }),
+            (
+                "page_background",
+                self.page_bg.map_or(Json::Null, |c| Json::Str(ink_hex(c))),
+            ),
+            (
+                "page_color",
+                self.painted_bg
+                    .map_or(Json::Null, |c| Json::Str(ink_hex(c))),
+            ),
+            (
+                "column_left",
+                match (self.column.get(), self.viewport.get()) {
+                    (Some(col), Some(view)) => {
+                        Json::Num(f64::from(f32::from(col.origin.x - view.origin.x).round()))
+                    }
+                    _ => Json::Null,
+                },
+            ),
             ("focused", Json::Bool(self.focus.is_focused(window))),
             ("editable", Json::Bool(self.editable)),
             (
@@ -872,7 +960,10 @@ impl Render for DocView {
             cx.theme().background,
             theme_dark,
             self.content_dark,
+            self.page_bg,
         );
+        self.painted_bg = Some(bg);
+        let inset = resolve_page_inset(self.page_inset);
         // The document's inherited font: the host's (whatever its ancestors
         // set), made loadable without touching the host's theme (#1900). The
         // same family `Measurer::new` measures in, so measured = drawn.
@@ -986,8 +1077,11 @@ impl Render for DocView {
                     // sideways (#1895).
                     .overflow_scroll()
                     .text_color(pal.fg)
-                    .px(px(48.))
-                    .py(px(28.))
+                    // The host's padding, or the default (#2003).
+                    .pt(inset.top)
+                    .pr(inset.right)
+                    .pb(inset.bottom)
+                    .pl(inset.left)
                     .children(blocks)
                     // The text width, inside the padding: a percent width
                     // resolves against the scroll area, not its extent.
@@ -1312,18 +1406,45 @@ fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, care
 
 /// The page the document draws on and its palette. A light page (white, in
 /// the ink Print Layout's sheet uses) unless dark mode for content is on and
-/// the theme is dark: then the theme's own background and colours. The
-/// selection is the theme's either way.
+/// the theme is dark: then the theme's own colours on the host's page colour
+/// (`page_bg`, #2003), else on the theme's background. The selection is the
+/// theme's either way.
 pub(crate) fn content_look(
     theme: Pal,
     theme_bg: Hsla,
     theme_dark: bool,
     content_dark: bool,
+    page_bg: Option<Hsla>,
 ) -> (Hsla, Pal) {
     if content_dark && theme_dark {
-        return (theme_bg, theme);
+        return (page_bg.unwrap_or(theme_bg), theme);
     }
     (hsla_u(0xffffff), page_pal(0xffffff, theme.sel))
+}
+
+/// The padding the view draws around the document (#2003): the host's, each
+/// edge at least 0, else [`DEFAULT_PAGE_INSET`].
+pub(crate) fn resolve_page_inset(inset: Option<Edges<Pixels>>) -> Edges<Pixels> {
+    let Some(e) = inset else {
+        return DEFAULT_PAGE_INSET;
+    };
+    let edge = |p: Pixels| p.max(px(0.));
+    Edges {
+        top: edge(e.top),
+        right: edge(e.right),
+        bottom: edge(e.bottom),
+        left: edge(e.left),
+    }
+}
+
+/// Store `v` in `slot`; whether it differed from what was there, which is
+/// when a setter notifies (#2003).
+fn set_if_changed<T: PartialEq>(slot: &mut T, v: T) -> bool {
+    if *slot == v {
+        return false;
+    }
+    *slot = v;
+    true
 }
 
 /// One zoom step from `zoom`: in (`dir` > 0), out (< 0) or back to 100%
@@ -1617,18 +1738,80 @@ mod tests {
         let ink = hsla_u(design_tab::page_ink(0xffffff).0);
         // Light content on a dark theme: the white page, its ink, the
         // theme's selection.
-        let (bg, p) = content_look(theme, theme_bg, true, false);
+        let (bg, p) = content_look(theme, theme_bg, true, false, None);
         assert_eq!(bg, hsla_u(0xffffff));
         assert_eq!(p.fg, ink);
         assert_eq!(p.sel, hsla_u(0x123456));
         // Dark mode for content on a dark theme: the theme's own.
-        let (bg, p) = content_look(theme, theme_bg, true, true);
+        let (bg, p) = content_look(theme, theme_bg, true, true, None);
         assert_eq!(bg, theme_bg);
         assert_eq!(p.fg, hsla_u(0xeeeeee));
         // On a light theme it changes nothing.
-        let (bg, p) = content_look(theme, theme_bg, false, true);
+        let (bg, p) = content_look(theme, theme_bg, false, true, None);
         assert_eq!(bg, hsla_u(0xffffff));
         assert_eq!(p.fg, ink);
+    }
+
+    #[test]
+    fn the_host_paints_the_dark_page_only_and_keeps_the_palette_2003() {
+        let theme = pal(0xeeeeee);
+        let theme_bg = hsla_u(0x0a0a0a);
+        let host = hsla_u(0x262626);
+        let ink = hsla_u(design_tab::page_ink(0xffffff).0);
+        // Unset: the theme's background, as before.
+        let (bg, p) = content_look(theme, theme_bg, true, true, None);
+        assert_eq!(bg, theme_bg);
+        assert_eq!(p.fg, hsla_u(0xeeeeee));
+        // Set: the host's colour, the theme's palette unchanged.
+        let (bg, p) = content_look(theme, theme_bg, true, true, Some(host));
+        assert_eq!(bg, host);
+        assert_eq!(p.fg, hsla_u(0xeeeeee));
+        assert_eq!(p.link, hsla_u(0x0000ff));
+        assert_eq!(p.sel, hsla_u(0x123456));
+        // The light page stays white: light content, or a light theme.
+        for (theme_dark, content_dark) in [(true, false), (false, true), (false, false)] {
+            let (bg, p) = content_look(theme, theme_bg, theme_dark, content_dark, Some(host));
+            assert_eq!(bg, hsla_u(0xffffff), "{theme_dark} {content_dark}");
+            assert_eq!(p.fg, ink);
+        }
+        // Reset to `None`: the theme's background again.
+        let (bg, _) = content_look(theme, theme_bg, true, true, None);
+        assert_eq!(bg, theme_bg);
+    }
+
+    #[test]
+    fn the_page_inset_is_the_hosts_or_48_by_28_and_never_negative_2003() {
+        let e = |t: f32, r: f32, b: f32, l: f32| Edges {
+            top: px(t),
+            right: px(r),
+            bottom: px(b),
+            left: px(l),
+        };
+        assert_eq!(resolve_page_inset(None), e(28., 48., 28., 48.));
+        assert_eq!(
+            resolve_page_inset(Some(e(12., 22., 12., 22.))),
+            e(12., 22., 12., 22.)
+        );
+        assert_eq!(
+            resolve_page_inset(Some(e(-4., 0., 3., -1.))),
+            e(0., 0., 3., 0.)
+        );
+    }
+
+    #[test]
+    fn a_page_setter_notifies_only_when_its_value_changes_2003() {
+        let inset = Edges::all(px(10.));
+        let mut slot: Option<Edges<Pixels>> = None;
+        assert!(set_if_changed(&mut slot, Some(inset)));
+        assert!(!set_if_changed(&mut slot, Some(inset)));
+        assert_eq!(slot, Some(inset));
+        assert!(set_if_changed(&mut slot, None));
+        assert!(!set_if_changed(&mut slot, None));
+        let mut bg: Option<Hsla> = None;
+        assert!(set_if_changed(&mut bg, Some(hsla_u(0x262626))));
+        assert!(!set_if_changed(&mut bg, Some(hsla_u(0x262626))));
+        assert!(set_if_changed(&mut bg, None));
+        assert!(!set_if_changed(&mut bg, None));
     }
 
     #[test]
@@ -1645,7 +1828,7 @@ mod tests {
             };
             let theme = Pal::from_theme(&t, theme_dark);
             for content_dark in [false, true] {
-                let (bg, p) = content_look(theme, t.background, theme_dark, content_dark);
+                let (bg, p) = content_look(theme, t.background, theme_dark, content_dark, None);
                 let r = contrast(p.link.to_rgb(), bg.to_rgb());
                 assert!(
                     r >= 4.5,

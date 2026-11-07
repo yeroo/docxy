@@ -68,7 +68,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   update. The view never opens a link.
 - Colours: the chrome (scroll bar, selection) is the theme's; the document
   is a white page in Print Layout's palette (`content_look`, `page_pal`) unless
-  `set_content_dark(true)` on a dark theme, which draws the theme's own.
+  `set_content_dark(true)` on a dark theme, which draws the theme's own (on
+  the host's page colour if it set one, #2003).
   A link draws in its run's colour (#1906); only a link without one takes
   the palette's `Pal::link`: `LINK` `#2F6FDB` on the white page, `LINK_DARK`
   `#6CA0F0` on the dark one (7.5:1 on the stock `#0A0A0A`). HTML import
@@ -88,7 +89,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `ext-doc-read` (blocks, tables, pictures, links, selection,
   selected_paragraphs, zoom, scroll_y, max_scroll_y, scroll_x,
   max_scroll_x, text_width, table_widths, link_click,
-  content_dark, focused, links_followed, link_calls), `ext-doc-set
+  content_dark, focused, links_followed, link_calls; the page fields are
+  #2003's, below), `ext-doc-set
   {link_click, content_dark}`, the regions `ext-doc-view`,
   `ext-doc-link:<n>[:left]` (`:left` 8 px left of the span, at mid-height)
   and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
@@ -232,3 +234,39 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `ext-doc-call`) add `can_copy`. The `issue 1977` test in
   `uiharness/cases/ext-doc-edit.uit` copies "Beta", then cuts the whole
   paragraph, so the second clipboard read can only be the cut's.
+
+## Page inset and page background (#2003)
+
+- `DocView::set_page_inset(Option<Edges<Pixels>>)` / `page_inset()`: the
+  padding around the document inside `ext-doc-scroll`, all four edges, in
+  logical px; `None` is `DEFAULT_PAGE_INSET` (48 left/right, 28 top/bottom,
+  the old fixed padding). `resolve_page_inset` clamps each edge at 0. It
+  does not scale with the zoom (the default never did): a host aligns the
+  body with its own header in fixed pixels. The `w_full` width probe sits
+  inside the padding, so `text_w` (what tables fit) and `column` follow it;
+  the root's `on_mouse_down` covers the padding, so a press there focuses
+  the view. The 12 px scroll-bar strips overlay the right and bottom
+  padding: an edge under 12 px lets them cover the text's edge.
+- `DocView::set_page_background(Option<Hsla>)` / `page_background()`: the
+  dark page's colour (`content_look`'s `page_bg`, used only when content
+  is dark on a dark theme); `None` is the theme's `background`. The light
+  page stays white and the palette is unchanged: a host recolours the
+  document's text in the document. The colour paints the view's root, so
+  the padding is that colour too.
+- Both setters notify only when the stored value changes (`set_if_changed`);
+  the getters return what the host set, `None` included.
+- Harness: `ext-doc-set` takes `page_inset` (`null` or
+  `{top,right,bottom,left}`, all four, px) and `page_background` (`null` or
+  `"rrggbb"`, a leading `#` allowed); `ext-doc-read` adds `page_inset`
+  (resolved), `page_background` (`rrggbb` or null), `page_color` (what the
+  last frame painted) and `column_left` (the text column's left from the
+  view's left), the last two read after a `shot`. Colours have no `#`: a
+  case's `#` starts a comment. Regions `ext-doc-inset:left` (middle of the
+  left padding at mid-height) and `ext-doc-header` (the fixture's header
+  line, 6 px above the view). The fixture's header has its own focus
+  handle and takes it on a press. With nothing else focusable on a Mail tab,
+  `focus_ext_surface` hands the root's focus straight back to the view, so
+  this is the only way a case can start a press with the view unfocused.
+  The `issue 2003` test in `uiharness/cases/ext-doc-view.uit` (a 1000 px
+  window) checks 904 → 956 px of text, column at 48 → 22 and the page
+  `262626` dark / `ffffff` light, and shoots each.

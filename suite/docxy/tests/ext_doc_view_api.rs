@@ -11,7 +11,9 @@ use docxcore::model::Align;
 use docxcore::model::Document;
 use docxcore::package::Package;
 use docxy_suite::ext::{self, CaretFormat, DocFormat, DocView, Extensions, LinkClick, TabSurface};
-use gpui::{AnyView, App, AppContext as _, Entity, FocusHandle, Window};
+use gpui::{
+    AnyView, App, AppContext as _, Edges, Entity, FocusHandle, Hsla, Pixels, Window, px, rgb,
+};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -53,6 +55,22 @@ fn embed(doc: Document, pkg: Package, cx: &mut App) -> Reader {
         let _selected: String = v.selected_text();
         let _focus: FocusHandle = v.focus_handle();
         v.set_document(Document { body: vec![] }, None, cx);
+        // The host's page inset and dark page colour (#2003), and back to
+        // the defaults.
+        v.set_page_inset(
+            Some(Edges {
+                top: px(12.),
+                right: px(22.),
+                bottom: px(12.),
+                left: px(22.),
+            }),
+            cx,
+        );
+        let _inset: Option<Edges<Pixels>> = v.page_inset();
+        v.set_page_background(Some(rgb(0x262626).into()), cx);
+        let _bg: Option<Hsla> = v.page_background();
+        v.set_page_inset(None, cx);
+        v.set_page_background(None, cx);
     });
     Reader { view, followed }
 }

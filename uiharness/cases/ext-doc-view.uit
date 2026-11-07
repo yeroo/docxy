@@ -215,6 +215,77 @@ test issue 1895 a 100% table fits a narrow view and a fixed one scrolls sideways
   call tab-list {}
   assert reply.count is 1
 
+test issue 2003 the host sets the view's page inset and its dark page's colour, and resets both
+  call window-size {"w":1000,"h":700}
+  call theme-set {"theme":"dark"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  # The default: 48 px beside the text, 28 above and below, the theme's
+  # background under dark content.
+  call ext-doc-set {"content_dark":true}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_inset.top is 28
+  assert reply.page_inset.right is 48
+  assert reply.page_inset.bottom is 28
+  assert reply.page_inset.left is 48
+  assert reply.page_background is null
+  assert reply.column_left is 48
+  assert reply.page_color is not 262626
+  assert reply.text_width is 904
+  # The host's: 22 px beside, 12 above and below, the page in its header's
+  # #262626. The text is 2 x (48 - 22) = 52 px wider.
+  call ext-doc-set {"page_inset":{"top":12,"right":22,"bottom":12,"left":22},"page_background":"262626"}
+  assert reply.page_inset.left is 22
+  assert reply.page_background is 262626
+  shot window
+  call ext-doc-read {}
+  assert reply.page_inset.top is 12
+  assert reply.page_inset.right is 22
+  assert reply.page_inset.bottom is 12
+  assert reply.column_left is 22
+  assert reply.page_color is 262626
+  assert reply.text_width is 956
+  # A press on the fixture's header takes the keys from the view; one in
+  # the narrower left padding gives them back.
+  call pointer-click {"region":"ext-doc-header"}
+  call ext-doc-read {}
+  assert reply.focused is false
+  call pointer-click {"region":"ext-doc-inset:left"}
+  call ext-doc-read {}
+  assert reply.focused is true
+  assert reply.selection is empty
+  # Light content on the dark theme: the white page, whatever the host's.
+  call ext-doc-set {"content_dark":false}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_color is ffffff
+  assert reply.column_left is 22
+  # The light theme: the white page too, dark content or not.
+  call ext-doc-set {"content_dark":true}
+  call theme-set {"theme":"light"}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_color is ffffff
+  assert reply.page_background is 262626
+  assert reply.column_left is 22
+  # Back to the dark theme and the defaults: 48 x 28 and the theme's page.
+  call theme-set {"theme":"dark"}
+  call ext-doc-set {"page_inset":null,"page_background":null}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_inset.left is 48
+  assert reply.page_background is null
+  assert reply.column_left is 48
+  assert reply.page_color is not 262626
+  call ext-doc-set {"content_dark":false}
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
 test issue 1873 the view's copy pastes into a document with its bold, as another app's rich copy
   # Last: the document it pastes into stays open (and edited).
   call backstage {"action":"open"}

@@ -34,9 +34,10 @@ use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::VertAlign;
 use gpui::{
-    App, AppContext as _, Bounds, Context, EntityInputHandler as _, KeyDownEvent, KeyUpEvent,
-    Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px, size,
+    App, AppContext as _, Bounds, Context, Edges, EntityInputHandler as _, Hsla, KeyDownEvent,
+    KeyUpEvent, Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchPhase, Window, point, px,
+    size,
 };
 use gpui_component::ActiveTheme;
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
@@ -1623,6 +1624,48 @@ fn ext_fixture_view(
         .map_err(|_| "the active tab is not the test extension's".to_string())
 }
 
+/// `ext-doc-set`'s page inset and background, each `None` when not given
+/// and `Some(None)` for `null`.
+type ExtDocPage = (Option<Option<Edges<Pixels>>>, Option<Option<Hsla>>);
+
+/// What `ext-doc-set` has the view's host set for its page (#2003), each
+/// `None` when not given: `page_inset`, `null` (the default) or
+/// `{"top","right","bottom","left"}` in px, every edge given; and
+/// `page_background`, `null` (the theme's) or `"rrggbb"` (a `#` before it
+/// is allowed; `ext-doc-read` reports it without, as a case's `#` starts a
+/// comment).
+fn ext_doc_page_args(args: &Json) -> Result<ExtDocPage, String> {
+    const INSET: &str =
+        "'page_inset' must be null or {\"top\",\"right\",\"bottom\",\"left\"} in px";
+    let inset = match args.get("page_inset") {
+        None => None,
+        Some(Json::Null) => Some(None),
+        Some(v @ Json::Obj(_)) => {
+            let edge = |k: &str| {
+                v.get(k)
+                    .and_then(Json::as_f64)
+                    .map(|n| px(n as f32))
+                    .ok_or_else(|| INSET.to_string())
+            };
+            Some(Some(Edges {
+                top: edge("top")?,
+                right: edge("right")?,
+                bottom: edge("bottom")?,
+                left: edge("left")?,
+            }))
+        }
+        Some(_) => return Err(INSET.into()),
+    };
+    const BG: &str = "'page_background' must be null or \"rrggbb\"";
+    let bg = match args.get("page_background") {
+        None => None,
+        Some(Json::Null) => Some(None),
+        Some(Json::Str(s)) => Some(Some(crate::hsla_u(crate::hex_rgb(s).ok_or(BG)?))),
+        Some(_) => return Err(BG.into()),
+    };
+    Ok((inset, bg))
+}
+
 /// A host call `ext-doc-call` makes on the test extension's view (#1947).
 #[derive(Debug, PartialEq)]
 enum ExtDocCall {
@@ -1787,6 +1830,22 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             .map(|b| b.center())
             .ok_or_else(|| "the view is not drawn yet".to_string());
     }
+    if part == "header" {
+        // The fixture's header line, just above the view (#2003).
+        return view
+            .viewport()
+            .map(|b| point(b.left() + px(20.), b.top() - px(6.)))
+            .ok_or_else(|| "the view is not drawn yet".to_string());
+    }
+    if part == "inset:left" {
+        // The middle of the left padding at the view's mid-height (#2003),
+        // clear of the scroll bars along the right and bottom edges.
+        let left = crate::doc_view::resolve_page_inset(view.page_inset()).left;
+        return view
+            .viewport()
+            .map(|b| point(b.left() + left / 2., b.center().y))
+            .ok_or_else(|| "the view is not drawn yet".to_string());
+    }
     if let Some(n) = part.strip_prefix("link:") {
         // `:left`: 8 px left of the span, at mid-height (the blank beside a
         // row that starts with the link).
@@ -1826,7 +1885,7 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             None => b.center(),
         });
     }
-    Err("the test extension's regions are ext-doc-view, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
+    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its
@@ -5470,10 +5529,14 @@ fn dispatch_verb(
             };
             let dark = flag("content_dark")?;
             let editable = flag("editable")?;
-            if mode.is_none() && dark.is_none() && editable.is_none() {
-                return Err(
-                    "ext-doc-set takes 'link_click', 'content_dark' and/or 'editable'".into(),
-                );
+            let (inset, page_bg) = ext_doc_page_args(args)?;
+            if mode.is_none()
+                && dark.is_none()
+                && editable.is_none()
+                && inset.is_none()
+                && page_bg.is_none()
+            {
+                return Err("ext-doc-set takes 'link_click', 'content_dark', 'editable', 'page_inset' and/or 'page_background'".into());
             }
             let doc = fixture.read(cx).doc.clone();
             doc.update(cx, |v, cx| {
@@ -5485,6 +5548,12 @@ fn dispatch_verb(
                 }
                 if let Some(on) = editable {
                     v.set_editable(on, cx);
+                }
+                if let Some(inset) = inset {
+                    v.set_page_inset(inset, cx);
+                }
+                if let Some(bg) = page_bg {
+                    v.set_page_background(bg, cx);
                 }
             });
             let mut reply = match doc.read(cx).harness_json(window) {
@@ -8944,6 +9013,44 @@ mod tests {
             r#"{"undo":false}"#,
         ] {
             assert!(call(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// #2003: `ext-doc-set`'s page inset and background, each `null` for
+    /// the default or a value, and what it refuses.
+    #[test]
+    fn ext_doc_set_parses_the_page_inset_and_background() {
+        let page = |text: &str| ext_doc_page_args(&Json::parse(text).unwrap());
+        assert_eq!(page("{}"), Ok((None, None)));
+        assert_eq!(
+            page(r##"{"page_inset":null,"page_background":null}"##),
+            Ok((Some(None), Some(None)))
+        );
+        let (inset, bg) = page(
+            r##"{"page_inset":{"top":12,"right":22,"bottom":12,"left":22},"page_background":"#262626"}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            inset,
+            Some(Some(Edges {
+                top: px(12.),
+                right: px(22.),
+                bottom: px(12.),
+                left: px(22.),
+            }))
+        );
+        assert_eq!(bg, Some(Some(crate::hsla_u(0x262626))));
+        let (_, bg) = page(r##"{"page_background":"262626"}"##).unwrap();
+        assert_eq!(bg, Some(Some(crate::hsla_u(0x262626))));
+        for bad in [
+            r##"{"page_inset":{"top":12,"right":22,"bottom":12}}"##,
+            r##"{"page_inset":24}"##,
+            r##"{"page_inset":{"top":"a","right":0,"bottom":0,"left":0}}"##,
+            r##"{"page_background":"#2626"}"##,
+            r##"{"page_background":"#26262g"}"##,
+            r##"{"page_background":true}"##,
+        ] {
+            assert!(page(bad).is_err(), "{bad}");
         }
     }
 
