@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
-    MasterCategory, Message, MessageFields, Recipient, Recurrence,
+    MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link,
 };
 use crate::json::{self, Value};
 
@@ -2754,8 +2754,10 @@ impl Store {
             web_link: String::new(),
             last_modified: String::new(),
             body_html: f.body_html.clone(),
-            // What Graph will create (#1983), so the row reads the same
-            // before and after the next calendar refresh.
+            // The fields Graph sets on create (#1983), and the join link
+            // `Event::from_json` would find in the location or body. Not
+            // everything matches the next refresh: reminders stay 0/false
+            // (#1937), and a series reads as `calendarView`'s occurrences.
             show_as: "busy".to_string(),
             sensitivity: "normal".to_string(),
             importance: "normal".to_string(),
@@ -2771,6 +2773,9 @@ impl Store {
                 .as_ref()
                 .and_then(|r| EventRecurrence::from_json(&r.to_json())),
             is_organizer: true,
+            join_url: meeting_link(&f.location)
+                .or_else(|| meeting_link(&f.body_html))
+                .unwrap_or_default(),
             ..NewEvent::default()
         })?;
         self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
@@ -5127,6 +5132,7 @@ mod calendar_tests {
             .create_local_event(
                 &LocalEventFields {
                     recurrence: Some(rec),
+                    body_html: "<a href=\"https://zoom.us/j/7\">Join</a>".into(),
                     ..sample_fields()
                 },
                 "Me",
@@ -5146,8 +5152,10 @@ mod calendar_tests {
         }
         assert_eq!(row(&single).event_type, "singleInstance");
         assert_eq!(row(&single).recurrence, None);
+        assert_eq!(row(&single).join_url, "", "Room 1, no link in the body");
         let series = row(&series);
         assert_eq!(series.event_type, "seriesMaster");
+        assert_eq!(series.join_url, "https://zoom.us/j/7");
         let r = series.recurrence.unwrap();
         assert_eq!(r.pattern.r#type, "weekly");
         assert_eq!(r.pattern.days_of_week, vec!["monday"]);
