@@ -264,7 +264,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   run look, else the base size and `pal.fg`, no longer `pal.dim`. In a
   hanging indent its trailing space goes ("1." not "1. "): the gap after it
   separates it, and "1. " fills a browser's 17.8 px hang exactly, pushing
-  the text to the next stop. The numbering level's own `w:rPr` is not read.
+  the text to the next stop. There the number and its gap are one
+  `flex_none` box of the measured width (`marker_box_width`), the number
+  left in it at its own width, so the text starts on the stop whatever the
+  glyphs lay out at: DirectWrite drew "1." a pixel wider than measured and
+  put the text at 41 (#1986 ci1). The numbering level's own `w:rPr` is not
+  read.
 - A nested HTML list sits at its own indent (600 twips per list): an item
   with a left of its own takes no level step (Lists, above).
 - Harness (test extension): `ext-doc-load {"html": ...}` imports a page

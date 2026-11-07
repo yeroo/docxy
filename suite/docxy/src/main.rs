@@ -6463,6 +6463,20 @@ fn leading_items(
     items
 }
 
+/// The width of the box a list number at `leading[k]` (measured
+/// `marker_width` px) is drawn in with the gap after it: their sum, so the
+/// text starts on the gap's stop whatever width the number's glyphs lay
+/// out at (DirectWrite and the measurer may differ by a pixel, #1986);
+/// `None` when no gap follows it (no hanging indent).
+fn marker_box_width(leading: &[LeadingItem], k: usize, marker_width: f32) -> Option<f32> {
+    match (leading.get(k), leading.get(k + 1)) {
+        (Some(LeadingItem::ListMarker), Some(LeadingItem::MarkerGap(gap))) => {
+            Some(marker_width + gap)
+        }
+        _ => None,
+    }
+}
+
 fn paragraph_indent_layout(indent: EffIndent, zoom: f32) -> ParagraphIndentLayout {
     let continuation_x = tw_px(indent.left, zoom);
     let first_x = tw_px(indent.left.saturating_add(indent.first), zoom);
@@ -7592,6 +7606,43 @@ mod flow_view_tests {
         let p = item(&ed);
         assert_eq!((p.indent, p.ilvl), (2020, 1));
         assert_eq!(eff_indent(&p).left, 2020);
+    }
+
+    /// #1986 ci1: in a hanging indent the number and its gap are one box
+    /// ending on the stop, whatever the number measured, so the text's x
+    /// does not follow the number's laid-out width; with no hang, none.
+    #[test]
+    fn a_hanging_number_sits_in_a_box_ending_on_the_stop() {
+        let p = ParProps {
+            indent: 600,
+            first_line: -267,
+            num_id: Some(2),
+            ..ParProps::default()
+        };
+        let layout = paragraph_indent_layout(eff_indent(&p), 1.0);
+        for measured in [13.0, 13.4, 14.2] {
+            let leading = leading_items(layout, Some(measured), 48.0, &[]);
+            let k = leading
+                .iter()
+                .position(|l| *l == LeadingItem::ListMarker)
+                .unwrap();
+            let width = marker_box_width(&leading, k, measured).expect("a box");
+            assert!(
+                (layout.first_x + width - 40.0).abs() < 0.01,
+                "{measured}: {width}"
+            );
+        }
+        let flat = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                indent: 600,
+                num_id: Some(2),
+                ..ParProps::default()
+            }),
+            1.0,
+        );
+        let leading = leading_items(flat, Some(13.0), 48.0, &[]);
+        assert_eq!(leading, [LeadingItem::ListMarker]);
+        assert_eq!(marker_box_width(&leading, 0, 13.0), None);
     }
 
     fn spacing(before: i32, after: i32, line: i32, rule: &str) -> docxcore::model::Spacing {
@@ -35853,7 +35904,8 @@ fn paragraph_el(
         meas.map(|m| m.width_in(s, look.size, look.bold, look.italic, look.font.as_deref()))
             .unwrap_or(0.0)
     });
-    for item in leading_items(indent_layout, marker_width, interval, &customs) {
+    let leading = leading_items(indent_layout, marker_width, interval, &customs);
+    for (k, item) in leading.iter().copied().enumerate() {
         match item {
             LeadingItem::Spacer { width, margin } => spans.push(
                 div()
@@ -35876,20 +35928,42 @@ fn paragraph_el(
                     });
                     bounds_probe(at)
                 });
-                spans.push(
-                    div()
-                        .when(probe.is_some(), |d| d.relative())
-                        .text_size(px(look.size))
-                        .text_color(look.ink)
-                        .when_some(look.family.clone(), |d, f| d.font_family(f))
-                        .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
-                        .when(look.italic, |d| d.italic())
-                        .child(SharedString::from(m.to_string()))
-                        .children(probe)
-                        .into_any_element(),
-                );
-                x += marker_width.unwrap_or(0.0);
+                let number = div()
+                    .when(probe.is_some(), |d| d.relative())
+                    .text_size(px(look.size))
+                    .text_color(look.ink)
+                    .when_some(look.family.clone(), |d, f| d.font_family(f))
+                    .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
+                    .when(look.italic, |d| d.italic())
+                    .child(SharedString::from(m.to_string()))
+                    .children(probe);
+                let measured = marker_width.unwrap_or(0.0);
+                match marker_box_width(&leading, k, measured) {
+                    // In a hanging indent the number and its gap are one box
+                    // of the measured width, so the text starts on the stop
+                    // whatever width the glyphs lay out at (#1986).
+                    Some(width) => {
+                        spans.push(
+                            // A row, so the number keeps its own width (the
+                            // harness's probe reads it) and overflows the box
+                            // rather than wrapping if wider.
+                            div()
+                                .flex()
+                                .flex_none()
+                                .w(px(width))
+                                .child(number.flex_none().whitespace_nowrap())
+                                .into_any_element(),
+                        );
+                        x += width;
+                    }
+                    None => {
+                        spans.push(number.into_any_element());
+                        x += measured;
+                    }
+                }
             }
+            // Inside the number's box ([`marker_box_width`]).
+            LeadingItem::MarkerGap(_) if k > 0 && leading[k - 1] == LeadingItem::ListMarker => {}
             LeadingItem::MarkerGap(width) => {
                 spans.push(div().w(px(width)).h(px(1.)).flex_none().into_any_element());
                 x += width;
