@@ -606,6 +606,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   first of a name wins, values are trimmed (an empty one stays `Some("")`).
   Parsing is lenient: no field, a null one or a malformed entry gives no
   header, never an error.
+- #2015 adds `msip_labels`, the Microsoft Purview sensitivity label
+  (`MSIP_Label_<guid>_Name=Confidential; ...`), so a client can show it as
+  Outlook does under the recipients. It is stored like the two stamps (case
+  ignored, trimmed, otherwise verbatim); mailcore never parses it, and label
+  names or parents from the Information Protection API are the caller's.
+  Mail stored before #2015 reads `None` until its body is fetched again.
 - `SyncEngine::fetch_and_store_body` (FetchBody and the engine's own fetches)
   stores them with `Store::put_fetched_body_with_headers`: body and headers in
   one transaction, the message's earlier headers replaced. `put_fetched_body`
@@ -623,7 +629,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `a_failed_header_write_keeps_the_earlier_body_and_headers`,
   `a_missing_message_stores_no_headers`, `message_headers_go_with_a_deleted_message`,
   `reconcile_id_moves_message_headers`; `engine.rs`
-  `fetch_body_stores_exchange_auth_as_header`.
+  `fetch_body_stores_exchange_auth_as_header`. #2015: `model.rs`
+  `msip_labels_is_a_stored_header`, `client.rs`
+  `get_body_keeps_the_msip_labels_header`, `store`
+  `body_format_tests::message_header_keeps_msip_labels`, `engine.rs`
+  `fetch_body_stores_the_msip_labels_header`.
 
 ## Calendar sync keeps reminder settings (#1937)
 

@@ -259,14 +259,20 @@ impl Body {
 }
 
 /// The internet headers a fetched body brings along that the store keeps
-/// with the message (#1933): Exchange's own stamps of where a message came
-/// from, so a caller can tell mail from inside the tenant (`AuthAs:
-/// Internal`, `MessageDirectionality: Originating`) from outside mail
-/// (`Anonymous`, `Incoming`) without trusting the sender's domain. Matched
-/// ignoring ASCII case. Only these, never the whole header block.
+/// with the message. Matched ignoring ASCII case. Only these, never the
+/// whole header block:
+///
+/// - Exchange's own stamps of where a message came from (#1933), so a
+///   caller can tell mail from inside the tenant (`AuthAs: Internal`,
+///   `MessageDirectionality: Originating`) from outside mail (`Anonymous`,
+///   `Incoming`) without trusting the sender's domain.
+/// - `msip_labels`, the message's Microsoft Purview sensitivity label
+///   (#2015): `MSIP_Label_<guid>_Name=Confidential; ...` fields, kept as
+///   Graph sends them (trimmed) for the caller to parse; mailcore does not.
 pub const STORED_HEADERS: &[&str] = &[
     "X-MS-Exchange-Organization-AuthAs",
     "X-MS-Exchange-Organization-MessageDirectionality",
+    "msip_labels",
 ];
 
 /// Whether `name` is one of [`STORED_HEADERS`], ignoring ASCII case.
@@ -1492,6 +1498,16 @@ fn recipient_list(v: &Value, key: &str) -> Vec<Recipient> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn msip_labels_is_a_stored_header() {
+        // #2015: the sensitivity label is kept with a body, in any case.
+        for name in ["msip_labels", "MSIP_LABELS", "Msip_Labels"] {
+            assert!(is_stored_header(name), "{name}");
+        }
+        assert!(!is_stored_header("msip_label"));
+        assert!(!is_stored_header("Received"));
+    }
 
     #[test]
     fn parses_message() {
