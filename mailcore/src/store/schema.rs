@@ -198,7 +198,12 @@ CREATE TABLE IF NOT EXISTS events (
     has_attachments          INTEGER NOT NULL DEFAULT 0,
     original_start_tz        TEXT NOT NULL DEFAULT '',
     original_end_tz          TEXT NOT NULL DEFAULT '',
-    calendar_id              TEXT NOT NULL DEFAULT ''
+    calendar_id              TEXT NOT NULL DEFAULT '',
+    -- A `local:` event created without a reminder (#1994): its `CreateEvent`
+    -- sends none, so Graph applies the mailbox default, and the reconcile
+    -- writes Graph's back and clears this. Internal: not in `EventRow`, not
+    -- written by `upsert_event_on`.
+    reminder_unset           INTEGER NOT NULL DEFAULT 0
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
