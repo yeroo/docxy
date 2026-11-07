@@ -243,8 +243,12 @@ pub enum SyncCommand {
     /// Push an edited event's currently-stored fields
     /// (`Store::update_event_fields`, already applied by the caller) to
     /// Graph: enqueue [`crate::store::OutboxOp::UpdateEvent`] and drain,
-    /// then emit [`SyncEvent::CalendarUpdated`].
-    UpdateEvent { id: String },
+    /// then emit [`SyncEvent::CalendarUpdated`]. `fields` is the set
+    /// `update_event_fields` returned: the PATCH sends only those (#1994).
+    UpdateEvent {
+        id: String,
+        fields: crate::graph::client::EventFieldSet,
+    },
     /// Delete an event (optimistic local delete already applied by the
     /// caller via `Store::delete_event`): enqueue
     /// [`crate::store::OutboxOp::DeleteEvent`] and drain, then emit
@@ -1262,8 +1266,8 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::CreateEvent { id });
                 self.emit(SyncEvent::CalendarUpdated);
             }
-            SyncCommand::UpdateEvent { id } => {
-                self.enqueue_and_drain(OutboxOp::UpdateEvent { id });
+            SyncCommand::UpdateEvent { id, fields } => {
+                self.enqueue_and_drain(OutboxOp::UpdateEvent { id, fields });
                 self.emit(SyncEvent::CalendarUpdated);
             }
             SyncCommand::DeleteEvent { id } => {

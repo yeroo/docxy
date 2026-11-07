@@ -12,6 +12,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
+use crate::graph::client::{AttendeeInput, EventFieldSet};
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
     MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link_in,
@@ -268,8 +269,12 @@ pub enum OutboxOp {
     CreateEvent {
         id: String,
     },
+    /// `fields` are the groups the edit changed (`Store::update_event_fields`,
+    /// #1994): the PATCH sends only those. A row queued before #1994 has no
+    /// `fields` and reads as `EventFieldSet::LEGACY_UPDATE`.
     UpdateEvent {
         id: String,
+        fields: EventFieldSet,
     },
     DeleteEvent {
         id: String,
@@ -367,9 +372,21 @@ impl OutboxOp {
                     },
                 ),
             ]),
-            OutboxOp::CreateEvent { id }
-            | OutboxOp::UpdateEvent { id }
-            | OutboxOp::DeleteEvent { id } => Value::Object(vec![
+            OutboxOp::UpdateEvent { id, fields } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "fields".to_string(),
+                    Value::Array(
+                        fields
+                            .to_names()
+                            .into_iter()
+                            .map(|n| Value::Str(n.to_string()))
+                            .collect(),
+                    ),
+                ),
+            ]),
+            OutboxOp::CreateEvent { id } | OutboxOp::DeleteEvent { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
@@ -425,7 +442,15 @@ impl OutboxOp {
                     .map(str::to_string),
             }),
             "createEvent" => Some(OutboxOp::CreateEvent { id: id()? }),
-            "updateEvent" => Some(OutboxOp::UpdateEvent { id: id()? }),
+            "updateEvent" => Some(OutboxOp::UpdateEvent {
+                id: id()?,
+                fields: match v.get("fields").and_then(Value::as_array) {
+                    Some(names) => EventFieldSet::from_names(
+                        &names.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+                    ),
+                    None => EventFieldSet::LEGACY_UPDATE,
+                },
+            }),
             "deleteEvent" => Some(OutboxOp::DeleteEvent { id: id()? }),
             _ => None,
         }
@@ -698,9 +723,14 @@ impl From<&Attendee> for NewAttendee {
     }
 }
 
-/// The editable fields of an event the compose form collects — the input to
-/// `create_local_event`/`update_event_fields`.
-#[derive(Debug, Clone, PartialEq)]
+/// The editable fields of an event a host collects — the input to
+/// `create_local_event`/`update_event_fields`. Each `Option` is `None` for
+/// "leave as stored" on an update and "Graph's default" on a create (#1994),
+/// so a host whose form shows only some fields passes `..Default::default()`
+/// without clobbering what another client set. `Some("")` for `show_as`,
+/// `sensitivity`, `importance` or `online_meeting_provider` is `None`: Graph
+/// refuses an empty enum.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LocalEventFields {
     pub subject: String,
     pub start_utc: String,
@@ -708,9 +738,29 @@ pub struct LocalEventFields {
     pub is_all_day: bool,
     pub location: String,
     pub body_html: String,
-    pub attendees: Vec<(String, String)>, // (name, address)
+    /// An attendee whose `r#type` is `""` keeps the type of the stored
+    /// attendee with the same address on an update, and is `required`
+    /// otherwise.
+    pub attendees: Vec<AttendeeInput>,
     /// The recurrence pattern for a repeating event (create-only), or `None`.
     pub recurrence: Option<Recurrence>,
+    pub show_as: Option<String>,
+    pub sensitivity: Option<String>,
+    pub importance: Option<String>,
+    pub categories: Option<Vec<String>>,
+    /// `None` on a create: Graph applies the mailbox's default reminder.
+    pub reminder: Option<EventReminder>,
+    pub is_online_meeting: Option<bool>,
+    pub online_meeting_provider: Option<String>,
+    pub response_requested: Option<bool>,
+    pub allow_new_time_proposals: Option<bool>,
+}
+
+/// An event's reminder: Graph `isReminderOn` and `reminderMinutesBeforeStart`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventReminder {
+    pub on: bool,
+    pub minutes_before_start: i64,
 }
 
 /// Everything `sync::outbox` needs to build a `graph::client::EventInput` for a
@@ -723,9 +773,22 @@ pub struct EventSendData {
     pub is_all_day: bool,
     pub location: String,
     pub body_html: String,
-    pub attendees: Vec<(String, String)>,
+    pub attendees: Vec<AttendeeInput>,
     /// The recurrence pattern for a repeating event (create-only), or `None`.
     pub recurrence: Option<Recurrence>,
+    pub show_as: String,
+    pub sensitivity: String,
+    pub importance: String,
+    pub categories: Vec<String>,
+    pub is_reminder_on: bool,
+    pub reminder_minutes: i64,
+    pub is_online_meeting: bool,
+    pub online_meeting_provider: String,
+    pub response_requested: bool,
+    pub allow_new_time_proposals: bool,
+    /// A `local:` event created without a reminder (`events.reminder_unset`):
+    /// its `CreateEvent` sends none, so Graph applies the mailbox default.
+    pub reminder_unset: bool,
 }
 
 /// The local mail database. Single-threaded access is assumed (the sync
@@ -811,6 +874,7 @@ impl Store {
             "original_start_tz TEXT NOT NULL DEFAULT ''",
             "original_end_tz TEXT NOT NULL DEFAULT ''",
             "calendar_id TEXT NOT NULL DEFAULT ''",
+            "reminder_unset INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
         }
@@ -2686,22 +2750,7 @@ impl Store {
     /// The attendees stored for an event, in insertion order (the order
     /// `put_event_attendees` last wrote them in).
     pub fn event_attendees(&self, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, addr, type, response, response_time
-             FROM event_attendees WHERE event_id = ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![id], |row| {
-                Ok(AttendeeRow {
-                    name: row.get(0)?,
-                    addr: row.get(1)?,
-                    r#type: row.get(2)?,
-                    response: row.get(3)?,
-                    response_time: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        event_attendees_on(&self.conn, id)
     }
 
     /// The stored `body_html` for an event: `None` if there's no `events`
@@ -2731,7 +2780,11 @@ impl Store {
 
     /// Inserts a locally-created event with a fresh `local:` id and the given
     /// organizer, so it shows in the agenda immediately (before it syncs to
-    /// Graph). `response_status` is `"organizer"`.
+    /// Graph). `response_status` is `"organizer"`. A `None` field stores what
+    /// Graph sets on create (#1983, #1994); a `None` reminder, which Graph
+    /// takes from the mailbox's default, is marked `reminder_unset` (its
+    /// `CreateEvent` sends none, and `reconcile_created_event` writes back
+    /// Graph's).
     pub fn create_local_event(
         &self,
         f: &LocalEventFields,
@@ -2739,63 +2792,164 @@ impl Store {
         organizer_addr: &str,
     ) -> Result<String, StoreError> {
         let id = local_draft_id(); // a unique "local:<hex>" id
-        self.upsert_event(&NewEvent {
-            id: id.clone(),
-            subject: f.subject.clone(),
-            start_utc: f.start_utc.clone(),
-            end_utc: f.end_utc.clone(),
-            is_all_day: f.is_all_day,
-            location: f.location.clone(),
-            organizer_name: organizer_name.to_string(),
-            organizer_addr: organizer_addr.to_string(),
-            response_status: "organizer".to_string(),
-            series_master_id: None,
-            body_preview: String::new(),
-            web_link: String::new(),
-            last_modified: String::new(),
-            body_html: f.body_html.clone(),
-            // The fields Graph sets on create (#1983), and the join link
-            // `Event::from_json` would find in the location or body. Not
-            // everything matches the next refresh: reminders stay 0/false
-            // (#1937), and a series reads as `calendarView`'s occurrences.
-            show_as: "busy".to_string(),
-            sensitivity: "normal".to_string(),
-            importance: "normal".to_string(),
-            event_type: if f.recurrence.is_some() {
-                "seriesMaster"
-            } else {
-                "singleInstance"
-            }
-            .to_string(),
-            // The create-side recurrence is already in Graph's shape.
-            recurrence: f
-                .recurrence
-                .as_ref()
-                .and_then(|r| EventRecurrence::from_json(&r.to_json())),
-            is_organizer: true,
-            join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
-            ..NewEvent::default()
-        })?;
-        self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
-        if let Some(rec) = &f.recurrence {
-            self.conn.execute(
-                "UPDATE events SET recurrence = ?1 WHERE id = ?2",
-                params![rec.to_json().to_string(), id],
-            )?;
-        }
+        let reminder = f.reminder.unwrap_or_default();
+        let enum_or =
+            |v: &Option<String>, default: &str| non_empty(v).unwrap_or_else(|| default.to_string());
+        let tx = self.conn.unchecked_transaction()?;
+        upsert_event_on(
+            &tx,
+            &NewEvent {
+                id: id.clone(),
+                subject: f.subject.clone(),
+                start_utc: f.start_utc.clone(),
+                end_utc: f.end_utc.clone(),
+                is_all_day: f.is_all_day,
+                location: f.location.clone(),
+                organizer_name: organizer_name.to_string(),
+                organizer_addr: organizer_addr.to_string(),
+                response_status: "organizer".to_string(),
+                series_master_id: None,
+                body_preview: String::new(),
+                web_link: String::new(),
+                last_modified: String::new(),
+                body_html: f.body_html.clone(),
+                reminder_minutes: reminder.minutes_before_start,
+                is_reminder_on: reminder.on,
+                // What the host set, else what Graph sets on create (#1983),
+                // and the join link `Event::from_json` would find in the
+                // location or body. A series reads as `calendarView`'s
+                // occurrences on the next refresh.
+                show_as: enum_or(&f.show_as, "busy"),
+                sensitivity: enum_or(&f.sensitivity, "normal"),
+                importance: enum_or(&f.importance, "normal"),
+                categories: f.categories.clone().unwrap_or_default(),
+                is_online_meeting: f.is_online_meeting.unwrap_or(false),
+                online_meeting_provider: non_empty(&f.online_meeting_provider).unwrap_or_default(),
+                response_requested: f.response_requested.unwrap_or(true),
+                allow_new_time_proposals: f.allow_new_time_proposals.unwrap_or(true),
+                event_type: if f.recurrence.is_some() {
+                    "seriesMaster"
+                } else {
+                    "singleInstance"
+                }
+                .to_string(),
+                // The create-side recurrence is already in Graph's shape.
+                recurrence: f
+                    .recurrence
+                    .as_ref()
+                    .and_then(|r| EventRecurrence::from_json(&r.to_json())),
+                is_organizer: true,
+                join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
+                ..NewEvent::default()
+            },
+        )?;
+        put_event_attendees_on(&tx, &id, &typed_attendees(&f.attendees, &[]))?;
+        tx.execute(
+            "UPDATE events SET recurrence = ?2, reminder_unset = ?3 WHERE id = ?1",
+            params![
+                id,
+                f.recurrence
+                    .as_ref()
+                    .map(|r| r.to_json().to_string())
+                    .unwrap_or_default(),
+                f.reminder.is_none()
+            ],
+        )?;
+        tx.commit()?;
         Ok(id)
     }
 
-    /// Overwrites a stored event's editable fields + attendees + body in place.
+    /// Writes a host's edit of a stored event and returns the groups whose
+    /// value changed (#1994): the `UpdateEvent` op sends only those. A `None`
+    /// field keeps the stored value and is not in the set; so is a `Some`
+    /// equal to it. Attendees are rewritten only when they changed (as the
+    /// ordered list of name, address and type), and each one whose address
+    /// matches a stored one (case-insensitive) keeps its response and
+    /// response time, and its type when the input's is `""`. Recurrence is
+    /// create-only: never written here, never in the set.
+    ///
     /// `join_url` follows the new location and body (`meeting_link_in`, as
-    /// `create_local_event` derives it), except on an online meeting, whose
-    /// join link is Graph's `onlineMeeting.joinUrl`, which no location or body
-    /// edit changes (#1983).
-    pub fn update_event_fields(&self, id: &str, f: &LocalEventFields) -> Result<(), StoreError> {
-        self.conn.execute(
+    /// `create_local_event` derives it), except on an event stored as an
+    /// online meeting, whose join link is Graph's `onlineMeeting.joinUrl`,
+    /// which no location or body edit changes (#1983), and which Graph keeps
+    /// even when an edit sends `isOnlineMeeting: false`.
+    pub fn update_event_fields(
+        &self,
+        id: &str,
+        f: &LocalEventFields,
+    ) -> Result<EventFieldSet, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let old = event_for_send_on(&tx, id)?
+            .ok_or_else(|| StoreError::Sql(format!("no event stored for {id}")))?;
+        let stored_attendees = event_attendees_on(&tx, id)?;
+        let mut changed = EventFieldSet::default();
+        let mut mark = |group: EventFieldSet, differs: bool| {
+            if differs {
+                changed.insert(group);
+            }
+        };
+        mark(EventFieldSet::SUBJECT, f.subject != old.subject);
+        mark(
+            EventFieldSet::TIMES,
+            f.start_utc != old.start_utc
+                || f.end_utc != old.end_utc
+                || f.is_all_day != old.is_all_day,
+        );
+        mark(EventFieldSet::LOCATION, f.location != old.location);
+        mark(EventFieldSet::BODY, f.body_html != old.body_html);
+        let show_as = non_empty(&f.show_as).unwrap_or(old.show_as.clone());
+        mark(EventFieldSet::SHOW_AS, show_as != old.show_as);
+        let sensitivity = non_empty(&f.sensitivity).unwrap_or(old.sensitivity.clone());
+        mark(EventFieldSet::SENSITIVITY, sensitivity != old.sensitivity);
+        let importance = non_empty(&f.importance).unwrap_or(old.importance.clone());
+        mark(EventFieldSet::IMPORTANCE, importance != old.importance);
+        let categories = f.categories.clone().unwrap_or(old.categories.clone());
+        mark(EventFieldSet::CATEGORIES, categories != old.categories);
+        let old_reminder = EventReminder {
+            on: old.is_reminder_on,
+            minutes_before_start: old.reminder_minutes,
+        };
+        let reminder = f.reminder.unwrap_or(old_reminder);
+        mark(
+            EventFieldSet::REMINDER,
+            f.reminder.is_some() && (reminder != old_reminder || old.reminder_unset),
+        );
+        let online = f.is_online_meeting.unwrap_or(old.is_online_meeting);
+        let provider =
+            non_empty(&f.online_meeting_provider).unwrap_or(old.online_meeting_provider.clone());
+        mark(
+            EventFieldSet::ONLINE_MEETING,
+            online != old.is_online_meeting || provider != old.online_meeting_provider,
+        );
+        let response_requested = f.response_requested.unwrap_or(old.response_requested);
+        mark(
+            EventFieldSet::RESPONSE_REQUESTED,
+            response_requested != old.response_requested,
+        );
+        let allow_new = f
+            .allow_new_time_proposals
+            .unwrap_or(old.allow_new_time_proposals);
+        mark(
+            EventFieldSet::ALLOW_NEW_TIME_PROPOSALS,
+            allow_new != old.allow_new_time_proposals,
+        );
+        let attendees = typed_attendees(&f.attendees, &stored_attendees);
+        let attendees_differ = attendees.len() != stored_attendees.len()
+            || attendees
+                .iter()
+                .zip(&stored_attendees)
+                .any(|(a, s)| a.name != s.name || a.addr != s.addr || a.r#type != s.r#type);
+        mark(EventFieldSet::ATTENDEES, attendees_differ);
+
+        tx.execute(
             "UPDATE events SET subject = ?2, start_utc = ?3, end_utc = ?4, is_all_day = ?5,
                     location = ?6, body_html = ?7,
-                    join_url = CASE WHEN is_online_meeting THEN join_url ELSE ?8 END
+                    join_url = CASE WHEN is_online_meeting THEN join_url ELSE ?8 END,
+                    show_as = ?9, sensitivity = ?10, importance = ?11, categories = ?12,
+                    is_reminder_on = ?13, reminder_minutes = ?14,
+                    reminder_unset = reminder_unset AND ?15,
+                    is_online_meeting = ?16, online_meeting_provider = ?17,
+                    response_requested = ?18, allow_new_time_proposals = ?19
              WHERE id = ?1",
             params![
                 id,
@@ -2805,11 +2959,25 @@ impl Store {
                 f.is_all_day,
                 f.location,
                 f.body_html,
-                meeting_link_in(&f.location, &f.body_html).unwrap_or_default()
+                meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
+                show_as,
+                sensitivity,
+                importance,
+                encode_categories(&categories),
+                reminder.on,
+                reminder.minutes_before_start,
+                f.reminder.is_none(),
+                online,
+                provider,
+                response_requested,
+                allow_new
             ],
         )?;
-        self.put_event_attendees(id, &to_new_attendees(&f.attendees))?;
-        Ok(())
+        if attendees_differ {
+            put_event_attendees_on(&tx, id, &attendees)?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
 
     /// Removes an event (and its attendees) locally.
@@ -2826,55 +2994,21 @@ impl Store {
 
     /// Reads a stored event's send-relevant fields (`None` if no such event).
     pub fn event_for_send(&self, id: &str) -> Result<Option<EventSendData>, StoreError> {
-        let row = self.conn.query_row(
-            "SELECT subject, start_utc, end_utc, is_all_day, location, body_html, recurrence FROM events WHERE id = ?1",
-            params![id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, bool>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            },
-        );
-        let (subject, start_utc, end_utc, is_all_day, location, body_html, recurrence_raw) =
-            match row {
-                Ok(t) => t,
-                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-                Err(e) => return Err(e.into()),
-            };
-        let recurrence = if recurrence_raw.is_empty() {
-            None
-        } else {
-            crate::json::parse(&recurrence_raw)
-                .ok()
-                .and_then(|v| Recurrence::from_json(&v))
-        };
-        let attendees = self
-            .event_attendees(id)?
-            .into_iter()
-            .map(|a| (a.name, a.addr))
-            .collect();
-        Ok(Some(EventSendData {
-            subject,
-            start_utc,
-            end_utc,
-            is_all_day,
-            location,
-            body_html,
-            attendees,
-            recurrence,
-        }))
+        event_for_send_on(&self.conn, id)
     }
 
     /// Re-points a `local:` event id to its Graph id after `create_event`
-    /// (mirrors `reconcile_id` for drafts): updates `events.id` and
-    /// `event_attendees.event_id` in one transaction.
-    pub fn reconcile_event_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
+    /// (mirrors `reconcile_id` for drafts) and writes back what only Graph
+    /// decides on a create (#1994), in one transaction: the reminder (the
+    /// host's, or the mailbox default when it set none), and an online
+    /// meeting's join link and provider when Graph returned them. Clears
+    /// `reminder_unset`, so a Graph-id row never keeps it.
+    pub fn reconcile_created_event(
+        &self,
+        local_id: &str,
+        created: &Event,
+    ) -> Result<(), StoreError> {
+        let graph_id = created.id.as_str();
         let tx = self.conn.unchecked_transaction()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
@@ -2885,8 +3019,31 @@ impl Store {
             "UPDATE event_attendees SET event_id = ?2 WHERE event_id = ?1",
             params![local_id, graph_id],
         )?;
+        tx.execute(
+            "UPDATE events SET is_reminder_on = ?2, reminder_minutes = ?3, reminder_unset = 0
+             WHERE id = ?1",
+            params![graph_id, created.is_reminder_on, created.reminder_minutes],
+        )?;
+        set_event_online_meeting_on(
+            &tx,
+            graph_id,
+            &created.join_url,
+            &created.online_meeting_provider,
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes an online meeting's join link and provider as Graph returned
+    /// them (an update that turned the meeting on, #1994); an empty one is
+    /// left as stored.
+    pub fn set_event_online_meeting(
+        &self,
+        id: &str,
+        join_url: &str,
+        provider: &str,
+    ) -> Result<(), StoreError> {
+        set_event_online_meeting_on(&self.conn, id, join_url, provider)
     }
 
     /// Locally sets an event's RSVP response status (`"accepted"`,
@@ -3157,18 +3314,137 @@ fn local_draft_id() -> String {
     format!("local:{}", to_hex(&crate::pkce::random_bytes(16)))
 }
 
-/// Converts the (name, address) pairs `LocalEventFields::attendees` collects
-/// into `NewAttendee`s, defaulting every attendee to required/no-response —
-/// the compose form doesn't collect attendee type or track RSVP state itself.
-fn to_new_attendees(pairs: &[(String, String)]) -> Vec<NewAttendee> {
-    pairs
+/// `Store::event_for_send` on `conn` (a transaction in
+/// `Store::update_event_fields`).
+fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT subject, start_utc, end_utc, is_all_day, location, body_html, recurrence,
+                    show_as, sensitivity, importance, categories, is_reminder_on,
+                    reminder_minutes, is_online_meeting, online_meeting_provider,
+                    response_requested, allow_new_time_proposals, reminder_unset
+             FROM events WHERE id = ?1",
+            params![id],
+            |r| {
+                let recurrence_raw: String = r.get(6)?;
+                let recurrence = if recurrence_raw.is_empty() {
+                    None
+                } else {
+                    crate::json::parse(&recurrence_raw)
+                        .ok()
+                        .and_then(|v| Recurrence::from_json(&v))
+                };
+                Ok(EventSendData {
+                    subject: r.get(0)?,
+                    start_utc: r.get(1)?,
+                    end_utc: r.get(2)?,
+                    is_all_day: r.get(3)?,
+                    location: r.get(4)?,
+                    body_html: r.get(5)?,
+                    attendees: Vec::new(),
+                    recurrence,
+                    show_as: r.get(7)?,
+                    sensitivity: r.get(8)?,
+                    importance: r.get(9)?,
+                    categories: decode_categories(&r.get::<_, String>(10)?),
+                    is_reminder_on: r.get(11)?,
+                    reminder_minutes: r.get(12)?,
+                    is_online_meeting: r.get(13)?,
+                    online_meeting_provider: r.get(14)?,
+                    response_requested: r.get(15)?,
+                    allow_new_time_proposals: r.get(16)?,
+                    reminder_unset: r.get(17)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut data) = row else {
+        return Ok(None);
+    };
+    data.attendees = event_attendees_on(conn, id)?
+        .into_iter()
+        .map(|a| AttendeeInput {
+            name: a.name,
+            addr: a.addr,
+            r#type: a.r#type,
+        })
+        .collect();
+    Ok(Some(data))
+}
+
+/// `Store::event_attendees` on `conn`.
+fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT name, addr, type, response, response_time
+         FROM event_attendees WHERE event_id = ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![id], |row| {
+            Ok(AttendeeRow {
+                name: row.get(0)?,
+                addr: row.get(1)?,
+                r#type: row.get(2)?,
+                response: row.get(3)?,
+                response_time: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// `Store::set_event_online_meeting` on `conn`.
+fn set_event_online_meeting_on(
+    conn: &Connection,
+    id: &str,
+    join_url: &str,
+    provider: &str,
+) -> Result<(), StoreError> {
+    if !join_url.is_empty() {
+        conn.execute(
+            "UPDATE events SET join_url = ?2 WHERE id = ?1",
+            params![id, join_url],
+        )?;
+    }
+    if !provider.is_empty() {
+        conn.execute(
+            "UPDATE events SET online_meeting_provider = ?2 WHERE id = ?1",
+            params![id, provider],
+        )?;
+    }
+    Ok(())
+}
+
+/// A host's enum string, `Some("")` read as `None` (Graph refuses `""`).
+fn non_empty(v: &Option<String>) -> Option<String> {
+    v.clone().filter(|s| !s.is_empty())
+}
+
+/// The attendees a host's `LocalEventFields::attendees` stores, given the
+/// event's stored ones (`&[]` on a create): one whose address matches a
+/// stored attendee (case-insensitive) keeps that row's response and response
+/// time, and its type when the input's is `""` (#1994); a new one is
+/// `required` (or its given type) with no response.
+fn typed_attendees(input: &[AttendeeInput], stored: &[AttendeeRow]) -> Vec<NewAttendee> {
+    input
         .iter()
-        .map(|(name, addr)| NewAttendee {
-            name: name.clone(),
-            addr: addr.clone(),
-            r#type: "required".to_string(),
-            response: "none".to_string(),
-            response_time: String::new(),
+        .map(|a| {
+            let old = stored.iter().find(|s| s.addr.eq_ignore_ascii_case(&a.addr));
+            let r#type = if !a.r#type.is_empty() {
+                a.r#type.clone()
+            } else {
+                old.map(|s| s.r#type.clone())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "required".to_string())
+            };
+            NewAttendee {
+                name: a.name.clone(),
+                addr: a.addr.clone(),
+                r#type,
+                response: old
+                    .map(|s| s.response.clone())
+                    .unwrap_or_else(|| "none".to_string()),
+                response_time: old.map(|s| s.response_time.clone()).unwrap_or_default(),
+            }
         })
         .collect()
 }
@@ -4835,8 +5111,13 @@ mod calendar_tests {
             is_all_day: false,
             location: "Room 1".into(),
             body_html: "<p>agenda</p>".into(),
-            attendees: vec![("Bob".into(), "bob@x.com".into())],
+            attendees: vec![AttendeeInput {
+                name: "Bob".into(),
+                addr: "bob@x.com".into(),
+                r#type: String::new(),
+            }],
             recurrence: None,
+            ..Default::default()
         }
     }
 
@@ -4882,18 +5163,26 @@ mod calendar_tests {
         assert_eq!(send.subject, "Sync");
         assert_eq!(
             send.attendees,
-            vec![("Bob".to_string(), "bob@x.com".to_string())]
+            vec![AttendeeInput {
+                name: "Bob".into(),
+                addr: "bob@x.com".into(),
+                r#type: "required".into(),
+            }]
         );
         assert_eq!(send.body_html, "<p>agenda</p>");
     }
 
     #[test]
-    fn reconcile_event_id_repoints_event_and_attendees() {
+    fn reconcile_created_event_repoints_event_and_attendees() {
         let s = Store::open_in_memory().unwrap();
         let id = s
             .create_local_event(&sample_fields(), "Me", "me@x")
             .unwrap();
-        s.reconcile_event_id(&id, "EV1").unwrap();
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        s.reconcile_created_event(&id, &created).unwrap();
         assert!(s.event_for_send(&id).unwrap().is_none()); // old id gone
         let send = s.event_for_send("EV1").unwrap().unwrap(); // under graph id
         assert_eq!(send.attendees.len(), 1); // attendees moved too
@@ -5474,7 +5763,10 @@ mod outbox_tests {
             OutboxOp::CreateEvent {
                 id: "local:e1".into(),
             },
-            OutboxOp::UpdateEvent { id: "EV1".into() },
+            OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: EventFieldSet::SUBJECT.union(EventFieldSet::REMINDER),
+            },
             OutboxOp::DeleteEvent { id: "EV2".into() },
         ] {
             assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op));

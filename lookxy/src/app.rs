@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::ui::compose::{Compose, ComposeAction, ComposeField};
 use editcore::ops::Editor;
 use mailcore::compose_html;
-use mailcore::graph::client::RsvpKind;
+use mailcore::graph::client::{AttendeeInput, RsvpKind};
 use mailcore::graph::model::{
     AttachmentKind, AttachmentMeta, AutomaticReplies, Body, MasterCategory, OofStatus, Recurrence,
     RecurrenceKind,
@@ -2510,27 +2510,54 @@ impl App {
         } else {
             None
         };
+        // The form shows the stored body's plain text and saves what is typed
+        // as escaped text; an untouched body keeps the stored HTML, so a save
+        // neither rewrites another client's formatting nor counts the body as
+        // changed (#1994).
+        let stored_body = form
+            .editing_id
+            .as_deref()
+            .and_then(|id| self.store.event_body(id).ok().flatten());
+        let body_html = match stored_body {
+            Some(html) if compose_html::from_html(&html).plain() == form.body => html,
+            _ => compose_html::escape_html(&form.body), // plain text as HTML text
+        };
+        // The fields the form does not show stay `None`: an edit keeps what
+        // another client set (#1994).
         let fields = mailcore::store::LocalEventFields {
             subject: form.title.clone(),
             start_utc,
             end_utc,
             is_all_day: form.all_day,
             location: form.location.clone(),
-            body_html: compose_html::escape_html(&form.body), // plain text as HTML text
-            attendees: parse_attendee_pairs(&form.attendees),
+            body_html,
+            attendees: parse_attendee_pairs(&form.attendees)
+                .into_iter()
+                .map(|(name, addr)| AttendeeInput {
+                    name,
+                    addr,
+                    r#type: String::new(), // keep a stored attendee's type
+                })
+                .collect(),
             recurrence,
+            ..Default::default()
         };
         let editing = form.editing_id.clone();
         match editing {
             Some(id) => {
-                if self.store.update_event_fields(&id, &fields).is_err() {
+                let Ok(changed) = self.store.update_event_fields(&id, &fields) else {
                     self.set_form_error("Couldn't save the event");
                     return; // keep the form open; no sync command
-                }
+                };
                 // A local:-only event's pending CreateEvent carries the
-                // update; don't enqueue UpdateEvent for it.
-                if !id.starts_with("local:") {
-                    let _ = self.sync.cmd_tx.send(SyncCommand::UpdateEvent { id });
+                // update; don't enqueue UpdateEvent for it. An edit that
+                // changed nothing sends nothing; one that did sends only
+                // what changed.
+                if !id.starts_with("local:") && !changed.is_empty() {
+                    let _ = self.sync.cmd_tx.send(SyncCommand::UpdateEvent {
+                        id,
+                        fields: changed,
+                    });
                 }
             }
             None => {
@@ -7219,11 +7246,19 @@ pub(crate) mod tests {
         // The form must hold the PLAIN TEXT, not the raw HTML source.
         assert_eq!(app.event_form.as_ref().unwrap().body, "agenda");
 
-        // Re-save unchanged.
+        // Re-save unchanged: the stored HTML is kept as it is (#1994), so
+        // neither double-escaped nor flattened to text.
         app.save_event_form();
 
         let send = app.store.event_for_send("e3").unwrap().unwrap();
-        assert_eq!(send.body_html, "agenda"); // stable — not "&lt;p&gt;agenda&lt;/p&gt;"
+        assert_eq!(send.body_html, "<p>agenda</p>");
+
+        // An edited body is saved as the typed text, escaped.
+        app.open_edit_event();
+        app.event_form.as_mut().unwrap().body = "agenda <b>".into();
+        app.save_event_form();
+        let send = app.store.event_for_send("e3").unwrap().unwrap();
+        assert_eq!(send.body_html, "agenda &lt;b&gt;");
     }
 
     #[test]

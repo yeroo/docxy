@@ -21,7 +21,8 @@
 //! like `SaveDraft`/`SendDraft` do for drafts.
 
 use crate::graph::client::{
-    GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind, graph_error_message, one_line,
+    EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
+    graph_error_message, one_line,
 };
 use crate::graph::model::Recipient;
 use crate::store::{OutboxOp, Store};
@@ -78,16 +79,38 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             client.respond_event(id, rsvp, comment.as_deref(), true, proposed)
         }
         OutboxOp::CreateEvent { id } => {
-            let input = event_input_for(store, id)?;
+            // Every group, read at send time, so an edit of the `local:`
+            // event before the drain is carried too; no reminder when the
+            // host set none, so Graph applies the mailbox default (#1994).
+            let mut fields = EventFieldSet::ALL;
+            let (mut input, reminder_unset) = event_input_for(store, id)?;
+            if reminder_unset {
+                fields.remove(EventFieldSet::REMINDER);
+            }
+            input.fields = fields;
             let created = client.create_event(&input)?;
             store
-                .reconcile_event_id(id, &created.id)
+                .reconcile_created_event(id, &created)
                 .map_err(|e| GraphError::Parse(e.to_string()))?;
             Ok(())
         }
-        OutboxOp::UpdateEvent { id } => {
-            let input = event_input_for(store, id)?;
-            client.update_event(id, &input)
+        OutboxOp::UpdateEvent { id, fields } => {
+            // Only the groups the edit changed (#1994), each with its latest
+            // stored value. An edit that changed nothing sends nothing.
+            if fields.is_empty() {
+                return Ok(());
+            }
+            let (mut input, _) = event_input_for(store, id)?;
+            input.fields = *fields;
+            let updated = client.update_event(id, &input)?;
+            // An edit that turned the online meeting on: Graph's answer holds
+            // the join link. The PATCH already happened, so a store error is
+            // not a failed op (the next refresh corrects the row).
+            if let Some(ev) = updated.filter(|_| fields.contains(EventFieldSet::ONLINE_MEETING)) {
+                let _ =
+                    store.set_event_online_meeting(id, &ev.join_url, &ev.online_meeting_provider);
+            }
+            Ok(())
         }
         OutboxOp::DeleteEvent { id } => {
             // A local:-only event never reached Graph; nothing to delete there.
@@ -223,16 +246,15 @@ pub(crate) fn send_error_text(err: &GraphError) -> String {
 }
 
 /// Reads the stored event `id` and builds the `EventInput` the create/update
-/// calls take. Errors if the event isn't in the store (a corrupt/raced op).
-fn event_input_for(
-    store: &Store,
-    id: &str,
-) -> Result<crate::graph::client::EventInput, GraphError> {
+/// calls take (with no `fields`: the caller sets them), and whether the event
+/// was created without a reminder (`EventSendData::reminder_unset`). Errors
+/// if the event isn't in the store (a corrupt/raced op).
+fn event_input_for(store: &Store, id: &str) -> Result<(EventInput, bool), GraphError> {
     let d = store
         .event_for_send(id)
         .map_err(|e| GraphError::Parse(e.to_string()))?
         .ok_or_else(|| GraphError::Parse(format!("no local event stored for {id}")))?;
-    Ok(crate::graph::client::EventInput {
+    let input = EventInput {
         subject: d.subject,
         start_utc: d.start_utc,
         end_utc: d.end_utc,
@@ -241,7 +263,19 @@ fn event_input_for(
         attendees: d.attendees,
         body_html: d.body_html,
         recurrence: d.recurrence,
-    })
+        show_as: d.show_as,
+        sensitivity: d.sensitivity,
+        importance: d.importance,
+        categories: d.categories,
+        is_reminder_on: d.is_reminder_on,
+        reminder_minutes: d.reminder_minutes,
+        is_online_meeting: d.is_online_meeting,
+        online_meeting_provider: d.online_meeting_provider,
+        response_requested: d.response_requested,
+        allow_new_time_proposals: d.allow_new_time_proposals,
+        fields: EventFieldSet::default(),
+    };
+    Ok((input, d.reminder_unset))
 }
 
 /// A best-effort MIME type from a file name's extension, defaulting to
@@ -1544,8 +1578,13 @@ mod tests {
             is_all_day: false,
             location: "Room 1".into(),
             body_html: "<p>agenda</p>".into(),
-            attendees: vec![("Bob".into(), "bob@x.com".into())],
+            attendees: vec![crate::graph::client::AttendeeInput {
+                name: "Bob".into(),
+                addr: "bob@x.com".into(),
+                r#type: String::new(),
+            }],
             recurrence: None,
+            ..Default::default()
         }
     }
 

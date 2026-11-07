@@ -198,19 +198,148 @@ pub enum RsvpKind {
     Tentative,
 }
 
-/// The editable fields of an event, as the create/update calls serialize them.
-#[derive(Debug, Clone, PartialEq)]
+/// The groups of event properties a create or update sends (#1994). An
+/// update sends only the groups an edit changed (`Store::update_event_fields`
+/// returns them), so editing a title does not rewrite the attendees. Each
+/// group has a JSON name, which a queued `OutboxOp::UpdateEvent` stores: the
+/// names never change (see `docs/claude/mail.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventFieldSet(u32);
+
+impl EventFieldSet {
+    pub const SUBJECT: EventFieldSet = EventFieldSet(1 << 0);
+    /// `start`, `end` and `isAllDay`, always together: Graph validates them
+    /// as one (an all-day toggle with only `isAllDay` is refused).
+    pub const TIMES: EventFieldSet = EventFieldSet(1 << 1);
+    pub const LOCATION: EventFieldSet = EventFieldSet(1 << 2);
+    pub const ATTENDEES: EventFieldSet = EventFieldSet(1 << 3);
+    pub const BODY: EventFieldSet = EventFieldSet(1 << 4);
+    /// `recurrence`, sent only when the input has one.
+    pub const RECURRENCE: EventFieldSet = EventFieldSet(1 << 5);
+    pub const SHOW_AS: EventFieldSet = EventFieldSet(1 << 6);
+    pub const SENSITIVITY: EventFieldSet = EventFieldSet(1 << 7);
+    pub const IMPORTANCE: EventFieldSet = EventFieldSet(1 << 8);
+    pub const CATEGORIES: EventFieldSet = EventFieldSet(1 << 9);
+    /// `isReminderOn` and `reminderMinutesBeforeStart`.
+    pub const REMINDER: EventFieldSet = EventFieldSet(1 << 10);
+    /// `isOnlineMeeting`, and `onlineMeetingProvider` when one is set.
+    pub const ONLINE_MEETING: EventFieldSet = EventFieldSet(1 << 11);
+    pub const RESPONSE_REQUESTED: EventFieldSet = EventFieldSet(1 << 12);
+    pub const ALLOW_NEW_TIME_PROPOSALS: EventFieldSet = EventFieldSet(1 << 13);
+
+    /// Every group: what a create sends.
+    pub const ALL: EventFieldSet = EventFieldSet((1 << 14) - 1);
+    /// What an update sent before #1994, so an `UpdateEvent` queued then
+    /// (with no `fields`) still sends what it did.
+    pub const LEGACY_UPDATE: EventFieldSet = EventFieldSet(
+        Self::SUBJECT.0
+            | Self::TIMES.0
+            | Self::LOCATION.0
+            | Self::ATTENDEES.0
+            | Self::BODY.0
+            | Self::RECURRENCE.0,
+    );
+
+    /// Each group and its JSON name, in bit order. Never rename one: a
+    /// queued op stores them.
+    const NAMES: [(EventFieldSet, &'static str); 14] = [
+        (Self::SUBJECT, "subject"),
+        (Self::TIMES, "times"),
+        (Self::LOCATION, "location"),
+        (Self::ATTENDEES, "attendees"),
+        (Self::BODY, "body"),
+        (Self::RECURRENCE, "recurrence"),
+        (Self::SHOW_AS, "showAs"),
+        (Self::SENSITIVITY, "sensitivity"),
+        (Self::IMPORTANCE, "importance"),
+        (Self::CATEGORIES, "categories"),
+        (Self::REMINDER, "reminder"),
+        (Self::ONLINE_MEETING, "onlineMeeting"),
+        (Self::RESPONSE_REQUESTED, "responseRequested"),
+        (Self::ALLOW_NEW_TIME_PROPOSALS, "allowNewTimeProposals"),
+    ];
+
+    pub fn contains(self, other: EventFieldSet) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn insert(&mut self, other: EventFieldSet) {
+        self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: EventFieldSet) {
+        self.0 &= !other.0;
+    }
+
+    pub fn union(self, other: EventFieldSet) -> EventFieldSet {
+        EventFieldSet(self.0 | other.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The JSON names of the groups in the set, in bit order.
+    pub fn to_names(self) -> Vec<&'static str> {
+        Self::NAMES
+            .iter()
+            .filter(|(g, _)| self.contains(*g))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    /// The set the names spell; an unknown name is dropped.
+    pub fn from_names<S: AsRef<str>>(names: &[S]) -> EventFieldSet {
+        let mut set = EventFieldSet::default();
+        for name in names {
+            if let Some((g, _)) = Self::NAMES.iter().find(|(_, n)| *n == name.as_ref()) {
+                set.insert(*g);
+            }
+        }
+        set
+    }
+}
+
+/// One attendee an event create or update sends. `r#type` is Graph's
+/// `required`, `optional` or `resource`; `""` sends `required` (and, on a
+/// `Store::update_event_fields`, keeps the stored attendee's type).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AttendeeInput {
+    pub name: String,
+    pub addr: String,
+    pub r#type: String,
+}
+
+/// The fields of an event, as the create/update calls serialize them. Only
+/// the groups in `fields` are sent (`event_body_json`).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EventInput {
     pub subject: String,
     pub start_utc: String, // YYYY-MM-DDTHH:MM:SSZ
     pub end_utc: String,
     pub is_all_day: bool,
     pub location: String,
-    pub attendees: Vec<(String, String)>, // (name, address)
+    pub attendees: Vec<AttendeeInput>,
     pub body_html: String,
     /// The recurrence pattern for a repeating event, or `None` for a single
     /// event. Serialized into the create/update body by `event_body_json`.
     pub recurrence: Option<Recurrence>,
+    /// Graph `showAs`, `sensitivity`, `importance`; `""` is not sent (Graph
+    /// refuses an empty enum).
+    pub show_as: String,
+    pub sensitivity: String,
+    pub importance: String,
+    pub categories: Vec<String>,
+    pub is_reminder_on: bool,
+    pub reminder_minutes: i64,
+    pub is_online_meeting: bool,
+    /// Graph `onlineMeetingProvider`; `""` is not sent, so Graph uses the
+    /// calendar's default provider (`teamsForBusiness` on Microsoft 365).
+    pub online_meeting_provider: String,
+    pub response_requested: bool,
+    pub allow_new_time_proposals: bool,
+    /// The groups this call sends.
+    pub fields: EventFieldSet,
 }
 
 /// The `$select` fields covering every header field `Message::from_json`
@@ -903,12 +1032,18 @@ impl GraphClient {
         Event::from_json(&v).ok_or_else(|| GraphError::Parse("malformed created event".to_string()))
     }
 
-    /// PATCH `/me/events/{id}` with the same body shape as `create_event`.
-    pub fn update_event(&self, id: &str, input: &EventInput) -> Result<(), GraphError> {
+    /// PATCH `/me/events/{id}` with the groups in `input.fields` (the same
+    /// body shape as `create_event`, #1994). Graph answers with 200 and the
+    /// updated event; an answer without one (an empty 204, or a body with no
+    /// `id`) is `Ok(None)`, never an error: the PATCH was applied.
+    pub fn update_event(&self, id: &str, input: &EventInput) -> Result<Option<Event>, GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/events/{id}");
-        self.send(Method::Patch, &path, Some(event_body_json(input)), &[])?;
-        Ok(())
+        let resp = self.send(Method::Patch, &path, Some(event_body_json(input)), &[])?;
+        Ok(parse_body(resp)
+            .ok()
+            .and_then(|v| Event::from_json(&v))
+            .filter(|e| !e.id.is_empty()))
     }
 
     /// DELETE `/me/events/{id}` (cancels an organized event / removes an
@@ -1329,9 +1464,12 @@ fn draft_body_json(
 }
 
 /// Serializes an `EventInput` to the JSON body shared by `create_event` and
-/// `update_event`. `start`/`end` carry the UTC wall clock (the `Z` suffix
-/// stripped) with `timeZone:"UTC"`, matching how `calendar_view` reads events
-/// back under the `Prefer: outlook.timezone="UTC"` header.
+/// `update_event`: only the groups in `input.fields` (#1994), and never an
+/// empty enum string (`showAs`, `sensitivity`, `importance`,
+/// `onlineMeetingProvider`: Graph refuses `""`). `start`/`end` carry the UTC
+/// wall clock (the `Z` suffix stripped) with `timeZone:"UTC"`, matching how
+/// `calendar_view` reads events back under the `Prefer:
+/// outlook.timezone="UTC"` header.
 fn event_body_json(input: &EventInput) -> String {
     let dt = |utc: &str| -> Value {
         Value::Object(vec![
@@ -1342,47 +1480,113 @@ fn event_body_json(input: &EventInput) -> String {
             ("timeZone".to_string(), Value::Str("UTC".to_string())),
         ])
     };
-    let attendees = Value::Array(
-        input
-            .attendees
-            .iter()
-            .map(|(name, addr)| {
-                Value::Object(vec![
-                    (
-                        "emailAddress".to_string(),
-                        Value::Object(vec![
-                            ("address".to_string(), Value::Str(addr.clone())),
-                            ("name".to_string(), Value::Str(name.clone())),
-                        ]),
-                    ),
-                    ("type".to_string(), Value::Str("required".to_string())),
-                ])
-            })
-            .collect(),
-    );
-    let mut obj = vec![
-        ("subject".to_string(), Value::Str(input.subject.clone())),
-        ("start".to_string(), dt(&input.start_utc)),
-        ("end".to_string(), dt(&input.end_utc)),
-        ("isAllDay".to_string(), Value::Bool(input.is_all_day)),
-        (
-            "location".to_string(),
+    let has = |g: EventFieldSet| input.fields.contains(g);
+    let mut obj: Vec<(String, Value)> = Vec::new();
+    let mut put = |k: &str, v: Value| obj.push((k.to_string(), v));
+    let enum_str = |s: &str| (!s.is_empty()).then(|| Value::Str(s.to_string()));
+    if has(EventFieldSet::SUBJECT) {
+        put("subject", Value::Str(input.subject.clone()));
+    }
+    if has(EventFieldSet::TIMES) {
+        put("start", dt(&input.start_utc));
+        put("end", dt(&input.end_utc));
+        put("isAllDay", Value::Bool(input.is_all_day));
+    }
+    if has(EventFieldSet::LOCATION) {
+        put(
+            "location",
             Value::Object(vec![(
                 "displayName".to_string(),
                 Value::Str(input.location.clone()),
             )]),
-        ),
-        ("attendees".to_string(), attendees),
-        (
-            "body".to_string(),
+        );
+    }
+    if has(EventFieldSet::ATTENDEES) {
+        let attendees = input
+            .attendees
+            .iter()
+            .map(|a| {
+                let kind = if a.r#type.is_empty() {
+                    "required"
+                } else {
+                    &a.r#type
+                };
+                Value::Object(vec![
+                    (
+                        "emailAddress".to_string(),
+                        Value::Object(vec![
+                            ("address".to_string(), Value::Str(a.addr.clone())),
+                            ("name".to_string(), Value::Str(a.name.clone())),
+                        ]),
+                    ),
+                    ("type".to_string(), Value::Str(kind.to_string())),
+                ])
+            })
+            .collect();
+        put("attendees", Value::Array(attendees));
+    }
+    if has(EventFieldSet::BODY) {
+        put(
+            "body",
             Value::Object(vec![
                 ("contentType".to_string(), Value::Str("HTML".to_string())),
                 ("content".to_string(), Value::Str(input.body_html.clone())),
             ]),
-        ),
-    ];
-    if let Some(rec) = &input.recurrence {
-        obj.push(("recurrence".to_string(), rec.to_json()));
+        );
+    }
+    if has(EventFieldSet::RECURRENCE) {
+        if let Some(rec) = &input.recurrence {
+            put("recurrence", rec.to_json());
+        }
+    }
+    if has(EventFieldSet::SHOW_AS) {
+        if let Some(v) = enum_str(&input.show_as) {
+            put("showAs", v);
+        }
+    }
+    if has(EventFieldSet::SENSITIVITY) {
+        if let Some(v) = enum_str(&input.sensitivity) {
+            put("sensitivity", v);
+        }
+    }
+    if has(EventFieldSet::IMPORTANCE) {
+        if let Some(v) = enum_str(&input.importance) {
+            put("importance", v);
+        }
+    }
+    if has(EventFieldSet::CATEGORIES) {
+        put(
+            "categories",
+            Value::Array(
+                input
+                    .categories
+                    .iter()
+                    .map(|c| Value::Str(c.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if has(EventFieldSet::REMINDER) {
+        put("isReminderOn", Value::Bool(input.is_reminder_on));
+        put(
+            "reminderMinutesBeforeStart",
+            Value::Num(input.reminder_minutes as f64),
+        );
+    }
+    if has(EventFieldSet::ONLINE_MEETING) {
+        put("isOnlineMeeting", Value::Bool(input.is_online_meeting));
+        if let Some(v) = enum_str(&input.online_meeting_provider) {
+            put("onlineMeetingProvider", v);
+        }
+    }
+    if has(EventFieldSet::RESPONSE_REQUESTED) {
+        put("responseRequested", Value::Bool(input.response_requested));
+    }
+    if has(EventFieldSet::ALLOW_NEW_TIME_PROPOSALS) {
+        put(
+            "allowNewTimeProposals",
+            Value::Bool(input.allow_new_time_proposals),
+        );
     }
     Value::Object(obj).to_string()
 }
@@ -3770,9 +3974,20 @@ mod tests {
             end_utc: "2026-07-20T12:00:00Z".into(),
             is_all_day: false,
             location: "Room 1".into(),
-            attendees: vec![("Bob".into(), "bob@x.com".into())],
+            attendees: vec![AttendeeInput {
+                name: "Bob".into(),
+                addr: "bob@x.com".into(),
+                r#type: String::new(),
+            }],
             body_html: "<p>agenda</p>".into(),
             recurrence: None,
+            show_as: "busy".into(),
+            sensitivity: "normal".into(),
+            importance: "normal".into(),
+            response_requested: true,
+            allow_new_time_proposals: true,
+            fields: EventFieldSet::ALL,
+            ..EventInput::default()
         }
     }
 
@@ -3795,6 +4010,8 @@ mod tests {
                 start_date: "2026-07-20".into(),
                 until: None,
             }),
+            fields: EventFieldSet::ALL,
+            ..EventInput::default()
         };
         let body = json::parse(&event_body_json(&input)).unwrap();
         assert!(body.get("recurrence").is_some());
