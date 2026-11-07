@@ -7314,6 +7314,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1937: `refresh_calendar` stores Graph's `isReminderOn` /
+    /// `reminderMinutesBeforeStart`; before the fix
+    /// `Store::replace_events_in_window` wrote neither column, so every
+    /// synced event read back as 0 minutes, reminder off.
+    #[test]
+    fn refresh_calendar_keeps_reminder_settings() {
+        let plain = calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00");
+        let event = plain.replacen(
+            r#""isAllDay":false"#,
+            r#""isAllDay":false,"isReminderOn":true,"reminderMinutesBeforeStart":15"#,
+            1,
+        );
+        assert_ne!(event, plain, "the reminder keys were not added");
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(r#"{{"value":[{event}]}}"#),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("refresh-calendar-reminders");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "E1");
+        assert_eq!(rows[0].reminder_minutes, 15);
+        assert!(rows[0].is_reminder_on);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn respond_event_optimistically_flips_status_and_drains_to_accept() {
         let mut routes = backfill_routes();

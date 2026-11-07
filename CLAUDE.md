@@ -103,7 +103,8 @@ issue number to find its notes.
   out (#1920), granted scopes and a refused sign-in's `error_description` (#1875),
   `Content-Length` on bodiless POSTs and one-line HTTP error text (#1954), inline outbound
   attachments (#1949), the whole mailbox newest first, backfilled in idle time (#1871),
-  new mail with its body, recent bodies prefetched, FetchBody served between folders (#1978).
+  new mail with its body, recent bodies prefetched, FetchBody served between folders (#1978),
+  calendar sync keeps events' reminder settings (#1937).
 
 ## Build and test
 
