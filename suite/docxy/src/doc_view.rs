@@ -98,6 +98,16 @@ pub struct DocView {
     text_w: Rc<Cell<Option<f32>>>,
     /// Each top-level table's painted bounds in the last frame (#1895).
     tables: PaintedTables,
+    /// Each top-level paragraph's painted layout in the last frame, in a
+    /// harness instance (#1986).
+    paras: PaintedParas,
+    /// The text column's bounds as last painted (#1986).
+    column: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Bumped by [`DocView::set_document`]; `painted_gen` is the one the
+    /// last painted frame drew, so the harness never reads an older
+    /// document's layout (#1986).
+    doc_gen: u64,
+    painted_gen: Rc<Cell<Option<u64>>>,
     /// The scroll offset of the last render: a Ctrl+wheel puts it back, as
     /// the scroll area has already moved by then.
     held_scroll: Point<Pixels>,
@@ -140,6 +150,10 @@ impl DocView {
             viewport: Rc::default(),
             text_w: Rc::default(),
             tables: PaintedTables::default(),
+            paras: PaintedParas::default(),
+            column: Rc::default(),
+            doc_gen: 0,
+            painted_gen: Rc::default(),
             held_scroll: Point::default(),
             wheel_acc: 0.,
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
@@ -158,6 +172,7 @@ impl DocView {
         drop(cache);
         self.editor = Editor::new(doc);
         self.pkg = pkg;
+        self.doc_gen += 1;
         self.run_styles = RefCell::default();
         self.selecting = false;
         self.press_link = None;
@@ -663,6 +678,24 @@ impl DocView {
     // ---- what the harness reads -------------------------------------------
 
     /// The view's state for the harness's `ext-doc-read`.
+    /// The harness's `ext-doc-layout` (#1986): [`painted_layout_json`] of
+    /// the last frame, or `painted: false` until a frame of the document
+    /// last set has been painted.
+    pub(crate) fn layout_json(&self) -> ctlcore::json::Json {
+        use ctlcore::json::Json;
+        match self.column.get() {
+            Some(col) if self.painted_gen.get() == Some(self.doc_gen) => painted_layout_json(
+                &self.paras.borrow(),
+                &self.editor.doc.body,
+                f32::from(col.origin.x),
+            ),
+            _ => Json::obj(vec![
+                ("painted", Json::Bool(false)),
+                ("paragraphs", Json::Arr(Vec::new())),
+            ]),
+        }
+    }
+
     pub(crate) fn harness_json(&self, window: &Window) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         let body = &self.editor.doc.body;
@@ -833,6 +866,7 @@ impl Render for DocView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.words.borrow_mut().clear();
         self.tables.borrow_mut().clear();
+        self.paras.borrow_mut().clear();
         self.held_scroll = self.scroll.offset();
         let theme_dark = cx.theme().mode.is_dark();
         let (bg, pal) = content_look(
@@ -885,15 +919,28 @@ impl Render for DocView {
             // Tables fit the text width as last painted (#1895).
             fit_width: self.text_w.get(),
             tables: Some(&self.tables),
+            // A flow view (#1986): fully spaced paragraphs drawn exactly,
+            // the column's gap per block, the layout kept for the harness.
+            flow: true,
+            gap_below: false,
+            paras: harness().then_some(&self.paras),
         };
         let blocks: Vec<AnyElement> = body
             .iter()
             .enumerate()
-            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
+            .map(|(i, b)| {
+                let ctx = RenderCtx {
+                    gap_below: flow_gap_below(body, i),
+                    ..ctx
+                };
+                block_el(b, vec![i], markers[i].as_deref(), ctx)
+            })
             .collect();
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
         let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
+        let (column, painted_gen, doc_gen) =
+            (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
         div()
             .id("ext-doc-view")
             .font_family(ui_font)
@@ -943,19 +990,18 @@ impl Render for DocView {
                     .text_color(pal.fg)
                     .px(px(48.))
                     .py(px(28.))
-                    .gap_1()
                     .children(blocks)
                     // The text width, inside the padding: a percent width
                     // resolves against the scroll area, not its extent.
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(0.))
-                            .child(fit_width_probe(used_w, move |b, _| {
-                                text_w.set(Some(f32::from(b.size.width)))
-                            })),
-                    ),
+                    .child(div().relative().w_full().h(px(0.)).child(fit_width_probe(
+                        used_w,
+                        move |b, _| {
+                            text_w.set(Some(f32::from(b.size.width)));
+                            // Prepainted after every block (#1986).
+                            column.set(Some(b));
+                            painted_gen.set(Some(doc_gen));
+                        },
+                    ))),
             )
             .child(
                 canvas(
@@ -1012,6 +1058,179 @@ pub(crate) fn copy_payload(
     pkg: Option<&Package>,
 ) -> Option<(String, Option<String>)> {
     Some(clip_payload(&editor.copy()?, pkg))
+}
+
+/// A colour as `rrggbb`, with no `#`: a case's `#` starts a comment.
+fn ink_hex(c: Hsla) -> String {
+    let c = Rgba::from(c);
+    let b = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
+    format!("{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))
+}
+
+/// One painted line of a paragraph (#1986): its top and left, its right
+/// edge, its text, and its first word's size and ink.
+#[derive(Clone, Debug, PartialEq)]
+struct LaidLine {
+    y: f32,
+    x: f32,
+    right: f32,
+    text: String,
+    size: f32,
+    ink: Hsla,
+}
+
+/// The lines `para` painted: its words in order, joined with the run
+/// holding each by offset (`runs_text`: those runs' texts, in order); a
+/// word left of the one before it starts a line, as the row wrapped.
+fn painted_lines(para: &PaintedPara, runs_text: &[&str]) -> Vec<LaidLine> {
+    let mut lines: Vec<LaidLine> = Vec::new();
+    for w in para.words.borrow().iter() {
+        let Some((i, run)) = para
+            .runs
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.off <= w.off && w.off < r.off + r.len)
+        else {
+            continue;
+        };
+        let b = w.bounds();
+        let (x, y, right) = (
+            f32::from(b.origin.x),
+            f32::from(b.origin.y),
+            f32::from(b.origin.x + b.size.width),
+        );
+        let text: String = runs_text
+            .get(i)
+            .map(|t| t.chars().skip(w.off - run.off).take(w.len).collect())
+            .unwrap_or_default();
+        match lines.last_mut() {
+            Some(line) if x >= line.right - 0.5 => {
+                line.right = right;
+                line.y = line.y.min(y);
+                line.text.push_str(&text);
+            }
+            _ => lines.push(LaidLine {
+                y,
+                x,
+                right,
+                text,
+                size: run.size,
+                ink: run.ink,
+            }),
+        }
+    }
+    for line in &mut lines {
+        line.text.truncate(line.text.trim_end().len());
+    }
+    lines
+}
+
+/// The harness's `ext-doc-layout` (#1986) of the paragraphs a frame
+/// painted (`paras`) over `body`: per paragraph its block, top and height,
+/// its text's left (`text_x`), its list number and its lines, px rounded,
+/// x from the text column's left (`column_x`) and y from the first
+/// paragraph's top; `marker_matches_text` (the number's ink is its first
+/// line's) and `marker_fits` (it ends left of the text), null without a
+/// number; and the least and greatest pitch between consecutive lines of
+/// the document, an empty paragraph counting as one line at its top.
+fn painted_layout_json(
+    paras: &[PaintedPara],
+    body: &[Block],
+    column_x: f32,
+) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let num = |v: f32| Json::Num(f64::from(v.round()));
+    let y0 = paras
+        .first()
+        .map_or(0., |p| f32::from(p.root.get().origin.y));
+    let mut tops: Vec<f32> = Vec::new();
+    let out = paras
+        .iter()
+        .map(|para| {
+            let root = para.root.get();
+            let texts: Vec<String> = match body.get(para.block) {
+                Some(Block::Paragraph(p)) => flat_inlines(&p.content)
+                    .iter()
+                    .filter_map(|(i, _)| match &**i {
+                        Inline::Run(r) => Some(r.text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+            let lines = painted_lines(para, &texts);
+            let top = f32::from(root.origin.y) - y0;
+            if lines.is_empty() {
+                tops.push(top.round());
+            }
+            tops.extend(lines.iter().map(|l| (l.y - y0).round()));
+            let text_x = lines.first().map(|l| l.x - column_x);
+            let marker = para.marker.as_ref().map(|m| {
+                let at = m.at.get();
+                let (x, right) = (
+                    f32::from(at.origin.x) - column_x,
+                    f32::from(at.origin.x + at.size.width) - column_x,
+                );
+                (m, x, right)
+            });
+            let matches = marker.as_ref().map_or(Json::Null, |(m, _, _)| {
+                Json::Bool(
+                    lines
+                        .first()
+                        .is_some_and(|l| ink_hex(l.ink) == ink_hex(m.ink)),
+                )
+            });
+            let fits = marker.as_ref().map_or(Json::Null, |(_, _, right)| {
+                Json::Bool(text_x.is_some_and(|t| right.round() <= t.round()))
+            });
+            Json::obj(vec![
+                ("block", Json::Num(para.block as f64)),
+                ("top", num(top)),
+                ("height", num(f32::from(root.size.height))),
+                ("text_x", text_x.map_or(Json::Null, num)),
+                (
+                    "marker",
+                    marker.map_or(Json::Null, |(m, x, right)| {
+                        Json::obj(vec![
+                            ("text", Json::Str(m.text.clone())),
+                            ("x", num(x)),
+                            ("right", num(right)),
+                            ("size", num(m.size)),
+                            ("color", Json::Str(ink_hex(m.ink))),
+                        ])
+                    }),
+                ),
+                ("marker_matches_text", matches),
+                ("marker_fits", fits),
+                (
+                    "lines",
+                    Json::Arr(
+                        lines
+                            .iter()
+                            .map(|l| {
+                                Json::obj(vec![
+                                    ("y", num(l.y - y0)),
+                                    ("x", num(l.x - column_x)),
+                                    ("text", Json::Str(l.text.clone())),
+                                    ("size", num(l.size)),
+                                    ("color", Json::Str(ink_hex(l.ink))),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ])
+        })
+        .collect();
+    let pitches: Vec<f32> = tops.windows(2).map(|w| w[1] - w[0]).collect();
+    let pitch = |f: fn(f32, f32) -> f32| pitches.iter().copied().reduce(f).map_or(Json::Null, num);
+    Json::obj(vec![
+        ("painted", Json::Bool(true)),
+        ("paragraphs", Json::Arr(out)),
+        ("pitch_min", pitch(f32::min)),
+        ("pitch_max", pitch(f32::max)),
+    ])
 }
 
 /// [`CaretFormat`] for the harness's `ext-doc-read`.
@@ -1216,6 +1435,97 @@ mod tests {
     use super::*;
     use core::prelude::v1::test;
     use docxcore::model::{Hyperlink, Run};
+
+    /// A painted piece at `x`..`x + w`, `y`, holding caret offsets
+    /// `off..off + len`.
+    fn piece(off: usize, len: usize, x: f32, y: f32, w: f32) -> WordSpan {
+        let cell = UnitCell::default();
+        cell.set(Bounds::new(point(px(x), px(y)), size(px(w), px(18.))));
+        WordSpan {
+            shape: SpanShape::Unit(cell),
+            off,
+            len,
+            trailing_space: false,
+        }
+    }
+
+    /// #1986: the layout dump joins painted words with their runs by
+    /// offset, starts a line where the row wrapped, and reports positions
+    /// from the text column and the first paragraph, pitches and whether
+    /// a number is in its text's ink.
+    #[test]
+    fn layout_dump_reads_lines_markers_and_pitch() {
+        use ctlcore::json::Json;
+        let ink = hsla_u(0x112233);
+        let body = vec![
+            Block::Paragraph(Paragraph {
+                content: vec![run("Item one wraps")],
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph::default()),
+        ];
+        let at = |x: f32, y: f32, w: f32, h: f32| {
+            let c = UnitCell::default();
+            c.set(Bounds::new(point(px(x), px(y)), size(px(w), px(h))));
+            c
+        };
+        let words = WordSpans::default();
+        words.borrow_mut().extend([
+            piece(0, 5, 140., 128., 30.),
+            piece(5, 4, 170., 128., 26.),
+            piece(9, 5, 140., 146., 40.),
+        ]);
+        let paras = vec![
+            PaintedPara {
+                block: 0,
+                root: at(100., 128., 500., 36.),
+                marker: Some(PaintedMarker {
+                    text: "1.".into(),
+                    size: 16.,
+                    ink,
+                    at: at(122., 128., 13., 18.),
+                }),
+                runs: vec![PaintedRun {
+                    off: 0,
+                    len: 14,
+                    size: 16.,
+                    ink,
+                }],
+                words,
+            },
+            PaintedPara {
+                block: 1,
+                root: at(100., 164., 500., 18.),
+                marker: None,
+                runs: Vec::new(),
+                words: WordSpans::default(),
+            },
+        ];
+        let j = painted_layout_json(&paras, &body, 100.);
+        let get = |path: &str| {
+            path.split('.')
+                .try_fold(&j, |v, k| match k.parse::<usize>() {
+                    Ok(i) => v.as_array().and_then(|a| a.get(i)),
+                    Err(_) => v.get(k),
+                })
+        };
+        let num = |path: &str| get(path).and_then(Json::as_f64).unwrap();
+        let text = |path: &str| get(path).and_then(Json::as_str).unwrap().to_string();
+        assert_eq!(text("paragraphs.0.lines.0.text"), "Item one");
+        assert_eq!(text("paragraphs.0.lines.1.text"), "wraps");
+        assert_eq!(num("paragraphs.0.lines.1.y"), 18.);
+        assert_eq!(num("paragraphs.0.text_x"), 40.);
+        assert_eq!(num("paragraphs.0.marker.x"), 22.);
+        assert_eq!(text("paragraphs.0.lines.0.color"), "112233");
+        assert_eq!(
+            get("paragraphs.0.marker_matches_text"),
+            Some(&Json::Bool(true))
+        );
+        assert_eq!(get("paragraphs.0.marker_fits"), Some(&Json::Bool(true)));
+        assert_eq!(get("paragraphs.1.marker_matches_text"), Some(&Json::Null));
+        assert_eq!(num("paragraphs.1.top"), 36.);
+        assert_eq!((num("pitch_min"), num("pitch_max")), (18., 18.));
+    }
 
     fn run(text: &str) -> Inline {
         Inline::Run(Run {

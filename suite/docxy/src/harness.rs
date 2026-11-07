@@ -5409,6 +5409,27 @@ fn dispatch_verb(
             reply.insert(0, ("done".into(), Json::Bool(done)));
             Done::ok(Json::Obj(reply))
         }
+        // Show a document imported from `html` in the view (#1986), as a
+        // host shows a mail; the reply is `ext-doc-read`'s fields.
+        "ext-doc-load" => {
+            let fixture = ext_fixture_view(app)?;
+            let html = args
+                .get("html")
+                .and_then(Json::as_str)
+                .ok_or("ext-doc-load takes 'html', the page to import")?;
+            let doc = docxcore::import::html::import_html(html.as_bytes())
+                .map_err(|e| format!("ext-doc-load: {e}"))?;
+            let view = fixture.read(cx).doc.clone();
+            view.update(cx, |v, cx| v.set_document(doc, None, cx));
+            Done::ok(view.read(cx).harness_json(window))
+        }
+        // The view's painted layout (#1986): each top-level paragraph's
+        // box, list number and lines, and the document's line pitch
+        // ([`crate::doc_view::DocView::layout_json`]).
+        "ext-doc-layout" => {
+            let fixture = ext_fixture_view(app)?;
+            Done::ok(fixture.read(cx).doc.read(cx).layout_json())
+        }
         // What the view's `document()` and `package()` hand the host (#1947).
         "ext-doc-document" => {
             let fixture = ext_fixture_view(app)?;

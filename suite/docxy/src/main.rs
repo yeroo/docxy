@@ -6323,8 +6323,10 @@ struct EffIndent {
 
 fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
     // An explicit numId 0 is no list (#1728). No numId at all may still be
-    // a level of the style's numbering, so it keeps its step.
-    let list_step = if p.num_id == Some(0) {
+    // a level of the style's numbering, so it keeps its step. A loaded
+    // left indent replaces the level's, as Word reads the file: an HTML
+    // item's already holds its nesting (#1986).
+    let list_step = if p.num_id == Some(0) || p.has_loaded_left_indent() {
         0
     } else {
         p.ilvl.max(0).saturating_mul(300)
@@ -7174,6 +7176,277 @@ mod link_colour_tests {
             let r = contrast(rgb(theme_link(dark)), theme.background.to_rgb());
             assert!(r >= 4.5, "dark={dark}: {r:.2}");
         }
+    }
+}
+
+/// The flow view's drawing of an imported mail (#1986).
+#[cfg(test)]
+mod flow_view_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use docxcore::model::ParProps;
+
+    /// #1986: a loaded left indent replaces the level's, as Word reads the
+    /// file (an imported HTML item's holds its nesting), so no step adds.
+    #[test]
+    fn a_loaded_left_indent_takes_no_list_step() {
+        let mut p = ParProps {
+            indent: 1200,
+            first_line: -267,
+            num_id: Some(2),
+            ilvl: 1,
+            ..ParProps::default()
+        };
+        assert_eq!(eff_indent(&p).list_step, 300);
+        p.shadow = vec![r#"<w:ind w:left="1200" w:hanging="267"/>"#.to_string()];
+        let eff = eff_indent(&p);
+        assert_eq!((eff.list_step, eff.left, eff.first), (0, 1200, -267));
+        // An imported nested item, as the importer gives it.
+        let d = docxcore::import::html::import_html(
+            b"<ol><li><div>a</div><ol><li><div>b</div></li></ol></li></ol>",
+        )
+        .unwrap();
+        let lefts: Vec<i32> = d
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lefts, [600, 1200]);
+    }
+
+    /// #1986: an imported nested item stays where it is drawn as the ruler
+    /// or Increase Indent moves it: its loaded left stays loaded, so no
+    /// level step comes back.
+    #[test]
+    fn an_imported_items_indent_edit_does_not_jump() {
+        let d = docxcore::import::html::import_html(
+            b"<ol><li><div>a</div><ol><li><div>b</div></li></ol></li></ol>",
+        )
+        .unwrap();
+        let mut ed = docxcore::editor::Editor::new(d);
+        ed.caret = docxcore::editor::Caret {
+            path: vec![1],
+            offset: 0,
+        };
+        ed.anchor = None;
+        let item = |ed: &docxcore::editor::Editor| match &ed.doc.body[1] {
+            Block::Paragraph(p) => p.props.clone(),
+            _ => panic!(),
+        };
+        ed.set_indent(1300, -267);
+        ed.change_indent(720);
+        let p = item(&ed);
+        assert_eq!((p.indent, p.ilvl), (2020, 1));
+        assert!(p.has_loaded_left_indent());
+        assert_eq!(eff_indent(&p).left, p.indent);
+    }
+
+    fn spacing(before: i32, after: i32, line: i32, rule: &str) -> docxcore::model::Spacing {
+        docxcore::model::Spacing {
+            before: Some(before),
+            after: Some(after),
+            line: Some(line),
+            line_rule: Some(rule.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// #1986: only a paragraph whose direct spacing sets before, after and
+    /// the line is drawn exactly.
+    #[test]
+    fn fully_spaced_needs_before_after_and_line() {
+        assert!(fully_spaced(&spacing(0, 0, 240, "auto")));
+        for s in [
+            docxcore::model::Spacing {
+                before: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing {
+                after: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing {
+                line: None,
+                line_rule: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing::default(),
+        ] {
+            assert!(!fully_spaced(&s), "{s:?}");
+        }
+    }
+
+    /// #1986: a single line is 1.15 of the text, at a whole pixel.
+    #[test]
+    fn flow_line_height_is_a_browsers() {
+        let px12 = 16.0;
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 240, "auto"), px12, 1.0),
+            18.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 360, "auto"), px12, 1.0),
+            28.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 360, "exact"), px12, 1.0),
+            24.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 120, "atLeast"), px12, 1.0),
+            18.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 600, "atLeast"), px12, 1.0),
+            40.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 240, "auto"), 32.0, 2.0),
+            37.0
+        );
+        // The multiple is clamped as before.
+        assert_eq!(flow_line_height(&spacing(0, 0, 24, "auto"), px12, 1.0), 9.0);
+    }
+
+    /// #1986: a fully spaced paragraph in the flow view is drawn exactly;
+    /// any other, and every paragraph in Print Layout, as before.
+    #[test]
+    fn para_box_is_exact_only_for_a_fully_spaced_flow_paragraph() {
+        let exact = spacing(0, 0, 240, "auto");
+        assert_eq!(
+            para_box(&exact, true, true, 26.0, 16.0, 1.0),
+            ParaBox {
+                pad_y: 0.,
+                heading_mt: false,
+                line_h: 18.,
+                min_h: 18.
+            }
+        );
+        let legacy = |base: f32, heading: bool, mult: f32| ParaBox {
+            pad_y: 2.,
+            heading_mt: heading,
+            line_h: base * 1.35 * mult,
+            min_h: (base * 1.35 * mult).max(base + 6.),
+        };
+        // Print Layout.
+        assert_eq!(
+            para_box(&exact, false, false, 14.5, 16.0, 1.0),
+            legacy(14.5, false, 1.0)
+        );
+        assert_eq!(
+            para_box(&exact, false, true, 26.0, 16.0, 1.0),
+            legacy(26.0, true, 1.0)
+        );
+        // Not fully spaced, in the flow view.
+        let after_only = docxcore::model::Spacing {
+            after: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            para_box(&after_only, true, false, 14.5, 16.0, 1.0),
+            legacy(14.5, false, 1.0)
+        );
+        let half = docxcore::model::Spacing {
+            line: Some(480),
+            line_rule: Some("auto".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            para_box(&half, true, true, 26.0, 16.0, 1.0),
+            legacy(26.0, true, 2.0)
+        );
+        assert_eq!(legacy(14.5, false, 1.0).min_h, 20.5);
+    }
+
+    /// #1986: an empty line (`<div><br></div>`) is one line of its mark's
+    /// size; a paragraph's line is its largest run's, links' too.
+    #[test]
+    fn a_paragraphs_text_size_is_its_largest_run_else_its_mark() {
+        let d = docxcore::import::html::import_html(
+            br#"<div style="font-size:12pt"><br></div><div style="font-size:12pt">a <span style="font-size:18pt">b</span> <a href="https://x">c</a></div>"#,
+        )
+        .unwrap();
+        let paras: Vec<&Paragraph> = d
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let styler = run_look::RunStyler::default();
+        let size = |p: &Paragraph| para_text_px(p, styler, &shown_mark(p, styler), 14.5, 1.0);
+        assert!(paras[0].content.is_empty(), "{:?}", paras[0].content);
+        assert!((size(paras[0]) - 16.0).abs() < 0.01);
+        assert!((size(paras[1]) - 24.0).abs() < 0.01);
+        let empty = para_box(
+            &paras[0].props.spacing,
+            true,
+            false,
+            14.5,
+            size(paras[0]),
+            1.0,
+        );
+        assert_eq!((empty.line_h, empty.min_h), (18.0, 18.0));
+        // No runs and no mark: the base.
+        let bare = Paragraph::default();
+        assert_eq!(size(&bare), 14.5);
+    }
+
+    /// #1986: a list number is drawn in its mark's look, in its ink (the
+    /// page's text colour without one, never the dim grey).
+    #[test]
+    fn marker_look_is_the_marks() {
+        let sel = hsla_u(0x3388ff);
+        let mark = ParProps {
+            raw_props: vec![
+                r#"<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:color w:val="000000"/><w:sz w:val="24"/></w:rPr>"#
+                    .to_string(),
+            ],
+            ..ParProps::default()
+        }
+        .mark_run_props()
+        .unwrap();
+        for pal in [page_pal(0xffffff, sel), page_pal(0x1e1e1e, sel)] {
+            let look = marker_look(&mark, 14.5, 1.0, &pal);
+            assert!((look.size - 16.0).abs() < 0.01);
+            assert_eq!(look.font.as_deref(), Some("Aptos"));
+            assert_eq!(look.ink, hsla_u(0x000000));
+            let none = marker_look(&RunProps::default(), 14.5, 1.0, &pal);
+            assert_eq!((none.size, none.ink, none.font), (14.5, pal.fg, None));
+            assert_ne!(none.ink, pal.dim);
+        }
+    }
+
+    /// #1986: the flow column's 4 px stays between two blocks neither of
+    /// which is a fully spaced paragraph, and goes beside one.
+    #[test]
+    fn flow_gap_is_between_two_blocks_not_fully_spaced() {
+        let para = |s: docxcore::model::Spacing| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    spacing: s,
+                    ..ParProps::default()
+                },
+                ..Paragraph::default()
+            })
+        };
+        let exact = || para(spacing(0, 0, 240, "auto"));
+        let legacy = || para(docxcore::model::Spacing::default());
+        let body = vec![
+            legacy(),
+            legacy(),
+            Block::Raw(String::new()),
+            legacy(),
+            exact(),
+            exact(),
+            legacy(),
+        ];
+        let gaps: Vec<bool> = (0..body.len()).map(|i| flow_gap_below(&body, i)).collect();
+        assert_eq!(gaps, [true, true, true, false, false, false, false]);
     }
 }
 
@@ -8979,10 +9252,75 @@ struct RenderCtx<'a> {
     /// Where each top-level body table's painted bounds go, by block, for
     /// the harness (#1895); `None` records none.
     tables: Option<&'a PaintedTables>,
+    /// A flow view (Draft, Web Layout, the embedded view): a fully spaced
+    /// paragraph is drawn exactly (#1986). False in Print Layout, headers
+    /// and footers.
+    flow: bool,
+    /// This top-level block takes the flow column's 4 px below it
+    /// ([`flow_gap_below`], #1986); false for anything nested.
+    gap_below: bool,
+    /// Where each top-level paragraph's painted layout goes, for the
+    /// harness (#1986); `None` records none.
+    paras: Option<&'a PaintedParas>,
 }
 
 /// Each top-level table's block and painted bounds in the frame last drawn.
 type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
+
+/// A top-level paragraph as the flow view last painted it, for the
+/// harness's `ext-doc-layout` (#1986): its block, its box, its list number
+/// and its runs (caret offset, length, text size and ink) to join with its
+/// painted words by offset.
+#[derive(Clone)]
+struct PaintedPara {
+    block: usize,
+    root: UnitCell,
+    marker: Option<PaintedMarker>,
+    runs: Vec<PaintedRun>,
+    words: WordSpans,
+}
+
+#[derive(Clone)]
+struct PaintedMarker {
+    text: String,
+    size: f32,
+    ink: Hsla,
+    at: UnitCell,
+}
+
+#[derive(Clone, Copy)]
+struct PaintedRun {
+    off: usize,
+    len: usize,
+    size: f32,
+    ink: Hsla,
+}
+
+/// The [`PaintedPara`]s of the frame last drawn.
+type PaintedParas = std::rc::Rc<std::cell::RefCell<Vec<PaintedPara>>>;
+
+/// How the flow view draws a paragraph (#1986): `flow` draws a fully spaced
+/// one exactly, `gap_below` gives a top-level one the column's 4 px below
+/// it, and `record` takes its painted layout under its block.
+#[derive(Clone, Copy, Default)]
+struct FlowPara<'a> {
+    flow: bool,
+    gap_below: bool,
+    record: Option<(&'a PaintedParas, usize)>,
+}
+
+/// A canvas filling its (relative) parent that takes its bounds at prepaint.
+fn bounds_probe(cell: UnitCell) -> AnyElement {
+    canvas(
+        move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| cell.set(b),
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
 
 /// The harness's view of [`PaintedTables`] (#1895): each table's block, its
 /// painted width, its left and right edges from the viewport's left
@@ -34332,6 +34670,143 @@ fn para_base(p: &Paragraph, zoom: f32) -> f32 {
     }
 }
 
+/// A single line's height in em: a browser's `line-height: normal` and
+/// Word's single for Arial, Liberation Sans and Times (Chrome draws 16 px
+/// text 18 px apart), drawn at a whole pixel as a browser does (#1986).
+const SINGLE_LINE: f32 = 1.15;
+
+/// Whether a paragraph's direct spacing sets all of before, after and the
+/// line (#1986): its style then adds none, so the flow view draws it
+/// exactly. Every imported HTML paragraph is (#1979); a Word paragraph
+/// leaning on its style's spacing, which the suite does not resolve, keeps
+/// the stand-in look.
+fn fully_spaced(s: &docxcore::model::Spacing) -> bool {
+    s.before.is_some() && s.after.is_some() && s.line.is_some()
+}
+
+/// A fully spaced paragraph's line height in the flow view, px (#1986): a
+/// multiple of [`SINGLE_LINE`] at `size_px` (its largest text) for `auto`,
+/// rounded to a pixel so lines do not drift; the `w:line` itself for
+/// `exact`; the larger of the two for `atLeast`.
+fn flow_line_height(s: &docxcore::model::Spacing, size_px: f32, zoom: f32) -> f32 {
+    let single = (size_px * SINGLE_LINE).round();
+    let line = tw_px(s.line.unwrap_or(240).max(0), zoom);
+    match s.line_rule.as_deref() {
+        Some("exact") => line,
+        Some("atLeast") => single.max(line),
+        _ => {
+            let mult = s.line_multiple().unwrap_or(1.0).clamp(0.5, 4.0);
+            (size_px * SINGLE_LINE * mult).round()
+        }
+    }
+}
+
+/// How a paragraph's box is drawn: its padding above and below when its
+/// spacing gives none, whether a heading takes `mt_2`, its line height and
+/// its least height, px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParaBox {
+    pad_y: f32,
+    heading_mt: bool,
+    line_h: f32,
+    min_h: f32,
+}
+
+/// [`ParaBox`] of a paragraph: drawn exactly in the flow view when it is
+/// [`fully_spaced`] (#1986), at `size_px`, its largest text; else as
+/// before, at its `base`: 2 px padding, `mt_2` on a heading, `1.35` lines
+/// and at least `base + 6`.
+fn para_box(
+    s: &docxcore::model::Spacing,
+    flow: bool,
+    is_heading: bool,
+    base: f32,
+    size_px: f32,
+    zoom: f32,
+) -> ParaBox {
+    if flow && fully_spaced(s) {
+        let line_h = flow_line_height(s, size_px, zoom);
+        return ParaBox {
+            pad_y: 0.,
+            heading_mt: false,
+            line_h,
+            min_h: line_h,
+        };
+    }
+    // Line spacing (auto-rule multiple; exact/atLeast fall back to single
+    // here).
+    let mult = s.line_multiple().unwrap_or(1.0).clamp(0.5, 4.0);
+    let line_h = base * 1.35 * mult;
+    ParaBox {
+        pad_y: 2.,
+        heading_mt: is_heading,
+        line_h,
+        min_h: line_h.max(base + 6.),
+    }
+}
+
+/// The size, px, of a paragraph's largest shown text: its runs' (links'
+/// too), else its mark's (an empty line, `<div><br></div>`), else `base`.
+fn para_text_px(
+    p: &Paragraph,
+    styler: run_look::RunStyler,
+    mark: &RunProps,
+    base: f32,
+    zoom: f32,
+) -> f32 {
+    flat_inlines(&p.content)
+        .iter()
+        .filter_map(|(i, _)| match &**i {
+            Inline::Run(r) => Some(run_look::run_size_px(&styler.shown(r), base, zoom)),
+            _ => None,
+        })
+        .reduce(f32::max)
+        .unwrap_or_else(|| run_look::run_size_px(mark, base, zoom))
+}
+
+/// A paragraph mark's run properties as its styles show them (#1986):
+/// what its list number is drawn in, as Word does.
+fn shown_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
+    let mark = docxcore::model::Run {
+        props: p.props.mark_run_props().unwrap_or_default(),
+        ..Default::default()
+    };
+    styler.shown(&mark).into_owned()
+}
+
+/// How a list number is drawn (#1986): in its paragraph mark's look.
+#[derive(Clone, Debug, PartialEq)]
+struct MarkerLook {
+    size: f32,
+    /// The font as named (measured by it: `width_in` substitutes it).
+    font: Option<String>,
+    /// The family drawn ([`font_subst::family`]).
+    family: Option<SharedString>,
+    bold: bool,
+    italic: bool,
+    ink: Hsla,
+}
+
+fn marker_look(mark: &RunProps, base: f32, zoom: f32, pal: &Pal) -> MarkerLook {
+    MarkerLook {
+        size: run_look::run_size_px(mark, base, zoom),
+        font: mark.font.clone(),
+        family: mark.font.as_deref().and_then(font_subst::family),
+        bold: mark.bold,
+        italic: mark.italic,
+        ink: run_ink(mark, false, pal),
+    }
+}
+
+/// Whether top-level block `i` of a flow view's `body` takes the 4 px gap
+/// below it (#1986): when a block follows and neither is a
+/// [`fully_spaced`] paragraph, as the column's `gap_1` gave every block.
+fn flow_gap_below(body: &[Block], i: usize) -> bool {
+    let exact = |b: &Block| matches!(b, Block::Paragraph(p) if fully_spaced(&p.props.spacing));
+    body.get(i + 1)
+        .is_some_and(|next| !exact(&body[i]) && !exact(next))
+}
+
 /// An alignment tab (`w:ptab`, #768); docxcore reads and measures it for both
 /// hosts (#1433).
 type Ptab = docxcore::ptab::Ptab;
@@ -34479,6 +34954,7 @@ fn hf_para_el(
         },
         pics,
         page_vals,
+        FlowPara::default(),
     )
 }
 
@@ -34827,11 +35303,24 @@ fn paragraph_el(
     styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
+    flow: FlowPara,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let styler = styler.for_paragraph(p.props.style_id.as_deref());
     let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
+    // The mark's look: the list number's (#1986), and an empty line's size.
+    let mark = shown_mark(p, styler);
+    let pbox = para_box(
+        &p.props.spacing,
+        flow.flow,
+        is_heading,
+        base,
+        para_text_px(p, styler, &mark, base, zoom),
+        zoom,
+    );
+    let mut painted_runs: Vec<PaintedRun> = Vec::new();
+    let mut painted_marker: Option<PaintedMarker> = None;
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
 
@@ -34859,16 +35348,10 @@ fn paragraph_el(
         }
     }
     let mut x = indent_layout.first_line_tab_origin();
-    // Line spacing (auto-rule multiple; exact/atLeast fall back to single
-    // here). The span loop needs it to size the caret bar so a small-zoom
-    // line can never inflate a row (see `line_numbers::caret_height`).
-    let line_mult = p
-        .props
-        .spacing
-        .line_multiple()
-        .unwrap_or(1.0)
-        .clamp(0.5, 4.0);
-    let line_h = base * 1.35 * line_mult;
+    // The span loop needs the line height to size the caret bar so a
+    // small-zoom line can never inflate a row (see
+    // `line_numbers::caret_height`).
+    let line_h = pbox.line_h;
     let caret_h = line_numbers::caret_height(line_h);
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
@@ -34912,7 +35395,17 @@ fn paragraph_el(
     };
     // The first flex item shifts just the first line. Subsequent wrapped lines
     // start at the paragraph's left padding, including hanging indents.
-    let marker_width = marker.map(|s| meas.map(|m| m.width(s, base, false, false)).unwrap_or(0.0));
+    // The number in its paragraph mark's look, measured in it (#1986). In a
+    // hanging indent the gap after it separates it from the text, so its
+    // trailing space goes: "1. " in a browser's 17.8 px hang would pass the
+    // indent and push the text to the next stop.
+    let hangs = indent_layout.first_x + 0.5 < indent_layout.continuation_x;
+    let marker = marker.map(|m| if hangs { m.trim_end() } else { m });
+    let look = marker_look(&mark, base, zoom, &pal);
+    let marker_width = marker.map(|s| {
+        meas.map(|m| m.width_in(s, look.size, look.bold, look.italic, look.font.as_deref()))
+            .unwrap_or(0.0)
+    });
     for item in leading_items(indent_layout, marker_width, interval, &customs) {
         match item {
             LeadingItem::Spacer { width, margin } => spans.push(
@@ -34926,11 +35419,26 @@ fn paragraph_el(
             LeadingItem::ListMarker => {
                 let m = marker.expect("marker descriptor requires a marker");
                 // The marker isn't document content and must not map clicks to offsets.
+                let probe = flow.record.map(|_| {
+                    let at = UnitCell::default();
+                    painted_marker = Some(PaintedMarker {
+                        text: m.to_string(),
+                        size: look.size,
+                        ink: look.ink,
+                        at: at.clone(),
+                    });
+                    bounds_probe(at)
+                });
                 spans.push(
                     div()
-                        .text_size(px(base))
-                        .text_color(pal.dim)
+                        .when(probe.is_some(), |d| d.relative())
+                        .text_size(px(look.size))
+                        .text_color(look.ink)
+                        .when_some(look.family.clone(), |d, f| d.font_family(f))
+                        .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
+                        .when(look.italic, |d| d.italic())
                         .child(SharedString::from(m.to_string()))
+                        .children(probe)
                         .into_any_element(),
                 );
                 x += marker_width.unwrap_or(0.0);
@@ -34946,20 +35454,19 @@ fn paragraph_el(
         let idx_before = idx;
         match inline {
             Inline::Run(r) => {
+                let shown = styler.shown(r);
                 emit_run(
-                    &mut spans,
-                    &r.text,
-                    &styler.shown(r),
-                    base,
-                    in_link,
-                    &mut idx,
-                    &mut caret,
-                    sel,
-                    click,
-                    pal,
-                    caret_h,
-                    zoom,
+                    &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
+                    pal, caret_h, zoom,
                 );
+                if flow.record.is_some() {
+                    painted_runs.push(PaintedRun {
+                        off: idx_before,
+                        len: idx - idx_before,
+                        size: run_look::run_size_px(&shown, base, zoom),
+                        ink: run_ink(&shown, in_link, &pal),
+                    });
+                }
                 x += run_w(r);
             }
             // Opened up by `flat_inlines`.
@@ -35229,7 +35736,7 @@ fn paragraph_el(
     let mut row = h_flex()
         .w_full()
         .flex_wrap()
-        .min_h(px(line_h.max(base + 6.)))
+        .min_h(px(pbox.min_h))
         .line_height(px(line_h));
     row = match p.props.align {
         Align::Center => row.justify_center(),
@@ -35251,14 +35758,32 @@ fn paragraph_el(
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
     let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
     let sp_after = zoom * (p.props.spacing.after.unwrap_or(0).max(0) as f32) / 15.0;
+    // The harness's record of this paragraph (#1986): its box's bounds.
+    let root_probe = flow.record.map(|(paras, block)| {
+        let root = UnitCell::default();
+        paras.borrow_mut().push(PaintedPara {
+            block,
+            root: root.clone(),
+            marker: painted_marker.take(),
+            runs: std::mem::take(&mut painted_runs),
+            words: click.map(|c| c.words.clone()).unwrap_or_default(),
+        });
+        bounds_probe(root)
+    });
     v_flex()
         .w_full()
-        .py_0p5()
-        .when(sp_before > 0.5, |d| d.pt(px(sp_before)))
-        .when(sp_after > 0.5, |d| d.pb(px(sp_after)))
+        // A fully spaced paragraph in the flow view has only its own
+        // spacing (#1986); others keep 2 px where theirs gives none.
+        .pt(px(if sp_before > 0.5 {
+            sp_before
+        } else {
+            pbox.pad_y
+        }))
+        .pb(px(if sp_after > 0.5 { sp_after } else { pbox.pad_y }))
         .pl(px(pad))
         .pr(px(pad_r))
-        .when(is_heading, |d| d.mt_2())
+        .when(pbox.heading_mt, |d| d.mt_2())
+        .when(flow.gap_below, |d| d.mb(px(4.)))
         .when(has_border, |d| d.border_b_1().border_color(pal.fg).pb_1())
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
@@ -35307,6 +35832,7 @@ fn paragraph_el(
             None => row.children(spans),
         })
         .when_some(overlay, |d, o| d.relative().child(o))
+        .when_some(root_probe, |d, probe| d.relative().child(probe))
         .into_any_element()
 }
 
@@ -35427,6 +35953,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let text_w = tw_px(cb.width as i32 - 216, zoom).max(0.0);
             let cell_ctx = RenderCtx {
                 line_width: Some(text_w),
+                gap_below: false,
                 pal: cell_pal(ctx.pal, cb.fill),
                 cell_run: Some(&cb.run),
                 // A nested table fits its cell when this one was fitted.
@@ -35705,6 +36232,9 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         .flex_none()
         .w(w(widest))
         .my_2()
+        // The flow column's 4 px below a top-level table (#1986), past its
+        // own 8 px: a later `mb` replaces the bottom margin.
+        .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
         .when(fits, |d| match table_view::h_align(t) {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),
@@ -35730,6 +36260,7 @@ fn block_el_numbered(
     ctx: RenderCtx,
     lines: Option<LineSlot>,
 ) -> AnyElement {
+    let top = path.len() == 1;
     match b {
         Block::Paragraph(p) => {
             let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
@@ -35812,11 +36343,22 @@ fn block_el_numbered(
                 },
                 ctx.pics,
                 ctx.page_vals,
+                FlowPara {
+                    flow: ctx.flow,
+                    gap_below: top && ctx.gap_below,
+                    record: ctx
+                        .paras
+                        .filter(|_| ctx.active && ctx.hf_width.is_none())
+                        .zip(top.then(|| path[0])),
+                },
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
-        Block::SectionProperties(_) => div().h(px(0.)).into_any_element(),
-        Block::Raw(_) => div().h(px(0.)).into_any_element(),
+        // Zero-height, but a gap below as every block had (#1986).
+        Block::SectionProperties(_) | Block::Raw(_) => div()
+            .h(px(0.))
+            .when(top && ctx.gap_below, |d| d.mb(px(4.)))
+            .into_any_element(),
     }
 }
 
@@ -41536,6 +42078,10 @@ impl Render for Docxy {
                         // The flow branch below fits its tables (#1895).
                         fit_width: None,
                         tables: Some(&painted_tables),
+                        // The flow branch below sets these (#1986).
+                        flow: false,
+                        gap_below: false,
+                        paras: None,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -41823,6 +42369,9 @@ impl Render for Docxy {
                                     page_vals: page_vals.get(pi),
                                     fit_width: None,
                                     tables: None,
+                                    flow: false,
+                                    gap_below: false,
+                                    paras: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -42273,12 +42822,22 @@ impl Render for Docxy {
                         let used_w = self.ruler_probe.borrow().draft_text_w;
                         let flow_ctx = RenderCtx {
                             fit_width: used_w,
+                            flow: true,
                             ..ctx
                         };
+                        // The column puts 4 px between blocks as each
+                        // block's margin, none beside a fully spaced
+                        // paragraph (#1986).
                         let blocks: Vec<AnyElement> = body
                             .iter()
                             .enumerate()
-                            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), flow_ctx))
+                            .map(|(i, b)| {
+                                let ctx = RenderCtx {
+                                    gap_below: flow_gap_below(body, i),
+                                    ..flow_ctx
+                                };
+                                block_el(b, vec![i], markers[i].as_deref(), ctx)
+                            })
                             .collect();
                         let probe = self.ruler_probe.clone();
                         let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
@@ -42296,7 +42855,6 @@ impl Render for Docxy {
                             .text_color(fg)
                             .px(px(48.))
                             .py(px(28.))
-                            .gap_1()
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
                             // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.
