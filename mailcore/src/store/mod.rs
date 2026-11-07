@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{AttendeeInput, EventFieldSet};
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, Event, EventRecurrence,
     FolderContact, MailFolder, MasterCategory, Message, MessageFields, MessageHeader, Recipient,
     Recurrence, is_stored_header, meeting_link_in,
 };
@@ -557,6 +557,24 @@ pub struct AttendeeRow {
     pub response: String,
     /// Graph `status.time`; `""` when never (#1983).
     pub response_time: String,
+}
+
+/// A stored calendar (`Store::calendars`, #1984): Graph's fields, and
+/// whether the engine syncs it (`Store::synced_calendar_ids`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CalendarRow {
+    pub calendar: Calendar,
+    pub syncs: bool,
+}
+
+/// One calendar's events as one sync pass fetched them over the window
+/// (`Store::apply_calendar_sync`): every event is stored under
+/// `calendar_id`, whatever its own `calendar_id` says.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FetchedCalendar {
+    pub calendar_id: String,
+    pub events: Vec<NewEvent>,
+    pub attendees: Vec<(String, Vec<NewAttendee>)>,
 }
 
 /// The field set `upsert_event` writes to an `events` row.
@@ -2744,54 +2762,104 @@ impl Store {
         from_utc: &str,
         to_utc: &str,
     ) -> Result<Vec<EventRow>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, subject, start_utc, end_utc, is_all_day, location,
-                    organizer_name, organizer_addr, response_status, series_master_id,
-                    reminder_minutes, is_reminder_on, show_as, is_online_meeting,
-                    online_meeting_provider, join_url, categories, sensitivity, importance,
-                    event_type, graph_recurrence, is_cancelled, is_organizer,
-                    response_requested, allow_new_time_proposals, has_attachments,
-                    original_start_tz, original_end_tz, calendar_id
-             FROM events
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {EVENT_ROW_COLUMNS} FROM events
              WHERE start_utc < ?2 AND end_utc > ?1
-             ORDER BY start_utc ASC",
-        )?;
+             ORDER BY start_utc ASC"
+        ))?;
         let rows = stmt
-            .query_map(params![from_utc, to_utc], |row| {
-                Ok(EventRow {
-                    id: row.get(0)?,
-                    subject: row.get(1)?,
-                    start_utc: row.get(2)?,
-                    end_utc: row.get(3)?,
-                    is_all_day: row.get(4)?,
-                    location: row.get(5)?,
-                    organizer_name: row.get(6)?,
-                    organizer_addr: row.get(7)?,
-                    response_status: row.get(8)?,
-                    series_master_id: row.get(9)?,
-                    reminder_minutes: row.get(10)?,
-                    is_reminder_on: row.get(11)?,
-                    show_as: row.get(12)?,
-                    is_online_meeting: row.get(13)?,
-                    online_meeting_provider: row.get(14)?,
-                    join_url: row.get(15)?,
-                    categories: decode_categories(&row.get::<_, String>(16)?),
-                    sensitivity: row.get(17)?,
-                    importance: row.get(18)?,
-                    event_type: row.get(19)?,
-                    recurrence: decode_graph_recurrence(&row.get::<_, String>(20)?),
-                    is_cancelled: row.get(21)?,
-                    is_organizer: row.get(22)?,
-                    response_requested: row.get(23)?,
-                    allow_new_time_proposals: row.get(24)?,
-                    has_attachments: row.get(25)?,
-                    original_start_time_zone: row.get(26)?,
-                    original_end_time_zone: row.get(27)?,
-                    calendar_id: row.get(28)?,
-                })
-            })?
+            .query_map(params![from_utc, to_utc], event_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// `events_in_window`'s overlap rule and order, restricted to events of
+    /// the calendars in `calendar_ids` (#1984). An empty slice returns no
+    /// events (not every calendar's).
+    pub fn events_in_range(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        calendar_ids: &[String],
+    ) -> Result<Vec<EventRow>, StoreError> {
+        if calendar_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let marks = vec!["?"; calendar_ids.len()].join(", ");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {EVENT_ROW_COLUMNS} FROM events
+             WHERE start_utc < ?2 AND end_utc > ?1 AND calendar_id IN ({marks})
+             ORDER BY start_utc ASC"
+        ))?;
+        let args = [from_utc, to_utc]
+            .into_iter()
+            .chain(calendar_ids.iter().map(String::as_str));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), event_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The days (1..=31, sorted, each once) of `year`-`month` on which an
+    /// event of `calendar_ids` falls, in local time at `utc_offset_minutes`
+    /// east of UTC (#1984): what a date navigator bolds.
+    ///
+    /// A timed event marks every local day its `[start, end)` overlaps, so
+    /// one ending exactly at local midnight does not mark the next day, and
+    /// a zero-length one marks its start day. An all-day event marks the
+    /// days of its UTC dates `[start, end)`, without the offset: under
+    /// `Prefer: outlook.timezone="UTC"` Graph gives an all-day event's
+    /// dates at UTC midnight. Cancelled events count like any other.
+    ///
+    /// One fixed offset, not a time zone: in a month with a DST change, an
+    /// event within the shifted hour of local midnight can mark the
+    /// neighbouring day. Close enough for bold days. A `month` outside
+    /// 1..=12 has no days.
+    pub fn days_with_events(
+        &self,
+        year: i32,
+        month: u32,
+        utc_offset_minutes: i32,
+        calendar_ids: &[String],
+    ) -> Result<Vec<u32>, StoreError> {
+        if !(1..=12).contains(&month) {
+            return Ok(Vec::new());
+        }
+        let first = days_from_civil(i64::from(year), month, 1);
+        let last = first + i64::from(days_in_month(i64::from(year), month));
+        let off = i64::from(utc_offset_minutes) * 60;
+        // Timed events: the local month's span in UTC; all-day ones: the
+        // unshifted dates. One query over both, then classify each event.
+        let from = (first * 86400).min(first * 86400 - off);
+        let to = (last * 86400).max(last * 86400 - off);
+        let events = self.events_in_range(
+            &unix_secs_to_iso8601(from),
+            &unix_secs_to_iso8601(to),
+            calendar_ids,
+        )?;
+        let mut marked = [false; 31];
+        for e in &events {
+            let (Some(start), Some(end)) = (
+                iso8601_to_unix_secs(&e.start_utc),
+                iso8601_to_unix_secs(&e.end_utc),
+            ) else {
+                continue;
+            };
+            let shift = if e.is_all_day { 0 } else { off };
+            let (start, end) = (start + shift, end + shift);
+            let first_day = start.div_euclid(86400);
+            // The day holding the last instant before `end`; a zero-length
+            // (or inverted) event keeps its start day.
+            let last_day = if end > start {
+                (end - 1).div_euclid(86400)
+            } else {
+                first_day
+            };
+            for day in first_day.max(first)..=last_day.min(last - 1) {
+                marked[(day - first) as usize] = true;
+            }
+        }
+        Ok((1..=31u32).filter(|d| marked[*d as usize - 1]).collect())
     }
 
     /// The attendees stored for an event, in insertion order (the order
@@ -2887,6 +2955,10 @@ impl Store {
                     .and_then(|r| EventRecurrence::from_json(&r.to_json())),
                 is_organizer: true,
                 join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
+                // `CreateEvent` POSTs to `/me/events`: the default calendar
+                // (#1984). `''` until the calendar list is known; the next
+                // sync pass adopts it then.
+                calendar_id: default_calendar_id_on(&tx)?.unwrap_or_default(),
                 ..NewEvent::default()
             },
         )?;
@@ -3103,6 +3175,182 @@ impl Store {
             "UPDATE events SET response_status = ?1 WHERE id = ?2",
             params![status, id],
         );
+    }
+
+    /// Writes the calendar list `GET /me/calendars` returned (#1984), in its
+    /// order (`position`), in one transaction: the stored list becomes
+    /// exactly `calendars` (a calendar Graph no longer lists is deleted; a
+    /// repeated id keeps its first place). Returns whether the stored list
+    /// changed (any field, or the order), so the engine announces
+    /// `CalendarsUpdated` only then. The selection (`set_calendar_selection`)
+    /// is kept apart from this list, so a chosen calendar that vanishes and
+    /// comes back is still chosen.
+    pub fn replace_calendars(&self, calendars: &[Calendar]) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let before = stored_calendars_on(&tx)?;
+        let mut seen = HashSet::new();
+        let after: Vec<Calendar> = calendars
+            .iter()
+            .filter(|c| seen.insert(c.id.clone()))
+            .cloned()
+            .collect();
+        if before == after {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM calendars", [])?;
+        for (position, c) in after.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO calendars (id, name, color, hex_color, is_default, can_edit,
+                                        owner_name, owner_addr, position)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    c.id,
+                    c.name,
+                    c.color,
+                    c.hex_color,
+                    c.is_default,
+                    c.can_edit,
+                    c.owner_name,
+                    c.owner_addr,
+                    position as i64
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The stored calendars in Graph's order, each with whether it syncs
+    /// (`synced_calendar_ids`).
+    pub fn calendars(&self) -> Result<Vec<CalendarRow>, StoreError> {
+        let synced: HashSet<String> = synced_calendar_ids_on(&self.conn)?.into_iter().collect();
+        Ok(stored_calendars_on(&self.conn)?
+            .into_iter()
+            .map(|c| CalendarRow {
+                syncs: synced.contains(&c.id),
+                calendar: c,
+            })
+            .collect())
+    }
+
+    /// The ids of the calendars the engine syncs, in `position` order: the
+    /// stored calendars a host chose (`set_calendar_selection`), or, with no
+    /// choice, the user's own. A calendar is the user's own when its owner
+    /// address equals the default calendar's owner address (ASCII case and
+    /// surrounding whitespace ignored, as `is_contact` folds); the default
+    /// calendar always is. With no default calendar, or one without an owner
+    /// address, every calendar counts as own. A chosen id Graph does not
+    /// list syncs nothing until it does.
+    pub fn synced_calendar_ids(&self) -> Result<Vec<String>, StoreError> {
+        synced_calendar_ids_on(&self.conn)
+    }
+
+    /// The host's explicit choice of calendars (`SyncCommand::SetCalendars`),
+    /// `None` when it made none (the own-calendars default). Kept in `meta`
+    /// (`calendar_selection`, a JSON array), so it survives a restart. A
+    /// stored value that is not a JSON array of strings reads as `None`.
+    pub fn calendar_selection(&self) -> Result<Option<Vec<String>>, StoreError> {
+        calendar_selection_on(&self.conn)
+    }
+
+    /// Stores (`Some`) or clears (`None`, back to the own-calendars default)
+    /// the host's choice of calendars, and, in the same transaction, deletes
+    /// the synced (non-`local:`) events of every **stored** calendar that no
+    /// longer syncs. Events of an id the list does not hold, and pre-#1984
+    /// rows without a calendar id, are left to the next sync pass
+    /// (`apply_calendar_sync`), which runs only after a successful list: so
+    /// a host restoring its choice at startup, before the first list,
+    /// deletes nothing. Returns whether the synced set changed.
+    pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let before = synced_calendar_ids_on(&tx)?;
+        match ids {
+            Some(ids) => {
+                let list = Value::Array(ids.iter().map(|i| Value::Str(i.clone())).collect());
+                tx.execute(
+                    "INSERT INTO meta (key, value) VALUES ('calendar_selection', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![list.to_string()],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM meta WHERE key = 'calendar_selection'", [])?;
+            }
+        }
+        let after = synced_calendar_ids_on(&tx)?;
+        let synced: HashSet<&str> = after.iter().map(String::as_str).collect();
+        for c in stored_calendars_on(&tx)? {
+            if !synced.contains(c.id.as_str()) {
+                delete_calendar_events_on(&tx, &c.id)?;
+            }
+        }
+        tx.commit()?;
+        Ok(before != after)
+    }
+
+    /// Writes one sync pass over `[from_utc, to_utc)` (#1984), in one
+    /// transaction, so no event disappears between a calendar's delete and
+    /// its refill:
+    ///
+    /// 1. Pre-#1984 rows (`calendar_id = ''`, `local:` ones too) move to the
+    ///    stored default calendar's id, when there is one. Sync read only
+    ///    the default calendar before #1984, and rows that slid out of the
+    ///    window are history a date navigator shows, so they are adopted,
+    ///    never deleted.
+    /// 2. For each calendar in `fetched`, its synced events overlapping the
+    ///    window (`events_in_window`'s rule; `local:` rows excluded, as in
+    ///    `replace_events_in_window`) are replaced by the fetched ones, each
+    ///    stored under that calendar's id, with their attendees. A synced
+    ///    calendar missing from `fetched` (its view failed) keeps its rows.
+    /// 3. Every synced event, of any date, whose non-empty `calendar_id` is
+    ///    not in `synced_calendar_ids` is deleted: a deselected calendar, or
+    ///    one Graph no longer lists. `''` rows (left only when no default is
+    ///    known) and `local:` rows are kept.
+    pub fn apply_calendar_sync(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        fetched: &[FetchedCalendar],
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(default) = default_calendar_id_on(&tx)? {
+            tx.execute(
+                "UPDATE events SET calendar_id = ?1 WHERE calendar_id = ''",
+                params![default],
+            )?;
+        }
+        for f in fetched {
+            tx.execute(
+                "DELETE FROM events
+                 WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
+                       AND id NOT LIKE 'local:%'",
+                params![from_utc, to_utc, f.calendar_id],
+            )?;
+            for e in &f.events {
+                if e.calendar_id == f.calendar_id {
+                    upsert_event_on(&tx, e)?;
+                } else {
+                    let e = NewEvent {
+                        calendar_id: f.calendar_id.clone(),
+                        ..e.clone()
+                    };
+                    upsert_event_on(&tx, &e)?;
+                }
+            }
+            for (id, atts) in &f.attendees {
+                put_event_attendees_on(&tx, id, atts)?;
+            }
+        }
+        let synced: HashSet<String> = synced_calendar_ids_on(&tx)?.into_iter().collect();
+        let stored: Vec<String> = tx
+            .prepare("SELECT DISTINCT calendar_id FROM events WHERE calendar_id <> ''")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in stored.iter().filter(|id| !synced.contains(*id)) {
+            delete_calendar_events_on(&tx, id)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// The stored delta link for the calendar, if any (`None` before the
@@ -3418,6 +3666,224 @@ fn body_satisfies(
 /// folder (`well_known_name = 'drafts'`) hasn't synced down from Graph yet.
 /// See `Store::drafts_folder_id`.
 pub(crate) const LOCAL_DRAFTS_SENTINEL_FOLDER_ID: &str = "local:drafts-pending";
+
+/// The columns `event_row` reads, in its order.
+const EVENT_ROW_COLUMNS: &str = "id, subject, start_utc, end_utc, is_all_day, location,
+    organizer_name, organizer_addr, response_status, series_master_id,
+    reminder_minutes, is_reminder_on, show_as, is_online_meeting,
+    online_meeting_provider, join_url, categories, sensitivity, importance,
+    event_type, graph_recurrence, is_cancelled, is_organizer,
+    response_requested, allow_new_time_proposals, has_attachments,
+    original_start_tz, original_end_tz, calendar_id";
+
+/// An `EventRow` from a row selected with `EVENT_ROW_COLUMNS`.
+fn event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        start_utc: row.get(2)?,
+        end_utc: row.get(3)?,
+        is_all_day: row.get(4)?,
+        location: row.get(5)?,
+        organizer_name: row.get(6)?,
+        organizer_addr: row.get(7)?,
+        response_status: row.get(8)?,
+        series_master_id: row.get(9)?,
+        reminder_minutes: row.get(10)?,
+        is_reminder_on: row.get(11)?,
+        show_as: row.get(12)?,
+        is_online_meeting: row.get(13)?,
+        online_meeting_provider: row.get(14)?,
+        join_url: row.get(15)?,
+        categories: decode_categories(&row.get::<_, String>(16)?),
+        sensitivity: row.get(17)?,
+        importance: row.get(18)?,
+        event_type: row.get(19)?,
+        recurrence: decode_graph_recurrence(&row.get::<_, String>(20)?),
+        is_cancelled: row.get(21)?,
+        is_organizer: row.get(22)?,
+        response_requested: row.get(23)?,
+        allow_new_time_proposals: row.get(24)?,
+        has_attachments: row.get(25)?,
+        original_start_time_zone: row.get(26)?,
+        original_end_time_zone: row.get(27)?,
+        calendar_id: row.get(28)?,
+    })
+}
+
+/// The stored calendars in `position` order (#1984).
+fn stored_calendars_on(conn: &Connection) -> Result<Vec<Calendar>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, color, hex_color, is_default, can_edit, owner_name, owner_addr
+         FROM calendars ORDER BY position ASC, id ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Calendar {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                color: row.get(2)?,
+                hex_color: row.get(3)?,
+                is_default: row.get(4)?,
+                can_edit: row.get(5)?,
+                owner_name: row.get(6)?,
+                owner_addr: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The first stored default calendar's id, if any.
+fn default_calendar_id_on(conn: &Connection) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM calendars WHERE is_default = 1 ORDER BY position ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// See `Store::calendar_selection`.
+fn calendar_selection_on(conn: &Connection) -> Result<Option<Vec<String>>, StoreError> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'calendar_selection'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let Ok(Value::Array(items)) = json::parse(&raw) else {
+        return Ok(None);
+    };
+    Ok(items
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect())
+}
+
+/// See `Store::synced_calendar_ids`.
+fn synced_calendar_ids_on(conn: &Connection) -> Result<Vec<String>, StoreError> {
+    let calendars = stored_calendars_on(conn)?;
+    let ids = match calendar_selection_on(conn)? {
+        Some(chosen) => {
+            let chosen: HashSet<String> = chosen.into_iter().collect();
+            calendars
+                .into_iter()
+                .filter(|c| chosen.contains(&c.id))
+                .map(|c| c.id)
+                .collect()
+        }
+        None => {
+            let owner = calendars
+                .iter()
+                .find(|c| c.is_default)
+                .map(|c| owner_key(&c.owner_addr))
+                .filter(|o| !o.is_empty());
+            calendars
+                .into_iter()
+                .filter(|c| match &owner {
+                    Some(o) => c.is_default || owner_key(&c.owner_addr) == *o,
+                    None => true,
+                })
+                .map(|c| c.id)
+                .collect()
+        }
+    };
+    Ok(ids)
+}
+
+/// A calendar owner address as compared: ASCII case and surrounding
+/// whitespace ignored (`folder_contact_key`'s fold, #1934).
+fn owner_key(addr: &str) -> String {
+    addr.trim().to_ascii_lowercase()
+}
+
+/// Deletes a calendar's synced (non-`local:`) events, of any date; their
+/// attendees go by `ON DELETE CASCADE`.
+fn delete_calendar_events_on(conn: &Connection, calendar_id: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM events WHERE calendar_id = ?1 AND id NOT LIKE 'local:%'",
+        params![calendar_id],
+    )?;
+    Ok(())
+}
+
+/// Days since the Unix epoch of a civil date (Howard Hinnant's
+/// `days_from_civil`, the inverse of `civil_from_days`).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = i64::from(m);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(d) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Converts a count of days since the Unix epoch into a `(year, month, day)`
+/// civil date (Howard Hinnant's `civil_from_days`).
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// The number of days in a month (1..=12) of the proleptic Gregorian
+/// calendar.
+fn days_in_month(y: i64, m: u32) -> u32 {
+    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    (days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)) as u32
+}
+
+/// A Unix timestamp as the store's `YYYY-MM-DDTHH:MM:SSZ`.
+fn unix_secs_to_iso8601(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    let rem = secs.rem_euclid(86400);
+    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+}
+
+/// The store's `YYYY-MM-DDTHH:MM:SSZ` as a Unix timestamp; `None` when it
+/// is not that shape or not a real date (Graph's no-date
+/// `0000-00-00T00:00:00Z` fallback).
+fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<u32>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m)
+        || d == 0
+        || d > days_in_month(i64::from(y), m)
+        || h > 23
+        || mi > 59
+        || sec > 60
+    {
+        return None;
+    }
+    Some(days_from_civil(i64::from(y), m, d) * 86400 + i64::from(h * 3600 + mi * 60 + sec))
+}
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
@@ -6317,6 +6783,487 @@ mod calendar_tests {
         assert_client_fields(&rows[0], &e);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Every calendar and calendar queries (#1984) ---
+
+    fn cal(id: &str, default: bool, owner: &str) -> Calendar {
+        Calendar {
+            id: id.into(),
+            name: format!("n{id}"),
+            color: "auto".into(),
+            hex_color: String::new(),
+            is_default: default,
+            can_edit: true,
+            owner_name: String::new(),
+            owner_addr: owner.into(),
+        }
+    }
+
+    fn in_cal(id: &str, cal: &str, start: &str, end: &str) -> NewEvent {
+        NewEvent {
+            calendar_id: cal.into(),
+            ..ev(id, start, end)
+        }
+    }
+
+    fn fetched(cal: &str, events: Vec<NewEvent>) -> FetchedCalendar {
+        FetchedCalendar {
+            calendar_id: cal.into(),
+            attendees: events.iter().map(|e| (e.id.clone(), Vec::new())).collect(),
+            events,
+        }
+    }
+
+    fn ids(rows: &[EventRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    fn all_events(s: &Store) -> Vec<EventRow> {
+        s.events_in_window("0001-01-01T00:00:00Z", "9999-12-31T00:00:00Z")
+            .unwrap()
+    }
+
+    const FROM: &str = "2026-07-13T00:00:00Z";
+    const TO: &str = "2026-08-19T00:00:00Z";
+
+    #[test]
+    fn replace_calendars_upserts_deletes_and_keeps_order() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(
+            s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+                .unwrap()
+        );
+        // Same list again: nothing changed.
+        assert!(
+            !s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+                .unwrap()
+        );
+        // Reordered: changed.
+        assert!(
+            s.replace_calendars(&[cal("B", false, "me@x"), cal("A", true, "me@x")])
+                .unwrap()
+        );
+        let order: Vec<String> = s
+            .calendars()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.calendar.id)
+            .collect();
+        assert_eq!(order, ["B", "A"]);
+        // A field changed, C added, B gone; a repeated id keeps its first place.
+        let mut a = cal("A", true, "me@x");
+        a.hex_color = "#ff0000".into();
+        assert!(
+            s.replace_calendars(&[a.clone(), cal("C", false, "me@x"), cal("A", false, "")])
+                .unwrap()
+        );
+        let rows = s.calendars().unwrap();
+        assert_eq!(
+            rows.iter().map(|c| c.calendar.clone()).collect::<Vec<_>>(),
+            vec![a, cal("C", false, "me@x")]
+        );
+        assert!(rows.iter().all(|c| c.syncs));
+    }
+
+    #[test]
+    fn own_calendars_follow_the_default_calendars_owner() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[
+            cal("A", true, " Me@X.com "),
+            cal("B", false, "me@x.COM"),
+            cal("Shared", false, "boss@x.com"),
+            cal("NoOwner", false, ""),
+        ])
+        .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["A", "B"]);
+        let syncs: Vec<(String, bool)> = s
+            .calendars()
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.calendar.id, c.syncs))
+            .collect();
+        assert_eq!(
+            syncs,
+            [
+                ("A".to_string(), true),
+                ("B".to_string(), true),
+                ("Shared".to_string(), false),
+                ("NoOwner".to_string(), false)
+            ]
+        );
+        // ASCII case only: a Kelvin sign is not `k`.
+        s.replace_calendars(&[
+            cal("A", true, "kate@x.com"),
+            cal("K", false, "\u{212A}ate@x.com"),
+        ])
+        .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["A"]);
+        // The default calendar is own even when its owner address is blank,
+        // and then every calendar is (nothing to tell them apart by).
+        s.replace_calendars(&[cal("A", true, ""), cal("Shared", false, "boss@x.com")])
+            .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["A", "Shared"]);
+        // No default calendar: every calendar.
+        s.replace_calendars(&[cal("X", false, "a@x"), cal("Y", false, "b@x")])
+            .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["X", "Y"]);
+    }
+
+    #[test]
+    fn calendar_selection_intersects_the_list_and_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-calendar-selection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.replace_calendars(&[cal("A", true, "me@x"), cal("Shared", false, "boss@x")])
+                .unwrap();
+            let chosen = vec!["Shared".to_string(), "Later".to_string()];
+            assert!(s.set_calendar_selection(Some(&chosen)).unwrap());
+            // Same set again: unchanged.
+            assert!(!s.set_calendar_selection(Some(&chosen)).unwrap());
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.calendar_selection().unwrap(),
+            Some(vec!["Shared".to_string(), "Later".to_string()])
+        );
+        // `Later` is not listed: it syncs nothing until it is.
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["Shared"]);
+        s.replace_calendars(&[
+            cal("A", true, "me@x"),
+            cal("Later", false, "me@x"),
+            cal("Shared", false, "boss@x"),
+        ])
+        .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["Later", "Shared"]);
+        // `None` is back to the user's own.
+        assert!(s.set_calendar_selection(None).unwrap());
+        assert_eq!(s.calendar_selection().unwrap(), None);
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["A", "Later"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_selection_reads_as_none() {
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('calendar_selection', '{\"a\":1}')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.calendar_selection().unwrap(), None);
+    }
+
+    #[test]
+    fn set_calendar_selection_deletes_only_stored_deselected_calendars_events() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        for e in [
+            in_cal("a1", "A", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            in_cal("b1", "B", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            // B's history, outside any window: goes too.
+            in_cal("b0", "B", "2025-01-01T09:00:00Z", "2025-01-01T10:00:00Z"),
+            in_cal(
+                "local:1",
+                "B",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+            in_cal("old", "", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            in_cal(
+                "gone",
+                "Unlisted",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        assert!(s.set_calendar_selection(Some(&["A".to_string()])).unwrap());
+        let rows = all_events(&s);
+        let mut left = ids(&rows);
+        left.sort();
+        assert_eq!(left, ["a1", "gone", "local:1", "old"]);
+    }
+
+    #[test]
+    fn set_calendars_before_the_first_list_deletes_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        for e in [
+            in_cal("old", "", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            in_cal("a1", "A", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        assert!(!s.set_calendar_selection(Some(&["A".to_string()])).unwrap());
+        assert!(!s.set_calendar_selection(None).unwrap());
+        assert_eq!(all_events(&s).len(), 2);
+    }
+
+    #[test]
+    fn apply_calendar_sync_replaces_each_calendars_window_apart() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        for e in [
+            in_cal(
+                "a-stale",
+                "A",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+            in_cal(
+                "b-kept",
+                "B",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+            in_cal(
+                "a-history",
+                "A",
+                "2026-05-01T09:00:00Z",
+                "2026-05-01T10:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        // Only A was fetched (B's view failed): B keeps its rows. A's event
+        // claiming another calendar is stored under A.
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[fetched(
+                "A",
+                vec![in_cal(
+                    "a-new",
+                    "WRONG",
+                    "2026-07-21T09:00:00Z",
+                    "2026-07-21T10:00:00Z",
+                )],
+            )],
+        )
+        .unwrap();
+        let rows = all_events(&s);
+        assert_eq!(ids(&rows), ["a-history", "b-kept", "a-new"]);
+        assert_eq!(rows[2].calendar_id, "A");
+        assert_eq!(
+            ids(&s.events_in_range(FROM, TO, &["A".to_string()]).unwrap()),
+            ["a-new"]
+        );
+    }
+
+    #[test]
+    fn apply_calendar_sync_adopts_rows_without_a_calendar_into_the_default() {
+        let s = Store::open_in_memory().unwrap();
+        for e in [
+            in_cal("E1", "", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            in_cal(
+                "history",
+                "",
+                "2026-05-01T09:00:00Z",
+                "2026-05-01T10:00:00Z",
+            ),
+            in_cal(
+                "local:1",
+                "",
+                "2026-07-22T09:00:00Z",
+                "2026-07-22T10:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        // No calendar list yet: no default, nothing adopted, nothing deleted.
+        s.apply_calendar_sync(FROM, TO, &[]).unwrap();
+        assert!(all_events(&s).iter().all(|e| e.calendar_id.is_empty()));
+
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[
+                fetched(
+                    "A",
+                    vec![in_cal(
+                        "E1",
+                        "A",
+                        "2026-07-20T09:00:00Z",
+                        "2026-07-20T10:00:00Z",
+                    )],
+                ),
+                fetched("B", vec![]),
+            ],
+        )
+        .unwrap();
+        let rows = all_events(&s);
+        assert_eq!(ids(&rows), ["history", "E1", "local:1"]);
+        assert!(rows.iter().all(|e| e.calendar_id == "A"), "{rows:?}");
+    }
+
+    #[test]
+    fn apply_calendar_sync_deletes_unsynced_calendars_but_not_local_or_blank_rows() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("Shared", false, "boss@x")])
+            .unwrap();
+        for e in [
+            in_cal(
+                "shared",
+                "Shared",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+            in_cal(
+                "vanished",
+                "Gone",
+                "2025-07-20T09:00:00Z",
+                "2025-07-20T10:00:00Z",
+            ),
+            in_cal(
+                "local:1",
+                "Gone",
+                "2026-07-20T09:00:00Z",
+                "2026-07-20T10:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        s.apply_calendar_sync(FROM, TO, &[fetched("A", vec![])])
+            .unwrap();
+        assert_eq!(ids(&all_events(&s)), ["local:1"]);
+    }
+
+    #[test]
+    fn events_in_range_filters_by_calendar() {
+        let s = Store::open_in_memory().unwrap();
+        for e in [
+            in_cal("a", "A", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            in_cal("b", "B", "2026-07-20T08:00:00Z", "2026-07-20T09:00:00Z"),
+            in_cal("c", "C", "2026-07-20T07:00:00Z", "2026-07-20T08:00:00Z"),
+            in_cal("a-out", "A", "2026-07-25T09:00:00Z", "2026-07-25T10:00:00Z"),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        let range = |cals: &[&str]| {
+            let cals: Vec<String> = cals.iter().map(|c| c.to_string()).collect();
+            s.events_in_range("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z", &cals)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(range(&["A", "B"]), ["b", "a"]);
+        assert_eq!(range(&["C"]), ["c"]);
+        assert!(range(&[]).is_empty());
+        assert!(range(&["Z"]).is_empty());
+    }
+
+    #[test]
+    fn days_with_events_marks_local_days() {
+        let s = Store::open_in_memory().unwrap();
+        let all_day = |id: &str, start: &str, end: &str| NewEvent {
+            is_all_day: true,
+            ..in_cal(id, "A", start, end)
+        };
+        for e in [
+            // Timed, Oct 30 22:00 .. Nov 2 01:00 UTC: across the month start.
+            in_cal("multi", "A", "2026-10-30T22:00:00Z", "2026-11-02T01:00:00Z"),
+            // Nov 10 23:30 UTC: Nov 11 at +60, Nov 10 at 0.
+            in_cal("late", "A", "2026-11-10T23:30:00Z", "2026-11-10T23:45:00Z"),
+            // Nov 20 00:30 UTC: Nov 19 at -60.
+            in_cal("early", "A", "2026-11-20T00:30:00Z", "2026-11-20T00:45:00Z"),
+            // Ends exactly at midnight UTC: Nov 25 only, at offset 0.
+            in_cal(
+                "to-midnight",
+                "A",
+                "2026-11-25T22:00:00Z",
+                "2026-11-26T00:00:00Z",
+            ),
+            // Zero length on Nov 28.
+            in_cal("zero", "A", "2026-11-28T12:00:00Z", "2026-11-28T12:00:00Z"),
+            // All day Nov 15 and 16: no offset moves it.
+            all_day("allday", "2026-11-15T00:00:00Z", "2026-11-17T00:00:00Z"),
+            // All day Nov 30 .. Dec 1: only Nov 30 is in November.
+            all_day("allday-end", "2026-11-30T00:00:00Z", "2026-12-02T00:00:00Z"),
+            // Another calendar's event never counts.
+            in_cal("other", "B", "2026-11-05T09:00:00Z", "2026-11-05T10:00:00Z"),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        let a = ["A".to_string()];
+        assert_eq!(
+            s.days_with_events(2026, 11, 0, &a).unwrap(),
+            [1, 2, 10, 15, 16, 20, 25, 28, 30]
+        );
+        // +60: "multi" ends Nov 2 02:00 local, "late" moves to Nov 11, and
+        // "to-midnight" now ends at 01:00 on Nov 26.
+        assert_eq!(
+            s.days_with_events(2026, 11, 60, &a).unwrap(),
+            [1, 2, 11, 15, 16, 20, 25, 26, 28, 30]
+        );
+        // -60: "multi" ends Nov 2 00:00 local (Nov 1 only), "early" moves
+        // to Nov 19, "to-midnight" is 21:00..23:00 on Nov 25.
+        assert_eq!(
+            s.days_with_events(2026, 11, -60, &a).unwrap(),
+            [1, 10, 15, 16, 19, 25, 28, 30]
+        );
+        // October holds "multi"'s first two days.
+        assert_eq!(s.days_with_events(2026, 10, 0, &a).unwrap(), [30, 31]);
+        assert!(s.days_with_events(2026, 11, 0, &[]).unwrap().is_empty());
+        assert!(s.days_with_events(2026, 13, 0, &a).unwrap().is_empty());
+    }
+
+    #[test]
+    fn date_helpers_round_trip() {
+        for (y, m, d) in [(1970, 1, 1), (2024, 2, 29), (2026, 12, 31), (1969, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2026, 12), 31);
+        let t = "2026-11-07T15:48:53Z";
+        assert_eq!(unix_secs_to_iso8601(iso8601_to_unix_secs(t).unwrap()), t);
+        assert_eq!(iso8601_to_unix_secs("0000-00-00T00:00:00Z"), None);
+        assert_eq!(iso8601_to_unix_secs("2026-11-07"), None);
+    }
+
+    #[test]
+    fn create_local_event_takes_the_default_calendar() {
+        let s = Store::open_in_memory().unwrap();
+        let before = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        s.replace_calendars(&[cal("B", false, "me@x"), cal("A", true, "me@x")])
+            .unwrap();
+        let after = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        let rows = all_events(&s);
+        let cal_of = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .calendar_id
+                .clone()
+        };
+        assert_eq!(cal_of(&before), "");
+        assert_eq!(cal_of(&after), "A");
+        let a = ["A".to_string()];
+        assert_eq!(
+            s.events_in_range("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z", &a)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
 
