@@ -585,7 +585,7 @@ pub struct FetchedCalendar {
 /// superset of this (it additionally carries `attendees`),
 /// so rather than folding `NewEvent` away, the sync engine bridges the two
 /// via the `From<&Event> for NewEvent` conversion below — a straight
-/// per-field copy the engine runs for every event `calendar_view` returns.
+/// per-field copy the engine runs for every event `calendar_view_in` returns.
 ///
 /// `body_html` supersedes the original spec idea of reusing the `bodies`
 /// table (keyed `event:<id>`) for event bodies — `bodies.message_id` has an
@@ -687,7 +687,8 @@ pub struct NewAttendee {
 }
 
 /// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
-/// every event `GraphClient::calendar_view` returns, before `upsert_event`.
+/// every event `GraphClient::calendar_view_in` returns, before
+/// `apply_calendar_sync`.
 impl From<&Event> for NewEvent {
     fn from(e: &Event) -> Self {
         NewEvent {
@@ -2686,6 +2687,10 @@ impl Store {
         Ok(())
     }
 
+    /// Every calendar's window at once, the pre-#1984 writer: the engine now
+    /// writes a pass per calendar with `apply_calendar_sync`, which keeps
+    /// this one's rules (the `local:` exclusion, one transaction).
+    ///
     /// Replaces every event overlapping `[from_utc, to_utc)` (the same
     /// overlap condition `events_in_window` filters by: `start_utc < to_utc
     /// AND end_utc > from_utc`) with `events`/`attendees` — a full

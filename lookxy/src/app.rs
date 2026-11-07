@@ -719,6 +719,10 @@ impl App {
             // isn't currently showing is harmless, and keeps `agenda` correct
             // for the moment `g` shows it again rather than reloading late.
             SyncEvent::CalendarUpdated => self.reload_agenda(),
+            // lookxy shows no calendar list (its agenda is every stored
+            // calendar's, `events_in_window`), so a changed list or choice
+            // has nothing to redraw (#1984).
+            SyncEvent::CalendarsUpdated => {}
             // A send failed for good: the engine already put the message
             // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
             SyncEvent::SendFailed { error, .. } => {
