@@ -601,8 +601,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   included, is written by both. Before #1937 the window writer had its own
   copy of the SQL without the two reminder columns, and every synced event
   read back as 0 minutes, reminder off. A new `events` column goes into
-  `upsert_event_on` once. `put_event_attendees` opens its own transaction,
-  so `replace_events_in_window` still inlines the attendee SQL.
+  `upsert_event_on` once. Attendees go the same way: `put_event_attendees`
+  (in its own transaction) and `replace_events_in_window` (in its) both run
+  `put_event_attendees_on(conn, id, a)`.
 - Tests: `store` `calendar_tests::replace_events_in_window_writes_reminder_fields`
   (insert, and a later refresh that changes them),
   `calendar_tests::replace_events_in_window_conflict_path_updates_reminder_fields`

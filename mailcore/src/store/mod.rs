@@ -2382,17 +2382,7 @@ impl Store {
     /// reasoning applies here).
     pub fn put_event_attendees(&self, id: &str, a: &[NewAttendee]) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM event_attendees WHERE event_id = ?1",
-            params![id],
-        )?;
-        for att in a {
-            tx.execute(
-                "INSERT INTO event_attendees (event_id, name, addr, type, response)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id, att.name, att.addr, att.r#type, att.response],
-            )?;
-        }
+        put_event_attendees_on(&tx, id, a)?;
         tx.commit()?;
         Ok(())
     }
@@ -2430,19 +2420,18 @@ impl Store {
     /// and attendee replace) so a crash mid-refresh can't leave the window
     /// emptied without ever refilling it: either the whole replacement
     /// commits, or none of it does and the prior window contents are
-    /// untouched. Each event goes through `upsert_event_on`, the same
-    /// statement `upsert_event` runs, here on the transaction. It does NOT
-    /// call `put_event_attendees` (that opens its own transaction via
-    /// `unchecked_transaction`; nesting a second `BEGIN` on the same
-    /// connection while this one is still open would error), so the
-    /// attendee SQL is inlined here instead. The per-event attendee
-    /// `DELETE` before each insert is technically redundant with `events`'
-    /// `ON DELETE CASCADE` for an event this call's own window-delete just
-    /// removed, but not for one that instead takes the `ON CONFLICT` update
-    /// path (a boundary mismatch between this window and the row's stored
-    /// dates) — cheap insurance against a duplicate attendee row in that
-    /// edge case, and the same delete-then-insert `put_event_attendees`
-    /// itself always does.
+    /// untouched. Each event and its attendees go through `upsert_event_on`
+    /// and `put_event_attendees_on`, the statements `upsert_event` and
+    /// `put_event_attendees` run, here on the transaction (calling
+    /// `put_event_attendees` itself would nest a second `BEGIN` on the same
+    /// connection while this one is still open, which errors). The
+    /// per-event attendee `DELETE` before each insert is technically
+    /// redundant with `events`' `ON DELETE CASCADE` for an event this
+    /// call's own window-delete just removed, but not for one that instead
+    /// takes the `ON CONFLICT` update path (a boundary mismatch between this
+    /// window and the row's stored dates) — cheap insurance against a
+    /// duplicate attendee row in that edge case, and the same
+    /// delete-then-insert `put_event_attendees` itself always does.
     pub fn replace_events_in_window(
         &self,
         from_utc: &str,
@@ -2459,17 +2448,7 @@ impl Store {
             upsert_event_on(&tx, e)?;
         }
         for (id, atts) in attendees {
-            tx.execute(
-                "DELETE FROM event_attendees WHERE event_id = ?1",
-                params![id],
-            )?;
-            for att in atts {
-                tx.execute(
-                    "INSERT INTO event_attendees (event_id, name, addr, type, response)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![id, att.name, att.addr, att.r#type, att.response],
-                )?;
-            }
+            put_event_attendees_on(&tx, id, atts)?;
         }
         tx.commit()?;
         Ok(())
@@ -3133,6 +3112,29 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
             e.is_reminder_on,
         ],
     )?;
+    Ok(())
+}
+
+/// Replaces an event's `event_attendees` rows with `a` (delete, then
+/// insert), on `conn`: `Store::put_event_attendees` runs it in its own
+/// transaction, `Store::replace_events_in_window` on its window's, so the
+/// attendee SQL exists once, as `upsert_event_on`'s does (#1937).
+fn put_event_attendees_on(
+    conn: &Connection,
+    id: &str,
+    a: &[NewAttendee],
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM event_attendees WHERE event_id = ?1",
+        params![id],
+    )?;
+    for att in a {
+        conn.execute(
+            "INSERT INTO event_attendees (event_id, name, addr, type, response)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, att.name, att.addr, att.r#type, att.response],
+        )?;
+    }
     Ok(())
 }
 
