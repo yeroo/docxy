@@ -2078,6 +2078,48 @@ mod tests {
     }
 
     #[test]
+    fn get_body_keeps_the_msip_labels_header() {
+        // #2015: the sensitivity label comes with the body as Exchange names
+        // it (lowercase), trimmed and otherwise byte for byte as sent.
+        let label = "MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_Enabled=true; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_SetDate=2026-11-02T09:15:00Z; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_Method=Standard; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_Name=Confidential; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_SiteId=72f988bf-86f1-41af-91ab-2d7cd011db47; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_ActionId=0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9; \
+            MSIP_Label_6f0b3a2e-1c4d-4e5f-8a9b-0c1d2e3f4a5b_ContentBits=0";
+        let body = format!(
+            r#"{{"body":{{"contentType":"text","content":"hi"}},"internetMessageHeaders":[
+                {{"name":"Received","value":"from x"}},
+                {{"name":"msip_labels","value":"  {label}\r\n"}},
+                {{"name":"X-MS-Exchange-Organization-AuthAs","value":"Internal"}}
+            ]}}"#
+        );
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body,
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (_, headers) = c.get_body_with_headers("M1", false).unwrap();
+        assert_eq!(
+            headers,
+            [
+                MessageHeader {
+                    name: "msip_labels".into(),
+                    value: label.into(),
+                },
+                MessageHeader {
+                    name: "X-MS-Exchange-Organization-AuthAs".into(),
+                    value: "Internal".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn get_body_without_usable_headers_yields_none() {
         // No field, a null one, or malformed entries: the body still parses
         // and no header comes back (#1933).

@@ -6273,6 +6273,51 @@ mod tests {
             Some("Internal")
         );
         assert_eq!(store.message_header("M1", "Received").unwrap(), None);
+        // A body that came without a sensitivity label has none (#2015).
+        assert_eq!(store.message_header("M1", "msip_labels").unwrap(), None);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_body_stores_the_msip_labels_header() {
+        // #2015: the test server serves the sensitivity label with the body;
+        // the store keeps it, read back under any case.
+        const LABEL: &str = "MSIP_Label_6f0b_Enabled=true; MSIP_Label_6f0b_Method=Standard; \
+            MSIP_Label_6f0b_Name=Confidential; MSIP_Label_6f0b_ContentBits=0";
+        let (srv, handle, store_path, dir) = body_engine(
+            "body-msip-labels",
+            vec![get_route(
+                &body_get_path("M1"),
+                200,
+                &format!(
+                    r#"{{"body":{{"contentType":"text","content":"hi"}},"internetMessageHeaders":[
+                        {{"name":"Received","value":"from x"}},
+                        {{"name":"msip_labels","value":" {LABEL}"}}
+                    ]}}"#
+                ),
+            )],
+            EngineOptions::without_prefetch(),
+        );
+        fetch_m1_body(&handle);
+
+        assert_eq!(m1_body_gets(&srv).len(), 1);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.get_body("M1").unwrap().unwrap().content, "hi");
+        for name in ["msip_labels", "MSIP_Labels"] {
+            assert_eq!(
+                store.message_header("M1", name).unwrap().as_deref(),
+                Some(LABEL),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            store
+                .message_header("M1", "X-MS-Exchange-Organization-AuthAs")
+                .unwrap(),
+            None
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

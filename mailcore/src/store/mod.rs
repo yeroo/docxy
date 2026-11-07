@@ -8962,6 +8962,38 @@ mod body_format_tests {
     }
 
     #[test]
+    fn message_header_keeps_msip_labels() {
+        // #2015: the sensitivity label is stored beside Exchange's stamps,
+        // written under any case and read back under any case, its value
+        // trimmed and otherwise verbatim.
+        const LABEL: &str = "MSIP_Label_6f0b_Enabled=true; MSIP_Label_6f0b_Name=Confidential; \
+            MSIP_Label_6f0b_ContentBits=0";
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("hi"),
+            BodyFormat::Text,
+            &[
+                header(AUTH_AS, "Internal"),
+                header("MSIP_Labels", &format!(" {LABEL} ")),
+            ],
+        )
+        .unwrap();
+        for name in ["msip_labels", "MSIP_LABELS", "MSIP_Labels"] {
+            assert_eq!(
+                s.message_header("M", name).unwrap().as_deref(),
+                Some(LABEL),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            s.message_header("M", AUTH_AS).unwrap().as_deref(),
+            Some("Internal")
+        );
+        assert_eq!(headers_rows(&s), 2);
+    }
+
+    #[test]
     fn refetch_replaces_message_headers() {
         let s = store_with_message();
         s.put_fetched_body_with_headers(
