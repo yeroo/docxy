@@ -1190,9 +1190,11 @@ fn is_meeting_url(after_scheme: &str) -> bool {
         starts(&["/meet/"])
     } else if under("zoom.us") || under("zoomgov.com") {
         starts(&["/j/", "/w/", "/my/"])
-    } else if host == "meet.google.com" || host == "meet.goto.com" || host == "chime.aws" {
-        has_path
-    } else if under("webex.com") {
+    } else if host == "meet.google.com"
+        || host == "meet.goto.com"
+        || host == "chime.aws"
+        || under("webex.com")
+    {
         has_path
     } else if host == "global.gotomeeting.com" {
         starts(&["/join/"])
