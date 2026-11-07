@@ -280,6 +280,21 @@ pub enum OutboxOp {
     DeleteEvent {
         id: String,
     },
+    /// Cancel a meeting the user organizes (#1985): Graph's `.../cancel`
+    /// sends every attendee a cancellation with `comment` and deletes the
+    /// organizer's copy. `SyncCommand::CancelEvent` has already deleted the
+    /// row locally. A `local:` id never reached Graph and sends nothing.
+    CancelEvent {
+        id: String,
+        comment: Option<String>,
+    },
+    /// Forward a meeting to `to` with `comment` (#1985, `.../forward`).
+    /// Nothing local changes. `to` is stored as `[{"name":…,"address":…}]`.
+    ForwardEvent {
+        id: String,
+        to: Vec<Recipient>,
+        comment: Option<String>,
+    },
 }
 
 impl OutboxOp {
@@ -299,6 +314,8 @@ impl OutboxOp {
             OutboxOp::CreateEvent { .. } => "createEvent",
             OutboxOp::UpdateEvent { .. } => "updateEvent",
             OutboxOp::DeleteEvent { .. } => "deleteEvent",
+            OutboxOp::CancelEvent { .. } => "cancelEvent",
+            OutboxOp::ForwardEvent { .. } => "forwardEvent",
         }
     }
 
@@ -391,6 +408,29 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
+            OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("comment".to_string(), optional_str(comment)),
+            ]),
+            OutboxOp::ForwardEvent { id, to, comment } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "to".to_string(),
+                    Value::Array(
+                        to.iter()
+                            .map(|r| {
+                                Value::Object(vec![
+                                    ("name".to_string(), Value::Str(r.name.clone())),
+                                    ("address".to_string(), Value::Str(r.address.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("comment".to_string(), optional_str(comment)),
+            ]),
         }
     }
 
@@ -453,8 +493,43 @@ impl OutboxOp {
                 },
             }),
             "deleteEvent" => Some(OutboxOp::DeleteEvent { id: id()? }),
+            "cancelEvent" => Some(OutboxOp::CancelEvent {
+                id: id()?,
+                comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+            }),
+            // An empty `to` is kept: the engine refuses one at command
+            // time, so only a hand-edited row holds one, and Graph's
+            // refusal then quarantines it. A recipient without an address
+            // is a corrupt row.
+            "forwardEvent" => Some(OutboxOp::ForwardEvent {
+                id: id()?,
+                to: v
+                    .get("to")?
+                    .as_array()?
+                    .iter()
+                    .map(|r| {
+                        Some(Recipient {
+                            name: r
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            address: r.get("address")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+            }),
             _ => None,
         }
+    }
+}
+
+/// `Some` as a JSON string, `None` as `null` (an outbox op's optional text).
+fn optional_str(s: &Option<String>) -> Value {
+    match s {
+        Some(s) => Value::Str(s.clone()),
+        None => Value::Null,
     }
 }
 
@@ -1363,7 +1438,9 @@ impl Store {
                 OutboxOp::RespondEvent { .. }
                 | OutboxOp::CreateEvent { .. }
                 | OutboxOp::UpdateEvent { .. }
-                | OutboxOp::DeleteEvent { .. } => None,
+                | OutboxOp::DeleteEvent { .. }
+                | OutboxOp::CancelEvent { .. }
+                | OutboxOp::ForwardEvent { .. } => None,
             })
             .collect();
         ids.sort();
@@ -2802,6 +2879,20 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The stored event `id` (`None` if there is none): what
+    /// `SyncCommand::CancelEvent` checks before it cancels (#1985).
+    pub fn event(&self, id: &str) -> Result<Option<EventRow>, StoreError> {
+        let row = self
+            .conn
+            .query_row(
+                &format!("SELECT {EVENT_ROW_COLUMNS} FROM events WHERE id = ?1"),
+                params![id],
+                event_row,
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Events overlapping `[from_utc, to_utc)`: `start_utc < to_utc AND
@@ -6268,6 +6359,33 @@ mod calendar_tests {
     }
 
     #[test]
+    fn event_by_id_returns_the_row() {
+        let s = Store::open_in_memory().unwrap();
+        let mut e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        e.is_organizer = true;
+        s.upsert_event(&e).unwrap();
+        let mut other = ev("E2", "2026-07-20T11:00:00Z", "2026-07-20T12:00:00Z");
+        other.is_organizer = false;
+        s.upsert_event(&other).unwrap();
+
+        let row = s.event("E1").unwrap().unwrap();
+        assert_eq!(row.id, "E1");
+        assert_client_fields(&row, &e);
+        // The row is the one the window read gives.
+        let listed = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        assert_eq!(Some(&row), listed.iter().find(|r| r.id == "E1"));
+        assert!(!s.event("E2").unwrap().unwrap().is_organizer);
+        assert_eq!(s.event("nope").unwrap(), None);
+        // A local event is the user's own meeting.
+        let local = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        assert!(s.event(&local).unwrap().unwrap().is_organizer);
+    }
+
+    #[test]
     fn delete_event_removes_it() {
         let s = Store::open_in_memory().unwrap();
         let id = s
@@ -8413,6 +8531,78 @@ mod outbox_tests {
         ] {
             assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op));
         }
+    }
+
+    #[test]
+    fn outbox_op_cancel_and_forward_round_trip() {
+        let cancel = OutboxOp::CancelEvent {
+            id: "EV1".into(),
+            comment: Some("Moved".into()),
+        };
+        assert_eq!(
+            cancel.to_json().to_string(),
+            r#"{"kind":"cancelEvent","id":"EV1","comment":"Moved"}"#
+        );
+        let forward = OutboxOp::ForwardEvent {
+            id: "EV1".into(),
+            to: vec![
+                Recipient {
+                    name: "Ann".into(),
+                    address: "ann@x".into(),
+                },
+                Recipient {
+                    name: "".into(),
+                    address: "bob@y".into(),
+                },
+            ],
+            comment: None,
+        };
+        assert_eq!(
+            forward.to_json().to_string(),
+            r#"{"kind":"forwardEvent","id":"EV1","to":[{"name":"Ann","address":"ann@x"},{"name":"","address":"bob@y"}],"comment":null}"#
+        );
+        for op in [
+            cancel,
+            forward,
+            OutboxOp::CancelEvent {
+                id: "local:e1".into(),
+                comment: None,
+            },
+            OutboxOp::ForwardEvent {
+                id: "EV2".into(),
+                to: vec![],
+                comment: Some("FYI".into()),
+            },
+        ] {
+            let stored = op.to_json().to_string();
+            assert_eq!(
+                OutboxOp::from_json(&json::parse(&stored).unwrap()),
+                Some(op),
+                "{stored}"
+            );
+        }
+        // A recipient without an address, or no `to` at all, is a corrupt
+        // row; a missing name reads as empty.
+        for corrupt in [
+            r#"{"kind":"forwardEvent","id":"EV1","to":[{"name":"Ann"}],"comment":null}"#,
+            r#"{"kind":"forwardEvent","id":"EV1","comment":null}"#,
+            r#"{"kind":"cancelEvent","comment":null}"#,
+        ] {
+            assert_eq!(OutboxOp::from_json(&json::parse(corrupt).unwrap()), None);
+        }
+        let v =
+            json::parse(r#"{"kind":"forwardEvent","id":"EV1","to":[{"address":"a@x"}]}"#).unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::ForwardEvent {
+                id: "EV1".into(),
+                to: vec![Recipient {
+                    name: "".into(),
+                    address: "a@x".into(),
+                }],
+                comment: None,
+            })
+        );
     }
 
     #[test]

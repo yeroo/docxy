@@ -1195,6 +1195,47 @@ impl GraphClient {
         Ok(())
     }
 
+    /// POST `/me/events/{id}/cancel` with `{"comment":…}` (#1985): the
+    /// organizer cancels a meeting, and Graph sends every attendee a
+    /// cancellation carrying `comment` and deletes the organizer's copy.
+    /// Only the organizer may call it. `comment` is `""` for `None`, as in
+    /// `respond_event`. Graph answers `202` with no body.
+    pub fn cancel_event(&self, id: &str, comment: Option<&str>) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}/cancel");
+        let body = Value::Object(vec![(
+            "comment".to_string(),
+            Value::Str(comment.unwrap_or("").to_string()),
+        )])
+        .to_string();
+        self.send(Method::Post, &path, Some(body), &[])?;
+        Ok(())
+    }
+
+    /// POST `/me/events/{id}/forward` with `{"toRecipients":[…],
+    /// "comment":…}` (#1985): sends the meeting to `to`, organizer or
+    /// attendee alike. `comment` is `""` for `None`. Graph answers `202` with
+    /// no body.
+    pub fn forward_event(
+        &self,
+        id: &str,
+        to: &[Recipient],
+        comment: Option<&str>,
+    ) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}/forward");
+        let body = Value::Object(vec![
+            ("toRecipients".to_string(), recipients_json(to)),
+            (
+                "comment".to_string(),
+                Value::Str(comment.unwrap_or("").to_string()),
+            ),
+        ])
+        .to_string();
+        self.send(Method::Post, &path, Some(body), &[])?;
+        Ok(())
+    }
+
     /// GET `/me/people` (top 200, relevance-ordered). Each returned person's
     /// primary address is its first `scoredEmailAddresses` entry; people with
     /// no email address are skipped. `rank` is the entry's position in the
@@ -4153,6 +4194,122 @@ mod tests {
         let reqs = srv.requests();
         assert!(reqs[0].path.contains(encoded_id));
         assert!(!reqs[0].path.contains(raw_id));
+    }
+
+    /// A route answering a meeting action as Graph does: `202`, no body.
+    fn accepted(path: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    #[test]
+    fn cancel_event_posts_comment() {
+        let srv = FakeServer::start(vec![accepted("/me/events/E1/cancel")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.cancel_event("E1", Some("Moved to next week")).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/E1/cancel");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent,
+            Value::Object(vec![(
+                "comment".to_string(),
+                Value::Str("Moved to next week".to_string())
+            )])
+        );
+    }
+
+    #[test]
+    fn cancel_event_without_comment_sends_empty() {
+        let srv = FakeServer::start(vec![accepted("/me/events/E1/cancel")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.cancel_event("E1", None).unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some(""));
+    }
+
+    #[test]
+    fn cancel_event_id_is_percent_encoded() {
+        let srv = FakeServer::start(vec![accepted("/me/events/AAMk%2Fid%2Bwith%3Dchars/cancel")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.cancel_event("AAMk/id+with=chars", None).unwrap();
+        assert_eq!(
+            srv.requests()[0].path,
+            "/me/events/AAMk%2Fid%2Bwith%3Dchars/cancel"
+        );
+    }
+
+    #[test]
+    fn cancel_event_refused_is_an_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/cancel".into(),
+            status: 400,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorInvalidRequest"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.cancel_event("E1", None),
+            Err(GraphError::Http { status: 400, .. })
+        ));
+    }
+
+    #[test]
+    fn forward_event_posts_recipients_and_comment() {
+        let srv = FakeServer::start(vec![accepted("/me/events/AAMk%2Fid/forward")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let to = [
+            Recipient {
+                name: "Ann".into(),
+                address: "ann@x".into(),
+            },
+            Recipient {
+                name: "".into(),
+                address: "bob@y".into(),
+            },
+        ];
+        c.forward_event("AAMk/id", &to, Some("FYI")).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/AAMk%2Fid/forward");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some("FYI"));
+        let got: Vec<(&str, &str)> = sent
+            .get("toRecipients")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let a = r.get("emailAddress").unwrap();
+                (
+                    a.get("name").and_then(Value::as_str).unwrap(),
+                    a.get("address").and_then(Value::as_str).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(got, [("Ann", "ann@x"), ("", "bob@y")]);
+    }
+
+    #[test]
+    fn forward_event_without_comment_sends_empty() {
+        let srv = FakeServer::start(vec![accepted("/me/events/E1/forward")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let to = [Recipient {
+            name: "Ann".into(),
+            address: "ann@x".into(),
+        }];
+        c.forward_event("E1", &to, None).unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some(""));
     }
 
     #[test]

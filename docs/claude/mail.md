@@ -1161,3 +1161,59 @@ wider window fresh without downloading it again.
   (`/o=ExchangeLabs/...`) is not matched: resolving it needs `/users`.
   Feeding the folder into autocomplete. Clearing the set on sign-out (the
   store is kept across sign-out, #1920).
+
+## Cancel and forward a meeting (#1985)
+
+The first slice of #1985 (items 1 and 2). The rest is split: series and occurrences
+(#2022), respond options and proposals (#2023), meeting message types (#2024), reminder
+dismiss and snooze on the server (#2025).
+
+- `GraphClient::cancel_event(id, comment)` POSTs `/me/events/{id}/cancel` with
+  `{"comment":…}`, and `forward_event(id, to, comment)` POSTs `.../forward` with
+  `{"toRecipients":[…],"comment":…}` (the drafts' `emailAddress` shape). `comment` is `""`
+  for `None`, as in `respond_event`. Graph answers both with `202` and no body.
+- Both are outbox ops (`cancelEvent`, `forwardEvent`), so they wait out being offline. A
+  `ForwardEvent` stores its recipients as `[{"name":…,"address":…}]`; `from_json` keeps
+  an empty list (only a hand-edited row holds one) and refuses a recipient without an
+  address.
+- `SyncCommand::CancelEvent`: the **engine** does the local delete, unlike
+  `DeleteEvent`, whose host deletes the row first. It reads the row (`Store::event`) and
+  refuses with an `Error` an event that is not stored or whose `is_organizer` is false
+  (Graph lets only the organizer cancel; an attendee declines or deletes). Then it queues
+  the op **before** it deletes the row, as `SendDraft` does: a failed queue after the
+  delete would hide a meeting every attendee keeps, with no op whose quarantine could
+  bring it back. A host must not delete the row itself first.
+- A cancel answered 404 is dropped by the drain at once, with no retry and no quarantine
+  `Error`, and resets the calendars (`reset_calendars`: delta state cleared, then a
+  refresh of initial rounds). A 404 is a retry after a lost 202 (Graph deleted the
+  organizer's copy on the first attempt; a lost 202 is a `Transport` error, which bumps no
+  attempt, so the attempt count cannot tell) or a cancel Graph could never do: a stale id,
+  or an event `/me/events` does not hold, such as a shared calendar's. Only Graph knows
+  which, so the reset asks it: the row stays gone when Graph deleted the event, and comes
+  back when Graph still has it. `apply_op` returns the 404 as is. A `local:` cancel sends nothing (nobody was invited), as
+  `DeleteEvent`. A quarantined `CancelEvent` is an event op: the calendar reset brings
+  the row back, as for `DeleteEvent`.
+- The engine does not refuse a cancel of an event without attendees: the stored attendee
+  list is not authoritative. Whether to offer Cancel (attendees) or Delete is the host's.
+- `SyncCommand::ForwardEvent` changes nothing locally, so no `CalendarUpdated`, and it is
+  not an event op for the quarantine. An empty `to`, or a `local:` id (an event id has
+  no later alias to follow, unlike a draft's `current_id`), is an `Error` and nothing is
+  queued.
+- Known gaps, recorded as follow-ups: a forward retried after a lost 202 goes out twice
+  (Graph has nothing to ask whether it went out). A pending cancel can be undone locally
+  by an *initial* calendar round (a window move, `FetchCalendarRange`) while it is still
+  queued offline, as a pending `DeleteEvent` can. A `local:` cancel queued behind its
+  `CreateEvent` has `DeleteEvent`'s race. No lookxy or suite UI yet.
+- Tests: `client.rs` `cancel_event_posts_comment`,
+  `cancel_event_without_comment_sends_empty`, `cancel_event_id_is_percent_encoded`,
+  `cancel_event_refused_is_an_error`, `forward_event_posts_recipients_and_comment`,
+  `forward_event_without_comment_sends_empty`; `store`
+  `outbox_op_cancel_and_forward_round_trip`, `event_by_id_returns_the_row`; `outbox.rs`
+  `cancel_event_local_id_makes_no_request`, `cancel_event_posts_cancel`,
+  `cancel_event_404_and_refusals_are_errors`, `forward_event_posts_forward`; `engine.rs`
+  `cancel_event_deletes_and_posts_cancel`, `cancel_event_refuses_an_attendee_or_unknown_id`,
+  `cancel_event_of_a_local_event_deletes_it_and_sends_nothing`,
+  `cancel_event_quarantine_restores_the_event`,
+  `cancel_event_404_brings_back_an_event_graph_still_has`,
+  `cancel_event_404_after_a_lost_202_leaves_the_event_gone`, `forward_event_posts_forward`,
+  `forward_event_refuses_local_id_and_no_recipients`.

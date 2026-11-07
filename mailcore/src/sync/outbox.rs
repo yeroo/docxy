@@ -120,6 +120,21 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
                 client.delete_event(id)
             }
         }
+        OutboxOp::CancelEvent { id, comment } => {
+            // A `local:` event never reached Graph, so nobody was invited.
+            if id.starts_with("local:") {
+                return Ok(());
+            }
+            // A 404 is returned as is: the drain drops the op and resets
+            // the calendars (#1985), as only Graph knows whether the cancel
+            // went out.
+            client.cancel_event(id, comment.as_deref())
+        }
+        // Nothing local to reconcile. A retry after a lost 202 forwards
+        // twice: Graph has nothing to ask whether the first one went out.
+        OutboxOp::ForwardEvent { id, to, comment } => {
+            client.forward_event(id, to, comment.as_deref())
+        }
     }
 }
 
@@ -1920,6 +1935,128 @@ mod tests {
         )
         .unwrap();
         assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn cancel_event_local_id_makes_no_request() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::CancelEvent {
+                id: "local:never".into(),
+                comment: Some("off".into()),
+            },
+        )
+        .unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn cancel_event_posts_cancel() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/EV1/cancel".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::CancelEvent {
+                id: "EV1".into(),
+                comment: Some("Moved".into()),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/EV1/cancel");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some("Moved"));
+    }
+
+    #[test]
+    fn cancel_event_404_and_refusals_are_errors() {
+        // `apply_op` reports a 404 as is: the drain, not this layer, drops
+        // the op and resets the calendars (#1985).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/GONE/cancel".into(),
+                status: 404,
+                headers: vec![],
+                body: r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events/MINE/cancel".into(),
+                status: 400,
+                headers: vec![],
+                body: r#"{"error":{"code":"ErrorInvalidRequest"}}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let cancel = |id: &str| OutboxOp::CancelEvent {
+            id: id.into(),
+            comment: None,
+        };
+        assert_eq!(
+            apply_op(&c, &store, &cancel("GONE")),
+            Err(GraphError::NotFound)
+        );
+        assert!(matches!(
+            apply_op(&c, &store, &cancel("MINE")),
+            Err(GraphError::Http { status: 400, .. })
+        ));
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn forward_event_posts_forward() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/EV1/forward".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::ForwardEvent {
+                id: "EV1".into(),
+                to: vec![Recipient {
+                    name: "Ann".into(),
+                    address: "ann@x".into(),
+                }],
+                comment: Some("FYI".into()),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/me/events/EV1/forward");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("comment").and_then(Value::as_str), Some("FYI"));
+        let to = sent.get("toRecipients").and_then(Value::as_array).unwrap();
+        assert_eq!(to.len(), 1);
+        assert_eq!(
+            to[0]
+                .get("emailAddress")
+                .and_then(|a| a.get("address"))
+                .and_then(Value::as_str),
+            Some("ann@x")
+        );
     }
 
     #[test]
