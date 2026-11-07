@@ -773,6 +773,13 @@ impl PprGroup {
     }
 }
 
+/// The `w:ind` a save writes for `props`' indents when none was loaded:
+/// what an imported paragraph keeps as loaded, so it reads as it does once
+/// saved and opened again (#1986).
+pub(crate) fn direct_ind_xml(props: &ParProps) -> Option<String> {
+    ind_xml(props, None, None)
+}
+
 /// The `w:ind` for edited indents. Of a loaded element, each indent the edit
 /// left alone keeps its attributes as loaded (`w:start`, `w:leftChars`, …);
 /// a changed one drops every attribute that sets it (a `*Chars` value would

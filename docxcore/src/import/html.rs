@@ -2987,9 +2987,9 @@ impl<'a> Html<'a> {
 
     /// Make `props` its item's numbered paragraph: the list's number and
     /// level, the item's look on the mark (#1979, as a browser's
-    /// `::marker`), and at the margin an explicit zero indent, or the
-    /// numbering level's 720 would stand (FIX r1 m6; written as a loaded
-    /// one, so an edit replaces it).
+    /// `::marker`), and its `w:ind` as a loaded one (#1986), so an edit
+    /// replaces it: at the margin an explicit zero indent, or the
+    /// numbering level's 720 would stand (FIX r1 m6).
     fn number_item(&self, props: &mut ParProps, numbered: bool, level: i32) {
         props.num_id = Some(if numbered { 2 } else { 1 });
         props.ilvl = level;
@@ -2997,9 +2997,16 @@ impl<'a> Html<'a> {
         if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
             props.raw_props.push(rpr);
         }
-        if props.indent == 0 {
-            props.shadow = vec![ZERO_IND.to_string()];
-        }
+        // Its `w:ind` reads as loaded, as it does once saved and opened
+        // again: its left replaces the level's, which the suite draws
+        // with no level step (#1986).
+        props.shadow = if props.indent == 0 {
+            vec![ZERO_IND.to_string()]
+        } else {
+            crate::serialize::direct_ind_xml(props)
+                .into_iter()
+                .collect()
+        };
     }
 
     /// The empty paragraph at `index` of the flow at `depth` gives its
@@ -3013,7 +3020,8 @@ impl<'a> Html<'a> {
                 p.num_id = None;
                 p.ilvl = 0;
                 p.first_line = 0;
-                p.shadow.retain(|x| x != ZERO_IND);
+                p.shadow
+                    .retain(|x| crate::serialize::local_name(x) != "ind");
             }
         }
     }
@@ -7147,6 +7155,47 @@ mod outlook_tests {
         }
     }
 
+    /// #1986: every numbered item's `w:ind` reads as loaded, as after a
+    /// save and a load, so the suite draws it at its own indent; the
+    /// save writes the same bytes as it did with no shadow, and a
+    /// continuation keeps none.
+    #[test]
+    fn items_carry_their_ind_as_loaded_and_save_the_same() {
+        let li = "font-family:Aptos; font-size:12pt; margin-top:0px; margin-bottom:0px";
+        let html = format!(
+            r#"<body><ol style="margin-top:0px; margin-bottom:0px">
+<li style="{li}"><div>Outer</div><ol style="margin-top:0px; margin-bottom:0px"><li style="{li}"><div>Inner</div></li></ol></li>
+<li style="{li}"><div>Third</div><div>More of third</div></li>
+</ol></body>"#
+        );
+        let d = doc(&html);
+        let outer = para_of(&d, "Outer");
+        let inner = para_of(&d, "Inner");
+        assert_eq!((outer.props.ilvl, outer.props.indent), (0, 600));
+        assert_eq!((inner.props.ilvl, inner.props.indent), (1, 1200));
+        for q in [&outer, &inner, &para_of(&d, "Third")] {
+            assert!(q.props.has_loaded_left_indent(), "{:?}", q.plain_text());
+        }
+        let more = para_of(&d, "More of third");
+        assert_eq!(more.props.num_id, None);
+        assert!(!more.props.has_loaded_left_indent());
+        assert!(more.props.shadow.is_empty(), "{:?}", more.props.shadow);
+        // The same document with no ind shadow (as imported before).
+        let mut bare = d.clone();
+        for b in &mut bare.body {
+            if let DocBlock::Paragraph(p) = b {
+                if p.props.indent != 0 {
+                    p.props.shadow.clear();
+                }
+            }
+        }
+        assert_ne!(d, bare);
+        assert_eq!(
+            crate::serialize::document_to_xml(&d),
+            crate::serialize::document_to_xml(&bare)
+        );
+    }
+
     #[test]
     fn mark_and_spacing_survive_a_save_and_a_load() {
         let imported = doc(&outlook_mail());
@@ -7322,6 +7371,9 @@ mod outlook_tests {
             ),
             (None, 600, 0)
         );
+        // It gave up the number's loaded `w:ind` with it (#1986).
+        assert!(first.props.shadow.is_empty(), "{:?}", first.props.shadow);
+        assert!(para_of(&d, "x").props.has_loaded_left_indent());
         // A `<br>` is a line: the number is beside it, as in a browser.
         let d = doc("<ol><li><div><br></div><div>y</div></li></ol>");
         assert_eq!(para_of(&d, "y").props.num_id, None);
