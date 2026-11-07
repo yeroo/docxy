@@ -709,6 +709,13 @@ impl ParProps {
         crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_LEFT)
     }
 
+    /// Whether the paragraph has a left indent of its own, set in session
+    /// or loaded (a `w:left="0"` pin included): it replaces a list level's
+    /// indent, as Word reads the file (#1986).
+    pub fn has_direct_left_indent(&self) -> bool {
+        self.indent > 0 || self.has_loaded_left_indent()
+    }
+
     /// Whether the paragraph is a list item: a `w:numId` of 0 means "no
     /// numbering" in OOXML, as in `numbering.rs`.
     pub fn in_list(&self) -> bool {

@@ -677,7 +677,6 @@ impl DocView {
 
     // ---- what the harness reads -------------------------------------------
 
-    /// The view's state for the harness's `ext-doc-read`.
     /// The harness's `ext-doc-layout` (#1986): [`painted_layout_json`] of
     /// the last frame, or `painted: false` until a frame of the document
     /// last set has been painted.
@@ -696,6 +695,7 @@ impl DocView {
         }
     }
 
+    /// The view's state for the harness's `ext-doc-read`.
     pub(crate) fn harness_json(&self, window: &Window) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         let body = &self.editor.doc.body;

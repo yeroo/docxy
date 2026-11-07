@@ -43,15 +43,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
   the edit, re-parsing the numbering; the suite after an indent that made
   a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
-  draws the level from `ilvl`, so there it is for the saved file). Not an
-  undo step; nothing repairs at load. The suite's `eff_indent` gives an
-  explicit numId 0 no level step, nor an item with a loaded left indent
-  (`has_loaded_left_indent`): a loaded `w:left` replaces the level's, as
-  Word reads the file (#1986). So such an item keeps its loaded left as it
-  moves: `set_indent_from` pins it on a direct-numId (`Level`) item too, and
-  `step_indent` pins it when it was loaded before the step; forgetting it
-  would add the level step back and the item would jump `ilvl × 300` right
-  until a reload. Items given their indent in session keep the step.
+  draws an item with no left of its own at its level from `ilvl`, so there
+  it is for the saved file). Not an undo step; nothing repairs at load.
+- The suite's `eff_indent` adds the level step `ilvl × 300` only to a list
+  item with no left indent of its own: an explicit numId 0 takes none, nor
+  does an item with a direct left (`ParProps::has_direct_left_indent`:
+  `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included, the
+  editor's `had_direct_left`). A direct `w:left` replaces the level's
+  indent, as Word reads the file, and the session follows it, so an item
+  draws where a save and reload puts it (#1986 r1: a rule telling a
+  session-written left from a loaded one cannot survive the reload, which
+  sees only `w:left`). The ruler's Left drag writes the marker itself
+  (`RulerChange::Left { indent: marker }`): after the first move the item
+  has a left of its own; `dragged_left_marker` still clamps an item with
+  none at the drag start to its level's indent.
 
 ## Manual hyphenation (#1266)
 
@@ -253,6 +258,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   hanging indent its trailing space goes ("1." not "1. "): the gap after it
   separates it, and "1. " fills a browser's 17.8 px hang exactly, pushing
   the text to the next stop. The numbering level's own `w:rPr` is not read.
+- A nested HTML list sits at its own indent (600 twips per list): an item
+  with a left of its own takes no level step (Lists, above).
 - Harness (test extension): `ext-doc-load {"html": ...}` imports a page
   into the view; `ext-doc-layout` reads the last frame
   (`DocView::layout_json`, recorded only in a harness instance through

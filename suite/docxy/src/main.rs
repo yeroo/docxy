@@ -6323,10 +6323,11 @@ struct EffIndent {
 
 fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
     // An explicit numId 0 is no list (#1728). No numId at all may still be
-    // a level of the style's numbering, so it keeps its step. A loaded
-    // left indent replaces the level's, as Word reads the file: an HTML
-    // item's already holds its nesting (#1986).
-    let list_step = if p.num_id == Some(0) || p.has_loaded_left_indent() {
+    // a level of the style's numbering, so it keeps its step. A left
+    // indent of its own (set in session or loaded) replaces the level's,
+    // as Word reads the file, so an item draws where a reload puts it: an
+    // HTML item's already holds its nesting (#1986).
+    let list_step = if p.num_id == Some(0) || p.has_direct_left_indent() {
         0
     } else {
         p.ilvl.max(0).saturating_mul(300)
@@ -7186,21 +7187,35 @@ mod flow_view_tests {
     use core::prelude::v1::test;
     use docxcore::model::ParProps;
 
-    /// #1986: a loaded left indent replaces the level's, as Word reads the
-    /// file (an imported HTML item's holds its nesting), so no step adds.
+    /// #1986: a left indent of its own (set in session or loaded, a
+    /// `w:left="0"` pin too) replaces the level's, as Word reads the file;
+    /// only an item with none keeps `ilvl × 300`.
     #[test]
-    fn a_loaded_left_indent_takes_no_list_step() {
-        let mut p = ParProps {
-            indent: 1200,
-            first_line: -267,
+    fn a_direct_left_indent_takes_no_list_step() {
+        let level = ParProps {
             num_id: Some(2),
             ilvl: 1,
             ..ParProps::default()
         };
-        assert_eq!(eff_indent(&p).list_step, 300);
-        p.shadow = vec![r#"<w:ind w:left="1200" w:hanging="267"/>"#.to_string()];
-        let eff = eff_indent(&p);
+        assert_eq!(
+            (eff_indent(&level).list_step, eff_indent(&level).left),
+            (300, 300)
+        );
+        let own = ParProps {
+            indent: 1200,
+            first_line: -267,
+            ..level.clone()
+        };
+        let eff = eff_indent(&own);
         assert_eq!((eff.list_step, eff.left, eff.first), (0, 1200, -267));
+        let pinned = ParProps {
+            shadow: vec![r#"<w:ind w:left="0"/>"#.to_string()],
+            ..level
+        };
+        assert_eq!(
+            (eff_indent(&pinned).list_step, eff_indent(&pinned).left),
+            (0, 0)
+        );
         // An imported nested item, as the importer gives it.
         let d = docxcore::import::html::import_html(
             b"<ol><li><div>a</div><ol><li><div>b</div></li></ol></li></ol>",
@@ -7217,9 +7232,114 @@ mod flow_view_tests {
         assert_eq!(lefts, [600, 1200]);
     }
 
+    /// The first paragraph's props.
+    fn first_props(ed: &docxcore::editor::Editor) -> ParProps {
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => p.props.clone(),
+            _ => panic!("no paragraph"),
+        }
+    }
+
+    /// Where the first paragraph draws once saved and opened again.
+    fn reloaded_left(ed: &docxcore::editor::Editor) -> i32 {
+        let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
+        let back = docxcore::package::load_package(&docxcore::package::save_package(&pkg))
+            .unwrap()
+            .document;
+        match back.body.iter().find(|b| matches!(b, Block::Paragraph(_))) {
+            Some(Block::Paragraph(p)) => eff_indent(&p.props).left,
+            _ => panic!("no paragraph"),
+        }
+    }
+
+    /// A one-item list made in session, Increased at the margin to level 1.
+    fn session_item() -> docxcore::editor::Editor {
+        let mut ed = docxcore::editor::Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "a".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+        });
+        ed.set_list(Some(NUM_DECIMAL));
+        ed.select_all();
+        ed.change_indent(720);
+        let p = first_props(&ed);
+        assert_eq!((p.ilvl, p.indent, eff_indent(&p).left), (1, 0, 300));
+        ed
+    }
+
+    /// #1986 r1 M1: an item given its left in session draws where the
+    /// saved file puts it.
+    #[test]
+    fn a_session_left_draws_as_it_does_after_a_reload() {
+        let mut ed = session_item();
+        assert_eq!(reloaded_left(&ed), 300);
+        ed.set_indent(720, 0);
+        assert_eq!(eff_indent(&first_props(&ed)).left, 720);
+        assert_eq!(reloaded_left(&ed), 720);
+    }
+
+    /// #1986 r1 M2-M4: a ruler drag of a list item draws it at the marker
+    /// on every move, through the clamp and back, as after a reload.
+    #[test]
+    fn a_list_item_follows_the_ruler_drag() {
+        let drag = |ed: &mut docxcore::editor::Editor, moves: &[i32]| {
+            let start = eff_indent(&first_props(ed));
+            let base = ed.indent_base();
+            let d = RulerDrag {
+                handle: RulerHandle::Left,
+                start_x: 200.0,
+                zoom: 1.0,
+                indent: start,
+                page: docxcore::model::PageGeom::default(),
+                content_x: 300.0,
+                content_right: 900.0,
+                page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+                sect_checkpointed: false,
+            };
+            for &delta in moves {
+                let marker = dragged_left_marker(start, delta);
+                let RulerChange::Left { indent, first } =
+                    ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change
+                else {
+                    panic!("not a left change");
+                };
+                ed.set_indent_from(indent, first, &base);
+                let p = first_props(ed);
+                assert_eq!(eff_indent(&p).left, marker, "move {delta}: {p:?}");
+                assert_eq!(reloaded_left(ed), marker, "move {delta} reloaded");
+            }
+        };
+        // No left of its own at the start: it stops at its level's 300.
+        let mut ed = session_item();
+        drag(&mut ed, &[-720, 300, 600]);
+        // A left set in session: to the margin (pinned at 0) and back.
+        let mut ed = session_item();
+        ed.set_indent(360, 0);
+        drag(&mut ed, &[-720, 240, 600]);
+    }
+
+    /// #1986 r1 M3: Decrease to the margin, then Increase, on an item
+    /// given its left in session draws where the file puts it each step.
+    #[test]
+    fn decrease_to_the_margin_then_increase_draws_as_reloaded() {
+        let mut ed = session_item();
+        ed.set_indent(360, 0);
+        assert_eq!(eff_indent(&first_props(&ed)).left, 360);
+        assert_eq!(reloaded_left(&ed), 360);
+        for (delta, want) in [(-720, 0), (720, 720), (-360, 360)] {
+            ed.change_indent(delta);
+            let p = first_props(&ed);
+            assert_eq!((eff_indent(&p).left, p.ilvl), (want, 1), "{delta}: {p:?}");
+            assert_eq!(reloaded_left(&ed), want, "{delta} reloaded");
+        }
+    }
+
     /// #1986: an imported nested item stays where it is drawn as the ruler
-    /// or Increase Indent moves it: its loaded left stays loaded, so no
-    /// level step comes back.
+    /// or Increase Indent moves it.
     #[test]
     fn an_imported_items_indent_edit_does_not_jump() {
         let d = docxcore::import::html::import_html(
@@ -7237,11 +7357,11 @@ mod flow_view_tests {
             _ => panic!(),
         };
         ed.set_indent(1300, -267);
+        assert_eq!(eff_indent(&item(&ed)).left, 1300);
         ed.change_indent(720);
         let p = item(&ed);
         assert_eq!((p.indent, p.ilvl), (2020, 1));
-        assert!(p.has_loaded_left_indent());
-        assert_eq!(eff_indent(&p).left, p.indent);
+        assert_eq!(eff_indent(&p).left, 2020);
     }
 
     fn spacing(before: i32, after: i32, line: i32, rule: &str) -> docxcore::model::Spacing {
@@ -7893,26 +8013,37 @@ mod ruler_geom_tests {
         };
         let eff = eff_indent(&p);
         assert_eq!((eff.list_step, eff.left), (0, 720));
+        // Listed, the level's step stands only with no left of its own
+        // (#1986).
         let listed = eff_indent(&ParProps {
             num_id: Some(1),
+            ..p.clone()
+        });
+        assert_eq!((listed.list_step, listed.left), (0, 720));
+        let at_level = eff_indent(&ParProps {
+            num_id: Some(1),
+            indent: 0,
             ..p
         });
-        assert_eq!((listed.list_step, listed.left), (600, 1320));
+        assert_eq!((at_level.list_step, at_level.left), (600, 600));
     }
 
+    /// An item at its level's indent (no left of its own) stops there; the
+    /// left the drag writes is the marker itself (#1986).
     #[test]
     fn list_left_drag_clamps_to_its_nesting_step() {
         let p = ParProps {
-            indent: 1440,
+            indent: 0,
             ilvl: 2,
             ..ParProps::default()
         };
         let start = eff_indent(&p);
+        assert_eq!((start.left, start.list_step), (600, 600));
         for zoom in [1.0, 2.0] {
             let marker = dragged_left_marker(start, px_tw(-400.0 * zoom, zoom));
             assert_eq!(marker, 600);
-            assert_eq!(marker - start.list_step, 0);
             near(200.0 + tw_px(marker, zoom), 200.0 + 600.0 * zoom / 15.0);
+            assert_eq!(dragged_left_marker(start, 300), 900);
         }
     }
 
@@ -8399,10 +8530,12 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
             )
         }
         RulerHandle::Left => {
+            // The left written is the marker itself: once moved, the item
+            // has a left of its own, which takes no level step (#1986).
             let marker = dragged_left_marker(d.indent, delta);
             (
                 RulerChange::Left {
-                    indent: marker - d.indent.list_step,
+                    indent: marker,
                     first: d.indent.first.max(-marker),
                 },
                 d.content_x + tw(marker),

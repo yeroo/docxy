@@ -483,12 +483,9 @@ is #1987.
   - Every HTML item paragraph writes that `w:ind`, numbered or not. A
     numbered one at the margin writes `ZERO_IND` (`w:left="0"
     w:hanging="0"`, set as its load shadow, so an edit replaces it), or
-    Word and LibreOffice would take the level's 720 (#1979 r1). Any other
-    numbered one keeps the `w:ind` a save writes for it
-    (`serialize::direct_ind_xml`) as its load shadow, so it has a loaded
-    left on import as after a save and reload, and the suite draws it with
-    no level step (#1986); the save writes the same bytes. An empty
-    paragraph that gives its number up (`release_number`) drops the shadow.
+    Word and LibreOffice would take the level's 720 (#1979 r1). The suite
+    draws an item with a left of its own (600 per list, or that pin) with
+    no level step, so a nested list sits at its own indent (#1986).
   - A numbered paragraph hangs a browser's outside marker with its space:
     `DECIMAL_HANG` 1.1125em for an `ol`, `BULLET_HANG` 1.375em for a
     `ul`, measured in Chrome. The em is the `li`'s own font (`item_elem`),

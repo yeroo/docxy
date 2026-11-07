@@ -4254,7 +4254,7 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
 
 /// Whether the paragraph carries a left indent of its own, set in session or loaded.
 fn had_direct_left(p: &ParProps) -> bool {
-    p.indent > 0 || p.has_loaded_left_indent()
+    p.has_direct_left_indent()
 }
 
 /// Whether the paragraph is a list item: a nonzero direct `numId`, or, with
