@@ -243,7 +243,8 @@ pub fn account(path: &Path) -> Option<String> {
 /// (DPAPI on Windows, 0600 plaintext elsewhere): a store failure never
 /// fails the save, as losing the sign-in would be worse than the warned
 /// fallback. A reference that named another key has that item deleted
-/// once the new reference is written (errors ignored: the token is saved).
+/// once the new reference is written (errors ignored: the token is saved),
+/// unless the file at that key still refers to it (a copied cache).
 /// An error is a failure to write the file; whatever file was there is left
 /// as it was (an old reference to this key still points at the item the
 /// store now holds; an old token file is migrated by the next load).
@@ -262,7 +263,13 @@ pub(crate) fn save_in(
         let previous = referenced_key(path).filter(|k| *k != key);
         if store.set(&key, &label(&t.account), json.as_bytes()).is_ok() {
             write_file(path, &reference_json(store.name(), &key, &t.account))?;
-            if let Some(previous) = previous {
+            // Unless another cache still uses it: a copied cache directory's
+            // original still holds a reference to its own key. Checked
+            // after the write, so a file reached under the old name (the
+            // same file under another path) now names the new key.
+            if let Some(previous) = previous
+                && referenced_key(Path::new(&previous)).as_deref() != Some(previous.as_str())
+            {
                 let _ = store.delete(&previous);
             }
             return Ok(Storage::SecretStore);
@@ -1315,6 +1322,62 @@ mod tests {
         save_in(&p, &secret_sample(), Some(&store)).unwrap();
         assert!(store.deletes.borrow().is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copied_cache_leaves_the_original_signed_in() {
+        // `/a/token.bin` copied to `/b/token.bin`: the copy names `/a`'s
+        // key. Its first save stores under its own key and keeps `/a`'s
+        // item, which `/a` still uses.
+        let root = test_dir("store-copied");
+        let (a, b) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let (pa, pb) = (a.join("token.bin"), b.join("token.bin"));
+        let store = FakeStore::new();
+        save_in(&pa, &secret_sample(), Some(&store)).unwrap();
+        fs::copy(&pa, &pb).unwrap();
+        let other = TokenSet {
+            refresh_token: "COPY_RT".into(),
+            ..secret_sample()
+        };
+        assert_eq!(
+            save_in(&pb, &other, Some(&store)).unwrap(),
+            Storage::SecretStore
+        );
+        assert!(
+            store.deletes.borrow().is_empty(),
+            "{:?}",
+            store.deletes.borrow()
+        );
+        let (got, storage) = load_in(&pa, Some(&store)).unwrap().unwrap();
+        assert_eq!(
+            (fields(&got), storage),
+            (fields(&secret_sample()), Storage::SecretStore)
+        );
+        let copy = load_in(&pb, Some(&store)).unwrap().unwrap().0;
+        assert_eq!(copy.refresh_token, "COPY_RT");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_reached_under_another_name_drops_the_old_key() {
+        // The same file under two names (a symlinked directory): the old
+        // name's file now holds the new reference, so the old item goes.
+        let root = test_dir("store-alias");
+        let real = root.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let (p_alias, p_real) = (alias.join("token.bin"), real.join("token.bin"));
+        let store = FakeStore::new();
+        save_in(&p_alias, &secret_sample(), Some(&store)).unwrap();
+        save_in(&p_real, &secret_sample(), Some(&store)).unwrap();
+        assert_eq!(*store.deletes.borrow(), vec![key_of(&p_alias)]);
+        let keys: Vec<String> = store.items.borrow().keys().cloned().collect();
+        assert_eq!(keys, vec![key_of(&p_real)]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

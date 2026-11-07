@@ -153,30 +153,42 @@ impl Session {
         }
     }
 
-    /// Deletes `key`'s items other than `kept` outside `collection`,
-    /// unlocking the locked ones first.
-    fn delete_outside(
+    /// Deletes `key`'s unlocked items other than `kept` outside
+    /// `collection`, never prompting: a locked twin is left to sign-out's
+    /// `delete`, which unlocks. A `Delete` that asks for a prompt is left
+    /// unanswered. Every item is tried; the first error is returned.
+    fn delete_unlocked_twins(
         &self,
         key: &str,
         kept: &ObjectPath<'_>,
         collection: &str,
     ) -> Result<(), SecretStoreError> {
         let inside = format!("{collection}/");
-        let outside = |items: Vec<OwnedObjectPath>| -> Vec<OwnedObjectPath> {
-            items
-                .into_iter()
-                .filter(|i| i.as_str() != kept.as_str() && !i.as_str().starts_with(&inside))
-                .collect()
-        };
-        let (unlocked, locked) = self.search(key)?;
-        let (unlocked, locked) = (outside(unlocked), outside(locked));
-        if !locked.is_empty() {
-            self.unlock(&locked)?;
+        let (unlocked, _) = self.search(key)?;
+        let mut first = None;
+        for item in unlocked
+            .iter()
+            .filter(|i| i.as_str() != kept.as_str() && !i.as_str().starts_with(&inside))
+        {
+            let deleted: Result<OwnedObjectPath, _> =
+                call(&self.conn, item.as_str(), ITEM, "Delete", &());
+            if let Err(e) = deleted {
+                first.get_or_insert(e);
+            }
         }
-        for item in unlocked.iter().chain(&locked) {
-            self.delete_item(item)?;
+        first.map_or(Ok(()), Err)
+    }
+
+    /// Deletes every item of `items`, each tried; the first error is
+    /// returned.
+    fn delete_all(&self, items: &[OwnedObjectPath]) -> Result<(), SecretStoreError> {
+        let mut first = None;
+        for item in items {
+            if let Err(e) = self.delete_item(item) {
+                first.get_or_insert(e);
+            }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
     /// Deletes the item at `item`, through a prompt if the service asks.
@@ -240,22 +252,29 @@ impl SecretStore for SecretService {
         s.prompt(&prompt)?;
         // `replace` replaces only within the default collection: a twin a
         // user moved to another keyring would otherwise be read first by
-        // `get` and go stale. Best effort: the token is stored, so a
-        // failure here must not make the save fall back to the file.
-        let _ = s.delete_outside(key, &item, collection.as_str());
+        // `get` and go stale. Best effort and without a prompt: the token
+        // is stored, so a failure here must not make the save fall back to
+        // the file, and a locked twin must not raise a prompt on every
+        // save (sign-out removes it).
+        let _ = s.delete_unlocked_twins(key, &item, collection.as_str());
         Ok(())
     }
 
+    /// Deletes every item of `key`: the unlocked ones first, so a locked
+    /// twin whose unlock prompt is refused cannot keep the live token;
+    /// then the locked ones, unlocked first (a locked item's `Delete`
+    /// fails with `IsLocked`). Everything is tried; the first error is
+    /// returned.
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
         let s = Session::open()?;
         let (unlocked, locked) = s.search(key)?;
-        if !locked.is_empty() {
-            s.unlock(&locked)?;
+        let mut first = s.delete_all(&unlocked).err();
+        if !locked.is_empty()
+            && let Err(e) = s.unlock(&locked).and_then(|()| s.delete_all(&locked))
+        {
+            first.get_or_insert(e);
         }
-        for item in unlocked.iter().chain(&locked) {
-            s.delete_item(item)?;
-        }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 }
 
@@ -288,8 +307,9 @@ where
 }
 
 /// A D-Bus error as a store error: no Secret Service on the bus (nothing
-/// owns or can activate `org.freedesktop.secrets`) is `Unavailable`;
-/// anything else is `Failed`.
+/// owns or can activate `org.freedesktop.secrets`) is `Unavailable`; a call
+/// not answered within [`METHOD_TIMEOUT`] (`InputOutput(TimedOut)`) is
+/// `Refused`, so the latch stops asking; anything else is `Failed`.
 fn classify(e: zbus::Error) -> SecretStoreError {
     let unknown = |name: &str| {
         matches!(
