@@ -88,6 +88,16 @@ CREATE TABLE IF NOT EXISTS contacts (
     relevance  INTEGER
 );
 
+-- The user's own Contacts folder (`/me/contacts`, #1934), one row per
+-- lowercased address, replaced whole by every successful fetch
+-- (`Store::replace_folder_contacts`). Apart from `contacts` on purpose: that
+-- table is `/me/people` and mined correspondents, autocomplete only, while
+-- this one answers `Store::is_contact` for a trust decision.
+CREATE TABLE IF NOT EXISTS folder_contacts (
+    address TEXT PRIMARY KEY,
+    name    TEXT NOT NULL DEFAULT ''
+);
+
 -- `fetched_as` is the format `FetchBody` asked Graph for (`text`/`html`,
 -- #1901); NULL for a body written locally (drafts, createReply), which
 -- `Store::get_body_for` never offers for a refetch, or by an engine from
