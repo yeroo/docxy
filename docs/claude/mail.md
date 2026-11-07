@@ -591,3 +591,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   attachments still holds a click), the folder-tree listing or the
   calendar's pages; no `$batch`; pictures and attachments are not
   prefetched; no lookxy setting for the window.
+
+## Calendar sync keeps reminder settings (#1937)
+
+- `Store::upsert_event` and `Store::replace_events_in_window` (the writer
+  `Engine::refresh_calendar` uses, in one transaction) both write an
+  `events` row through one private `upsert_event_on(conn, e)`, so every
+  column `NewEvent` carries, `reminder_minutes` and `is_reminder_on`
+  included, is written by both. Before #1937 the window writer had its own
+  copy of the SQL without the two reminder columns, and every synced event
+  read back as 0 minutes, reminder off. A new `events` column goes into
+  `upsert_event_on` once. `put_event_attendees` opens its own transaction,
+  so `replace_events_in_window` still inlines the attendee SQL.
+- Tests: `store` `calendar_tests::replace_events_in_window_writes_reminder_fields`
+  (insert, and a later refresh that changes them),
+  `calendar_tests::replace_events_in_window_conflict_path_updates_reminder_fields`
+  (a stored row outside the window takes the `ON CONFLICT` path), and
+  `engine.rs` `tests::refresh_calendar_keeps_reminder_settings` (a fake
+  `calendarView` with `isReminderOn` / `reminderMinutesBeforeStart`).
+- Not done: creating or updating an event sends no reminder fields to Graph
+  (`event_body_json`), and a `local:` event is stored with 0/false until the
+  next refresh.
