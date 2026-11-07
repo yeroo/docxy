@@ -393,10 +393,12 @@ pub enum SyncEvent {
     /// renamed, recoloured or moved), or which of them sync did (#1984);
     /// re-read `Store::calendars`.
     CalendarsUpdated,
-    /// A [`SyncCommand::FetchCalendarRange`] finished: every synced
-    /// calendar's events over `[from, to)` (the bounds the command carried)
-    /// are in the store, fetched or already fresh; read them with
-    /// `Store::events_in_range` (#2014).
+    /// A [`SyncCommand::FetchCalendarRange`] finished (#2014): every synced
+    /// calendar whose view did not fail has its events over `[from, to)`
+    /// (the bounds the command carried) in the store, fetched or already
+    /// fresh; read them with `Store::events_in_range`. A calendar whose
+    /// view failed (a 404, HTTP or parse error) was reported by an earlier
+    /// [`SyncEvent::Error`]; asking again fetches what is still missing.
     CalendarRangeFetched { from: String, to: String },
     /// A status transition.
     State(SyncState),
@@ -3252,13 +3254,41 @@ impl Engine {
             }
         };
         let mut wrote = false;
+        let finished = self.fetch_range_gaps(&synced, from, to, &mut wrote);
+        // Whatever ended the command, what landed is announced.
+        if wrote {
+            self.emit(SyncEvent::CalendarUpdated);
+        }
+        if finished {
+            self.emit(SyncEvent::CalendarRangeFetched {
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+    }
+
+    /// `fetch_calendar_range`'s loop: fetches and stores each gap of each
+    /// of `synced` over `[from, to)`, setting `wrote` once a gap is
+    /// stored. `false` when the command ends early (signed out, a throttle
+    /// or back-off wait, a 401, throttle or transport error, a store
+    /// error; each already reported), so no `CalendarRangeFetched` follows.
+    /// A 404, HTTP or parse error (reported by `react`) leaves that gap and
+    /// the calendar's later gaps unfetched and unrecorded, its earlier gaps
+    /// stay written, and the next calendar carries on.
+    fn fetch_range_gaps(
+        &mut self,
+        synced: &[String],
+        from: &str,
+        to: &str,
+        wrote: &mut bool,
+    ) -> bool {
         for id in synced {
             let fresh_since = self.range_stamp().fresh_since;
-            let gaps = match self.store.calendar_range_gaps(&id, from, to, fresh_since) {
+            let gaps = match self.store.calendar_range_gaps(id, from, to, fresh_since) {
                 Ok(gaps) => gaps,
                 Err(e) => {
                     self.emit(SyncEvent::Error(e.to_string()));
-                    return;
+                    return false;
                 }
             };
             if gaps.is_empty() {
@@ -3266,47 +3296,37 @@ impl Engine {
             }
             if self.token.is_none() {
                 self.emit(SyncEvent::Error("not signed in".to_string()));
-                return;
+                return false;
             }
-            if waiting(self) {
-                if wrote {
-                    self.emit(SyncEvent::CalendarUpdated);
-                }
-                return;
+            if self.next_retry.is_some_and(|t| Instant::now() < t) {
+                return false;
             }
             for (a, b) in gaps {
-                match self.with_auth(|c| c.calendar_view_in(&id, &a, &b)) {
+                match self.with_auth(|c| c.calendar_view_in(id, &a, &b)) {
                     Ok(events) => {
                         let f = fetched_calendar(id.clone(), &events);
                         let stamp = self.range_stamp();
                         if let Err(e) = self.store.apply_calendar_range(&a, &b, &f, stamp) {
                             self.emit(SyncEvent::Error(e.to_string()));
-                            return;
+                            return false;
                         }
-                        wrote = true;
+                        *wrote = true;
                     }
                     Err(e) => {
                         // Sign-in, throttle or offline: the range waits
                         // for the host to ask again.
                         if self.react(e) {
-                            if wrote {
-                                self.emit(SyncEvent::CalendarUpdated);
-                            }
-                            return;
+                            return false;
                         }
-                        // Reported: this calendar keeps its rows.
+                        // Reported: this gap and the calendar's later ones
+                        // stay unfetched and unrecorded (its earlier gaps
+                        // stay written), so asking again fetches them.
                         break;
                     }
                 }
             }
         }
-        if wrote {
-            self.emit(SyncEvent::CalendarUpdated);
-        }
-        self.emit(SyncEvent::CalendarRangeFetched {
-            from: from.to_string(),
-            to: to.to_string(),
-        });
+        true
     }
 
     /// `SyncCommand::SetCalendars`: stores the choice (deleting the events of

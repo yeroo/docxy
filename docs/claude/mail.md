@@ -920,8 +920,13 @@ Item 1 of #1984: a host whose calendar shows dates outside the kept window
   throttle or back-off wait the command does nothing more, and a 401,
   throttle or transport error mid-range ends it (what landed stays,
   recorded): in both no `CalendarRangeFetched`, the host asks again. A
-  404/HTTP/parse error on one calendar is an `Error`, the calendar keeps
-  its rows and records nothing, and the others carry on.
+  404/HTTP/parse error on a calendar's gap is an `Error`: that gap and the
+  calendar's later gaps stay unfetched and unrecorded (its earlier gaps stay
+  written), and the other calendars carry on, so `CalendarRangeFetched`
+  still follows and means "every calendar whose view did not fail"; asking
+  again fetches what is missing. However the command ends (a store error
+  too), `CalendarUpdated` goes out first when a gap was written
+  (`Engine::fetch_range_gaps`).
 - Coverage is the `calendar_ranges` table (`calendar_id`, `from_utc`,
   `to_utc`, `fetched_at` in unix seconds), kept on disk, so a restart does
   not re-fetch. Per calendar the intervals are disjoint: recording one cuts
