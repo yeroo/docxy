@@ -2568,7 +2568,9 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// `place` across `text_column`, `null` without one:
 /// `crate::painted_tables_json`), and `pictures`, each body inline picture
 /// the last frame built (`width`, `height`, clip `radius`, `shape`, `round`:
-/// `crate::pictures::drawn_pictures_json`, #1926).
+/// `crate::pictures::drawn_pictures_json`, #1926), and `layout`, the flow
+/// view's paragraphs (`crate::doc_view::painted_layout_json`, #1986; `null`
+/// in Print Layout).
 fn flow_state(app: &crate::Docxy) -> Json {
     let probe = app.ruler_probe.borrow();
     let num = |v: f32| Json::Num(f64::from(v.round()));
@@ -2604,6 +2606,18 @@ fn flow_state(app: &crate::Docxy) -> Json {
         (
             "pictures",
             crate::pictures::drawn_pictures_json(&app.drawn_pictures),
+        ),
+        // The flow view's paragraphs as last painted (#1986), as the test
+        // extension's `ext-doc-layout` reads them; `null` in Print Layout
+        // or before Web Layout has drawn.
+        (
+            "layout",
+            match (probe.draft, probe.draft_column) {
+                (true, Some(column)) => {
+                    crate::doc_view::painted_layout_json(&app.painted_paras.borrow(), column.x)
+                }
+                _ => Json::Null,
+            },
         ),
     ])
 }
@@ -5408,6 +5422,27 @@ fn dispatch_verb(
             };
             reply.insert(0, ("done".into(), Json::Bool(done)));
             Done::ok(Json::Obj(reply))
+        }
+        // Show a document imported from `html` in the view (#1986), as a
+        // host shows a mail; the reply is `ext-doc-read`'s fields.
+        "ext-doc-load" => {
+            let fixture = ext_fixture_view(app)?;
+            let html = args
+                .get("html")
+                .and_then(Json::as_str)
+                .ok_or("ext-doc-load takes 'html', the page to import")?;
+            let doc = docxcore::import::html::import_html(html.as_bytes())
+                .map_err(|e| format!("ext-doc-load: {e}"))?;
+            let view = fixture.read(cx).doc.clone();
+            view.update(cx, |v, cx| v.set_document(doc, None, cx));
+            Done::ok(view.read(cx).harness_json(window))
+        }
+        // The view's painted layout (#1986): each top-level paragraph's
+        // box, list number and lines, and the document's line pitch
+        // ([`crate::doc_view::DocView::layout_json`]).
+        "ext-doc-layout" => {
+            let fixture = ext_fixture_view(app)?;
+            Done::ok(fixture.read(cx).doc.read(cx).layout_json())
         }
         // What the view's `document()` and `package()` hand the host (#1947).
         "ext-doc-document" => {

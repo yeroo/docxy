@@ -3067,8 +3067,8 @@ impl Editor {
         self.selected_para_paths()
             .into_iter()
             .map(|path| {
-                let direct =
-                    resolve_para(&self.doc.body, &path).is_some_and(|p| had_direct_left(&p.props));
+                let direct = resolve_para(&self.doc.body, &path)
+                    .is_some_and(|p| p.props.has_direct_left_indent());
                 (path, direct)
             })
             .collect()
@@ -3079,9 +3079,22 @@ impl Editor {
     /// live paragraph, so an earlier move of the same drag does not count
     /// (#1814). A paragraph `base` does not name reads the live one.
     pub fn set_indent_from(&mut self, left: i32, first_line: i32, base: &[(Vec<usize>, bool)]) {
+        self.set_indents_from(base, |_, _| (left, first_line));
+    }
+
+    /// [`Self::set_indent_from`], each selected paragraph taking its own
+    /// left indent and first-line delta from `each` by its index among the
+    /// selected paragraphs and its path (the suite's ruler drag moves each
+    /// from where it was drawn, #1986).
+    pub fn set_indents_from(
+        &mut self,
+        base: &[(Vec<usize>, bool)],
+        each: impl Fn(usize, &[usize]) -> (i32, i32),
+    ) {
         let styles = self.styles.clone();
         self.checkpoint(EditKind::Structural);
         for (i, path) in self.selected_para_paths().into_iter().enumerate() {
+            let (left, first_line) = each(i, &path);
             let Some(p) = para_mut(&mut self.doc.body, &path) else {
                 continue;
             };
@@ -3094,7 +3107,7 @@ impl Editor {
                     .get(i)
                     .filter(|(b, _)| *b == path)
                     .or_else(|| base.iter().find(|(b, _)| *b == path))
-                    .map_or_else(|| had_direct_left(pr), |(_, d)| *d);
+                    .map_or_else(|| pr.has_direct_left_indent(), |(_, d)| *d);
                 (fallback != IndentFallback::None && direct).then_some(0)
             } else {
                 match fallback {
@@ -4225,7 +4238,7 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
     // A style item's in-session indent cannot be told from nothing once
     // Increase wrote it, so only a loaded (or pinned) left counts there.
     let direct = if fallback == IndentFallback::Level {
-        had_direct_left(pr)
+        pr.has_direct_left_indent()
     } else {
         pr.has_loaded_left_indent()
     };
@@ -4250,11 +4263,6 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
         // decrease clamped to zero twips must still clear `w:leftChars`.
         pr.forget_loaded_indent(&[IndentSide::Left]);
     }
-}
-
-/// Whether the paragraph carries a left indent of its own, set in session or loaded.
-fn had_direct_left(p: &ParProps) -> bool {
-    p.indent > 0 || p.has_loaded_left_indent()
 }
 
 /// Whether the paragraph is a list item: a nonzero direct `numId`, or, with

@@ -426,7 +426,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 A simple mail from Outlook on the web, new Outlook or classic Outlook
 imports as a browser lays it out. Slice 1 of #1979: the model. The
 suite's flow view drawing it (marker look, spacing, line height) is
-#1986, and `ext::DocView`'s page margin is #1987.
+#1986 (`docs/claude/docx-editing.md`), and `ext::DocView`'s page margin
+is #1987.
 
 - Spacing comes from CSS only. Every HTML paragraph writes `w:spacing`:
   - `before`/`after` from its innermost block's top/bottom box, else 0.
@@ -482,7 +483,9 @@ suite's flow view drawing it (marker look, spacing, line height) is
   - Every HTML item paragraph writes that `w:ind`, numbered or not. A
     numbered one at the margin writes `ZERO_IND` (`w:left="0"
     w:hanging="0"`, set as its load shadow, so an edit replaces it), or
-    Word and LibreOffice would take the level's 720 (#1979 r1).
+    Word and LibreOffice would take the level's 720 (#1979 r1). The suite
+    draws an item with a left of its own (600 per list, or that pin) with
+    no level step, so a nested list sits at its own indent (#1986).
   - A numbered paragraph hangs a browser's outside marker with its space:
     `DECIMAL_HANG` 1.1125em for an `ol`, `BULLET_HANG` 1.375em for a
     `ul`, measured in Chrome. The em is the `li`'s own font (`item_elem`),
@@ -540,5 +543,3 @@ suite's flow view drawing it (marker look, spacing, line height) is
   - A page's `em` margin on a heading resolves at the parent's size, as
     before.
   - The HTML Standard's rarer quirks public ids and the IBM system id.
-  - The suite's `eff_indent` adds `ilvl × 300` to a nested item until
-    #1986.

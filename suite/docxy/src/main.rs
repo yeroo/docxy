@@ -5616,6 +5616,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
+    /// The document tab's top-level paragraphs as its flow view last painted
+    /// them, in a harness instance (#1986), for `doc`'s `flow.layout`.
+    painted_paras: PaintedParas,
     /// The document tab's body pictures as last drawn (#1926), for the
     /// harness's `doc` read.
     drawn_pictures: pictures::DrawnPictures,
@@ -6323,8 +6326,11 @@ struct EffIndent {
 
 fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
     // An explicit numId 0 is no list (#1728). No numId at all may still be
-    // a level of the style's numbering, so it keeps its step.
-    let list_step = if p.num_id == Some(0) {
+    // a level of the style's numbering, so it keeps its step. A left
+    // indent of its own (set in session or loaded) replaces the level's,
+    // as Word reads the file, so an item draws where a reload puts it: an
+    // HTML item's already holds its nesting (#1986).
+    let list_step = if p.num_id == Some(0) || p.has_direct_left_indent() {
         0
     } else {
         p.ilvl.max(0).saturating_mul(300)
@@ -6455,6 +6461,20 @@ fn leading_items(
         }
     }
     items
+}
+
+/// The width of the box a list number at `leading[k]` (measured
+/// `marker_width` px) is drawn in with the gap after it: their sum, so the
+/// text starts on the gap's stop whatever width the number's glyphs lay
+/// out at (DirectWrite and the measurer may differ by a pixel, #1986);
+/// `None` when no gap follows it (no hanging indent).
+fn marker_box_width(leading: &[LeadingItem], k: usize, marker_width: f32) -> Option<f32> {
+    match (leading.get(k), leading.get(k + 1)) {
+        (Some(LeadingItem::ListMarker), Some(LeadingItem::MarkerGap(gap))) => {
+            Some(marker_width + gap)
+        }
+        _ => None,
+    }
 }
 
 fn paragraph_indent_layout(indent: EffIndent, zoom: f32) -> ParagraphIndentLayout {
@@ -7177,6 +7197,660 @@ mod link_colour_tests {
     }
 }
 
+/// The flow view's drawing of an imported mail (#1986).
+#[cfg(test)]
+mod flow_view_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use docxcore::model::ParProps;
+
+    /// #1986: a left indent of its own (set in session or loaded, a
+    /// `w:left="0"` pin too) replaces the level's, as Word reads the file;
+    /// only an item with none keeps `ilvl × 300`.
+    #[test]
+    fn a_direct_left_indent_takes_no_list_step() {
+        let level = ParProps {
+            num_id: Some(2),
+            ilvl: 1,
+            ..ParProps::default()
+        };
+        assert_eq!(
+            (eff_indent(&level).list_step, eff_indent(&level).left),
+            (300, 300)
+        );
+        let own = ParProps {
+            indent: 1200,
+            first_line: -267,
+            ..level.clone()
+        };
+        let eff = eff_indent(&own);
+        assert_eq!((eff.list_step, eff.left, eff.first), (0, 1200, -267));
+        let pinned = ParProps {
+            shadow: vec![r#"<w:ind w:left="0"/>"#.to_string()],
+            ..level
+        };
+        assert_eq!(
+            (eff_indent(&pinned).list_step, eff_indent(&pinned).left),
+            (0, 0)
+        );
+        // An imported nested item, as the importer gives it.
+        let d = docxcore::import::html::import_html(
+            b"<ol><li><div>a</div><ol><li><div>b</div></li></ol></li></ol>",
+        )
+        .unwrap();
+        let lefts: Vec<i32> = d
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lefts, [600, 1200]);
+    }
+
+    /// The first paragraph's props.
+    fn first_props(ed: &docxcore::editor::Editor) -> ParProps {
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => p.props.clone(),
+            _ => panic!("no paragraph"),
+        }
+    }
+
+    /// Where the first paragraph draws once saved and opened again.
+    fn reloaded_left(ed: &docxcore::editor::Editor) -> i32 {
+        let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
+        let back = docxcore::package::load_package(&docxcore::package::save_package(&pkg))
+            .unwrap()
+            .document;
+        match back.body.iter().find(|b| matches!(b, Block::Paragraph(_))) {
+            Some(Block::Paragraph(p)) => eff_indent(&p.props).left,
+            _ => panic!("no paragraph"),
+        }
+    }
+
+    /// A one-item list made in session, Increased at the margin to level 1.
+    fn session_item() -> docxcore::editor::Editor {
+        let mut ed = docxcore::editor::Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "a".into(),
+                    ..Default::default()
+                })],
+                ..Default::default()
+            })],
+        });
+        ed.set_list(Some(NUM_DECIMAL));
+        ed.select_all();
+        ed.change_indent(720);
+        let p = first_props(&ed);
+        assert_eq!((p.ilvl, p.indent, eff_indent(&p).left), (1, 0, 300));
+        ed
+    }
+
+    /// #1986 r1 M1: an item given its left in session draws where the
+    /// saved file puts it.
+    #[test]
+    fn a_session_left_draws_as_it_does_after_a_reload() {
+        let mut ed = session_item();
+        assert_eq!(reloaded_left(&ed), 300);
+        ed.set_indent(720, 0);
+        assert_eq!(eff_indent(&first_props(&ed)).left, 720);
+        assert_eq!(reloaded_left(&ed), 720);
+    }
+
+    /// #1986 r1 M2-M4: a ruler drag of a list item draws it at the marker
+    /// on every move, through the clamp and back, as after a reload.
+    #[test]
+    fn a_list_item_follows_the_ruler_drag() {
+        let drag = |ed: &mut docxcore::editor::Editor, moves: &[i32]| {
+            let start = eff_indent(&first_props(ed));
+            let base = ed.indent_base();
+            let d = RulerDrag {
+                handle: RulerHandle::Left,
+                start_x: 200.0,
+                zoom: 1.0,
+                indent: start,
+                page: docxcore::model::PageGeom::default(),
+                content_x: 300.0,
+                content_right: 900.0,
+                page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+                sect_checkpointed: false,
+            };
+            let starts = RulerIndentBase::of(ed, false).starts;
+            for &delta in moves {
+                let marker = dragged_left_marker(start, delta);
+                let RulerChange::Left { indent, first } =
+                    ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change
+                else {
+                    panic!("not a left change");
+                };
+                ed.set_indents_from(&base, |i, path| {
+                    let at = ruler_start_at(&base, &starts, i, path);
+                    ruler_left_for(indent, first, start.left, at)
+                });
+                let p = first_props(ed);
+                assert_eq!(eff_indent(&p).left, marker, "move {delta}: {p:?}");
+                assert_eq!(reloaded_left(ed), marker, "move {delta} reloaded");
+            }
+        };
+        // No left of its own at the start: it stops at its level's 300.
+        let mut ed = session_item();
+        drag(&mut ed, &[-720, 300, 600]);
+        // A left set in session: to the margin (pinned at 0) and back.
+        let mut ed = session_item();
+        ed.set_indent(360, 0);
+        drag(&mut ed, &[-720, 240, 600]);
+    }
+
+    /// Lefts as drawn, by paragraph.
+    fn lefts(ed: &docxcore::editor::Editor) -> Vec<i32> {
+        ed.doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The same, once saved and opened again.
+    fn reloaded_lefts(ed: &docxcore::editor::Editor) -> Vec<i32> {
+        let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
+        let back = docxcore::package::load_package(&docxcore::package::save_package(&pkg))
+            .unwrap()
+            .document;
+        back.body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A selected list of items at `(ilvl, indent)`.
+    fn selected_list(items: &[(i32, i32)]) -> docxcore::editor::Editor {
+        let body = items
+            .iter()
+            .map(|&(ilvl, indent)| {
+                Block::Paragraph(Paragraph {
+                    props: ParProps {
+                        num_id: Some(NUM_DECIMAL),
+                        ilvl,
+                        indent,
+                        ..ParProps::default()
+                    },
+                    content: vec![Inline::Run(docxcore::model::Run {
+                        text: "a".into(),
+                        ..Default::default()
+                    })],
+                })
+            })
+            .collect();
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.select_all();
+        ed
+    }
+
+    /// One Left-drag move of `delta` twips over the whole selection, the
+    /// caret on paragraph `caret`, as `ruler_drag_move` applies it.
+    fn drag_selection(ed: &mut docxcore::editor::Editor, caret: usize, delta: i32) {
+        let Some(Block::Paragraph(p)) = ed.doc.body.get(caret) else {
+            panic!("no paragraph {caret}");
+        };
+        let start = eff_indent(&p.props);
+        let base = RulerIndentBase::of(ed, false);
+        let d = RulerDrag {
+            handle: RulerHandle::Left,
+            start_x: 200.0,
+            zoom: 1.0,
+            indent: start,
+            page: docxcore::model::PageGeom::default(),
+            content_x: 300.0,
+            content_right: 900.0,
+            page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+            sect_checkpointed: false,
+        };
+        let RulerChange::Left { indent, first } =
+            ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change
+        else {
+            panic!("not a left change");
+        };
+        let (paras, starts) = base.for_editor(false);
+        ed.set_indents_from(paras, |i, path| {
+            ruler_left_for(
+                indent,
+                first,
+                start.left,
+                ruler_start_at(paras, starts, i, path),
+            )
+        });
+    }
+
+    /// #1986 r2 M1, r3 M1: a Left drag over several paragraphs moves each
+    /// by the drag from where it was drawn, never left of its own level, so
+    /// a list keeps its nesting, on screen and after a save and reload.
+    #[test]
+    fn a_multi_item_ruler_drag_moves_each_by_the_drag() {
+        let level_only = [(0, 0), (1, 0), (2, 0)];
+        let mut ed = selected_list(&level_only);
+        assert_eq!(lefts(&ed), [0, 300, 600]);
+        drag_selection(&mut ed, 0, 360);
+        assert_eq!(lefts(&ed), [360, 660, 960]);
+        assert_eq!(reloaded_lefts(&ed), [360, 660, 960]);
+        // The caret on the deepest item (600 + 300 = 900, on the ruler's
+        // 180 tw grid).
+        let mut ed = selected_list(&level_only);
+        drag_selection(&mut ed, 2, 300);
+        assert_eq!(lefts(&ed), [300, 600, 900]);
+        assert_eq!(reloaded_lefts(&ed), [300, 600, 900]);
+        // Leftward, it clamps at the caret's level: none goes left of its own.
+        let mut ed = selected_list(&level_only);
+        drag_selection(&mut ed, 2, -720);
+        assert_eq!(lefts(&ed), [0, 300, 600]);
+        assert_eq!(reloaded_lefts(&ed), [0, 300, 600]);
+        // A left of its own beside a level-only item: each moves by the
+        // drag (300 + 360 snaps to 720: by 420).
+        let mixed = [(1, 720), (1, 0)];
+        let mut ed = selected_list(&mixed);
+        assert_eq!(lefts(&ed), [720, 300]);
+        drag_selection(&mut ed, 1, 360);
+        assert_eq!(lefts(&ed), [1140, 720]);
+        assert_eq!(reloaded_lefts(&ed), [1140, 720]);
+        let mut ed = selected_list(&mixed);
+        drag_selection(&mut ed, 0, 360);
+        assert_eq!(lefts(&ed), [1080, 660]);
+        assert_eq!(reloaded_lefts(&ed), [1080, 660]);
+        // Leftward, the level-only item stops at its level while the other
+        // goes on to the margin.
+        let mut ed = selected_list(&[(2, 0), (0, 720)]);
+        assert_eq!(lefts(&ed), [600, 720]);
+        drag_selection(&mut ed, 1, -720);
+        assert_eq!(lefts(&ed), [600, 0]);
+        assert_eq!(reloaded_lefts(&ed), [600, 0]);
+    }
+
+    /// #1986 r4 m1: a drag over a hanging list item and a plain paragraph,
+    /// the caret on the item, keeps each paragraph's own first line.
+    #[test]
+    fn a_multi_paragraph_drag_keeps_each_first_line() {
+        let para = |props: ParProps| {
+            Block::Paragraph(Paragraph {
+                props,
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "a".into(),
+                    ..Default::default()
+                })],
+            })
+        };
+        let body = vec![
+            para(ParProps {
+                num_id: Some(NUM_DECIMAL),
+                indent: 720,
+                first_line: -330,
+                ..ParProps::default()
+            }),
+            para(ParProps::default()),
+        ];
+        let mut ed = docxcore::editor::Editor::new(Document { body });
+        ed.select_all();
+        drag_selection(&mut ed, 0, 180);
+        let firsts: Vec<(i32, i32)> = ed
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some((p.props.indent, p.props.first_line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(firsts, [(900, -330), (180, 0)]);
+        assert_eq!(reloaded_lefts(&ed), [900, 180]);
+    }
+
+    /// #1986 r3 M1: an imported nested list (600 / 1200 twips, lefts of
+    /// their own) keeps its nesting under a drag, the caret on either item.
+    #[test]
+    fn an_imported_nested_list_keeps_its_nesting_under_a_drag() {
+        let imported = || {
+            let d = docxcore::import::html::import_html(
+                b"<ol><li><div>one</div><ol><li><div>two</div></li></ol></li></ol>",
+            )
+            .unwrap();
+            let mut ed = docxcore::editor::Editor::new(d);
+            ed.select_all();
+            assert_eq!(lefts(&ed), [600, 1200]);
+            ed
+        };
+        // On "one": 600 + 300 = 900.
+        let mut ed = imported();
+        drag_selection(&mut ed, 0, 300);
+        assert_eq!(lefts(&ed), [900, 1500]);
+        assert_eq!(reloaded_lefts(&ed), [900, 1500]);
+        // On "two": 1200 + 300 snaps to 1440, so by 240.
+        let mut ed = imported();
+        drag_selection(&mut ed, 1, 300);
+        assert_eq!(lefts(&ed), [840, 1440]);
+        assert_eq!(reloaded_lefts(&ed), [840, 1440]);
+        // On "two", leftward: "one" moves left too, and stops at the margin.
+        let mut ed = imported();
+        drag_selection(&mut ed, 1, -900);
+        assert_eq!(lefts(&ed), [0, 360]);
+        assert_eq!(reloaded_lefts(&ed), [0, 360]);
+    }
+
+    /// `ruler_left_for`: moved by the drag from its start, at or right of
+    /// its level, its own first line clamped to its new left; no start, the
+    /// marker and the caret's first line.
+    #[test]
+    fn ruler_left_for_moves_by_the_drag() {
+        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0, 0))), (360, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((600, 600, 0))), (960, 0));
+        assert_eq!(ruler_left_for(960, 0, 600, Some((0, 0, -720))), (360, -360));
+        // A plain paragraph keeps its own first line, not the caret's hang.
+        assert_eq!(ruler_left_for(960, -330, 600, Some((0, 0, 0))), (360, 0));
+        assert_eq!(ruler_left_for(300, 0, 600, Some((600, 600, 0))), (600, 0));
+        assert_eq!(ruler_left_for(960, -720, 600, None), (960, -720));
+        let paras = vec![(vec![0], false), (vec![3], true)];
+        let starts = vec![Some((0, 0, 0)), Some((720, 0, -360))];
+        assert_eq!(
+            ruler_start_at(&paras, &starts, 1, &[3]),
+            Some((720, 0, -360))
+        );
+        assert_eq!(
+            ruler_start_at(&paras, &starts, 0, &[3]),
+            Some((720, 0, -360))
+        );
+        assert_eq!(ruler_start_at(&paras, &starts, 0, &[9]), None);
+    }
+
+    /// #1986 r1 M3: Decrease to the margin, then Increase, on an item
+    /// given its left in session draws where the file puts it each step.
+    #[test]
+    fn decrease_to_the_margin_then_increase_draws_as_reloaded() {
+        let mut ed = session_item();
+        ed.set_indent(360, 0);
+        assert_eq!(eff_indent(&first_props(&ed)).left, 360);
+        assert_eq!(reloaded_left(&ed), 360);
+        for (delta, want) in [(-720, 0), (720, 720), (-360, 360)] {
+            ed.change_indent(delta);
+            let p = first_props(&ed);
+            assert_eq!((eff_indent(&p).left, p.ilvl), (want, 1), "{delta}: {p:?}");
+            assert_eq!(reloaded_left(&ed), want, "{delta} reloaded");
+        }
+    }
+
+    /// #1986: an imported nested item stays where it is drawn as the ruler
+    /// or Increase Indent moves it.
+    #[test]
+    fn an_imported_items_indent_edit_does_not_jump() {
+        let d = docxcore::import::html::import_html(
+            b"<ol><li><div>a</div><ol><li><div>b</div></li></ol></li></ol>",
+        )
+        .unwrap();
+        let mut ed = docxcore::editor::Editor::new(d);
+        ed.caret = docxcore::editor::Caret {
+            path: vec![1],
+            offset: 0,
+        };
+        ed.anchor = None;
+        let item = |ed: &docxcore::editor::Editor| match &ed.doc.body[1] {
+            Block::Paragraph(p) => p.props.clone(),
+            _ => panic!(),
+        };
+        ed.set_indent(1300, -267);
+        assert_eq!(eff_indent(&item(&ed)).left, 1300);
+        ed.change_indent(720);
+        let p = item(&ed);
+        assert_eq!((p.indent, p.ilvl), (2020, 1));
+        assert_eq!(eff_indent(&p).left, 2020);
+    }
+
+    /// #1986 ci1: in a hanging indent the number and its gap are one box
+    /// ending on the stop, whatever the number measured, so the text's x
+    /// does not follow the number's laid-out width; with no hang, none.
+    #[test]
+    fn a_hanging_number_sits_in_a_box_ending_on_the_stop() {
+        let p = ParProps {
+            indent: 600,
+            first_line: -267,
+            num_id: Some(2),
+            ..ParProps::default()
+        };
+        let layout = paragraph_indent_layout(eff_indent(&p), 1.0);
+        for measured in [13.0, 13.4, 14.2] {
+            let leading = leading_items(layout, Some(measured), 48.0, &[]);
+            let k = leading
+                .iter()
+                .position(|l| *l == LeadingItem::ListMarker)
+                .unwrap();
+            let width = marker_box_width(&leading, k, measured).expect("a box");
+            assert!(
+                (layout.first_x + width - 40.0).abs() < 0.01,
+                "{measured}: {width}"
+            );
+        }
+        let flat = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                indent: 600,
+                num_id: Some(2),
+                ..ParProps::default()
+            }),
+            1.0,
+        );
+        let leading = leading_items(flat, Some(13.0), 48.0, &[]);
+        assert_eq!(leading, [LeadingItem::ListMarker]);
+        assert_eq!(marker_box_width(&leading, 0, 13.0), None);
+    }
+
+    fn spacing(before: i32, after: i32, line: i32, rule: &str) -> docxcore::model::Spacing {
+        docxcore::model::Spacing {
+            before: Some(before),
+            after: Some(after),
+            line: Some(line),
+            line_rule: Some(rule.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// #1986: only a paragraph whose direct spacing sets before, after and
+    /// the line is drawn exactly.
+    #[test]
+    fn fully_spaced_needs_before_after_and_line() {
+        assert!(fully_spaced(&spacing(0, 0, 240, "auto")));
+        for s in [
+            docxcore::model::Spacing {
+                before: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing {
+                after: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing {
+                line: None,
+                line_rule: None,
+                ..spacing(0, 0, 240, "auto")
+            },
+            docxcore::model::Spacing::default(),
+        ] {
+            assert!(!fully_spaced(&s), "{s:?}");
+        }
+    }
+
+    /// #1986: a single line is 1.15 of the text, at a whole pixel.
+    #[test]
+    fn flow_line_height_is_a_browsers() {
+        let px12 = 16.0;
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 240, "auto"), px12, 1.0),
+            18.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 360, "auto"), px12, 1.0),
+            28.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 360, "exact"), px12, 1.0),
+            24.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 120, "atLeast"), px12, 1.0),
+            18.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 600, "atLeast"), px12, 1.0),
+            40.0
+        );
+        assert_eq!(
+            flow_line_height(&spacing(0, 0, 240, "auto"), 32.0, 2.0),
+            37.0
+        );
+        // The multiple is clamped as before.
+        assert_eq!(flow_line_height(&spacing(0, 0, 24, "auto"), px12, 1.0), 9.0);
+    }
+
+    /// #1986: a fully spaced paragraph in the flow view is drawn exactly;
+    /// any other, and every paragraph in Print Layout, as before.
+    #[test]
+    fn para_box_is_exact_only_for_a_fully_spaced_flow_paragraph() {
+        let exact = spacing(0, 0, 240, "auto");
+        assert_eq!(
+            para_box(&exact, true, true, 26.0, 16.0, 1.0),
+            ParaBox {
+                pad_y: 0.,
+                heading_mt: false,
+                line_h: 18.,
+                min_h: 18.
+            }
+        );
+        let legacy = |base: f32, heading: bool, mult: f32| ParaBox {
+            pad_y: 2.,
+            heading_mt: heading,
+            line_h: base * 1.35 * mult,
+            min_h: (base * 1.35 * mult).max(base + 6.),
+        };
+        // Print Layout.
+        assert_eq!(
+            para_box(&exact, false, false, 14.5, 16.0, 1.0),
+            legacy(14.5, false, 1.0)
+        );
+        assert_eq!(
+            para_box(&exact, false, true, 26.0, 16.0, 1.0),
+            legacy(26.0, true, 1.0)
+        );
+        // Not fully spaced, in the flow view.
+        let after_only = docxcore::model::Spacing {
+            after: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            para_box(&after_only, true, false, 14.5, 16.0, 1.0),
+            legacy(14.5, false, 1.0)
+        );
+        let half = docxcore::model::Spacing {
+            line: Some(480),
+            line_rule: Some("auto".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            para_box(&half, true, true, 26.0, 16.0, 1.0),
+            legacy(26.0, true, 2.0)
+        );
+        assert_eq!(legacy(14.5, false, 1.0).min_h, 20.5);
+    }
+
+    /// #1986: an empty line (`<div><br></div>`) is one line of its mark's
+    /// size; a paragraph's line is its largest run's, links' too.
+    #[test]
+    fn a_paragraphs_text_size_is_its_largest_run_else_its_mark() {
+        let d = docxcore::import::html::import_html(
+            br#"<div style="font-size:12pt"><br></div><div style="font-size:12pt">a <span style="font-size:18pt">b</span> <a href="https://x">c</a></div>"#,
+        )
+        .unwrap();
+        let paras: Vec<&Paragraph> = d
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let styler = run_look::RunStyler::default();
+        let size = |p: &Paragraph| para_text_px(p, styler, &shown_mark(p, styler), 14.5, 1.0);
+        assert!(paras[0].content.is_empty(), "{:?}", paras[0].content);
+        assert!((size(paras[0]) - 16.0).abs() < 0.01);
+        assert!((size(paras[1]) - 24.0).abs() < 0.01);
+        let empty = para_box(
+            &paras[0].props.spacing,
+            true,
+            false,
+            14.5,
+            size(paras[0]),
+            1.0,
+        );
+        assert_eq!((empty.line_h, empty.min_h), (18.0, 18.0));
+        // No runs and no mark: the base.
+        let bare = Paragraph::default();
+        assert_eq!(size(&bare), 14.5);
+    }
+
+    /// #1986: a list number is drawn in its mark's look, in its ink (the
+    /// page's text colour without one, never the dim grey).
+    #[test]
+    fn marker_look_is_the_marks() {
+        let sel = hsla_u(0x3388ff);
+        let mark = ParProps {
+            raw_props: vec![
+                r#"<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:color w:val="000000"/><w:sz w:val="24"/></w:rPr>"#
+                    .to_string(),
+            ],
+            ..ParProps::default()
+        }
+        .mark_run_props()
+        .unwrap();
+        for pal in [page_pal(0xffffff, sel), page_pal(0x1e1e1e, sel)] {
+            let look = marker_look(&mark, 14.5, 1.0, &pal);
+            assert!((look.size - 16.0).abs() < 0.01);
+            assert_eq!(look.font.as_deref(), Some("Aptos"));
+            assert_eq!(look.ink, hsla_u(0x000000));
+            let none = marker_look(&RunProps::default(), 14.5, 1.0, &pal);
+            assert_eq!((none.size, none.ink, none.font), (14.5, pal.fg, None));
+            assert_ne!(none.ink, pal.dim);
+        }
+    }
+
+    /// #1986: the flow column's 4 px stays between two blocks neither of
+    /// which is a fully spaced paragraph, and goes beside one.
+    #[test]
+    fn flow_gap_is_between_two_blocks_not_fully_spaced() {
+        let para = |s: docxcore::model::Spacing| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    spacing: s,
+                    ..ParProps::default()
+                },
+                ..Paragraph::default()
+            })
+        };
+        let exact = || para(spacing(0, 0, 240, "auto"));
+        let legacy = || para(docxcore::model::Spacing::default());
+        let body = vec![
+            legacy(),
+            legacy(),
+            Block::Raw(String::new()),
+            legacy(),
+            exact(),
+            exact(),
+            legacy(),
+        ];
+        let gaps: Vec<bool> = (0..body.len()).map(|i| flow_gap_below(&body, i)).collect();
+        assert_eq!(gaps, [true, true, true, false, false, false, false]);
+    }
+}
+
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
@@ -7620,26 +8294,37 @@ mod ruler_geom_tests {
         };
         let eff = eff_indent(&p);
         assert_eq!((eff.list_step, eff.left), (0, 720));
+        // Listed, the level's step stands only with no left of its own
+        // (#1986).
         let listed = eff_indent(&ParProps {
             num_id: Some(1),
+            ..p.clone()
+        });
+        assert_eq!((listed.list_step, listed.left), (0, 720));
+        let at_level = eff_indent(&ParProps {
+            num_id: Some(1),
+            indent: 0,
             ..p
         });
-        assert_eq!((listed.list_step, listed.left), (600, 1320));
+        assert_eq!((at_level.list_step, at_level.left), (600, 600));
     }
 
+    /// An item at its level's indent (no left of its own) stops there; the
+    /// left the drag writes is the marker itself (#1986).
     #[test]
     fn list_left_drag_clamps_to_its_nesting_step() {
         let p = ParProps {
-            indent: 1440,
+            indent: 0,
             ilvl: 2,
             ..ParProps::default()
         };
         let start = eff_indent(&p);
+        assert_eq!((start.left, start.list_step), (600, 600));
         for zoom in [1.0, 2.0] {
             let marker = dragged_left_marker(start, px_tw(-400.0 * zoom, zoom));
             assert_eq!(marker, 600);
-            assert_eq!(marker - start.list_step, 0);
             near(200.0 + tw_px(marker, zoom), 200.0 + 600.0 * zoom / 15.0);
+            assert_eq!(dragged_left_marker(start, 300), 900);
         }
     }
 
@@ -7650,15 +8335,21 @@ mod ruler_geom_tests {
         let base = RulerIndentBase {
             hf: true,
             paras: vec![(vec![0], true)],
+            starts: vec![Some((300, 300, 0))],
         };
-        assert_eq!(base.for_editor(true), &[(vec![0], true)]);
-        assert!(base.for_editor(false).is_empty());
+        assert_eq!(
+            base.for_editor(true),
+            (&[(vec![0], true)][..], &[Some((300, 300, 0))][..])
+        );
+        assert!(base.for_editor(false).0.is_empty());
+        assert!(base.for_editor(false).1.is_empty());
         let body = RulerIndentBase {
             hf: false,
             paras: vec![(vec![2], false)],
+            starts: Vec::new(),
         };
-        assert_eq!(body.for_editor(false), &[(vec![2], false)]);
-        assert!(body.for_editor(true).is_empty());
+        assert_eq!(body.for_editor(false).0, &[(vec![2], false)]);
+        assert!(body.for_editor(true).0.is_empty());
     }
 
     #[test]
@@ -8077,20 +8768,83 @@ struct RulerDrag {
     sect_checkpointed: bool,
 }
 
+/// A paragraph's drawn left, level step and first-line delta
+/// (`eff_indent`) at a drag's start (#1986); `None` where it was not found.
+type RulerStart = Option<(i32, i32, i32)>;
+
 /// A Left-marker drag's paragraphs at its start (`Editor::indent_base`),
 /// and whether they came from the open header or footer's editor (#1814).
 #[derive(Default)]
 struct RulerIndentBase {
     hf: bool,
     paras: Vec<(Vec<usize>, bool)>,
+    /// Each of `paras`' [`RulerStart`], by index.
+    starts: Vec<RulerStart>,
 }
 
 impl RulerIndentBase {
+    /// The base of a Left drag in `ed`: [`Editor::indent_base`] and where
+    /// each selected paragraph is drawn.
+    fn of(ed: &Editor, hf: bool) -> Self {
+        let paras = ed.indent_base();
+        let starts = paras
+            .iter()
+            .map(|(path, _)| {
+                docxcore::editor::resolve_para(&ed.doc.body, path).map(|p| {
+                    let eff = eff_indent(&p.props);
+                    (eff.left, eff.list_step, eff.first)
+                })
+            })
+            .collect();
+        RulerIndentBase { hf, paras, starts }
+    }
+
     /// The base for a move that edits the header or footer (`hf_now`) or the
-    /// body: empty (the live paragraphs decide) when that is not the editor
-    /// it was taken from, as its paths name another story's paragraphs.
-    fn for_editor(&self, hf_now: bool) -> &[(Vec<usize>, bool)] {
-        if self.hf == hf_now { &self.paras } else { &[] }
+    /// body, and its paragraphs' starts: empty (the live paragraphs decide)
+    /// when that is not the editor it was taken from, as its paths name
+    /// another story's paragraphs.
+    fn for_editor(&self, hf_now: bool) -> (&[(Vec<usize>, bool)], &[RulerStart]) {
+        if self.hf == hf_now {
+            (&self.paras, &self.starts)
+        } else {
+            (&[], &[])
+        }
+    }
+}
+
+/// The start of the `i`th paragraph a move edits, at `path`: `starts[i]`
+/// when `paras` lists the same paths in order, else found by path.
+fn ruler_start_at(
+    paras: &[(Vec<usize>, bool)],
+    starts: &[RulerStart],
+    i: usize,
+    path: &[usize],
+) -> RulerStart {
+    let at = match paras.get(i) {
+        Some((p, _)) if p.as_slice() == path => Some(i),
+        _ => paras.iter().position(|(p, _)| p.as_slice() == path),
+    };
+    at.and_then(|j| starts.get(j).copied().flatten())
+}
+
+/// The left indent and first-line delta a Left drag to `marker` (with the
+/// caret paragraph's clamped `first`, the caret paragraph drawn at
+/// `caret_left` at the start) writes to a paragraph drawn at `start`
+/// (its left, level step and first-line delta, #1986): it moves by the
+/// drag from where it was, never left of its own level, keeping its own
+/// first line clamped to its new left, so a selection keeps its nesting
+/// and its differences, and one paragraph gets the marker (its own first
+/// line clamped so is the caret's `first`). A paragraph with no start
+/// gets the marker and `first`.
+fn ruler_left_for(marker: i32, first: i32, caret_left: i32, start: RulerStart) -> (i32, i32) {
+    match start {
+        Some((left, step, own_first)) => {
+            let left = left
+                .saturating_add(marker.saturating_sub(caret_left))
+                .max(step);
+            (left, own_first.max(-left))
+        }
+        None => (marker, first.max(-marker)),
     }
 }
 
@@ -8126,10 +8880,12 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
             )
         }
         RulerHandle::Left => {
+            // The left written is the marker itself: once moved, the item
+            // has a left of its own, which takes no level step (#1986).
             let marker = dragged_left_marker(d.indent, delta);
             (
                 RulerChange::Left {
-                    indent: marker - d.indent.list_step,
+                    indent: marker,
                     first: d.indent.first.max(-marker),
                 },
                 d.content_x + tw(marker),
@@ -8979,10 +9735,77 @@ struct RenderCtx<'a> {
     /// Where each top-level body table's painted bounds go, by block, for
     /// the harness (#1895); `None` records none.
     tables: Option<&'a PaintedTables>,
+    /// A flow view (Draft, Web Layout, the embedded view): a fully spaced
+    /// paragraph is drawn exactly (#1986). False in Print Layout, headers
+    /// and footers.
+    flow: bool,
+    /// This top-level block takes the flow column's 4 px below it
+    /// ([`flow_gap_below`], #1986); false for anything nested.
+    gap_below: bool,
+    /// Where each top-level paragraph's painted layout goes, for the
+    /// harness (#1986); `None` records none.
+    paras: Option<&'a PaintedParas>,
 }
 
 /// Each top-level table's block and painted bounds in the frame last drawn.
 type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
+
+/// A top-level paragraph as the flow view last painted it, for the
+/// harness's `ext-doc-layout` (#1986): its block, its box, its list number
+/// and its runs (caret offset, length, text size and ink) to join with its
+/// painted words by offset.
+#[derive(Clone)]
+struct PaintedPara {
+    block: usize,
+    root: UnitCell,
+    marker: Option<PaintedMarker>,
+    runs: Vec<PaintedRun>,
+    words: WordSpans,
+}
+
+#[derive(Clone)]
+struct PaintedMarker {
+    text: String,
+    size: f32,
+    ink: Hsla,
+    at: UnitCell,
+}
+
+#[derive(Clone)]
+struct PaintedRun {
+    off: usize,
+    len: usize,
+    size: f32,
+    ink: Hsla,
+    /// Its text, as drawn (a markup view's may not be the editor's).
+    text: String,
+}
+
+/// The [`PaintedPara`]s of the frame last drawn.
+type PaintedParas = std::rc::Rc<std::cell::RefCell<Vec<PaintedPara>>>;
+
+/// How the flow view draws a paragraph (#1986): `flow` draws a fully spaced
+/// one exactly, `gap_below` gives a top-level one the column's 4 px below
+/// it, and `record` takes its painted layout under its block.
+#[derive(Clone, Copy, Default)]
+struct FlowPara<'a> {
+    flow: bool,
+    gap_below: bool,
+    record: Option<(&'a PaintedParas, usize)>,
+}
+
+/// A canvas filling its (relative) parent that takes its bounds at prepaint.
+fn bounds_probe(cell: UnitCell) -> AnyElement {
+    canvas(
+        move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| cell.set(b),
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
 
 /// The harness's view of [`PaintedTables`] (#1895): each table's block, its
 /// painted width, its left and right edges from the viewport's left
@@ -15627,6 +16450,7 @@ impl Docxy {
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             painted_tables: PaintedTables::default(),
+            painted_paras: PaintedParas::default(),
             drawn_pictures: pictures::DrawnPictures::default(),
             doc_follow: std::rc::Rc::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
@@ -26170,12 +26994,16 @@ impl Docxy {
         // The editor the moves edit (`with_editor`): the open header or
         // footer, else the body.
         self.ruler_indent_base = match (handle, self.tabs.get(self.active)) {
-            (RulerHandle::Left, Some(tab)) => RulerIndentBase {
-                hf: tab.hf_edit.is_some(),
-                paras: tab_edit_target_ref(tab)
-                    .map(Editor::indent_base)
-                    .unwrap_or_default(),
-            },
+            (RulerHandle::Left, Some(tab)) => {
+                let hf = tab.hf_edit.is_some();
+                tab_edit_target_ref(tab).map_or(
+                    RulerIndentBase {
+                        hf,
+                        ..Default::default()
+                    },
+                    |ed| RulerIndentBase::of(ed, hf),
+                )
+            }
             _ => RulerIndentBase::default(),
         };
         self.ruler_drag = Some(RulerDrag {
@@ -26211,8 +27039,16 @@ impl Docxy {
                     .tabs
                     .get(self.active)
                     .is_some_and(|t| t.hf_edit.is_some());
-                let paras = base.for_editor(hf_now);
-                self.with_editor(window, cx, |e| e.set_indent_from(indent, first, paras));
+                // Each paragraph moves by the drag from where it was
+                // drawn (#1986).
+                let (paras, starts) = base.for_editor(hf_now);
+                let caret_left = d.indent.left;
+                self.with_editor(window, cx, |e| {
+                    e.set_indents_from(paras, |i, path| {
+                        let start = ruler_start_at(paras, starts, i, path);
+                        ruler_left_for(indent, first, caret_left, start)
+                    })
+                });
                 self.ruler_indent_base = base;
             }
             RulerChange::Right(right) => {
@@ -34332,6 +35168,143 @@ fn para_base(p: &Paragraph, zoom: f32) -> f32 {
     }
 }
 
+/// A single line's height in em: a browser's `line-height: normal` and
+/// Word's single for Arial, Liberation Sans and Times (Chrome draws 16 px
+/// text 18 px apart), drawn at a whole pixel as a browser does (#1986).
+const SINGLE_LINE: f32 = 1.15;
+
+/// Whether a paragraph's direct spacing sets all of before, after and the
+/// line (#1986): its style then adds none, so the flow view draws it
+/// exactly. Every imported HTML paragraph is (#1979); a Word paragraph
+/// leaning on its style's spacing, which the suite does not resolve, keeps
+/// the stand-in look.
+fn fully_spaced(s: &docxcore::model::Spacing) -> bool {
+    s.before.is_some() && s.after.is_some() && s.line.is_some()
+}
+
+/// A fully spaced paragraph's line height in the flow view, px (#1986): a
+/// multiple of [`SINGLE_LINE`] at `size_px` (its largest text) for `auto`,
+/// rounded to a pixel so lines do not drift; the `w:line` itself for
+/// `exact`; the larger of the two for `atLeast`.
+fn flow_line_height(s: &docxcore::model::Spacing, size_px: f32, zoom: f32) -> f32 {
+    let single = (size_px * SINGLE_LINE).round();
+    let line = tw_px(s.line.unwrap_or(240).max(0), zoom);
+    match s.line_rule.as_deref() {
+        Some("exact") => line,
+        Some("atLeast") => single.max(line),
+        _ => {
+            let mult = s.line_multiple().unwrap_or(1.0).clamp(0.5, 4.0);
+            (size_px * SINGLE_LINE * mult).round()
+        }
+    }
+}
+
+/// How a paragraph's box is drawn: its padding above and below when its
+/// spacing gives none, whether a heading takes `mt_2`, its line height and
+/// its least height, px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParaBox {
+    pad_y: f32,
+    heading_mt: bool,
+    line_h: f32,
+    min_h: f32,
+}
+
+/// [`ParaBox`] of a paragraph: drawn exactly in the flow view when it is
+/// [`fully_spaced`] (#1986), at `size_px`, its largest text; else as
+/// before, at its `base`: 2 px padding, `mt_2` on a heading, `1.35` lines
+/// and at least `base + 6`.
+fn para_box(
+    s: &docxcore::model::Spacing,
+    flow: bool,
+    is_heading: bool,
+    base: f32,
+    size_px: f32,
+    zoom: f32,
+) -> ParaBox {
+    if flow && fully_spaced(s) {
+        let line_h = flow_line_height(s, size_px, zoom);
+        return ParaBox {
+            pad_y: 0.,
+            heading_mt: false,
+            line_h,
+            min_h: line_h,
+        };
+    }
+    // Line spacing (auto-rule multiple; exact/atLeast fall back to single
+    // here).
+    let mult = s.line_multiple().unwrap_or(1.0).clamp(0.5, 4.0);
+    let line_h = base * 1.35 * mult;
+    ParaBox {
+        pad_y: 2.,
+        heading_mt: is_heading,
+        line_h,
+        min_h: line_h.max(base + 6.),
+    }
+}
+
+/// The size, px, of a paragraph's largest shown text: its runs' (links'
+/// too), else its mark's (an empty line, `<div><br></div>`), else `base`.
+fn para_text_px(
+    p: &Paragraph,
+    styler: run_look::RunStyler,
+    mark: &RunProps,
+    base: f32,
+    zoom: f32,
+) -> f32 {
+    flat_inlines(&p.content)
+        .iter()
+        .filter_map(|(i, _)| match &**i {
+            Inline::Run(r) => Some(run_look::run_size_px(&styler.shown(r), base, zoom)),
+            _ => None,
+        })
+        .reduce(f32::max)
+        .unwrap_or_else(|| run_look::run_size_px(mark, base, zoom))
+}
+
+/// A paragraph mark's run properties as its styles show them (#1986):
+/// what its list number is drawn in, as Word does.
+fn shown_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
+    let mark = docxcore::model::Run {
+        props: p.props.mark_run_props().unwrap_or_default(),
+        ..Default::default()
+    };
+    styler.shown(&mark).into_owned()
+}
+
+/// How a list number is drawn (#1986): in its paragraph mark's look.
+#[derive(Clone, Debug, PartialEq)]
+struct MarkerLook {
+    size: f32,
+    /// The font as named (measured by it: `width_in` substitutes it).
+    font: Option<String>,
+    /// The family drawn ([`font_subst::family`]).
+    family: Option<SharedString>,
+    bold: bool,
+    italic: bool,
+    ink: Hsla,
+}
+
+fn marker_look(mark: &RunProps, base: f32, zoom: f32, pal: &Pal) -> MarkerLook {
+    MarkerLook {
+        size: run_look::run_size_px(mark, base, zoom),
+        font: mark.font.clone(),
+        family: mark.font.as_deref().and_then(font_subst::family),
+        bold: mark.bold,
+        italic: mark.italic,
+        ink: run_ink(mark, false, pal),
+    }
+}
+
+/// Whether top-level block `i` of a flow view's `body` takes the 4 px gap
+/// below it (#1986): when a block follows and neither is a
+/// [`fully_spaced`] paragraph, as the column's `gap_1` gave every block.
+fn flow_gap_below(body: &[Block], i: usize) -> bool {
+    let exact = |b: &Block| matches!(b, Block::Paragraph(p) if fully_spaced(&p.props.spacing));
+    body.get(i + 1)
+        .is_some_and(|next| !exact(&body[i]) && !exact(next))
+}
+
 /// An alignment tab (`w:ptab`, #768); docxcore reads and measures it for both
 /// hosts (#1433).
 type Ptab = docxcore::ptab::Ptab;
@@ -34479,6 +35452,7 @@ fn hf_para_el(
         },
         pics,
         page_vals,
+        FlowPara::default(),
     )
 }
 
@@ -34827,11 +35801,24 @@ fn paragraph_el(
     styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
+    flow: FlowPara,
 ) -> AnyElement {
     use docxcore::model::TabAlign;
     let styler = styler.for_paragraph(p.props.style_id.as_deref());
     let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
+    // The mark's look: the list number's (#1986), and an empty line's size.
+    let mark = shown_mark(p, styler);
+    let pbox = para_box(
+        &p.props.spacing,
+        flow.flow,
+        is_heading,
+        base,
+        para_text_px(p, styler, &mark, base, zoom),
+        zoom,
+    );
+    let mut painted_runs: Vec<PaintedRun> = Vec::new();
+    let mut painted_marker: Option<PaintedMarker> = None;
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
 
@@ -34859,16 +35846,10 @@ fn paragraph_el(
         }
     }
     let mut x = indent_layout.first_line_tab_origin();
-    // Line spacing (auto-rule multiple; exact/atLeast fall back to single
-    // here). The span loop needs it to size the caret bar so a small-zoom
-    // line can never inflate a row (see `line_numbers::caret_height`).
-    let line_mult = p
-        .props
-        .spacing
-        .line_multiple()
-        .unwrap_or(1.0)
-        .clamp(0.5, 4.0);
-    let line_h = base * 1.35 * line_mult;
+    // The span loop needs the line height to size the caret bar so a
+    // small-zoom line can never inflate a row (see
+    // `line_numbers::caret_height`).
+    let line_h = pbox.line_h;
     let caret_h = line_numbers::caret_height(line_h);
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
@@ -34912,8 +35893,19 @@ fn paragraph_el(
     };
     // The first flex item shifts just the first line. Subsequent wrapped lines
     // start at the paragraph's left padding, including hanging indents.
-    let marker_width = marker.map(|s| meas.map(|m| m.width(s, base, false, false)).unwrap_or(0.0));
-    for item in leading_items(indent_layout, marker_width, interval, &customs) {
+    // The number in its paragraph mark's look, measured in it (#1986). In a
+    // hanging indent the gap after it separates it from the text, so its
+    // trailing space goes: "1. " in a browser's 17.8 px hang would pass the
+    // indent and push the text to the next stop.
+    let hangs = indent_layout.first_x + 0.5 < indent_layout.continuation_x;
+    let marker = marker.map(|m| if hangs { m.trim_end() } else { m });
+    let look = marker_look(&mark, base, zoom, &pal);
+    let marker_width = marker.map(|s| {
+        meas.map(|m| m.width_in(s, look.size, look.bold, look.italic, look.font.as_deref()))
+            .unwrap_or(0.0)
+    });
+    let leading = leading_items(indent_layout, marker_width, interval, &customs);
+    for (k, item) in leading.iter().copied().enumerate() {
         match item {
             LeadingItem::Spacer { width, margin } => spans.push(
                 div()
@@ -34926,15 +35918,52 @@ fn paragraph_el(
             LeadingItem::ListMarker => {
                 let m = marker.expect("marker descriptor requires a marker");
                 // The marker isn't document content and must not map clicks to offsets.
-                spans.push(
-                    div()
-                        .text_size(px(base))
-                        .text_color(pal.dim)
-                        .child(SharedString::from(m.to_string()))
-                        .into_any_element(),
-                );
-                x += marker_width.unwrap_or(0.0);
+                let probe = flow.record.map(|_| {
+                    let at = UnitCell::default();
+                    painted_marker = Some(PaintedMarker {
+                        text: m.to_string(),
+                        size: look.size,
+                        ink: look.ink,
+                        at: at.clone(),
+                    });
+                    bounds_probe(at)
+                });
+                let number = div()
+                    .when(probe.is_some(), |d| d.relative())
+                    .text_size(px(look.size))
+                    .text_color(look.ink)
+                    .when_some(look.family.clone(), |d, f| d.font_family(f))
+                    .when(look.bold, |d| d.font_weight(FontWeight::BOLD))
+                    .when(look.italic, |d| d.italic())
+                    .child(SharedString::from(m.to_string()))
+                    .children(probe);
+                let measured = marker_width.unwrap_or(0.0);
+                match marker_box_width(&leading, k, measured) {
+                    // In a hanging indent the number and its gap are one box
+                    // of the measured width, so the text starts on the stop
+                    // whatever width the glyphs lay out at (#1986).
+                    Some(width) => {
+                        spans.push(
+                            // A row, so the number keeps its own width (the
+                            // harness's probe reads it) and overflows the box
+                            // rather than wrapping if wider.
+                            div()
+                                .flex()
+                                .flex_none()
+                                .w(px(width))
+                                .child(number.flex_none().whitespace_nowrap())
+                                .into_any_element(),
+                        );
+                        x += width;
+                    }
+                    None => {
+                        spans.push(number.into_any_element());
+                        x += measured;
+                    }
+                }
             }
+            // Inside the number's box ([`marker_box_width`]).
+            LeadingItem::MarkerGap(_) if k > 0 && leading[k - 1] == LeadingItem::ListMarker => {}
             LeadingItem::MarkerGap(width) => {
                 spans.push(div().w(px(width)).h(px(1.)).flex_none().into_any_element());
                 x += width;
@@ -34946,20 +35975,20 @@ fn paragraph_el(
         let idx_before = idx;
         match inline {
             Inline::Run(r) => {
+                let shown = styler.shown(r);
                 emit_run(
-                    &mut spans,
-                    &r.text,
-                    &styler.shown(r),
-                    base,
-                    in_link,
-                    &mut idx,
-                    &mut caret,
-                    sel,
-                    click,
-                    pal,
-                    caret_h,
-                    zoom,
+                    &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
+                    pal, caret_h, zoom,
                 );
+                if flow.record.is_some() {
+                    painted_runs.push(PaintedRun {
+                        off: idx_before,
+                        len: idx - idx_before,
+                        size: run_look::run_size_px(&shown, base, zoom),
+                        ink: run_ink(&shown, in_link, &pal),
+                        text: r.text.clone(),
+                    });
+                }
                 x += run_w(r);
             }
             // Opened up by `flat_inlines`.
@@ -35229,7 +36258,7 @@ fn paragraph_el(
     let mut row = h_flex()
         .w_full()
         .flex_wrap()
-        .min_h(px(line_h.max(base + 6.)))
+        .min_h(px(pbox.min_h))
         .line_height(px(line_h));
     row = match p.props.align {
         Align::Center => row.justify_center(),
@@ -35251,14 +36280,32 @@ fn paragraph_el(
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
     let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
     let sp_after = zoom * (p.props.spacing.after.unwrap_or(0).max(0) as f32) / 15.0;
+    // The harness's record of this paragraph (#1986): its box's bounds.
+    let root_probe = flow.record.map(|(paras, block)| {
+        let root = UnitCell::default();
+        paras.borrow_mut().push(PaintedPara {
+            block,
+            root: root.clone(),
+            marker: painted_marker.take(),
+            runs: std::mem::take(&mut painted_runs),
+            words: click.map(|c| c.words.clone()).unwrap_or_default(),
+        });
+        bounds_probe(root)
+    });
     v_flex()
         .w_full()
-        .py_0p5()
-        .when(sp_before > 0.5, |d| d.pt(px(sp_before)))
-        .when(sp_after > 0.5, |d| d.pb(px(sp_after)))
+        // A fully spaced paragraph in the flow view has only its own
+        // spacing (#1986); others keep 2 px where theirs gives none.
+        .pt(px(if sp_before > 0.5 {
+            sp_before
+        } else {
+            pbox.pad_y
+        }))
+        .pb(px(if sp_after > 0.5 { sp_after } else { pbox.pad_y }))
         .pl(px(pad))
         .pr(px(pad_r))
-        .when(is_heading, |d| d.mt_2())
+        .when(pbox.heading_mt, |d| d.mt_2())
+        .when(flow.gap_below, |d| d.mb(px(4.)))
         .when(has_border, |d| d.border_b_1().border_color(pal.fg).pb_1())
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
@@ -35307,6 +36354,7 @@ fn paragraph_el(
             None => row.children(spans),
         })
         .when_some(overlay, |d, o| d.relative().child(o))
+        .when_some(root_probe, |d, probe| d.relative().child(probe))
         .into_any_element()
 }
 
@@ -35427,6 +36475,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let text_w = tw_px(cb.width as i32 - 216, zoom).max(0.0);
             let cell_ctx = RenderCtx {
                 line_width: Some(text_w),
+                gap_below: false,
                 pal: cell_pal(ctx.pal, cb.fill),
                 cell_run: Some(&cb.run),
                 // A nested table fits its cell when this one was fitted.
@@ -35705,6 +36754,9 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         .flex_none()
         .w(w(widest))
         .my_2()
+        // The flow column's 4 px below a top-level table (#1986), past its
+        // own 8 px: a later `mb` replaces the bottom margin.
+        .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
         .when(fits, |d| match table_view::h_align(t) {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),
@@ -35730,6 +36782,7 @@ fn block_el_numbered(
     ctx: RenderCtx,
     lines: Option<LineSlot>,
 ) -> AnyElement {
+    let top = path.len() == 1;
     match b {
         Block::Paragraph(p) => {
             let caret = (ctx.active && ctx.caret_path == path.as_slice()).then_some(ctx.caret_off);
@@ -35812,11 +36865,22 @@ fn block_el_numbered(
                 },
                 ctx.pics,
                 ctx.page_vals,
+                FlowPara {
+                    flow: ctx.flow,
+                    gap_below: top && ctx.gap_below,
+                    record: ctx
+                        .paras
+                        .filter(|_| ctx.active && ctx.hf_width.is_none())
+                        .zip(top.then(|| path[0])),
+                },
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
-        Block::SectionProperties(_) => div().h(px(0.)).into_any_element(),
-        Block::Raw(_) => div().h(px(0.)).into_any_element(),
+        // Zero-height, but a gap below as every block had (#1986).
+        Block::SectionProperties(_) | Block::Raw(_) => div()
+            .h(px(0.))
+            .when(top && ctx.gap_below, |d| d.mb(px(4.)))
+            .into_any_element(),
     }
 }
 
@@ -41510,6 +42574,9 @@ impl Render for Docxy {
                         .map(|pkg| pictures::Pictures::new(pkg, &tab.pictures));
                     let painted_tables = self.painted_tables.clone();
                     painted_tables.borrow_mut().clear();
+                    // The flow view's paragraphs, for the harness (#1986).
+                    let painted_paras = self.painted_paras.clone();
+                    painted_paras.borrow_mut().clear();
                     // The body's pictures as drawn, for the harness (#1926).
                     let drawn_pictures = self.drawn_pictures.clone();
                     drawn_pictures.borrow_mut().clear();
@@ -41536,6 +42603,10 @@ impl Render for Docxy {
                         // The flow branch below fits its tables (#1895).
                         fit_width: None,
                         tables: Some(&painted_tables),
+                        // The flow branch below sets these (#1986).
+                        flow: false,
+                        gap_below: false,
+                        paras: None,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -41823,6 +42894,9 @@ impl Render for Docxy {
                                     page_vals: page_vals.get(pi),
                                     fit_width: None,
                                     tables: None,
+                                    flow: false,
+                                    gap_below: false,
+                                    paras: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -42273,12 +43347,23 @@ impl Render for Docxy {
                         let used_w = self.ruler_probe.borrow().draft_text_w;
                         let flow_ctx = RenderCtx {
                             fit_width: used_w,
+                            flow: true,
+                            paras: doc_view::harness().then_some(&painted_paras),
                             ..ctx
                         };
+                        // The column puts 4 px between blocks as each
+                        // block's margin, none beside a fully spaced
+                        // paragraph (#1986).
                         let blocks: Vec<AnyElement> = body
                             .iter()
                             .enumerate()
-                            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), flow_ctx))
+                            .map(|(i, b)| {
+                                let ctx = RenderCtx {
+                                    gap_below: flow_gap_below(body, i),
+                                    ..flow_ctx
+                                };
+                                block_el(b, vec![i], markers[i].as_deref(), ctx)
+                            })
                             .collect();
                         let probe = self.ruler_probe.clone();
                         let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
@@ -42296,7 +43381,6 @@ impl Render for Docxy {
                             .text_color(fg)
                             .px(px(48.))
                             .py(px(28.))
-                            .gap_1()
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
                             // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.

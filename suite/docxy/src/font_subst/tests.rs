@@ -355,6 +355,12 @@ fn every_family_reaching_gpui_is_resolved() {
             ".when_some(family.clone(), |d, f| d.font_family(f))",
             "let family = props.font.as_deref().and_then(font_subst::family);",
         ),
+        // A list number (#1986): `marker_look` resolves its mark's font.
+        (
+            "main.rs",
+            ".when_some(look.family.clone(), |d, f| d.font_family(f))",
+            "family: mark.font.as_deref().and_then(font_subst::family),",
+        ),
         // DocView's root draws in the family its Measurer measures in.
         (
             "doc_view.rs",

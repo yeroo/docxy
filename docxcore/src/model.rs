@@ -693,10 +693,27 @@ pub enum IndentSide {
 }
 
 impl ParProps {
+    /// The paragraph mark's run properties: its `w:rPr` (kept verbatim in
+    /// `raw_props`) read as a run's `w:rPr` is. A list number is drawn in
+    /// them (#1986). `None` without one.
+    pub fn mark_run_props(&self) -> Option<RunProps> {
+        self.raw_props
+            .iter()
+            .find(|r| r.starts_with("<w:rPr"))
+            .and_then(|r| crate::load::rpr_of_element(r))
+    }
+
     /// Whether a left indent attribute (`w:left`, `w:start` or their
     /// character units) was loaded and not since replaced, whatever its value.
     pub fn has_loaded_left_indent(&self) -> bool {
         crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_LEFT)
+    }
+
+    /// Whether the paragraph has a left indent of its own, set in session
+    /// or loaded (a `w:left="0"` pin included): it replaces a list level's
+    /// indent, as Word reads the file (#1986).
+    pub fn has_direct_left_indent(&self) -> bool {
+        self.indent > 0 || self.has_loaded_left_indent()
     }
 
     /// Whether the paragraph is a list item: a `w:numId` of 0 means "no
@@ -1962,6 +1979,30 @@ fn collect_block_revisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1986: a list number is drawn in its paragraph mark's look.
+    #[test]
+    fn mark_run_props_reads_the_mark_rpr_as_a_run_does() {
+        let p = ParProps {
+            raw_props: vec![
+                r#"<w:spacing w:after="0"/>"#.to_string(),
+                r#"<w:rPr><w:rFonts w:ascii="Aptos" w:hAnsi="Aptos"/><w:b/><w:color w:val="1F4E79"/><w:sz w:val="24"/></w:rPr>"#
+                    .to_string(),
+            ],
+            ..ParProps::default()
+        };
+        let m = p.mark_run_props().expect("a mark rPr");
+        assert_eq!(m.font.as_deref(), Some("Aptos"));
+        assert_eq!(m.size_half_pts, Some(24));
+        assert_eq!(m.color.as_deref(), Some("1F4E79"));
+        assert!(m.bold);
+        assert_eq!(ParProps::default().mark_run_props(), None);
+        let empty = ParProps {
+            raw_props: vec!["<w:rPr/>".to_string()],
+            ..ParProps::default()
+        };
+        assert_eq!(empty.mark_run_props(), Some(RunProps::default()));
+    }
 
     fn row(text: &str) -> Row {
         Row {

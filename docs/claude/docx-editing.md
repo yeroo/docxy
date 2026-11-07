@@ -43,9 +43,27 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
   the edit, re-parsing the numbering; the suite after an indent that made
   a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
-  draws the level from `ilvl`, so there it is for the saved file). Not an
-  undo step; nothing repairs at load. The suite's `eff_indent` gives an
-  explicit numId 0 no level step.
+  draws an item with no left of its own at its level from `ilvl`, so there
+  it is for the saved file). Not an undo step; nothing repairs at load.
+- The suite's `eff_indent` adds the level step `ilvl × 300` only to a list
+  item with no left indent of its own: an explicit numId 0 takes none, nor
+  does an item with a direct left (`ParProps::has_direct_left_indent`:
+  `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included). A
+  direct `w:left` replaces the level's indent, as Word reads the file,
+  and the session follows it, so an item
+  draws where a save and reload puts it (#1986 r1: a rule telling a
+  session-written left from a loaded one cannot survive the reload, which
+  sees only `w:left`). The ruler's Left drag (`RulerChange::Left { indent:
+  marker }`) moves each selected paragraph by the drag from where it was
+  drawn at the drag start, never left of its own level step:
+  `max(start_left + marker − caret_start_left, step)`, its own first-line
+  delta clamped to that left (#1986 r4) (`ruler_left_for`,
+  `Editor::set_indents_from`; the starts are `RulerIndentBase::starts`,
+  aligned with its paths by index, #1986 r2/r3). One paragraph gets the
+  marker; a selection keeps its nesting and its differences (an imported
+  600 / 1200 list included, whose items have lefts of their own and no
+  step), and a list or non-list selection is no longer flattened to one
+  indent. `dragged_left_marker` still clamps at the caret's level step.
 
 ## Manual hyphenation (#1266)
 
@@ -207,3 +225,71 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   the view's left, `fits_text`, `right_in_view`, Print Layout's too) and
   `pointer-wheel`'s `"shift": true`; `uiharness/cases/web-layout-table-fit.uit`
   and `ext-doc-view.uit` drive them.
+
+## The flow view draws an imported mail as a browser does (#1986)
+
+- In the flow view (a document tab's Draft and Web Layout, and
+  `ext::DocView`; `RenderCtx::flow`) a paragraph whose direct `w:spacing`
+  sets all of `before`, `after` and `line` (`fully_spaced`; every imported
+  HTML paragraph is, #1979) is drawn exactly (`para_box`): no 2 px padding,
+  no heading `mt_2`, no block gap beside it, its own before/after, and a
+  line of `round(size × SINGLE_LINE × multiple)` px for `auto`
+  (`SINGLE_LINE` 1.15: a browser's `line-height: normal` and Word's single
+  for Arial, Liberation Sans and Times; whole pixels so lines do not drift),
+  the `w:line` for `exact`, the larger for `atLeast`, at least one line
+  high. `size` is its largest shown run (links' too), else its mark's (an
+  empty `<div><br></div>` imports as an empty paragraph), else the base.
+  So a 12pt mail's lines are 18 px apart, as in Chrome.
+- Any other paragraph, and every paragraph in Print Layout, headers and
+  footers, draws as before: 2 px where its spacing gives none, `mt_2` on a
+  heading, `base × 1.35 × multiple`, at least `base + 6`. Only all three
+  count: a Word paragraph with only `w:after` leans on its style's line
+  spacing, which the suite does not resolve. Word files that set all three
+  directly on every paragraph (Google Docs and LibreOffice exports often
+  do) now draw exactly in the flow view too. Cells keep `flow`, so an HTML
+  table's cells draw tight.
+- The flow columns have no `gap_1`: top-level block i takes the 4 px as
+  its own bottom margin (`RenderCtx::gap_below`, `flow_gap_below`) when a
+  block follows and neither is fully spaced, so two other blocks stay 4 px
+  apart. A table's root has `my_2`, which a later `mb` replaces: it takes
+  `mb(8 + 4)`; the zero-height `SectionProperties` / `Raw` divs take it
+  too. A margin, not a wrapper: a wrapper would stretch a wide table's root
+  (#1895) and move `bounds_for_item(b)` off block b. Cells reset it. The
+  last block's 4 px above the width probe is gone (scroll extent only).
+- A list number is drawn and measured in its paragraph mark's run
+  properties as the paragraph's styles show them (`shown_mark`,
+  `ParProps::mark_run_props`, `marker_look`): size, weight, slant, family
+  through `font_subst` (measured by the raw name, `width_in` substitutes),
+  ink through `run_ink`, in every view; with no mark `w:rPr`, the style's
+  run look, else the base size and `pal.fg`, no longer `pal.dim`. In a
+  hanging indent its trailing space goes ("1." not "1. "): the gap after it
+  separates it, and "1. " fills a browser's 17.8 px hang exactly, pushing
+  the text to the next stop. There the number and its gap are one
+  `flex_none` box of the measured width (`marker_box_width`), the number
+  left in it at its own width, so the text starts on the stop whatever the
+  glyphs lay out at: DirectWrite drew "1." a pixel wider than measured and
+  put the text at 41 (#1986 ci1). The numbering level's own `w:rPr` is not
+  read.
+- A nested HTML list sits at its own indent (600 twips per list): an item
+  with a left of its own takes no level step (Lists, above).
+- Harness (test extension): `ext-doc-load {"html": ...}` imports a page
+  into the view; `ext-doc-layout` reads the last frame
+  (`DocView::layout_json`, recorded only in a harness instance through
+  `RenderCtx::paras`): per top-level paragraph its `block`, `top`,
+  `height`, `text_x`, `marker` (`text`, `x`, `right`, `size`, `color`),
+  `lines` (`y`, `x`, `text`, `size`, `color` of its first word; a word left
+  of the one before starts a line), `marker_matches_text` and
+  `marker_fits`, and the document's `pitch_min` / `pitch_max` (an empty
+  paragraph counts as a line at its top); px rounded, x from the text
+  column, y from the first paragraph; colours `rrggbb` with no `#` (a
+  case's `#` starts a comment). Words join their runs by caret offset. It
+  says `painted: false` until a frame of the document last loaded has
+  painted. The document tab's flow view records the same
+  (`Docxy::painted_paras`, a harness instance only) for `doc`'s
+  `flow.layout` (`null` in Print Layout; x from `draft_column`).
+  `uiharness/cases/ext-doc-outlook-mail.uit` drives both: the view, and the
+  same mail (`fixtures/outlook-mail.html`) opened in a document tab.
+- Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`), and
+  now its numbers, stay black on a dark page; Outlook lightens them. Style
+  spacing (docDefaults, Normal, the style chain) is still not resolved, so
+  Word paragraphs keep the stand-ins. `ext::DocView`'s page margin is #1987.
