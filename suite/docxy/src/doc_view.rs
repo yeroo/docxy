@@ -228,7 +228,8 @@ impl DocView {
     /// break) is a line break, and it all takes the formatting typing at the
     /// caret would give. One undo step of its own; the caret ends after it
     /// and [`DocView::on_change`] hears of it. Characters a document cannot
-    /// hold (other control characters, U+FFFE, U+FFFF) are left out. True
+    /// hold (other control characters, U+FFFE, U+FFFF) are left out, and so
+    /// is U+FFFC, the editor's stand-in for a field. True
     /// when it ran; false, changing nothing, on a read-only view or for a
     /// text with nothing left to insert. Give the focus back after a host's
     /// button, as for [`DocView::format`].
@@ -253,18 +254,21 @@ impl DocView {
 
     /// Cut the selection, as Ctrl+X does: the clipboard gets what a copy
     /// would, and the selection is deleted as one undo step, which
-    /// [`DocView::on_change`] hears of. False, changing nothing, on a
-    /// read-only view or with nothing to cut.
+    /// [`DocView::on_change`] hears of. A selection from body text into a
+    /// table cell is copied but not deleted (the caret collapses, as in a
+    /// document tab), so the host hears of no change. True when there was
+    /// something to cut; false, changing nothing, on a read-only view or
+    /// with nothing to cut.
     pub fn cut(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.editable {
             return false;
         }
         self.seed_styles();
-        let Some(clip) = edit::cut(&mut self.editor) else {
+        let Some((clip, changed)) = edit::cut(&mut self.editor) else {
             return false;
         };
         self.write_clip(&clip, cx);
-        self.after_edit(true, cx);
+        self.after_edit(changed, cx);
         true
     }
 
@@ -549,7 +553,7 @@ impl DocView {
             edit::KeyOutcome::Copy => {
                 self.write_copy(cx);
             }
-            edit::KeyOutcome::Cut(clip) => self.write_clip(&clip, cx),
+            edit::KeyOutcome::Cut(clip, _) => self.write_clip(&clip, cx),
             edit::KeyOutcome::Moved | edit::KeyOutcome::Changed => {}
         }
         // Ctrl+Home / Ctrl+End go to the very top and bottom, as read-only.

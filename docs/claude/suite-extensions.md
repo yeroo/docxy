@@ -208,14 +208,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   step: the text is split on it, `paste_text_only` per piece and
   `insert_line_break` between them, in one outer `one_step`. It drops what
   a `w:t` cannot hold (`insertable`: other C0 controls, U+FFFE, U+FFFF,
-  `FIELD_CHAR`), as `serialize::esc_text` escapes only `& < >`. One undo
+  `FIELD_CHAR`, the field stand-in), as `serialize::esc_text` escapes only
+  `& < >`. One undo
   step of its own (`one_step` ends the typing run before and after). A
   text with nothing left runs nothing and returns false. Inside a
   hyperlink the text lands between the link's two halves (`paste`'s
   `split_content`), as Paste Text Only does in a document tab.
-- `cut` is Ctrl+X's path (`edit::cut`, which the key uses too): the clip
-  on the clipboard through `write_clip` (text and RTF), one undo step,
-  `on_change`. False with nothing to cut.
+- `cut` is Ctrl+X's path (`edit::cut`, which the key uses too): the
+  document tab's `one_step("Cut", ...)` run through `edit()`, so it says
+  whether the document changed. The clip goes on the clipboard through
+  `write_clip` (text and RTF). A selection from body text into a table
+  cell is copied, but `Editor::cut` only collapses it (no step), so
+  `on_change` does not fire; `KeyOutcome::Cut` carries that flag. True
+  when there was something to cut, false with nothing to cut.
 - `copy` works in either mode, as Ctrl+C does in the read-only view
   (`write_copy`): a reader host's Copy button copies. This departs from
   the issue's "each returns false on a read-only view", which holds only

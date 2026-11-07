@@ -22,15 +22,16 @@ pub(crate) enum KeyOutcome {
     Changed,
     /// Ctrl+C: the view writes the selection to the clipboard.
     Copy,
-    /// Ctrl+X cut this, which the view writes to the clipboard; the document
-    /// changed.
-    Cut(Clip),
+    /// Ctrl+X cut this, which the view writes to the clipboard, and whether
+    /// the document changed (a cut across containers only collapses, see
+    /// [`cut`]).
+    Cut(Clip, bool),
 }
 
 impl KeyOutcome {
     /// Whether the document changed.
     pub(crate) fn changed(&self) -> bool {
-        matches!(self, KeyOutcome::Changed | KeyOutcome::Cut(_))
+        matches!(self, KeyOutcome::Changed | KeyOutcome::Cut(_, true))
     }
 }
 
@@ -213,12 +214,16 @@ pub(crate) fn insert_text(ed: &mut Editor, text: &str) -> Formatted {
     }
 }
 
-/// Cut, by Ctrl+X or the host's [`DocView::cut`]: the selection's clip,
-/// deleted as one undo step of its own; `None`, and nothing done, with
-/// nothing to cut.
-pub(crate) fn cut(ed: &mut Editor) -> Option<Clip> {
-    ed.break_undo_group();
-    ed.cut()
+/// Cut, by Ctrl+X or the host's [`DocView::cut`]: the selection's clip and
+/// whether the document changed, as the document tab's Cut, one undo step
+/// "Cut" ([`Editor::one_step`]); `None`, and nothing done, with nothing to
+/// cut. A selection across containers (body text into a table cell) is
+/// copied but not deleted: [`Editor::cut`] only collapses it, with no step,
+/// so the document has not changed.
+pub(crate) fn cut(ed: &mut Editor) -> Option<(Clip, bool)> {
+    let mut clip = None;
+    let out = edit(ed, |ed| ed.one_step("Cut", |ed| clip = ed.cut()));
+    clip.map(|clip| (clip, out.changed()))
 }
 
 impl From<Formatted> for KeyOutcome {
@@ -321,7 +326,7 @@ pub(crate) fn edit_key(
             }
             "c" if !shift => KeyOutcome::Copy,
             "x" if !shift => match cut(ed) {
-                Some(clip) => KeyOutcome::Cut(clip),
+                Some((clip, changed)) => KeyOutcome::Cut(clip, changed),
                 None => KeyOutcome::Moved,
             },
             "m" => {
@@ -933,7 +938,7 @@ mod tests {
         press(&mut ed, "ctrl-a");
         assert!(matches!(press(&mut ed, "ctrl-c")[0], KeyOutcome::Copy));
         let out = press(&mut ed, "ctrl-x").remove(0);
-        let KeyOutcome::Cut(clip) = out else {
+        let KeyOutcome::Cut(clip, true) = out else {
             panic!("{out:?}")
         };
         assert_eq!(clip.to_text(), "x");
@@ -1130,18 +1135,21 @@ mod tests {
         let mut ed = editor(&["Alpha Beta"]);
         type_text(&mut ed, "z");
         select(&mut ed, 0, 6);
-        let clip = cut(&mut ed).expect("a selection");
+        let (clip, changed) = cut(&mut ed).expect("a selection");
+        assert!(changed);
         assert_eq!(clip.to_text(), "zAlpha");
         assert_eq!(texts(&ed), [" Beta"]);
         // Ctrl+X takes the same clip.
         let mut keyed = editor(&["Alpha Beta"]);
         type_text(&mut keyed, "z");
         select(&mut keyed, 0, 6);
-        let KeyOutcome::Cut(key_clip) = press(&mut keyed, "ctrl-x").remove(0) else {
+        let KeyOutcome::Cut(key_clip, true) = press(&mut keyed, "ctrl-x").remove(0) else {
             panic!("a cut")
         };
         assert_eq!(key_clip.to_text(), clip.to_text());
         assert_eq!(texts(&keyed), texts(&ed));
+        // The step is the document tab's "Cut".
+        assert_eq!(ed.undo_names().first().map(String::as_str), Some("Cut"));
         // One undo restores the cut, not the typing before it.
         history(&mut ed, false);
         assert_eq!(texts(&ed), ["zAlpha Beta"]);
@@ -1151,5 +1159,44 @@ mod tests {
         assert!(cut(&mut ed).is_none());
         assert_eq!(texts(&ed), ["zAlpha Beta"]);
         assert_eq!(ed.undo_serial(), steps);
+    }
+
+    #[test]
+    fn a_cut_across_containers_copies_but_changes_nothing_1977() {
+        use docxcore::model::{Cell, Row, Table, VMerge};
+        let table = Block::Table(Table {
+            grid: vec![100],
+            rows: vec![Row {
+                cells: vec![Cell {
+                    grid_span: 1,
+                    v_merge: VMerge::None,
+                    blocks: vec![para("Cell")],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let fresh = || {
+            let mut ed = Editor::new(Document {
+                body: vec![para("Body"), table.clone()],
+            });
+            ed.anchor = Some(Caret::at(vec![0], 1));
+            ed.caret = Caret::at(vec![1, 0, 0, 0], 2);
+            ed
+        };
+        let mut ed = fresh();
+        let before = ed.doc.body.clone();
+        let (clip, changed) = cut(&mut ed).expect("something to copy");
+        assert!(!clip.to_text().is_empty());
+        assert!(!changed);
+        assert_eq!(ed.doc.body, before);
+        assert!(ed.undo_serial().is_none(), "no step");
+        // Ctrl+X: a cut, not a change.
+        let mut keyed = fresh();
+        let out = press(&mut keyed, "ctrl-x").remove(0);
+        assert!(matches!(out, KeyOutcome::Cut(_, false)), "{out:?}");
+        assert!(!out.changed());
+        assert_eq!(keyed.doc.body, before);
     }
 }
