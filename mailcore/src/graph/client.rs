@@ -9,9 +9,9 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderContact, FolderListing,
-    MailFolder, MasterCategory, Me, Message, MessageFields, MessageHeader, OofStatus, Person,
-    Recipient, Recurrence, ScheduleEntry, plain_to_html,
+    AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, FolderContact,
+    FolderListing, MailFolder, MasterCategory, Me, Message, MessageFields, MessageHeader,
+    OofStatus, Person, Recipient, Recurrence, ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -811,15 +811,42 @@ impl GraphClient {
         Ok(())
     }
 
-    /// GET `/me/calendarView?startDateTime=&endDateTime=&$top=50`, sending
-    /// `Prefer: outlook.timezone="UTC"` so every returned event's `start`/
-    /// `end` is already a UTC wall-clock time (see `Event::from_json` /
-    /// `model::to_utc` for the fixed-width normalization this enables), and
-    /// following `@odata.nextLink` — a relative path or a full URL, either
-    /// way `full_url` resolves it — until Graph stops sending one.
+    /// GET `/me/calendarView?startDateTime=&endDateTime=&$top=50`: the
+    /// default calendar's occurrences in the range (`calendar_view_paged`).
     pub fn calendar_view(&self, from_utc: &str, to_utc: &str) -> Result<Vec<Event>, GraphError> {
-        let mut target =
-            format!("/me/calendarView?startDateTime={from_utc}&endDateTime={to_utc}&$top=50");
+        self.calendar_view_paged(format!(
+            "/me/calendarView?startDateTime={from_utc}&endDateTime={to_utc}&$top=50"
+        ))
+    }
+
+    /// GET `/me/calendars/{id}/calendarView?startDateTime=&endDateTime=&$top=50`:
+    /// one calendar's occurrences in the range (#1984), the id
+    /// percent-encoded as a path segment. Each returned event's
+    /// `calendar_id` is `calendar_id`: the URL decides which calendar an
+    /// event is in, not the JSON's `calendar.id`.
+    pub fn calendar_view_in(
+        &self,
+        calendar_id: &str,
+        from_utc: &str,
+        to_utc: &str,
+    ) -> Result<Vec<Event>, GraphError> {
+        let id = encode_path_segment(calendar_id);
+        let mut events = self.calendar_view_paged(format!(
+            "/me/calendars/{id}/calendarView?startDateTime={from_utc}&endDateTime={to_utc}&$top=50"
+        ))?;
+        for e in &mut events {
+            e.calendar_id = calendar_id.to_string();
+        }
+        Ok(events)
+    }
+
+    /// Sends `Prefer: outlook.timezone="UTC"` so every returned event's
+    /// `start`/`end` is already a UTC wall-clock time (see `Event::from_json`
+    /// / `model::to_utc` for the fixed-width normalization this enables),
+    /// and follows `@odata.nextLink` (a relative path or a full URL, either
+    /// way `full_url` resolves it) until Graph stops sending one.
+    fn calendar_view_paged(&self, first: String) -> Result<Vec<Event>, GraphError> {
+        let mut target = first;
         let mut events = Vec::new();
         loop {
             let resp = self.send(
@@ -837,6 +864,31 @@ impl GraphClient {
             }
         }
         Ok(events)
+    }
+
+    /// GET `/me/calendars` (#1984): the user's calendars in Graph's order,
+    /// 100 a page, following `@odata.nextLink`. An item without an `id` is
+    /// skipped. Any page's failure is an `Err`, never a partial list, so
+    /// `Store::replace_calendars` never drops a calendar it did not see.
+    pub fn list_calendars(&self) -> Result<Vec<Calendar>, GraphError> {
+        let mut target =
+            "/me/calendars?$select=id,name,color,hexColor,isDefaultCalendar,canEdit,owner&$top=100"
+                .to_string();
+        let mut out = Vec::new();
+        loop {
+            let resp = self.send(Method::Get, &target, None, &[])?;
+            let v = parse_body(resp)?;
+            out.extend(
+                value_array(&v, "value")?
+                    .iter()
+                    .filter_map(Calendar::from_json),
+            );
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) => target = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// POST `/me/calendar/getSchedule` — the availability of each address in
@@ -3170,6 +3222,115 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].id, "E1");
         assert_eq!(events[1].id, "E2");
+    }
+
+    #[test]
+    fn calendar_view_in_encodes_the_id_and_pages() {
+        // The calendar id holds `/`, `+` and `=`; the second page is the
+        // more specific prefix, so it goes first (first prefix match wins).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars/A%2Fb%2B%3D/calendarView?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    sample_event_json("E2", "2026-07-18T11:00:00")
+                ),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars/A%2Fb%2B%3D/calendarView?startDateTime=".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/calendars/A%2Fb%2B%3D/calendarView?$skiptoken=P2"}}"#,
+                    sample_event_json("E1", "2026-07-18T09:00:00"),
+                ),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let events = c
+            .calendar_view_in("A/b+=", "2026-07-18T00:00:00Z", "2026-07-19T00:00:00Z")
+            .unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["E1", "E2"]);
+        assert!(events.iter().all(|e| e.calendar_id == "A/b+="));
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0]
+                .path
+                .contains("endDateTime=2026-07-19T00:00:00Z&$top=50")
+        );
+        for r in &reqs {
+            assert!(
+                r.headers
+                    .iter()
+                    .any(|(k, v)| k.eq_ignore_ascii_case("prefer")
+                        && v == "outlook.timezone=\"UTC\"")
+            );
+        }
+    }
+
+    #[test]
+    fn list_calendars_follows_next_link() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars?$skip=100".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"C2","name":"Birthdays"},{"name":"no id"}]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars?".into(),
+                status: 200,
+                headers: vec![],
+                body: r##"{"value":[{"id":"C1","name":"Calendar","color":"auto","hexColor":"",
+                    "isDefaultCalendar":true,"canEdit":true,
+                    "owner":{"name":"Ann","address":"ann@x.com"}}],
+                    "@odata.nextLink":"/me/calendars?$skip=100"}"##
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let cals = c.list_calendars().unwrap();
+        let ids: Vec<&str> = cals.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["C1", "C2"]);
+        assert!(cals[0].is_default && cals[0].can_edit);
+        assert_eq!(cals[0].owner_addr, "ann@x.com");
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs[0].path,
+            "/me/calendars?$select=id,name,color,hexColor,isDefaultCalendar,canEdit,owner&$top=100"
+        );
+        assert_eq!(reqs[1].path, "/me/calendars?$skip=100");
+    }
+
+    #[test]
+    fn list_calendars_fails_whole_when_a_page_fails() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars?$skip=100".into(),
+                status: 500,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendars?".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"C1"}],"@odata.nextLink":"/me/calendars?$skip=100"}"#
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.list_calendars().is_err());
     }
 
     #[test]

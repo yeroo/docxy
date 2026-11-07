@@ -974,6 +974,48 @@ impl EventRecurrence {
     }
 }
 
+/// One of the user's calendars, as `GET /me/calendars` lists it (#1984).
+/// Missing fields read as `""` / `false`; `hex_color` is `""` when Graph
+/// has no explicit colour (`color` is then `auto` or a preset name).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Calendar {
+    pub id: String,
+    pub name: String,
+    /// Graph `color`: a preset name (`lightBlue`, ..., `auto`).
+    pub color: String,
+    /// Graph `hexColor` (`#RRGGBB`), `""` when absent.
+    pub hex_color: String,
+    pub is_default: bool,
+    pub can_edit: bool,
+    /// Graph `owner` (`{name, address}`, an `emailAddress`, not a
+    /// `recipient`).
+    pub owner_name: String,
+    pub owner_addr: String,
+}
+
+impl Calendar {
+    /// `None` for an item without a non-empty `id`.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let id = str_field(v, "id");
+        if id.is_empty() {
+            return None;
+        }
+        let owner = v.get("owner");
+        let owner_field = |key: &str| owner.map(|o| str_field(o, key)).unwrap_or_default();
+        let flag = |key: &str| v.get(key).and_then(Value::as_bool).unwrap_or(false);
+        Some(Calendar {
+            id,
+            name: str_field(v, "name"),
+            color: str_field(v, "color"),
+            hex_color: str_field(v, "hexColor"),
+            is_default: flag("isDefaultCalendar"),
+            can_edit: flag("canEdit"),
+            owner_name: owner_field("name"),
+            owner_addr: owner_field("address"),
+        })
+    }
+}
+
 /// A calendar event, as returned by Graph's `/me/calendarView` and
 /// `/me/events` endpoints. `start_utc`/`end_utc` are always normalized to
 /// `YYYY-MM-DDTHH:MM:SSZ` by `to_utc` (see its docs) — callers never see
@@ -1033,8 +1075,10 @@ pub struct Event {
     /// organizer set the times in (to show "in another time zone").
     pub original_start_time_zone: String,
     pub original_end_time_zone: String,
-    /// The calendar holding the event (`calendar.id`, when Graph expands
-    /// it); `""` is the default calendar (#1984 fills it per calendar).
+    /// The calendar holding the event: `calendar.id` when Graph expands it,
+    /// else `""`. The engine sets it to the calendar whose `calendarView`
+    /// returned the event (#1984), so a stored event always carries the id
+    /// of the calendar it was fetched from.
     pub calendar_id: String,
 }
 
@@ -2015,6 +2059,43 @@ mod tests {
             assert_eq!(me.mail, "", "{body}");
             assert_eq!(me.address(), "ada@outlook.com", "{body}");
         }
+    }
+
+    #[test]
+    fn calendar_reads_graph_fields() {
+        let c = Calendar::from_json(
+            &parse(
+                r##"{"id":"C1","name":"Work","color":"lightBlue","hexColor":"#3366ff",
+                    "isDefaultCalendar":true,"canEdit":true,
+                    "owner":{"name":"Ann","address":"ann@x.com"}}"##,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            c,
+            Calendar {
+                id: "C1".into(),
+                name: "Work".into(),
+                color: "lightBlue".into(),
+                hex_color: "#3366ff".into(),
+                is_default: true,
+                can_edit: true,
+                owner_name: "Ann".into(),
+                owner_addr: "ann@x.com".into(),
+            }
+        );
+        // Missing fields default; no id, or an empty one, is skipped.
+        let bare = Calendar::from_json(&parse(r#"{"id":"C2"}"#).unwrap()).unwrap();
+        assert_eq!(
+            bare,
+            Calendar {
+                id: "C2".into(),
+                ..Calendar::default()
+            }
+        );
+        assert!(Calendar::from_json(&parse(r#"{"name":"x"}"#).unwrap()).is_none());
+        assert!(Calendar::from_json(&parse(r#"{"id":""}"#).unwrap()).is_none());
     }
 
     /// An event body around `extra`, the times every #1983 test shares.
