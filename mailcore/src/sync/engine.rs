@@ -3177,7 +3177,7 @@ impl Engine {
     ///
     /// Same signed-in guard as `fetch_body` et al. A failed list ends the
     /// pass with nothing changed. An expired link (`is_expired_sync_state`:
-    /// a 410, or a 400 `syncStateNotFound`/`resyncRequired`) runs that
+    /// a 410, or a 400 whose code it lists) runs that
     /// calendar's initial round at once, in the same pass. A 401, throttle
     /// or transport error on any round goes through `react` and ends the
     /// pass with no event written and every stored link kept, never a
@@ -3248,9 +3248,10 @@ impl Engine {
     /// every page in memory, so a round that fails part way writes
     /// nothing (replaying the link next pass is harmless). In a delta
     /// round the latest item about an event wins: a removal drops the
-    /// round's earlier upserts of that id and of its occurrences, and an
-    /// upsert cancels an earlier removal, since the store removes before
-    /// it upserts. An initial round's removals mean nothing: the window
+    /// round's earlier upserts of that id, and an upsert cancels an
+    /// earlier removal, since the store removes before it upserts. A
+    /// removal keeps the round's occurrences of that id: the store then
+    /// takes it for a changed series master, not a removed series. An initial round's removals mean nothing: the window
     /// is replaced whole.
     fn calendar_delta_round(
         &mut self,
@@ -3280,9 +3281,9 @@ impl Engine {
                         events.push(e);
                     }
                     EventDeltaItem::Removed(gone) if incremental => {
-                        events.retain(|e| {
-                            e.id != gone && e.series_master_id.as_deref() != Some(gone.as_str())
-                        });
+                        // The round's occurrences of `gone` stay: they say
+                        // the series still exists (`apply_calendar_delta_on`).
+                        events.retain(|e| e.id != gone);
                         if !removed.contains(&gone) {
                             removed.push(gone);
                         }
@@ -8676,6 +8677,111 @@ mod tests {
     }
 
     #[test]
+    fn calendar_delta_removed_outside_the_window_keeps_the_row() {
+        // Graph lists events outside the range that changed as `@removed`
+        // too: an event 200 days out (say, a FetchCalendarRange row) stays.
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(
+                    &[removed_json("FAR"), removed_json("NEAR")],
+                    "/cal-delta/CAL-A?token=2",
+                ),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-outside", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("NEAR", "CAL-A", 3600)],
+                    (&from, &to),
+                    &link,
+                );
+                s.upsert_event(&stored_event("FAR", "CAL-A", 200 * 86400))
+                    .unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(ids_in(&Store::open(&store_path).unwrap(), "CAL-A"), ["FAR"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_removed_master_beside_its_occurrences_keeps_them() {
+        let occurrence = |id: &str, from_now: u64| {
+            event_from_now(id, from_now).replacen(
+                r#""seriesMasterId":null"#,
+                r#""seriesMasterId":"S1""#,
+                1,
+            )
+        };
+        let routes = vec![
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &calendar_delta_page(
+                    &[occurrence("O1", 3600), occurrence("O2", 86400 + 3600)],
+                    "/cal-delta/CAL-A?token=1",
+                ),
+            ),
+            // The series edited: one occurrence changed, then its master
+            // (outside the range) listed as `@removed`.
+            get_route(
+                "/cal-delta/CAL-A?token=1",
+                200,
+                &calendar_delta_page(
+                    &[
+                        occurrence("O1", 7200).replacen(
+                            r#""subject":"Standup""#,
+                            r#""subject":"Edited""#,
+                            1,
+                        ),
+                        removed_json("S1"),
+                    ],
+                    "/cal-delta/CAL-A?token=2",
+                ),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-series-edit", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 2);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        let mut ids = ids_in(&store, "CAL-A");
+        ids.sort();
+        assert_eq!(ids, ["O1", "O2"]);
+        let edited = store
+            .events_in_range(
+                "2000-01-01T00:00:00Z",
+                "2100-01-01T00:00:00Z",
+                &["CAL-A".to_string()],
+            )
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "O1")
+            .unwrap();
+        assert_eq!(edited.subject, "Edited");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn calendar_delta_410_restarts_with_an_initial_round() {
         let (from, to) = today_window();
         let mut routes = calendar_routes(
@@ -9195,7 +9301,7 @@ mod tests {
         );
         let (srv, handle, store_path, dir) =
             spawn_calendar_engine("calendar-range-404", routes, |s| {
-                s.upsert_event(&stored_event("KEPT", "CAL-A", 60 * 86400))
+                s.upsert_event(&stored_event("KEPT", "CAL-A", 200 * 86400))
                     .unwrap();
             });
         let (from, to) = (iso_from_now(190), iso_from_now(210));

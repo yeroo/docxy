@@ -4018,6 +4018,16 @@ fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<()
 /// with that id and those whose `series_master_id` it is (a removed series
 /// takes its occurrences; an id with no row is a no-op). The window is
 /// then recorded as fetched at `stamp`: the round brought it up to date.
+///
+/// A removal deletes only rows overlapping the window: Graph's
+/// calendarView delta also lists as `@removed` events outside the range
+/// that were added, changed or deleted, which Graph may still have (an
+/// event moved to day 200, a `FetchCalendarRange` row past the window,
+/// history). An event that moved out of the window still has its old
+/// in-window times here, so it goes. A removed id the round upserts
+/// occurrences of is not a removed series: a series master that starts
+/// before the window is "outside the range" when it is edited, and its
+/// occurrences stay; only the row with that id goes.
 fn apply_calendar_delta_on(
     conn: &Connection,
     from_utc: &str,
@@ -4026,13 +4036,22 @@ fn apply_calendar_delta_on(
     removed: &[String],
     stamp: RangeStamp,
 ) -> Result<(), StoreError> {
+    let named_masters: HashSet<&str> = f
+        .events
+        .iter()
+        .filter_map(|e| e.series_master_id.as_deref())
+        .collect();
     for id in removed {
-        conn.execute(
+        let sql = if named_masters.contains(id.as_str()) {
+            "DELETE FROM events
+             WHERE calendar_id = ?1 AND id = ?2
+                   AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'"
+        } else {
             "DELETE FROM events
              WHERE calendar_id = ?1 AND (id = ?2 OR series_master_id = ?2)
-                   AND id NOT LIKE 'local:%'",
-            params![f.calendar_id, id],
-        )?;
+                   AND start_utc < ?4 AND end_utc > ?3 AND id NOT LIKE 'local:%'"
+        };
+        conn.execute(sql, params![f.calendar_id, id, from_utc, to_utc])?;
     }
     upsert_fetched_events_on(conn, f)?;
     record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)
@@ -7796,6 +7815,74 @@ mod calendar_tests {
             .unwrap();
         assert_eq!(sorted_ids_of(&s, "A"), ["other", "single"]);
         assert_eq!(ids_of(&s, "B"), ["b-o1"], "another calendar's series stays");
+    }
+
+    #[test]
+    fn apply_calendar_sync_delta_removes_only_rows_in_the_window() {
+        // Graph's calendarView delta also lists events outside the range as
+        // `@removed`: rows outside the window are not the round's to delete.
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let occurrence = |id: &str, start: &str, end: &str| NewEvent {
+            series_master_id: Some("M".into()),
+            ..in_cal(id, "A", start, end)
+        };
+        for e in [
+            in_cal("in", "A", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"),
+            // A FetchCalendarRange row past the window, and history.
+            in_cal("later", "A", "2026-09-20T09:00:00Z", "2026-09-20T10:00:00Z"),
+            in_cal(
+                "history",
+                "A",
+                "2026-05-01T09:00:00Z",
+                "2026-05-01T10:00:00Z",
+            ),
+            // Overlapping the window's start: in it.
+            in_cal("edge", "A", "2026-07-12T23:00:00Z", "2026-07-13T01:00:00Z"),
+            occurrence("m-in", "2026-07-21T09:00:00Z", "2026-07-21T10:00:00Z"),
+            occurrence("m-later", "2026-09-21T09:00:00Z", "2026-09-21T10:00:00Z"),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[delta(
+                "A",
+                vec![],
+                &["in", "later", "history", "edge", "M"],
+                "L",
+            )],
+            STAMP,
+        )
+        .unwrap();
+        assert_eq!(sorted_ids_of(&s, "A"), ["history", "later", "m-later"]);
+    }
+
+    #[test]
+    fn apply_calendar_sync_delta_keeps_a_series_the_round_names_occurrences_of() {
+        // A master starting before the window is "outside the range" when
+        // its series is edited: Graph may list it as `@removed` beside the
+        // changed occurrences. The series is not gone.
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let occurrence = |id: &str, day: u32| NewEvent {
+            series_master_id: Some("S1".into()),
+            ..in_cal(
+                id,
+                "A",
+                &format!("2026-07-{day}T09:00:00Z"),
+                &format!("2026-07-{day}T10:00:00Z"),
+            )
+        };
+        for e in [occurrence("o1", 20), occurrence("o2", 27)] {
+            s.upsert_event(&e).unwrap();
+        }
+        let mut changed = occurrence("o1", 20);
+        changed.subject = "edited".into();
+        s.apply_calendar_sync(FROM, TO, &[delta("A", vec![changed], &["S1"], "L")], STAMP)
+            .unwrap();
+        assert_eq!(sorted_ids_of(&s, "A"), ["o1", "o2"]);
     }
 
     #[test]
