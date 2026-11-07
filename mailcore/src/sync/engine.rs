@@ -48,7 +48,7 @@ pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Me, Message, ScheduleEntry};
 use crate::store::{
     FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent,
-    OutboxOp, OutboxRow, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
+    OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
 };
 use crate::sync::outbox::{apply_op, apply_send, send_error_text};
 use crate::tokencache;
@@ -234,6 +234,25 @@ pub enum SyncCommand {
     /// a throttle or back-off, the calendar is refreshed right away so a
     /// newly chosen calendar fills in.
     SetCalendars { ids: Option<Vec<String>> },
+    /// Fetch the events of `[from_utc, to_utc)` (the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ`) of every synced calendar, for a calendar UI
+    /// showing dates outside the kept window (#2014). Per calendar only the
+    /// parts the store does not hold fresh (`Store::calendar_range_gaps`,
+    /// fetched within [`EngineOptions::calendar_range_fresh_for`]) go to
+    /// `calendarView`, one request per part; each is stored as it lands
+    /// (`Store::apply_calendar_range`: that calendar's synced events there
+    /// replaced). Then [`SyncEvent::CalendarUpdated`] when anything was
+    /// written, and [`SyncEvent::CalendarRangeFetched`]; a range wholly
+    /// fresh is served from the store with no request. With no stored
+    /// calendar list the calendars are listed first. Bounds that are not
+    /// that shape, or `from_utc >= to_utc`, are a [`SyncEvent::Error`].
+    /// When a part needs fetching: signed out is an `Error`; inside a
+    /// throttle or back-off wait the command does nothing more (neither
+    /// event, as `SyncFolder`), and a 401, throttle or transport error
+    /// mid-range ends it without `CalendarRangeFetched` (what landed
+    /// stays): the host sends it again. A 404, HTTP or parse error on one
+    /// calendar is an `Error`, and the others carry on.
+    FetchCalendarRange { from_utc: String, to_utc: String },
     /// Respond to a calendar event's invite: optimistic local
     /// `Store::set_event_response` (immediately reflected, before Graph is
     /// even reached) plus [`SyncEvent::CalendarUpdated`], then enqueue
@@ -374,6 +393,13 @@ pub enum SyncEvent {
     /// renamed, recoloured or moved), or which of them sync did (#1984);
     /// re-read `Store::calendars`.
     CalendarsUpdated,
+    /// A [`SyncCommand::FetchCalendarRange`] finished (#2014): every synced
+    /// calendar whose view did not fail has its events over `[from, to)`
+    /// (the bounds the command carried) in the store, fetched or already
+    /// fresh; read them with `Store::events_in_range`. A calendar whose
+    /// view failed (a 404, HTTP or parse error) was reported by an earlier
+    /// [`SyncEvent::Error`]; asking again fetches what is still missing.
+    CalendarRangeFetched { from: String, to: String },
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -452,6 +478,8 @@ const SMALL_FOLDER: i64 = 50;
 
 /// The default of [`EngineOptions::prefetch_body_days`] (#1978).
 pub const PREFETCH_BODY_DAYS: u32 = 14;
+/// The default of [`EngineOptions::calendar_range_fresh_for`] (#2014).
+pub const CALENDAR_RANGE_FRESH_FOR: Duration = Duration::from_secs(3600);
 /// At most this many bodies of the messages one delta round on a stored
 /// link added are fetched in that round (#1978); the prefetch takes the rest.
 const NEW_BODY_LIMIT: usize = 50;
@@ -585,6 +613,11 @@ pub struct EngineOptions {
     /// step. Drafts are never fetched. `0` turns every body fetch the
     /// engine makes on its own off: bodies come only from `FetchBody`.
     pub prefetch_body_days: u32,
+    /// How long a range [`SyncCommand::FetchCalendarRange`] fetched is
+    /// served from the store before it is fetched again (#2014; default
+    /// [`CALENDAR_RANGE_FRESH_FOR`]). The kept window counts as fetched by
+    /// each calendar pass. Zero fetches every time.
+    pub calendar_range_fresh_for: Duration,
 }
 
 impl Default for EngineOptions {
@@ -593,6 +626,7 @@ impl Default for EngineOptions {
             body_format: BodyFormat::default(),
             fast_tick: None,
             prefetch_body_days: PREFETCH_BODY_DAYS,
+            calendar_range_fresh_for: CALENDAR_RANGE_FRESH_FOR,
         }
     }
 }
@@ -1269,6 +1303,9 @@ impl Engine {
             SyncCommand::ComposeForward { id } => self.compose_forward(&id),
             SyncCommand::RefreshCalendar => self.refresh_calendar(),
             SyncCommand::SetCalendars { ids } => self.set_calendars(ids.as_deref()),
+            SyncCommand::FetchCalendarRange { from_utc, to_utc } => {
+                self.fetch_calendar_range(&from_utc, &to_utc)
+            }
             SyncCommand::RespondEvent {
                 id,
                 kind,
@@ -3107,20 +3144,8 @@ impl Engine {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        let calendars = match self.with_auth(|c| c.list_calendars()) {
-            Ok(calendars) => calendars,
-            Err(e) => {
-                self.react(e);
-                return;
-            }
-        };
-        match self.store.replace_calendars(&calendars) {
-            Ok(true) => self.emit(SyncEvent::CalendarsUpdated),
-            Ok(false) => {}
-            Err(e) => {
-                self.emit(SyncEvent::Error(e.to_string()));
-                return;
-            }
+        if !self.list_calendars_into_store() {
+            return;
         }
         let synced = match self.store.synced_calendar_ids() {
             Ok(ids) => ids,
@@ -3133,19 +3158,7 @@ impl Engine {
         let mut fetched = Vec::with_capacity(synced.len());
         for id in synced {
             match self.with_auth(|c| c.calendar_view_in(&id, &from, &to)) {
-                Ok(events) => fetched.push(FetchedCalendar {
-                    events: events.iter().map(NewEvent::from).collect(),
-                    attendees: events
-                        .iter()
-                        .map(|e| {
-                            (
-                                e.id.clone(),
-                                e.attendees.iter().map(NewAttendee::from).collect(),
-                            )
-                        })
-                        .collect(),
-                    calendar_id: id,
-                }),
+                Ok(events) => fetched.push(fetched_calendar(id, &events)),
                 // Sign-in, throttle or offline: the whole pass waits.
                 Err(e) => {
                     if self.react(e) {
@@ -3154,11 +3167,166 @@ impl Engine {
                 }
             }
         }
-        if let Err(e) = self.store.apply_calendar_sync(&from, &to, &fetched) {
+        let stamp = self.range_stamp();
+        if let Err(e) = self.store.apply_calendar_sync(&from, &to, &fetched, stamp) {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
         }
         self.emit(SyncEvent::CalendarUpdated);
+    }
+
+    /// Lists the user's calendars into the store (`list_calendars`,
+    /// `Store::replace_calendars`), emitting `SyncEvent::CalendarsUpdated`
+    /// when the list changed. `false` when the list or the store failed
+    /// (already reported: `react`, or an `Error`).
+    fn list_calendars_into_store(&mut self) -> bool {
+        let calendars = match self.with_auth(|c| c.list_calendars()) {
+            Ok(calendars) => calendars,
+            Err(e) => {
+                self.react(e);
+                return false;
+            }
+        };
+        match self.store.replace_calendars(&calendars) {
+            Ok(true) => {
+                self.emit(SyncEvent::CalendarsUpdated);
+                true
+            }
+            Ok(false) => true,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                false
+            }
+        }
+    }
+
+    /// Now, as the `calendar_ranges` rows a fetch records (#2014), with
+    /// the cutoff `EngineOptions::calendar_range_fresh_for` sets.
+    fn range_stamp(&self) -> RangeStamp {
+        let at = i64::try_from(now_unix()).unwrap_or(i64::MAX);
+        let fresh_for = i64::try_from(self.config.options.calendar_range_fresh_for.as_secs())
+            .unwrap_or(i64::MAX);
+        RangeStamp {
+            at,
+            fresh_since: at.saturating_sub(fresh_for),
+        }
+    }
+
+    /// `SyncCommand::FetchCalendarRange` (#2014): see there. Each gap of
+    /// each synced calendar is fetched and stored on its own, so a failure
+    /// keeps (and records) what already landed.
+    fn fetch_calendar_range(&mut self, from: &str, to: &str) {
+        match (
+            crate::store::iso8601_to_unix_secs(from),
+            crate::store::iso8601_to_unix_secs(to),
+        ) {
+            (Some(a), Some(b)) if a < b => {}
+            _ => {
+                self.emit(SyncEvent::Error(format!(
+                    "fetch calendar range: invalid range {from} .. {to}"
+                )));
+                return;
+            }
+        }
+        let waiting = |e: &Self| e.next_retry.is_some_and(|t| Instant::now() < t);
+        let listed = match self.store.calendars() {
+            Ok(list) => !list.is_empty(),
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        if !listed {
+            // Nothing says which calendars sync until they are listed.
+            if self.token.is_none() {
+                self.emit(SyncEvent::Error("not signed in".to_string()));
+                return;
+            }
+            if waiting(self) || !self.list_calendars_into_store() {
+                return;
+            }
+        }
+        let synced = match self.store.synced_calendar_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let mut wrote = false;
+        let finished = self.fetch_range_gaps(&synced, from, to, &mut wrote);
+        // Whatever ended the command, what landed is announced.
+        if wrote {
+            self.emit(SyncEvent::CalendarUpdated);
+        }
+        if finished {
+            self.emit(SyncEvent::CalendarRangeFetched {
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+    }
+
+    /// `fetch_calendar_range`'s loop: fetches and stores each gap of each
+    /// of `synced` over `[from, to)`, setting `wrote` once a gap is
+    /// stored. `false` when the command ends early (signed out, a throttle
+    /// or back-off wait, a 401, throttle or transport error, a store
+    /// error; each already reported), so no `CalendarRangeFetched` follows.
+    /// A 404, HTTP or parse error (reported by `react`) leaves that gap and
+    /// the calendar's later gaps unfetched and unrecorded, its earlier gaps
+    /// stay written, and the next calendar carries on.
+    fn fetch_range_gaps(
+        &mut self,
+        synced: &[String],
+        from: &str,
+        to: &str,
+        wrote: &mut bool,
+    ) -> bool {
+        for id in synced {
+            let fresh_since = self.range_stamp().fresh_since;
+            let gaps = match self.store.calendar_range_gaps(id, from, to, fresh_since) {
+                Ok(gaps) => gaps,
+                Err(e) => {
+                    self.emit(SyncEvent::Error(e.to_string()));
+                    return false;
+                }
+            };
+            if gaps.is_empty() {
+                continue;
+            }
+            if self.token.is_none() {
+                self.emit(SyncEvent::Error("not signed in".to_string()));
+                return false;
+            }
+            if self.next_retry.is_some_and(|t| Instant::now() < t) {
+                return false;
+            }
+            for (a, b) in gaps {
+                match self.with_auth(|c| c.calendar_view_in(id, &a, &b)) {
+                    Ok(events) => {
+                        let f = fetched_calendar(id.clone(), &events);
+                        let stamp = self.range_stamp();
+                        if let Err(e) = self.store.apply_calendar_range(&a, &b, &f, stamp) {
+                            self.emit(SyncEvent::Error(e.to_string()));
+                            return false;
+                        }
+                        *wrote = true;
+                    }
+                    Err(e) => {
+                        // Sign-in, throttle or offline: the range waits
+                        // for the host to ask again.
+                        if self.react(e) {
+                            return false;
+                        }
+                        // Reported: this gap and the calendar's later ones
+                        // stay unfetched and unrecorded (its earlier gaps
+                        // stay written), so asking again fetches them.
+                        break;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// `SyncCommand::SetCalendars`: stores the choice (deleting the events of
@@ -3792,6 +3960,24 @@ fn now_unix() -> u64 {
 /// engine's unsigned clock.
 fn unix_to_iso8601(secs: u64) -> String {
     crate::store::unix_secs_to_iso8601(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// One calendar's `calendarView` answer as the store writes it: the
+/// events and their attendees, under `id` (the URL decides, #1984).
+fn fetched_calendar(id: String, events: &[crate::graph::model::Event]) -> FetchedCalendar {
+    FetchedCalendar {
+        events: events.iter().map(NewEvent::from).collect(),
+        attendees: events
+            .iter()
+            .map(|e| {
+                (
+                    e.id.clone(),
+                    e.attendees.iter().map(NewAttendee::from).collect(),
+                )
+            })
+            .collect(),
+        calendar_id: id,
+    }
 }
 
 /// `RefreshCalendar`'s window, per calendar: this many days into the past...
@@ -7719,6 +7905,16 @@ mod tests {
         routes: Vec<Route>,
         seed: impl FnOnce(&Store),
     ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        spawn_calendar_engine_with(tag, routes, seed, EngineOptions::without_prefetch())
+    }
+
+    /// [`spawn_calendar_engine`] with the engine's options.
+    fn spawn_calendar_engine_with(
+        tag: &str,
+        routes: Vec<Route>,
+        seed: impl FnOnce(&Store),
+        options: EngineOptions,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
         let mut routes = routes;
         routes.extend(backfill_routes());
         let srv = FakeServer::start(routes);
@@ -7728,7 +7924,7 @@ mod tests {
         let token_path = dir.join("token.bin");
         seed_token(&token_path);
         seed(&Store::open(&store_path).unwrap());
-        let handle = spawn_with_bases(
+        let handle = spawn_with_bases_and_options(
             store_path.clone(),
             token_path,
             test_cfg(),
@@ -7736,6 +7932,7 @@ mod tests {
             base.clone(),
             base,
             Duration::from_secs(3600),
+            options,
         );
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
         (srv, handle, store_path, dir)
@@ -7998,6 +8195,316 @@ mod tests {
         want.sort();
         assert_eq!(ids, want, "adopted once each, none deleted");
         assert!(ids_in(&store, "").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Calendar ranges on demand (#2014) ---
+
+    /// A query parameter's value in a recorded request path.
+    fn query_value(path: &str, key: &str) -> String {
+        let query = path.split_once('?').map_or("", |(_, q)| q);
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The `(startDateTime, endDateTime)` of each `calendarView` request of
+    /// `calendar` from request `from` on.
+    fn view_ranges(srv: &FakeServer, from: usize, calendar: &str) -> Vec<(String, String)> {
+        let prefix = format!("/me/calendars/{calendar}/calendarView");
+        paths_from(srv, from)
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .map(|p| {
+                (
+                    query_value(p, "startDateTime"),
+                    query_value(p, "endDateTime"),
+                )
+            })
+            .collect()
+    }
+
+    /// How many calendar requests (the list and every view) were made from
+    /// request `from` on. The mail sync's own requests are not counted.
+    fn calendar_requests(srv: &FakeServer, from: usize) -> usize {
+        paths_from(srv, from)
+            .iter()
+            .filter(|p| p.starts_with("/me/calendars"))
+            .count()
+    }
+
+    fn iso_from_now(days: i64) -> String {
+        unix_to_iso8601((now_unix() as i64 + days * 86400) as u64)
+    }
+
+    fn fetch_range(handle: &SyncHandle, from: &str, to: &str) {
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchCalendarRange {
+                from_utc: from.into(),
+                to_utc: to.into(),
+            })
+            .unwrap();
+    }
+
+    /// Waits for the `CalendarRangeFetched` of `[from, to)`.
+    fn wait_for_range(rx: &Receiver<SyncEvent>, from: &str, to: &str) -> Vec<SyncEvent> {
+        wait_for(
+            rx,
+            |e| matches!(e, SyncEvent::CalendarRangeFetched { from: f, to: t } if f == from && t == to),
+        )
+    }
+
+    /// An event 60 days out: outside `calendar_window`.
+    fn far_event(id: &str) -> String {
+        let start = now_unix() + 60 * 86400;
+        calendar_event_json(
+            id,
+            unix_to_iso8601(start).trim_end_matches('Z'),
+            unix_to_iso8601(start + 1800).trim_end_matches('Z'),
+        )
+    }
+
+    #[test]
+    fn fetch_calendar_range_outside_the_window_is_fetched_once_then_served_from_the_store() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[far_event("FA")])),
+                ("CAL-B", 200, events_body(&[far_event("FB")])),
+            ],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-range-once", routes, |_| {});
+        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        // No calendar list stored yet: the command lists first.
+        fetch_range(&handle, &from, &to);
+        let seen = wait_for_range(&handle.evt_rx, &from, &to);
+        assert!(seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        assert!(seen.contains(&SyncEvent::CalendarsUpdated), "{seen:?}");
+        assert_eq!(view_ranges(&srv, 0, "CAL-A"), [(from.clone(), to.clone())]);
+        assert_eq!(view_ranges(&srv, 0, "CAL-B"), [(from.clone(), to.clone())]);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["FA"]);
+        assert_eq!(ids_in(&store, "CAL-B"), ["FB"]);
+
+        // Again: served from the store, no request.
+        let before = srv.requests().len();
+        fetch_range(&handle, &from, &to);
+        let seen = wait_for_range(&handle.evt_rx, &from, &to);
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        assert_eq!(view_requests(&srv, before, "CAL-A"), 0);
+        assert_eq!(view_requests(&srv, before, "CAL-B"), 0);
+        assert_eq!(calendar_requests(&srv, before), 0, "no list either");
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_inside_the_refreshed_window_makes_no_request() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("EA", 3600)]))],
+        );
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("calendar-range-window", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let before = srv.requests().len();
+        let (from, to) = (iso_from_now(1), iso_from_now(2));
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        assert_eq!(calendar_requests(&srv, before), 0);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_fetches_only_the_part_outside_the_window() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        );
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("calendar-range-part", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let window = view_ranges(&srv, 0, "CAL-A");
+        assert_eq!(window.len(), 1);
+        let win_to = window[0].1.clone();
+
+        // Partly in the window: only the part after it.
+        let before = srv.requests().len();
+        let (from, to) = (iso_from_now(20), iso_from_now(40));
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        assert_eq!(
+            view_ranges(&srv, before, "CAL-A"),
+            [(win_to.clone(), to.clone())]
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_around_the_window_makes_one_request_per_gap() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        );
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("calendar-range-around", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let (win_from, win_to) = view_ranges(&srv, 0, "CAL-A")[0].clone();
+
+        let before = srv.requests().len();
+        let (from, to) = (iso_from_now(-30), iso_from_now(60));
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        assert_eq!(
+            view_ranges(&srv, before, "CAL-A"),
+            [(from.clone(), win_from), (win_to, to.clone())]
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_refetches_a_stale_range() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[far_event("FA")]))],
+        );
+        let options = EngineOptions {
+            calendar_range_fresh_for: Duration::ZERO,
+            ..EngineOptions::without_prefetch()
+        };
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine_with("calendar-range-stale", routes, |_| {}, options);
+        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        // At once, within the same second: zero freshness is always stale.
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        assert_eq!(view_requests(&srv, 0, "CAL-A"), 2);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_rejects_bad_bounds() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        );
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("calendar-range-bad", routes, |_| {});
+        let before = srv.requests().len();
+        let a = iso_from_now(50);
+        let bad = [
+            ("2026-13-01T00:00:00Z".to_string(), a.clone()),
+            (a.clone(), "2026-01-01".to_string()),
+            (a.clone(), a.clone()),
+            (iso_from_now(60), a.clone()),
+        ];
+        for (from, to) in &bad {
+            fetch_range(&handle, from, to);
+        }
+        let mut errors = 0;
+        let seen = wait_for(&handle.evt_rx, |e| {
+            if matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")) {
+                errors += 1;
+            }
+            errors == bad.len()
+        });
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::CalendarRangeFetched { .. })),
+            "{seen:?}"
+        );
+        assert_eq!(calendar_requests(&srv, before), 0, "no Graph call");
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_throttled_emits_no_range_fetched() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 429, String::new())],
+        );
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("calendar-range-throttled", routes, |_| {});
+        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        fetch_range(&handle, &from, &to);
+        // A bad range after it marks the end of the first command's events.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::CalendarRangeFetched { .. })),
+            "{seen:?}"
+        );
+        assert_eq!(view_requests(&srv, 0, "CAL-A"), 1);
+        // Inside the throttle wait the range does nothing more.
+        let before = srv.requests().len();
+        fetch_range(&handle, &from, &to);
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::CalendarRangeFetched { .. })),
+            "{seen:?}"
+        );
+        assert_eq!(calendar_requests(&srv, before), 0);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_calendar_range_keeps_going_past_a_failed_calendar() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 404, String::new()),
+                ("CAL-B", 200, events_body(&[far_event("FB")])),
+            ],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-range-404", routes, |s| {
+                s.upsert_event(&stored_event("KEPT", "CAL-A", 60 * 86400))
+                    .unwrap();
+            });
+        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        fetch_range(&handle, &from, &to);
+        let seen = wait_for_range(&handle.evt_rx, &from, &to);
+        assert!(
+            seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["KEPT"]);
+        assert_eq!(ids_in(&store, "CAL-B"), ["FB"]);
+        // A recorded nothing: asked again, it is fetched again; B is not.
+        let before = srv.requests().len();
+        fetch_range(&handle, &from, &to);
+        wait_for_range(&handle.evt_rx, &from, &to);
+        assert_eq!(view_requests(&srv, before, "CAL-A"), 1);
+        assert_eq!(view_requests(&srv, before, "CAL-B"), 0);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

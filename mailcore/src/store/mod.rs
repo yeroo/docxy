@@ -577,6 +577,20 @@ pub struct FetchedCalendar {
     pub attendees: Vec<(String, Vec<NewAttendee>)>,
 }
 
+/// When a calendar range was fetched (#2014), for the `calendar_ranges`
+/// rows `apply_calendar_sync` and `apply_calendar_range` write: `at` is
+/// the fetch time (unix seconds), `fresh_since` the freshness cutoff
+/// (`at` minus how long a range stays fresh). A row is fresh while its
+/// `fetched_at > fresh_since` (`Store::calendar_range_gaps`), so recording
+/// first drops the calendar's rows at or before the cutoff: they can never
+/// count again, and the window pass would otherwise leave one sliver per
+/// pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeStamp {
+    pub at: i64,
+    pub fresh_since: i64,
+}
+
 /// The field set `upsert_event` writes to an `events` row.
 ///
 /// Same field set as `EventRow` plus the extra columns (`body_preview`,
@@ -3307,46 +3321,26 @@ impl Store {
     /// 2. For each calendar in `fetched`, its synced events overlapping the
     ///    window (`events_in_window`'s rule; `local:` rows excluded, as in
     ///    `replace_events_in_window`) are replaced by the fetched ones, each
-    ///    stored under that calendar's id, with their attendees. A synced
-    ///    calendar missing from `fetched` (its view failed) keeps its rows.
+    ///    stored under that calendar's id, with their attendees, and the
+    ///    window is recorded as fetched at `stamp` (#2014,
+    ///    `calendar_range_gaps`). A synced calendar missing from `fetched`
+    ///    (its view failed) keeps its rows and records nothing.
     /// 3. Every synced event, of any date, whose non-empty `calendar_id` is
     ///    not in `synced_calendar_ids` is deleted: a deselected calendar, or
     ///    one Graph no longer lists. `''` rows (left only when no default is
-    ///    known) and `local:` rows are kept.
+    ///    known) and `local:` rows are kept. The fetched ranges of every
+    ///    calendar not synced go too, events or not (#2014).
     pub fn apply_calendar_sync(
         &self,
         from_utc: &str,
         to_utc: &str,
         fetched: &[FetchedCalendar],
+        stamp: RangeStamp,
     ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        if let Some(default) = default_calendar_id_on(&tx)? {
-            tx.execute(
-                "UPDATE events SET calendar_id = ?1 WHERE calendar_id = ''",
-                params![default],
-            )?;
-        }
+        adopt_blank_calendar_rows_on(&tx)?;
         for f in fetched {
-            tx.execute(
-                "DELETE FROM events
-                 WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
-                       AND id NOT LIKE 'local:%'",
-                params![from_utc, to_utc, f.calendar_id],
-            )?;
-            for e in &f.events {
-                if e.calendar_id == f.calendar_id {
-                    upsert_event_on(&tx, e)?;
-                } else {
-                    let e = NewEvent {
-                        calendar_id: f.calendar_id.clone(),
-                        ..e.clone()
-                    };
-                    upsert_event_on(&tx, &e)?;
-                }
-            }
-            for (id, atts) in &f.attendees {
-                put_event_attendees_on(&tx, id, atts)?;
-            }
+            replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp)?;
         }
         let synced: HashSet<String> = synced_calendar_ids_on(&tx)?.into_iter().collect();
         let stored: Vec<String> = tx
@@ -3356,8 +3350,83 @@ impl Store {
         for id in stored.iter().filter(|id| !synced.contains(*id)) {
             delete_calendar_events_on(&tx, id)?;
         }
+        let ranged: Vec<String> = tx
+            .prepare("SELECT DISTINCT calendar_id FROM calendar_ranges")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        for id in ranged.iter().filter(|id| !synced.contains(*id)) {
+            tx.execute(
+                "DELETE FROM calendar_ranges WHERE calendar_id = ?1",
+                params![id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Writes one calendar's events fetched over `[from_utc, to_utc)` by a
+    /// `FetchCalendarRange` (#2014), in one transaction: pre-#1984 rows
+    /// are adopted into the default calendar (`apply_calendar_sync`'s step
+    /// 1), then the calendar's synced (non-`local:`) events overlapping the
+    /// range are replaced by `f`'s, and the range is recorded as fetched at
+    /// `stamp`. Other calendars' rows, and rows of other calendars that no
+    /// longer sync, are left to the sync pass.
+    pub fn apply_calendar_range(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        f: &FetchedCalendar,
+        stamp: RangeStamp,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        adopt_blank_calendar_rows_on(&tx)?;
+        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The parts of `[from_utc, to_utc)` that `calendar_id`'s fetched
+    /// ranges do not cover fresh (#2014), sorted and disjoint; empty when
+    /// the whole range is fresh. A range is fresh while its `fetched_at >
+    /// fresh_since` (strictly: with `fresh_since` = now, nothing is fresh).
+    /// Bounds are the store's fixed-width `YYYY-MM-DDTHH:MM:SSZ`, which
+    /// compare as strings.
+    pub fn calendar_range_gaps(
+        &self,
+        calendar_id: &str,
+        from_utc: &str,
+        to_utc: &str,
+        fresh_since: i64,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let covered: Vec<(String, String)> = self
+            .conn
+            .prepare(
+                "SELECT from_utc, to_utc FROM calendar_ranges
+                 WHERE calendar_id = ?1 AND fetched_at > ?2
+                       AND from_utc < ?4 AND to_utc > ?3
+                 ORDER BY from_utc",
+            )?
+            .query_map(params![calendar_id, fresh_since, from_utc, to_utc], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        let mut gaps = Vec::new();
+        let mut cursor = from_utc.to_string();
+        for (a, b) in covered {
+            if cursor.as_str() >= to_utc {
+                break;
+            }
+            if a > cursor {
+                gaps.push((cursor.clone(), a.min(to_utc.to_string())));
+            }
+            if b > cursor {
+                cursor = b;
+            }
+        }
+        if cursor.as_str() < to_utc {
+            gaps.push((cursor, to_utc.to_string()));
+        }
+        Ok(gaps)
     }
 
     /// The stored delta link for the calendar, if any (`None` before the
@@ -3817,6 +3886,105 @@ fn delete_calendar_events_on(conn: &Connection, calendar_id: &str) -> Result<(),
         "DELETE FROM events WHERE calendar_id = ?1 AND id NOT LIKE 'local:%'",
         params![calendar_id],
     )?;
+    // Its fetched ranges go with them (#2014): selected again, the
+    // calendar fetches them again.
+    conn.execute(
+        "DELETE FROM calendar_ranges WHERE calendar_id = ?1",
+        params![calendar_id],
+    )?;
+    Ok(())
+}
+
+/// `apply_calendar_sync`'s step 1: pre-#1984 rows (`calendar_id = ''`)
+/// take the stored default calendar's id, when there is one.
+fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
+    if let Some(default) = default_calendar_id_on(conn)? {
+        conn.execute(
+            "UPDATE events SET calendar_id = ?1 WHERE calendar_id = ''",
+            params![default],
+        )?;
+    }
+    Ok(())
+}
+
+/// Replaces `f.calendar_id`'s synced (non-`local:`) events overlapping
+/// `[from_utc, to_utc)` with `f`'s, each stored under that id, with their
+/// attendees, and records the range as fetched at `stamp`.
+fn replace_calendar_range_on(
+    conn: &Connection,
+    from_utc: &str,
+    to_utc: &str,
+    f: &FetchedCalendar,
+    stamp: RangeStamp,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM events
+         WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
+               AND id NOT LIKE 'local:%'",
+        params![from_utc, to_utc, f.calendar_id],
+    )?;
+    for e in &f.events {
+        if e.calendar_id == f.calendar_id {
+            upsert_event_on(conn, e)?;
+        } else {
+            let e = NewEvent {
+                calendar_id: f.calendar_id.clone(),
+                ..e.clone()
+            };
+            upsert_event_on(conn, &e)?;
+        }
+    }
+    for (id, atts) in &f.attendees {
+        put_event_attendees_on(conn, id, atts)?;
+    }
+    record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)
+}
+
+/// Records `[from_utc, to_utc)` of `calendar_id` as fetched at `stamp.at`,
+/// keeping the calendar's intervals disjoint: first its rows that can no
+/// longer be fresh (`fetched_at <= stamp.fresh_since`) go, then every
+/// interval overlapping the range is cut back to its pieces outside it
+/// (with their own `fetched_at`), then the range goes in.
+fn record_calendar_range_on(
+    conn: &Connection,
+    calendar_id: &str,
+    from_utc: &str,
+    to_utc: &str,
+    stamp: RangeStamp,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM calendar_ranges WHERE calendar_id = ?1 AND fetched_at <= ?2",
+        params![calendar_id, stamp.fresh_since],
+    )?;
+    let overlapping: Vec<(i64, String, String, i64)> = conn
+        .prepare(
+            "SELECT rowid, from_utc, to_utc, fetched_at FROM calendar_ranges
+             WHERE calendar_id = ?1 AND from_utc < ?3 AND to_utc > ?2",
+        )?
+        .query_map(params![calendar_id, from_utc, to_utc], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let insert = |a: &str, b: &str, at: i64| {
+        conn.execute(
+            "INSERT INTO calendar_ranges (calendar_id, from_utc, to_utc, fetched_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![calendar_id, a, b, at],
+        )
+    };
+    for (rowid, a, b, at) in overlapping {
+        conn.execute(
+            "DELETE FROM calendar_ranges WHERE rowid = ?1",
+            params![rowid],
+        )?;
+        if a.as_str() < from_utc {
+            insert(&a, from_utc, at)?;
+        }
+        if b.as_str() > to_utc {
+            insert(to_utc, &b, at)?;
+        }
+    }
+    insert(from_utc, to_utc, stamp.at)?;
     Ok(())
 }
 
@@ -3866,7 +4034,7 @@ pub(crate) fn unix_secs_to_iso8601(secs: i64) -> String {
 /// The store's `YYYY-MM-DDTHH:MM:SSZ` as a Unix timestamp; `None` when it
 /// is not that shape or not a real date (Graph's no-date
 /// `0000-00-00T00:00:00Z` fallback).
-fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
+pub(crate) fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
@@ -6835,6 +7003,11 @@ mod calendar_tests {
 
     const FROM: &str = "2026-07-13T00:00:00Z";
     const TO: &str = "2026-08-19T00:00:00Z";
+    /// A fetch at 1000 with nothing pruned.
+    const STAMP: RangeStamp = RangeStamp {
+        at: 1000,
+        fresh_since: 0,
+    };
 
     #[test]
     fn replace_calendars_upserts_deletes_and_keeps_order() {
@@ -7060,6 +7233,7 @@ mod calendar_tests {
                     "2026-07-21T10:00:00Z",
                 )],
             )],
+            STAMP,
         )
         .unwrap();
         let rows = all_events(&s);
@@ -7092,7 +7266,7 @@ mod calendar_tests {
             s.upsert_event(&e).unwrap();
         }
         // No calendar list yet: no default, nothing adopted, nothing deleted.
-        s.apply_calendar_sync(FROM, TO, &[]).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[], STAMP).unwrap();
         assert!(all_events(&s).iter().all(|e| e.calendar_id.is_empty()));
 
         s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
@@ -7112,6 +7286,7 @@ mod calendar_tests {
                 ),
                 fetched("B", vec![]),
             ],
+            STAMP,
         )
         .unwrap();
         let rows = all_events(&s);
@@ -7146,9 +7321,232 @@ mod calendar_tests {
         ] {
             s.upsert_event(&e).unwrap();
         }
-        s.apply_calendar_sync(FROM, TO, &[fetched("A", vec![])])
+        s.apply_calendar_sync(FROM, TO, &[fetched("A", vec![])], STAMP)
             .unwrap();
         assert_eq!(ids(&all_events(&s)), ["local:1"]);
+    }
+
+    // --- Calendar ranges on demand (#2014) ---
+
+    fn stamp(at: i64, fresh_since: i64) -> RangeStamp {
+        RangeStamp { at, fresh_since }
+    }
+
+    fn gaps(s: &Store, cal: &str, from: &str, to: &str, fresh_since: i64) -> Vec<(String, String)> {
+        s.calendar_range_gaps(cal, from, to, fresh_since).unwrap()
+    }
+
+    fn gap(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    fn range_rows(s: &Store, cal: &str) -> Vec<(String, String, i64)> {
+        s.conn
+            .prepare(
+                "SELECT from_utc, to_utc, fetched_at FROM calendar_ranges
+                 WHERE calendar_id = ?1 ORDER BY from_utc",
+            )
+            .unwrap()
+            .query_map(params![cal], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    const D1: &str = "2026-01-01T00:00:00Z";
+    const D2: &str = "2026-01-02T00:00:00Z";
+    const D3: &str = "2026-01-03T00:00:00Z";
+    const D4: &str = "2026-01-04T00:00:00Z";
+    const D5: &str = "2026-01-05T00:00:00Z";
+    const D6: &str = "2026-01-06T00:00:00Z";
+
+    #[test]
+    fn calendar_range_gaps_finds_the_parts_not_fetched_fresh() {
+        let s = Store::open_in_memory().unwrap();
+        // Nothing stored: the whole range.
+        assert_eq!(gaps(&s, "A", D1, D6, 0), [gap(D1, D6)]);
+        s.apply_calendar_range(D2, D3, &fetched("A", vec![]), stamp(100, 0))
+            .unwrap();
+        s.apply_calendar_range(D4, D5, &fetched("A", vec![]), stamp(100, 0))
+            .unwrap();
+        // Covering: none. Overlap at either end, a hole in the middle.
+        assert!(gaps(&s, "A", D2, D3, 0).is_empty());
+        assert_eq!(
+            gaps(&s, "A", D1, D6, 0),
+            [gap(D1, D2), gap(D3, D4), gap(D5, D6)]
+        );
+        assert_eq!(gaps(&s, "A", D2, D4, 0), [gap(D3, D4)]);
+        // Another calendar's ranges do not count.
+        assert_eq!(gaps(&s, "B", D2, D3, 0), [gap(D2, D3)]);
+        // Stale: the whole range.
+        assert_eq!(gaps(&s, "A", D2, D3, 200), [gap(D2, D3)]);
+    }
+
+    #[test]
+    fn calendar_range_gaps_freshness_is_strict() {
+        let s = Store::open_in_memory().unwrap();
+        s.apply_calendar_range(D1, D2, &fetched("A", vec![]), stamp(100, 0))
+            .unwrap();
+        assert!(gaps(&s, "A", D1, D2, 99).is_empty());
+        // Fetched exactly at the cutoff: stale, so a zero freshness
+        // re-fetches within the same second.
+        assert_eq!(gaps(&s, "A", D1, D2, 100), [gap(D1, D2)]);
+    }
+
+    #[test]
+    fn recording_a_range_splits_older_intervals() {
+        let s = Store::open_in_memory().unwrap();
+        s.apply_calendar_range(D1, D5, &fetched("A", vec![]), stamp(100, 0))
+            .unwrap();
+        s.apply_calendar_range(D2, D3, &fetched("A", vec![]), stamp(200, 0))
+            .unwrap();
+        assert_eq!(
+            range_rows(&s, "A"),
+            [
+                (D1.to_string(), D2.to_string(), 100),
+                (D2.to_string(), D3.to_string(), 200),
+                (D3.to_string(), D5.to_string(), 100),
+            ]
+        );
+        // Between the two fetch times only the newer piece is fresh.
+        assert_eq!(gaps(&s, "A", D1, D5, 150), [gap(D1, D2), gap(D3, D5)]);
+        assert!(gaps(&s, "A", D1, D5, 50).is_empty());
+    }
+
+    #[test]
+    fn recording_prunes_rows_that_can_no_longer_be_fresh() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        // A window pass, then another an hour later shifted by a day: the
+        // first one's sliver is past the cutoff and goes.
+        s.apply_calendar_sync(D1, D4, &[fetched("A", vec![])], stamp(100, 0))
+            .unwrap();
+        s.apply_calendar_sync(D2, D5, &[fetched("A", vec![])], stamp(3800, 200))
+            .unwrap();
+        assert_eq!(
+            range_rows(&s, "A"),
+            [(D2.to_string(), D5.to_string(), 3800)]
+        );
+        // Another calendar's old rows are its own recording's business.
+        s.apply_calendar_range(D1, D2, &fetched("B", vec![]), stamp(100, 0))
+            .unwrap();
+        s.apply_calendar_range(D5, D6, &fetched("A", vec![]), stamp(9000, 8000))
+            .unwrap();
+        assert_eq!(range_rows(&s, "B").len(), 1);
+        assert_eq!(
+            range_rows(&s, "A"),
+            [(D5.to_string(), D6.to_string(), 9000)]
+        );
+    }
+
+    #[test]
+    fn apply_calendar_sync_records_the_window_of_each_fetched_calendar() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        // B's view failed: B records nothing.
+        s.apply_calendar_sync(FROM, TO, &[fetched("A", vec![])], STAMP)
+            .unwrap();
+        assert!(gaps(&s, "A", FROM, TO, 0).is_empty());
+        assert_eq!(gaps(&s, "B", FROM, TO, 0), [gap(FROM, TO)]);
+    }
+
+    #[test]
+    fn apply_calendar_range_replaces_only_that_calendar_in_the_range() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        for e in [
+            in_cal(
+                "a-stale",
+                "A",
+                "2026-01-02T09:00:00Z",
+                "2026-01-02T10:00:00Z",
+            ),
+            in_cal("a-out", "A", "2026-01-05T09:00:00Z", "2026-01-05T10:00:00Z"),
+            in_cal(
+                "local:1",
+                "A",
+                "2026-01-02T09:00:00Z",
+                "2026-01-02T10:00:00Z",
+            ),
+            in_cal("b-in", "B", "2026-01-02T09:00:00Z", "2026-01-02T10:00:00Z"),
+            // Pre-#1984: adopted into the default, as a pass would.
+            in_cal("old", "", "2025-01-02T09:00:00Z", "2025-01-02T10:00:00Z"),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        s.apply_calendar_range(
+            D1,
+            D4,
+            &fetched(
+                "A",
+                vec![in_cal(
+                    "a-new",
+                    "WRONG",
+                    "2026-01-03T09:00:00Z",
+                    "2026-01-03T10:00:00Z",
+                )],
+            ),
+            STAMP,
+        )
+        .unwrap();
+        let mut a = ids_of(&s, "A");
+        a.sort();
+        assert_eq!(a, ["a-new", "a-out", "local:1", "old"]);
+        assert_eq!(ids_of(&s, "B"), ["b-in"]);
+        assert!(gaps(&s, "A", D1, D4, 0).is_empty());
+    }
+
+    fn ids_of(s: &Store, cal: &str) -> Vec<String> {
+        s.events_in_range(
+            "0001-01-01T00:00:00Z",
+            "9999-12-31T00:00:00Z",
+            &[cal.to_string()],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|e| e.id)
+        .collect()
+    }
+
+    #[test]
+    fn deselecting_a_calendar_forgets_its_ranges() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        s.apply_calendar_range(D1, D2, &fetched("B", vec![]), STAMP)
+            .unwrap();
+        s.set_calendar_selection(Some(&["A".to_string()])).unwrap();
+        s.set_calendar_selection(None).unwrap();
+        assert_eq!(gaps(&s, "B", D1, D2, 0), [gap(D1, D2)]);
+    }
+
+    #[test]
+    fn apply_calendar_sync_forgets_ranges_of_a_dropped_empty_calendar() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("Empty", false, "me@x")])
+            .unwrap();
+        // Empty has no events, only a fetched range.
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[fetched("A", vec![]), fetched("Empty", vec![])],
+            STAMP,
+        )
+        .unwrap();
+        assert!(gaps(&s, "Empty", FROM, TO, 0).is_empty());
+        // Graph stops listing it: the next pass forgets its range.
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[fetched("A", vec![])], STAMP)
+            .unwrap();
+        assert_eq!(gaps(&s, "Empty", FROM, TO, 0), [gap(FROM, TO)]);
+        assert!(gaps(&s, "A", FROM, TO, 0).is_empty());
+        // No calendar syncs at all: every range goes.
+        s.replace_calendars(&[]).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[], STAMP).unwrap();
+        assert!(range_rows(&s, "A").is_empty());
     }
 
     #[test]
