@@ -180,9 +180,11 @@ INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
 -- CASCADE`, so an `event:<id>` key would fail that FK (no such row in
 -- `messages`). Simplest correct fix, since an event has exactly one body:
 -- `events.body_html` below, a plain column, no separate table, no FK to
--- fight. The calendar's delta link (and, later, its sync window bounds)
--- live in `meta` alongside `schema_version` rather than getting dedicated
--- columns, since (unlike folders) there's only ever one calendar.
+-- fight. Each event carries the calendar it was fetched from in
+-- `calendar_id` (#1984): `calendars` below lists them, and the chosen
+-- calendars' selection is in `meta` (`calendar_selection`). `''` is a row
+-- stored before #1984 (all from the default calendar), which a sync pass
+-- moves to the default calendar's id once the list is known.
 CREATE TABLE IF NOT EXISTS events (
     id               TEXT PRIMARY KEY,
     subject          TEXT NOT NULL DEFAULT '',
@@ -233,6 +235,22 @@ CREATE TABLE IF NOT EXISTS events (
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
 -- range filter, ordered by `start_utc`.
 CREATE INDEX IF NOT EXISTS idx_events_window ON events(start_utc, end_utc);
+
+-- The user's calendars as `GET /me/calendars` lists them (#1984), in
+-- Graph's order (`position`). Written whole by `Store::replace_calendars`.
+-- Which of them sync is `Store::synced_calendar_ids`: the selection in
+-- `meta`, else the user's own (owner = the default calendar's owner).
+CREATE TABLE IF NOT EXISTS calendars (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    color      TEXT NOT NULL DEFAULT '',
+    hex_color  TEXT NOT NULL DEFAULT '',
+    is_default INTEGER NOT NULL DEFAULT 0,
+    can_edit   INTEGER NOT NULL DEFAULT 0,
+    owner_name TEXT NOT NULL DEFAULT '',
+    owner_addr TEXT NOT NULL DEFAULT '',
+    position   INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS event_attendees (
     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,

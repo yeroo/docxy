@@ -627,15 +627,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 
 ## Calendar sync keeps reminder settings (#1937)
 
-- `Store::upsert_event` and `Store::replace_events_in_window` (the writer
-  `Engine::refresh_calendar` uses, in one transaction) both write an
+- `Store::upsert_event`, `Store::replace_events_in_window` and
+  `Store::apply_calendar_sync` (the writer `Engine::refresh_calendar` uses
+  since #1984, in one transaction) all write an
   `events` row through one private `upsert_event_on(conn, e)`, so every
   column `NewEvent` carries, `reminder_minutes` and `is_reminder_on`
-  included, is written by both. Before #1937 the window writer had its own
+  included, is written by all three. Before #1937 the window writer had its own
   copy of the SQL without the two reminder columns, and every synced event
   read back as 0 minutes, reminder off. A new `events` column goes into
   `upsert_event_on` once. Attendees go the same way: `put_event_attendees`
-  (in its own transaction) and `replace_events_in_window` (in its) both run
+  (in its own transaction), `replace_events_in_window` and
+  `apply_calendar_sync` (in theirs) all run
   `put_event_attendees_on(conn, id, a)`.
 - Tests: `store` `calendar_tests::replace_events_in_window_writes_reminder_fields`
   (insert, and a later refresh that changes them),
@@ -719,8 +721,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: `calendarView` returns occurrences, never series masters, and nothing
   fetches a synced master yet (a `/me/events/{seriesMasterId}` read would), so
   `EventRow::recurrence` is `Some` in production only for a local series.
-  `calendar_id` is `""` (the default calendar) until #1984 syncs every
-  calendar. Safe Links-wrapped links
+  `calendar_id` is the calendar a pass fetched the event from since #1984
+  (`calendar.id` in the JSON loses to it). Safe Links-wrapped links
   (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
 
 ## Calendar event create and update fields (#1994)
@@ -805,6 +807,87 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: lookxy's form has no controls for the new fields (the host API
   has them). Recurring series stay create-only. Reading the calendar's
   `defaultOnlineMeetingProvider` / `allowedOnlineMeetingProviders`.
+
+## Every calendar and calendar queries (#1984)
+
+Items 3 and 4 of #1984; the wider window with `calendarView` delta is #2013, a
+range on demand (`FetchCalendarRange`) #2014.
+
+- `GraphClient::list_calendars` (`/me/calendars?$select=id,name,color,hexColor,
+  isDefaultCalendar,canEdit,owner&$top=100`, paged, all or `Err`) and
+  `calendar_view_in(id, from, to)` (`/me/calendars/{encoded id}/calendarView`,
+  sharing `calendar_view`'s UTC `Prefer` and paging). `calendar_view_in` sets
+  each event's `calendar_id` to the id it was asked for: the URL decides.
+- `calendars` table, written whole by `Store::replace_calendars` (Graph's
+  order in `position`; returns whether anything changed, so
+  `SyncEvent::CalendarsUpdated` goes out only then). `Store::calendars()`
+  gives `CalendarRow { calendar, syncs }`.
+- Which calendars sync: `Store::synced_calendar_ids`, the one rule. A host's
+  choice (`SyncCommand::SetCalendars { ids: Some(..) }`, in `meta`
+  `calendar_selection` as a JSON array, so it survives a restart) intersected
+  with the stored list (a chosen id Graph does not list syncs once it does);
+  with no choice (`None`), the user's own: owner address equal to the default
+  calendar's, ASCII case and whitespace ignored (`is_contact`'s fold), the
+  default always, and every calendar when there is no default or it has no
+  owner address.
+- A pass (`Engine::refresh_calendar`, tick and `RefreshCalendar`): list, then
+  each synced calendar's view over `calendar_window(now)`, then one
+  transaction (`Store::apply_calendar_sync`): (1) rows with `calendar_id = ''`
+  (`local:` too) take the default calendar's id, when one is stored; (2) each
+  fetched calendar's non-`local:` rows overlapping the window are replaced;
+  (3) non-`local:` rows of any date whose non-empty `calendar_id` is not
+  synced are deleted. Step 1 matters: before #1984 sync read only the
+  default calendar and never deleted rows that slid out of the window, so a
+  `''` row is the default calendar's history, which a date navigator shows.
+  A failed list changes nothing. A 401, throttle or transport error on any
+  view writes no events for the pass (the calendar list, stored and
+  announced before the views, stays); a 404/HTTP/parse error on one calendar
+  emits `Error` and keeps that calendar's rows.
+- `SetCalendars` (`Store::set_calendar_selection`) deletes at once only the
+  events of **stored** calendars that no longer sync. Unknown ids and `''`
+  rows wait for the next pass, which runs only after a successful list, so a
+  host restoring its choice at startup (empty `calendars`) deletes nothing.
+  It emits `CalendarUpdated`, `CalendarsUpdated` when the synced set changed,
+  and refreshes when signed in and not inside a throttle/back-off wait.
+- `create_local_event` stores the default calendar's id (`CreateEvent` POSTs
+  to `/me/events`), `''` before the list is known (step 1 adopts it).
+- Queries: `Store::events_in_range(from, to, calendar_ids)` (the
+  `events_in_window` overlap rule and order; an empty slice is no events;
+  `events_in_window` still returns every calendar, and lookxy keeps it), and
+  `Store::days_with_events(year, month, utc_offset_minutes, calendar_ids)`:
+  a timed event marks each local day its `[start, end)` overlaps (an end at
+  local midnight does not mark the next day, zero length marks its start
+  day); an all-day event marks its UTC dates without the offset. One fixed
+  offset, not a zone: in a DST month an event within the shifted hour of
+  midnight can mark the neighbouring day.
+- Test fixtures: the fake server takes the first route whose prefix
+  matches, so the list route is `/me/calendars?` (it cannot answer
+  `/me/calendars/{id}/calendarView`); `engine.rs` `calendar_routes` builds
+  both. A test that only silences the tick answers `/me/calendars?` with an
+  empty list (no view requests; `is_calendar` counts list requests).
+- Known gaps: deselecting a calendar while an edit or RSVP on one of its
+  events is queued deletes the row, so `apply_op`'s `event_input_for` fails
+  until the op is quarantined. A chosen calendar of another owner needs
+  `Calendars.Read.Shared`, which the default scope lacks, so its view errors
+  on every pass (it is not synced unless chosen). Creating, editing and
+  deleting stay on `/me/events` (the default calendar). Each pass costs one
+  list plus one view per synced calendar.
+- Tests: `model.rs` `calendar_reads_graph_fields`; `client.rs`
+  `list_calendars_follows_next_link`, `list_calendars_fails_whole_when_a_page_fails`,
+  `calendar_view_in_encodes_the_id_and_pages`; `store` `calendar_tests`
+  (`replace_calendars_upserts_deletes_and_keeps_order`,
+  `own_calendars_follow_the_default_calendars_owner`,
+  `calendar_selection_intersects_the_list_and_survives_a_restart`,
+  `set_calendar_selection_deletes_only_stored_deselected_calendars_events`,
+  `set_calendars_before_the_first_list_deletes_nothing`, `apply_calendar_sync_*`,
+  `events_in_range_filters_by_calendar`, `days_with_events_marks_local_days`,
+  `create_local_event_takes_the_default_calendar`); `engine.rs`
+  `refresh_calendar_syncs_two_calendars_into_separate_ids`,
+  `set_calendars_drops_a_calendars_events_and_stops_syncing_it`,
+  `refresh_calendar_skips_calendars_of_other_owners_by_default`,
+  `refresh_calendar_keeps_a_calendars_events_when_its_view_fails`,
+  `refresh_calendar_writes_nothing_when_a_view_is_throttled`,
+  `refresh_calendar_adopts_pre_1984_rows_into_the_default_calendar`.
 
 ## Contacts folder and is_contact (#1934)
 

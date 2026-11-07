@@ -109,6 +109,7 @@ issue number to find its notes.
   Exchange's AuthAs header stored with a fetched body (#1933),
   calendar sync keeps events' reminder settings (#1937), event fields a calendar client
   shows (#1983), creating and updating them, an update PATCHes only what changed (#1994),
+  every calendar, `SetCalendars`, events in a range and days with events (#1984),
   the Contacts folder and `is_contact` (#1934).
 
 ## Build and test

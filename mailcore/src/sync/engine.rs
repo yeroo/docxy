@@ -47,8 +47,8 @@ use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind, is_ex
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Me, Message, ScheduleEntry};
 use crate::store::{
-    FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboxOp, OutboxRow,
-    SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
+    FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent,
+    OutboxOp, OutboxRow, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
 };
 use crate::sync::outbox::{apply_op, apply_send, send_error_text};
 use crate::tokencache;
@@ -213,12 +213,27 @@ pub enum SyncCommand {
     /// Fetch a pre-quoted forward draft for `id` (`createForward`), store
     /// it, and emit [`SyncEvent::DraftReady`].
     ComposeForward { id: String },
-    /// Fetch the calendar window (`calendar_window`, anchored at
-    /// `SystemTime::now()`) via `calendar_view`, upsert every event and its
-    /// attendees into the store, and emit [`SyncEvent::CalendarUpdated`].
-    /// Also run automatically on the periodic tick (see `Engine::on_tick`),
-    /// interleaved with the mail sync pass.
+    /// List the user's calendars (`Store::replace_calendars`, emitting
+    /// [`SyncEvent::CalendarsUpdated`] when the list changed), then fetch
+    /// the calendar window (`calendar_window`, anchored at
+    /// `SystemTime::now()`) of every synced calendar
+    /// (`Store::synced_calendar_ids`) via `calendar_view_in`, store it
+    /// (`Store::apply_calendar_sync`), and emit
+    /// [`SyncEvent::CalendarUpdated`] (#1984). Also run automatically on the
+    /// periodic tick (see `Engine::on_tick`), interleaved with the mail sync
+    /// pass.
     RefreshCalendar,
+    /// Choose which calendars sync (#1984): `Some(ids)` stores the choice,
+    /// `None` goes back to the default, every calendar the user owns
+    /// (`Store::synced_calendar_ids`). The choice is kept in the store, so it
+    /// survives a restart. The events of a stored calendar that no longer
+    /// syncs are deleted at once (`Store::set_calendar_selection`), then
+    /// [`SyncEvent::CalendarUpdated`] is emitted, and
+    /// [`SyncEvent::CalendarsUpdated`] when the synced set changed (each
+    /// `CalendarRow::syncs` follows it). When signed in and not waiting out
+    /// a throttle or back-off, the calendar is refreshed right away so a
+    /// newly chosen calendar fills in.
+    SetCalendars { ids: Option<Vec<String>> },
     /// Respond to a calendar event's invite: optimistic local
     /// `Store::set_event_response` (immediately reflected, before Graph is
     /// even reached) plus [`SyncEvent::CalendarUpdated`], then enqueue
@@ -355,6 +370,10 @@ pub enum SyncEvent {
     /// The events store changed (a `RefreshCalendar`/`RespondEvent` just
     /// landed); re-read `Store::events_in_window`/`Store::event_attendees`.
     CalendarUpdated,
+    /// The stored calendar list changed (a calendar added, removed,
+    /// renamed, recoloured or moved), or which of them sync did (#1984);
+    /// re-read `Store::calendars`.
+    CalendarsUpdated,
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -1249,6 +1268,7 @@ impl Engine {
             SyncCommand::ComposeReply { id, all } => self.compose_reply(&id, all),
             SyncCommand::ComposeForward { id } => self.compose_forward(&id),
             SyncCommand::RefreshCalendar => self.refresh_calendar(),
+            SyncCommand::SetCalendars { ids } => self.set_calendars(ids.as_deref()),
             SyncCommand::RespondEvent {
                 id,
                 kind,
@@ -3058,54 +3078,108 @@ impl Engine {
 
     // --- Calendar ----------------------------------------------------------
 
-    /// Fetches `calendar_window(SystemTime::now())` via `calendar_view` and
-    /// replaces the window's stored contents with it
-    /// (`Store::replace_events_in_window`) in one atomic transaction, then
-    /// emits `SyncEvent::CalendarUpdated`. Unlike mail's delta sync, Graph's
-    /// `/me/calendarView` isn't a delta endpoint — there's no link to resume
-    /// from, so every call re-fetches the whole window; replacing (rather
-    /// than only upserting) is what prunes an event that Graph no longer
-    /// returns for the window — cancelled, or moved outside it — instead of
-    /// leaving it stuck locally forever. (`Store::calendar_delta_link`/
-    /// `set_calendar_delta_link` are there for a future delta-capable
-    /// endpoint; nothing here has a link to write into them.)
+    /// One calendar sync pass (#1984). Lists the user's calendars
+    /// (`list_calendars` into `Store::replace_calendars`, emitting
+    /// `SyncEvent::CalendarsUpdated` when the list changed), then fetches
+    /// `calendar_window(SystemTime::now())` of every synced calendar
+    /// (`Store::synced_calendar_ids`) through
+    /// `/me/calendars/{id}/calendarView`, and writes the pass in one
+    /// transaction (`Store::apply_calendar_sync`): each fetched calendar's
+    /// window is replaced, pre-#1984 rows move to the default calendar, and
+    /// the events of calendars that no longer sync go. Then emits
+    /// `SyncEvent::CalendarUpdated`. Graph's `calendarView` isn't a delta
+    /// endpoint, so every pass re-fetches each window whole; replacing
+    /// (rather than only upserting) is what prunes an event Graph no longer
+    /// returns (cancelled, or moved out of the window).
     ///
-    /// Same signed-in guard as `fetch_body` et al.; a Graph failure goes
-    /// through `react` for the standard auth/throttle/transport handling (a
-    /// 4xx/parse is surfaced via `SyncEvent::Error`, not fatal to the
-    /// caller). Also called by `drain_outbox` right after a `RespondEvent`
-    /// op quarantines, to reconverge the optimistic local RSVP with server
-    /// truth (see the quarantine branch there).
+    /// Same signed-in guard as `fetch_body` et al. A failed list ends the
+    /// pass with nothing changed. A 401, throttle or transport error on any
+    /// calendar's view goes through `react` and ends the pass with no event
+    /// written, never a partial window (the calendar list, already stored
+    /// and announced, stays); a 404, other HTTP error or parse
+    /// failure on one calendar is surfaced (`SyncEvent::Error`) and that
+    /// calendar keeps its stored events while the others are written. Also
+    /// called by `drain_outbox` right after a `RespondEvent` op
+    /// quarantines, to reconverge the optimistic local RSVP with server
+    /// truth (see the quarantine branch there), and by `set_calendars`.
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        let (from, to) = calendar_window(SystemTime::now());
-        match self.with_auth(|c| c.calendar_view(&from, &to)) {
-            Ok(events) => {
-                let new_events: Vec<NewEvent> = events.iter().map(NewEvent::from).collect();
-                let attendees: Vec<(String, Vec<NewAttendee>)> = events
-                    .iter()
-                    .map(|e| {
-                        (
-                            e.id.clone(),
-                            e.attendees.iter().map(NewAttendee::from).collect(),
-                        )
-                    })
-                    .collect();
-                if let Err(e) =
-                    self.store
-                        .replace_events_in_window(&from, &to, &new_events, &attendees)
-                {
-                    self.emit(SyncEvent::Error(e.to_string()));
-                    return;
-                }
-                self.emit(SyncEvent::CalendarUpdated);
-            }
+        let calendars = match self.with_auth(|c| c.list_calendars()) {
+            Ok(calendars) => calendars,
             Err(e) => {
                 self.react(e);
+                return;
             }
+        };
+        match self.store.replace_calendars(&calendars) {
+            Ok(true) => self.emit(SyncEvent::CalendarsUpdated),
+            Ok(false) => {}
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        }
+        let synced = match self.store.synced_calendar_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        let (from, to) = calendar_window(SystemTime::now());
+        let mut fetched = Vec::with_capacity(synced.len());
+        for id in synced {
+            match self.with_auth(|c| c.calendar_view_in(&id, &from, &to)) {
+                Ok(events) => fetched.push(FetchedCalendar {
+                    events: events.iter().map(NewEvent::from).collect(),
+                    attendees: events
+                        .iter()
+                        .map(|e| {
+                            (
+                                e.id.clone(),
+                                e.attendees.iter().map(NewAttendee::from).collect(),
+                            )
+                        })
+                        .collect(),
+                    calendar_id: id,
+                }),
+                // Sign-in, throttle or offline: the whole pass waits.
+                Err(e) => {
+                    if self.react(e) {
+                        return;
+                    }
+                }
+            }
+        }
+        if let Err(e) = self.store.apply_calendar_sync(&from, &to, &fetched) {
+            self.emit(SyncEvent::Error(e.to_string()));
+            return;
+        }
+        self.emit(SyncEvent::CalendarUpdated);
+    }
+
+    /// `SyncCommand::SetCalendars`: stores the choice (deleting the events of
+    /// stored calendars that no longer sync), announces it, and refreshes
+    /// the calendar when signed in and not waiting out a throttle or
+    /// back-off (`next_retry` still ahead), as `on_tick` would not run then.
+    fn set_calendars(&mut self, ids: Option<&[String]>) {
+        let changed = match self.store.set_calendar_selection(ids) {
+            Ok(changed) => changed,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        self.emit(SyncEvent::CalendarUpdated);
+        if changed {
+            self.emit(SyncEvent::CalendarsUpdated);
+        }
+        let waiting = self.next_retry.is_some_and(|t| Instant::now() < t);
+        if self.token.is_some() && !waiting {
+            self.refresh_calendar();
         }
     }
 
@@ -3714,17 +3788,13 @@ fn now_unix() -> u64 {
 }
 
 /// Formats a Unix timestamp as an ISO-8601 UTC string
-/// (`YYYY-MM-DDTHH:MM:SSZ`) — no dependency, used only for the backfill cutoff
-/// comparison.
+/// (`YYYY-MM-DDTHH:MM:SSZ`): the store's `unix_secs_to_iso8601`, for the
+/// engine's unsigned clock.
 fn unix_to_iso8601(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    crate::store::unix_secs_to_iso8601(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-/// `RefreshCalendar`'s window: this many days into the past...
+/// `RefreshCalendar`'s window, per calendar: this many days into the past...
 const CALENDAR_WINDOW_PAST_DAYS: u64 = 7;
 /// ...and this many days into the future, both anchored at the base time
 /// `calendar_window` is called with.
@@ -3742,21 +3812,6 @@ fn calendar_window(base: SystemTime) -> (String, String) {
     let from = base_secs.saturating_sub(CALENDAR_WINDOW_PAST_DAYS * 86400);
     let to = base_secs + CALENDAR_WINDOW_FUTURE_DAYS * 86400;
     (unix_to_iso8601(from), unix_to_iso8601(to))
-}
-
-/// Converts a count of days since the Unix epoch into a `(year, month, day)`
-/// civil date — Howard Hinnant's well-known `civil_from_days` algorithm.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Whether `bytes` begin (after optional BOM/leading whitespace) with an
@@ -4755,7 +4810,7 @@ mod tests {
         let mut routes = folder_routes(F1_F2, &[], &[]);
         routes.insert(
             0,
-            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+            (get_route("/me/calendars?", 200, r#"{"value":[]}"#), None),
         );
         routes.insert(
             0,
@@ -7543,21 +7598,380 @@ mod tests {
         )
     }
 
+    // --- Every calendar (#1984) ---
+
+    /// One `/me/calendars` item.
+    fn calendar_json(id: &str, default: bool, owner: &str) -> String {
+        format!(
+            r##"{{"id":"{id}","name":"n{id}","color":"lightBlue","hexColor":"#3366ff",
+            "isDefaultCalendar":{default},"canEdit":true,
+            "owner":{{"name":"Owner","address":"{owner}"}}}}"##
+        )
+    }
+
+    /// A `value` page of events.
+    fn events_body(events: &[String]) -> String {
+        format!(r#"{{"value":[{}]}}"#, events.join(","))
+    }
+
+    /// The routes a calendar refresh asks for (#1984): each calendar's
+    /// `calendarView` (`status`, `body`; a 429 carries `Retry-After: 30`),
+    /// then the `/me/calendars` list of `cals` (id, default, owner). The
+    /// list's prefix ends in `?`, so it never answers a view: the fake
+    /// server takes the first route whose prefix matches.
+    fn calendar_routes(cals: &[(&str, bool, &str)], views: Vec<(&str, u16, String)>) -> Vec<Route> {
+        let mut routes: Vec<Route> = views
+            .into_iter()
+            .map(|(id, status, body)| Route {
+                method: "GET".into(),
+                path_prefix: format!("/me/calendars/{id}/calendarView?"),
+                status,
+                headers: if status == 429 {
+                    vec![("Retry-After".into(), "30".into())]
+                } else {
+                    vec![]
+                },
+                body,
+            })
+            .collect();
+        let items: Vec<String> = cals
+            .iter()
+            .map(|(id, default, owner)| calendar_json(id, *default, owner))
+            .collect();
+        routes.push(get_route("/me/calendars?", 200, &events_body(&items)));
+        routes
+    }
+
+    /// An event `calendar_event_json` shapes, starting `from_now` seconds
+    /// from now for half an hour: inside `calendar_window(now)`.
+    fn event_from_now(id: &str, from_now: u64) -> String {
+        let start = now_unix() + from_now;
+        calendar_event_json(
+            id,
+            unix_to_iso8601(start).trim_end_matches('Z'),
+            unix_to_iso8601(start + 1800).trim_end_matches('Z'),
+        )
+    }
+
+    /// A stored event of `calendar` starting `from_now` seconds from now
+    /// (negative: in the past).
+    fn stored_event(id: &str, calendar: &str, from_now: i64) -> NewEvent {
+        let start = (now_unix() as i64 + from_now) as u64;
+        NewEvent {
+            id: id.into(),
+            subject: id.into(),
+            start_utc: unix_to_iso8601(start),
+            end_utc: unix_to_iso8601(start + 1800),
+            calendar_id: calendar.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Starts an engine on `routes` (plus the mail backfill's) with `seed`
+    /// run on its store first, and waits for the backfill to land.
+    fn spawn_calendar_engine(
+        tag: &str,
+        routes: Vec<Route>,
+        seed: impl FnOnce(&Store),
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let mut routes = routes;
+        routes.extend(backfill_routes());
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        seed(&Store::open(&store_path).unwrap());
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        (srv, handle, store_path, dir)
+    }
+
+    /// Waits for the `n`th `CalendarUpdated`, returning every event seen.
+    fn wait_for_calendar_updates(rx: &Receiver<SyncEvent>, n: usize) -> Vec<SyncEvent> {
+        let mut seen = 0;
+        wait_for(rx, |e| {
+            if matches!(e, SyncEvent::CalendarUpdated) {
+                seen += 1;
+            }
+            seen == n
+        })
+    }
+
+    fn ids_in(store: &Store, calendar: &str) -> Vec<String> {
+        store
+            .events_in_range(
+                "2000-01-01T00:00:00Z",
+                "2100-01-01T00:00:00Z",
+                &[calendar.to_string()],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    fn view_requests(srv: &FakeServer, from: usize, calendar: &str) -> usize {
+        let prefix = format!("/me/calendars/{calendar}/calendarView");
+        paths_from(srv, from)
+            .iter()
+            .filter(|p| p.starts_with(&prefix))
+            .count()
+    }
+
+    #[test]
+    fn refresh_calendar_syncs_two_calendars_into_separate_ids() {
+        // B's event names another calendar in its JSON: the URL decides.
+        let b_event = event_from_now("EB", 7200).replacen(
+            r#""isAllDay":false"#,
+            r#""isAllDay":false,"calendar":{"id":"WRONG"}"#,
+            1,
+        );
+        assert!(b_event.contains("WRONG"));
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "ME@X")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                ("CAL-B", 200, events_body(&[b_event])),
+            ],
+        );
+        let (_srv, handle, store_path, dir) = spawn_calendar_engine("calendar-two", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert!(seen.contains(&SyncEvent::CalendarsUpdated), "{seen:?}");
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert_eq!(ids_in(&store, "CAL-B"), ["EB"]);
+        assert!(ids_in(&store, "WRONG").is_empty());
+        let cals = store.calendars().unwrap();
+        assert_eq!(cals.len(), 2);
+        let a = &cals[0];
+        assert_eq!(a.calendar.id, "CAL-A");
+        assert_eq!(a.calendar.name, "nCAL-A");
+        assert_eq!(a.calendar.color, "lightBlue");
+        assert_eq!(a.calendar.hex_color, "#3366ff");
+        assert!(a.calendar.is_default && a.calendar.can_edit);
+        assert_eq!(a.calendar.owner_addr, "me@x");
+        assert!(!cals[1].calendar.is_default);
+        assert!(cals.iter().all(|c| c.syncs), "same owner, either case");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_calendars_drops_a_calendars_events_and_stops_syncing_it() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                ("CAL-B", 200, events_body(&[event_from_now("EB", 7200)])),
+            ],
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine("calendar-set", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert_eq!(ids_in(&Store::open(&store_path).unwrap(), "CAL-B"), ["EB"]);
+
+        // Only A: B's events go, and the refresh that follows skips B.
+        let before = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCalendars {
+                ids: Some(vec!["CAL-A".into()]),
+            })
+            .unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 2);
+        assert!(seen.contains(&SyncEvent::CalendarsUpdated), "{seen:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert!(ids_in(&store, "CAL-B").is_empty());
+        let syncs: Vec<bool> = store.calendars().unwrap().iter().map(|c| c.syncs).collect();
+        assert_eq!(syncs, [true, false]);
+        assert_eq!(view_requests(&srv, before, "CAL-A"), 1);
+        assert_eq!(view_requests(&srv, before, "CAL-B"), 0);
+
+        // A later refresh still skips B.
+        let before = srv.requests().len();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert_eq!(view_requests(&srv, before, "CAL-B"), 0);
+        assert!(ids_in(&Store::open(&store_path).unwrap(), "CAL-B").is_empty());
+
+        // Back to the default: B syncs again.
+        let before = srv.requests().len();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCalendars { ids: None })
+            .unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 2);
+        assert!(seen.contains(&SyncEvent::CalendarsUpdated), "{seen:?}");
+        assert_eq!(view_requests(&srv, before, "CAL-B"), 1);
+        assert_eq!(ids_in(&Store::open(&store_path).unwrap(), "CAL-B"), ["EB"]);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_skips_calendars_of_other_owners_by_default() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("SHARED", false, "boss@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                ("SHARED", 200, events_body(&[event_from_now("ES", 3600)])),
+            ],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-shared", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        let cals = store.calendars().unwrap();
+        assert_eq!(cals[1].calendar.id, "SHARED");
+        assert!(cals[0].syncs && !cals[1].syncs);
+        assert_eq!(view_requests(&srv, 0, "SHARED"), 0);
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert!(ids_in(&store, "SHARED").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_keeps_a_calendars_events_when_its_view_fails() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                (
+                    "CAL-B",
+                    404,
+                    r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
+                ),
+            ],
+        );
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-view-fails", routes, |s| {
+                s.upsert_event(&stored_event("A-OLD", "CAL-A", 86400))
+                    .unwrap();
+                s.upsert_event(&stored_event("B-KEPT", "CAL-B", 86400))
+                    .unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert!(
+            seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"], "A's window was replaced");
+        assert_eq!(ids_in(&store, "CAL-B"), ["B-KEPT"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_writes_nothing_when_a_view_is_throttled() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                ("CAL-B", 429, "{}".into()),
+            ],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-throttled", routes, |s| {
+                s.upsert_event(&stored_event("A-OLD", "", 86400)).unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        // Commands run in order, so this one's `CalendarUpdated` comes after
+        // the throttled pass ended; inside the `Retry-After` wait it
+        // refreshes nothing.
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCalendars { ids: None })
+            .unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(view_requests(&srv, 0, "CAL-B"), 1, "{seen:?}");
+        assert_eq!(view_requests(&srv, 0, "CAL-A"), 1);
+
+        let store = Store::open(&store_path).unwrap();
+        // The list was stored; no event of the pass was, and the old row
+        // was neither adopted nor replaced.
+        assert_eq!(store.calendars().unwrap().len(), 2);
+        assert!(ids_in(&store, "CAL-A").is_empty());
+        assert_eq!(ids_in(&store, ""), ["A-OLD"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_adopts_pre_1984_rows_into_the_default_calendar() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 86400)]))],
+        );
+        let mut local = String::new();
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-adopt", routes, |s| {
+                // Stored before #1984: no calendar id.
+                s.upsert_event(&stored_event("E1", "", 86400)).unwrap();
+                s.upsert_event(&stored_event("HISTORY", "", -60 * 86400))
+                    .unwrap();
+                local = s
+                    .create_local_event(
+                        &crate::store::LocalEventFields {
+                            subject: "Local".into(),
+                            start_utc: unix_to_iso8601(now_unix() + 3 * 86400),
+                            end_utc: unix_to_iso8601(now_unix() + 3 * 86400 + 1800),
+                            ..Default::default()
+                        },
+                        "Me",
+                        "me@x",
+                    )
+                    .unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        let mut ids = ids_in(&store, "CAL-A");
+        ids.sort();
+        let mut want = vec!["E1".to_string(), "HISTORY".to_string(), local];
+        want.sort();
+        assert_eq!(ids, want, "adopted once each, none deleted");
+        assert!(ids_in(&store, "").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn refresh_calendar_populates_store_and_emits_event() {
         let mut routes = backfill_routes();
-        routes.insert(
-            0,
-            Route {
-                method: "GET".into(),
-                path_prefix: "/me/calendarView".into(),
-                status: 200,
-                headers: vec![],
-                body: format!(
-                    r#"{{"value":[{}]}}"#,
-                    calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
-                ),
-            },
+        routes.splice(
+            0..0,
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![(
+                    "CAL-A",
+                    200,
+                    format!(
+                        r#"{{"value":[{}]}}"#,
+                        calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                    ),
+                )],
+            ),
         );
         let srv = FakeServer::start(routes);
         let base = srv.base_url.clone();
@@ -7618,15 +8032,12 @@ mod tests {
         );
         assert_ne!(event, plain, "the reminder keys were not added");
         let mut routes = backfill_routes();
-        routes.insert(
-            0,
-            Route {
-                method: "GET".into(),
-                path_prefix: "/me/calendarView".into(),
-                status: 200,
-                headers: vec![],
-                body: format!(r#"{{"value":[{event}]}}"#),
-            },
+        routes.splice(
+            0..0,
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, format!(r#"{{"value":[{event}]}}"#))],
+            ),
         );
         let srv = FakeServer::start(routes);
         let base = srv.base_url.clone();
@@ -7690,15 +8101,12 @@ mod tests {
                 "time":"2026-07-17T08:00:00Z"},
                 "emailAddress":{"name":"Room","address":"room@x"}}]}"#;
         let mut routes = backfill_routes();
-        routes.insert(
-            0,
-            Route {
-                method: "GET".into(),
-                path_prefix: "/me/calendarView".into(),
-                status: 200,
-                headers: vec![],
-                body: format!(r#"{{"value":[{event}]}}"#),
-            },
+        routes.splice(
+            0..0,
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, format!(r#"{{"value":[{event}]}}"#))],
+            ),
         );
         let srv = FakeServer::start(routes);
         let base = srv.base_url.clone();
@@ -7749,7 +8157,9 @@ mod tests {
         assert!(r.has_attachments);
         assert_eq!(r.original_start_time_zone, "Tokyo Standard Time");
         assert_eq!(r.original_end_time_zone, "UTC");
-        assert_eq!(r.calendar_id, "CAL1");
+        // The JSON says `CAL1`; the calendar it was fetched from decides
+        // (#1984).
+        assert_eq!(r.calendar_id, "CAL-A");
         let atts = store.event_attendees("E1").unwrap();
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0].r#type, "resource");
@@ -7949,24 +8359,27 @@ mod tests {
     fn refresh_calendar_prunes_events_no_longer_in_the_fetched_window() {
         // A cancelled (or moved-out-of-window) event: plain upserting would
         // never remove it, since it's simply never returned by a later
-        // `calendar_view` fetch. `replace_events_in_window` (Store) is what
+        // `calendar_view_in` fetch. `apply_calendar_sync` (Store) is what
         // prunes it — this proves `refresh_calendar` actually uses that
-        // replace path, not a plain upsert loop.
+        // replace path, not a plain upsert loop. OLD1 is stored without a
+        // calendar id (pre-#1984), so the pass first moves it to the
+        // default calendar, whose window then replaces it.
         let mut routes = backfill_routes();
-        routes.insert(
-            0,
-            Route {
-                method: "GET".into(),
-                path_prefix: "/me/calendarView".into(),
-                status: 200,
-                headers: vec![],
-                // A DIFFERENT set that does NOT include the previously-
-                // stored OLD1 event below.
-                body: format!(
-                    r#"{{"value":[{}]}}"#,
-                    calendar_event_json("NEW1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
-                ),
-            },
+        // A DIFFERENT set that does NOT include the previously-
+        // stored OLD1 event below.
+        routes.splice(
+            0..0,
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![(
+                    "CAL-A",
+                    200,
+                    format!(
+                        r#"{{"value":[{}]}}"#,
+                        calendar_event_json("NEW1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                    ),
+                )],
+            ),
         );
         let srv = FakeServer::start(routes);
         let base = srv.base_url.clone();
@@ -8058,20 +8471,21 @@ mod tests {
                 body: "{}".into(),
             },
         );
-        routes.insert(
-            0,
-            Route {
-                method: "GET".into(),
-                path_prefix: "/me/calendarView".into(),
-                status: 200,
-                headers: vec![],
-                // Server truth: E1 is still unanswered ("none"), never
-                // "accepted" — the optimistic local write never landed.
-                body: format!(
-                    r#"{{"value":[{}]}}"#,
-                    calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
-                ),
-            },
+        // Server truth: E1 is still unanswered ("none"), never
+        // "accepted" — the optimistic local write never landed.
+        routes.splice(
+            0..0,
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![(
+                    "CAL-A",
+                    200,
+                    format!(
+                        r#"{{"value":[{}]}}"#,
+                        calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
+                    ),
+                )],
+            ),
         );
         let srv = FakeServer::start(routes);
         let base = srv.base_url.clone();
@@ -8676,8 +9090,9 @@ mod tests {
         path.starts_with("/me/mailFolders?")
     }
 
+    /// A calendar refresh: its one `/me/calendars` list request (#1984).
     fn is_calendar(path: &str) -> bool {
-        path.starts_with("/me/calendarView")
+        path.starts_with("/me/calendars?")
     }
 
     fn is_contacts(path: &str) -> bool {
@@ -9161,7 +9576,7 @@ mod tests {
         let mut routes = folder_routes(F1_F2, &[], &[]);
         routes.insert(
             0,
-            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+            (get_route("/me/calendars?", 200, r#"{"value":[]}"#), None),
         );
         let srv = FakeServer::start_limited(routes);
         let (handle, _store_path, dir) = spawn_fast(
@@ -9241,7 +9656,7 @@ mod tests {
                 },
                 None,
             ),
-            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+            (get_route("/me/calendars?", 200, r#"{"value":[]}"#), None),
         ];
         routes.extend(folder_routes(F1_F2, &[], &[]));
         routes
@@ -10397,9 +10812,10 @@ mod tests {
         routes
     }
 
-    /// The calendar a tick refreshes: empty.
+    /// The calendar list a tick refreshes: empty, so no calendar view is
+    /// asked for (#1984).
     fn calendar_route() -> (Route, Option<usize>) {
-        (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None)
+        (get_route("/me/calendars?", 200, r#"{"value":[]}"#), None)
     }
 
     fn message_json(id: &str, read: bool, flagged: bool, categories: &[&str]) -> String {
