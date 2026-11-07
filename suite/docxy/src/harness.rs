@@ -1629,17 +1629,22 @@ enum ExtDocCall {
     Format(crate::ext::DocFormat),
     Undo,
     Redo,
+    /// `insert_text` (#1977).
+    InsertText(String),
+    Copy,
+    Cut,
 }
 
 /// `ext-doc-call`'s arguments: exactly one of `{"format": <command>}` (bold,
 /// italic, underline, bullets, numbering, indent, outdent, align-left,
 /// align-center, align-right, align-justify), `{"font": <name>}`,
 /// `{"size": <points>}`, `{"color": <RRGGBB or null>}`, `{"highlight":
-/// <name or null>}`, `{"undo": true}` or `{"redo": true}`.
+/// <name or null>}`, `{"undo": true}`, `{"redo": true}`, `{"insert_text":
+/// <text>}`, `{"copy": true}` or `{"cut": true}` (#1977).
 fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
     use crate::ext::DocFormat as F;
     use docxcore::model::Align;
-    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo' or 'redo'";
+    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo', 'redo', 'insert_text', 'copy' or 'cut'";
     let keys = [
         "format",
         "font",
@@ -1648,6 +1653,9 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
         "highlight",
         "undo",
         "redo",
+        "insert_text",
+        "copy",
+        "cut",
     ];
     let given: Vec<&str> = keys
         .iter()
@@ -1685,15 +1693,20 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
         },
         "color" => F::Color(text_or_null(value)?),
         "highlight" => F::Highlight(text_or_null(value)?),
-        "undo" | "redo" => {
+        "undo" | "redo" | "copy" | "cut" => {
             if *value != Json::Bool(true) {
                 return Err(format!("'{key}' must be true"));
             }
-            return Ok(if key == "undo" {
-                ExtDocCall::Undo
-            } else {
-                ExtDocCall::Redo
+            return Ok(match key {
+                "undo" => ExtDocCall::Undo,
+                "redo" => ExtDocCall::Redo,
+                "copy" => ExtDocCall::Copy,
+                _ => ExtDocCall::Cut,
             });
+        }
+        "insert_text" => {
+            let text = value.as_str().ok_or("'insert_text' must be a string")?;
+            return Ok(ExtDocCall::InsertText(text.to_string()));
         }
         _ => unreachable!("a listed key"),
     }))
@@ -5374,7 +5387,8 @@ fn dispatch_verb(
             Done::ok(Json::Obj(reply))
         }
         // The host's calls on the view (#1947): one formatting command, an
-        // undo or a redo, through the view's public API; the reply is what it
+        // undo or a redo, an insert, a copy or a cut (#1977), through the
+        // view's public API; the reply is what it
         // returned (`done`) and `ext-doc-read`'s fields.
         "ext-doc-call" => {
             let fixture = ext_fixture_view(app)?;
@@ -5384,6 +5398,9 @@ fn dispatch_verb(
                 ExtDocCall::Format(f) => v.format(f, cx),
                 ExtDocCall::Undo => v.undo(cx),
                 ExtDocCall::Redo => v.redo(cx),
+                ExtDocCall::InsertText(text) => v.insert_text(&text, cx),
+                ExtDocCall::Copy => v.copy(cx),
+                ExtDocCall::Cut => v.cut(cx),
             });
             let mut reply = match doc.read(cx).harness_json(window) {
                 Json::Obj(fields) => fields,
@@ -8871,7 +8888,19 @@ mod tests {
         );
         assert_eq!(call(r#"{"undo":true}"#), Ok(ExtDocCall::Undo));
         assert_eq!(call(r#"{"redo":true}"#), Ok(ExtDocCall::Redo));
+        // #1977: the host's Insert, Copy and Cut.
+        assert_eq!(
+            call(r#"{"insert_text":"a\nb"}"#),
+            Ok(ExtDocCall::InsertText("a\nb".into()))
+        );
+        assert_eq!(call(r#"{"copy":true}"#), Ok(ExtDocCall::Copy));
+        assert_eq!(call(r#"{"cut":true}"#), Ok(ExtDocCall::Cut));
         for bad in [
+            r#"{"insert_text":3}"#,
+            r#"{"insert_text":null}"#,
+            r#"{"cut":false}"#,
+            r#"{"copy":"yes"}"#,
+            r#"{"copy":true,"cut":true}"#,
             "{}",
             r#"{"format":"bold","undo":true}"#,
             r#"{"format":"sparkle"}"#,

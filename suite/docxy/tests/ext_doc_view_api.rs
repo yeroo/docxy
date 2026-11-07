@@ -58,7 +58,8 @@ fn embed(doc: Document, pkg: Package, cx: &mut App) -> Reader {
 }
 
 /// A mail body: the view made editable, the host ribbon's commands, its
-/// pressed states, the change event and what is exported (#1947).
+/// pressed states, its Insert, Copy and Cut (#1977), the change event and
+/// what is exported (#1947).
 fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
     let changes: Rc<Cell<usize>> = Rc::default();
     let view = cx.new(|cx| DocView::new(doc, Some(pkg), cx));
@@ -93,6 +94,10 @@ fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
         let _lists: (bool, bool, Align) = (shown.bullets, shown.numbering, shown.align);
         let _undone: bool = v.can_undo() && v.undo(cx);
         let _redone: bool = v.can_redo() && v.redo(cx);
+        // The host's Insert, Copy and Cut buttons (#1977).
+        let _inserted: bool = v.insert_text("Kind regards,\nA. Sender", cx);
+        let _copied: bool = v.can_copy() && v.copy(cx);
+        let _cut: bool = v.can_copy() && v.editable() && v.cut(cx);
         let _body: Document = v.document();
         let _pkg: Option<Package> = v.package();
     });
