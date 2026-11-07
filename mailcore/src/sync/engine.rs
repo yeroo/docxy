@@ -7373,6 +7373,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1983: a calendar refresh stores every field a calendar client
+    /// shows, read back through `events_in_window` and `event_attendees`.
+    /// The join link here is found only in the body (no `onlineMeeting`).
+    #[test]
+    fn refresh_calendar_stores_calendar_client_fields() {
+        let event = r#"{"id":"E1","subject":"Review",
+            "start":{"dateTime":"2026-07-18T09:00:00.0000000","timeZone":"UTC"},
+            "end":{"dateTime":"2026-07-18T09:30:00.0000000","timeZone":"UTC"},
+            "isAllDay":false,"location":{"displayName":"Room"},
+            "organizer":{"emailAddress":{"name":"Org","address":"org@x"}},
+            "responseStatus":{"response":"tentativelyAccepted"},
+            "body":{"contentType":"html","content":"<a href=\"https://us02web.zoom.us/j/42?pwd=a&amp;b=1\">Join</a>"},
+            "showAs":"tentative","isOnlineMeeting":false,"onlineMeetingProvider":"unknown",
+            "categories":["Red category","Plan, phase; 2"],
+            "sensitivity":"confidential","importance":"high","type":"seriesMaster",
+            "recurrence":{"pattern":{"type":"weekly","interval":1,"month":0,"dayOfMonth":0,
+                "daysOfWeek":["friday"],"firstDayOfWeek":"monday","index":"first"},
+                "range":{"type":"noEnd","startDate":"2026-07-18","endDate":"0001-01-01",
+                "recurrenceTimeZone":"UTC","numberOfOccurrences":0}},
+            "isCancelled":true,"isOrganizer":false,"responseRequested":false,
+            "allowNewTimeProposals":false,"hasAttachments":true,
+            "originalStartTimeZone":"Tokyo Standard Time","originalEndTimeZone":"UTC",
+            "calendar":{"id":"CAL1"},
+            "attendees":[{"type":"resource","status":{"response":"accepted",
+                "time":"2026-07-17T08:00:00Z"},
+                "emailAddress":{"name":"Room","address":"room@x"}}]}"#;
+        let mut routes = backfill_routes();
+        routes.insert(
+            0,
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/calendarView".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(r#"{{"value":[{event}]}}"#),
+            },
+        );
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("refresh-calendar-client-fields");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        let rows = store
+            .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.show_as, "tentative");
+        assert!(!r.is_online_meeting);
+        assert_eq!(r.online_meeting_provider, "unknown");
+        assert_eq!(r.join_url, "https://us02web.zoom.us/j/42?pwd=a&b=1");
+        assert_eq!(r.categories, vec!["Red category", "Plan, phase; 2"]);
+        assert_eq!(r.sensitivity, "confidential");
+        assert_eq!(r.importance, "high");
+        assert_eq!(r.event_type, "seriesMaster");
+        let rec = r.recurrence.as_ref().unwrap();
+        assert_eq!(rec.pattern.r#type, "weekly");
+        assert_eq!(rec.pattern.days_of_week, vec!["friday"]);
+        assert_eq!(rec.pattern.first_day_of_week, "monday");
+        assert_eq!(rec.range.r#type, "noEnd");
+        assert_eq!(rec.range.end_date, "");
+        assert!(r.is_cancelled);
+        assert!(!r.is_organizer);
+        assert!(!r.response_requested);
+        assert!(!r.allow_new_time_proposals);
+        assert!(r.has_attachments);
+        assert_eq!(r.original_start_time_zone, "Tokyo Standard Time");
+        assert_eq!(r.original_end_time_zone, "UTC");
+        assert_eq!(r.calendar_id, "CAL1");
+        let atts = store.event_attendees("E1").unwrap();
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].r#type, "resource");
+        assert_eq!(atts[0].response, "accepted");
+        assert_eq!(atts[0].response_time, "2026-07-17T08:00:00Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn respond_event_optimistically_flips_status_and_drains_to_accept() {
         let mut routes = backfill_routes();
