@@ -176,7 +176,29 @@ CREATE TABLE IF NOT EXISTS events (
     body_html        TEXT NOT NULL DEFAULT '',
     recurrence       TEXT NOT NULL DEFAULT '',
     reminder_minutes INTEGER NOT NULL DEFAULT 0,
-    is_reminder_on   INTEGER NOT NULL DEFAULT 0
+    is_reminder_on   INTEGER NOT NULL DEFAULT 0,
+    -- What a calendar client shows (#1983). `Store::init` adds each to an
+    -- older database with `ALTER TABLE`, after this script runs: no index
+    -- here may name one of them. `graph_recurrence` is Graph's recurrence
+    -- of a series (read side); `recurrence` above is the create-side one
+    -- `Store::event_for_send` re-sends.
+    show_as                  TEXT NOT NULL DEFAULT '',
+    is_online_meeting        INTEGER NOT NULL DEFAULT 0,
+    online_meeting_provider  TEXT NOT NULL DEFAULT '',
+    join_url                 TEXT NOT NULL DEFAULT '',
+    categories               TEXT NOT NULL DEFAULT '',
+    sensitivity              TEXT NOT NULL DEFAULT '',
+    importance               TEXT NOT NULL DEFAULT '',
+    event_type               TEXT NOT NULL DEFAULT '',
+    graph_recurrence         TEXT NOT NULL DEFAULT '',
+    is_cancelled             INTEGER NOT NULL DEFAULT 0,
+    is_organizer             INTEGER NOT NULL DEFAULT 0,
+    response_requested       INTEGER NOT NULL DEFAULT 1,
+    allow_new_time_proposals INTEGER NOT NULL DEFAULT 1,
+    has_attachments          INTEGER NOT NULL DEFAULT 0,
+    original_start_tz        TEXT NOT NULL DEFAULT '',
+    original_end_tz          TEXT NOT NULL DEFAULT '',
+    calendar_id              TEXT NOT NULL DEFAULT ''
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`
@@ -188,7 +210,9 @@ CREATE TABLE IF NOT EXISTS event_attendees (
     name     TEXT NOT NULL DEFAULT '',
     addr     TEXT NOT NULL DEFAULT '',
     type     TEXT NOT NULL DEFAULT '',
-    response TEXT NOT NULL DEFAULT ''
+    response TEXT NOT NULL DEFAULT '',
+    -- Graph `status.time`, `''` when never (#1983).
+    response_time TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_attendees_event ON event_attendees(event_id);

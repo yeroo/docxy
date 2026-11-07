@@ -127,16 +127,7 @@ impl Message {
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
                 == Some("#microsoft.graph.eventMessageRequest"),
-            categories: v
-                .get("categories")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            categories: string_list(v, "categories"),
         })
     }
 }
@@ -654,6 +645,10 @@ pub struct Attendee {
     pub addr: String,
     pub r#type: String,
     pub response: String,
+    /// Graph `attendees[].status.time`: when the attendee last responded,
+    /// as Graph sends it. `""` when absent or Graph's "never"
+    /// (`0001-01-01T00:00:00Z`; see `graph_date_or_empty`).
+    pub response_time: String,
 }
 
 impl Attendee {
@@ -669,7 +664,25 @@ impl Attendee {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            response_time: graph_date_or_empty(
+                v.get("status")
+                    .and_then(|s| s.get("time"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
         })
+    }
+}
+
+/// Graph writes "no date" as the minimum date, `0001-01-01` (a `noEnd`
+/// recurrence range's `endDate`, an attendee who never responded's
+/// `status.time` `0001-01-01T00:00:00Z`). Any value starting `0001-01-01`
+/// reads as `""`; every other value is kept as Graph sent it.
+fn graph_date_or_empty(s: &str) -> String {
+    if s.starts_with("0001-01-01") {
+        String::new()
+    } else {
+        s.to_string()
     }
 }
 
@@ -771,16 +784,7 @@ impl Recurrence {
         let range = v.get("range")?;
         let kind = RecurrenceKind::from_wire(pattern.get("type")?.as_str()?)?;
         let interval = pattern.get("interval").and_then(Value::as_i64).unwrap_or(1) as u32;
-        let days_of_week = pattern
-            .get("daysOfWeek")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let days_of_week = string_list(pattern, "daysOfWeek");
         let day_of_month = pattern
             .get("dayOfMonth")
             .and_then(Value::as_i64)
@@ -798,6 +802,111 @@ impl Recurrence {
             start_date,
             until,
         })
+    }
+}
+
+/// A series' recurrence as Graph reports it (`event.recurrence`), read side
+/// only (#1983). Lenient: every enum Graph uses is kept as its raw string,
+/// so a value this crate does not know is kept, not dropped. Not the
+/// create-side `Recurrence`: that one is what `Store::event_for_send` sends
+/// back to Graph on every create and update, and its three kinds and
+/// `to_json` (a `numbered` range becomes `noEnd`, `firstDayOfWeek` is forced
+/// to `sunday`) would rewrite a synced series. The store keeps this one in
+/// its own column, `events.graph_recurrence`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EventRecurrence {
+    pub pattern: RecurrencePattern,
+    pub range: RecurrenceRange,
+}
+
+/// Graph's `recurrencePattern`: `type` is `daily`, `weekly`,
+/// `absoluteMonthly`, `relativeMonthly`, `absoluteYearly` or
+/// `relativeYearly`; `index` is `first` .. `last`. Graph fills every field on
+/// every type (`month: 0`, `index: "first"` where unused), and they are kept.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RecurrencePattern {
+    pub r#type: String,
+    pub interval: u32,
+    pub month: u32,
+    pub day_of_month: u32,
+    pub days_of_week: Vec<String>,
+    pub first_day_of_week: String,
+    pub index: String,
+}
+
+/// Graph's `recurrenceRange`: `type` is `endDate`, `noEnd` or `numbered`.
+/// Dates are `YYYY-MM-DD`; Graph's "no date" (`0001-01-01`, a `noEnd`
+/// range's `endDate`) reads as `""` (`graph_date_or_empty`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RecurrenceRange {
+    pub r#type: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub number_of_occurrences: u32,
+    pub recurrence_time_zone: String,
+}
+
+impl EventRecurrence {
+    /// `None` unless `v` is an object whose `pattern` is an object (Graph
+    /// sends `"recurrence": null` for every non-series event). A missing or
+    /// malformed `range` reads as an empty one.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let p = v.get("pattern").filter(|p| matches!(p, Value::Object(_)))?;
+        let pattern = RecurrencePattern {
+            r#type: str_field(p, "type"),
+            interval: u32_field(p, "interval"),
+            month: u32_field(p, "month"),
+            day_of_month: u32_field(p, "dayOfMonth"),
+            days_of_week: string_list(p, "daysOfWeek"),
+            first_day_of_week: str_field(p, "firstDayOfWeek"),
+            index: str_field(p, "index"),
+        };
+        let range = match v.get("range") {
+            Some(r @ Value::Object(_)) => RecurrenceRange {
+                r#type: str_field(r, "type"),
+                start_date: graph_date_or_empty(&str_field(r, "startDate")),
+                end_date: graph_date_or_empty(&str_field(r, "endDate")),
+                number_of_occurrences: u32_field(r, "numberOfOccurrences"),
+                recurrence_time_zone: str_field(r, "recurrenceTimeZone"),
+            },
+            _ => RecurrenceRange::default(),
+        };
+        Some(EventRecurrence { pattern, range })
+    }
+
+    /// Graph's `recurrence` shape, every field written (the store's
+    /// `events.graph_recurrence` text; `from_json` reads it back equal).
+    pub fn to_json(&self) -> Value {
+        let s = |v: &str| Value::Str(v.to_string());
+        let n = |v: u32| Value::Num(v as f64);
+        let p = &self.pattern;
+        let r = &self.range;
+        let pattern = Value::Object(vec![
+            ("type".to_string(), s(&p.r#type)),
+            ("interval".to_string(), n(p.interval)),
+            ("month".to_string(), n(p.month)),
+            ("dayOfMonth".to_string(), n(p.day_of_month)),
+            (
+                "daysOfWeek".to_string(),
+                Value::Array(p.days_of_week.iter().map(|d| s(d)).collect()),
+            ),
+            ("firstDayOfWeek".to_string(), s(&p.first_day_of_week)),
+            ("index".to_string(), s(&p.index)),
+        ]);
+        let range = Value::Object(vec![
+            ("type".to_string(), s(&r.r#type)),
+            ("startDate".to_string(), s(&r.start_date)),
+            ("endDate".to_string(), s(&r.end_date)),
+            (
+                "numberOfOccurrences".to_string(),
+                n(r.number_of_occurrences),
+            ),
+            ("recurrenceTimeZone".to_string(), s(&r.recurrence_time_zone)),
+        ]);
+        Value::Object(vec![
+            ("pattern".to_string(), pattern),
+            ("range".to_string(), range),
+        ])
     }
 }
 
@@ -826,6 +935,87 @@ pub struct Event {
     /// fires. `is_reminder_on` gates whether a reminder exists at all.
     pub reminder_minutes: i64,
     pub is_reminder_on: bool,
+    /// Graph `showAs` as sent: `free`, `tentative`, `busy`, `oof`,
+    /// `workingElsewhere` or `unknown` (`""` when absent).
+    pub show_as: String,
+    pub is_online_meeting: bool,
+    /// Graph `onlineMeetingProvider` (`teamsForBusiness`, `skypeForBusiness`,
+    /// `skypeForConsumer`, `unknown`).
+    pub online_meeting_provider: String,
+    /// The link to join the meeting: `onlineMeeting.joinUrl`, else
+    /// `onlineMeetingUrl`, else a meeting link found in the location, else
+    /// one found in the body (`meeting_link`); `""` when there is none.
+    pub join_url: String,
+    /// Assigned category names; colours are the master categories'.
+    pub categories: Vec<String>,
+    /// Graph `sensitivity`: `normal`, `personal`, `private`, `confidential`.
+    pub sensitivity: String,
+    /// Graph `importance`: `low`, `normal`, `high`.
+    pub importance: String,
+    /// Graph `type`: `singleInstance`, `occurrence`, `exception`,
+    /// `seriesMaster`.
+    pub event_type: String,
+    /// A series master's pattern and range; `None` for every other event
+    /// (`calendarView` returns occurrences, whose `recurrence` is null).
+    pub recurrence: Option<EventRecurrence>,
+    pub is_cancelled: bool,
+    pub is_organizer: bool,
+    /// `true` when absent: Graph's default.
+    pub response_requested: bool,
+    /// `true` when absent: Graph's default.
+    pub allow_new_time_proposals: bool,
+    pub has_attachments: bool,
+    /// Graph `originalStartTimeZone` / `originalEndTimeZone`: the zone the
+    /// organizer set the times in (to show "in another time zone").
+    pub original_start_time_zone: String,
+    pub original_end_time_zone: String,
+    /// The calendar holding the event (`calendar.id`, when Graph expands
+    /// it); `""` is the default calendar (#1984 fills it per calendar).
+    pub calendar_id: String,
+}
+
+/// Every field empty, zero or `false`, except `response_requested` and
+/// `allow_new_time_proposals`, which are `true` as in Graph (and in
+/// `from_json` for a missing key, and in the store's `DEFAULT 1`).
+impl Default for Event {
+    fn default() -> Self {
+        Event {
+            id: String::new(),
+            subject: String::new(),
+            start_utc: String::new(),
+            end_utc: String::new(),
+            is_all_day: false,
+            location: String::new(),
+            organizer_name: String::new(),
+            organizer_addr: String::new(),
+            response_status: String::new(),
+            series_master_id: None,
+            body_preview: String::new(),
+            web_link: String::new(),
+            last_modified: String::new(),
+            body_html: String::new(),
+            attendees: Vec::new(),
+            reminder_minutes: 0,
+            is_reminder_on: false,
+            show_as: String::new(),
+            is_online_meeting: false,
+            online_meeting_provider: String::new(),
+            join_url: String::new(),
+            categories: Vec::new(),
+            sensitivity: String::new(),
+            importance: String::new(),
+            event_type: String::new(),
+            recurrence: None,
+            is_cancelled: false,
+            is_organizer: false,
+            response_requested: true,
+            allow_new_time_proposals: true,
+            has_attachments: false,
+            original_start_time_zone: String::new(),
+            original_end_time_zone: String::new(),
+            calendar_id: String::new(),
+        }
+    }
 }
 
 impl Event {
@@ -834,6 +1024,28 @@ impl Event {
             .get("organizer")
             .and_then(Recipient::from_json)
             .unwrap_or_default();
+        let location = v
+            .get("location")
+            .and_then(|l| l.get("displayName"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let body_html = v
+            .get("body")
+            .and_then(|b| b.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let join_url = v
+            .get("onlineMeeting")
+            .and_then(|m| m.get("joinUrl"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|u| !u.is_empty())
+            .or_else(|| opt_str_field(v, "onlineMeetingUrl").filter(|u| !u.is_empty()))
+            .or_else(|| meeting_link_in(&location, &body_html))
+            .unwrap_or_default();
+        let flag = |key: &str, absent: bool| v.get(key).and_then(Value::as_bool).unwrap_or(absent);
         Some(Event {
             id: str_field(v, "id"),
             subject: str_field(v, "subject"),
@@ -851,12 +1063,7 @@ impl Event {
             start_utc: datetime_field_to_utc(v.get("start").unwrap_or(&Value::Null)),
             end_utc: datetime_field_to_utc(v.get("end").unwrap_or(&Value::Null)),
             is_all_day: v.get("isAllDay").and_then(Value::as_bool).unwrap_or(false),
-            location: v
-                .get("location")
-                .and_then(|l| l.get("displayName"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            location,
             organizer_name: organizer.name,
             organizer_addr: organizer.address,
             response_status: v
@@ -869,12 +1076,7 @@ impl Event {
             body_preview: str_field(v, "bodyPreview"),
             web_link: str_field(v, "webLink"),
             last_modified: str_field(v, "lastModifiedDateTime"),
-            body_html: v
-                .get("body")
-                .and_then(|b| b.get("content"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            body_html,
             attendees: v
                 .get("attendees")
                 .and_then(Value::as_array)
@@ -884,11 +1086,165 @@ impl Event {
                 .get("reminderMinutesBeforeStart")
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
-            is_reminder_on: v
-                .get("isReminderOn")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            is_reminder_on: flag("isReminderOn", false),
+            show_as: str_field(v, "showAs"),
+            is_online_meeting: flag("isOnlineMeeting", false),
+            online_meeting_provider: str_field(v, "onlineMeetingProvider"),
+            join_url,
+            categories: string_list(v, "categories"),
+            sensitivity: str_field(v, "sensitivity"),
+            importance: str_field(v, "importance"),
+            event_type: str_field(v, "type"),
+            recurrence: v.get("recurrence").and_then(EventRecurrence::from_json),
+            is_cancelled: flag("isCancelled", false),
+            is_organizer: flag("isOrganizer", false),
+            response_requested: flag("responseRequested", true),
+            allow_new_time_proposals: flag("allowNewTimeProposals", true),
+            has_attachments: flag("hasAttachments", false),
+            original_start_time_zone: str_field(v, "originalStartTimeZone"),
+            original_end_time_zone: str_field(v, "originalEndTimeZone"),
+            calendar_id: v
+                .get("calendar")
+                .map(|c| str_field(c, "id"))
+                .unwrap_or_default(),
         })
+    }
+}
+
+/// The meeting link an event's location or body holds: the location's
+/// first, else the body's (`meeting_link`). The location goes first: it is a
+/// field someone set, while a body can quote an old invite. `Event::from_json`
+/// falls back to it after Graph's own join link, and the store derives a local
+/// event's `join_url` with it on create and edit.
+pub(crate) fn meeting_link_in(location: &str, body: &str) -> Option<String> {
+    meeting_link(location).or_else(|| meeting_link(body))
+}
+
+/// The first link in `text` (an event's location or HTML/text body) that
+/// joins a meeting on a known service, or `None`. A link starts at
+/// `https://` (any case) and ends at a quote, `<`, `>`, whitespace, an
+/// escaped bracket or quote (`&lt;`, `&gt;`, `&quot;`, `&#39;`, `&#x27;`) or
+/// the end; `&amp;` is decoded, then trailing prose punctuation (`.`, `,`,
+/// `;`, `:`, `)`, `]`, `!`) is trimmed. Only the parsed host decides the
+/// service (`is_meeting_url`), and the scan resumes after a rejected link's
+/// end, so a meeting link inside another link's query or path, or a
+/// lookalike host, is not taken, and each byte is scanned once (a body is
+/// sender-controlled: a long run of `https://` must stay linear). Safe
+/// Links-wrapped links (`*.safelinks.protection.outlook.com/?url=...`) are
+/// not unwrapped.
+fn meeting_link(text: &str) -> Option<String> {
+    const SCHEME: &str = "https://";
+    // ASCII lowercasing keeps every byte offset, so offsets in `lower`
+    // index `text` too (and land on the ASCII `h`, a char boundary).
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(SCHEME) {
+        let start = from + pos;
+        let end = link_end(text, start + SCHEME.len());
+        let decoded = text[start..end].replace("&amp;", "&");
+        let url = decoded.trim_end_matches(['.', ',', ';', ':', ')', ']', '!']);
+        if is_meeting_url(&url[SCHEME.len()..]) {
+            return Some(url.to_string());
+        }
+        from = end;
+    }
+    None
+}
+
+/// The byte offset where the link whose scheme ends at `from` ends: the
+/// first quote, `<`, `>`, whitespace or HTML entity other than `&amp;`
+/// (`is_entity_end`) at or after `from`, else `text.len()`.
+fn link_end(text: &str, from: usize) -> usize {
+    text[from..]
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '"' | '\'' | '<' | '>')
+                || c.is_whitespace()
+                || (c == '&' && is_entity_end(&text[from + i..]))
+        })
+        .map_or(text.len(), |(i, _)| from + i)
+}
+
+/// `at` (text starting at a `&`) starts an HTML entity that ends a link:
+/// a numeric one (`&#…`: `&#160;`, `&#x27;`, `&#34;`) or a named one (an
+/// ASCII letter, then up to 31 letters or digits, then `;`: `&nbsp;`,
+/// `&lt;`, `&quot;`), except `&amp;`, which a link's query holds and
+/// `meeting_link` decodes. A raw `&` not shaped like an entity
+/// (`?pwd=x&y=1` in a plain-text location) stays in the link. The lookahead
+/// is bounded, so the scan stays linear.
+fn is_entity_end(at: &str) -> bool {
+    let rest = &at.as_bytes()[1..];
+    if at.starts_with("&amp;") {
+        return false;
+    }
+    if rest.first() == Some(&b'#') {
+        return true;
+    }
+    if !rest.first().is_some_and(u8::is_ascii_alphabetic) {
+        return false;
+    }
+    let name = rest
+        .iter()
+        .take(33)
+        .take_while(|b| b.is_ascii_alphanumeric())
+        .count();
+    name <= 32 && rest.get(name) == Some(&b';')
+}
+
+/// `after_scheme` (a link without its `https://`) is a meeting link: its
+/// host and path (as is) match a known meeting service. The authority runs
+/// to the first `/`, `?`, `#` or `\` (a browser reads `\` as `/` in an
+/// `https` link, so `https://evil.example\.zoom.us/` is `evil.example`). An
+/// authority with userinfo (`@`, as in `teams.microsoft.com:443@evil.example`)
+/// is refused; a `:port` must be digits and is dropped; the host left must be
+/// ASCII letters, digits, `-` and `.`, and is compared lowercased. `base` or
+/// `*.base` hosts match a `base` entry, so `notzoom.us` is not `zoom.us`.
+fn is_meeting_url(after_scheme: &str) -> bool {
+    let authority_end = after_scheme
+        .find(['/', '?', '#', '\\'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let path = &after_scheme[authority_end..];
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.split_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return false;
+    }
+    let under = |base: &str| {
+        host == base
+            || host
+                .strip_suffix(base)
+                .is_some_and(|sub| sub.ends_with('.'))
+    };
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|p| path.starts_with(p));
+    let has_path = path.len() > 1;
+    if host == "teams.microsoft.com" {
+        starts(&["/l/meetup-join/", "/meet/"])
+    } else if host == "teams.live.com" {
+        starts(&["/meet/"])
+    } else if under("zoom.us") || under("zoomgov.com") {
+        starts(&["/j/", "/w/", "/my/"])
+    } else if host == "meet.google.com"
+        || host == "meet.goto.com"
+        || host == "chime.aws"
+        || under("webex.com")
+    {
+        has_path
+    } else if host == "global.gotomeeting.com" {
+        starts(&["/join/"])
+    } else {
+        false
     }
 }
 
@@ -985,6 +1341,28 @@ pub fn parse_flag(v: &Value) -> bool {
 /// Reads a string field, defaulting to `""` when absent or not a string.
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Reads a non-negative integer field as `u32`, `0` when absent, not a
+/// number or negative.
+fn u32_field(v: &Value, key: &str) -> u32 {
+    v.get(key)
+        .and_then(Value::as_i64)
+        .map(|n| n.clamp(0, u32::MAX as i64) as u32)
+        .unwrap_or(0)
+}
+
+/// Reads an array of strings, skipping non-string items; empty when absent.
+fn string_list(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Reads a string field as `Option<String>`, `None` when absent or not a
@@ -1573,5 +1951,314 @@ mod tests {
             assert_eq!(me.mail, "", "{body}");
             assert_eq!(me.address(), "ada@outlook.com", "{body}");
         }
+    }
+
+    /// An event body around `extra`, the times every #1983 test shares.
+    fn ev(extra: &str) -> Event {
+        let json = format!(
+            r#"{{"id":"E1","subject":"s",
+                "start":{{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"}},
+                "end":{{"dateTime":"2026-07-20T10:00:00.0000000","timeZone":"UTC"}}{extra}}}"#
+        );
+        Event::from_json(&parse(&json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn event_reads_calendar_client_fields() {
+        let e = ev(r#","showAs":"workingElsewhere","isOnlineMeeting":true,
+            "onlineMeetingProvider":"teamsForBusiness",
+            "onlineMeeting":{"joinUrl":"https://teams.microsoft.com/l/meetup-join/19%3a1"},
+            "categories":["Red category","Plan, phase; 2"],
+            "sensitivity":"private","importance":"high","type":"exception",
+            "isCancelled":true,"isOrganizer":true,"responseRequested":false,
+            "allowNewTimeProposals":false,"hasAttachments":true,
+            "originalStartTimeZone":"Pacific Standard Time",
+            "originalEndTimeZone":"Eastern Standard Time",
+            "calendar":{"id":"CAL1"},
+            "attendees":[{"type":"resource","status":{"response":"accepted",
+                "time":"2026-07-18T08:01:02Z"},
+                "emailAddress":{"name":"Room","address":"room@x"}}]"#);
+        assert_eq!(e.show_as, "workingElsewhere");
+        assert!(e.is_online_meeting);
+        assert_eq!(e.online_meeting_provider, "teamsForBusiness");
+        assert_eq!(
+            e.join_url,
+            "https://teams.microsoft.com/l/meetup-join/19%3a1"
+        );
+        assert_eq!(e.categories, vec!["Red category", "Plan, phase; 2"]);
+        assert_eq!(e.sensitivity, "private");
+        assert_eq!(e.importance, "high");
+        assert_eq!(e.event_type, "exception");
+        assert!(e.is_cancelled);
+        assert!(e.is_organizer);
+        assert!(!e.response_requested);
+        assert!(!e.allow_new_time_proposals);
+        assert!(e.has_attachments);
+        assert_eq!(e.original_start_time_zone, "Pacific Standard Time");
+        assert_eq!(e.original_end_time_zone, "Eastern Standard Time");
+        assert_eq!(e.calendar_id, "CAL1");
+        assert_eq!(e.attendees[0].r#type, "resource");
+        assert_eq!(e.attendees[0].response, "accepted");
+        assert_eq!(e.attendees[0].response_time, "2026-07-18T08:01:02Z");
+    }
+
+    #[test]
+    fn event_defaults_when_fields_absent() {
+        let e = ev("");
+        assert_eq!(e.show_as, "");
+        assert!(!e.is_online_meeting);
+        assert_eq!(e.online_meeting_provider, "");
+        assert_eq!(e.join_url, "");
+        assert!(e.categories.is_empty());
+        assert_eq!(e.sensitivity, "");
+        assert_eq!(e.importance, "");
+        assert_eq!(e.event_type, "");
+        assert_eq!(e.recurrence, None);
+        assert!(!e.is_cancelled);
+        assert!(!e.is_organizer);
+        assert!(e.response_requested, "Graph's default");
+        assert!(e.allow_new_time_proposals, "Graph's default");
+        assert!(!e.has_attachments);
+        assert_eq!(e.original_start_time_zone, "");
+        assert_eq!(e.original_end_time_zone, "");
+        assert_eq!(e.calendar_id, "");
+        assert_eq!(ev(r#","recurrence":null"#).recurrence, None);
+    }
+
+    #[test]
+    fn default_event_agrees_with_graph_on_request_flags() {
+        let d = Event::default();
+        assert!(d.response_requested);
+        assert!(d.allow_new_time_proposals);
+        assert!(!d.is_organizer && !d.is_cancelled && !d.is_online_meeting);
+    }
+
+    #[test]
+    fn event_join_url_sources() {
+        let zoom_loc = r#","location":{"displayName":"Zoom: https://us02web.zoom.us/j/111"}"#;
+        let body = r#","body":{"contentType":"html","content":"<a href=\"https://meet.google.com/abc-defg-hij\">Join</a>"}"#;
+        // 1. onlineMeeting.joinUrl wins over everything.
+        let all = format!(
+            r#","onlineMeeting":{{"joinUrl":"https://teams.microsoft.com/l/meetup-join/A"}},
+               "onlineMeetingUrl":"https://teams.microsoft.com/l/meetup-join/B"{zoom_loc}{body}"#
+        );
+        assert_eq!(
+            ev(&all).join_url,
+            "https://teams.microsoft.com/l/meetup-join/A"
+        );
+        // 2. onlineMeetingUrl, with onlineMeeting null.
+        let no_om = format!(
+            r#","onlineMeeting":null,
+               "onlineMeetingUrl":"https://teams.microsoft.com/l/meetup-join/B"{zoom_loc}{body}"#
+        );
+        assert_eq!(
+            ev(&no_om).join_url,
+            "https://teams.microsoft.com/l/meetup-join/B"
+        );
+        // 3. the location, before the body; onlineMeeting absent.
+        assert_eq!(
+            ev(&format!("{zoom_loc}{body}")).join_url,
+            "https://us02web.zoom.us/j/111"
+        );
+        // 4. the body.
+        assert_eq!(ev(body).join_url, "https://meet.google.com/abc-defg-hij");
+        // An empty joinUrl falls through.
+        assert_eq!(
+            ev(&format!(r#","onlineMeeting":{{"joinUrl":""}}{body}"#)).join_url,
+            "https://meet.google.com/abc-defg-hij"
+        );
+        // Teams' short /meet/ link and zoomgov.com are meeting links.
+        assert_eq!(
+            ev(r#","location":{"displayName":"https://teams.microsoft.com/meet/2468?p=Xy"}"#)
+                .join_url,
+            "https://teams.microsoft.com/meet/2468?p=Xy"
+        );
+        assert_eq!(
+            ev(r#","location":{"displayName":"https://agency.zoomgov.com/j/16"}"#).join_url,
+            "https://agency.zoomgov.com/j/16"
+        );
+    }
+
+    #[test]
+    fn event_join_url_found_only_in_body() {
+        let e = ev(
+            r#","isOnlineMeeting":false,"location":{"displayName":"Room 4"},
+            "body":{"contentType":"html","content":"<p>See <a href=\"https://example.com/agenda\">agenda</a>.</p><a href=\"https://teams.microsoft.com/l/meetup-join/19%3ameeting_X%40thread.v2/0?context=%7b%22Tid%22%7d&amp;btype=a&amp;role=a\">Join the meeting now</a>"}"#,
+        );
+        assert_eq!(
+            e.join_url,
+            "https://teams.microsoft.com/l/meetup-join/19%3ameeting_X%40thread.v2/0?context=%7b%22Tid%22%7d&btype=a&role=a"
+        );
+    }
+
+    #[test]
+    fn event_join_url_ignores_non_meeting_links() {
+        let e = ev(r#","location":{"displayName":"https://maps.example/room"},
+            "body":{"content":"<a href=\"https://example.com/x\">x</a> https://zoom.us/pricing https://www.webex.com/"}"#);
+        assert_eq!(e.join_url, "");
+    }
+
+    #[test]
+    fn event_join_url_trims_prose_punctuation() {
+        let e = ev(
+            r#","body":{"contentType":"text","content":"Join: https://zoom.us/j/123?pwd=a1. Thanks"}"#,
+        );
+        assert_eq!(e.join_url, "https://zoom.us/j/123?pwd=a1");
+        let e = ev(r#","body":{"content":"(https://meet.google.com/abc-defg-hij), later"}"#);
+        assert_eq!(e.join_url, "https://meet.google.com/abc-defg-hij");
+    }
+
+    #[test]
+    fn event_join_url_rejects_lookalike_hosts() {
+        for text in [
+            "https://notzoom.us/j/1",
+            "https://evil.example/?u=teams.microsoft.com/l/meetup-join/1",
+            "https://evil.example/teams.microsoft.com/l/meetup-join/1",
+            "https://teams.microsoft.com@evil.example/l/meetup-join/1",
+            "https://zoom.us.evil.example/j/1",
+            "http://zoom.us/j/1",
+            // Userinfo after a port colon: the browser opens evil.example.
+            "https://teams.microsoft.com:443@evil.example/l/meetup-join/1",
+            "https://zoom.us:x@evil.example/j/1",
+            // A backslash is a `/` to the browser: the host is evil.example.
+            "https://evil.example\\\\.zoom.us/j/1",
+            "https://evil.example\\\\.webex.com/meet/x",
+            // A port that is not digits, a host with other characters.
+            "https://zoom.us:44x/j/1",
+            "https://zo%6Fm.us/j/1",
+            // A meeting link nested in another link's query or path.
+            "https://evil.example/?u=https://zoom.us/j/1",
+            "https://evil.example/r/https://teams.microsoft.com/l/meetup-join/1",
+        ] {
+            let e = ev(&format!(r#","location":{{"displayName":"{text}"}}"#));
+            assert_eq!(e.join_url, "", "{text}");
+        }
+        // A real link after a rejected one is still found.
+        let e = ev(r#","location":{"displayName":"https://notzoom.us/j/1 https://zoom.us/j/2"}"#);
+        assert_eq!(e.join_url, "https://zoom.us/j/2");
+        let e = ev(
+            r#","location":{"displayName":"https://teams.microsoft.com:443@evil.example/l/meetup-join/1 https://teams.microsoft.com:443/l/meetup-join/2"}"#,
+        );
+        assert_eq!(
+            e.join_url,
+            "https://teams.microsoft.com:443/l/meetup-join/2"
+        );
+    }
+
+    #[test]
+    fn event_join_url_ends_at_escaped_brackets_and_quotes() {
+        for (body, want) in [
+            (
+                "Join: &lt;https://zoom.us/j/7&gt; now",
+                "https://zoom.us/j/7",
+            ),
+            ("&quot;https://zoom.us/j/8&quot;", "https://zoom.us/j/8"),
+            ("&#39;https://zoom.us/j/9&#39;", "https://zoom.us/j/9"),
+            ("&#x27;https://zoom.us/j/10&#x27;", "https://zoom.us/j/10"),
+            (
+                "https://zoom.us/j/11?a=1&amp;b=2&gt;",
+                "https://zoom.us/j/11?a=1&b=2",
+            ),
+            // Other named and numeric entities end a link too.
+            ("Join: https://zoom.us/j/1&nbsp;</p>", "https://zoom.us/j/1"),
+            (
+                "https://aka.ms/x&nbsp;https://zoom.us/j/1",
+                "https://zoom.us/j/1",
+            ),
+            ("&#34;https://zoom.us/j/2&#34;", "https://zoom.us/j/2"),
+            ("https://zoom.us/j/3&#xa0;more", "https://zoom.us/j/3"),
+            // A raw & not shaped like an entity stays in the link.
+            (
+                "https://zoom.us/j/4?pwd=x&y=1 next",
+                "https://zoom.us/j/4?pwd=x&y=1",
+            ),
+            ("https://zoom.us/j/5?a&b;c", "https://zoom.us/j/5?a"),
+        ] {
+            let e = ev(&format!(r#","body":{{"content":"{body}"}}"#));
+            assert_eq!(e.join_url, want, "{body}");
+        }
+    }
+
+    /// A sender-controlled body of `https://` with no whitespace is scanned
+    /// once, not once per `https://` (that took minutes at this size); a
+    /// link after the run is still found. Finishing is the check.
+    #[test]
+    fn event_join_url_scan_is_linear_on_a_long_scheme_run() {
+        let run = "https://".repeat(200_000);
+        assert_eq!(meeting_link(&run), None);
+        let text = format!("{run} https://zoom.us/j/1");
+        assert_eq!(meeting_link(&text).as_deref(), Some("https://zoom.us/j/1"));
+        let e = ev(&format!(r#","body":{{"content":"{run}"}}"#));
+        assert_eq!(e.join_url, "");
+    }
+
+    #[test]
+    fn event_join_url_scheme_and_host_case_insensitive() {
+        let e =
+            ev(r#","location":{"displayName":"HTTPS://Teams.Microsoft.COM/l/meetup-join/AbC"}"#);
+        assert_eq!(e.join_url, "HTTPS://Teams.Microsoft.COM/l/meetup-join/AbC");
+        // The path is matched as is.
+        let e = ev(r#","location":{"displayName":"https://teams.microsoft.com/L/MEETUP-JOIN/x"}"#);
+        assert_eq!(e.join_url, "");
+    }
+
+    #[test]
+    fn event_recurrence_reads_every_pattern_and_range() {
+        // A full Graph payload: every field present, unused ones at Graph's
+        // fillers, and a noEnd range's 0001-01-01 end date.
+        let e = ev(r#","type":"seriesMaster","recurrence":{
+            "pattern":{"type":"relativeMonthly","interval":2,"month":0,"dayOfMonth":0,
+                "daysOfWeek":["tuesday"],"firstDayOfWeek":"sunday","index":"second"},
+            "range":{"type":"noEnd","startDate":"2026-07-14","endDate":"0001-01-01",
+                "recurrenceTimeZone":"W. Europe Standard Time","numberOfOccurrences":0}}"#);
+        let r = e.recurrence.clone().unwrap();
+        assert_eq!(r.pattern.r#type, "relativeMonthly");
+        assert_eq!(r.pattern.interval, 2);
+        assert_eq!(r.pattern.days_of_week, vec!["tuesday"]);
+        assert_eq!(r.pattern.first_day_of_week, "sunday");
+        assert_eq!(r.pattern.index, "second");
+        assert_eq!(r.range.r#type, "noEnd");
+        assert_eq!(r.range.start_date, "2026-07-14");
+        assert_eq!(r.range.end_date, "", "Graph's never date");
+        assert_eq!(r.range.recurrence_time_zone, "W. Europe Standard Time");
+        assert_eq!(EventRecurrence::from_json(&r.to_json()), Some(r));
+
+        let yearly = ev(r#","recurrence":{
+            "pattern":{"type":"absoluteYearly","interval":1,"month":3,"dayOfMonth":17,
+                "daysOfWeek":[],"firstDayOfWeek":"monday","index":"first"},
+            "range":{"type":"numbered","startDate":"2026-03-17","endDate":"0001-01-01",
+                "recurrenceTimeZone":"","numberOfOccurrences":5}}"#)
+        .recurrence
+        .unwrap();
+        assert_eq!(yearly.pattern.month, 3);
+        assert_eq!(yearly.pattern.day_of_month, 17);
+        assert_eq!(yearly.pattern.first_day_of_week, "monday");
+        assert_eq!(yearly.range.r#type, "numbered");
+        assert_eq!(yearly.range.number_of_occurrences, 5);
+        assert_eq!(EventRecurrence::from_json(&yearly.to_json()), Some(yearly));
+
+        let dated = ev(r#","recurrence":{"pattern":{"type":"daily","interval":1},
+            "range":{"type":"endDate","startDate":"2026-07-01","endDate":"2026-07-31"}}"#)
+        .recurrence
+        .unwrap();
+        assert_eq!(dated.range.end_date, "2026-07-31");
+        assert_eq!(EventRecurrence::from_json(&dated.to_json()), Some(dated));
+
+        // No pattern object: no recurrence.
+        assert_eq!(ev(r#","recurrence":{"pattern":null}"#).recurrence, None);
+    }
+
+    #[test]
+    fn attendee_response_time_and_never() {
+        let e = ev(r#","attendees":[
+            {"type":"required","status":{"response":"none","time":"0001-01-01T00:00:00Z"},
+             "emailAddress":{"name":"A","address":"a@x"}},
+            {"type":"optional","status":{"response":"declined"},
+             "emailAddress":{"name":"B","address":"b@x"}}]"#);
+        assert_eq!(e.attendees[0].r#type, "required");
+        assert_eq!(e.attendees[0].response_time, "");
+        assert_eq!(e.attendees[1].r#type, "optional");
+        assert_eq!(e.attendees[1].response, "declined");
+        assert_eq!(e.attendees[1].response_time, "");
     }
 }

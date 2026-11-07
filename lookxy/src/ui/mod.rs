@@ -1505,6 +1505,7 @@ mod tests {
                 body_html: "".into(),
                 reminder_minutes: 0,
                 is_reminder_on: false,
+                ..Default::default()
             })
             .unwrap();
         app.reload_agenda();
@@ -1551,6 +1552,7 @@ mod tests {
                 body_html: "".into(),
                 reminder_minutes: 0,
                 is_reminder_on: false,
+                ..Default::default()
             })
             .unwrap();
         app.reload_agenda();

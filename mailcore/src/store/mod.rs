@@ -13,8 +13,8 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, MailFolder, MasterCategory,
-    Message, MessageFields, Recipient, Recurrence,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
+    MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -462,15 +462,75 @@ pub struct EventRow {
     pub series_master_id: Option<String>,
     pub reminder_minutes: i64,
     pub is_reminder_on: bool,
+    /// Graph `showAs` (#1983); see `graph::model::Event` for each field below.
+    pub show_as: String,
+    pub is_online_meeting: bool,
+    pub online_meeting_provider: String,
+    pub join_url: String,
+    pub categories: Vec<String>,
+    pub sensitivity: String,
+    pub importance: String,
+    pub event_type: String,
+    /// A series' Graph recurrence, kept in `events.graph_recurrence` (not
+    /// the create-side `events.recurrence` `event_for_send` re-sends).
+    pub recurrence: Option<EventRecurrence>,
+    pub is_cancelled: bool,
+    pub is_organizer: bool,
+    pub response_requested: bool,
+    pub allow_new_time_proposals: bool,
+    pub has_attachments: bool,
+    pub original_start_time_zone: String,
+    pub original_end_time_zone: String,
+    pub calendar_id: String,
+}
+
+/// Every field empty, zero or `false`, except `response_requested` and
+/// `allow_new_time_proposals`: `true`, as in Graph and `graph::model::Event`.
+impl Default for EventRow {
+    fn default() -> Self {
+        EventRow {
+            id: String::new(),
+            subject: String::new(),
+            start_utc: String::new(),
+            end_utc: String::new(),
+            is_all_day: false,
+            location: String::new(),
+            organizer_name: String::new(),
+            organizer_addr: String::new(),
+            response_status: String::new(),
+            series_master_id: None,
+            reminder_minutes: 0,
+            is_reminder_on: false,
+            show_as: String::new(),
+            is_online_meeting: false,
+            online_meeting_provider: String::new(),
+            join_url: String::new(),
+            categories: Vec::new(),
+            sensitivity: String::new(),
+            importance: String::new(),
+            event_type: String::new(),
+            recurrence: None,
+            is_cancelled: false,
+            is_organizer: false,
+            response_requested: true,
+            allow_new_time_proposals: true,
+            has_attachments: false,
+            original_start_time_zone: String::new(),
+            original_end_time_zone: String::new(),
+            calendar_id: String::new(),
+        }
+    }
 }
 
 /// An `event_attendees` row, as read back from the store.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AttendeeRow {
     pub name: String,
     pub addr: String,
     pub r#type: String,
     pub response: String,
+    /// Graph `status.time`; `""` when never (#1983).
+    pub response_time: String,
 }
 
 /// The field set `upsert_event` writes to an `events` row.
@@ -506,17 +566,80 @@ pub struct NewEvent {
     pub body_html: String,
     pub reminder_minutes: i64,
     pub is_reminder_on: bool,
+    /// Graph `showAs` (#1983); see `graph::model::Event` for each field below.
+    pub show_as: String,
+    pub is_online_meeting: bool,
+    pub online_meeting_provider: String,
+    pub join_url: String,
+    pub categories: Vec<String>,
+    pub sensitivity: String,
+    pub importance: String,
+    pub event_type: String,
+    /// A series' Graph recurrence, kept in `events.graph_recurrence` (not
+    /// the create-side `events.recurrence` `event_for_send` re-sends).
+    pub recurrence: Option<EventRecurrence>,
+    pub is_cancelled: bool,
+    pub is_organizer: bool,
+    pub response_requested: bool,
+    pub allow_new_time_proposals: bool,
+    pub has_attachments: bool,
+    pub original_start_time_zone: String,
+    pub original_end_time_zone: String,
+    pub calendar_id: String,
+}
+
+/// Every field empty, zero or `false`, except `response_requested` and
+/// `allow_new_time_proposals`: `true`, as in Graph and `graph::model::Event`.
+impl Default for NewEvent {
+    fn default() -> Self {
+        NewEvent {
+            id: String::new(),
+            subject: String::new(),
+            start_utc: String::new(),
+            end_utc: String::new(),
+            is_all_day: false,
+            location: String::new(),
+            organizer_name: String::new(),
+            organizer_addr: String::new(),
+            response_status: String::new(),
+            series_master_id: None,
+            body_preview: String::new(),
+            web_link: String::new(),
+            last_modified: String::new(),
+            body_html: String::new(),
+            reminder_minutes: 0,
+            is_reminder_on: false,
+            show_as: String::new(),
+            is_online_meeting: false,
+            online_meeting_provider: String::new(),
+            join_url: String::new(),
+            categories: Vec::new(),
+            sensitivity: String::new(),
+            importance: String::new(),
+            event_type: String::new(),
+            recurrence: None,
+            is_cancelled: false,
+            is_organizer: false,
+            response_requested: true,
+            allow_new_time_proposals: true,
+            has_attachments: false,
+            original_start_time_zone: String::new(),
+            original_end_time_zone: String::new(),
+            calendar_id: String::new(),
+        }
+    }
 }
 
 /// The field set `put_event_attendees` writes for one `event_attendees` row —
 /// the same field set as `graph::model::Attendee`; see `From<&Attendee> for
 /// NewAttendee` below.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct NewAttendee {
     pub name: String,
     pub addr: String,
     pub r#type: String,
     pub response: String,
+    pub response_time: String,
 }
 
 /// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
@@ -540,6 +663,23 @@ impl From<&Event> for NewEvent {
             body_html: e.body_html.clone(),
             reminder_minutes: e.reminder_minutes,
             is_reminder_on: e.is_reminder_on,
+            show_as: e.show_as.clone(),
+            is_online_meeting: e.is_online_meeting,
+            online_meeting_provider: e.online_meeting_provider.clone(),
+            join_url: e.join_url.clone(),
+            categories: e.categories.clone(),
+            sensitivity: e.sensitivity.clone(),
+            importance: e.importance.clone(),
+            event_type: e.event_type.clone(),
+            recurrence: e.recurrence.clone(),
+            is_cancelled: e.is_cancelled,
+            is_organizer: e.is_organizer,
+            response_requested: e.response_requested,
+            allow_new_time_proposals: e.allow_new_time_proposals,
+            has_attachments: e.has_attachments,
+            original_start_time_zone: e.original_start_time_zone.clone(),
+            original_end_time_zone: e.original_end_time_zone.clone(),
+            calendar_id: e.calendar_id.clone(),
         }
     }
 }
@@ -553,6 +693,7 @@ impl From<&Attendee> for NewAttendee {
             addr: a.addr.clone(),
             r#type: a.r#type.clone(),
             response: a.response.clone(),
+            response_time: a.response_time.clone(),
         }
     }
 }
@@ -646,6 +787,35 @@ impl Store {
         );
         let _ = conn.execute(
             "ALTER TABLE events ADD COLUMN is_reminder_on INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Same idempotent-migration pattern, for what a calendar client
+        // shows (#1983). `SCHEMA_SQL` runs before these, so it must not
+        // index any of them: an old database would fail that `CREATE INDEX`
+        // before the column exists.
+        for column in [
+            "show_as TEXT NOT NULL DEFAULT ''",
+            "is_online_meeting INTEGER NOT NULL DEFAULT 0",
+            "online_meeting_provider TEXT NOT NULL DEFAULT ''",
+            "join_url TEXT NOT NULL DEFAULT ''",
+            "categories TEXT NOT NULL DEFAULT ''",
+            "sensitivity TEXT NOT NULL DEFAULT ''",
+            "importance TEXT NOT NULL DEFAULT ''",
+            "event_type TEXT NOT NULL DEFAULT ''",
+            "graph_recurrence TEXT NOT NULL DEFAULT ''",
+            "is_cancelled INTEGER NOT NULL DEFAULT 0",
+            "is_organizer INTEGER NOT NULL DEFAULT 0",
+            "response_requested INTEGER NOT NULL DEFAULT 1",
+            "allow_new_time_proposals INTEGER NOT NULL DEFAULT 1",
+            "has_attachments INTEGER NOT NULL DEFAULT 0",
+            "original_start_tz TEXT NOT NULL DEFAULT ''",
+            "original_end_tz TEXT NOT NULL DEFAULT ''",
+            "calendar_id TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
+        }
+        let _ = conn.execute(
+            "ALTER TABLE event_attendees ADD COLUMN response_time TEXT NOT NULL DEFAULT ''",
             [],
         );
         // Same idempotent-migration pattern as `is_draft`/`body_html` above:
@@ -2466,7 +2636,11 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, subject, start_utc, end_utc, is_all_day, location,
                     organizer_name, organizer_addr, response_status, series_master_id,
-                    reminder_minutes, is_reminder_on
+                    reminder_minutes, is_reminder_on, show_as, is_online_meeting,
+                    online_meeting_provider, join_url, categories, sensitivity, importance,
+                    event_type, graph_recurrence, is_cancelled, is_organizer,
+                    response_requested, allow_new_time_proposals, has_attachments,
+                    original_start_tz, original_end_tz, calendar_id
              FROM events
              WHERE start_utc < ?2 AND end_utc > ?1
              ORDER BY start_utc ASC",
@@ -2486,6 +2660,23 @@ impl Store {
                     series_master_id: row.get(9)?,
                     reminder_minutes: row.get(10)?,
                     is_reminder_on: row.get(11)?,
+                    show_as: row.get(12)?,
+                    is_online_meeting: row.get(13)?,
+                    online_meeting_provider: row.get(14)?,
+                    join_url: row.get(15)?,
+                    categories: decode_categories(&row.get::<_, String>(16)?),
+                    sensitivity: row.get(17)?,
+                    importance: row.get(18)?,
+                    event_type: row.get(19)?,
+                    recurrence: decode_graph_recurrence(&row.get::<_, String>(20)?),
+                    is_cancelled: row.get(21)?,
+                    is_organizer: row.get(22)?,
+                    response_requested: row.get(23)?,
+                    allow_new_time_proposals: row.get(24)?,
+                    has_attachments: row.get(25)?,
+                    original_start_time_zone: row.get(26)?,
+                    original_end_time_zone: row.get(27)?,
+                    calendar_id: row.get(28)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2496,7 +2687,8 @@ impl Store {
     /// `put_event_attendees` last wrote them in).
     pub fn event_attendees(&self, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, addr, type, response FROM event_attendees WHERE event_id = ?1",
+            "SELECT name, addr, type, response, response_time
+             FROM event_attendees WHERE event_id = ?1",
         )?;
         let rows = stmt
             .query_map(params![id], |row| {
@@ -2505,6 +2697,7 @@ impl Store {
                     addr: row.get(1)?,
                     r#type: row.get(2)?,
                     response: row.get(3)?,
+                    response_time: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2561,8 +2754,27 @@ impl Store {
             web_link: String::new(),
             last_modified: String::new(),
             body_html: f.body_html.clone(),
-            reminder_minutes: 0,
-            is_reminder_on: false,
+            // The fields Graph sets on create (#1983), and the join link
+            // `Event::from_json` would find in the location or body. Not
+            // everything matches the next refresh: reminders stay 0/false
+            // (#1937), and a series reads as `calendarView`'s occurrences.
+            show_as: "busy".to_string(),
+            sensitivity: "normal".to_string(),
+            importance: "normal".to_string(),
+            event_type: if f.recurrence.is_some() {
+                "seriesMaster"
+            } else {
+                "singleInstance"
+            }
+            .to_string(),
+            // The create-side recurrence is already in Graph's shape.
+            recurrence: f
+                .recurrence
+                .as_ref()
+                .and_then(|r| EventRecurrence::from_json(&r.to_json())),
+            is_organizer: true,
+            join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
+            ..NewEvent::default()
         })?;
         self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
         if let Some(rec) = &f.recurrence {
@@ -2575,10 +2787,16 @@ impl Store {
     }
 
     /// Overwrites a stored event's editable fields + attendees + body in place.
+    /// `join_url` follows the new location and body (`meeting_link_in`, as
+    /// `create_local_event` derives it), except on an online meeting, whose
+    /// join link is Graph's `onlineMeeting.joinUrl`, which no location or body
+    /// edit changes (#1983).
     pub fn update_event_fields(&self, id: &str, f: &LocalEventFields) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE events SET subject = ?2, start_utc = ?3, end_utc = ?4, is_all_day = ?5,
-                    location = ?6, body_html = ?7 WHERE id = ?1",
+                    location = ?6, body_html = ?7,
+                    join_url = CASE WHEN is_online_meeting THEN join_url ELSE ?8 END
+             WHERE id = ?1",
             params![
                 id,
                 f.subject,
@@ -2586,7 +2804,8 @@ impl Store {
                 f.end_utc,
                 f.is_all_day,
                 f.location,
-                f.body_html
+                f.body_html,
+                meeting_link_in(&f.location, &f.body_html).unwrap_or_default()
             ],
         )?;
         self.put_event_attendees(id, &to_new_attendees(&f.attendees))?;
@@ -2949,6 +3168,7 @@ fn to_new_attendees(pairs: &[(String, String)]) -> Vec<NewAttendee> {
             addr: addr.clone(),
             r#type: "required".to_string(),
             response: "none".to_string(),
+            response_time: String::new(),
         })
         .collect()
 }
@@ -2982,6 +3202,17 @@ fn decode_categories(s: &str) -> Vec<String> {
         return Vec::new();
     }
     s.split('\u{1f}').map(str::to_string).collect()
+}
+
+/// Reads `events.graph_recurrence` (`EventRecurrence::to_json` text, `''`
+/// for none). Text that does not parse reads as `None`.
+fn decode_graph_recurrence(s: &str) -> Option<EventRecurrence> {
+    if s.is_empty() {
+        return None;
+    }
+    json::parse(s)
+        .ok()
+        .and_then(|v| EventRecurrence::from_json(&v))
 }
 
 /// Encodes a list of recipients into the flat text form stored in
@@ -3075,8 +3306,15 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
              id, subject, start_utc, end_utc, is_all_day, location,
              organizer_name, organizer_addr, response_status,
              series_master_id, body_preview, web_link, last_modified,
-             body_html, reminder_minutes, is_reminder_on
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             body_html, reminder_minutes, is_reminder_on,
+             show_as, is_online_meeting, online_meeting_provider, join_url,
+             categories, sensitivity, importance, event_type, graph_recurrence,
+             is_cancelled, is_organizer, response_requested,
+             allow_new_time_proposals, has_attachments, original_start_tz,
+             original_end_tz, calendar_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                   ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                   ?31, ?32, ?33)
          ON CONFLICT(id) DO UPDATE SET
              subject = excluded.subject,
              start_utc = excluded.start_utc,
@@ -3092,7 +3330,24 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
              last_modified = excluded.last_modified,
              body_html = excluded.body_html,
              reminder_minutes = excluded.reminder_minutes,
-             is_reminder_on = excluded.is_reminder_on",
+             is_reminder_on = excluded.is_reminder_on,
+             show_as = excluded.show_as,
+             is_online_meeting = excluded.is_online_meeting,
+             online_meeting_provider = excluded.online_meeting_provider,
+             join_url = excluded.join_url,
+             categories = excluded.categories,
+             sensitivity = excluded.sensitivity,
+             importance = excluded.importance,
+             event_type = excluded.event_type,
+             graph_recurrence = excluded.graph_recurrence,
+             is_cancelled = excluded.is_cancelled,
+             is_organizer = excluded.is_organizer,
+             response_requested = excluded.response_requested,
+             allow_new_time_proposals = excluded.allow_new_time_proposals,
+             has_attachments = excluded.has_attachments,
+             original_start_tz = excluded.original_start_tz,
+             original_end_tz = excluded.original_end_tz,
+             calendar_id = excluded.calendar_id",
         params![
             e.id,
             e.subject,
@@ -3110,6 +3365,26 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
             e.body_html,
             e.reminder_minutes,
             e.is_reminder_on,
+            e.show_as,
+            e.is_online_meeting,
+            e.online_meeting_provider,
+            e.join_url,
+            encode_categories(&e.categories),
+            e.sensitivity,
+            e.importance,
+            e.event_type,
+            e.recurrence
+                .as_ref()
+                .map(|r| r.to_json().to_string())
+                .unwrap_or_default(),
+            e.is_cancelled,
+            e.is_organizer,
+            e.response_requested,
+            e.allow_new_time_proposals,
+            e.has_attachments,
+            e.original_start_time_zone,
+            e.original_end_time_zone,
+            e.calendar_id,
         ],
     )?;
     Ok(())
@@ -3130,9 +3405,16 @@ fn put_event_attendees_on(
     )?;
     for att in a {
         conn.execute(
-            "INSERT INTO event_attendees (event_id, name, addr, type, response)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, att.name, att.addr, att.r#type, att.response],
+            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                att.name,
+                att.addr,
+                att.r#type,
+                att.response,
+                att.response_time
+            ],
         )?;
     }
     Ok(())
@@ -4213,6 +4495,7 @@ mod calendar_tests {
             body_html: "".into(),
             reminder_minutes: 0,
             is_reminder_on: false,
+            ..Default::default()
         }
     }
 
@@ -4354,6 +4637,7 @@ mod calendar_tests {
                     addr: "bob@x".into(),
                     r#type: "required".into(),
                     response: "accepted".into(),
+                    ..Default::default()
                 }],
             )],
         )
@@ -4473,12 +4757,14 @@ mod calendar_tests {
                     addr: "bob@x".into(),
                     r#type: "required".into(),
                     response: "accepted".into(),
+                    ..Default::default()
                 },
                 NewAttendee {
                     name: "Carol".into(),
                     addr: "carol@x".into(),
                     r#type: "optional".into(),
                     response: "none".into(),
+                    ..Default::default()
                 },
             ],
         )
@@ -4502,6 +4788,7 @@ mod calendar_tests {
                 addr: "bob@x".into(),
                 r#type: "required".into(),
                 response: "accepted".into(),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -4625,6 +4912,389 @@ mod calendar_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A Graph series recurrence for the #1983 tests.
+    fn graph_recurrence(kind: &str, occurrences: u32) -> EventRecurrence {
+        let json = format!(
+            r#"{{"pattern":{{"type":"{kind}","interval":2,"month":0,"dayOfMonth":0,
+                "daysOfWeek":["tuesday"],"firstDayOfWeek":"sunday","index":"second"}},
+                "range":{{"type":"numbered","startDate":"2026-07-14","endDate":"0001-01-01",
+                "recurrenceTimeZone":"UTC","numberOfOccurrences":{occurrences}}}}}"#
+        );
+        EventRecurrence::from_json(&crate::json::parse(&json).unwrap()).unwrap()
+    }
+
+    /// `ev` with every #1983 field set away from its default.
+    fn client_event(id: &str, start: &str, end: &str) -> NewEvent {
+        NewEvent {
+            show_as: "oof".into(),
+            is_online_meeting: true,
+            online_meeting_provider: "teamsForBusiness".into(),
+            join_url: "https://teams.microsoft.com/l/meetup-join/1".into(),
+            categories: vec!["Red category".into(), "Plan, phase; 2".into()],
+            sensitivity: "private".into(),
+            importance: "high".into(),
+            event_type: "seriesMaster".into(),
+            recurrence: Some(graph_recurrence("relativeMonthly", 4)),
+            is_cancelled: true,
+            is_organizer: true,
+            response_requested: false,
+            allow_new_time_proposals: false,
+            has_attachments: true,
+            original_start_time_zone: "Pacific Standard Time".into(),
+            original_end_time_zone: "Eastern Standard Time".into(),
+            calendar_id: "CAL1".into(),
+            ..ev(id, start, end)
+        }
+    }
+
+    /// The #1983 fields of an `EventRow` match the `NewEvent` written.
+    fn assert_client_fields(row: &EventRow, e: &NewEvent) {
+        assert_eq!(row.show_as, e.show_as);
+        assert_eq!(row.is_online_meeting, e.is_online_meeting);
+        assert_eq!(row.online_meeting_provider, e.online_meeting_provider);
+        assert_eq!(row.join_url, e.join_url);
+        assert_eq!(row.categories, e.categories);
+        assert_eq!(row.sensitivity, e.sensitivity);
+        assert_eq!(row.importance, e.importance);
+        assert_eq!(row.event_type, e.event_type);
+        assert_eq!(row.recurrence, e.recurrence);
+        assert_eq!(row.is_cancelled, e.is_cancelled);
+        assert_eq!(row.is_organizer, e.is_organizer);
+        assert_eq!(row.response_requested, e.response_requested);
+        assert_eq!(row.allow_new_time_proposals, e.allow_new_time_proposals);
+        assert_eq!(row.has_attachments, e.has_attachments);
+        assert_eq!(row.original_start_time_zone, e.original_start_time_zone);
+        assert_eq!(row.original_end_time_zone, e.original_end_time_zone);
+        assert_eq!(row.calendar_id, e.calendar_id);
+    }
+
+    #[test]
+    fn store_defaults_agree_with_graph_on_request_flags() {
+        for (requested, proposals) in [
+            (
+                NewEvent::default().response_requested,
+                NewEvent::default().allow_new_time_proposals,
+            ),
+            (
+                EventRow::default().response_requested,
+                EventRow::default().allow_new_time_proposals,
+            ),
+        ] {
+            assert!(requested && proposals);
+        }
+        // And the schema's column default: a row written without them.
+        let s = Store::open_in_memory().unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO events (id, start_utc, end_utc) VALUES ('E', ?1, ?2)",
+                params!["2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"],
+            )
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        assert!(rows[0].response_requested);
+        assert!(rows[0].allow_new_time_proposals);
+    }
+
+    #[test]
+    fn replace_events_in_window_writes_calendar_client_fields() {
+        let s = Store::open_in_memory().unwrap();
+        let (from, to) = ("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z");
+        let mut e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        let attendee = NewAttendee {
+            name: "Room".into(),
+            addr: "room@x".into(),
+            r#type: "resource".into(),
+            response: "accepted".into(),
+            response_time: "2026-07-18T08:01:02Z".into(),
+        };
+        s.replace_events_in_window(
+            from,
+            to,
+            std::slice::from_ref(&e),
+            &[("E1".into(), vec![attendee.clone()])],
+        )
+        .unwrap();
+        let rows = s.events_in_window(from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_client_fields(&rows[0], &e);
+        let atts = s.event_attendees("E1").unwrap();
+        assert_eq!(atts[0].r#type, "resource");
+        assert_eq!(atts[0].response, "accepted");
+        assert_eq!(atts[0].response_time, "2026-07-18T08:01:02Z");
+
+        // A later refresh that changes every field overwrites them.
+        e = NewEvent {
+            show_as: "tentative".into(),
+            is_online_meeting: false,
+            online_meeting_provider: "unknown".into(),
+            join_url: "".into(),
+            categories: vec![],
+            sensitivity: "normal".into(),
+            importance: "low".into(),
+            event_type: "singleInstance".into(),
+            recurrence: None,
+            is_cancelled: false,
+            is_organizer: false,
+            response_requested: true,
+            allow_new_time_proposals: true,
+            has_attachments: false,
+            original_start_time_zone: "UTC".into(),
+            original_end_time_zone: "UTC".into(),
+            calendar_id: "".into(),
+            ..e
+        };
+        s.replace_events_in_window(
+            from,
+            to,
+            std::slice::from_ref(&e),
+            &[(
+                "E1".into(),
+                vec![NewAttendee {
+                    response_time: "".into(),
+                    ..attendee
+                }],
+            )],
+        )
+        .unwrap();
+        let rows = s.events_in_window(from, to).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_client_fields(&rows[0], &e);
+        assert_eq!(s.event_attendees("E1").unwrap()[0].response_time, "");
+    }
+
+    /// The `ON CONFLICT` path (a stored row outside the replaced window, and
+    /// a second `upsert_event`) writes every #1983 column too.
+    #[test]
+    fn upsert_event_conflict_path_updates_calendar_client_fields() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_event(&ev("E1", "2026-08-01T09:00:00Z", "2026-08-01T10:00:00Z"))
+            .unwrap();
+        let moved = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        s.replace_events_in_window(
+            "2026-07-20T00:00:00Z",
+            "2026-07-21T00:00:00Z",
+            std::slice::from_ref(&moved),
+            &[],
+        )
+        .unwrap();
+        let all = ("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z");
+        let rows = s.events_in_window(all.0, all.1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_client_fields(&rows[0], &moved);
+
+        let again = NewEvent {
+            show_as: "free".into(),
+            categories: vec!["Blue category".into()],
+            recurrence: Some(graph_recurrence("weekly", 9)),
+            response_requested: true,
+            calendar_id: "CAL2".into(),
+            ..moved
+        };
+        s.upsert_event(&again).unwrap();
+        let rows = s.events_in_window(all.0, all.1).unwrap();
+        assert_client_fields(&rows[0], &again);
+    }
+
+    #[test]
+    fn a_corrupt_graph_recurrence_reads_as_none() {
+        let s = Store::open_in_memory().unwrap();
+        let e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        s.upsert_event(&e).unwrap();
+        s.conn
+            .execute(
+                "UPDATE events SET graph_recurrence = '{\"pattern\":' WHERE id = 'E1'",
+                [],
+            )
+            .unwrap();
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows[0].recurrence, None);
+        assert_eq!(rows[0].show_as, "oof", "the rest of the row still reads");
+    }
+
+    #[test]
+    fn create_local_event_reads_as_graph_will_create_it() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let window = ("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z");
+        let single = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        let rec = Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: Some("2026-08-31".into()),
+        };
+        let series = s
+            .create_local_event(
+                &LocalEventFields {
+                    recurrence: Some(rec),
+                    body_html: "<a href=\"https://zoom.us/j/7\">Join</a>".into(),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let rows = s.events_in_window(window.0, window.1).unwrap();
+        let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap().clone();
+        for r in [row(&single), row(&series)] {
+            assert_eq!(r.show_as, "busy");
+            assert_eq!(r.sensitivity, "normal");
+            assert_eq!(r.importance, "normal");
+            assert!(r.is_organizer);
+            assert!(r.response_requested);
+            assert!(r.allow_new_time_proposals);
+            assert!(!r.is_cancelled && !r.is_online_meeting && !r.has_attachments);
+        }
+        assert_eq!(row(&single).event_type, "singleInstance");
+        assert_eq!(row(&single).recurrence, None);
+        assert_eq!(row(&single).join_url, "", "Room 1, no link in the body");
+        let series = row(&series);
+        assert_eq!(series.event_type, "seriesMaster");
+        assert_eq!(series.join_url, "https://zoom.us/j/7");
+        let r = series.recurrence.unwrap();
+        assert_eq!(r.pattern.r#type, "weekly");
+        assert_eq!(r.pattern.days_of_week, vec!["monday"]);
+        assert_eq!(r.range.r#type, "endDate");
+        assert_eq!(r.range.end_date, "2026-08-31");
+        assert_eq!(s.event_attendees(&series.id).unwrap()[0].response_time, "");
+    }
+
+    #[test]
+    fn update_event_fields_follows_the_join_link_unless_online_meeting() {
+        let s = Store::open_in_memory().unwrap();
+        let window = ("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z");
+        let join = |s: &Store, id: &str| {
+            s.events_in_window(window.0, window.1)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .join_url
+        };
+        let fields = |location: &str| LocalEventFields {
+            location: location.into(),
+            ..sample_fields()
+        };
+        let id = s
+            .create_local_event(&fields("https://zoom.us/j/1"), "Me", "me@x")
+            .unwrap();
+        assert_eq!(join(&s, &id), "https://zoom.us/j/1");
+        s.update_event_fields(&id, &fields("https://zoom.us/j/2"))
+            .unwrap();
+        assert_eq!(join(&s, &id), "https://zoom.us/j/2");
+        s.update_event_fields(&id, &fields("Room 2")).unwrap();
+        assert_eq!(join(&s, &id), "", "no link left in location or body");
+        s.update_event_fields(
+            &id,
+            &LocalEventFields {
+                body_html: "<a href=\"https://meet.google.com/abc-defg-hij\">Join</a>".into(),
+                ..fields("Room 2")
+            },
+        )
+        .unwrap();
+        assert_eq!(join(&s, &id), "https://meet.google.com/abc-defg-hij");
+
+        // A synced online meeting keeps Graph's join link through an edit
+        // that drops every link.
+        let teams = "https://teams.microsoft.com/l/meetup-join/T";
+        s.upsert_event(&NewEvent {
+            is_online_meeting: true,
+            join_url: teams.into(),
+            ..ev("G1", "2026-07-20T13:00:00Z", "2026-07-20T14:00:00Z")
+        })
+        .unwrap();
+        s.update_event_fields("G1", &fields("Room 3")).unwrap();
+        assert_eq!(join(&s, "G1"), teams);
+    }
+
+    /// A database whose `events` / `event_attendees` tables are at their
+    /// last pre-#1983 shape gains the new columns in place: its rows stay,
+    /// read the new fields as their defaults, and a second open is fine.
+    #[test]
+    fn events_without_1983_columns_migrate() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-events-1983-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (
+                     id TEXT PRIMARY KEY, subject TEXT NOT NULL DEFAULT '',
+                     start_utc TEXT NOT NULL DEFAULT '', end_utc TEXT NOT NULL DEFAULT '',
+                     is_all_day INTEGER NOT NULL DEFAULT 0, location TEXT NOT NULL DEFAULT '',
+                     organizer_name TEXT NOT NULL DEFAULT '',
+                     organizer_addr TEXT NOT NULL DEFAULT '',
+                     response_status TEXT NOT NULL DEFAULT '', series_master_id TEXT,
+                     body_preview TEXT NOT NULL DEFAULT '', web_link TEXT NOT NULL DEFAULT '',
+                     last_modified TEXT NOT NULL DEFAULT '', body_html TEXT NOT NULL DEFAULT '',
+                     recurrence TEXT NOT NULL DEFAULT '',
+                     reminder_minutes INTEGER NOT NULL DEFAULT 0,
+                     is_reminder_on INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE event_attendees (
+                     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                     name TEXT NOT NULL DEFAULT '', addr TEXT NOT NULL DEFAULT '',
+                     type TEXT NOT NULL DEFAULT '', response TEXT NOT NULL DEFAULT '');
+                 INSERT INTO events (id, subject, start_utc, end_utc, reminder_minutes,
+                                     is_reminder_on)
+                 VALUES ('E1', 'Old', '2026-07-20T09:00:00Z', '2026-07-20T10:00:00Z', 15, 1);
+                 INSERT INTO event_attendees VALUES ('E1', 'Bob', 'bob@x', 'optional',
+                                                     'accepted');",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let s = Store::open(&path).unwrap();
+            let rows = s
+                .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let r = &rows[0];
+            assert_eq!(r.subject, "Old");
+            assert_eq!(r.reminder_minutes, 15);
+            assert!(r.is_reminder_on);
+            let expected = EventRow {
+                id: r.id.clone(),
+                subject: r.subject.clone(),
+                start_utc: r.start_utc.clone(),
+                end_utc: r.end_utc.clone(),
+                reminder_minutes: 15,
+                is_reminder_on: true,
+                ..EventRow::default()
+            };
+            assert_eq!(r, &expected, "the new fields read as their defaults");
+            let atts = s.event_attendees("E1").unwrap();
+            assert_eq!(atts.len(), 1);
+            assert_eq!(atts[0].name, "Bob");
+            assert_eq!(atts[0].r#type, "optional");
+            assert_eq!(atts[0].response_time, "");
+        }
+        // The migrated table takes every new column.
+        let s = Store::open(&path).unwrap();
+        let e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
+        s.upsert_event(&e).unwrap();
+        let rows = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap();
+        assert_client_fields(&rows[0], &e);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

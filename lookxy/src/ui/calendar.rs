@@ -735,6 +735,7 @@ mod tests {
             body_html: "<p>agenda</p>".into(),
             reminder_minutes: 0,
             is_reminder_on: false,
+            ..Default::default()
         }
     }
 
@@ -768,6 +769,7 @@ mod tests {
             series_master_id: None,
             reminder_minutes: 0,
             is_reminder_on: false,
+            ..Default::default()
         }
     }
 
@@ -1025,6 +1027,7 @@ mod tests {
                     addr: "alice@example.com".into(),
                     r#type: "required".into(),
                     response: "accepted".into(),
+                    ..Default::default()
                 }],
             )
             .unwrap();

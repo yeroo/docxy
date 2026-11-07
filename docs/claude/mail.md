@@ -613,3 +613,80 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: creating or updating an event sends no reminder fields to Graph
   (`event_body_json`), and a `local:` event is stored with 0/false until the
   next refresh.
+
+## Calendar events carry what a client shows (#1983)
+
+- `graph::model::Event::from_json` reads `showAs`, `isOnlineMeeting`,
+  `onlineMeetingProvider`, a `join_url`, `categories`, `sensitivity`,
+  `importance`, `type` (`event_type`), a series' `recurrence`
+  (`EventRecurrence`), `isCancelled`, `isOrganizer`, `hasAttachments`,
+  `responseRequested`, `allowNewTimeProposals`, `originalStartTimeZone` /
+  `originalEndTimeZone`, `calendar.id` (`calendar_id`), and each attendee's
+  `status.time` (`response_time`). Enums stay Graph's raw strings.
+- `join_url` is the first of `onlineMeeting.joinUrl`, `onlineMeetingUrl`, a
+  meeting link in `location.displayName`, then one in `body.content`
+  (`meeting_link_in`, the one helper the store uses too): the location goes
+  first because it is a field someone set, while a body can quote an old
+  invite. A link starts at `https://` (any case) and ends at a quote, `<`,
+  `>`, whitespace or an HTML entity other than `&amp;` (`is_entity_end`: `&#`
+  then anything, or `&`, a letter, up to 31 letters or digits and `;`).
+  lookxy's `escape_html` writes `&lt;`, `&gt;` and `&quot;`; other HTML
+  bodies also use `&nbsp;` and numeric entities (`&#160;`, `&#34;`). A raw
+  `&` not shaped like an entity (`?pwd=x&y=1` in a plain-text location)
+  stays in the link. `&amp;` is decoded and trailing `.,;:)]!` trimmed. After a rejected link the scan resumes at
+  that link's end, so a meeting link nested in it is not taken and each byte
+  is scanned once: a body is sender-controlled, and resuming just past the
+  `https://` made a long run of them quadratic. Only the host a browser would open decides
+  (`is_meeting_url`): the authority ends at `/`, `?`, `#` or `\` (a browser
+  reads `\` as `/`), userinfo (`@`) is refused, a `:port` must be digits, and
+  the host may hold only ASCII letters, digits, `-` and `.`. Hosts:
+  `teams.microsoft.com` (`/l/meetup-join/`, `/meet/`), `teams.live.com`
+  (`/meet/`), `zoom.us` / `zoomgov.com` and their subdomains (`/j/`, `/w/`,
+  `/my/`), `meet.google.com`, `meet.goto.com`, `chime.aws`, and `webex.com`
+  and its subdomains (any non-empty path), `global.gotomeeting.com`
+  (`/join/`). Rejected: a meeting host in another link's query or path,
+  lookalikes (`notzoom.us`), userinfo after a port
+  (`teams.microsoft.com:443@evil.example`) and a backslash
+  (`evil.example\.zoom.us`).
+- `responseRequested` and `allowNewTimeProposals` are `true` when absent, as in
+  Graph, and every default agrees: the hand-written `Default` of `Event`,
+  `NewEvent` and `EventRow`, and the columns' `DEFAULT 1`. Graph's "no date"
+  (`0001-01-01...`, a `noEnd` range's `endDate`, a never-responded attendee's
+  `status.time`) reads as `""` (`graph_date_or_empty`).
+- Two recurrence columns: `events.recurrence` is the create-side `Recurrence`
+  that `event_for_send` re-sends on every create **and update**;
+  `events.graph_recurrence` is Graph's `EventRecurrence` (read side), written
+  by `upsert_event_on`. Never write Graph's recurrence into `recurrence`: the
+  lossy create-side type (three kinds, `numbered` becomes `noEnd`,
+  `firstDayOfWeek` forced to `sunday`) would rewrite a synced series on the
+  first edit.
+- Every new column is in `upsert_event_on` (insert and `ON CONFLICT`), as
+  #1937 asks. `Store::init` adds them to an old database with `ALTER TABLE`
+  after `SCHEMA_SQL` runs, so `SCHEMA_SQL` must not index any of them (an old
+  database would fail the `CREATE INDEX` before the column exists).
+- `create_local_event` stores the fields Graph sets on create: `busy`,
+  `normal` sensitivity and importance, organizer, both request flags on,
+  `singleInstance`, or `seriesMaster` with its recurrence in
+  `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
+  location or body. `update_event_fields` derives `join_url` again from the
+  edited location and body, except on an online meeting (`is_online_meeting`),
+  whose link is Graph's `onlineMeeting.joinUrl` and is kept. Not all of it
+  matches the next refresh: reminders stay 0/false (#1937), and a series then
+  reads as `calendarView`'s occurrences.
+- Tests: `model.rs` `event_reads_calendar_client_fields`,
+  `event_defaults_when_fields_absent`, `event_join_url_*`,
+  `event_recurrence_reads_every_pattern_and_range`,
+  `attendee_response_time_and_never`; `store` `calendar_tests`
+  (`replace_events_in_window_writes_calendar_client_fields`,
+  `upsert_event_conflict_path_updates_calendar_client_fields`,
+  `create_local_event_reads_as_graph_will_create_it`,
+  `update_event_fields_follows_the_join_link_unless_online_meeting`,
+  `events_without_1983_columns_migrate`); `engine.rs`
+  `refresh_calendar_stores_calendar_client_fields`.
+- Not done: the write side (`EventInput` fields, PATCH only what changed) is
+  #1994. `calendarView` returns occurrences, never series masters, and nothing
+  fetches a synced master yet (a `/me/events/{seriesMasterId}` read would), so
+  `EventRow::recurrence` is `Some` in production only for a local series.
+  `calendar_id` is `""` (the default calendar) until #1984 syncs every
+  calendar. Safe Links-wrapped links
+  (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
