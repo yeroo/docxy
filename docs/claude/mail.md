@@ -814,8 +814,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `/me/people` (anyone the user corresponded with) and mined senders and
   recipients for autocomplete: a trust decision on those would trust anyone
   who ever mailed the user. The match is exact (`=`, never `LIKE`), ignoring
-  case and surrounding whitespace (`folder_contact_key`: Rust's
-  `to_lowercase`, as `upsert_contact`). A blank address is `false`.
+  ASCII case and surrounding whitespace (`folder_contact_key`:
+  `to_ascii_lowercase`, both when stored and when asked). Not Unicode
+  `to_lowercase`, which `contacts` keeps for autocomplete: it folds U+212A
+  KELVIN SIGN onto `k`, so `\u{212A}ate@x.com` would match `kate@x.com`, a
+  false positive on trust. The cost is on the safe side: a stored
+  `Ärger@x.com` does not match `ärger@x.com`. A blank address is `false`.
 - A table of its own, not a `source` value in `contacts`: there any two
   sources merge into `both`, which loses which ones, and removing a contact
   would have to strip one source off a merged row. `upsert_contact`,
@@ -850,7 +854,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Tests: `client.rs` `contacts_follows_next_links_and_keeps_every_address`,
   `contacts_propagates_a_403`, `contacts_later_page_error_is_an_error`,
   `contacts_page_without_value_is_an_error`; `store`
-  `is_contact_matches_only_folder_contacts`,
+  `is_contact_matches_only_folder_contacts`, `is_contact_folds_ascii_case_only`,
   `replace_folder_contacts_drops_absent_and_blank`,
   `is_contact_on_a_database_from_before_the_table`; `engine.rs`
   `full_pass_syncs_the_contacts_folder_apart_from_people_and_mined`,

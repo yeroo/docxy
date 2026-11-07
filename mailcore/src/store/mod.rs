@@ -3308,7 +3308,8 @@ impl Store {
     /// Replaces the whole stored Contacts-folder set (#1934) in one
     /// transaction with `contacts`, what `GraphClient::contacts` fetched:
     /// a contact no longer in the folder stops counting for `is_contact`.
-    /// Each address is trimmed and lowercased (`folder_contact_key`); blank
+    /// Each address is trimmed and its ASCII letters lowercased
+    /// (`folder_contact_key`); blank
     /// ones and ones without an `@` are dropped (a contact saved from the
     /// directory can carry an Exchange X500 address, `/o=ExchangeLabs/...`,
     /// which no sender address ever equals); duplicates collapse, the first
@@ -3336,7 +3337,8 @@ impl Store {
 
     /// Whether `address` is in the user's own Contacts folder, as the last
     /// successful fetch stored it (`replace_folder_contacts`): an exact
-    /// match ignoring case and surrounding whitespace, never a substring.
+    /// match ignoring ASCII case and surrounding whitespace, never a
+    /// substring (`folder_contact_key`).
     /// `/me/people` and mined correspondents (`contacts`) never count. A
     /// blank address is `false`.
     ///
@@ -3360,10 +3362,14 @@ impl Store {
 }
 
 /// The key `folder_contacts` stores an address under, and `is_contact`
-/// looks one up by: trimmed, lowercased with Rust's `to_lowercase`, as
-/// `upsert_contact` lowercases `contacts` addresses.
+/// looks one up by: trimmed, ASCII letters lowercased, nothing else folded.
+/// Not Unicode `to_lowercase` (which `contacts` keeps for autocomplete): it
+/// maps characters such as U+212A KELVIN SIGN onto ASCII `k`, so a sender
+/// spelled `\u{212A}ate@x.com` would match a stored `kate@x.com`, a false
+/// positive on a trust decision. The cost errs on the safe side: a stored
+/// `Ärger@x.com` does not match a sender spelled `ärger@x.com`.
 fn folder_contact_key(address: &str) -> String {
-    address.trim().to_lowercase()
+    address.trim().to_ascii_lowercase()
 }
 
 /// `Store::drafts_folder_id` on `conn`, which `create_local_draft` passes
@@ -4955,6 +4961,20 @@ mod tests {
         // Mining again does not write Contacts either.
         s.refresh_local_contacts().unwrap();
         assert!(!s.is_contact("carol@x.com").unwrap());
+    }
+
+    #[test]
+    fn is_contact_folds_ascii_case_only() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_folder_contacts(&[fc("Kate", "kate@x.com"), fc("Ä", "Ärger@x.com")])
+            .unwrap();
+        // U+212A KELVIN SIGN lowercases to ASCII `k` in Unicode: no match.
+        assert!(!s.is_contact("\u{212A}ate@x.com").unwrap());
+        assert!(s.is_contact("KATE@X.COM").unwrap());
+        // Non-ASCII letters are compared as they are; the ASCII ones re-cased.
+        assert!(s.is_contact("Ärger@x.com").unwrap());
+        assert!(s.is_contact("ÄRGER@X.com").unwrap());
+        assert!(!s.is_contact("ärger@x.com").unwrap());
     }
 
     #[test]

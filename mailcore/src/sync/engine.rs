@@ -4601,7 +4601,7 @@ mod tests {
 
     // `contacts_routes` plus `/me/contacts` and `/me/outlook/masterCategories`
     // (#1934). `contacts` are the answers to `/me/contacts`, in order: each
-    // `(status, body, limit)`, the later ones answering after the earlier
+    // `(prefix, status, body, limit)`, the later ones answering after the earlier
     // ones used up their limit. A page-2 `$skip` route goes in `contacts`
     // first, as the fake server answers the first matching prefix.
     fn folder_contacts_routes(
@@ -4630,28 +4630,6 @@ mod tests {
 
     const CAROL_PERSON: &str = r#"{"value":[{"displayName":"Carol","scoredEmailAddresses":[{"address":"carol@x.com","relevanceScore":5.0}]}]}"#;
 
-    fn spawn_contacts_engine(
-        srv: &FakeServer,
-        tag: &str,
-        seed: impl FnOnce(&Store),
-    ) -> (SyncHandle, PathBuf, PathBuf) {
-        let dir = unique_dir(tag);
-        let store_path = dir.join("mail.db");
-        let token_path = dir.join("token.bin");
-        seed_token(&token_path);
-        seed(&Store::open(&store_path).unwrap());
-        let handle = spawn_with_bases(
-            store_path.clone(),
-            token_path,
-            test_cfg(),
-            3650,
-            srv.base_url.clone(),
-            srv.base_url.clone(),
-            HOUR,
-        );
-        (handle, store_path, dir)
-    }
-
     #[test]
     fn full_pass_syncs_the_contacts_folder_apart_from_people_and_mined() {
         let srv = FakeServer::start_limited(folder_contacts_routes(
@@ -4671,7 +4649,7 @@ mod tests {
                 ),
             ],
         ));
-        let (handle, store_path, dir) = spawn_contacts_engine(&srv, "folder-contacts-ok", |_| {});
+        let (handle, store_path, dir) = spawn_fast(&srv, "folder-contacts-ok", HOUR, None, |_| {});
         let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
         assert!(
             !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
@@ -4704,7 +4682,7 @@ mod tests {
                 None,
             )],
         ));
-        let (handle, store_path, dir) = spawn_contacts_engine(&srv, "folder-contacts-403", |s| {
+        let (handle, store_path, dir) = spawn_fast(&srv, "folder-contacts-403", HOUR, None, |s| {
             s.replace_folder_contacts(&[FolderContact {
                 name: "Dave".into(),
                 address: "dave@x.com".into(),
@@ -4755,7 +4733,7 @@ mod tests {
             ],
         ));
         let (handle, store_path, dir) =
-            spawn_contacts_engine(&srv, "folder-contacts-removed", |_| {});
+            spawn_fast(&srv, "folder-contacts-removed", HOUR, None, |_| {});
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
         let store = Store::open(&store_path).unwrap();
         assert!(store.is_contact("dave@x.com").unwrap());
