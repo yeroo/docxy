@@ -264,7 +264,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   Graph failures go through `with_auth` and `react`.
 - `SyncCommand::SignOut` deletes the token file (`tokencache::clear`, which
   also removes the `.tmp` sibling `save` writes, through the shared
-  `tmp_path`), clears the throttle/offline back-off (not the outbox's
+  `tmp_path`, and since #1877 the secret store's item), clears the throttle/offline back-off (not the outbox's
   `op_retry`), and goes through `enter_signin`: it always emits
   `SignInRequired`, but `State(SignInRequired)` only when the state changes
   (`set_state`), so a repeated SignOut emits just `SignInRequired`, and
@@ -1217,3 +1217,69 @@ dismiss and snooze on the server (#2025).
   `cancel_event_404_brings_back_an_event_graph_still_has`,
   `cancel_event_404_after_a_lost_202_leaves_the_event_gone`, `forward_event_posts_forward`,
   `forward_event_refuses_local_id_and_no_recipients`.
+
+## OAuth tokens in the platform secret store (#1877)
+
+- `tokencache` keeps the `TokenSet` in the platform's secret store when one is reachable: the
+  Secret Service (`org.freedesktop.secrets` over the D-Bus session bus, through `zbus`'s pure-Rust
+  blocking client, a Linux-only dependency) on Linux, a generic password item in the default
+  Keychain (`security-framework`, already in the macOS tree) on macOS. Windows has no store: its
+  DPAPI file is unchanged. The file at `path` then holds only a reference,
+  `{"secret_store":"secret-service","key":"<abs path>","account":"me@x"}`, written like any cache
+  file (atomic, created 0600). `load` tells it apart by the `secret_store` key and reads the item
+  under the file's `key`; a reference without `key` is `InvalidData`.
+- The key is the cache file's absolute path (`std::path::absolute`), not the account: one file has
+  one item, and signing in as someone else replaces it. Linux attributes: `xdg:schema =
+  mailcore.TokenCache`, `application = mailcore`, `cache = <key>`, label `Mail sign-in for
+  <account>`, created in the `default` collection with `replace`, then any match outside that
+  collection deleted. macOS: service `mailcore`, account `<key>`, no label.
+- The core is store-generic (`save_in` / `load_in` / `clear_in` over a `SecretStore`), which the
+  tests drive with a fake; `save` / `load` / `clear` keep their signatures and pass
+  `platform_store()`, and `save_reporting` / `load_reporting` also say where the token went
+  (`Storage::SecretStore`, `EncryptedFile`, `PlainFile`). `platform_store()` is `None` on Windows,
+  under `cfg(test)` and with `MAILCORE_TOKEN_STORE=file`. `cfg(test)` only covers mailcore's own
+  unit tests: a host's tests that write a token through mailcore set `MAILCORE_TOKEN_STORE=file`,
+  as CI's `test` and `coverage` jobs do (a macOS Keychain prompt would hang a leg).
+- `StoreError` is `Unavailable` (no bus, no Secret Service, no default collection, no keychain:
+  cheap, not remembered), `Refused` (the unlock prompt dismissed or unanswered within
+  `secret_service::PROMPT_TIMEOUT`, 60 s, after which it is dismissed) or `Failed`. The platform
+  store is one process-wide `Latched` store: after the first `Refused`, every call is `Unavailable`
+  without asking, so an hourly refresh does not raise the prompt again.
+- Save: a store that takes the JSON gets a reference written; any store error falls back to the
+  token file (0600 plaintext off Windows), never a save error. A reference that cannot be written
+  after the store took the token is the write's error, and the old file stays.
+- Load: no file is `Ok(None)` with no store call. A reference whose item is gone is `Ok(None)`; no
+  store or an unavailable/refused one is `io::ErrorKind::NotConnected`, `secret store unavailable:
+  <reason>`, and the reference stays (a locked keyring may open next time); a store failure is its
+  own error. A token file is migrated when a store takes it: stored, then replaced by the
+  reference (atomic rename; the old blocks are not zero-filled), the `.tmp` removed. If the store
+  does not take it, or the reference cannot be written, the file stays and reports `PlainFile`.
+- Clear (sign-out): removes the file and the `.tmp`, then with a store deletes the item under the
+  computed key and under the reference's key when it differs, whatever the file held: a fallback
+  token file may sit over a reference whose item is still stored. The first error is returned
+  after everything was tried. The engine's sign-out message says the store kept its item when the
+  file is gone, and the old message when the file is still there.
+- `tokencache::account(path)` reads the account from the file (reference or token file) with no
+  store call. lookxy's `reload_account` uses it: it runs on the UI thread after every sync pass,
+  where a keyring prompt must not block.
+- `SyncEvent::TokenStoredUnencrypted`: sent at most once per engine run (`warned_unencrypted`,
+  kept over sign-out), the first time the startup load, a refresh's save or the sign-in's save
+  ends in `PlainFile`; never on Windows. At startup it comes right after the load, before the
+  near-expiry refresh. lookxy ignores it. A startup load that fails with `NotConnected` emits
+  `Error("secret store unavailable: …")` before `SignInRequired`; any other load error stays silent.
+- macOS ties a Keychain item's access to the code identity that created it: an unsigned rebuild
+  asks once whether it may read the item. That prompt blocks the engine thread, not the UI.
+- `zbus` 5 pulls `uuid`, whose 1.27+ needs rustc 1.89: `Cargo.lock` pins `uuid` 1.26.1 for MSRV
+  1.88. A `cargo update` that lifts it breaks the `msrv` job.
+- Tests: the fake-store tests in `tokencache::tests` (save, load, migrate, clear whatever the file
+  holds, fallback per error, a gone item, an unreachable store, a reference without key, re-save
+  under another account, `account()`, the latch, a reference that cannot be written: skipped where
+  a read-only directory is still writable, as root); engine tests
+  `a_plaintext_token_warns_once_per_run`, `a_sign_in_saved_to_the_file_warns`,
+  `a_reference_without_its_store_says_why_sign_in_is_needed`. The real store:
+  `tokencache::secret_service::tests::real_roundtrip`, which runs only with
+  `MAILCORE_SECRET_SERVICE_TEST=1`, in CI's `test (ubuntu-latest)` step "Token cache in a real
+  Secret Service": `gnome-keyring dbus-daemon`, then under `dbus-run-session` with a throwaway
+  `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` (the latter also keeps `--unlock` off a desktop's running
+  daemon), `echo -n ci-pass | gnome-keyring-daemon --unlock --components=secrets`. The Keychain
+  backend has no test; the macOS leg builds and lints it.
