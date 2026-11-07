@@ -632,11 +632,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   since #1984, in one transaction) all write an
   `events` row through one private `upsert_event_on(conn, e)`, so every
   column `NewEvent` carries, `reminder_minutes` and `is_reminder_on`
-  included, is written by both. Before #1937 the window writer had its own
+  included, is written by all three. Before #1937 the window writer had its own
   copy of the SQL without the two reminder columns, and every synced event
   read back as 0 minutes, reminder off. A new `events` column goes into
   `upsert_event_on` once. Attendees go the same way: `put_event_attendees`
-  (in its own transaction) and `replace_events_in_window` (in its) both run
+  (in its own transaction), `replace_events_in_window` and
+  `apply_calendar_sync` (in theirs) all run
   `put_event_attendees_on(conn, id, a)`.
 - Tests: `store` `calendar_tests::replace_events_in_window_writes_reminder_fields`
   (insert, and a later refresh that changes them),
@@ -839,7 +840,8 @@ range on demand (`FetchCalendarRange`) #2014.
   default calendar and never deleted rows that slid out of the window, so a
   `''` row is the default calendar's history, which a date navigator shows.
   A failed list changes nothing. A 401, throttle or transport error on any
-  view writes nothing for the pass; a 404/HTTP/parse error on one calendar
+  view writes no events for the pass (the calendar list, stored and
+  announced before the views, stays); a 404/HTTP/parse error on one calendar
   emits `Error` and keeps that calendar's rows.
 - `SetCalendars` (`Store::set_calendar_selection`) deletes at once only the
   events of **stored** calendars that no longer sync. Unknown ids and `''`

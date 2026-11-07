@@ -2835,7 +2835,9 @@ impl Store {
         let off = i64::from(utc_offset_minutes) * 60;
         // Timed events: the local month's span in UTC; all-day ones: the
         // unshifted dates. One query over both, then classify each event.
-        let from = (first * 86400).min(first * 86400 - off);
+        // The lower bound is a second early: the query keeps `end > from`,
+        // which would drop a zero-length event at midnight on the 1st.
+        let from = (first * 86400).min(first * 86400 - off) - 1;
         let to = (last * 86400).max(last * 86400 - off);
         let events = self.events_in_range(
             &unix_secs_to_iso8601(from),
@@ -3852,8 +3854,9 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     (days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)) as u32
 }
 
-/// A Unix timestamp as the store's `YYYY-MM-DDTHH:MM:SSZ`.
-fn unix_secs_to_iso8601(secs: i64) -> String {
+/// A Unix timestamp as the store's `YYYY-MM-DDTHH:MM:SSZ` (the engine's
+/// `unix_to_iso8601` too).
+pub(crate) fn unix_secs_to_iso8601(secs: i64) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86400));
     let rem = secs.rem_euclid(86400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -4181,9 +4184,10 @@ fn sanitize_fts_query(query: &str) -> String {
 }
 
 /// The one `INSERT ... ON CONFLICT(id) DO UPDATE` that writes an `events`
-/// row from a `NewEvent`, shared by `Store::upsert_event` and
-/// `Store::replace_events_in_window` (on its transaction, which derefs to a
-/// `Connection`) so every column `NewEvent` carries is written by both:
+/// row from a `NewEvent`, shared by `Store::upsert_event`,
+/// `Store::replace_events_in_window` and `Store::apply_calendar_sync` (on
+/// their transactions, which deref to a `Connection`) so every column
+/// `NewEvent` carries is written by all three:
 /// the calendar sync once wrote its own copy without `reminder_minutes`/
 /// `is_reminder_on` and lost every synced event's reminder (#1937).
 fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
@@ -7221,6 +7225,39 @@ mod calendar_tests {
             s.days_with_events(2026, 11, -60, &a).unwrap(),
             [1, 10, 15, 16, 19, 25, 28, 30]
         );
+        // The query span follows the offset at both month edges, in a
+        // calendar of their own: Oct 31 23:30Z is Nov 1 at +60, Dec 1
+        // 00:30Z is Nov 30 at -60, and neither is November at 0.
+        for e in [
+            in_cal(
+                "oct-edge",
+                "E",
+                "2026-10-31T23:30:00Z",
+                "2026-10-31T23:45:00Z",
+            ),
+            in_cal(
+                "dec-edge",
+                "E",
+                "2026-12-01T00:30:00Z",
+                "2026-12-01T00:45:00Z",
+            ),
+            // Zero length at midnight on the 1st marks the 1st.
+            in_cal(
+                "zero-first",
+                "Z",
+                "2026-11-01T00:00:00Z",
+                "2026-11-01T00:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        let edge = ["E".to_string()];
+        assert_eq!(s.days_with_events(2026, 11, 60, &edge).unwrap(), [1]);
+        assert_eq!(s.days_with_events(2026, 11, -60, &edge).unwrap(), [30]);
+        assert!(s.days_with_events(2026, 11, 0, &edge).unwrap().is_empty());
+        let zero = ["Z".to_string()];
+        assert_eq!(s.days_with_events(2026, 11, 0, &zero).unwrap(), [1]);
+        assert_eq!(s.days_with_events(2026, 11, 60, &zero).unwrap(), [1]);
         // October holds "multi"'s first two days.
         assert_eq!(s.days_with_events(2026, 10, 0, &a).unwrap(), [30, 31]);
         assert!(s.days_with_events(2026, 11, 0, &[]).unwrap().is_empty());

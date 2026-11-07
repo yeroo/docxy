@@ -3094,8 +3094,9 @@ impl Engine {
     ///
     /// Same signed-in guard as `fetch_body` et al. A failed list ends the
     /// pass with nothing changed. A 401, throttle or transport error on any
-    /// calendar's view goes through `react` and ends the pass with nothing
-    /// written, never a partial window; a 404, other HTTP error or parse
+    /// calendar's view goes through `react` and ends the pass with no event
+    /// written, never a partial window (the calendar list, already stored
+    /// and announced, stays); a 404, other HTTP error or parse
     /// failure on one calendar is surfaced (`SyncEvent::Error`) and that
     /// calendar keeps its stored events while the others are written. Also
     /// called by `drain_outbox` right after a `RespondEvent` op
@@ -3787,14 +3788,10 @@ fn now_unix() -> u64 {
 }
 
 /// Formats a Unix timestamp as an ISO-8601 UTC string
-/// (`YYYY-MM-DDTHH:MM:SSZ`) — no dependency, used only for the backfill cutoff
-/// comparison.
+/// (`YYYY-MM-DDTHH:MM:SSZ`): the store's `unix_secs_to_iso8601`, for the
+/// engine's unsigned clock.
 fn unix_to_iso8601(secs: u64) -> String {
-    let days = (secs / 86400) as i64;
-    let rem = secs % 86400;
-    let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, m, d) = crate::store::civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
+    crate::store::unix_secs_to_iso8601(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
 /// `RefreshCalendar`'s window, per calendar: this many days into the past...
