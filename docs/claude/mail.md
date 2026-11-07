@@ -1232,9 +1232,12 @@ dismiss and snooze on the server (#2025).
   one item, and signing in as someone else replaces it. Linux attributes: `xdg:schema =
   mailcore.TokenCache`, `application = mailcore`, `cache = <key>`, label `Mail sign-in for
   <account>`, created in the `default` collection with `replace`, then any match outside that
-  collection deleted (best effort: a failure there does not fail the save). Locked items are
-  unlocked before they are read or deleted: gnome-keyring refuses `Item.Delete` on a locked item
-  (`IsLocked`). macOS: service `mailcore`, account `<key>`, no label.
+  collection deleted: only unlocked ones and never through a prompt (best effort: a failure
+  there does not fail the save, and a locked twin does not raise a prompt on every save;
+  sign-out removes it). Locked items are unlocked before they are read or deleted:
+  gnome-keyring refuses `Item.Delete` on a locked item (`IsLocked`). `delete` removes the
+  unlocked matches first, then unlocks and removes the locked ones, trying everything and
+  returning the first error, so a locked twin's refused prompt cannot keep the live token. macOS: service `mailcore`, account `<key>`, no label.
 - The core is store-generic (`save_in` / `load_in` / `clear_in` over a `SecretStore`), which the
   tests drive with a fake; `save` / `load` / `clear` keep their signatures and pass
   `platform_store()`, and `save_reporting` / `load_reporting` also say where the token went
@@ -1258,7 +1261,9 @@ dismiss and snooze on the server (#2025).
   token file (0600 plaintext off Windows), never a save error. A reference that cannot be written
   after the store took the token is the write's error, and the old file stays. A reference that
   named another key (a moved directory, another path to the cache) has that item deleted after
-  the new reference is written, errors ignored.
+  the new reference is written, errors ignored, unless the file at that key still refers to it:
+  a copied cache directory's original still uses its item. Checked after the write, so the same
+  file reached under another name now names the new key and the old item goes.
 - Load: no file is `Ok(None)` with no store call. A reference whose item is gone is `Ok(None)`; no
   store or an unavailable/refused one is `io::ErrorKind::NotConnected`, `secret store unavailable:
   <reason>`, and the reference stays (a locked keyring may open next time); a store failure is its
@@ -1288,6 +1293,7 @@ dismiss and snooze on the server (#2025).
 - Tests: the fake-store tests in `tokencache::tests` (save, load, migrate, clear whatever the file
   holds, an unreachable store on clear, fallback per error, a gone item, an unreachable store, a
   reference without key, re-save under another account, a save over a reference to another key,
+  a copied cache and a cache under another name,
   `account()`, the latch, sign-out past the latch, a reference that cannot be written: skipped
   where a read-only directory is still writable, as root); `secret_service::tests::
   errors_are_classified`; engine tests `a_plaintext_token_warns_once_per_run`,
