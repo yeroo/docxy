@@ -821,7 +821,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 ## Every calendar and calendar queries (#1984)
 
 Items 3 and 4 of #1984; the wider window with `calendarView` delta is #2013, a
-range on demand (`FetchCalendarRange`) #2014.
+range on demand (`FetchCalendarRange`) #2014 (the next section).
 
 - `GraphClient::list_calendars` (`/me/calendars?$select=id,name,color,hexColor,
   isDefaultCalendar,canEdit,owner&$top=100`, paged, all or `Err`) and
@@ -898,6 +898,72 @@ range on demand (`FetchCalendarRange`) #2014.
   `refresh_calendar_keeps_a_calendars_events_when_its_view_fails`,
   `refresh_calendar_writes_nothing_when_a_view_is_throttled`,
   `refresh_calendar_adopts_pre_1984_rows_into_the_default_calendar`.
+
+## Calendar ranges on demand (#2014)
+
+Item 1 of #1984: a host whose calendar shows dates outside the kept window
+(`calendar_window`, 7 days back and 30 forward) asks for them.
+
+- `SyncCommand::FetchCalendarRange { from_utc, to_utc }` (the store's
+  `YYYY-MM-DDTHH:MM:SSZ`; anything else, or `from >= to`, is an `Error`
+  with no request). For each synced calendar (`synced_calendar_ids`), only
+  the parts the store does not hold fresh (`Store::calendar_range_gaps`) go
+  to `calendar_view_in`, **one request per gap** (a range around the
+  window has two, neither re-downloading it), and each gap is written as it
+  lands (`Store::apply_calendar_range`: the pass's step 1 adoption, then
+  that calendar's synced rows overlapping the gap replaced, then the gap
+  recorded). Then `CalendarUpdated` when anything was written, and
+  `SyncEvent::CalendarRangeFetched { from, to }` (the command's bounds). A
+  range wholly fresh is served from the store: no request, only
+  `CalendarRangeFetched`. With no stored calendar list it lists first.
+- Failures: signed out (with a gap to fetch) is an `Error`; inside a
+  throttle or back-off wait the command does nothing more, and a 401,
+  throttle or transport error mid-range ends it (what landed stays,
+  recorded): in both no `CalendarRangeFetched`, the host asks again. A
+  404/HTTP/parse error on one calendar is an `Error`, the calendar keeps
+  its rows and records nothing, and the others carry on.
+- Coverage is the `calendar_ranges` table (`calendar_id`, `from_utc`,
+  `to_utc`, `fetched_at` in unix seconds), kept on disk, so a restart does
+  not re-fetch. Per calendar the intervals are disjoint: recording one cuts
+  the older ones it overlaps back to their outside pieces, which keep
+  their own `fetched_at`. A row is fresh while `fetched_at > fresh_since`
+  (`RangeStamp`, now minus `EngineOptions::calendar_range_fresh_for`,
+  default `CALENDAR_RANGE_FRESH_FOR`, an hour). Strict, so a zero
+  freshness re-fetches within the same second.
+- Every calendar pass records its window (`apply_calendar_sync` takes a
+  `RangeStamp`), so a range inside the window costs nothing. The window
+  slides each pass and would leave one sliver row per pass: recording
+  first deletes the calendar's rows at or before the cutoff, which can
+  never count again.
+- Forgetting: `delete_calendar_events_on` (deselecting, `SetCalendars`)
+  deletes the calendar's ranges with its events, and the pass's step 3
+  deletes the ranges of every calendar not synced, events or not (an empty
+  calendar Graph stops listing). Selected again, its ranges are fetched
+  again.
+- Not done: a range dropped in a back-off or offline is not retried (the
+  host sends it again; `events_in_range` serves what is stored meanwhile).
+  No cap on a range's length, no checkpoint between a range's pages.
+  lookxy never sends the command.
+- Tests: `store` `calendar_tests`
+  `calendar_range_gaps_finds_the_parts_not_fetched_fresh`,
+  `calendar_range_gaps_freshness_is_strict`,
+  `recording_a_range_splits_older_intervals`,
+  `recording_prunes_rows_that_can_no_longer_be_fresh`,
+  `apply_calendar_sync_records_the_window_of_each_fetched_calendar`,
+  `apply_calendar_range_replaces_only_that_calendar_in_the_range`,
+  `deselecting_a_calendar_forgets_its_ranges`,
+  `apply_calendar_sync_forgets_ranges_of_a_dropped_empty_calendar`;
+  `engine.rs`
+  `fetch_calendar_range_outside_the_window_is_fetched_once_then_served_from_the_store`,
+  `fetch_calendar_range_inside_the_refreshed_window_makes_no_request`,
+  `fetch_calendar_range_fetches_only_the_part_outside_the_window`,
+  `fetch_calendar_range_around_the_window_makes_one_request_per_gap`,
+  `fetch_calendar_range_refetches_a_stale_range`,
+  `fetch_calendar_range_rejects_bad_bounds`,
+  `fetch_calendar_range_throttled_emits_no_range_fetched`,
+  `fetch_calendar_range_keeps_going_past_a_failed_calendar`. The engine
+  tests count `/me/calendars` requests only (`calendar_requests`): the
+  mail sync makes its own requests in the meantime.
 
 ## Contacts folder and is_contact (#1934)
 

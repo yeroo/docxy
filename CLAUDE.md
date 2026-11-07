@@ -111,6 +111,7 @@ issue number to find its notes.
   calendar sync keeps events' reminder settings (#1937), event fields a calendar client
   shows (#1983), creating and updating them, an update PATCHes only what changed (#1994),
   every calendar, `SetCalendars`, events in a range and days with events (#1984),
+  a calendar range on demand, fetched once while fresh (#2014),
   the Contacts folder and `is_contact` (#1934).
 
 ## Build and test
