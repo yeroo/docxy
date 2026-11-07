@@ -58,15 +58,18 @@ jobs:
       # The token cache against a real Secret Service (#1877): a throwaway
       # gnome-keyring on a private session bus, its login keyring created
       # and unlocked with a fixed password. Its own XDG dirs keep it off any
-      # other keyring. The test talks to the Secret Service directly, so the
-      # job's MAILCORE_TOKEN_STORE does not turn it off.
+      # other keyring, and no display keeps its unlock prompt off any screen
+      # (the test locks the keyring, and headless the prompt is dismissed at
+      # once). The test talks to the Secret Service directly, so the job's
+      # MAILCORE_TOKEN_STORE does not turn it off.
       - name: Token cache in a real Secret Service
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y --no-install-recommends gnome-keyring dbus-daemon
           keyring=$(mktemp -d)
           mkdir -m 700 "$keyring/run"
-          XDG_DATA_HOME="$keyring/data" XDG_RUNTIME_DIR="$keyring/run" dbus-run-session -- sh -c \
+          env -u DISPLAY -u WAYLAND_DISPLAY XDG_DATA_HOME="$keyring/data" XDG_RUNTIME_DIR="$keyring/run" \
+            dbus-run-session -- sh -c \
             'echo -n ci-pass | gnome-keyring-daemon --unlock --components=secrets >/dev/null &&
              MAILCORE_SECRET_SERVICE_TEST=1 cargo test -p mailcore --locked --lib -- --exact tokencache::secret_service::tests::real_roundtrip --nocapture'
 

@@ -1232,7 +1232,9 @@ dismiss and snooze on the server (#2025).
   one item, and signing in as someone else replaces it. Linux attributes: `xdg:schema =
   mailcore.TokenCache`, `application = mailcore`, `cache = <key>`, label `Mail sign-in for
   <account>`, created in the `default` collection with `replace`, then any match outside that
-  collection deleted. macOS: service `mailcore`, account `<key>`, no label.
+  collection deleted (best effort: a failure there does not fail the save). Locked items are
+  unlocked before they are read or deleted: gnome-keyring refuses `Item.Delete` on a locked item
+  (`IsLocked`). macOS: service `mailcore`, account `<key>`, no label.
 - The core is store-generic (`save_in` / `load_in` / `clear_in` over a `SecretStore`), which the
   tests drive with a fake; `save` / `load` / `clear` keep their signatures and pass
   `platform_store()`, and `save_reporting` / `load_reporting` also say where the token went
@@ -1240,14 +1242,23 @@ dismiss and snooze on the server (#2025).
   under `cfg(test)` and with `MAILCORE_TOKEN_STORE=file`. `cfg(test)` only covers mailcore's own
   unit tests: a host's tests that write a token through mailcore set `MAILCORE_TOKEN_STORE=file`,
   as CI's `test` and `coverage` jobs do (a macOS Keychain prompt would hang a leg).
-- `StoreError` is `Unavailable` (no bus, no Secret Service, no default collection, no keychain:
-  cheap, not remembered), `Refused` (the unlock prompt dismissed or unanswered within
-  `secret_service::PROMPT_TIMEOUT`, 60 s, after which it is dismissed) or `Failed`. The platform
-  store is one process-wide `Latched` store: after the first `Refused`, every call is `Unavailable`
-  without asking, so an hourly refresh does not raise the prompt again.
+- `SecretStoreError` (not `StoreError`, which is `mailcore::store`'s) is `Unavailable` (no bus,
+  no Secret Service, no default collection, no keychain: cheap, not remembered), `Refused` (the
+  unlock prompt dismissed or unanswered within `secret_service::PROMPT_TIMEOUT`, 60 s, after
+  which it is dismissed; or a D-Bus method call unanswered within `METHOD_TIMEOUT`, 25 s, set on
+  the connection, as zbus waits forever by default) or `Failed`. The prompt wait races an
+  `async_io::Timer` on the calling thread (`futures-lite`'s `block_on`; both crates were already
+  in zbus's tree), so nothing outlives the call. The platform store is one process-wide
+  `Latched` store: after the first `Refused`, every `get` and `set` is `Unavailable` without
+  asking, so an hourly refresh does not raise the prompt again. `delete` bypasses the latch:
+  sign-out is the user's request, and a token stored before the refusal would otherwise stay in
+  the store with no file pointing at it. The trait, the `_in` core, `Latched` and
+  `platform_store` are `pub(crate)`.
 - Save: a store that takes the JSON gets a reference written; any store error falls back to the
   token file (0600 plaintext off Windows), never a save error. A reference that cannot be written
-  after the store took the token is the write's error, and the old file stays.
+  after the store took the token is the write's error, and the old file stays. A reference that
+  named another key (a moved directory, another path to the cache) has that item deleted after
+  the new reference is written, errors ignored.
 - Load: no file is `Ok(None)` with no store call. A reference whose item is gone is `Ok(None)`; no
   store or an unavailable/refused one is `io::ErrorKind::NotConnected`, `secret store unavailable:
   <reason>`, and the reference stays (a locked keyring may open next time); a store failure is its
@@ -1257,8 +1268,11 @@ dismiss and snooze on the server (#2025).
 - Clear (sign-out): removes the file and the `.tmp`, then with a store deletes the item under the
   computed key and under the reference's key when it differs, whatever the file held: a fallback
   token file may sit over a reference whose item is still stored. The first error is returned
-  after everything was tried. The engine's sign-out message says the store kept its item when the
-  file is gone, and the old message when the file is still there.
+  after everything was tried: an unreachable store is reported even over a token file, as an item
+  may be there (`NotConnected`). The engine's sign-out message (`sign_out_error`) is the old one
+  when the file is still there; with the file gone, "could not reach the secret store to delete a
+  sign-in saved there" for `NotConnected` (no claim that an item exists), and "… from the secret
+  store …; it stays there" for a store that failed.
 - `tokencache::account(path)` reads the account from the file (reference or token file) with no
   store call. lookxy's `reload_account` uses it: it runs on the UI thread after every sync pass,
   where a keyring prompt must not block.
@@ -1272,14 +1286,22 @@ dismiss and snooze on the server (#2025).
 - `zbus` 5 pulls `uuid`, whose 1.27+ needs rustc 1.89: `Cargo.lock` pins `uuid` 1.26.1 for MSRV
   1.88. A `cargo update` that lifts it breaks the `msrv` job.
 - Tests: the fake-store tests in `tokencache::tests` (save, load, migrate, clear whatever the file
-  holds, fallback per error, a gone item, an unreachable store, a reference without key, re-save
-  under another account, `account()`, the latch, a reference that cannot be written: skipped where
-  a read-only directory is still writable, as root); engine tests
-  `a_plaintext_token_warns_once_per_run`, `a_sign_in_saved_to_the_file_warns`,
-  `a_reference_without_its_store_says_why_sign_in_is_needed`. The real store:
+  holds, an unreachable store on clear, fallback per error, a gone item, an unreachable store, a
+  reference without key, re-save under another account, a save over a reference to another key,
+  `account()`, the latch, sign-out past the latch, a reference that cannot be written: skipped
+  where a read-only directory is still writable, as root); `secret_service::tests::
+  errors_are_classified`; engine tests `a_plaintext_token_warns_once_per_run`,
+  `a_sign_in_saved_to_the_file_warns`, `a_reference_without_its_store_says_why_sign_in_is_needed`,
+  `sign_out_errors_say_what_was_left`. The real store:
   `tokencache::secret_service::tests::real_roundtrip`, which runs only with
   `MAILCORE_SECRET_SERVICE_TEST=1`, in CI's `test (ubuntu-latest)` step "Token cache in a real
   Secret Service": `gnome-keyring dbus-daemon`, then under `dbus-run-session` with a throwaway
   `XDG_DATA_HOME` and `XDG_RUNTIME_DIR` (the latter also keeps `--unlock` off a desktop's running
-  daemon), `echo -n ci-pass | gnome-keyring-daemon --unlock --components=secrets`. The Keychain
-  backend has no test; the macOS leg builds and lints it.
+  daemon) and `DISPLAY` / `WAYLAND_DISPLAY` unset (run on a desktop, the locked-keyring step
+  would otherwise put a real unlock prompt on the screen), `echo -n ci-pass | gnome-keyring-daemon --unlock --components=secrets`. It also
+  locks the collection (`Service.Lock`) and signs out: headless, gnome-keyring dismisses the
+  unlock prompt at once (no prompter), so the test checks the sign-out asked to unlock
+  (`NotConnected`, "dismissed", where a bare `Delete` fails `IsLocked`), unlocks with the
+  password through `org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface.
+  UnlockWithMasterPassword`, and signs out again: the item is gone. An answered prompt is not
+  tested. The Keychain backend has no test; the macOS leg builds and lints it.
