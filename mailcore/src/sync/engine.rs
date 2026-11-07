@@ -48,7 +48,7 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, EventDeltaItem, MailFolder, Me, Message, ScheduleEntry,
+    AutomaticReplies, DeltaItem, EventDeltaItem, MailFolder, Me, Message, Recipient, ScheduleEntry,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -296,6 +296,36 @@ pub enum SyncCommand {
     /// [`SyncEvent::CalendarUpdated`]. A `local:` id that never reached
     /// Graph is a no-op on the Graph side (see `sync::outbox::apply_op`).
     DeleteEvent { id: String },
+    /// Cancel a meeting the user organizes, telling every attendee with
+    /// `comment` (#1985, Graph's `.../cancel`), where `DeleteEvent` would
+    /// tell nobody. The engine checks the stored row first: an event that
+    /// is not stored, or whose `is_organizer` is false (Graph lets only the
+    /// organizer cancel; an attendee declines or deletes), is a
+    /// [`SyncEvent::Error`] and nothing else happens. Otherwise it queues
+    /// [`crate::store::OutboxOp::CancelEvent`], then deletes the row itself
+    /// (Graph deletes the organizer's copy on a cancel), emits
+    /// [`SyncEvent::CalendarUpdated`] and drains. The host must **not**
+    /// delete the row first, unlike `DeleteEvent`: the check would then
+    /// find nothing. A cancel quarantined after repeated refusals brings the
+    /// row back with the calendar reset, as a quarantined `DeleteEvent`.
+    /// A `local:` event (the user's, never on Graph) is deleted and sends
+    /// nothing. The host decides whether to offer Cancel (the meeting has
+    /// attendees) or Delete: the engine does not refuse a cancel of an
+    /// event without attendees, as the stored list is not authoritative.
+    CancelEvent { id: String, comment: Option<String> },
+    /// Forward a meeting to `to` with `comment` (#1985, Graph's
+    /// `.../forward`), organizer or attendee alike: queue
+    /// [`crate::store::OutboxOp::ForwardEvent`] and drain. Nothing local
+    /// changes, so no `CalendarUpdated`. An empty `to`, or a `local:` id
+    /// (not on Graph yet, and an event id has no later alias to follow),
+    /// is a [`SyncEvent::Error`] and nothing is queued. A retry after a
+    /// lost `202` forwards twice: Graph has nothing to ask whether the
+    /// first one went out.
+    ForwardEvent {
+        id: String,
+        to: Vec<Recipient>,
+        comment: Option<String>,
+    },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -1371,6 +1401,8 @@ impl Engine {
                 self.enqueue_and_drain(OutboxOp::DeleteEvent { id });
                 self.emit(SyncEvent::CalendarUpdated);
             }
+            SyncCommand::CancelEvent { id, comment } => self.cancel_event(id, comment),
+            SyncCommand::ForwardEvent { id, to, comment } => self.forward_event(id, to, comment),
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2331,6 +2363,54 @@ impl Engine {
 
     /// Optimistic local write already applied by the caller: persist the op,
     /// reflect the pending count, and (if signed in) try to push it now.
+    /// [`SyncCommand::CancelEvent`].
+    fn cancel_event(&mut self, id: String, comment: Option<String>) {
+        let refusal = match self.store.event(&id) {
+            Ok(Some(row)) if row.is_organizer => None,
+            Ok(Some(_)) => Some("only the organizer can cancel a meeting".to_string()),
+            Ok(None) => Some("no such event".to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(why) = refusal {
+            self.emit(SyncEvent::Error(format!("cancel event {id}: {why}")));
+            return;
+        }
+        // Queue first, as `SendDraft` does: a cancel is a send. Deleting the
+        // row before a queue that then fails would hide a meeting every
+        // attendee keeps, with no op whose quarantine could bring it back.
+        if let Err(e) = self.store.enqueue_op(&OutboxOp::CancelEvent {
+            id: id.clone(),
+            comment,
+        }) {
+            self.emit(SyncEvent::Error(format!("cancel event {id}: {e}")));
+            return;
+        }
+        // Graph deletes the organizer's copy on a cancel. A failed delete
+        // leaves the op queued: the next calendar round removes the row.
+        if let Err(e) = self.store.delete_event(&id) {
+            self.emit(SyncEvent::Error(format!("cancel event {id}: {e}")));
+        }
+        self.emit(SyncEvent::CalendarUpdated);
+        self.drain_queued();
+    }
+
+    /// [`SyncCommand::ForwardEvent`].
+    fn forward_event(&mut self, id: String, to: Vec<Recipient>, comment: Option<String>) {
+        if to.is_empty() {
+            self.emit(SyncEvent::Error(format!(
+                "forward event {id}: no recipients"
+            )));
+            return;
+        }
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "forward event {id}: the event is not on the server yet"
+            )));
+            return;
+        }
+        self.enqueue_and_drain(OutboxOp::ForwardEvent { id, to, comment });
+    }
+
     fn enqueue_and_drain(&mut self, op: OutboxOp) {
         if let Err(e) = self.store.enqueue_op(&op) {
             self.emit(SyncEvent::Error(e.to_string()));
@@ -2470,14 +2550,16 @@ impl Engine {
                             OutboxOp::RespondEvent { .. }
                                 | OutboxOp::UpdateEvent { .. }
                                 | OutboxOp::DeleteEvent { .. }
+                                | OutboxOp::CancelEvent { .. }
                         );
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
                         )));
-                        // A quarantined `RespondEvent`, `UpdateEvent` or
-                        // `DeleteEvent` leaves its optimistic local write
-                        // (an RSVP, edited fields, a deleted row) on an
+                        // A quarantined `RespondEvent`, `UpdateEvent`,
+                        // `DeleteEvent` or `CancelEvent` leaves its
+                        // optimistic local write (an RSVP, edited fields, a
+                        // deleted row) on an
                         // event Graph never changed, which no calendar delta
                         // round names (#2013), and the mail reconverge above
                         // doesn't touch the `events` table at all. Forget
@@ -8988,6 +9070,309 @@ mod tests {
                 to_utc: to,
                 delta_link: delta_link_of("CAL-A"),
             })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The POSTs `srv` saw to `path`.
+    fn posts_to(srv: &FakeServer, path: &str) -> Vec<crate::testserver::RecordedRequest> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == path)
+            .collect()
+    }
+
+    /// A stored event of `CAL-A` an hour from now, organized by the user
+    /// when `organizer`.
+    fn meeting(id: &str, organizer: bool) -> NewEvent {
+        NewEvent {
+            is_organizer: organizer,
+            ..stored_event(id, "CAL-A", 3600)
+        }
+    }
+
+    /// An engine on a synced `CAL-A` holding `events`, with `extra` routes
+    /// ahead of the calendar's.
+    fn spawn_meeting_engine(
+        tag: &str,
+        extra: Vec<Route>,
+        events: Vec<NewEvent>,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let (from, to) = today_window();
+        let mut routes = extra;
+        routes.extend(calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        ));
+        spawn_calendar_engine(tag, routes, |s| {
+            seed_synced_calendar(s, "CAL-A", events, (&from, &to), &delta_link_of("CAL-A"));
+        })
+    }
+
+    #[test]
+    fn cancel_event_deletes_and_posts_cancel() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "cancel-event",
+            vec![post_route("/me/events/E1/cancel", 202, "")],
+            vec![meeting("E1", true), meeting("E2", true)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: "E1".into(),
+                comment: Some("Moved to Friday".into()),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        // The optimistic delete lands before the drain reaches Graph.
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && !posts_to(&srv, "/me/events/E1/cancel").is_empty()),
+            "no cancel drained; requests: {:?}",
+            srv.requests()
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let posts = posts_to(&srv, "/me/events/E1/cancel");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, r#"{"comment":"Moved to Friday"}"#);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_event_refuses_an_attendee_or_unknown_id() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "cancel-event-refused",
+            vec![post_route("/me/events/", 202, "")],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: "E1".into(),
+                comment: None,
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::Error(
+                "cancel event E1: only the organizer can cancel a meeting".into()
+            ))
+        );
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: "NOPE".into(),
+                comment: None,
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::Error("cancel event NOPE: no such event".into()))
+        );
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"], "nothing deleted");
+        assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
+        assert!(
+            srv.requests().iter().all(|r| r.method != "POST"),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_event_of_a_local_event_deletes_it_and_sends_nothing() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "cancel-event-local",
+            vec![post_route("/me/events/", 202, "")],
+            vec![],
+        );
+        let local = Store::open(&store_path)
+            .unwrap()
+            .create_local_event(
+                &crate::store::LocalEventFields {
+                    subject: "Draft meeting".into(),
+                    start_utc: "2026-07-20T09:00:00Z".into(),
+                    end_utc: "2026-07-20T10:00:00Z".into(),
+                    ..Default::default()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: local.clone(),
+                comment: None,
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.event(&local).unwrap(), None);
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "the no-op cancel drains"
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            srv.requests().iter().all(|r| r.method != "POST"),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_event_quarantine_restores_the_event() {
+        // The cancel always 400s: as `delete_event_quarantine_restores_the_
+        // event`, only the initial round the quarantine forces brings the
+        // optimistically deleted row back.
+        let (from, to) = today_window();
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
+        routes.insert(
+            0,
+            post_route(
+                "/me/events/E1/cancel",
+                400,
+                r#"{"error":{"code":"ErrorInvalidRequest"}}"#,
+            ),
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("cancel-event-reconverge", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![meeting("E1", true)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        handle
+            .cmd_tx
+            .send(SyncCommand::CancelEvent {
+                id: "E1".into(),
+                comment: Some("off".into()),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        assert!(
+            ids_in(&Store::open(&store_path).unwrap(), "CAL-A").is_empty(),
+            "deleted at once"
+        );
+        for _ in 0..4 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"], "the row is back");
+        assert_eq!(
+            posts_to(&srv, "/me/events/E1/cancel").len(),
+            MAX_OP_ATTEMPTS as usize
+        );
+        assert_eq!(
+            view_paths(&srv, "CAL-A").last(),
+            Some(&initial_delta_path("CAL-A", &from, &to)),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forward_event_posts_forward() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "forward-event",
+            vec![post_route("/me/events/E1/forward", 202, "")],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::ForwardEvent {
+                id: "E1".into(),
+                to: vec![
+                    Recipient {
+                        name: "Ann".into(),
+                        address: "ann@x".into(),
+                    },
+                    Recipient {
+                        name: "".into(),
+                        address: "bob@y".into(),
+                    },
+                ],
+                comment: Some("FYI".into()),
+            })
+            .unwrap();
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && !posts_to(&srv, "/me/events/E1/forward").is_empty()),
+            "no forward drained; requests: {:?}",
+            srv.requests()
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let posts = posts_to(&srv, "/me/events/E1/forward");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].body,
+            r#"{"toRecipients":[{"emailAddress":{"address":"ann@x","name":"Ann"}},{"emailAddress":{"address":"bob@y","name":""}}],"comment":"FYI"}"#
+        );
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"], "nothing local changes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forward_event_refuses_local_id_and_no_recipients() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "forward-event-refused",
+            vec![post_route("/me/events/", 202, "")],
+            vec![meeting("E1", true)],
+        );
+        let ann = Recipient {
+            name: "Ann".into(),
+            address: "ann@x".into(),
+        };
+        for (id, to, error) in [
+            ("E1", vec![], "forward event E1: no recipients"),
+            (
+                "local:e9",
+                vec![ann],
+                "forward event local:e9: the event is not on the server yet",
+            ),
+        ] {
+            handle
+                .cmd_tx
+                .send(SyncCommand::ForwardEvent {
+                    id: id.into(),
+                    to,
+                    comment: None,
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert_eq!(seen.last(), Some(&SyncEvent::Error(error.into())));
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
+        assert!(
+            srv.requests().iter().all(|r| r.method != "POST"),
+            "{:?}",
+            srv.requests()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
