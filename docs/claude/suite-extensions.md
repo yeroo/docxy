@@ -191,3 +191,39 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   tab); AutoCorrect, Repeat; IME, dead keys and Windows' WM_CHAR packet
   text (the suite's input handler is the root's, so a focused view gets
   plain key-downs only).
+
+## Host insert, copy and cut (#1977)
+
+- `DocView::insert_text(&str)`, `copy`, `cut`, `can_copy`: a host ribbon's
+  Insert Signature / Quick Part and its Clipboard group's Copy and Cut,
+  without `document()` / `set_document()` (which lose the caret, the
+  selection and the history). The decisions are `doc_view/edit.rs`'s
+  `insert_text` and `cut`, tested without a window.
+- `insert_text` is Paste Text Only's path (`Editor::paste_text_only`):
+  it replaces the selection, newlines split paragraphs (`\r\n` and a lone
+  `\r` are newlines too), tabs are tab inlines, every run takes the
+  formatting typing at the caret would give (a format toggled at a
+  collapsed caret too), the caret ends after it. `\u{0B}` (`LINE_BREAK`,
+  Word's plain-text manual line break) is a line break inside the same
+  step: the text is split on it, `paste_text_only` per piece and
+  `insert_line_break` between them, in one outer `one_step`. It drops what
+  a `w:t` cannot hold (`insertable`: other C0 controls, U+FFFE, U+FFFF,
+  `FIELD_CHAR`), as `serialize::esc_text` escapes only `& < >`. One undo
+  step of its own (`one_step` ends the typing run before and after). A
+  text with nothing left runs nothing and returns false. Inside a
+  hyperlink the text lands between the link's two halves (`paste`'s
+  `split_content`), as Paste Text Only does in a document tab.
+- `cut` is Ctrl+X's path (`edit::cut`, which the key uses too): the clip
+  on the clipboard through `write_clip` (text and RTF), one undo step,
+  `on_change`. False with nothing to cut.
+- `copy` works in either mode, as Ctrl+C does in the read-only view
+  (`write_copy`): a reader host's Copy button copies. This departs from
+  the issue's "each returns false on a read-only view", which holds only
+  for `insert_text` and `cut`. `can_copy` is `has_selection()` in either
+  mode. A host enables Cut with `can_copy() && editable()`. A copy never
+  fires `on_change`.
+- Harness: `ext-doc-call` takes `{"insert_text": <text>}`,
+  `{"copy": true}`, `{"cut": true}`; `ext-doc-read` (and `ext-doc-set`,
+  `ext-doc-call`) add `can_copy`. The `issue 1977` test in
+  `uiharness/cases/ext-doc-edit.uit` copies "Beta", then cuts the whole
+  paragraph, so the second clipboard read can only be the cut's.
