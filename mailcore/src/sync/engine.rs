@@ -9,7 +9,7 @@
 //! the folder tree (#1886: names, parents, counts, new folders, and the
 //! removal of folders deleted on the server), re-runs per-folder delta sync
 //! and drains the outbox; a full pass (startup, `Refresh`, sign-in) also
-//! refreshes people and master categories. Mutation commands write the
+//! refreshes people, the Contacts folder (#1934) and master categories. Mutation commands write the
 //! store optimistically, enqueue an outbox op, and drain. Graph calls go
 //! through [`Engine::with_auth`], which refreshes the token once on a 401 and
 //! retries. Throttling (`Retry-After`) is honored by rescheduling; transport
@@ -304,6 +304,13 @@ pub enum SyncEvent {
     PhotoFetched { photo: Option<(Vec<u8>, String)> },
     /// The master category list changed; the UI re-reads `Store::master_categories`.
     CategoriesUpdated,
+    /// A full pass fetched the user's Contacts folder and stored it
+    /// (`Store::replace_folder_contacts`, #1934); a client re-reads
+    /// `Store::is_contact` for the trust decisions it made. Sent after every
+    /// successful fetch, whether the set changed or not (as
+    /// `CategoriesUpdated`); a failed fetch sends nothing and keeps the
+    /// stored set.
+    ContactsUpdated,
     /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
     /// its free/busy grid.
     ScheduleFetched { entries: Vec<ScheduleEntry> },
@@ -734,8 +741,8 @@ struct Engine {
     /// Whether a folder enumeration has ever completed successfully.
     /// False at startup, after a failed first backfill (e.g. launched
     /// offline), and after a quarantine reconverge — while false
-    /// (`needs_full_pass`), a tick runs a FULL pass (people and master
-    /// categories too, and `FoldersUpdated` after every list) and the fast
+    /// (`needs_full_pass`), a tick runs a FULL pass (people, the Contacts
+    /// folder and master categories too, and `FoldersUpdated` after every list) and the fast
     /// schedule promotes its next deadline to one, so the client recovers
     /// instead of running deltas over an empty/stale folder set. Every pass
     /// lists the folders either way (#1886).
@@ -1012,8 +1019,8 @@ impl Engine {
     /// Whether the next normal pass must be a full one: no folder
     /// enumeration has completed (launched offline, or a quarantine
     /// reconverge reset it), or no folder is stored. Every pass lists the
-    /// folders (#1886); a full one also refreshes people and master
-    /// categories, and the fast schedule runs it at its next deadline.
+    /// folders (#1886); a full one also refreshes people, the Contacts
+    /// folder and master categories, and the fast schedule runs it at its next deadline.
     fn needs_full_pass(&self) -> bool {
         !self.backfill_done || self.store.folders().map(|f| f.is_empty()).unwrap_or(true)
     }
@@ -1070,8 +1077,8 @@ impl Engine {
     /// otherwise list the folder tree, re-run every folder's delta and drain
     /// the outbox (`sync_pass`). When the initial backfill never completed
     /// (launched offline, or a quarantine reconverge reset it) — or the
-    /// folder set is empty — the pass is a FULL one (people and master
-    /// categories too), so the client recovers under back-off rather than
+    /// folder set is empty — the pass is a FULL one (people, the Contacts
+    /// folder and master categories too), so the client recovers under back-off rather than
     /// idling forever on an empty/stale folder set.
     fn on_tick(&mut self) {
         if self.token.is_none() {
@@ -1285,7 +1292,8 @@ impl Engine {
     /// parents, new and deleted folders and counts follow the server), then
     /// delta-sync every stored folder and drain the outbox. A `full` pass
     /// (startup, `Refresh`, sign-in, a pass that `needs_full_pass`) also
-    /// refreshes people and master categories. Auth/throttle/transport
+    /// refreshes people, the Contacts folder and master categories, in that
+    /// order, each best-effort. Auth/throttle/transport
     /// failures abort the pass (state already set); per-folder 4xx/parse
     /// errors are surfaced and skipped so one folder can't sink the rest.
     fn sync_pass(&mut self, full: bool) {
@@ -1350,6 +1358,7 @@ impl Engine {
                 return;
             }
             self.sync_people();
+            self.sync_folder_contacts();
             self.refresh_master_categories();
         }
 
@@ -1503,6 +1512,23 @@ impl Engine {
                 frequency: 0,
                 relevance: Some(p.rank),
             });
+        }
+    }
+
+    /// Best-effort Contacts-folder fetch (`/me/contacts`, #1934) → the whole
+    /// stored set replaced (`Store::replace_folder_contacts`) and
+    /// `ContactsUpdated`. Any error (no `Contacts.Read`, which a host adds to
+    /// its scope, Conditional Access, offline, parse) is swallowed and keeps
+    /// the stored set: a failed fetch says nothing about the folder, and this
+    /// never fails a sync pass or emits an error event. Full passes only, so
+    /// a removal takes effect at the next one, not at a periodic tick.
+    fn sync_folder_contacts(&mut self) {
+        let contacts = match self.with_auth(|c| c.contacts()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if self.store.replace_folder_contacts(&contacts).is_ok() {
+            self.emit(SyncEvent::ContactsUpdated);
         }
     }
 
@@ -3747,6 +3773,7 @@ fn looks_like_icalendar(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::auth::{AuthConfig, TokenSet};
+    use crate::graph::model::FolderContact;
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
@@ -4567,6 +4594,236 @@ mod tests {
         // The pass still completes and local contacts are present; no panic,
         // no error surfaced despite the 403 from `/me/people`.
         assert!(!wait_for_contact(&store_path, "alice").is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `contacts_routes` plus `/me/contacts` and `/me/outlook/masterCategories`
+    // (#1934). `contacts` are the answers to `/me/contacts`, in order: each
+    // `(status, body, limit)`, the later ones answering after the earlier
+    // ones used up their limit. A page-2 `$skip` route goes in `contacts`
+    // first, as the fake server answers the first matching prefix.
+    fn folder_contacts_routes(
+        people_body: &str,
+        contacts: &[(&str, u16, &str, Option<usize>)],
+    ) -> Vec<(Route, Option<usize>)> {
+        let mut routes: Vec<(Route, Option<usize>)> = contacts
+            .iter()
+            .map(|(prefix, status, body, limit)| (get_route(prefix, *status, body), *limit))
+            .collect();
+        routes.push((
+            get_route(
+                "/me/outlook/masterCategories",
+                200,
+                r#"{"value":[{"id":"c1","displayName":"Work","color":"preset0"}]}"#,
+            ),
+            None,
+        ));
+        routes.extend(
+            contacts_routes(200, people_body)
+                .into_iter()
+                .map(|r| (r, None)),
+        );
+        routes
+    }
+
+    const CAROL_PERSON: &str = r#"{"value":[{"displayName":"Carol","scoredEmailAddresses":[{"address":"carol@x.com","relevanceScore":5.0}]}]}"#;
+
+    fn spawn_contacts_engine(
+        srv: &FakeServer,
+        tag: &str,
+        seed: impl FnOnce(&Store),
+    ) -> (SyncHandle, PathBuf, PathBuf) {
+        let dir = unique_dir(tag);
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+        seed(&Store::open(&store_path).unwrap());
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path,
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            HOUR,
+        );
+        (handle, store_path, dir)
+    }
+
+    #[test]
+    fn full_pass_syncs_the_contacts_folder_apart_from_people_and_mined() {
+        let srv = FakeServer::start_limited(folder_contacts_routes(
+            CAROL_PERSON,
+            &[
+                (
+                    "/me/contacts?$skip=200",
+                    200,
+                    r#"{"value":[{"displayName":"Erin","emailAddresses":[{"address":"Erin@X.com"}]}]}"#,
+                    None,
+                ),
+                (
+                    "/me/contacts",
+                    200,
+                    r#"{"value":[{"displayName":"Dave","emailAddresses":[{"address":"dave@x.com"}]}],"@odata.nextLink":"/me/contacts?$skip=200"}"#,
+                    None,
+                ),
+            ],
+        ));
+        let (handle, store_path, dir) = spawn_contacts_engine(&srv, "folder-contacts-ok", |_| {});
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.is_contact("dave@x.com").unwrap());
+        assert!(store.is_contact("erin@x.com").unwrap());
+        // `/me/people` and the mined sender and recipient are in `contacts`
+        // (autocomplete), never Contacts.
+        assert_eq!(store.search_contacts("carol", 1).unwrap().len(), 1);
+        assert_eq!(store.search_contacts("alice", 1).unwrap().len(), 1);
+        for no in ["carol@x.com", "alice@x", "bob@x"] {
+            assert!(!store.is_contact(no).unwrap(), "{no}");
+        }
+        assert_eq!(count(&srv, is_contacts), 2, "both pages");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contacts_403_keeps_the_stored_set_and_does_not_fail_the_pass() {
+        let srv = FakeServer::start_limited(folder_contacts_routes(
+            CAROL_PERSON,
+            &[(
+                "/me/contacts",
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied"}}"#,
+                None,
+            )],
+        ));
+        let (handle, store_path, dir) = spawn_contacts_engine(&srv, "folder-contacts-403", |s| {
+            s.replace_folder_contacts(&[FolderContact {
+                name: "Dave".into(),
+                address: "dave@x.com".into(),
+            }])
+            .unwrap();
+        });
+        // Categories come after the Contacts attempt in the same pass.
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::CategoriesUpdated)
+        });
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::ContactsUpdated | SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        assert_eq!(count(&srv, is_contacts), 1);
+        // The pass ran to its end: it settles at Idle with no error.
+        let rest = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Idle))
+        });
+        assert!(
+            !rest.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{rest:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            store.is_contact("dave@x.com").unwrap(),
+            "the stored set is kept"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_removed_from_the_folder_stops_counting_after_the_next_full_pass() {
+        let srv = FakeServer::start_limited(folder_contacts_routes(
+            CAROL_PERSON,
+            &[
+                (
+                    "/me/contacts",
+                    200,
+                    r#"{"value":[{"displayName":"Dave","emailAddresses":[{"address":"dave@x.com"}]}]}"#,
+                    Some(1),
+                ),
+                ("/me/contacts", 200, r#"{"value":[]}"#, None),
+            ],
+        ));
+        let (handle, store_path, dir) =
+            spawn_contacts_engine(&srv, "folder-contacts-removed", |_| {});
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.is_contact("dave@x.com").unwrap());
+
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(
+            !store.is_contact("dave@x.com").unwrap(),
+            "removed from the folder"
+        );
+        assert_eq!(count(&srv, is_contacts), 2);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_full_pass_fetches_the_contacts_folder() {
+        let mut routes = folder_routes(F1_F2, &[], &[]);
+        routes.insert(
+            0,
+            (get_route("/me/calendarView", 200, r#"{"value":[]}"#), None),
+        );
+        routes.insert(
+            0,
+            (
+                get_route(
+                    "/me/contacts",
+                    200,
+                    r#"{"value":[{"displayName":"Dave","emailAddresses":[{"address":"dave@x.com"}]}]}"#,
+                ),
+                None,
+            ),
+        );
+        let srv = FakeServer::start_limited(routes);
+        let (handle, _store_path, dir) = spawn_fast(
+            &srv,
+            "folder-contacts-ticks",
+            Duration::from_millis(600),
+            Some(FAST),
+            |_| {},
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetFastFolders {
+                ids: vec!["F1".into()],
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        // Two normal ticks (each lists the folders and refreshes the
+        // calendar) and fast ticks between them (F1's delta alone).
+        assert!(
+            wait_until(ENGINE_WAIT, || count(&srv, is_calendar) >= 2
+                && count(&srv, |p| is_delta(p, "F1")) >= 4),
+            "{:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(
+            count(&srv, is_folder_list) >= 3,
+            "{:?}",
+            paths_from(&srv, 0)
+        );
+        assert_eq!(
+            count(&srv, is_contacts),
+            1,
+            "the startup pass only: {:?}",
+            paths_from(&srv, 0)
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -8445,6 +8702,10 @@ mod tests {
         path.starts_with("/me/calendarView")
     }
 
+    fn is_contacts(path: &str) -> bool {
+        path.starts_with("/me/contacts")
+    }
+
     fn count(srv: &FakeServer, pred: impl Fn(&str) -> bool) -> usize {
         paths_from(srv, 0).iter().filter(|p| pred(p)).count()
     }
@@ -8491,6 +8752,11 @@ mod tests {
         assert_eq!(count(&srv, |p| is_counts(p, "F2")), 0);
         assert_eq!(count(&srv, is_folder_list), 1, "the startup list only");
         assert_eq!(count(&srv, is_calendar), 0, "no calendar on a fast tick");
+        assert_eq!(
+            count(&srv, is_contacts),
+            1,
+            "the Contacts folder at startup only"
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -8946,6 +9212,8 @@ mod tests {
                     "delta F2"
                 } else if p.starts_with("/me/people") {
                     "people"
+                } else if is_contacts(p) {
+                    "contacts"
                 } else if p.starts_with("/me/outlook/masterCategories") {
                     "categories"
                 } else if is_calendar(p) {
@@ -8956,6 +9224,8 @@ mod tests {
             })
             .take_while(|k| *k != "calendar")
             .collect();
+        // The Contacts folder (#1934) goes between people and categories,
+        // on the full startup pass only.
         assert_eq!(
             kinds,
             vec![
@@ -8965,6 +9235,7 @@ mod tests {
                 "delta F1",
                 "delta F2",
                 "people",
+                "contacts",
                 "categories",
                 "list",
                 "children F1",

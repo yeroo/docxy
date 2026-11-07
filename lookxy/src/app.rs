@@ -749,7 +749,8 @@ impl App {
             // lookxy never asks for them. The granted scopes (#1875) are for
             // a client that asks for more than it may have been granted.
             // lookxy shows no backfill progress (#1871): its list reloads on
-            // each page's `MessagesUpdated`.
+            // each page's `MessagesUpdated`. lookxy makes no trust decision
+            // on `Store::is_contact` (#1934).
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
             | SyncEvent::Sent { .. }
@@ -757,6 +758,7 @@ impl App {
             | SyncEvent::ProfileFetched { .. }
             | SyncEvent::PhotoFetched { .. }
             | SyncEvent::Scopes { .. }
+            | SyncEvent::ContactsUpdated
             | SyncEvent::FolderProgress { .. } => {}
         }
     }
