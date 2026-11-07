@@ -1138,7 +1138,7 @@ impl Event {
 /// (`is_meeting_url`), so a meeting host in another link's query, or a
 /// lookalike host, is not taken. Safe Links-wrapped links
 /// (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
-fn meeting_link(text: &str) -> Option<String> {
+pub(crate) fn meeting_link(text: &str) -> Option<String> {
     const SCHEME: &str = "https://";
     // ASCII lowercasing keeps every byte offset, so offsets in `lower`
     // index `text` too (and land on the ASCII `h`, a char boundary).
@@ -1161,19 +1161,33 @@ fn meeting_link(text: &str) -> Option<String> {
 }
 
 /// `after_scheme` (a link without its `https://`) is a meeting link: its
-/// host (up to the first `/`, `?`, `#` or `:`, compared lowercased) and
-/// path (as is) match a known meeting service. `base` or `*.base` hosts
-/// match a `base` entry, so `notzoom.us` is not `zoom.us`.
+/// host and path (as is) match a known meeting service. The authority runs
+/// to the first `/`, `?`, `#` or `\` (a browser reads `\` as `/` in an
+/// `https` link, so `https://evil.example\.zoom.us/` is `evil.example`). An
+/// authority with userinfo (`@`, as in `teams.microsoft.com:443@evil.example`)
+/// is refused; a `:port` must be digits and is dropped; the host left must be
+/// ASCII letters, digits, `-` and `.`, and is compared lowercased. `base` or
+/// `*.base` hosts match a `base` entry, so `notzoom.us` is not `zoom.us`.
 fn is_meeting_url(after_scheme: &str) -> bool {
-    let host_end = after_scheme
-        .find(['/', '?', '#', ':'])
+    let authority_end = after_scheme
+        .find(['/', '?', '#', '\\'])
         .unwrap_or(after_scheme.len());
-    let host = after_scheme[..host_end].to_ascii_lowercase();
-    let mut path = &after_scheme[host_end..];
-    if let Some(port) = path.strip_prefix(':') {
-        path = &port[port.find(['/', '?', '#']).unwrap_or(port.len())..];
+    let authority = &after_scheme[..authority_end];
+    let path = &after_scheme[authority_end..];
+    if authority.contains(['@', '\\']) {
+        return false;
     }
-    if host.is_empty() || host.contains('@') {
+    let host = match authority.split_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        Some(_) => return false,
+        None => authority,
+    };
+    let host = host.to_ascii_lowercase();
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
         return false;
     }
     let under = |base: &str| {
@@ -2072,6 +2086,15 @@ mod tests {
             "https://teams.microsoft.com@evil.example/l/meetup-join/1",
             "https://zoom.us.evil.example/j/1",
             "http://zoom.us/j/1",
+            // Userinfo after a port colon: the browser opens evil.example.
+            "https://teams.microsoft.com:443@evil.example/l/meetup-join/1",
+            "https://zoom.us:x@evil.example/j/1",
+            // A backslash is a `/` to the browser: the host is evil.example.
+            "https://evil.example\\\\.zoom.us/j/1",
+            "https://evil.example\\\\.webex.com/meet/x",
+            // A port that is not digits, a host with other characters.
+            "https://zoom.us:44x/j/1",
+            "https://zo%6Fm.us/j/1",
         ] {
             let e = ev(&format!(r#","location":{{"displayName":"{text}"}}"#));
             assert_eq!(e.join_url, "", "{text}");
@@ -2079,6 +2102,13 @@ mod tests {
         // A real link after a rejected one is still found.
         let e = ev(r#","location":{"displayName":"https://notzoom.us/j/1 https://zoom.us/j/2"}"#);
         assert_eq!(e.join_url, "https://zoom.us/j/2");
+        let e = ev(
+            r#","location":{"displayName":"https://teams.microsoft.com:443@evil.example/l/meetup-join/1 https://teams.microsoft.com:443/l/meetup-join/2"}"#,
+        );
+        assert_eq!(
+            e.join_url,
+            "https://teams.microsoft.com:443/l/meetup-join/2"
+        );
     }
 
     #[test]
