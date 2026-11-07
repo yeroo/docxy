@@ -468,6 +468,13 @@ pub enum SyncEvent {
         granted: Vec<String>,
         missing: Vec<String>,
     },
+    /// The sign-in is stored unencrypted on this computer (#1877): no
+    /// secret store (the Secret Service on Linux, the Keychain on macOS)
+    /// took the token, so it is in the token file, protected only by its
+    /// permissions. Sent at most once per engine run, the first time a load
+    /// or save ends there; never on Windows, whose file DPAPI encrypts. A
+    /// client may tell the user once.
+    TokenStoredUnencrypted,
     /// A folder's backfill of older mail moved on (#1871): after every page
     /// of its full delta, and once when it completed (`complete: true`).
     /// `synced` is the persisted count of items that delta has walked past:
@@ -833,6 +840,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         op_retry: None,
         op_backoff: BACKOFF_MIN,
         announced_scopes: None,
+        warned_unencrypted: false,
         cmd_rx,
         deferred: VecDeque::new(),
         shutting_down: false,
@@ -912,6 +920,9 @@ struct Engine {
     /// de-duplicated set of normalised scopes; `None` after
     /// `enter_signin`, so a new session announces again.
     announced_scopes: Option<Vec<String>>,
+    /// [`SyncEvent::TokenStoredUnencrypted`] was sent this run (#1877).
+    /// Sign-out keeps it: still the same computer and store.
+    warned_unencrypted: bool,
     /// The commands from the UI. The main loop waits on it; long work
     /// drains it at each `checkpoint` (#1978).
     cmd_rx: Receiver<SyncCommand>,
@@ -941,13 +952,21 @@ impl Engine {
     /// runs the initial folder + delta backfill. Otherwise emits
     /// `SignInRequired` and waits for a `SignIn` command in the loop.
     fn startup(&mut self) {
-        match tokencache::load(&self.config.token_path) {
-            Ok(Some(t)) => {
+        match tokencache::load_reporting(&self.config.token_path) {
+            Ok(Some((t, storage))) => {
                 self.token = Some(t);
+                self.note_storage(storage);
                 self.refresh_if_near_expiry();
                 // A refresh just now has announced already; then this is
                 // the same grant and sends nothing.
                 self.announce_scopes();
+            }
+            // A reference to a secret store that cannot be reached now
+            // (#1877): say why the user has to sign in again.
+            Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                self.enter_signin();
+                return;
             }
             // No cache yet, or a cache that failed to decrypt/parse: either way
             // the user has to (re-)sign in.
@@ -3154,9 +3173,16 @@ impl Engine {
     /// outbox's own back-off stays with the outbox, which is kept.
     fn sign_out(&mut self) {
         if let Err(e) = tokencache::clear(&self.config.token_path) {
-            self.emit(SyncEvent::Error(format!(
-                "could not delete the saved sign-in ({e}); it may be used again at the next start"
-            )));
+            let message = if self.config.token_path.exists() {
+                format!(
+                    "could not delete the saved sign-in ({e}); it may be used again at the next start"
+                )
+            } else {
+                // The file is gone, so the next start is signed out, but
+                // the secret store kept its item (#1877).
+                format!("could not delete the sign-in from the secret store ({e}); it stays there")
+            };
+            self.emit(SyncEvent::Error(message));
         }
         self.clear_backoff();
         self.enter_signin();
@@ -3649,6 +3675,15 @@ impl Engine {
         }
     }
 
+    /// Sends [`SyncEvent::TokenStoredUnencrypted`] the first time this run
+    /// a token load or save ends in the plaintext file (#1877).
+    fn note_storage(&mut self, storage: tokencache::Storage) {
+        if storage == tokencache::Storage::PlainFile && !self.warned_unencrypted {
+            self.warned_unencrypted = true;
+            self.emit(SyncEvent::TokenStoredUnencrypted);
+        }
+    }
+
     /// Exchanges the refresh token for a fresh token set and persists it.
     /// Returns false on any failure (no token to refresh, or the endpoint
     /// rejected it). Token values are never logged. A response that names
@@ -3671,7 +3706,9 @@ impl Engine {
                 if t.scopes.is_none() {
                     t.scopes = previous_scopes;
                 }
-                let _ = tokencache::save(&self.config.token_path, &t);
+                if let Ok(storage) = tokencache::save_reporting(&self.config.token_path, &t) {
+                    self.note_storage(storage);
+                }
                 self.token = Some(t);
                 self.announce_scopes();
                 true
@@ -3738,7 +3775,9 @@ impl Engine {
         };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
             Ok(t) => {
-                let _ = tokencache::save(&self.config.token_path, &t);
+                if let Ok(storage) = tokencache::save_reporting(&self.config.token_path, &t) {
+                    self.note_storage(storage);
+                }
                 self.token = Some(t);
                 self.announce_scopes();
                 self.clear_backoff();
@@ -7570,6 +7609,117 @@ mod tests {
             cached.scopes,
             Some(strings(&["OFFLINE_ACCESS", "mail.readwrite"]))
         );
+        finish(handle, dir);
+    }
+
+    // --- Tokens in the platform secret store (#1877) ----------------------
+
+    /// How many `TokenStoredUnencrypted` events are among `events`.
+    fn unencrypted_warnings(events: &[SyncEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::TokenStoredUnencrypted))
+            .count()
+    }
+
+    #[test]
+    fn a_plaintext_token_warns_once_per_run() {
+        // No secret store under `cfg(test)`, so every load and save ends in
+        // the token file: the startup load, its near-expiry refresh, and the
+        // refresh after the folder list's 401. One warning for all three.
+        let (mut events, dir, handle, _srv) = startup_events(
+            "unencrypted-once",
+            vec![
+                (
+                    token_route(
+                        r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#,
+                    ),
+                    None,
+                ),
+                (empty_folders_route(401), Some(1)),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            |p| seed_token_with_scopes(p, 10, SEEDED),
+        );
+        // A full pass after the warning (`Refresh`) sends none either.
+        let _ = handle.cmd_tx.send(SyncCommand::Refresh);
+        events.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::FoldersUpdated)
+        }));
+        let cached = tokencache::load(&dir.join("token.bin")).unwrap().unwrap();
+        assert_eq!(cached.access_token, "AT2", "the token was saved again");
+        let expected = if cfg!(windows) { 0 } else { 1 };
+        assert_eq!(unencrypted_warnings(&events), expected, "{events:?}");
+        if !cfg!(windows) {
+            // Sent at the startup load, before the first pass.
+            let warned = events
+                .iter()
+                .position(|e| matches!(e, SyncEvent::TokenStoredUnencrypted))
+                .unwrap();
+            let first_pass = events
+                .iter()
+                .position(|e| matches!(e, SyncEvent::FoldersUpdated))
+                .unwrap();
+            assert!(warned < first_pass, "{events:?}");
+        }
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_sign_in_saved_to_the_file_warns() {
+        // The redeem's save ends in the token file: warned, once.
+        let srv = FakeServer::start(vec![
+            token_route(r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#),
+            empty_folders_route(200),
+        ]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("unencrypted-signin");
+        let token_path = dir.join("token.bin");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        let mut events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        assert_eq!(unencrypted_warnings(&events), 0, "no token yet: {events:?}");
+        sign_in_through_loopback(&handle);
+        events.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::FoldersUpdated)
+        }));
+        assert!(tokencache::load(&token_path).unwrap().is_some());
+        let expected = if cfg!(windows) { 0 } else { 1 };
+        assert_eq!(unencrypted_warnings(&events), expected, "{events:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_reference_without_its_store_says_why_sign_in_is_needed() {
+        // A reference to a store this start cannot reach (none at all under
+        // `cfg(test)`): the user is told why, then asked to sign in.
+        let dir = unique_dir("store-unreachable");
+        let token_path = dir.join("token.bin");
+        tokencache::write_reference(&token_path, "secret-service", "/elsewhere", "me@x").unwrap();
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            test_cfg(),
+            3650,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:9".to_string(),
+            Duration::from_secs(3600),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let error = events.iter().position(
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("secret store unavailable: ")),
+        );
+        assert!(error.is_some(), "{events:?}");
+        assert_eq!(unencrypted_warnings(&events), 0, "{events:?}");
+        assert!(token_path.exists(), "the reference stays for a later start");
         finish(handle, dir);
     }
 
