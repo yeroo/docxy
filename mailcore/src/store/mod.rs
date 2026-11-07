@@ -1747,6 +1747,8 @@ impl Store {
     /// plain-text message's native body is text). Leaves the message's
     /// stored headers as they are, an earlier fetch's included: the engine
     /// stores a fetched body with [`Store::put_fetched_body_with_headers`].
+    /// Tests use it.
+    #[cfg(test)]
     pub fn put_fetched_body(
         &self,
         message_id: &str,
@@ -1756,8 +1758,11 @@ impl Store {
         write_body_on(&self.conn, message_id, b, Some(asked))
     }
 
-    /// [`Store::put_fetched_body`] and the internet headers that came with
-    /// the body (#1933), in one transaction: the message's stored headers
+    /// Inserts or replaces the body of a message as `FetchBody` fetched it,
+    /// recording the format it asked Graph for (`fetched_as`, #1901), which
+    /// for `Html` can differ from the content type that came back (a
+    /// plain-text message's native body is text), and the internet headers
+    /// that came with it (#1933), in one transaction: the message's stored headers
     /// are replaced by those of `headers` named in `STORED_HEADERS` (a
     /// header Graph no longer sends reads `None` after a refetch), names
     /// lowercased, values trimmed, the first of a name kept. Read them with
@@ -7773,9 +7778,44 @@ mod body_format_tests {
     }
 
     #[test]
-    fn a_refused_body_stores_no_headers() {
-        // No message row: the body's foreign key refuses it, and the
-        // headers go with it (one transaction).
+    fn a_failed_header_write_keeps_the_earlier_body_and_headers() {
+        // The body and its headers are one transaction: a header write that
+        // fails after the body write succeeded leaves the earlier body and
+        // headers, not the new body with the old headers.
+        let s = store_with_message();
+        s.put_fetched_body_with_headers(
+            "M",
+            &text_body("v1"),
+            BodyFormat::Text,
+            &[header(AUTH_AS, "Internal")],
+        )
+        .unwrap();
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_headers BEFORE INSERT ON message_headers
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        assert!(
+            s.put_fetched_body_with_headers(
+                "M",
+                &text_body("v2"),
+                BodyFormat::Text,
+                &[header(AUTH_AS, "Anonymous")],
+            )
+            .is_err()
+        );
+        assert_eq!(s.get_body("M").unwrap().unwrap().content, "v1");
+        assert_eq!(
+            s.message_header("M", AUTH_AS).unwrap().as_deref(),
+            Some("Internal")
+        );
+    }
+
+    #[test]
+    fn a_missing_message_stores_no_headers() {
+        // No message row: the body's foreign key refuses it, and no header
+        // row is written for it.
         let s = store_with_message();
         assert!(
             s.put_fetched_body_with_headers(

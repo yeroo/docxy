@@ -2524,7 +2524,7 @@ impl Engine {
     /// (best for a TUI); `Html` sends no `Prefer` and gets each body in its
     /// native format (html, or text for a plain-text message). The body is
     /// stored with the format *asked for*, not the content type it came back
-    /// as (`Store::put_fetched_body`), so `Store::get_body_for` can tell a
+    /// as (`Store::put_fetched_body_with_headers`), so `Store::get_body_for` can tell a
     /// native-text answer to an `Html` ask from a body to refetch. Every
     /// `FetchBody` goes to Graph: the caller decides when one is needed.
     /// Returns `react`'s answer to a failure (true: an auth, throttle or
@@ -3751,6 +3751,9 @@ mod tests {
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     /// The query of a body GET: `get_body_with_headers`'s `$select`
     /// (`BODY_SELECT`, #1933).
@@ -3762,9 +3765,6 @@ mod tests {
     fn body_get_path(id: &str) -> String {
         format!("/me/messages/{id}{}", body_query())
     }
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::mpsc::RecvTimeoutError;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     fn unique_dir(tag: &str) -> PathBuf {
         let n = SystemTime::now()

@@ -42,7 +42,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   unchanged); `Html` sends no `Prefer`, so a body comes back native (html,
   or text for a plain-text message).
 - `bodies.fetched_as` records the format `FetchBody` *asked for*
-  (`Store::put_fetched_body`), not the content type that came back. NULL is
+  (`Store::put_fetched_body_with_headers`), not the content type that came back. NULL is
   a body not fetched by `FetchBody`: `put_body` (a `createReply` draft),
   `create_local_draft`, `update_draft_fields` (which also makes the body
   html, as compose writes html), or a row from before the column.
@@ -542,7 +542,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   window bounds it). A command a checkpoint kept, or a tick come due, ends
   the batch, so they wait for one body at most, as for one backfill page; a
   kept command also ends a round's new-mail bodies (the prefetch takes the
-  rest). One `GET /me/messages/{id}?$select=body` each, the
+  rest). One `GET /me/messages/{id}?$select=body,internetMessageHeaders`
+  (`BODY_SELECT`, #1933) each, the
   call `FetchBody` makes (`fetch_and_store_body` is shared: `fetched_as`
   recorded, `BodyReady` sent, so `BodyReady` may name a message nobody
   opened).
@@ -608,7 +609,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - `SyncEngine::fetch_and_store_body` (FetchBody and the engine's own fetches)
   stores them with `Store::put_fetched_body_with_headers`: body and headers in
   one transaction, the message's earlier headers replaced. `put_fetched_body`
-  leaves headers alone (tests only now).
+  leaves headers alone; it is `#[cfg(test)]`, tests use it.
 - They live in `message_headers` (`message_id`, lowercased `name`, `value`),
   a new table, so an older database gets it empty at `open` and its mail
   reads `None`; old mail is never refetched for them. Rows go with their
@@ -619,7 +620,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Tests: `client.rs` `get_body_selects_internet_message_headers`,
   `get_body_without_usable_headers_yields_none`; `store`
   `body_format_tests::message_header_*`, `refetch_replaces_message_headers`,
-  `a_refused_body_stores_no_headers`, `message_headers_go_with_a_deleted_message`,
+  `a_failed_header_write_keeps_the_earlier_body_and_headers`,
+  `a_missing_message_stores_no_headers`, `message_headers_go_with_a_deleted_message`,
   `reconcile_id_moves_message_headers`; `engine.rs`
   `fetch_body_stores_exchange_auth_as_header`.
 
