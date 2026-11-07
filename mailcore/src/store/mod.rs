@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
-    MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link,
+    MasterCategory, Message, MessageFields, Recipient, Recurrence, meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -2773,9 +2773,7 @@ impl Store {
                 .as_ref()
                 .and_then(|r| EventRecurrence::from_json(&r.to_json())),
             is_organizer: true,
-            join_url: meeting_link(&f.location)
-                .or_else(|| meeting_link(&f.body_html))
-                .unwrap_or_default(),
+            join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
             ..NewEvent::default()
         })?;
         self.put_event_attendees(&id, &to_new_attendees(&f.attendees))?;
@@ -2789,10 +2787,16 @@ impl Store {
     }
 
     /// Overwrites a stored event's editable fields + attendees + body in place.
+    /// `join_url` follows the new location and body (`meeting_link_in`, as
+    /// `create_local_event` derives it), except on an online meeting, whose
+    /// join link is Graph's `onlineMeeting.joinUrl`, which no location or body
+    /// edit changes (#1983).
     pub fn update_event_fields(&self, id: &str, f: &LocalEventFields) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE events SET subject = ?2, start_utc = ?3, end_utc = ?4, is_all_day = ?5,
-                    location = ?6, body_html = ?7 WHERE id = ?1",
+                    location = ?6, body_html = ?7,
+                    join_url = CASE WHEN is_online_meeting THEN join_url ELSE ?8 END
+             WHERE id = ?1",
             params![
                 id,
                 f.subject,
@@ -2800,7 +2804,8 @@ impl Store {
                 f.end_utc,
                 f.is_all_day,
                 f.location,
-                f.body_html
+                f.body_html,
+                meeting_link_in(&f.location, &f.body_html).unwrap_or_default()
             ],
         )?;
         self.put_event_attendees(id, &to_new_attendees(&f.attendees))?;
@@ -5162,6 +5167,54 @@ mod calendar_tests {
         assert_eq!(r.range.r#type, "endDate");
         assert_eq!(r.range.end_date, "2026-08-31");
         assert_eq!(s.event_attendees(&series.id).unwrap()[0].response_time, "");
+    }
+
+    #[test]
+    fn update_event_fields_follows_the_join_link_unless_online_meeting() {
+        let s = Store::open_in_memory().unwrap();
+        let window = ("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z");
+        let join = |s: &Store, id: &str| {
+            s.events_in_window(window.0, window.1)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .join_url
+        };
+        let fields = |location: &str| LocalEventFields {
+            location: location.into(),
+            ..sample_fields()
+        };
+        let id = s
+            .create_local_event(&fields("https://zoom.us/j/1"), "Me", "me@x")
+            .unwrap();
+        assert_eq!(join(&s, &id), "https://zoom.us/j/1");
+        s.update_event_fields(&id, &fields("https://zoom.us/j/2"))
+            .unwrap();
+        assert_eq!(join(&s, &id), "https://zoom.us/j/2");
+        s.update_event_fields(&id, &fields("Room 2")).unwrap();
+        assert_eq!(join(&s, &id), "", "no link left in location or body");
+        s.update_event_fields(
+            &id,
+            &LocalEventFields {
+                body_html: "<a href=\"https://meet.google.com/abc-defg-hij\">Join</a>".into(),
+                ..fields("Room 2")
+            },
+        )
+        .unwrap();
+        assert_eq!(join(&s, &id), "https://meet.google.com/abc-defg-hij");
+
+        // A synced online meeting keeps Graph's join link through an edit
+        // that drops every link.
+        let teams = "https://teams.microsoft.com/l/meetup-join/T";
+        s.upsert_event(&NewEvent {
+            is_online_meeting: true,
+            join_url: teams.into(),
+            ..ev("G1", "2026-07-20T13:00:00Z", "2026-07-20T14:00:00Z")
+        })
+        .unwrap();
+        s.update_event_fields("G1", &fields("Room 3")).unwrap();
+        assert_eq!(join(&s, "G1"), teams);
     }
 
     /// A database whose `events` / `event_attendees` tables are at their

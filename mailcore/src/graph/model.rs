@@ -1061,8 +1061,7 @@ impl Event {
             .map(str::to_string)
             .filter(|u| !u.is_empty())
             .or_else(|| opt_str_field(v, "onlineMeetingUrl").filter(|u| !u.is_empty()))
-            .or_else(|| meeting_link(&location))
-            .or_else(|| meeting_link(&body_html))
+            .or_else(|| meeting_link_in(&location, &body_html))
             .unwrap_or_default();
         let flag = |key: &str, absent: bool| v.get(key).and_then(Value::as_bool).unwrap_or(absent);
         Some(Event {
@@ -1130,15 +1129,28 @@ impl Event {
     }
 }
 
+/// The meeting link an event's location or body holds: the location's
+/// first, else the body's (`meeting_link`). The location goes first: it is a
+/// field someone set, while a body can quote an old invite. `Event::from_json`
+/// falls back to it after Graph's own join link, and the store derives a local
+/// event's `join_url` with it on create and edit.
+pub(crate) fn meeting_link_in(location: &str, body: &str) -> Option<String> {
+    meeting_link(location).or_else(|| meeting_link(body))
+}
+
 /// The first link in `text` (an event's location or HTML/text body) that
 /// joins a meeting on a known service, or `None`. A link starts at
-/// `https://` (any case) and ends at a quote, `<`, `>`, whitespace or the
-/// end; `&amp;` is decoded, then trailing prose punctuation (`.`, `,`, `;`,
-/// `:`, `)`, `]`, `!`) is trimmed. Only the parsed host decides the service
-/// (`is_meeting_url`), so a meeting host in another link's query, or a
-/// lookalike host, is not taken. Safe Links-wrapped links
-/// (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
-pub(crate) fn meeting_link(text: &str) -> Option<String> {
+/// `https://` (any case) and ends at a quote, `<`, `>`, whitespace, an
+/// escaped bracket or quote (`&lt;`, `&gt;`, `&quot;`, `&#39;`, `&#x27;`) or
+/// the end; `&amp;` is decoded, then trailing prose punctuation (`.`, `,`,
+/// `;`, `:`, `)`, `]`, `!`) is trimmed. Only the parsed host decides the
+/// service (`is_meeting_url`), and the scan resumes after a rejected link's
+/// end, so a meeting link inside another link's query or path, or a
+/// lookalike host, is not taken, and each byte is scanned once (a body is
+/// sender-controlled: a long run of `https://` must stay linear). Safe
+/// Links-wrapped links (`*.safelinks.protection.outlook.com/?url=...`) are
+/// not unwrapped.
+fn meeting_link(text: &str) -> Option<String> {
     const SCHEME: &str = "https://";
     // ASCII lowercasing keeps every byte offset, so offsets in `lower`
     // index `text` too (and land on the ASCII `h`, a char boundary).
@@ -1146,18 +1158,30 @@ pub(crate) fn meeting_link(text: &str) -> Option<String> {
     let mut from = 0;
     while let Some(pos) = lower[from..].find(SCHEME) {
         let start = from + pos;
-        let rest = &text[start..];
-        let end = rest
-            .find(|c: char| matches!(c, '"' | '\'' | '<' | '>') || c.is_whitespace())
-            .unwrap_or(rest.len());
-        let decoded = rest[..end].replace("&amp;", "&");
+        let end = link_end(text, start + SCHEME.len());
+        let decoded = text[start..end].replace("&amp;", "&");
         let url = decoded.trim_end_matches(['.', ',', ';', ':', ')', ']', '!']);
         if is_meeting_url(&url[SCHEME.len()..]) {
             return Some(url.to_string());
         }
-        from = start + SCHEME.len();
+        from = end;
     }
     None
+}
+
+/// The byte offset where the link whose scheme ends at `from` ends: the
+/// first quote, `<`, `>`, whitespace or escaped bracket/quote at or after
+/// `from`, else `text.len()`.
+fn link_end(text: &str, from: usize) -> usize {
+    const ESCAPED_ENDS: [&str; 5] = ["&lt;", "&gt;", "&quot;", "&#39;", "&#x27;"];
+    text[from..]
+        .char_indices()
+        .find(|&(i, c)| {
+            matches!(c, '"' | '\'' | '<' | '>')
+                || c.is_whitespace()
+                || (c == '&' && ESCAPED_ENDS.iter().any(|e| text[from + i..].starts_with(e)))
+        })
+        .map_or(text.len(), |(i, _)| from + i)
 }
 
 /// `after_scheme` (a link without its `https://`) is a meeting link: its
@@ -1174,7 +1198,7 @@ fn is_meeting_url(after_scheme: &str) -> bool {
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
     let path = &after_scheme[authority_end..];
-    if authority.contains(['@', '\\']) {
+    if authority.contains('@') {
         return false;
     }
     let host = match authority.split_once(':') {
@@ -2095,6 +2119,9 @@ mod tests {
             // A port that is not digits, a host with other characters.
             "https://zoom.us:44x/j/1",
             "https://zo%6Fm.us/j/1",
+            // A meeting link nested in another link's query or path.
+            "https://evil.example/?u=https://zoom.us/j/1",
+            "https://evil.example/r/https://teams.microsoft.com/l/meetup-join/1",
         ] {
             let e = ev(&format!(r#","location":{{"displayName":"{text}"}}"#));
             assert_eq!(e.join_url, "", "{text}");
@@ -2109,6 +2136,39 @@ mod tests {
             e.join_url,
             "https://teams.microsoft.com:443/l/meetup-join/2"
         );
+    }
+
+    #[test]
+    fn event_join_url_ends_at_escaped_brackets_and_quotes() {
+        for (body, want) in [
+            (
+                "Join: &lt;https://zoom.us/j/7&gt; now",
+                "https://zoom.us/j/7",
+            ),
+            ("&quot;https://zoom.us/j/8&quot;", "https://zoom.us/j/8"),
+            ("&#39;https://zoom.us/j/9&#39;", "https://zoom.us/j/9"),
+            ("&#x27;https://zoom.us/j/10&#x27;", "https://zoom.us/j/10"),
+            (
+                "https://zoom.us/j/11?a=1&amp;b=2&gt;",
+                "https://zoom.us/j/11?a=1&b=2",
+            ),
+        ] {
+            let e = ev(&format!(r#","body":{{"content":"{body}"}}"#));
+            assert_eq!(e.join_url, want, "{body}");
+        }
+    }
+
+    /// A sender-controlled body of `https://` with no whitespace is scanned
+    /// once, not once per `https://` (that took minutes at this size); a
+    /// link after the run is still found. Finishing is the check.
+    #[test]
+    fn event_join_url_scan_is_linear_on_a_long_scheme_run() {
+        let run = "https://".repeat(200_000);
+        assert_eq!(meeting_link(&run), None);
+        let text = format!("{run} https://zoom.us/j/1");
+        assert_eq!(meeting_link(&text).as_deref(), Some("https://zoom.us/j/1"));
+        let e = ev(&format!(r#","body":{{"content":"{run}"}}"#));
+        assert_eq!(e.join_url, "");
     }
 
     #[test]
