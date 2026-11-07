@@ -707,6 +707,53 @@ impl DeltaPage {
     }
 }
 
+/// One entry of a calendarView delta page (#2013): an added or changed
+/// occurrence, or the id of one removed since the last round (an item
+/// with `@removed`). What a removal deletes is the store's rule
+/// (`apply_calendar_delta_on`): only rows in the window, and a series
+/// master's occurrences unless the round names some of them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventDeltaItem {
+    Upsert(Event),
+    Removed(String),
+}
+
+/// A page of `/me/calendars/{id}/calendarView/delta` (#2013), with the
+/// `nextLink` to the next page or, on the last page, the `deltaLink` the
+/// next round starts from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventDeltaPage {
+    pub items: Vec<EventDeltaItem>,
+    pub next_link: Option<String>,
+    pub delta_link: Option<String>,
+}
+
+impl EventDeltaPage {
+    /// `None` without a `value` array. A removed item without an id is
+    /// dropped (there is nothing to remove).
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let items = v
+            .get("value")?
+            .as_array()?
+            .iter()
+            .filter_map(|item| {
+                if item.get("@removed").is_some() {
+                    opt_str_field(item, "id")
+                        .filter(|id| !id.is_empty())
+                        .map(EventDeltaItem::Removed)
+                } else {
+                    Event::from_json(item).map(EventDeltaItem::Upsert)
+                }
+            })
+            .collect();
+        Some(EventDeltaPage {
+            items,
+            next_link: opt_str_field(v, "@odata.nextLink"),
+            delta_link: opt_str_field(v, "@odata.deltaLink"),
+        })
+    }
+}
+
 /// One attendee of a calendar event (required/optional/resource), and
 /// their RSVP status as Graph's `attendees[].status.response`.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1770,6 +1817,42 @@ mod tests {
         let f = MessageFields::of(&invite);
         assert!(f.is_partial() && f.writes_meeting_request() && f.writes_is_draft());
         assert!(!MessageFields::all().is_partial());
+    }
+
+    #[test]
+    fn event_delta_page_reads_upserts_removed_and_links() {
+        let v = parse(
+            r#"{
+          "value":[
+            {"id":"E1","subject":"Standup","start":{"dateTime":"2026-07-18T09:00:00.0000000","timeZone":"UTC"},"end":{"dateTime":"2026-07-18T09:30:00.0000000","timeZone":"UTC"}},
+            {"id":"E2","@removed":{"reason":"deleted"}},
+            {"@removed":{"reason":"deleted"}}
+          ],
+          "@odata.deltaLink":"https://graph.example/delta?$deltatoken=T"
+        }"#,
+        )
+        .unwrap();
+        let page = EventDeltaPage::from_json(&v).unwrap();
+        assert_eq!(page.items.len(), 2);
+        let EventDeltaItem::Upsert(e) = &page.items[0] else {
+            panic!("an upsert first")
+        };
+        assert_eq!(
+            (e.id.as_str(), e.subject.as_str(), e.start_utc.as_str()),
+            ("E1", "Standup", "2026-07-18T09:00:00Z")
+        );
+        assert_eq!(page.items[1], EventDeltaItem::Removed("E2".to_string()));
+        assert_eq!(page.next_link, None);
+        assert_eq!(
+            page.delta_link.as_deref(),
+            Some("https://graph.example/delta?$deltatoken=T")
+        );
+    }
+
+    #[test]
+    fn event_delta_page_without_value_is_none() {
+        let v = parse(r#"{"@odata.deltaLink":"x"}"#).unwrap();
+        assert!(EventDeltaPage::from_json(&v).is_none());
     }
 
     #[test]

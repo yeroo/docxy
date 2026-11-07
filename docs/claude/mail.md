@@ -841,10 +841,12 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
   default always, and every calendar when there is no default or it has no
   owner address.
 - A pass (`Engine::refresh_calendar`, tick and `RefreshCalendar`): list, then
-  each synced calendar's view over `calendar_window(now)`, then one
+  each synced calendar's round over `calendar_window(now)` (a
+  `calendarView/delta` round since #2013, next section but one), then one
   transaction (`Store::apply_calendar_sync`): (1) rows with `calendar_id = ''`
   (`local:` too) take the default calendar's id, when one is stored; (2) each
-  fetched calendar's non-`local:` rows overlapping the window are replaced;
+  fetched calendar's non-`local:` rows overlapping the window are replaced
+  (an initial round; a delta round applies only what it names);
   (3) non-`local:` rows of any date whose non-empty `calendar_id` is not
   synced are deleted. Step 1 matters: before #1984 sync read only the
   default calendar and never deleted rows that slid out of the window, so a
@@ -902,7 +904,7 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
 ## Calendar ranges on demand (#2014)
 
 Item 1 of #1984: a host whose calendar shows dates outside the kept window
-(`calendar_window`, 7 days back and 30 forward) asks for them.
+(`calendar_window`, 30 days back and 180 forward since #2013) asks for them.
 
 - `SyncCommand::FetchCalendarRange { from_utc, to_utc }` (the store's
   `YYYY-MM-DDTHH:MM:SSZ`; anything else, or `from >= to`, is an `Error`
@@ -937,7 +939,8 @@ Item 1 of #1984: a host whose calendar shows dates outside the kept window
   freshness re-fetches within the same second.
 - Every calendar pass records its window (`apply_calendar_sync` takes a
   `RangeStamp`), so a range inside the window costs nothing. The window
-  slides each pass and would leave one sliver row per pass: recording
+  moves (each UTC day since #2013, each pass before) and would leave one
+  sliver row per move: recording
   first deletes the calendar's rows at or before the cutoff, which can
   never count again.
 - Forgetting: `delete_calendar_events_on` (deselecting, `SetCalendars`)
@@ -967,8 +970,132 @@ Item 1 of #1984: a host whose calendar shows dates outside the kept window
   `fetch_calendar_range_rejects_bad_bounds`,
   `fetch_calendar_range_throttled_emits_no_range_fetched`,
   `fetch_calendar_range_keeps_going_past_a_failed_calendar`. The engine
-  tests count `/me/calendars` requests only (`calendar_requests`): the
-  mail sync makes its own requests in the meantime.
+  tests count calendar requests only (`calendar_requests`: `/me/calendars`
+  and, since #2013, the `/cal-delta/` link rounds): the mail sync makes
+  its own requests in the meantime.
+
+## Calendar delta over a kept window (#2013)
+
+Item 2 of #1984, with item 3's "delta per calendar": each pass keeps a
+wider window fresh without downloading it again.
+
+- The window: `EngineOptions::calendar_window` (`CalendarWindow {
+  past_days, future_days }`, default 30 and 180). `calendar_window(base,
+  window)` anchors at the start of `base`'s UTC day: `[day - past_days,
+  day + future_days + 1)`, the whole of the last day. Anchored, so the
+  bounds, and a deltaLink over them, hold all day; the first pass of a new
+  day (or after the option changed) runs an initial round per calendar. An
+  unanchored `now - 30 d` would never match a stored link.
+- `GraphClient::calendar_delta(CalendarDeltaCursor)`: one page. `Start {
+  calendar_id, from_utc, to_utc }` GETs `/me/calendars/{encoded id}/
+  calendarView/delta?startDateTime=&endDateTime=` (no `$top` or `$select`:
+  Graph's calendarView delta refuses both) and sets each upsert's
+  `calendar_id` (the URL decides); `Link(url)` sends a nextLink or
+  deltaLink as is (`full_url`), and the engine sets the calendar. Every
+  request, a link's too, sends `Prefer: outlook.timezone="UTC",
+  odata.maxpagesize=50`: a deltaLink does not keep the time zone.
+  `EventDeltaPage` holds `EventDeltaItem::Upsert(Event)` or `Removed(id)`
+  (an `@removed` item; one without an id is dropped). No `value` array, or
+  neither a nextLink nor a deltaLink (a round that could never end), is a
+  `Parse` error.
+- State: the `calendar_deltas` table (`calendar_id` primary key,
+  `from_utc`, `to_utc`, `delta_link`), `CREATE TABLE IF NOT EXISTS`, so an
+  older database starts with initial rounds. `Store::calendar_delta(id)`.
+  A pass uses the link only while its `(from, to)` is the pass's window.
+  The old single `meta` `calendar_delta_link` (never read) is gone; an
+  old row of it stays, unread.
+- A round (`Engine::calendar_delta_round`) follows nextLinks to the
+  deltaLink with every page in memory, so a round that fails part way
+  writes nothing (replaying a link is harmless). In a delta round the
+  latest item about an event wins: a removal drops the round's earlier
+  upserts of that id (not of its occurrences: see the series rule below),
+  and an upsert cancels an earlier removal, since the store removes
+  first. An initial round's
+  removals are ignored: it replaces the window.
+- Writing: `apply_calendar_sync` takes `SyncedCalendar { fetched, round,
+  delta_link }` (`FetchedCalendar` itself is unchanged, and
+  `apply_calendar_range` still takes it). `CalendarRound::Window` is the
+  #1984 replace. `CalendarRound::Delta { removed }` upserts `fetched`'s
+  events under the calendar's id with their attendees, and each removed id
+  deletes that calendar's non-`local:` row with that id and every row
+  whose `series_master_id` it is (a removed series takes its
+  occurrences; Graph's docs do not say whether it lists a master or each
+  occurrence, so both are handled; an id with no row is a no-op). A
+  removal deletes only rows overlapping the window: Graph's calendarView
+  delta also lists as `@removed` events outside the range that were
+  added, changed or deleted, which Graph may still have (an event moved
+  to day 200, a `FetchCalendarRange` row, history); an event that moved
+  out still has its old in-window times locally, so it goes. A removed
+  id the round also upserts occurrences of is a changed series master
+  (one starting before the window is "outside the range" when edited),
+  not a removed series: only the row with that id goes, and the engine
+  keeps the round's occurrences of it. Both
+  record the window as fetched (#2014's freshness) and store the window
+  and deltaLink, in the pass's one transaction. Except after a series
+  cascade (a delta round's removed master took occurrence rows other than
+  its own id's): Graph may list a master that only changed (its series end
+  moved past the window, say) with no in-window occurrence in the round,
+  so the calendar's delta state is deleted and the window not recorded
+  again; the next pass's initial round restores what Graph still has, or
+  confirms it is gone. Until then the earlier window record (an hour
+  fresh) still serves a `FetchCalendarRange` inside it from the store.
+- Errors: an expired link (`is_expired_sync_state`, as mail's #1871: a
+  410, or a 400 `syncStateNotFound`/`syncStateInvalid`/`resyncRequired`)
+  runs that calendar's initial round at once, in the same pass, once, with
+  no `Error`. A 401, throttle or transport error goes through `react`: the
+  pass writes nothing and every link stays, so the next pass after the
+  wait runs the same link. A 404, other HTTP or parse error is an `Error`,
+  and that calendar keeps its rows and link: a link that keeps failing
+  that way is retried until the window moves, at most a day.
+- Forgetting: `delete_calendar_events_on` (deselect, `SetCalendars`)
+  deletes the calendar's state with its events, or the calendar selected
+  again would replay its link onto no rows; step 3 deletes the state of
+  every calendar not synced.
+- Event-op quarantine: a delta never names an event Graph did not change,
+  so a quarantined `RespondEvent`, `UpdateEvent` or `DeleteEvent` would
+  leave its optimistic local write (an RSVP, edited fields, a deleted row)
+  until the next day. Before #2013 every tick's window replace repaired
+  it. `drain_outbox` now calls `Store::clear_calendar_deltas` and then
+  `refresh_calendar` for those three: on disk, so if that refresh fails the
+  next pass still runs initial rounds. `CreateEvent`'s `local:` row is
+  never replaced either way.
+- Not done: no checkpoint between a round's pages (as before); series
+  masters are not fetched; `FetchCalendarRange` stays plain
+  `calendarView` (a range overlapping the window, when its record is
+  stale, re-fetches that part, server truth either way). Two passes
+  straddling 00:00 UTC make the second an initial round, so a test that
+  asserts a link round could see one around midnight; no clock seam.
+- Tests: `model.rs` `event_delta_page_reads_upserts_removed_and_links`,
+  `event_delta_page_without_value_is_none`; `client.rs`
+  `calendar_delta_start_encodes_id_window_and_prefer_headers`,
+  `calendar_delta_link_cursor_uses_url_as_is`,
+  `calendar_delta_page_without_any_link_is_a_parse_error`; `store`
+  `calendar_tests` `apply_calendar_sync_delta_upserts_and_removes_only_that_calendar`,
+  `apply_calendar_sync_delta_removed_series_master_removes_its_occurrences`,
+  `apply_calendar_sync_delta_keeps_local_rows`,
+  `apply_calendar_sync_delta_removes_only_rows_in_the_window`,
+  `apply_calendar_sync_delta_keeps_a_series_the_round_names_occurrences_of`,
+  `apply_calendar_sync_delta_cascade_drops_the_delta_state_and_records_no_range`,
+  `apply_calendar_sync_delta_plain_removal_stores_the_link`,
+  `apply_calendar_sync_stores_and_forgets_delta_state`,
+  `clear_calendar_deltas_clears_every_calendar`; `engine.rs`
+  `calendar_window_defaults_to_30_days_back_and_180_days_forward`,
+  `refresh_calendar_first_pass_is_an_initial_delta_over_the_window`,
+  `refresh_calendar_uses_the_custom_window_option`,
+  `calendar_delta_adds_updates_and_removes_occurrences`,
+  `calendar_delta_removed_series_master_removes_its_occurrences`,
+  `calendar_delta_removed_outside_the_window_keeps_the_row`,
+  `calendar_delta_removed_master_beside_its_occurrences_keeps_them`,
+  `calendar_delta_410_restarts_with_an_initial_round`,
+  `calendar_delta_throttled_keeps_the_link_and_writes_nothing`,
+  `calendar_delta_link_of_another_window_is_not_used`,
+  `respond_event_quarantine_reconverges_local_status_from_server_truth`,
+  `delete_event_quarantine_restores_the_event`. Fixtures:
+  `calendar_routes` serves each calendar's initial delta round (its body
+  with `delta_link_of(id)`, a relative `/cal-delta/{id}?token=1`), that
+  link with no change, and the plain `calendarView?` ranges use; every
+  view prefix ends in `?`, so none answers another. #2014's "outside the
+  window" events are now 200 days out.
 
 ## Contacts folder and is_contact (#1934)
 

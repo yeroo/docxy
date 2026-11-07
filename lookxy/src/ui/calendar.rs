@@ -32,11 +32,11 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// How many days into the past/future `agenda_window` covers — matches
-/// `mailcore::sync::engine`'s `RefreshCalendar` fetch window (see its
-/// `CALENDAR_WINDOW_PAST_DAYS`/`CALENDAR_WINDOW_FUTURE_DAYS`, private to that
-/// module), so the agenda never asks the store for a wider range than what
-/// actually gets synced into it.
+/// How many days into the past/future `agenda_window` covers: 7 back and
+/// 30 forward, inside the window the engine keeps synced
+/// (`mailcore::sync::engine::EngineOptions::calendar_window`, by default 30
+/// days back and 180 forward), so the agenda never asks the store for a
+/// wider range than what actually gets synced into it.
 const AGENDA_WINDOW_PAST_DAYS: i64 = 7;
 const AGENDA_WINDOW_FUTURE_DAYS: i64 = 30;
 

@@ -267,6 +267,17 @@ CREATE TABLE IF NOT EXISTS calendar_ranges (
 
 CREATE INDEX IF NOT EXISTS idx_calendar_ranges ON calendar_ranges(calendar_id, from_utc);
 
+-- Each synced calendar's calendarView delta state (#2013): the deltaLink of
+-- its last round and the window `[from_utc, to_utc)` that round covers. A
+-- pass uses the link only while the window is the pass's own. Written with
+-- the pass (`apply_calendar_sync`), deleted with the calendar's events.
+CREATE TABLE IF NOT EXISTS calendar_deltas (
+    calendar_id TEXT PRIMARY KEY,
+    from_utc    TEXT NOT NULL,
+    to_utc      TEXT NOT NULL,
+    delta_link  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS event_attendees (
     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     name     TEXT NOT NULL DEFAULT '',

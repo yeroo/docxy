@@ -112,6 +112,7 @@ issue number to find its notes.
   shows (#1983), creating and updating them, an update PATCHes only what changed (#1994),
   every calendar, `SetCalendars`, events in a range and days with events (#1984),
   a calendar range on demand, fetched once while fresh (#2014),
+  a 30/180-day window kept by calendarView delta per calendar (#2013),
   the Contacts folder and `is_contact` (#1934).
 
 ## Build and test
