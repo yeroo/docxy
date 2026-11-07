@@ -13,7 +13,7 @@
 //! around it is the store-generic core, tested over a fake.
 #![cfg_attr(test, allow(dead_code))]
 
-use super::{SecretStore, StoreError};
+use super::{SecretStore, SecretStoreError};
 use security_framework::passwords;
 use std::io;
 
@@ -34,7 +34,7 @@ impl SecretStore for Keychain {
         "keychain"
     }
 
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
         match passwords::get_generic_password(SERVICE, key) {
             Ok(secret) => Ok(Some(secret)),
             Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
@@ -42,11 +42,11 @@ impl SecretStore for Keychain {
         }
     }
 
-    fn set(&self, key: &str, _label: &str, secret: &[u8]) -> Result<(), StoreError> {
+    fn set(&self, key: &str, _label: &str, secret: &[u8]) -> Result<(), SecretStoreError> {
         passwords::set_generic_password(SERVICE, key, secret).map_err(classify)
     }
 
-    fn delete(&self, key: &str) -> Result<(), StoreError> {
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
         match passwords::delete_generic_password(SERVICE, key) {
             Ok(()) => Ok(()),
             Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
@@ -59,13 +59,13 @@ impl SecretStore for Keychain {
 /// prompt is `Refused`; no keychain, or one that cannot ask the user
 /// (`errSecInteractionNotAllowed`: no GUI session), is `Unavailable`;
 /// anything else is `Failed`.
-fn classify(e: security_framework::base::Error) -> StoreError {
+fn classify(e: security_framework::base::Error) -> SecretStoreError {
     let message = format!("Keychain: {e} ({})", e.code());
     match e.code() {
-        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => StoreError::Refused(message),
+        ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED => SecretStoreError::Refused(message),
         ERR_SEC_NOT_AVAILABLE | ERR_SEC_NO_SUCH_KEYCHAIN | ERR_SEC_INTERACTION_NOT_ALLOWED => {
-            StoreError::Unavailable(message)
+            SecretStoreError::Unavailable(message)
         }
-        _ => StoreError::Failed(io::Error::other(message)),
+        _ => SecretStoreError::Failed(io::Error::other(message)),
     }
 }

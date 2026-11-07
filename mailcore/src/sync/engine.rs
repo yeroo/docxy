@@ -3166,22 +3166,18 @@ impl Engine {
         }
     }
 
-    /// Sign out: delete the saved token and drop the in-memory one. A file
-    /// that cannot be deleted is reported, but the engine still signs out:
-    /// keeping the token because of it would make Sign out do nothing. A
-    /// throttle or offline deadline belonged to the old session and goes; the
-    /// outbox's own back-off stays with the outbox, which is kept.
+    /// Sign out: delete the saved token, in the file and in the secret
+    /// store (#1877), and drop the in-memory one. What could not be deleted
+    /// is reported, but the engine still signs out: keeping the token
+    /// because of it would make Sign out do nothing. A file still there
+    /// may be used again at the next start; a store that could not be
+    /// reached may or may not hold an item (it is asked whatever the file
+    /// held); a store that failed kept its item. A throttle or offline
+    /// deadline belonged to the old session and goes; the outbox's own
+    /// back-off stays with the outbox, which is kept.
     fn sign_out(&mut self) {
         if let Err(e) = tokencache::clear(&self.config.token_path) {
-            let message = if self.config.token_path.exists() {
-                format!(
-                    "could not delete the saved sign-in ({e}); it may be used again at the next start"
-                )
-            } else {
-                // The file is gone, so the next start is signed out, but
-                // the secret store kept its item (#1877).
-                format!("could not delete the sign-in from the secret store ({e}); it stays there")
-            };
+            let message = sign_out_error(&e, self.config.token_path.exists());
             self.emit(SyncEvent::Error(message));
         }
         self.clear_backoff();
@@ -4294,6 +4290,20 @@ fn looks_like_icalendar(bytes: &[u8]) -> bool {
     let s = String::from_utf8_lossy(head);
     let s = s.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
     s.to_ascii_uppercase().starts_with("BEGIN:VCALENDAR")
+}
+
+/// What a sign-out reports when `tokencache::clear` failed with `e`
+/// (#1877): `file_left` when the token file is still there.
+fn sign_out_error(e: &std::io::Error, file_left: bool) -> String {
+    if file_left {
+        format!("could not delete the saved sign-in ({e}); it may be used again at the next start")
+    } else if e.kind() == std::io::ErrorKind::NotConnected {
+        // No store to ask (no bus, no keyring, or a refusal): whether it
+        // holds an item is unknown, so nothing is claimed.
+        format!("could not reach the secret store to delete a sign-in saved there ({e})")
+    } else {
+        format!("could not delete the sign-in from the secret store ({e}); it stays there")
+    }
 }
 
 #[cfg(test)]
@@ -7695,6 +7705,28 @@ mod tests {
         let expected = if cfg!(windows) { 0 } else { 1 };
         assert_eq!(unencrypted_warnings(&events), expected, "{events:?}");
         finish(handle, dir);
+    }
+
+    #[test]
+    fn sign_out_errors_say_what_was_left() {
+        let io = |kind, m: &str| std::io::Error::new(kind, m.to_string());
+        let unreachable = io(
+            std::io::ErrorKind::NotConnected,
+            "secret store unavailable: no D-Bus session bus",
+        );
+        // No keyring on this computer: nothing is claimed about an item.
+        let m = sign_out_error(&unreachable, false);
+        assert!(m.starts_with("could not reach the secret store"), "{m}");
+        assert!(!m.contains("stays there"), "{m}");
+        // The store answered with an error: it kept its item.
+        let m = sign_out_error(
+            &io(std::io::ErrorKind::Other, "Secret Service: boom"),
+            false,
+        );
+        assert!(m.ends_with("it stays there"), "{m}");
+        // The file itself is still there.
+        let m = sign_out_error(&io(std::io::ErrorKind::PermissionDenied, "denied"), true);
+        assert!(m.ends_with("it may be used again at the next start"), "{m}");
     }
 
     #[test]

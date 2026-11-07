@@ -11,16 +11,19 @@
 //! path), and is created in the `default` collection (the login keyring).
 //! A locked item or collection is unlocked through the service's prompt,
 //! waited for up to [`PROMPT_TIMEOUT`]; dismissed or unanswered is
-//! [`StoreError::Refused`]. No session bus, no Secret Service, or no
-//! default collection is [`StoreError::Unavailable`]; any other D-Bus error
-//! is [`StoreError::Failed`].
+//! [`SecretStoreError::Refused`], and so is a method call the service does
+//! not answer within [`METHOD_TIMEOUT`] (a wedged service), so the latch
+//! stops asking it. No session bus, no Secret Service, or no default
+//! collection is [`SecretStoreError::Unavailable`]; any other D-Bus error is
+//! [`SecretStoreError::Failed`]. Locked items are unlocked before they are
+//! read or deleted (deleting a locked item fails with `IsLocked`).
 
-use super::{SecretStore, StoreError};
+use super::{SecretStore, SecretStoreError};
+use futures_lite::StreamExt;
 use std::collections::HashMap;
 use std::io;
-use std::sync::mpsc;
 use std::time::Duration;
-use zbus::blocking::{Connection, MessageIterator};
+use zbus::blocking::Connection;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Value};
 
 const DEST: &str = "org.freedesktop.secrets";
@@ -37,7 +40,12 @@ const APPLICATION: &str = "mailcore";
 
 /// How long an unlock prompt may stay unanswered before the call gives up
 /// (and the prompt is dismissed).
-pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long one D-Bus method call may wait for the service's reply: zbus
+/// waits forever by default, which a wedged service would turn into an
+/// engine thread blocked for good.
+pub(crate) const METHOD_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The Secret Service on the session bus.
 pub struct SecretService;
@@ -52,9 +60,11 @@ struct Session {
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 impl Session {
-    fn open() -> Result<Session, StoreError> {
-        let conn = Connection::session()
-            .map_err(|e| StoreError::Unavailable(format!("no D-Bus session bus: {e}")))?;
+    fn open() -> Result<Session, SecretStoreError> {
+        let conn = zbus::blocking::connection::Builder::session()
+            .map(|b| b.method_timeout(METHOD_TIMEOUT))
+            .and_then(|b| b.build())
+            .map_err(|e| SecretStoreError::Unavailable(format!("no D-Bus session bus: {e}")))?;
         let (_, session): (OwnedValue, OwnedObjectPath) = call(
             &conn,
             SERVICE_PATH,
@@ -69,7 +79,7 @@ impl Session {
     fn search(
         &self,
         key: &str,
-    ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), StoreError> {
+    ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), SecretStoreError> {
         call(
             &self.conn,
             SERVICE_PATH,
@@ -80,7 +90,7 @@ impl Session {
     }
 
     /// Unlocks `objects`, through the service's prompt if it asks for one.
-    fn unlock(&self, objects: &[OwnedObjectPath]) -> Result<(), StoreError> {
+    fn unlock(&self, objects: &[OwnedObjectPath]) -> Result<(), SecretStoreError> {
         let (_, prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
             call(&self.conn, SERVICE_PATH, SERVICE, "Unlock", &(objects,))?;
         self.prompt(&prompt)
@@ -88,8 +98,10 @@ impl Session {
 
     /// Runs the prompt at `path` (`/` is none) and waits for its answer.
     /// The `Completed` signal is subscribed to before the prompt is shown,
-    /// so a fast answer is not missed.
-    fn prompt(&self, path: &ObjectPath<'_>) -> Result<(), StoreError> {
+    /// so a fast answer is not missed. The wait races a timer on this
+    /// thread, and the subscription is dropped on return: nothing outlives
+    /// the call, answered or not.
+    fn prompt(&self, path: &ObjectPath<'_>) -> Result<(), SecretStoreError> {
         if path.as_str() == "/" {
             return Ok(());
         }
@@ -100,41 +112,75 @@ impl Session {
             .and_then(|b| b.path(path.to_owned()))
             .map_err(failed)?
             .build();
-        let mut signals =
-            MessageIterator::for_match_rule(rule, &self.conn, Some(4)).map_err(failed)?;
+        let mut signals = futures_lite::future::block_on(zbus::MessageStream::for_match_rule(
+            rule,
+            self.conn.inner(),
+            Some(4),
+        ))
+        .map_err(failed)?;
         let () = call(&self.conn, path.as_str(), PROMPT, "Prompt", &("",))?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let dismissed = signals.next().map(|m| {
-                m.map_err(failed).and_then(|m| {
-                    m.body()
-                        .deserialize::<(bool, OwnedValue)>()
-                        .map(|(dismissed, _)| dismissed)
-                        .map_err(failed)
-                })
-            });
-            let _ = tx.send(dismissed);
-        });
-        match rx.recv_timeout(PROMPT_TIMEOUT) {
-            Ok(Some(Ok(false))) => Ok(()),
-            Ok(Some(Ok(true))) => Err(StoreError::Refused(
-                "the unlock prompt was dismissed".into(),
-            )),
-            Ok(Some(Err(e))) => Err(e),
-            Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => Err(StoreError::Unavailable(
+        let answer = futures_lite::future::block_on(futures_lite::future::or(
+            async { Some(signals.next().await) },
+            async {
+                async_io::Timer::after(PROMPT_TIMEOUT).await;
+                None
+            },
+        ));
+        match answer {
+            Some(Some(Ok(m))) => {
+                let (dismissed, _) = m
+                    .body()
+                    .deserialize::<(bool, OwnedValue)>()
+                    .map_err(failed)?;
+                if dismissed {
+                    Err(SecretStoreError::Refused(
+                        "the unlock prompt was dismissed".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Some(Some(Err(e))) => Err(failed(e)),
+            Some(None) => Err(SecretStoreError::Unavailable(
                 "the Secret Service went away during its prompt".into(),
             )),
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            None => {
                 let _: Result<(), _> = call(&self.conn, path.as_str(), PROMPT, "Dismiss", &());
-                Err(StoreError::Refused(
+                Err(SecretStoreError::Refused(
                     "nobody answered the unlock prompt".into(),
                 ))
             }
         }
     }
 
+    /// Deletes `key`'s items other than `kept` outside `collection`,
+    /// unlocking the locked ones first.
+    fn delete_outside(
+        &self,
+        key: &str,
+        kept: &ObjectPath<'_>,
+        collection: &str,
+    ) -> Result<(), SecretStoreError> {
+        let inside = format!("{collection}/");
+        let outside = |items: Vec<OwnedObjectPath>| -> Vec<OwnedObjectPath> {
+            items
+                .into_iter()
+                .filter(|i| i.as_str() != kept.as_str() && !i.as_str().starts_with(&inside))
+                .collect()
+        };
+        let (unlocked, locked) = self.search(key)?;
+        let (unlocked, locked) = (outside(unlocked), outside(locked));
+        if !locked.is_empty() {
+            self.unlock(&locked)?;
+        }
+        for item in unlocked.iter().chain(&locked) {
+            self.delete_item(item)?;
+        }
+        Ok(())
+    }
+
     /// Deletes the item at `item`, through a prompt if the service asks.
-    fn delete_item(&self, item: &ObjectPath<'_>) -> Result<(), StoreError> {
+    fn delete_item(&self, item: &ObjectPath<'_>) -> Result<(), SecretStoreError> {
         let prompt: OwnedObjectPath = call(&self.conn, item.as_str(), ITEM, "Delete", &())?;
         self.prompt(&prompt)
     }
@@ -145,7 +191,7 @@ impl SecretStore for SecretService {
         "secret-service"
     }
 
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
         let s = Session::open()?;
         let (mut unlocked, locked) = s.search(key)?;
         if unlocked.is_empty() {
@@ -156,18 +202,20 @@ impl SecretStore for SecretService {
             unlocked = s.search(key)?.0;
         }
         let Some(item) = unlocked.first() else {
-            return Err(StoreError::Unavailable("the item stayed locked".into()));
+            return Err(SecretStoreError::Unavailable(
+                "the item stayed locked".into(),
+            ));
         };
         let (secret,): (Secret,) = call(&s.conn, item.as_str(), ITEM, "GetSecret", &(&s.session,))?;
         Ok(Some(secret.2))
     }
 
-    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), StoreError> {
+    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), SecretStoreError> {
         let s = Session::open()?;
         let collection: OwnedObjectPath =
             call(&s.conn, SERVICE_PATH, SERVICE, "ReadAlias", &("default",))?;
         if collection.as_str() == "/" {
-            return Err(StoreError::Unavailable("no default keyring".into()));
+            return Err(SecretStoreError::Unavailable("no default keyring".into()));
         }
         s.unlock(std::slice::from_ref(&collection))?;
         let mut props: HashMap<&str, Value<'_>> = HashMap::new();
@@ -192,20 +240,18 @@ impl SecretStore for SecretService {
         s.prompt(&prompt)?;
         // `replace` replaces only within the default collection: a twin a
         // user moved to another keyring would otherwise be read first by
-        // `get` and go stale.
-        let inside = format!("{}/", collection.as_str());
-        let (unlocked, locked) = s.search(key)?;
-        for other in unlocked.iter().chain(&locked) {
-            if other.as_str() != item.as_str() && !other.as_str().starts_with(&inside) {
-                s.delete_item(other)?;
-            }
-        }
+        // `get` and go stale. Best effort: the token is stored, so a
+        // failure here must not make the save fall back to the file.
+        let _ = s.delete_outside(key, &item, collection.as_str());
         Ok(())
     }
 
-    fn delete(&self, key: &str) -> Result<(), StoreError> {
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
         let s = Session::open()?;
         let (unlocked, locked) = s.search(key)?;
+        if !locked.is_empty() {
+            s.unlock(&locked)?;
+        }
         for item in unlocked.iter().chain(&locked) {
             s.delete_item(item)?;
         }
@@ -230,7 +276,7 @@ fn call<B, R>(
     iface: &str,
     method: &str,
     body: &B,
-) -> Result<R, StoreError>
+) -> Result<R, SecretStoreError>
 where
     B: zbus::export::serde::ser::Serialize + zbus::zvariant::DynamicType,
     R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
@@ -244,7 +290,7 @@ where
 /// A D-Bus error as a store error: no Secret Service on the bus (nothing
 /// owns or can activate `org.freedesktop.secrets`) is `Unavailable`;
 /// anything else is `Failed`.
-fn classify(e: zbus::Error) -> StoreError {
+fn classify(e: zbus::Error) -> SecretStoreError {
     let unknown = |name: &str| {
         matches!(
             name,
@@ -254,8 +300,11 @@ fn classify(e: zbus::Error) -> StoreError {
         )
     };
     match &e {
+        zbus::Error::InputOutput(io) if io.kind() == io::ErrorKind::TimedOut => {
+            SecretStoreError::Refused(format!("the Secret Service did not answer: {e}"))
+        }
         zbus::Error::MethodError(name, _, _) if unknown(name.as_str()) => {
-            StoreError::Unavailable(format!("no Secret Service: {e}"))
+            SecretStoreError::Unavailable(format!("no Secret Service: {e}"))
         }
         zbus::Error::FDO(fdo)
             if matches!(
@@ -263,14 +312,14 @@ fn classify(e: zbus::Error) -> StoreError {
                 zbus::fdo::Error::ServiceUnknown(_) | zbus::fdo::Error::NameHasNoOwner(_)
             ) =>
         {
-            StoreError::Unavailable(format!("no Secret Service: {e}"))
+            SecretStoreError::Unavailable(format!("no Secret Service: {e}"))
         }
         _ => failed(e),
     }
 }
 
-fn failed(e: impl std::fmt::Display) -> StoreError {
-    StoreError::Failed(io::Error::other(format!("Secret Service: {e}")))
+fn failed(e: impl std::fmt::Display) -> SecretStoreError {
+    SecretStoreError::Failed(io::Error::other(format!("Secret Service: {e}")))
 }
 
 #[cfg(test)]
@@ -353,7 +402,87 @@ mod tests {
         assert!(store.get(&key).unwrap().is_some());
         clear_in(&path, Some(&store)).unwrap();
         assert_eq!(store.get(&key).unwrap(), None);
+
+        // A locked keyring: sign-out unlocks the item before deleting it
+        // (a locked item's Delete fails with IsLocked).
+        save_in(&path, &t, Some(&store)).unwrap();
+        let collection: OwnedObjectPath =
+            call(&s.conn, SERVICE_PATH, SERVICE, "ReadAlias", &("default",)).unwrap();
+        let _: (Vec<OwnedObjectPath>, OwnedObjectPath) = call(
+            &s.conn,
+            SERVICE_PATH,
+            SERVICE,
+            "Lock",
+            &(vec![collection.clone()],),
+        )
+        .unwrap();
+        let (unlocked, locked) = s.search(&key).unwrap();
+        assert_eq!((unlocked.len(), locked.len()), (0, 1), "the item is locked");
+        match clear_in(&path, Some(&store)) {
+            // A prompter answered (a desktop session).
+            Ok(()) => {}
+            // Headless, gnome-keyring dismisses the unlock prompt at once.
+            // The sign-out asked to unlock (a Delete of the locked item
+            // would have failed with IsLocked, a `Failed`), and the file
+            // is gone; once the keyring is open again, the next sign-out
+            // deletes the item.
+            Err(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::NotConnected, "{e}");
+                assert!(e.to_string().contains("dismissed"), "{e}");
+                assert!(!path.exists());
+                unlock_with_password(&s, &collection, KEYRING_PASSWORD);
+                clear_in(&path, Some(&store)).unwrap();
+            }
+        }
+        let (unlocked, locked) = s.search(&key).unwrap();
+        assert_eq!(unlocked.len() + locked.len(), 0, "the locked item is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn errors_are_classified() {
+        // A method call the service does not answer in time: Refused, so
+        // the latch stops asking a wedged service.
+        let timeout = zbus::Error::InputOutput(std::sync::Arc::new(io::Error::from(
+            io::ErrorKind::TimedOut,
+        )));
+        assert!(matches!(classify(timeout), SecretStoreError::Refused(_)));
+        // Nothing owns org.freedesktop.secrets: Unavailable.
+        let unknown = zbus::Error::FDO(Box::new(zbus::fdo::Error::ServiceUnknown(
+            "org.freedesktop.secrets".into(),
+        )));
+        assert!(matches!(
+            classify(unknown),
+            SecretStoreError::Unavailable(_)
+        ));
+        // Anything else: Failed.
+        let other = zbus::Error::InputOutput(std::sync::Arc::new(io::Error::from(
+            io::ErrorKind::BrokenPipe,
+        )));
+        assert!(matches!(classify(other), SecretStoreError::Failed(_)));
+    }
+
+    /// The throwaway keyring's password in CI's recipe
+    /// (`echo -n ci-pass | gnome-keyring-daemon --unlock …`).
+    const KEYRING_PASSWORD: &str = "ci-pass";
+
+    /// Unlocks `collection` with its password, with no prompt, through
+    /// gnome-keyring's own interface (what Seahorse uses).
+    fn unlock_with_password(s: &Session, collection: &ObjectPath<'_>, password: &str) {
+        let master: Secret = (
+            s.session.clone(),
+            Vec::new(),
+            password.as_bytes().to_vec(),
+            "text/plain".to_string(),
+        );
+        let () = call(
+            &s.conn,
+            SERVICE_PATH,
+            "org.gnome.keyring.InternalUnsupportedGuiltRiddenInterface",
+            "UnlockWithMasterPassword",
+            &(collection, master),
+        )
+        .unwrap();
     }
 
     type Fields = (String, String, u64, String, Option<Vec<String>>);

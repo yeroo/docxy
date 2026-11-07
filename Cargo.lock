@@ -1234,7 +1234,9 @@ dependencies = [
 name = "mailcore"
 version = "0.1.0"
 dependencies = [
+ "async-io",
  "editcore",
+ "futures-lite",
  "rusqlite",
  "security-framework",
  "ureq",

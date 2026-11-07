@@ -32,11 +32,16 @@ use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 mod keychain;
 #[cfg(target_os = "linux")]
-pub mod secret_service;
+mod secret_service;
 
 /// Why a [`SecretStore`] call did not succeed.
+// No secret store off Linux and macOS: only the tests build these there.
+#[cfg_attr(
+    all(not(test), not(any(target_os = "linux", target_os = "macos"))),
+    allow(dead_code)
+)]
 #[derive(Debug)]
-pub enum StoreError {
+pub(crate) enum SecretStoreError {
     /// No store to talk to (no session bus, no Secret Service, no keychain)
     /// or one that cannot be used now. Cheap to find out and not
     /// remembered: a store that appears later is used.
@@ -49,14 +54,14 @@ pub enum StoreError {
     Failed(io::Error),
 }
 
-impl StoreError {
+impl SecretStoreError {
     /// As an `io::Error`: an unavailable or refused store is
     /// `io::ErrorKind::NotConnected`, `secret store unavailable: <reason>`
     /// (the engine shows that one); a failure is the store's own error.
     fn into_io(self) -> io::Error {
         match self {
-            StoreError::Unavailable(m) | StoreError::Refused(m) => unavailable(&m),
-            StoreError::Failed(e) => e,
+            SecretStoreError::Unavailable(m) | SecretStoreError::Refused(m) => unavailable(&m),
+            SecretStoreError::Failed(e) => e,
         }
     }
 }
@@ -71,17 +76,17 @@ fn unavailable(reason: &str) -> io::Error {
 
 /// A store of secrets by key: the platform's (Secret Service, Keychain) or
 /// a test's fake.
-pub trait SecretStore {
+pub(crate) trait SecretStore {
     /// The store's name, written into the reference file
     /// (`"secret-service"`, `"keychain"`).
     fn name(&self) -> &'static str;
     /// The secret under `key`; `Ok(None)` when there is none.
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError>;
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError>;
     /// Stores `secret` under `key`, replacing what was there. `label` is
     /// what a keyring browser shows for it, where the store has labels.
-    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), StoreError>;
+    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), SecretStoreError>;
     /// Deletes the secret under `key`. A missing one is `Ok`.
-    fn delete(&self, key: &str) -> Result<(), StoreError>;
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError>;
 }
 
 /// Where a token set ended up after a save or a load.
@@ -103,30 +108,47 @@ const FILE_STORAGE: Storage = if cfg!(windows) {
 };
 
 /// A store that stops asking once the user refused its prompt: after the
-/// first [`StoreError::Refused`], every call is `Unavailable` without
-/// reaching `inner`. Without it every hourly token refresh would raise the
-/// keyring's unlock prompt again, or wait out a prompt nobody can see.
-pub struct Latched<S> {
+/// first [`SecretStoreError::Refused`], every `get` and `set` is
+/// `Unavailable` without reaching `inner`. Without it every hourly token
+/// refresh would raise the keyring's unlock prompt again, or wait out a
+/// prompt nobody can see (or a wedged service, `secret_service`'s method
+/// timeout). `delete` is a sign-out, which the user asked for: it always
+/// reaches `inner`, so a refresh token stored before the refusal is not
+/// left behind once the file no longer points at it.
+// No secret store off Linux and macOS: only the tests build these there.
+#[cfg_attr(
+    all(not(test), not(any(target_os = "linux", target_os = "macos"))),
+    allow(dead_code)
+)]
+pub(crate) struct Latched<S> {
     inner: S,
     refused: OnceLock<String>,
 }
 
+// No secret store off Linux and macOS: only the tests build these there.
+#[cfg_attr(
+    all(not(test), not(any(target_os = "linux", target_os = "macos"))),
+    allow(dead_code)
+)]
 impl<S> Latched<S> {
-    pub const fn new(inner: S) -> Self {
+    pub(crate) const fn new(inner: S) -> Self {
         Latched {
             inner,
             refused: OnceLock::new(),
         }
     }
 
-    fn call<T>(&self, f: impl FnOnce(&S) -> Result<T, StoreError>) -> Result<T, StoreError> {
+    fn call<T>(
+        &self,
+        f: impl FnOnce(&S) -> Result<T, SecretStoreError>,
+    ) -> Result<T, SecretStoreError> {
         if let Some(reason) = self.refused.get() {
-            return Err(StoreError::Unavailable(format!(
+            return Err(SecretStoreError::Unavailable(format!(
                 "{reason} (earlier in this run)"
             )));
         }
         let r = f(&self.inner);
-        if let Err(StoreError::Refused(reason)) = &r {
+        if let Err(SecretStoreError::Refused(reason)) = &r {
             let _ = self.refused.set(reason.clone());
         }
         r
@@ -137,14 +159,14 @@ impl<S: SecretStore> SecretStore for Latched<S> {
     fn name(&self) -> &'static str {
         self.inner.name()
     }
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
         self.call(|s| s.get(key))
     }
-    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), StoreError> {
+    fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), SecretStoreError> {
         self.call(|s| s.set(key, label, secret))
     }
-    fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.call(|s| s.delete(key))
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+        self.inner.delete(key)
     }
 }
 
@@ -153,7 +175,7 @@ impl<S: SecretStore> SecretStore for Latched<S> {
 /// and when `MAILCORE_TOKEN_STORE=file` (a host's own tests set it). One
 /// process-wide [`Latched`] store, so a refusal outlives an engine restart.
 #[cfg(all(not(test), target_os = "linux"))]
-pub fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
     static STORE: Latched<secret_service::SecretService> =
         Latched::new(secret_service::SecretService);
     (!file_only()).then_some(&STORE as &dyn SecretStore)
@@ -161,14 +183,14 @@ pub fn platform_store() -> Option<&'static dyn SecretStore> {
 
 /// See the Linux `platform_store`.
 #[cfg(all(not(test), target_os = "macos"))]
-pub fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
     static STORE: Latched<keychain::Keychain> = Latched::new(keychain::Keychain);
     (!file_only()).then_some(&STORE as &dyn SecretStore)
 }
 
 /// See the Linux `platform_store`.
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
-pub fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
     None
 }
 
@@ -220,21 +242,42 @@ pub fn account(path: &Path) -> Option<String> {
 /// or one that is unavailable, refused or failed, writes the token file
 /// (DPAPI on Windows, 0600 plaintext elsewhere): a store failure never
 /// fails the save, as losing the sign-in would be worse than the warned
-/// fallback. An error is a failure to write the file; whatever file was
-/// there is left as it was (an old reference still points at the item the
+/// fallback. A reference that named another key has that item deleted
+/// once the new reference is written (errors ignored: the token is saved).
+/// An error is a failure to write the file; whatever file was there is left
+/// as it was (an old reference to this key still points at the item the
 /// store now holds; an old token file is migrated by the next load).
-pub fn save_in(path: &Path, t: &TokenSet, store: Option<&dyn SecretStore>) -> io::Result<Storage> {
+pub(crate) fn save_in(
+    path: &Path,
+    t: &TokenSet,
+    store: Option<&dyn SecretStore>,
+) -> io::Result<Storage> {
     let json = token_json(t);
     if let Some(store) = store
         && let Ok(key) = store_key(path)
     {
+        // The item the file pointed at until now, if under another key (a
+        // moved directory, the cache reached through another path): read
+        // before the write replaces the reference, deleted once it has.
+        let previous = referenced_key(path).filter(|k| *k != key);
         if store.set(&key, &label(&t.account), json.as_bytes()).is_ok() {
             write_file(path, &reference_json(store.name(), &key, &t.account))?;
+            if let Some(previous) = previous {
+                let _ = store.delete(&previous);
+            }
             return Ok(Storage::SecretStore);
         }
     }
     write_file(path, &json)?;
     Ok(FILE_STORAGE)
+}
+
+/// The `key` of the reference at `path`; `None` when the file is missing,
+/// unreadable, a token file, or a reference without a key.
+fn referenced_key(path: &Path) -> Option<String> {
+    let v = read_file(path).ok()??;
+    v.get("secret_store")?;
+    reference_key(&v).ok().map(str::to_string)
 }
 
 /// The store-generic load:
@@ -252,7 +295,7 @@ pub fn save_in(path: &Path, t: &TokenSet, store: Option<&dyn SecretStore>) -> io
 ///   ([`Storage::SecretStore`]). A store that does not take it, or a
 ///   reference that cannot be written, leaves the file as it was
 ///   ([`Storage::PlainFile`]), and the next load tries again.
-pub fn load_in(
+pub(crate) fn load_in(
     path: &Path,
     store: Option<&dyn SecretStore>,
 ) -> io::Result<Option<(TokenSet, Storage)>> {
@@ -264,7 +307,7 @@ pub fn load_in(
         let Some(store) = store else {
             return Err(unavailable("no secret store on this system"));
         };
-        let Some(secret) = store.get(key).map_err(StoreError::into_io)? else {
+        let Some(secret) = store.get(key).map_err(SecretStoreError::into_io)? else {
             return Ok(None);
         };
         let text = String::from_utf8(secret).map_err(invalid)?;
@@ -295,12 +338,8 @@ pub fn load_in(
 /// item is still in the store. Everything is tried; the first error
 /// (removing the file, then each delete) is returned. A file or item that
 /// is already gone is `Ok`.
-pub fn clear_in(path: &Path, store: Option<&dyn SecretStore>) -> io::Result<()> {
-    let referenced = read_file(path)
-        .ok()
-        .flatten()
-        .filter(|v| v.get("secret_store").is_some())
-        .and_then(|v| reference_key(&v).ok().map(str::to_string));
+pub(crate) fn clear_in(path: &Path, store: Option<&dyn SecretStore>) -> io::Result<()> {
+    let referenced = referenced_key(path);
     let mut first: Option<io::Error> = match fs::remove_file(path) {
         Ok(()) => None,
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -825,12 +864,12 @@ mod tests {
             s
         }
 
-        fn answer(&self) -> Result<(), StoreError> {
+        fn answer(&self) -> Result<(), SecretStoreError> {
             match self.mode.get() {
                 Mode::Works => Ok(()),
-                Mode::Unavailable => Err(StoreError::Unavailable("no keyring".into())),
-                Mode::Refused => Err(StoreError::Refused("dismissed".into())),
-                Mode::Fails => Err(StoreError::Failed(io::Error::other("boom"))),
+                Mode::Unavailable => Err(SecretStoreError::Unavailable("no keyring".into())),
+                Mode::Refused => Err(SecretStoreError::Refused("dismissed".into())),
+                Mode::Fails => Err(SecretStoreError::Failed(io::Error::other("boom"))),
             }
         }
 
@@ -846,12 +885,12 @@ mod tests {
         fn name(&self) -> &'static str {
             "fake"
         }
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError> {
             self.gets.set(self.gets.get() + 1);
             self.answer()?;
             Ok(self.items.borrow().get(key).map(|(_, s)| s.clone()))
         }
-        fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), StoreError> {
+        fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), SecretStoreError> {
             self.sets.set(self.sets.get() + 1);
             self.answer()?;
             self.items
@@ -859,7 +898,7 @@ mod tests {
                 .insert(key.to_string(), (label.to_string(), secret.to_vec()));
             Ok(())
         }
-        fn delete(&self, key: &str) -> Result<(), StoreError> {
+        fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
             self.deletes.borrow_mut().push(key.to_string());
             self.answer()?;
             self.items.borrow_mut().remove(key);
@@ -1196,8 +1235,85 @@ mod tests {
         );
         assert_eq!(load_in(&p, Some(&store)).unwrap().unwrap().1, FILE_STORAGE);
         assert_eq!(store.inner.sets.get(), 1);
-        assert!(matches!(store.get("k"), Err(StoreError::Unavailable(_))));
+        assert!(matches!(
+            store.get("k"),
+            Err(SecretStoreError::Unavailable(_))
+        ));
         assert_eq!(store.inner.gets.get(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_reports_an_unreachable_store_even_over_a_token_file() {
+        // A keyring-less computer: the item may or may not exist, so the
+        // sign-out says the store could not be asked, and the file goes.
+        let dir = test_dir("store-clear-plain-down");
+        let p = dir.join("token.bin");
+        save_in(&p, &secret_sample(), None).unwrap();
+        let store = FakeStore::with_mode(Mode::Unavailable);
+        let e = clear_in(&p, Some(&store)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(*store.deletes.borrow(), vec![key_of(&p)]);
+        assert!(!p.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sign_out_reaches_a_store_the_latch_stopped() {
+        // The token was stored, then this run's unlock prompt was refused,
+        // so the next save fell back to the file over the reference. The
+        // sign-out still asks the store, which deletes the old item.
+        let dir = test_dir("store-latch-clear");
+        let p = dir.join("token.bin");
+        let store = Latched::new(FakeStore::new());
+        save_in(&p, &secret_sample(), Some(&store)).unwrap();
+        store.inner.mode.set(Mode::Refused);
+        assert_eq!(
+            save_in(&p, &secret_sample(), Some(&store)).unwrap(),
+            FILE_STORAGE
+        );
+        store.inner.mode.set(Mode::Works);
+        assert_eq!(
+            save_in(&p, &secret_sample(), Some(&store)).unwrap(),
+            FILE_STORAGE
+        );
+        assert_eq!(
+            store.inner.items.borrow().len(),
+            1,
+            "the old item is still stored"
+        );
+        clear_in(&p, Some(&store)).unwrap();
+        assert_eq!(*store.inner.deletes.borrow(), vec![key_of(&p)]);
+        assert!(store.inner.items.borrow().is_empty());
+        assert!(!p.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_deletes_the_item_a_reference_to_another_key_named() {
+        let dir = test_dir("store-save-other-key");
+        let p = dir.join("token.bin");
+        let store = FakeStore::new();
+        // The cache was reached through another path when it was saved.
+        store
+            .items
+            .borrow_mut()
+            .insert("/elsewhere/token.bin".into(), ("l".into(), b"OLD".to_vec()));
+        write_file(&p, &reference_json("fake", "/elsewhere/token.bin", "me@x")).unwrap();
+        assert_eq!(
+            save_in(&p, &secret_sample(), Some(&store)).unwrap(),
+            Storage::SecretStore
+        );
+        assert_eq!(
+            *store.deletes.borrow(),
+            vec!["/elsewhere/token.bin".to_string()]
+        );
+        let keys: Vec<String> = store.items.borrow().keys().cloned().collect();
+        assert_eq!(keys, vec![key_of(&p)]);
+        // A reference to this very key deletes nothing.
+        store.deletes.borrow_mut().clear();
+        save_in(&p, &secret_sample(), Some(&store)).unwrap();
+        assert!(store.deletes.borrow().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
