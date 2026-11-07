@@ -613,3 +613,60 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - Not done: creating or updating an event sends no reminder fields to Graph
   (`event_body_json`), and a `local:` event is stored with 0/false until the
   next refresh.
+
+## Calendar events carry what a client shows (#1983)
+
+- `graph::model::Event::from_json` reads `showAs`, `isOnlineMeeting`,
+  `onlineMeetingProvider`, a `join_url`, `categories`, `sensitivity`,
+  `importance`, `type` (`event_type`), a series' `recurrence`
+  (`EventRecurrence`), `isCancelled`, `isOrganizer`, `hasAttachments`,
+  `responseRequested`, `allowNewTimeProposals`, `originalStartTimeZone` /
+  `originalEndTimeZone`, `calendar.id` (`calendar_id`), and each attendee's
+  `status.time` (`response_time`). Enums stay Graph's raw strings.
+- `join_url` is the first of `onlineMeeting.joinUrl`, `onlineMeetingUrl`, a
+  meeting link in `location.displayName`, then one in `body.content`
+  (`meeting_link`): the location goes first because it is a field someone set,
+  while a body can quote an old invite. A link starts at `https://` (any case)
+  and ends at a quote, `<`, `>` or whitespace; `&amp;` is decoded and trailing
+  `.,;:)]!` trimmed. Only the parsed host decides (`is_meeting_url`):
+  `teams.microsoft.com` (`/l/meetup-join/`, `/meet/`), `teams.live.com`
+  (`/meet/`), `zoom.us` / `zoomgov.com` and their subdomains (`/j/`, `/w/`,
+  `/my/`), `meet.google.com`, `meet.goto.com`, `chime.aws` and `*.webex.com`
+  (any path), `global.gotomeeting.com` (`/join/`). A meeting host in another
+  link's query and lookalikes (`notzoom.us`) are rejected.
+- `responseRequested` and `allowNewTimeProposals` are `true` when absent, as in
+  Graph, and every default agrees: the hand-written `Default` of `Event`,
+  `NewEvent` and `EventRow`, and the columns' `DEFAULT 1`. Graph's "no date"
+  (`0001-01-01...`, a `noEnd` range's `endDate`, a never-responded attendee's
+  `status.time`) reads as `""` (`graph_date_or_empty`).
+- Two recurrence columns: `events.recurrence` is the create-side `Recurrence`
+  that `event_for_send` re-sends on every create **and update**;
+  `events.graph_recurrence` is Graph's `EventRecurrence` (read side), written
+  by `upsert_event_on`. Never write Graph's recurrence into `recurrence`: the
+  lossy create-side type (three kinds, `numbered` becomes `noEnd`,
+  `firstDayOfWeek` forced to `sunday`) would rewrite a synced series on the
+  first edit.
+- Every new column is in `upsert_event_on` (insert and `ON CONFLICT`), as
+  #1937 asks. `Store::init` adds them to an old database with `ALTER TABLE`
+  after `SCHEMA_SQL` runs, so `SCHEMA_SQL` must not index any of them (an old
+  database would fail the `CREATE INDEX` before the column exists).
+- `create_local_event` stores the event as Graph will create it: `busy`,
+  `normal` sensitivity and importance, organizer, both request flags on,
+  `singleInstance`, or `seriesMaster` with its recurrence in
+  `graph_recurrence`.
+- Tests: `model.rs` `event_reads_calendar_client_fields`,
+  `event_defaults_when_fields_absent`, `event_join_url_*`,
+  `event_recurrence_reads_every_pattern_and_range`,
+  `attendee_response_time_and_never`; `store` `calendar_tests`
+  (`replace_events_in_window_writes_calendar_client_fields`,
+  `upsert_event_conflict_path_updates_calendar_client_fields`,
+  `create_local_event_reads_as_graph_will_create_it`,
+  `events_without_1983_columns_migrate`); `engine.rs`
+  `refresh_calendar_stores_calendar_client_fields`.
+- Not done: the write side (`EventInput` fields, PATCH only what changed) is
+  #1994. `calendarView` returns occurrences, never series masters, and nothing
+  fetches a synced master yet (a `/me/events/{seriesMasterId}` read would), so
+  `EventRow::recurrence` is `Some` in production only for a local series.
+  `calendar_id` is `""` (the default calendar) until #1984 syncs every
+  calendar. Safe Links-wrapped links
+  (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
