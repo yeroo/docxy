@@ -625,10 +625,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `status.time` (`response_time`). Enums stay Graph's raw strings.
 - `join_url` is the first of `onlineMeeting.joinUrl`, `onlineMeetingUrl`, a
   meeting link in `location.displayName`, then one in `body.content`
-  (`meeting_link`): the location goes first because it is a field someone set,
-  while a body can quote an old invite. A link starts at `https://` (any case)
-  and ends at a quote, `<`, `>` or whitespace; `&amp;` is decoded and trailing
-  `.,;:)]!` trimmed. Only the host a browser would open decides
+  (`meeting_link_in`, the one helper the store uses too): the location goes
+  first because it is a field someone set, while a body can quote an old
+  invite. A link starts at `https://` (any case) and ends at a quote, `<`,
+  `>`, whitespace or an escaped bracket or quote (`&lt;`, `&gt;`, `&quot;`,
+  `&#39;`, `&#x27;`: lookxy's `escape_html` writes them); `&amp;` is decoded
+  and trailing `.,;:)]!` trimmed. After a rejected link the scan resumes at
+  that link's end, so a meeting link nested in it is not taken and each byte
+  is scanned once: a body is sender-controlled, and resuming just past the
+  `https://` made a long run of them quadratic. Only the host a browser would open decides
   (`is_meeting_url`): the authority ends at `/`, `?`, `#` or `\` (a browser
   reads `\` as `/`), userinfo (`@`) is refused, a `:port` must be digits, and
   the host may hold only ASCII letters, digits, `-` and `.`. Hosts:
@@ -659,9 +664,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - `create_local_event` stores the fields Graph sets on create: `busy`,
   `normal` sensitivity and importance, organizer, both request flags on,
   `singleInstance`, or `seriesMaster` with its recurrence in
-  `graph_recurrence`, and the `join_url` `meeting_link` finds in the location
-  or body. Not all of it matches the next refresh: reminders stay 0/false
-  (#1937), and a series then reads as `calendarView`'s occurrences.
+  `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
+  location or body. `update_event_fields` derives `join_url` again from the
+  edited location and body, except on an online meeting (`is_online_meeting`),
+  whose link is Graph's `onlineMeeting.joinUrl` and is kept. Not all of it
+  matches the next refresh: reminders stay 0/false (#1937), and a series then
+  reads as `calendarView`'s occurrences.
 - Tests: `model.rs` `event_reads_calendar_client_fields`,
   `event_defaults_when_fields_absent`, `event_join_url_*`,
   `event_recurrence_reads_every_pattern_and_range`,
@@ -669,6 +677,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`replace_events_in_window_writes_calendar_client_fields`,
   `upsert_event_conflict_path_updates_calendar_client_fields`,
   `create_local_event_reads_as_graph_will_create_it`,
+  `update_event_fields_follows_the_join_link_unless_online_meeting`,
   `events_without_1983_columns_migrate`); `engine.rs`
   `refresh_calendar_stores_calendar_client_fields`.
 - Not done: the write side (`EventInput` fields, PATCH only what changed) is
