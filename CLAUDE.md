@@ -106,7 +106,7 @@ issue number to find its notes.
   attachments (#1949), the whole mailbox newest first, backfilled in idle time (#1871),
   new mail with its body, recent bodies prefetched, FetchBody served between folders (#1978),
   calendar sync keeps events' reminder settings (#1937), event fields a calendar client
-  shows (#1983).
+  shows (#1983), creating and updating them, an update PATCHes only what changed (#1994).
 
 ## Build and test
 

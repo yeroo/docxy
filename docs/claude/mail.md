@@ -610,9 +610,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (a stored row outside the window takes the `ON CONFLICT` path), and
   `engine.rs` `tests::refresh_calendar_keeps_reminder_settings` (a fake
   `calendarView` with `isReminderOn` / `reminderMinutesBeforeStart`).
-- Not done: creating or updating an event sends no reminder fields to Graph
-  (`event_body_json`), and a `local:` event is stored with 0/false until the
-  next refresh.
+- The write side (a create or edit sets the reminder, and a create stores
+  Graph's) is #1994's: see "Calendar event create and update fields".
 
 ## Calendar events carry what a client shows (#1983)
 
@@ -670,9 +669,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
   location or body. `update_event_fields` derives `join_url` again from the
   edited location and body, except on an online meeting (`is_online_meeting`),
-  whose link is Graph's `onlineMeeting.joinUrl` and is kept. Not all of it
-  matches the next refresh: reminders stay 0/false (#1937), and a series then
-  reads as `calendarView`'s occurrences.
+  whose link is Graph's `onlineMeeting.joinUrl` and is kept. A series then
+  reads as `calendarView`'s occurrences on the next refresh.
 - Tests: `model.rs` `event_reads_calendar_client_fields`,
   `event_defaults_when_fields_absent`, `event_join_url_*`,
   `event_recurrence_reads_every_pattern_and_range`,
@@ -683,10 +681,92 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `update_event_fields_follows_the_join_link_unless_online_meeting`,
   `events_without_1983_columns_migrate`); `engine.rs`
   `refresh_calendar_stores_calendar_client_fields`.
-- Not done: the write side (`EventInput` fields, PATCH only what changed) is
-  #1994. `calendarView` returns occurrences, never series masters, and nothing
+- Not done: `calendarView` returns occurrences, never series masters, and nothing
   fetches a synced master yet (a `/me/events/{seriesMasterId}` read would), so
   `EventRow::recurrence` is `Some` in production only for a local series.
   `calendar_id` is `""` (the default calendar) until #1984 syncs every
   calendar. Safe Links-wrapped links
   (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
+
+## Calendar event create and update fields (#1994)
+
+- `graph::client::EventInput` carries every field a calendar client sets:
+  `showAs`, `sensitivity`, `importance`, `categories`, `isReminderOn` /
+  `reminderMinutesBeforeStart`, `isOnlineMeeting` / `onlineMeetingProvider`,
+  `responseRequested`, `allowNewTimeProposals`, and typed attendees
+  (`AttendeeInput`, `""` sends `required`). `event_body_json` sends only the
+  groups in `input.fields` (`EventFieldSet`) and never an empty enum string
+  (Graph refuses `""`). `onlineMeetingProvider` is sent only when the host
+  sets one: with none Graph uses the calendar's default
+  (`teamsForBusiness` on Microsoft 365), and no provider is guessed.
+- `EventFieldSet` groups and their JSON names, which a queued
+  `OutboxOp::UpdateEvent` stores in `fields` (never rename one; an unknown
+  name is dropped, a row without `fields` reads as `LEGACY_UPDATE`, what an
+  update sent before: subject, times, location, attendees, body,
+  recurrence):
+
+  | name | Graph properties |
+  |---|---|
+  | `subject` | `subject` |
+  | `times` | `start`, `end`, `isAllDay` (one group: Graph validates them together) |
+  | `location` | `location` |
+  | `attendees` | `attendees` |
+  | `body` | `body` |
+  | `recurrence` | `recurrence`, only when `Some` |
+  | `showAs`, `sensitivity`, `importance`, `categories` | the same name |
+  | `reminder` | `isReminderOn`, `reminderMinutesBeforeStart` |
+  | `onlineMeeting` | `isOnlineMeeting`, `onlineMeetingProvider` when set |
+  | `responseRequested`, `allowNewTimeProposals` | the same name |
+
+- An edit: `Store::update_event_fields` diffs the host's
+  `LocalEventFields` against the stored row, writes it, and returns the
+  changed groups; the host sends `SyncCommand::UpdateEvent { id, fields }`
+  only when the set is non-empty, and `apply_op` sends nothing for an empty
+  one. The op reads the stored values at send time, so two queued edits each
+  send the latest value of their own groups. Each `Option` field of
+  `LocalEventFields` is `None` for "keep as stored" (and Graph's default on
+  a create), and `Some("")` for the four enum strings is `None`, so a host
+  whose form shows only some fields (lookxy) keeps what Outlook set.
+  Attendees are rewritten only when the ordered (name, address, type) list
+  changed; an attendee whose address matches a stored one
+  (case-insensitive) keeps its `response`, `response_time`, and its type when
+  the input's is `""`. Before, every edit reset every RSVP to `none`.
+- lookxy's form shows a body's plain text: a save whose text equals the
+  stored HTML's `from_html(..).plain()` keeps the stored HTML, so an
+  untouched body is neither rewritten nor counted as changed.
+- A create sends every group, read at send time (so an edit of the `local:`
+  event before the drain rides along), except the reminder when the host set
+  none: `create_local_event` marks the row `events.reminder_unset` (internal,
+  not in `EventRow`, not written by `upsert_event_on`) and Graph applies the
+  mailbox default. `Store::reconcile_created_event` re-points the id and, in
+  the same transaction, writes Graph's returned reminder, a non-empty
+  `join_url` and provider, and clears `reminder_unset`, so a Graph-id row
+  never keeps it. An edit that sets a reminder clears it too.
+- `GraphClient::update_event` returns Graph's updated event (`Ok(None)` for
+  a 204 or a body without an `id`). When the op's set holds `onlineMeeting`,
+  `apply_op` writes back the join link and provider
+  (`Store::set_event_online_meeting`); its error is ignored, as the PATCH
+  already happened and the next refresh corrects the row.
+- Graph ignores `isOnlineMeeting: false` once a meeting is online. The store
+  writes `false` but keeps the stored `join_url` (its rule keys on the
+  stored flag before the edit), as Graph keeps the meeting; the next refresh
+  sets the flag back.
+- Tests: `client.rs` `event_body_sends_calendar_client_fields`,
+  `event_body_sends_only_the_given_fields`, `event_body_skips_empty_enum_strings`,
+  `event_field_set_names_round_trip`, `update_event_patches_only_changed_fields`,
+  `update_event_without_an_event_in_the_answer_is_ok_none`; `store`
+  `calendar_tests::update_event_fields_*`, `create_local_event_stores_given_fields`,
+  `create_local_event_without_reminder_marks_it_unset`,
+  `reconcile_created_event_*`, `events_without_1983_columns_migrate`
+  (`reminder_unset` too), `outbox_tests::update_event_op_round_trips_fields`,
+  `legacy_update_event_op_reads_as_full_set`; `outbox.rs`
+  `update_event_sends_only_changed_fields`, `update_event_with_empty_set_sends_nothing`,
+  `legacy_update_event_sends_the_old_full_set`,
+  `update_event_online_meeting_writes_back_join_url`,
+  `create_event_without_reminder_omits_it_and_stores_graphs`,
+  `create_event_with_reminder_sends_it`; lookxy
+  `saving_an_untouched_synced_event_sends_no_update` (timed and all-day),
+  `editing_only_the_title_sends_only_the_subject`.
+- Not done: lookxy's form has no controls for the new fields (the host API
+  has them). Recurring series stay create-only. Reading the calendar's
+  `defaultOnlineMeetingProvider` / `allowedOnlineMeetingProviders`.

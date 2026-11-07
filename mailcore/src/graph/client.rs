@@ -4066,6 +4066,237 @@ mod tests {
             Some("bob@x.com")
         );
         assert_eq!(att[0].get("type").and_then(Value::as_str), Some("required"));
+        // A create sends every group it is given (#1994).
+        assert_eq!(sent.get("showAs").and_then(Value::as_str), Some("busy"));
+        assert_eq!(
+            sent.get("responseRequested").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(sent.get("isReminderOn").is_some());
+    }
+
+    /// The keys of a sent JSON object, in order.
+    fn keys(body: &str) -> Vec<String> {
+        match json::parse(body).unwrap() {
+            Value::Object(o) => o.into_iter().map(|(k, _)| k).collect(),
+            other => panic!("not an object: {other:?}"),
+        }
+    }
+
+    /// Every input field set, every group sent: what a create of a full
+    /// calendar-client event looks like (#1994).
+    fn full_input() -> EventInput {
+        EventInput {
+            attendees: vec![
+                AttendeeInput {
+                    name: "Bob".into(),
+                    addr: "bob@x.com".into(),
+                    r#type: "optional".into(),
+                },
+                AttendeeInput {
+                    name: "Room".into(),
+                    addr: "room@x.com".into(),
+                    r#type: "resource".into(),
+                },
+                AttendeeInput {
+                    name: "Ann".into(),
+                    addr: "ann@x.com".into(),
+                    r#type: String::new(),
+                },
+            ],
+            show_as: "tentative".into(),
+            sensitivity: "private".into(),
+            importance: "high".into(),
+            categories: vec!["Red".into(), "Travel".into()],
+            is_reminder_on: true,
+            reminder_minutes: 30,
+            is_online_meeting: true,
+            online_meeting_provider: "teamsForBusiness".into(),
+            response_requested: false,
+            allow_new_time_proposals: false,
+            ..sample_input()
+        }
+    }
+
+    #[test]
+    fn event_body_sends_calendar_client_fields() {
+        let sent = json::parse(&event_body_json(&full_input())).unwrap();
+        let s = |k: &str| sent.get(k).and_then(Value::as_str).map(str::to_string);
+        let b = |k: &str| sent.get(k).and_then(Value::as_bool);
+        assert_eq!(s("showAs").as_deref(), Some("tentative"));
+        assert_eq!(s("sensitivity").as_deref(), Some("private"));
+        assert_eq!(s("importance").as_deref(), Some("high"));
+        let cats: Vec<&str> = sent
+            .get("categories")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(cats, ["Red", "Travel"]);
+        assert_eq!(b("isReminderOn"), Some(true));
+        assert_eq!(
+            sent.get("reminderMinutesBeforeStart")
+                .and_then(Value::as_i64),
+            Some(30)
+        );
+        assert_eq!(b("isOnlineMeeting"), Some(true));
+        assert_eq!(
+            s("onlineMeetingProvider").as_deref(),
+            Some("teamsForBusiness")
+        );
+        assert_eq!(b("responseRequested"), Some(false));
+        assert_eq!(b("allowNewTimeProposals"), Some(false));
+        let types: Vec<&str> = sent
+            .get("attendees")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.get("type").and_then(Value::as_str))
+            .collect();
+        // `""` sends `required`.
+        assert_eq!(types, ["optional", "resource", "required"]);
+    }
+
+    #[test]
+    fn event_body_sends_only_the_given_fields() {
+        let cases: [(EventFieldSet, &[&str]); 14] = [
+            (EventFieldSet::SUBJECT, &["subject"]),
+            (EventFieldSet::TIMES, &["start", "end", "isAllDay"]),
+            (EventFieldSet::LOCATION, &["location"]),
+            (EventFieldSet::ATTENDEES, &["attendees"]),
+            (EventFieldSet::BODY, &["body"]),
+            // `sample_input` has no recurrence: nothing to send.
+            (EventFieldSet::RECURRENCE, &[]),
+            (EventFieldSet::SHOW_AS, &["showAs"]),
+            (EventFieldSet::SENSITIVITY, &["sensitivity"]),
+            (EventFieldSet::IMPORTANCE, &["importance"]),
+            (EventFieldSet::CATEGORIES, &["categories"]),
+            (
+                EventFieldSet::REMINDER,
+                &["isReminderOn", "reminderMinutesBeforeStart"],
+            ),
+            (
+                EventFieldSet::ONLINE_MEETING,
+                &["isOnlineMeeting", "onlineMeetingProvider"],
+            ),
+            (EventFieldSet::RESPONSE_REQUESTED, &["responseRequested"]),
+            (
+                EventFieldSet::ALLOW_NEW_TIME_PROPOSALS,
+                &["allowNewTimeProposals"],
+            ),
+        ];
+        for (group, want) in cases {
+            let input = EventInput {
+                fields: group,
+                ..full_input()
+            };
+            assert_eq!(keys(&event_body_json(&input)), want, "{group:?}");
+        }
+        // The online meeting without a provider sends only the flag: Graph
+        // then uses the calendar's default provider.
+        let input = EventInput {
+            fields: EventFieldSet::ONLINE_MEETING,
+            online_meeting_provider: String::new(),
+            ..full_input()
+        };
+        assert_eq!(keys(&event_body_json(&input)), ["isOnlineMeeting"]);
+        // An empty set sends an empty object.
+        let input = EventInput {
+            fields: EventFieldSet::default(),
+            ..full_input()
+        };
+        assert_eq!(event_body_json(&input), "{}");
+    }
+
+    #[test]
+    fn event_body_skips_empty_enum_strings() {
+        let input = EventInput {
+            show_as: String::new(),
+            sensitivity: String::new(),
+            importance: String::new(),
+            online_meeting_provider: String::new(),
+            ..full_input()
+        };
+        let k = keys(&event_body_json(&input));
+        for absent in [
+            "showAs",
+            "sensitivity",
+            "importance",
+            "onlineMeetingProvider",
+        ] {
+            assert!(!k.iter().any(|x| x == absent), "{absent} sent as \"\"");
+        }
+        assert!(k.iter().any(|x| x == "isOnlineMeeting"));
+    }
+
+    #[test]
+    fn event_field_set_names_round_trip() {
+        assert_eq!(
+            EventFieldSet::from_names(&EventFieldSet::ALL.to_names()),
+            EventFieldSet::ALL
+        );
+        assert_eq!(EventFieldSet::ALL.to_names().len(), 14);
+        let set = EventFieldSet::SUBJECT.union(EventFieldSet::REMINDER);
+        assert_eq!(set.to_names(), ["subject", "reminder"]);
+        // An unknown name (a newer build's group) is dropped.
+        assert_eq!(
+            EventFieldSet::from_names(&["subject", "reminder", "futureThing"]),
+            set
+        );
+        assert!(EventFieldSet::default().is_empty());
+        assert!(EventFieldSet::ALL.contains(EventFieldSet::LEGACY_UPDATE));
+        let mut s = EventFieldSet::ALL;
+        s.remove(EventFieldSet::REMINDER);
+        assert!(!s.contains(EventFieldSet::REMINDER));
+        assert!(s.contains(EventFieldSet::SUBJECT));
+    }
+
+    #[test]
+    fn update_event_patches_only_changed_fields() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/EV1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"EV1","subject":"New","isOnlineMeeting":true,"onlineMeetingProvider":"teamsForBusiness","onlineMeeting":{"joinUrl":"https://teams.microsoft.com/l/meetup-join/abc"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let input = EventInput {
+            subject: "New".into(),
+            fields: EventFieldSet::SUBJECT,
+            ..full_input()
+        };
+        let ev = c.update_event("EV1", &input).unwrap().unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(keys(&reqs[0].body), ["subject"]);
+        // Graph's answer is the updated event.
+        assert_eq!(ev.id, "EV1");
+        assert_eq!(ev.join_url, "https://teams.microsoft.com/l/meetup-join/abc");
+    }
+
+    #[test]
+    fn update_event_without_an_event_in_the_answer_is_ok_none() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/E204".into(),
+                status: 204,
+                headers: vec![],
+                body: "".into(),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/Eobj".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        assert_eq!(c.update_event("E204", &sample_input()).unwrap(), None);
+        assert_eq!(c.update_event("Eobj", &sample_input()).unwrap(), None);
     }
 
     #[test]

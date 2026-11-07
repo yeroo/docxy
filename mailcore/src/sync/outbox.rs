@@ -1623,6 +1623,286 @@ mod tests {
         assert!(store.event_for_send(&local_id).unwrap().is_none());
     }
 
+    /// The keys of a sent JSON object, in order.
+    fn sent_keys(body: &str) -> Vec<String> {
+        match json::parse(body).unwrap() {
+            Value::Object(o) => o.into_iter().map(|(k, _)| k).collect(),
+            other => panic!("not an object: {other:?}"),
+        }
+    }
+
+    /// A synced event `EV1` with Graph's attendees and Outlook's fields.
+    fn store_with_synced_event() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_event(&crate::store::NewEvent {
+                id: "EV1".into(),
+                subject: "Sync".into(),
+                start_utc: "2026-07-20T11:00:00Z".into(),
+                end_utc: "2026-07-20T12:00:00Z".into(),
+                location: "Room 1".into(),
+                body_html: "<p>agenda</p>".into(),
+                show_as: "tentative".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn update_event_sends_only_changed_fields() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/EV1".into(),
+            status: 200,
+            headers: vec![],
+            body: event_json("EV1", "Sync v2"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_synced_event();
+        let changed = store
+            .update_event_fields(
+                "EV1",
+                &crate::store::LocalEventFields {
+                    subject: "Sync v2".into(),
+                    start_utc: "2026-07-20T11:00:00Z".into(),
+                    end_utc: "2026-07-20T12:00:00Z".into(),
+                    location: "Room 1".into(),
+                    body_html: "<p>agenda</p>".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::SUBJECT);
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: changed,
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(sent_keys(&reqs[0].body), ["subject"]);
+        assert_eq!(
+            json::parse(&reqs[0].body)
+                .unwrap()
+                .get("subject")
+                .and_then(Value::as_str),
+            Some("Sync v2")
+        );
+    }
+
+    #[test]
+    fn update_event_with_empty_set_sends_nothing() {
+        // No route: any request would fail the op.
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_synced_event();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: EventFieldSet::default(),
+            },
+        )
+        .unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    /// A queued pre-#1994 `UpdateEvent` (no `fields`) still sends the old
+    /// full set.
+    #[test]
+    fn legacy_update_event_sends_the_old_full_set() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/EV1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_synced_event();
+        let op = OutboxOp::from_json(&json::parse(r#"{"kind":"updateEvent","id":"EV1"}"#).unwrap())
+            .unwrap();
+        apply_op(&c, &store, &op).unwrap();
+        assert_eq!(
+            sent_keys(&srv.requests()[0].body),
+            [
+                "subject",
+                "start",
+                "end",
+                "isAllDay",
+                "location",
+                "attendees",
+                "body"
+            ]
+        );
+    }
+
+    #[test]
+    fn update_event_online_meeting_writes_back_join_url() {
+        let teams = "https://teams.microsoft.com/l/meetup-join/T";
+        let answer = format!(
+            r#"{{"id":"EV1","subject":"Sync","isOnlineMeeting":true,
+                "onlineMeetingProvider":"teamsForBusiness",
+                "onlineMeeting":{{"joinUrl":"{teams}"}}}}"#
+        );
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/EV1".into(),
+            status: 200,
+            headers: vec![],
+            body: answer,
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_synced_event();
+        let changed = store
+            .update_event_fields(
+                "EV1",
+                &crate::store::LocalEventFields {
+                    subject: "Sync".into(),
+                    start_utc: "2026-07-20T11:00:00Z".into(),
+                    end_utc: "2026-07-20T12:00:00Z".into(),
+                    location: "Room 1".into(),
+                    body_html: "<p>agenda</p>".into(),
+                    is_online_meeting: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::ONLINE_MEETING);
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: changed,
+            },
+        )
+        .unwrap();
+        // No provider set: Graph picks the calendar's default.
+        assert_eq!(sent_keys(&srv.requests()[0].body), ["isOnlineMeeting"]);
+        let row = store
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "EV1")
+            .unwrap();
+        assert_eq!(row.join_url, teams);
+        assert_eq!(row.online_meeting_provider, "teamsForBusiness");
+    }
+
+    #[test]
+    fn create_event_without_reminder_omits_it_and_stores_graphs() {
+        let answer = event_json("EV1", "Sync").replacen(
+            r#""isAllDay":false"#,
+            r#""isAllDay":false,"isReminderOn":true,"reminderMinutesBeforeStart":15"#,
+            1,
+        );
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events".into(),
+            status: 201,
+            headers: vec![],
+            body: answer,
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_event(&sample_event_fields(), "Me", "me@x")
+            .unwrap();
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        let k = sent_keys(&srv.requests()[0].body);
+        assert!(!k.iter().any(|x| x == "isReminderOn"), "{k:?}");
+        assert!(!k.iter().any(|x| x == "reminderMinutesBeforeStart"));
+        // Every other group is sent: Graph's create defaults as stored.
+        for want in [
+            "subject",
+            "start",
+            "attendees",
+            "body",
+            "showAs",
+            "sensitivity",
+            "importance",
+            "categories",
+            "isOnlineMeeting",
+            "responseRequested",
+            "allowNewTimeProposals",
+        ] {
+            assert!(k.iter().any(|x| x == want), "{want} not sent: {k:?}");
+        }
+        // The mailbox default Graph applied is stored right away.
+        let sent = store.event_for_send("EV1").unwrap().unwrap();
+        assert!(sent.is_reminder_on);
+        assert_eq!(sent.reminder_minutes, 15);
+        assert!(!sent.reminder_unset);
+    }
+
+    #[test]
+    fn create_event_with_reminder_sends_it() {
+        let teams = "https://teams.microsoft.com/l/meetup-join/C";
+        let answer = event_json("EV1", "Sync").replacen(
+            r#""isAllDay":false"#,
+            &format!(
+                r#""isAllDay":false,"isReminderOn":false,"reminderMinutesBeforeStart":0,"isOnlineMeeting":true,"onlineMeeting":{{"joinUrl":"{teams}"}}"#
+            ),
+            1,
+        );
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events".into(),
+            status: 201,
+            headers: vec![],
+            body: answer,
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_event(
+                &crate::store::LocalEventFields {
+                    reminder: Some(crate::store::EventReminder {
+                        on: false,
+                        minutes_before_start: 0,
+                    }),
+                    is_online_meeting: Some(true),
+                    ..sample_event_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert_eq!(
+            sent.get("isReminderOn").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            sent.get("reminderMinutesBeforeStart")
+                .and_then(Value::as_i64),
+            Some(0)
+        );
+        assert_eq!(
+            sent.get("isOnlineMeeting").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(sent.get("onlineMeetingProvider").is_none());
+        // The online meeting's join link Graph returned is stored.
+        let row = store
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "EV1")
+            .unwrap();
+        assert_eq!(row.join_url, teams);
+        assert!(!row.is_reminder_on);
+    }
+
     #[test]
     fn apply_op_delete_event_of_a_local_id_makes_no_graph_call() {
         // A local:-only event id that never synced: DeleteEvent must NOT

@@ -5506,6 +5506,433 @@ mod calendar_tests {
         assert_eq!(join(&s, "G1"), teams);
     }
 
+    /// A synced event as a refresh stores it, with what Outlook set: an HTML
+    /// body, `tentative` / `private`, categories, a 15-minute reminder, and
+    /// an accepted optional attendee (#1994).
+    fn synced_event(s: &Store) -> LocalEventFields {
+        s.upsert_event(&NewEvent {
+            subject: "Sync".into(),
+            location: "Room 1".into(),
+            body_html: "<p>agenda</p>".into(),
+            show_as: "tentative".into(),
+            sensitivity: "private".into(),
+            importance: "high".into(),
+            categories: vec!["Red".into()],
+            reminder_minutes: 15,
+            is_reminder_on: true,
+            ..ev("G1", "2026-07-20T11:00:00Z", "2026-07-20T12:00:00Z")
+        })
+        .unwrap();
+        s.put_event_attendees(
+            "G1",
+            &[NewAttendee {
+                name: "Bob".into(),
+                addr: "Bob@X.com".into(),
+                r#type: "optional".into(),
+                response: "accepted".into(),
+                response_time: "2026-07-19T08:00:00Z".into(),
+            }],
+        )
+        .unwrap();
+        // What a host whose form shows only the core fields sends back
+        // untouched: no type, no Outlook fields.
+        LocalEventFields {
+            subject: "Sync".into(),
+            start_utc: "2026-07-20T11:00:00Z".into(),
+            end_utc: "2026-07-20T12:00:00Z".into(),
+            location: "Room 1".into(),
+            body_html: "<p>agenda</p>".into(),
+            attendees: vec![AttendeeInput {
+                name: "Bob".into(),
+                addr: "Bob@X.com".into(),
+                r#type: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn update_event_fields_returns_only_changed_fields() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        assert_eq!(
+            s.update_event_fields("G1", &untouched).unwrap(),
+            EventFieldSet::default(),
+            "an untouched save changes nothing"
+        );
+        let changed = s
+            .update_event_fields(
+                "G1",
+                &LocalEventFields {
+                    subject: "Sync v2".into(),
+                    ..untouched.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::SUBJECT);
+        let sent = s.event_for_send("G1").unwrap().unwrap();
+        assert_eq!(sent.subject, "Sync v2");
+        assert_eq!(sent.body_html, "<p>agenda</p>");
+        assert_eq!(sent.start_utc, "2026-07-20T11:00:00Z");
+        // Each group on its own, each on a fresh copy of the synced event.
+        let one = |f: LocalEventFields| {
+            let s = Store::open_in_memory().unwrap();
+            synced_event(&s);
+            let changed = s.update_event_fields("G1", &f).unwrap();
+            (changed, s.event_for_send("G1").unwrap().unwrap())
+        };
+        let base = || untouched.clone();
+        assert_eq!(
+            one(LocalEventFields {
+                is_all_day: true,
+                ..base()
+            })
+            .0,
+            EventFieldSet::TIMES
+        );
+        assert_eq!(
+            one(LocalEventFields {
+                end_utc: "2026-07-20T13:00:00Z".into(),
+                ..base()
+            })
+            .0,
+            EventFieldSet::TIMES
+        );
+        assert_eq!(
+            one(LocalEventFields {
+                location: "Room 2".into(),
+                ..base()
+            })
+            .0,
+            EventFieldSet::LOCATION
+        );
+        assert_eq!(
+            one(LocalEventFields {
+                body_html: "x".into(),
+                ..base()
+            })
+            .0,
+            EventFieldSet::BODY
+        );
+        let (changed, sent) = one(LocalEventFields {
+            show_as: Some("free".into()),
+            sensitivity: Some("normal".into()),
+            importance: Some("low".into()),
+            categories: Some(vec![]),
+            ..base()
+        });
+        assert_eq!(
+            changed,
+            EventFieldSet::SHOW_AS
+                .union(EventFieldSet::SENSITIVITY)
+                .union(EventFieldSet::IMPORTANCE)
+                .union(EventFieldSet::CATEGORIES)
+        );
+        assert_eq!(sent.show_as, "free");
+        assert_eq!(sent.sensitivity, "normal");
+        assert_eq!(sent.importance, "low");
+        assert!(sent.categories.is_empty());
+        let (changed, sent) = one(LocalEventFields {
+            reminder: Some(EventReminder {
+                on: false,
+                minutes_before_start: 15,
+            }),
+            ..base()
+        });
+        assert_eq!(changed, EventFieldSet::REMINDER);
+        assert!(!sent.is_reminder_on);
+        let (changed, sent) = one(LocalEventFields {
+            is_online_meeting: Some(true),
+            ..base()
+        });
+        assert_eq!(changed, EventFieldSet::ONLINE_MEETING);
+        assert!(sent.is_online_meeting);
+        let (changed, sent) = one(LocalEventFields {
+            online_meeting_provider: Some("teamsForBusiness".into()),
+            ..base()
+        });
+        assert_eq!(changed, EventFieldSet::ONLINE_MEETING);
+        assert_eq!(sent.online_meeting_provider, "teamsForBusiness");
+        let (changed, sent) = one(LocalEventFields {
+            response_requested: Some(false),
+            allow_new_time_proposals: Some(false),
+            ..base()
+        });
+        assert_eq!(
+            changed,
+            EventFieldSet::RESPONSE_REQUESTED.union(EventFieldSet::ALLOW_NEW_TIME_PROPOSALS)
+        );
+        assert!(!sent.response_requested && !sent.allow_new_time_proposals);
+        // A `Some` equal to the stored value is no change.
+        let (changed, _) = one(LocalEventFields {
+            show_as: Some("tentative".into()),
+            categories: Some(vec!["Red".into()]),
+            reminder: Some(EventReminder {
+                on: true,
+                minutes_before_start: 15,
+            }),
+            response_requested: Some(true),
+            ..base()
+        });
+        assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    #[test]
+    fn update_event_fields_none_keeps_stored_values() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        s.update_event_fields(
+            "G1",
+            &LocalEventFields {
+                subject: "Sync v2".into(),
+                ..untouched
+            },
+        )
+        .unwrap();
+        let sent = s.event_for_send("G1").unwrap().unwrap();
+        assert_eq!(sent.show_as, "tentative");
+        assert_eq!(sent.sensitivity, "private");
+        assert_eq!(sent.importance, "high");
+        assert_eq!(sent.categories, vec!["Red".to_string()]);
+        assert!(sent.is_reminder_on);
+        assert_eq!(sent.reminder_minutes, 15);
+        assert!(sent.response_requested && sent.allow_new_time_proposals);
+    }
+
+    #[test]
+    fn update_event_fields_empty_enum_string_is_none() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        let changed = s
+            .update_event_fields(
+                "G1",
+                &LocalEventFields {
+                    show_as: Some(String::new()),
+                    sensitivity: Some(String::new()),
+                    importance: Some(String::new()),
+                    online_meeting_provider: Some(String::new()),
+                    ..untouched
+                },
+            )
+            .unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        let sent = s.event_for_send("G1").unwrap().unwrap();
+        assert_eq!(sent.show_as, "tentative");
+        assert_eq!(sent.sensitivity, "private");
+        assert_eq!(sent.importance, "high");
+    }
+
+    #[test]
+    fn update_event_fields_attendee_type_kept_when_unset() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        let with_ann = |ann_type: &str| LocalEventFields {
+            attendees: vec![
+                // Graph's address case differs from the form's: still the
+                // same attendee.
+                AttendeeInput {
+                    name: "Bob".into(),
+                    addr: "Bob@X.com".into(),
+                    r#type: String::new(),
+                },
+                AttendeeInput {
+                    name: "Ann".into(),
+                    addr: "ann@x.com".into(),
+                    r#type: ann_type.into(),
+                },
+            ],
+            ..untouched.clone()
+        };
+        assert_eq!(
+            s.update_event_fields("G1", &with_ann("")).unwrap(),
+            EventFieldSet::ATTENDEES
+        );
+        let atts = s.event_attendees("G1").unwrap();
+        assert_eq!(atts[0].r#type, "optional", "Bob keeps his stored type");
+        assert_eq!(atts[1].r#type, "required", "a new attendee is required");
+        // A type the host sets is a change, and is stored.
+        assert_eq!(
+            s.update_event_fields("G1", &with_ann("resource")).unwrap(),
+            EventFieldSet::ATTENDEES
+        );
+        assert_eq!(s.event_attendees("G1").unwrap()[1].r#type, "resource");
+        // And the same list again (Ann's type unset) changes nothing.
+        assert!(
+            s.update_event_fields("G1", &with_ann(""))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.event_attendees("G1").unwrap()[1].r#type, "resource");
+    }
+
+    #[test]
+    fn update_event_fields_keeps_attendee_responses() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        let accepted = |s: &Store| {
+            let a = s.event_attendees("G1").unwrap();
+            (a[0].response.clone(), a[0].response_time.clone())
+        };
+        let want = ("accepted".to_string(), "2026-07-19T08:00:00Z".to_string());
+        s.update_event_fields(
+            "G1",
+            &LocalEventFields {
+                subject: "Sync v2".into(),
+                ..untouched.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted(&s), want, "a subject-only edit");
+        let mut two = untouched.clone();
+        two.attendees.insert(
+            0,
+            AttendeeInput {
+                name: "Ann".into(),
+                addr: "ann@x.com".into(),
+                r#type: String::new(),
+            },
+        );
+        s.update_event_fields("G1", &two).unwrap();
+        let atts = s.event_attendees("G1").unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(
+            (atts[0].addr.as_str(), atts[0].response.as_str()),
+            ("ann@x.com", "none")
+        );
+        assert_eq!(atts[1].response, "accepted", "Bob is still accepted");
+        assert_eq!(atts[1].response_time, "2026-07-19T08:00:00Z");
+    }
+
+    #[test]
+    fn update_event_fields_of_a_missing_event_is_an_error() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.update_event_fields("nope", &sample_fields()).is_err());
+    }
+
+    #[test]
+    fn create_local_event_stores_given_fields() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    show_as: Some("oof".into()),
+                    sensitivity: Some("confidential".into()),
+                    importance: Some("low".into()),
+                    categories: Some(vec!["Blue".into(), "Travel".into()]),
+                    reminder: Some(EventReminder {
+                        on: true,
+                        minutes_before_start: 60,
+                    }),
+                    is_online_meeting: Some(true),
+                    online_meeting_provider: Some("teamsForBusiness".into()),
+                    response_requested: Some(false),
+                    allow_new_time_proposals: Some(false),
+                    attendees: vec![AttendeeInput {
+                        name: "Room".into(),
+                        addr: "room@x".into(),
+                        r#type: "resource".into(),
+                    }],
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.show_as, "oof");
+        assert_eq!(sent.sensitivity, "confidential");
+        assert_eq!(sent.importance, "low");
+        assert_eq!(sent.categories, vec!["Blue".to_string(), "Travel".into()]);
+        assert!(sent.is_reminder_on);
+        assert_eq!(sent.reminder_minutes, 60);
+        assert!(!sent.reminder_unset);
+        assert!(sent.is_online_meeting);
+        assert_eq!(sent.online_meeting_provider, "teamsForBusiness");
+        assert!(!sent.response_requested && !sent.allow_new_time_proposals);
+        assert_eq!(sent.attendees[0].r#type, "resource");
+        assert_eq!(s.event_attendees(&id).unwrap()[0].response, "none");
+    }
+
+    #[test]
+    fn create_local_event_without_reminder_marks_it_unset() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert!(sent.reminder_unset);
+        assert!(!sent.is_reminder_on);
+        // An edit that leaves the reminder alone keeps it unset; one that
+        // sets it clears the mark.
+        s.update_event_fields(&id, &sample_fields()).unwrap();
+        assert!(s.event_for_send(&id).unwrap().unwrap().reminder_unset);
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    // The stored 0/false, set explicitly: still a change,
+                    // since the create would otherwise send no reminder.
+                    reminder: Some(EventReminder::default()),
+                    ..sample_fields()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::REMINDER);
+        assert!(!s.event_for_send(&id).unwrap().unwrap().reminder_unset);
+    }
+
+    #[test]
+    fn reconcile_created_event_writes_back_reminder_and_join_url() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    is_online_meeting: Some(true),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let teams = "https://teams.microsoft.com/l/meetup-join/X";
+        s.reconcile_created_event(
+            &id,
+            &Event {
+                id: "EV1".into(),
+                is_reminder_on: true,
+                reminder_minutes: 15,
+                is_online_meeting: true,
+                online_meeting_provider: "teamsForBusiness".into(),
+                join_url: teams.into(),
+                ..Event::default()
+            },
+        )
+        .unwrap();
+        let sent = s.event_for_send("EV1").unwrap().unwrap();
+        assert!(sent.is_reminder_on);
+        assert_eq!(sent.reminder_minutes, 15);
+        assert!(!sent.reminder_unset, "a Graph-id row never keeps the mark");
+        assert_eq!(sent.online_meeting_provider, "teamsForBusiness");
+        let row = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "EV1")
+            .unwrap();
+        assert_eq!(row.join_url, teams);
+
+        // An answer without a join link or provider leaves the stored ones.
+        s.set_event_online_meeting("EV1", "", "").unwrap();
+        let row = s
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "EV1")
+            .unwrap();
+        assert_eq!(row.join_url, teams);
+        assert_eq!(row.online_meeting_provider, "teamsForBusiness");
+    }
+
     /// A database whose `events` / `event_attendees` tables are at their
     /// last pre-#1983 shape gains the new columns in place: its rows stay,
     /// read the new fields as their defaults, and a second open is fine.
@@ -5573,8 +6000,18 @@ mod calendar_tests {
             assert_eq!(atts[0].name, "Bob");
             assert_eq!(atts[0].r#type, "optional");
             assert_eq!(atts[0].response_time, "");
+            // `reminder_unset` (#1994) reads 0: the old row's reminder
+            // came from Graph.
+            assert!(!s.event_for_send("E1").unwrap().unwrap().reminder_unset);
         }
-        // The migrated table takes every new column.
+        // The migrated table takes every new column, `reminder_unset` too.
+        let s = Store::open(&path).unwrap();
+        let local = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        assert!(s.event_for_send(&local).unwrap().unwrap().reminder_unset);
+        s.delete_event(&local).unwrap();
+        drop(s);
         let s = Store::open(&path).unwrap();
         let e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
         s.upsert_event(&e).unwrap();
@@ -5771,6 +6208,59 @@ mod outbox_tests {
         ] {
             assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op));
         }
+    }
+
+    #[test]
+    fn update_event_op_round_trips_fields() {
+        let op = OutboxOp::UpdateEvent {
+            id: "EV1".into(),
+            fields: EventFieldSet::SUBJECT.union(EventFieldSet::ONLINE_MEETING),
+        };
+        let v = op.to_json();
+        assert_eq!(
+            v.to_string(),
+            r#"{"kind":"updateEvent","id":"EV1","fields":["subject","onlineMeeting"]}"#
+        );
+        assert_eq!(OutboxOp::from_json(&v), Some(op));
+        // An empty set round-trips as empty, not as the legacy full set.
+        let empty = OutboxOp::UpdateEvent {
+            id: "EV1".into(),
+            fields: EventFieldSet::default(),
+        };
+        assert_eq!(OutboxOp::from_json(&empty.to_json()), Some(empty));
+        // An unknown name is dropped.
+        let v = json::parse(r#"{"kind":"updateEvent","id":"EV1","fields":["subject","later"]}"#)
+            .unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: EventFieldSet::SUBJECT,
+            })
+        );
+    }
+
+    /// An `UpdateEvent` queued before #1994 has no `fields`: it still sends
+    /// what an update sent then.
+    #[test]
+    fn legacy_update_event_op_reads_as_full_set() {
+        let v = json::parse(r#"{"kind":"updateEvent","id":"X"}"#).unwrap();
+        let Some(OutboxOp::UpdateEvent { id, fields }) = OutboxOp::from_json(&v) else {
+            panic!("not an UpdateEvent");
+        };
+        assert_eq!(id, "X");
+        assert_eq!(fields, EventFieldSet::LEGACY_UPDATE);
+        assert_eq!(
+            fields.to_names(),
+            [
+                "subject",
+                "times",
+                "location",
+                "attendees",
+                "body",
+                "recurrence"
+            ]
+        );
     }
 }
 

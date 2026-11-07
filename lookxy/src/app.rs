@@ -7261,6 +7261,114 @@ pub(crate) mod tests {
         assert_eq!(send.body_html, "agenda &lt;b&gt;");
     }
 
+    /// An event stored as a calendar refresh stores it (#1994): whole-minute
+    /// times, an HTML body, `tentative` / `private`, a 15-minute reminder,
+    /// and an accepted optional attendee.
+    fn seed_refreshed_event(app: &mut App, id: &str, all_day: bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let (start, end) = if all_day {
+            let day = now.div_euclid(86_400) + 1;
+            (day * 86_400, (day + 1) * 86_400)
+        } else {
+            let start = (now + 86_400).div_euclid(3600) * 3600;
+            (start, start + 1_800)
+        };
+        app.store
+            .upsert_event(&mailcore::store::NewEvent {
+                start_utc: unix_secs_to_iso(start),
+                end_utc: unix_secs_to_iso(end),
+                is_all_day: all_day,
+                body_html: "<html><body><p>agenda <b>today</b></p></body></html>".into(),
+                show_as: "tentative".into(),
+                sensitivity: "private".into(),
+                reminder_minutes: 15,
+                is_reminder_on: true,
+                ..seeded_event(id, "Planning", 1, None)
+            })
+            .unwrap();
+        app.store
+            .put_event_attendees(
+                id,
+                &[mailcore::store::NewAttendee {
+                    name: "Bob".into(),
+                    addr: "bob@x.com".into(),
+                    r#type: "optional".into(),
+                    response: "accepted".into(),
+                    response_time: "2026-07-19T08:00:00Z".into(),
+                }],
+            )
+            .unwrap();
+        app.reload_agenda();
+        app.selected_event = Some(id.into());
+    }
+
+    fn drain_commands(app: &App) -> Vec<SyncCommand> {
+        let mut cmds = Vec::new();
+        while let Ok(cmd) = app.test_cmd_rx.as_ref().unwrap().try_recv() {
+            cmds.push(cmd);
+        }
+        cmds
+    }
+
+    /// Opening a synced event's edit form and saving it untouched changes
+    /// nothing and sends nothing, timed or all-day (#1994): the form's
+    /// fields round-trip, the HTML body is kept, and the fields the form
+    /// does not show keep what Outlook set.
+    #[test]
+    fn saving_an_untouched_synced_event_sends_no_update() {
+        for (id, all_day) in [("t1", false), ("a1", true)] {
+            let mut app = App::for_test_with_seeded_store();
+            app.mode = crate::app::Mode::Calendar;
+            seed_refreshed_event(&mut app, id, all_day);
+            let before = app.store.event_for_send(id).unwrap().unwrap();
+            app.open_edit_event();
+            assert!(app.event_form.is_some());
+            app.save_event_form();
+            assert!(app.event_form.is_none(), "the form closed");
+            assert!(
+                drain_commands(&app).is_empty(),
+                "an untouched save sent a command ({id})"
+            );
+            let after = app.store.event_for_send(id).unwrap().unwrap();
+            assert_eq!(after, before, "{id}");
+            assert_eq!(
+                app.store.event_attendees(id).unwrap()[0].response,
+                "accepted"
+            );
+        }
+    }
+
+    /// A title-only edit of a synced event sends `UpdateEvent` with only
+    /// `subject` (#1994), and the attendee keeps their RSVP.
+    #[test]
+    fn editing_only_the_title_sends_only_the_subject() {
+        let mut app = App::for_test_with_seeded_store();
+        app.mode = crate::app::Mode::Calendar;
+        seed_refreshed_event(&mut app, "t1", false);
+        app.open_edit_event();
+        app.event_form.as_mut().unwrap().title = "Planning v2".into();
+        app.save_event_form();
+        let cmds = drain_commands(&app);
+        assert_eq!(cmds.len(), 1, "{cmds:?}");
+        match &cmds[0] {
+            SyncCommand::UpdateEvent { id, fields } => {
+                assert_eq!(id, "t1");
+                assert_eq!(*fields, mailcore::graph::client::EventFieldSet::SUBJECT);
+            }
+            other => panic!("expected UpdateEvent, got {other:?}"),
+        }
+        let atts = app.store.event_attendees("t1").unwrap();
+        assert_eq!(atts[0].response, "accepted");
+        assert_eq!(atts[0].r#type, "optional");
+        let send = app.store.event_for_send("t1").unwrap().unwrap();
+        assert_eq!(send.subject, "Planning v2");
+        assert_eq!(send.show_as, "tentative");
+        assert_eq!(send.reminder_minutes, 15);
+    }
+
     #[test]
     fn deleting_an_event_confirms_then_removes_and_enqueues() {
         let mut app = App::for_test_with_seeded_store();
