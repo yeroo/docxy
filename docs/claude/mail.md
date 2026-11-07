@@ -628,12 +628,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`meeting_link`): the location goes first because it is a field someone set,
   while a body can quote an old invite. A link starts at `https://` (any case)
   and ends at a quote, `<`, `>` or whitespace; `&amp;` is decoded and trailing
-  `.,;:)]!` trimmed. Only the parsed host decides (`is_meeting_url`):
+  `.,;:)]!` trimmed. Only the host a browser would open decides
+  (`is_meeting_url`): the authority ends at `/`, `?`, `#` or `\` (a browser
+  reads `\` as `/`), userinfo (`@`) is refused, a `:port` must be digits, and
+  the host may hold only ASCII letters, digits, `-` and `.`. Hosts:
   `teams.microsoft.com` (`/l/meetup-join/`, `/meet/`), `teams.live.com`
   (`/meet/`), `zoom.us` / `zoomgov.com` and their subdomains (`/j/`, `/w/`,
-  `/my/`), `meet.google.com`, `meet.goto.com`, `chime.aws` and `*.webex.com`
-  (any path), `global.gotomeeting.com` (`/join/`). A meeting host in another
-  link's query and lookalikes (`notzoom.us`) are rejected.
+  `/my/`), `meet.google.com`, `meet.goto.com`, `chime.aws`, and `webex.com`
+  and its subdomains (any non-empty path), `global.gotomeeting.com`
+  (`/join/`). Rejected: a meeting host in another link's query or path,
+  lookalikes (`notzoom.us`), userinfo after a port
+  (`teams.microsoft.com:443@evil.example`) and a backslash
+  (`evil.example\.zoom.us`).
 - `responseRequested` and `allowNewTimeProposals` are `true` when absent, as in
   Graph, and every default agrees: the hand-written `Default` of `Event`,
   `NewEvent` and `EventRow`, and the columns' `DEFAULT 1`. Graph's "no date"
@@ -650,10 +656,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   #1937 asks. `Store::init` adds them to an old database with `ALTER TABLE`
   after `SCHEMA_SQL` runs, so `SCHEMA_SQL` must not index any of them (an old
   database would fail the `CREATE INDEX` before the column exists).
-- `create_local_event` stores the event as Graph will create it: `busy`,
+- `create_local_event` stores the fields Graph sets on create: `busy`,
   `normal` sensitivity and importance, organizer, both request flags on,
   `singleInstance`, or `seriesMaster` with its recurrence in
-  `graph_recurrence`.
+  `graph_recurrence`, and the `join_url` `meeting_link` finds in the location
+  or body. Not all of it matches the next refresh: reminders stay 0/false
+  (#1937), and a series then reads as `calendarView`'s occurrences.
 - Tests: `model.rs` `event_reads_calendar_client_fields`,
   `event_defaults_when_fields_absent`, `event_join_url_*`,
   `event_recurrence_reads_every_pattern_and_range`,
