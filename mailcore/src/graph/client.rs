@@ -9,9 +9,9 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderListing, MailFolder,
-    MasterCategory, Me, Message, MessageFields, MessageHeader, OofStatus, Person, Recipient,
-    Recurrence, ScheduleEntry, plain_to_html,
+    AttachmentMeta, AutomaticReplies, Body, DeltaPage, Event, FolderContact, FolderListing,
+    MailFolder, MasterCategory, Me, Message, MessageFields, MessageHeader, OofStatus, Person,
+    Recipient, Recurrence, ScheduleEntry, plain_to_html,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -1105,6 +1105,45 @@ impl GraphClient {
             })
             .collect();
         Ok(people)
+    }
+
+    /// GET `/me/contacts` (the default Contacts folder, #1934), 200 a page,
+    /// following `@odata.nextLink` (a relative path or a full URL, as
+    /// `calendar_view` does) until Graph stops sending one. Returns one
+    /// `FolderContact` per non-blank address of every contact (a contact
+    /// holds up to three `emailAddresses`), with the contact's
+    /// `displayName`. Any page's failure is an `Err`, never a partial list,
+    /// so a caller that replaces its stored set never drops contacts it
+    /// did not get to see. Requires `Contacts.Read`, which
+    /// `AuthConfig::default()` does not ask for: a host that wants
+    /// `Store::is_contact` adds it to its scope, and a token without it
+    /// gets a 403 here.
+    pub fn contacts(&self) -> Result<Vec<FolderContact>, GraphError> {
+        let mut target = "/me/contacts?$top=200&$select=displayName,emailAddresses".to_string();
+        let mut out = Vec::new();
+        loop {
+            let resp = self.send(Method::Get, &target, None, &[])?;
+            let v = parse_body(resp)?;
+            for c in value_array(&v, "value")? {
+                let name = c.get("displayName").and_then(Value::as_str).unwrap_or("");
+                let addresses = c.get("emailAddresses").and_then(Value::as_array);
+                for e in addresses.into_iter().flatten() {
+                    let address = e.get("address").and_then(Value::as_str).unwrap_or("");
+                    if address.trim().is_empty() {
+                        continue;
+                    }
+                    out.push(FolderContact {
+                        name: name.to_string(),
+                        address: address.to_string(),
+                    });
+                }
+            }
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) => target = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// POST `/me/messages/{id}/attachments` with an inline
@@ -3800,6 +3839,114 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(c.people().is_err());
+    }
+
+    #[test]
+    fn contacts_follows_next_links_and_keeps_every_address() {
+        // The page-2 route is listed first: the fake server answers the first
+        // route whose path_prefix matches (see
+        // `calendar_view_follows_next_link_pagination`).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts?$skip=200".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[
+                    {"displayName":"Erin","emailAddresses":[{"name":"Erin","address":"Erin@X.com"}]}
+                ]}"#
+                .into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[
+                    {"displayName":"Dave Doe","emailAddresses":[{"name":"Dave","address":"dave@x.com"},{"name":"Dave home","address":"dave@home.example"}]},
+                    {"displayName":"No Address","emailAddresses":[]},
+                    {"displayName":"Blank","emailAddresses":[{"name":"Blank","address":"  "}]},
+                    {"displayName":"Missing field"}
+                ],"@odata.nextLink":"/me/contacts?$skip=200"}"#
+                .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.contacts().unwrap();
+        let pairs: Vec<(&str, &str)> = got
+            .iter()
+            .map(|f| (f.name.as_str(), f.address.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Dave Doe", "dave@x.com"),
+                ("Dave Doe", "dave@home.example"),
+                ("Erin", "Erin@X.com"),
+            ]
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(
+            reqs[0].path.starts_with("/me/contacts?"),
+            "{}",
+            reqs[0].path
+        );
+        assert!(reqs[0].path.contains("$top=200"), "{}", reqs[0].path);
+        assert!(
+            reqs[0].path.contains("$select=displayName,emailAddresses"),
+            "{}",
+            reqs[0].path
+        );
+        assert_eq!(reqs[1].path, "/me/contacts?$skip=200");
+    }
+
+    #[test]
+    fn contacts_propagates_a_403() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/contacts".into(),
+            status: 403,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorAccessDenied"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.contacts().is_err());
+    }
+
+    #[test]
+    fn contacts_later_page_error_is_an_error() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts?$skip=200".into(),
+                status: 500,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"displayName":"Dave","emailAddresses":[{"address":"dave@x.com"}]}],"@odata.nextLink":"/me/contacts?$skip=200"}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.contacts().is_err());
+    }
+
+    #[test]
+    fn contacts_page_without_value_is_an_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/contacts".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"error":"nope"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.contacts().is_err());
     }
 
     #[test]

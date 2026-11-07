@@ -14,9 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{AttendeeInput, EventFieldSet};
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence, MailFolder,
-    MasterCategory, Message, MessageFields, MessageHeader, Recipient, Recurrence, is_stored_header,
-    meeting_link_in,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Event, EventRecurrence,
+    FolderContact, MailFolder, MasterCategory, Message, MessageFields, MessageHeader, Recipient,
+    Recurrence, is_stored_header, meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -3304,6 +3304,66 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+
+    /// Replaces the whole stored Contacts-folder set (#1934) in one
+    /// transaction with `contacts`, what `GraphClient::contacts` fetched:
+    /// a contact no longer in the folder stops counting for `is_contact`.
+    /// Each address is trimmed and lowercased (`folder_contact_key`); blank
+    /// ones and ones without an `@` are dropped (a contact saved from the
+    /// directory can carry an Exchange X500 address, `/o=ExchangeLabs/...`,
+    /// which no sender address ever equals); duplicates collapse, the first
+    /// non-empty name winning. An empty slice empties the set. Never touches
+    /// `contacts` (people and mined correspondents).
+    pub fn replace_folder_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM folder_contacts", [])?;
+        for c in contacts {
+            let address = folder_contact_key(&c.address);
+            if address.is_empty() || !address.contains('@') {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO folder_contacts (address, name) VALUES (?1, ?2)
+                 ON CONFLICT(address) DO UPDATE SET
+                     name = CASE WHEN folder_contacts.name = '' THEN excluded.name
+                                 ELSE folder_contacts.name END",
+                params![address, c.name.trim()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether `address` is in the user's own Contacts folder, as the last
+    /// successful fetch stored it (`replace_folder_contacts`): an exact
+    /// match ignoring case and surrounding whitespace, never a substring.
+    /// `/me/people` and mined correspondents (`contacts`) never count. A
+    /// blank address is `false`.
+    ///
+    /// The set is refreshed by the engine's full pass only (startup,
+    /// `Refresh`, sign-in, a pass `needs_full_pass` asks for), never by a
+    /// periodic tick: in a long-running session a contact removed from the
+    /// folder can keep counting for days, until the next full pass. A failed
+    /// fetch (no `Contacts.Read`, offline) keeps the last stored set.
+    pub fn is_contact(&self, address: &str) -> Result<bool, StoreError> {
+        let address = folder_contact_key(address);
+        if address.is_empty() {
+            return Ok(false);
+        }
+        let found: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folder_contacts WHERE address = ?1)",
+            params![address],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+}
+
+/// The key `folder_contacts` stores an address under, and `is_contact`
+/// looks one up by: trimmed, lowercased with Rust's `to_lowercase`, as
+/// `upsert_contact` lowercases `contacts` addresses.
+fn folder_contact_key(address: &str) -> String {
+    address.trim().to_lowercase()
 }
 
 /// `Store::drafts_folder_id` on `conn`, which `create_local_draft` passes
@@ -4819,6 +4879,149 @@ mod tests {
         // Bob appeared in ONE message, even though he's listed in both `to`
         // and `cc` of it — frequency counts messages, not role-appearances.
         assert_eq!(bob.frequency, 1);
+    }
+
+    fn fc(name: &str, address: &str) -> FolderContact {
+        FolderContact {
+            name: name.into(),
+            address: address.into(),
+        }
+    }
+
+    #[test]
+    fn is_contact_matches_only_folder_contacts() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "inbox".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        s.replace_folder_contacts(&[fc("Ann", "Ann@X.com")])
+            .unwrap();
+        // A `/me/people` person and a mined sender are not Contacts.
+        s.upsert_contact(&Contact {
+            name: "Bob".into(),
+            address: "bob@x.com".into(),
+            source: "graph".into(),
+            last_seen: String::new(),
+            frequency: 0,
+            relevance: Some(0),
+        })
+        .unwrap();
+        let mut m = msg("1", false);
+        m.from = Recipient {
+            name: "Carol".into(),
+            address: "carol@x.com".into(),
+        };
+        s.upsert_message("inbox", &m).unwrap();
+        s.refresh_local_contacts().unwrap();
+        assert_eq!(s.search_contacts("carol", 1).unwrap().len(), 1);
+
+        for yes in ["ann@x.com", "ANN@x.COM", " ann@x.com "] {
+            assert!(s.is_contact(yes).unwrap(), "{yes:?}");
+        }
+        for no in [
+            "bob@x.com",
+            "carol@x.com",
+            "nn@x.com",
+            "ann@x",
+            "ann@x.co",
+            "ann@x.com.evil",
+            "",
+            "   ",
+            "%",
+            "_nn@x.com",
+        ] {
+            assert!(!s.is_contact(no).unwrap(), "{no:?}");
+        }
+
+        // The tables do not touch each other: a people upsert of a Contact's
+        // address leaves it a Contact, and its `contacts` row stays `graph`.
+        s.upsert_contact(&Contact {
+            name: "Ann".into(),
+            address: "ann@x.com".into(),
+            source: "graph".into(),
+            last_seen: String::new(),
+            frequency: 0,
+            relevance: Some(1),
+        })
+        .unwrap();
+        assert!(s.is_contact("ann@x.com").unwrap());
+        assert_eq!(s.search_contacts("ann@", 1).unwrap()[0].source, "graph");
+        // Mining again does not write Contacts either.
+        s.refresh_local_contacts().unwrap();
+        assert!(!s.is_contact("carol@x.com").unwrap());
+    }
+
+    #[test]
+    fn replace_folder_contacts_drops_absent_and_blank() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_folder_contacts(&[fc("A", "a@x.com"), fc("B", "b@x.com")])
+            .unwrap();
+        assert!(s.is_contact("a@x.com").unwrap());
+        assert!(s.is_contact("b@x.com").unwrap());
+
+        s.replace_folder_contacts(&[fc("B", "b@x.com"), fc("Blank", "  ")])
+            .unwrap();
+        assert!(!s.is_contact("a@x.com").unwrap());
+        assert!(s.is_contact("b@x.com").unwrap());
+        let rows: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM folder_contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+
+        s.replace_folder_contacts(&[]).unwrap();
+        assert!(!s.is_contact("b@x.com").unwrap());
+
+        // Duplicates collapse (first non-empty name wins); an X500 address
+        // (a directory-saved contact) is not stored.
+        let x500 = "/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=ann";
+        s.replace_folder_contacts(&[
+            fc("", "B@x.com"),
+            fc("Bea", " b@X.com "),
+            fc("Other", "b@x.com"),
+            fc("Ann", x500),
+        ])
+        .unwrap();
+        let rows: Vec<(String, String)> = s
+            .conn
+            .prepare("SELECT address, name FROM folder_contacts")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows, vec![("b@x.com".to_string(), "Bea".to_string())]);
+        assert!(s.is_contact("B@X.COM").unwrap());
+        assert!(!s.is_contact(x500).unwrap());
+    }
+
+    #[test]
+    fn is_contact_on_a_database_from_before_the_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-folder-contacts-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.conn.execute_batch("DROP TABLE folder_contacts").unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert!(!s.is_contact("ann@x.com").unwrap());
+        s.replace_folder_contacts(&[fc("Ann", "ann@x.com")])
+            .unwrap();
+        assert!(s.is_contact("ann@x.com").unwrap());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -71,6 +71,16 @@ pub struct Person {
     pub rank: i64,
 }
 
+/// One address of one contact in the user's Contacts folder (`/me/contacts`,
+/// #1934): a contact with several `emailAddresses` gives one of these per
+/// address, each with the contact's `displayName`. What `Store::is_contact`
+/// answers from, apart from `/me/people` and mined correspondents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderContact {
+    pub name: String,
+    pub address: String,
+}
+
 /// A mail message, as returned by Graph's `/messages` endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
