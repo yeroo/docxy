@@ -2862,7 +2862,8 @@ impl Store {
     /// Writes a host's edit of a stored event and returns the groups whose
     /// value changed (#1994): the `UpdateEvent` op sends only those. A `None`
     /// field keeps the stored value and is not in the set; so is a `Some`
-    /// equal to it. Attendees are rewritten only when they changed (as the
+    /// equal to it, except a reminder on a row still marked `reminder_unset`
+    /// (its create would otherwise send none). Attendees are rewritten only when they changed (as the
     /// ordered list of name, address and type), and each one whose address
     /// matches a stored one (case-insensitive) keeps its response and
     /// response time, and its type when the input's is `""`. Recurrence is

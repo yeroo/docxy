@@ -653,7 +653,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   (`0001-01-01...`, a `noEnd` range's `endDate`, a never-responded attendee's
   `status.time`) reads as `""` (`graph_date_or_empty`).
 - Two recurrence columns: `events.recurrence` is the create-side `Recurrence`
-  that `event_for_send` re-sends on every create **and update**;
+  that `event_for_send` re-sends on every create (and on a pre-#1994 queued
+  update read as `LEGACY_UPDATE`; an edit since #1994 never sends it);
   `events.graph_recurrence` is Graph's `EventRecurrence` (read side), written
   by `upsert_event_on`. Never write Graph's recurrence into `recurrence`: the
   lossy create-side type (three kinds, `numbered` becomes `noEnd`,
@@ -663,7 +664,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   #1937 asks. `Store::init` adds them to an old database with `ALTER TABLE`
   after `SCHEMA_SQL` runs, so `SCHEMA_SQL` must not index any of them (an old
   database would fail the `CREATE INDEX` before the column exists).
-- `create_local_event` stores the fields Graph sets on create: `busy`,
+- `create_local_event` stores what the host set (#1994), else the fields
+  Graph sets on create: `busy`,
   `normal` sensitivity and importance, organizer, both request flags on,
   `singleInstance`, or `seriesMaster` with its recurrence in
   `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
