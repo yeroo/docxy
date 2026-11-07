@@ -1,0 +1,146 @@
+# The embedded view draws an imported Outlook mail as a browser lays out
+# the same HTML (#1986): `<div>` lines 18 px apart at 12pt (a browser's
+# `line-height: normal`, 1.15 of the text, with no space between them),
+# each `<div><br></div>` one 18 px line, list numbers at 22 px in the
+# hanging space and item text at the list's 40 px, a nested list at its
+# own 80 px, and each number in its item's font, size and colour, in light
+# and in dark mode for content. `ext-doc-load` imports the HTML into the
+# view; `ext-doc-layout` reads what the last frame painted: positions in
+# px from the text column's left and the first paragraph's top. Font
+# independent: positions come from indents and line heights, colours from
+# the model.
+ext fixture
+
+test issue 1986 an imported Outlook mail draws its lines, empty lines and list numbers as a browser does, light and dark
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Hi</div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Line two</div><ol start='1' style='direction:ltr; margin-top:0px; margin-bottom:0px; list-style-type:decimal'><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item one</div></li><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item two</div></li><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item three</div><div role='presentation'>More text that belongs to item three</div></li></ol><div style='margin-top:0px; margin-bottom:0px; direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'><br></div><div style='margin-top:0px; margin-bottom:0px; direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Closing line</div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'><br></div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Name</div></body>"}
+  assert reply.blocks is 11
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.pitch_min is 18
+  assert reply.pitch_max is 18
+  assert reply.paragraphs.0.top is 0
+  assert reply.paragraphs.0.height is 18
+  assert reply.paragraphs.0.lines.0.text is Hi
+  assert reply.paragraphs.0.lines.0.x is 0
+  assert reply.paragraphs.0.lines.0.size is 16
+  assert reply.paragraphs.1.top is 18
+  assert reply.paragraphs.2.top is 36
+  assert reply.paragraphs.2.lines.0.text is Item one
+  assert reply.paragraphs.2.marker.text is 1.
+  assert reply.paragraphs.2.marker.x is 22
+  assert reply.paragraphs.2.marker.size is 16
+  assert reply.paragraphs.2.text_x is 40
+  assert reply.paragraphs.2.marker_fits is true
+  assert reply.paragraphs.2.marker_matches_text is true
+  assert reply.paragraphs.3.top is 54
+  assert reply.paragraphs.3.marker.text is 2.
+  assert reply.paragraphs.3.marker.x is 22
+  assert reply.paragraphs.3.text_x is 40
+  assert reply.paragraphs.3.marker_matches_text is true
+  assert reply.paragraphs.4.top is 72
+  assert reply.paragraphs.4.marker.text is 3.
+  assert reply.paragraphs.4.text_x is 40
+  assert reply.paragraphs.4.marker_matches_text is true
+  assert reply.paragraphs.5.top is 90
+  assert reply.paragraphs.5.marker is null
+  assert reply.paragraphs.5.text_x is 40
+  assert reply.paragraphs.6.top is 108
+  assert reply.paragraphs.6.height is 18
+  assert reply.paragraphs.6.lines is []
+  assert reply.paragraphs.7.top is 126
+  assert reply.paragraphs.7.lines.0.text is Closing line
+  assert reply.paragraphs.8.top is 144
+  assert reply.paragraphs.8.height is 18
+  assert reply.paragraphs.9.top is 162
+  assert reply.paragraphs.9.lines.0.text is Name
+  assert reply.paragraphs.0.lines.0.color is 000000
+  assert reply.paragraphs.2.marker.color is 000000
+  call theme-set {"theme":"dark"}
+  call ext-doc-set {"content_dark":true}
+  assert reply.content_dark is true
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.pitch_min is 18
+  assert reply.pitch_max is 18
+  assert reply.paragraphs.0.top is 0
+  assert reply.paragraphs.0.height is 18
+  assert reply.paragraphs.0.lines.0.text is Hi
+  assert reply.paragraphs.0.lines.0.x is 0
+  assert reply.paragraphs.0.lines.0.size is 16
+  assert reply.paragraphs.1.top is 18
+  assert reply.paragraphs.2.top is 36
+  assert reply.paragraphs.2.lines.0.text is Item one
+  assert reply.paragraphs.2.marker.text is 1.
+  assert reply.paragraphs.2.marker.x is 22
+  assert reply.paragraphs.2.marker.size is 16
+  assert reply.paragraphs.2.text_x is 40
+  assert reply.paragraphs.2.marker_fits is true
+  assert reply.paragraphs.2.marker_matches_text is true
+  assert reply.paragraphs.3.top is 54
+  assert reply.paragraphs.3.marker.text is 2.
+  assert reply.paragraphs.3.marker.x is 22
+  assert reply.paragraphs.3.text_x is 40
+  assert reply.paragraphs.3.marker_matches_text is true
+  assert reply.paragraphs.4.top is 72
+  assert reply.paragraphs.4.marker.text is 3.
+  assert reply.paragraphs.4.text_x is 40
+  assert reply.paragraphs.4.marker_matches_text is true
+  assert reply.paragraphs.5.top is 90
+  assert reply.paragraphs.5.marker is null
+  assert reply.paragraphs.5.text_x is 40
+  assert reply.paragraphs.6.top is 108
+  assert reply.paragraphs.6.height is 18
+  assert reply.paragraphs.6.lines is []
+  assert reply.paragraphs.7.top is 126
+  assert reply.paragraphs.7.lines.0.text is Closing line
+  assert reply.paragraphs.8.top is 144
+  assert reply.paragraphs.8.height is 18
+  assert reply.paragraphs.9.top is 162
+  assert reply.paragraphs.9.lines.0.text is Name
+  assert reply.paragraphs.2.marker.color is 000000
+  call ext-doc-set {"content_dark":false}
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1986 a mail with no colour draws its numbers in the text's ink, never the dim grey, and a nested list at its own indent
+  call theme-set {"theme":"dark"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"content_dark":true}
+  call ext-doc-load {"html": "<body><div style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt'>Hi</div><ol style='margin-top:0px; margin-bottom:0px'><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; margin-top:0px; margin-bottom:0px'><div>Item one</div><ol style='margin-top:0px; margin-bottom:0px'><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; margin-top:0px; margin-bottom:0px'><div>Nested item</div></li></ol></li><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; margin-top:0px; margin-bottom:0px'><div>Item two</div></li></ol><div style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt'><br></div><div style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt'>Name</div></body>"}
+  assert reply.blocks is 7
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.pitch_min is 18
+  assert reply.pitch_max is 18
+  assert reply.paragraphs.1.lines.0.text is Item one
+  assert reply.paragraphs.1.marker.x is 22
+  assert reply.paragraphs.1.text_x is 40
+  assert reply.paragraphs.1.marker_matches_text is true
+  assert reply.paragraphs.1.marker.color is {ext-doc-layout.paragraphs.1.lines.0.color}
+  assert reply.paragraphs.2.lines.0.text is Nested item
+  assert reply.paragraphs.2.marker.x is 62
+  assert reply.paragraphs.2.text_x is 80
+  assert reply.paragraphs.2.marker_matches_text is true
+  assert reply.paragraphs.3.lines.0.text is Item two
+  assert reply.paragraphs.3.marker.text is 2.
+  assert reply.paragraphs.3.text_x is 40
+  assert reply.paragraphs.3.marker_matches_text is true
+  call ext-doc-set {"content_dark":false}
+  call ext-doc-layout {}
+  assert reply.paragraphs.1.marker_matches_text is true
+  assert reply.paragraphs.2.text_x is 80
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
