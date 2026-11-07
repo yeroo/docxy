@@ -939,7 +939,8 @@ Item 1 of #1984: a host whose calendar shows dates outside the kept window
   freshness re-fetches within the same second.
 - Every calendar pass records its window (`apply_calendar_sync` takes a
   `RangeStamp`), so a range inside the window costs nothing. The window
-  slides each pass and would leave one sliver row per pass: recording
+  moves (each UTC day since #2013, each pass before) and would leave one
+  sliver row per move: recording
   first deletes the calendar's rows at or before the cutoff, which can
   never count again.
 - Forgetting: `delete_calendar_events_on` (deselecting, `SetCalendars`)
@@ -969,8 +970,9 @@ Item 1 of #1984: a host whose calendar shows dates outside the kept window
   `fetch_calendar_range_rejects_bad_bounds`,
   `fetch_calendar_range_throttled_emits_no_range_fetched`,
   `fetch_calendar_range_keeps_going_past_a_failed_calendar`. The engine
-  tests count `/me/calendars` requests only (`calendar_requests`): the
-  mail sync makes its own requests in the meantime.
+  tests count calendar requests only (`calendar_requests`: `/me/calendars`
+  and, since #2013, the `/cal-delta/` link rounds): the mail sync makes
+  its own requests in the meantime.
 
 ## Calendar delta over a kept window (#2013)
 
@@ -1006,8 +1008,9 @@ wider window fresh without downloading it again.
   deltaLink with every page in memory, so a round that fails part way
   writes nothing (replaying a link is harmless). In a delta round the
   latest item about an event wins: a removal drops the round's earlier
-  upserts of that id and of its occurrences, and an upsert cancels an
-  earlier removal, since the store removes first. An initial round's
+  upserts of that id (not of its occurrences: see the series rule below),
+  and an upsert cancels an earlier removal, since the store removes
+  first. An initial round's
   removals are ignored: it replaces the window.
 - Writing: `apply_calendar_sync` takes `SyncedCalendar { fetched, round,
   delta_link }` (`FetchedCalendar` itself is unchanged, and
@@ -1017,7 +1020,16 @@ wider window fresh without downloading it again.
   deletes that calendar's non-`local:` row with that id and every row
   whose `series_master_id` it is (a removed series takes its
   occurrences; Graph's docs do not say whether it lists a master or each
-  occurrence, so both are handled; an id with no row is a no-op). Both
+  occurrence, so both are handled; an id with no row is a no-op). A
+  removal deletes only rows overlapping the window: Graph's calendarView
+  delta also lists as `@removed` events outside the range that were
+  added, changed or deleted, which Graph may still have (an event moved
+  to day 200, a `FetchCalendarRange` row, history); an event that moved
+  out still has its old in-window times locally, so it goes. A removed
+  id the round also upserts occurrences of is a changed series master
+  (one starting before the window is "outside the range" when edited),
+  not a removed series: only the row with that id goes, and the engine
+  keeps the round's occurrences of it. Both
   record the window as fetched (#2014's freshness) and store the window
   and deltaLink, in the pass's one transaction.
 - Errors: an expired link (`is_expired_sync_state`, as mail's #1871: a
@@ -1054,6 +1066,8 @@ wider window fresh without downloading it again.
   `calendar_tests` `apply_calendar_sync_delta_upserts_and_removes_only_that_calendar`,
   `apply_calendar_sync_delta_removed_series_master_removes_its_occurrences`,
   `apply_calendar_sync_delta_keeps_local_rows`,
+  `apply_calendar_sync_delta_removes_only_rows_in_the_window`,
+  `apply_calendar_sync_delta_keeps_a_series_the_round_names_occurrences_of`,
   `apply_calendar_sync_stores_and_forgets_delta_state`,
   `clear_calendar_deltas_clears_every_calendar`; `engine.rs`
   `calendar_window_defaults_to_30_days_back_and_180_days_forward`,
@@ -1061,6 +1075,8 @@ wider window fresh without downloading it again.
   `refresh_calendar_uses_the_custom_window_option`,
   `calendar_delta_adds_updates_and_removes_occurrences`,
   `calendar_delta_removed_series_master_removes_its_occurrences`,
+  `calendar_delta_removed_outside_the_window_keeps_the_row`,
+  `calendar_delta_removed_master_beside_its_occurrences_keeps_them`,
   `calendar_delta_410_restarts_with_an_initial_round`,
   `calendar_delta_throttled_keeps_the_link_and_writes_nothing`,
   `calendar_delta_link_of_another_window_is_not_used`,
