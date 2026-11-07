@@ -45,10 +45,13 @@ pub(crate) struct FixtureView {
     pub(crate) link_calls: Rc<RefCell<Vec<String>>>,
     /// How many change events the view sent (#1947).
     pub(crate) change_calls: Rc<Cell<usize>>,
+    /// The header line's own focus, as a host's chrome beside the view may
+    /// have (a press on it takes the keys from the view, #2003).
+    header_focus: FocusHandle,
 }
 
 impl Render for FixtureView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let calls = self.link_calls.borrow().len();
         div()
             .flex()
@@ -56,6 +59,14 @@ impl Render for FixtureView {
             .size_full()
             .child(
                 div()
+                    .id("ext-fixture-header")
+                    .track_focus(&self.header_focus)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.header_focus.focus(window, cx);
+                        }),
+                    )
                     .px_2()
                     .py_1()
                     .when(calls > 0, |d| d.font_weight(FontWeight::BOLD))
@@ -92,10 +103,11 @@ pub(crate) fn factory() -> ext::Factory {
             let changes = changes.clone();
             v.on_change(move |_cx| changes.set(changes.get() + 1));
         });
-        let root = cx.new(|_| FixtureView {
+        let root = cx.new(|cx| FixtureView {
             doc: view,
             link_calls: calls,
             change_calls: changes,
+            header_focus: cx.focus_handle(),
         });
         Ok(Box::new(FixtureMail { root }) as Box<dyn TabSurface>)
     })

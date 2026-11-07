@@ -36434,8 +36434,10 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         });
     }
     // The selection strips stop their press: with a pen on, the press is
-    // the pen's.
-    let selects = ctx.active && drawing.is_none();
+    // the pen's. The embedded view has no cell selection (its `table_click`
+    // takes none), so it draws none: a press beside a row there reaches the
+    // view and focuses it, one on a cell's left edge reaches the cell (#2003).
+    let selects = ctx.active && drawing.is_none() && ctx.ent.is_suite();
     let selected: Vec<(usize, usize)> = ctx
         .cell_range
         .filter(|r| r.table.as_slice() == path)

@@ -495,7 +495,8 @@ crop) and `round` (the radius is half the shorter side). A table is
 fitted to the
 width the frame before measured, so read it after a `shot`, which waits for
 the frame after the change. The embedded view's `ext-doc-read` reports
-`scroll_x`, `max_scroll_x`, `text_width` and `table_widths` the same way
+`scroll_x`, `max_scroll_x`, `text_width` and `table_widths` the same way,
+and `page_color` and `column_left` (#2003) too
 (`docs/claude/suite-extensions.md`).
 
 `table` is the caret's innermost table, or `null` outside one (#705):
