@@ -43,12 +43,17 @@
 //! Secrets (access/refresh tokens) are never logged.
 
 use crate::auth::{self, AuthConfig, TokenSet};
-use crate::graph::client::{DeltaCursor, GraphClient, GraphError, RsvpKind, is_expired_sync_state};
+use crate::graph::client::{
+    CalendarDeltaCursor, DeltaCursor, GraphClient, GraphError, RsvpKind, is_expired_sync_state,
+};
 pub use crate::graph::model::BodyFormat;
-use crate::graph::model::{AutomaticReplies, DeltaItem, MailFolder, Me, Message, ScheduleEntry};
+use crate::graph::model::{
+    AutomaticReplies, DeltaItem, EventDeltaItem, MailFolder, Me, Message, ScheduleEntry,
+};
 use crate::store::{
-    FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent,
-    OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
+    CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
+    NewEvent, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
+    SyncedCalendar,
 };
 use crate::sync::outbox::{apply_op, apply_send, send_error_text};
 use crate::tokencache;
@@ -214,11 +219,13 @@ pub enum SyncCommand {
     /// it, and emit [`SyncEvent::DraftReady`].
     ComposeForward { id: String },
     /// List the user's calendars (`Store::replace_calendars`, emitting
-    /// [`SyncEvent::CalendarsUpdated`] when the list changed), then fetch
-    /// the calendar window (`calendar_window`, anchored at
-    /// `SystemTime::now()`) of every synced calendar
-    /// (`Store::synced_calendar_ids`) via `calendar_view_in`, store it
-    /// (`Store::apply_calendar_sync`), and emit
+    /// [`SyncEvent::CalendarsUpdated`] when the list changed), then bring
+    /// the kept window ([`EngineOptions::calendar_window`], by default 30
+    /// days back and 180 forward from the start of today, UTC) of every
+    /// synced calendar (`Store::synced_calendar_ids`) up to date with its
+    /// `calendarView/delta` (#2013): an initial round over the window, or
+    /// a round from the deltaLink the last pass stored for that window,
+    /// store it (`Store::apply_calendar_sync`), and emit
     /// [`SyncEvent::CalendarUpdated`] (#1984). Also run automatically on the
     /// periodic tick (see `Engine::on_tick`), interleaved with the mail sync
     /// pass.
@@ -478,6 +485,27 @@ const SMALL_FOLDER: i64 = 50;
 
 /// The default of [`EngineOptions::prefetch_body_days`] (#1978).
 pub const PREFETCH_BODY_DAYS: u32 = 14;
+/// The calendar window a sync pass keeps (#2013,
+/// [`EngineOptions::calendar_window`]): from the start of the current UTC
+/// day, `past_days` back and the whole of the `future_days`th day forward.
+/// Anchored at the day, so the bounds and a deltaLink over them hold all
+/// day; the first pass of a new day runs an initial round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarWindow {
+    pub past_days: u32,
+    pub future_days: u32,
+}
+
+impl Default for CalendarWindow {
+    /// 30 days back and 180 forward.
+    fn default() -> Self {
+        CalendarWindow {
+            past_days: 30,
+            future_days: 180,
+        }
+    }
+}
+
 /// The default of [`EngineOptions::calendar_range_fresh_for`] (#2014).
 pub const CALENDAR_RANGE_FRESH_FOR: Duration = Duration::from_secs(3600);
 /// At most this many bodies of the messages one delta round on a stored
@@ -618,6 +646,10 @@ pub struct EngineOptions {
     /// [`CALENDAR_RANGE_FRESH_FOR`]). The kept window counts as fetched by
     /// each calendar pass. Zero fetches every time.
     pub calendar_range_fresh_for: Duration,
+    /// The window each calendar pass keeps fresh with `calendarView/delta`
+    /// (#2013; default 30 days back and 180 forward). Changing it makes
+    /// the next pass run initial rounds over the new window.
+    pub calendar_window: CalendarWindow,
 }
 
 impl Default for EngineOptions {
@@ -627,6 +659,7 @@ impl Default for EngineOptions {
             fast_tick: None,
             prefetch_body_days: PREFETCH_BODY_DAYS,
             calendar_range_fresh_for: CALENDAR_RANGE_FRESH_FOR,
+            calendar_window: CalendarWindow::default(),
         }
     }
 }
@@ -2432,21 +2465,31 @@ impl Engine {
                         let _ = self.store.clear_delta_links();
                         self.backfill_done = false;
                         self.reconverge_pending = true;
-                        let is_respond_event = matches!(row.op, OutboxOp::RespondEvent { .. });
+                        let is_event_op = matches!(
+                            row.op,
+                            OutboxOp::RespondEvent { .. }
+                                | OutboxOp::UpdateEvent { .. }
+                                | OutboxOp::DeleteEvent { .. }
+                        );
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
                         )));
-                        // A quarantined `RespondEvent` leaves the optimistic
-                        // local `response_status` wrong (Graph never got the
-                        // RSVP) — unlike mail, there's no delta re-sync to
-                        // fix that up later, and the mail reconverge above
-                        // doesn't touch the `events` table at all. Refresh
-                        // the calendar right away so `replace_events_in_
-                        // window` (see `Store::replace_events_in_window`)
-                        // pulls the true status back from the server instead
-                        // of leaving a phantom RSVP on the books.
-                        if is_respond_event {
+                        // A quarantined `RespondEvent`, `UpdateEvent` or
+                        // `DeleteEvent` leaves its optimistic local write
+                        // (an RSVP, edited fields, a deleted row) on an
+                        // event Graph never changed, which no calendar delta
+                        // round names (#2013), and the mail reconverge above
+                        // doesn't touch the `events` table at all. Forget
+                        // every calendar's delta state, so the refresh (or,
+                        // should it fail, the next pass) runs initial rounds
+                        // that replace each window with Graph's truth.
+                        // `CreateEvent`'s `local:` row is never replaced
+                        // either way.
+                        if is_event_op {
+                            if let Err(e) = self.store.clear_calendar_deltas() {
+                                self.emit(SyncEvent::Error(e.to_string()));
+                            }
                             self.refresh_calendar();
                         }
                     } else {
@@ -3115,30 +3158,37 @@ impl Engine {
 
     // --- Calendar ----------------------------------------------------------
 
-    /// One calendar sync pass (#1984). Lists the user's calendars
+    /// One calendar sync pass (#1984, #2013). Lists the user's calendars
     /// (`list_calendars` into `Store::replace_calendars`, emitting
-    /// `SyncEvent::CalendarsUpdated` when the list changed), then fetches
-    /// `calendar_window(SystemTime::now())` of every synced calendar
-    /// (`Store::synced_calendar_ids`) through
-    /// `/me/calendars/{id}/calendarView`, and writes the pass in one
-    /// transaction (`Store::apply_calendar_sync`): each fetched calendar's
-    /// window is replaced, pre-#1984 rows move to the default calendar, and
-    /// the events of calendars that no longer sync go. Then emits
-    /// `SyncEvent::CalendarUpdated`. Graph's `calendarView` isn't a delta
-    /// endpoint, so every pass re-fetches each window whole; replacing
-    /// (rather than only upserting) is what prunes an event Graph no longer
-    /// returns (cancelled, or moved out of the window).
+    /// `SyncEvent::CalendarsUpdated` when the list changed), then brings
+    /// the window (`calendar_window` of `SystemTime::now()` and
+    /// `EngineOptions::calendar_window`) of every synced calendar
+    /// (`Store::synced_calendar_ids`) up to date with one
+    /// `/me/calendars/{id}/calendarView/delta` round each
+    /// (`calendar_delta_round`): from the calendar's stored deltaLink when
+    /// it covers this window, else an initial round over it. It writes the
+    /// pass in one transaction (`Store::apply_calendar_sync`): an initial
+    /// round replaces the calendar's window, which is what prunes an event
+    /// Graph no longer returns; a delta round adds, changes and removes
+    /// only what it names. Pre-#1984 rows move to the default calendar, the
+    /// events of calendars that no longer sync go, and each fetched
+    /// calendar's deltaLink is stored with its window. Then emits
+    /// `SyncEvent::CalendarUpdated`.
     ///
     /// Same signed-in guard as `fetch_body` et al. A failed list ends the
-    /// pass with nothing changed. A 401, throttle or transport error on any
-    /// calendar's view goes through `react` and ends the pass with no event
-    /// written, never a partial window (the calendar list, already stored
-    /// and announced, stays); a 404, other HTTP error or parse
-    /// failure on one calendar is surfaced (`SyncEvent::Error`) and that
-    /// calendar keeps its stored events while the others are written. Also
-    /// called by `drain_outbox` right after a `RespondEvent` op
-    /// quarantines, to reconverge the optimistic local RSVP with server
-    /// truth (see the quarantine branch there), and by `set_calendars`.
+    /// pass with nothing changed. An expired link (`is_expired_sync_state`:
+    /// a 410, or a 400 `syncStateNotFound`/`resyncRequired`) runs that
+    /// calendar's initial round at once, in the same pass. A 401, throttle
+    /// or transport error on any round goes through `react` and ends the
+    /// pass with no event written and every stored link kept, never a
+    /// partial window (the calendar list, already stored and announced,
+    /// stays); a 404, other HTTP error or parse failure on one calendar is
+    /// surfaced (`SyncEvent::Error`) and that calendar keeps its stored
+    /// events and link while the others are written. Also called by
+    /// `drain_outbox` right after an event op quarantines (with every
+    /// calendar's delta state cleared first, so its rounds are initial),
+    /// to reconverge the optimistic local write with server truth (see the
+    /// quarantine branch there), and by `set_calendars`.
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
@@ -3154,12 +3204,29 @@ impl Engine {
                 return;
             }
         };
-        let (from, to) = calendar_window(SystemTime::now());
+        let (from, to) = calendar_window(SystemTime::now(), self.config.options.calendar_window);
         let mut fetched = Vec::with_capacity(synced.len());
         for id in synced {
-            match self.with_auth(|c| c.calendar_view_in(&id, &from, &to)) {
-                Ok(events) => fetched.push(fetched_calendar(id, &events)),
-                // Sign-in, throttle or offline: the whole pass waits.
+            // The stored link only while it covers this pass's window.
+            let link = match self.store.calendar_delta(&id) {
+                Ok(state) => state
+                    .filter(|s| s.from_utc == from && s.to_utc == to)
+                    .map(|s| s.delta_link),
+                Err(e) => {
+                    self.emit(SyncEvent::Error(e.to_string()));
+                    return;
+                }
+            };
+            let incremental = link.is_some();
+            let mut round = self.calendar_delta_round(&id, &from, &to, link);
+            // An expired link: an initial round, once, in this pass.
+            if incremental && matches!(&round, Err(e) if is_expired_sync_state(e)) {
+                round = self.calendar_delta_round(&id, &from, &to, None);
+            }
+            match round {
+                Ok(c) => fetched.push(c),
+                // Sign-in, throttle or offline: the whole pass waits, and
+                // every calendar keeps its stored link.
                 Err(e) => {
                     if self.react(e) {
                         return;
@@ -3173,6 +3240,77 @@ impl Engine {
             return;
         }
         self.emit(SyncEvent::CalendarUpdated);
+    }
+
+    /// One calendarView delta round of calendar `id` over `[from, to)`
+    /// (#2013): from `link` (the stored deltaLink) or, with none, an
+    /// initial round. Follows nextLinks until a deltaLink comes, keeping
+    /// every page in memory, so a round that fails part way writes
+    /// nothing (replaying the link next pass is harmless). In a delta
+    /// round the latest item about an event wins: a removal drops the
+    /// round's earlier upserts of that id and of its occurrences, and an
+    /// upsert cancels an earlier removal, since the store removes before
+    /// it upserts. An initial round's removals mean nothing: the window
+    /// is replaced whole.
+    fn calendar_delta_round(
+        &mut self,
+        id: &str,
+        from: &str,
+        to: &str,
+        link: Option<String>,
+    ) -> Result<SyncedCalendar, GraphError> {
+        let incremental = link.is_some();
+        let mut cursor = match link {
+            Some(link) => CalendarDeltaCursor::Link(link),
+            None => CalendarDeltaCursor::Start {
+                calendar_id: id.to_string(),
+                from_utc: from.to_string(),
+                to_utc: to.to_string(),
+            },
+        };
+        let mut events: Vec<crate::graph::model::Event> = Vec::new();
+        let mut removed: Vec<String> = Vec::new();
+        loop {
+            let page = self.with_auth(|c| c.calendar_delta(cursor.clone()))?;
+            for item in page.items {
+                match item {
+                    EventDeltaItem::Upsert(e) => {
+                        removed.retain(|r| *r != e.id);
+                        events.retain(|old| old.id != e.id);
+                        events.push(e);
+                    }
+                    EventDeltaItem::Removed(gone) if incremental => {
+                        events.retain(|e| {
+                            e.id != gone && e.series_master_id.as_deref() != Some(gone.as_str())
+                        });
+                        if !removed.contains(&gone) {
+                            removed.push(gone);
+                        }
+                    }
+                    EventDeltaItem::Removed(_) => {}
+                }
+            }
+            match (page.next_link, page.delta_link) {
+                (Some(next), _) => cursor = CalendarDeltaCursor::Link(next),
+                (None, Some(delta_link)) => {
+                    return Ok(SyncedCalendar {
+                        fetched: fetched_calendar(id.to_string(), &events),
+                        round: if incremental {
+                            CalendarRound::Delta { removed }
+                        } else {
+                            CalendarRound::Window
+                        },
+                        delta_link,
+                    });
+                }
+                // `calendar_delta` refuses such a page.
+                (None, None) => {
+                    return Err(GraphError::Parse(
+                        "calendar delta page without a nextLink or deltaLink".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
     /// Lists the user's calendars into the store (`list_calendars`,
@@ -3962,8 +4100,9 @@ fn unix_to_iso8601(secs: u64) -> String {
     crate::store::unix_secs_to_iso8601(i64::try_from(secs).unwrap_or(i64::MAX))
 }
 
-/// One calendar's `calendarView` answer as the store writes it: the
-/// events and their attendees, under `id` (the URL decides, #1984).
+/// One calendar's `calendarView` answer, or a delta round's upserts
+/// (#2013), as the store writes it: the events and their attendees, under
+/// `id` (the URL decides, #1984).
 fn fetched_calendar(id: String, events: &[crate::graph::model::Event]) -> FetchedCalendar {
     FetchedCalendar {
         events: events.iter().map(NewEvent::from).collect(),
@@ -3980,23 +4119,21 @@ fn fetched_calendar(id: String, events: &[crate::graph::model::Event]) -> Fetche
     }
 }
 
-/// `RefreshCalendar`'s window, per calendar: this many days into the past...
-const CALENDAR_WINDOW_PAST_DAYS: u64 = 7;
-/// ...and this many days into the future, both anchored at the base time
-/// `calendar_window` is called with.
-const CALENDAR_WINDOW_FUTURE_DAYS: u64 = 30;
-
-/// Computes the `[from, to]` ISO-8601 UTC bounds `RefreshCalendar` fetches:
-/// `base - 7d` .. `base + 30d`. `base` is an injectable anchor so tests can
-/// pin it to a fixed instant; production (`Engine::refresh_calendar`) always
-/// passes `SystemTime::now()`.
-fn calendar_window(base: SystemTime) -> (String, String) {
-    let base_secs = base
+/// The `[from, to)` ISO-8601 UTC bounds a calendar pass keeps (#2013):
+/// from the start of `base`'s UTC day, `window.past_days` back and
+/// `window.future_days + 1` forward (the whole of the last day). `base` is
+/// an injectable anchor so tests can pin it; production
+/// (`Engine::refresh_calendar`) passes `SystemTime::now()`.
+fn calendar_window(base: SystemTime, window: CalendarWindow) -> (String, String) {
+    const DAY: u64 = 86400;
+    let day = base
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    let from = base_secs.saturating_sub(CALENDAR_WINDOW_PAST_DAYS * 86400);
-    let to = base_secs + CALENDAR_WINDOW_FUTURE_DAYS * 86400;
+        .as_secs()
+        / DAY
+        * DAY;
+    let from = day.saturating_sub(u64::from(window.past_days) * DAY);
+    let to = day + (u64::from(window.future_days) + 1) * DAY;
     (unix_to_iso8601(from), unix_to_iso8601(to))
 }
 
@@ -7798,14 +7935,37 @@ mod tests {
     }
 
     #[test]
-    fn calendar_window_defaults_to_7_days_back_and_30_days_forward() {
-        // 2026-07-18T00:00:00Z, a fixed base so this doesn't depend on wall
-        // clock — the whole point of `calendar_window` taking `base` as a
-        // parameter rather than reading `SystemTime::now()` itself.
-        let base = UNIX_EPOCH + Duration::from_secs(1_784_332_800);
-        let (from, to) = calendar_window(base);
-        assert_eq!(from, "2026-07-11T00:00:00Z");
-        assert_eq!(to, "2026-08-17T00:00:00Z");
+    fn calendar_window_defaults_to_30_days_back_and_180_days_forward() {
+        // 2026-07-18T13:37:05Z, a fixed base in the middle of a day, so this
+        // doesn't depend on the wall clock — the whole point of
+        // `calendar_window` taking `base` as a parameter rather than reading
+        // `SystemTime::now()` itself. The window starts at the day.
+        let base = UNIX_EPOCH + Duration::from_secs(1_784_332_800 + 13 * 3600 + 37 * 60 + 5);
+        let (from, to) = calendar_window(base, CalendarWindow::default());
+        assert_eq!(from, "2026-06-18T00:00:00Z");
+        // The whole of the 180th day: 181 days after the start of today.
+        assert_eq!(to, "2027-01-15T00:00:00Z");
+        // Every instant of the day gives the same bounds, so a deltaLink
+        // over them holds all day.
+        let midnight = UNIX_EPOCH + Duration::from_secs(1_784_332_800);
+        let last_second = UNIX_EPOCH + Duration::from_secs(1_784_332_800 + 86_399);
+        for t in [midnight, last_second] {
+            assert_eq!(
+                calendar_window(t, CalendarWindow::default()),
+                (from.clone(), to.clone())
+            );
+        }
+        let custom = CalendarWindow {
+            past_days: 3,
+            future_days: 10,
+        };
+        assert_eq!(
+            calendar_window(base, custom),
+            (
+                "2026-07-15T00:00:00Z".to_string(),
+                "2026-07-29T00:00:00Z".to_string()
+            )
+        );
     }
 
     /// A Graph calendar-event JSON body shaped like `Event::from_json`
@@ -7845,26 +8005,64 @@ mod tests {
         format!(r#"{{"value":[{}]}}"#, events.join(","))
     }
 
-    /// The routes a calendar refresh asks for (#1984): each calendar's
-    /// `calendarView` (`status`, `body`; a 429 carries `Retry-After: 30`),
-    /// then the `/me/calendars` list of `cals` (id, default, owner). The
-    /// list's prefix ends in `?`, so it never answers a view: the fake
-    /// server takes the first route whose prefix matches.
+    /// `body` (a `value` page) as the last page of a calendar delta round,
+    /// ending with deltaLink `link` (#2013).
+    fn with_delta_link(body: &str, link: &str) -> String {
+        let open = body.trim_end().strip_suffix('}').expect("a JSON object");
+        format!(r#"{open},"@odata.deltaLink":"{link}"}}"#)
+    }
+
+    /// The deltaLink `calendar_routes` ends `id`'s rounds with: a relative
+    /// path, which `full_url` joins to the fake server's base.
+    fn delta_link_of(id: &str) -> String {
+        format!("/cal-delta/{id}?token=1")
+    }
+
+    /// The routes a calendar refresh asks for (#1984, #2013): for each of
+    /// `views` (`status`, `body`; a 429 carries `Retry-After: 30`), the
+    /// calendar's initial `calendarView/delta` round (`body`, with
+    /// `delta_link_of` added when it is a 200), a round from that link
+    /// with no change, and the plain `calendarView` a `FetchCalendarRange`
+    /// asks for (`body` as is); then the `/me/calendars` list of `cals`
+    /// (id, default, owner). The list's prefix ends in `?`, so it never
+    /// answers a view, and the view prefixes end in `?`, so none answers
+    /// another: the fake server takes the first route whose prefix
+    /// matches.
     fn calendar_routes(cals: &[(&str, bool, &str)], views: Vec<(&str, u16, String)>) -> Vec<Route> {
-        let mut routes: Vec<Route> = views
-            .into_iter()
-            .map(|(id, status, body)| Route {
-                method: "GET".into(),
-                path_prefix: format!("/me/calendars/{id}/calendarView?"),
+        let route = |path_prefix: String, status: u16, body: String| Route {
+            method: "GET".into(),
+            path_prefix,
+            status,
+            headers: if status == 429 {
+                vec![("Retry-After".into(), "30".into())]
+            } else {
+                vec![]
+            },
+            body,
+        };
+        let mut routes = Vec::new();
+        for (id, status, body) in views {
+            let link = delta_link_of(id);
+            let (delta, unchanged) = if status == 200 {
+                (
+                    with_delta_link(&body, &link),
+                    with_delta_link(r#"{"value":[]}"#, &link),
+                )
+            } else {
+                (body.clone(), body.clone())
+            };
+            routes.push(route(
+                format!("/me/calendars/{id}/calendarView/delta?"),
                 status,
-                headers: if status == 429 {
-                    vec![("Retry-After".into(), "30".into())]
-                } else {
-                    vec![]
-                },
+                delta,
+            ));
+            routes.push(route(link, status, unchanged));
+            routes.push(route(
+                format!("/me/calendars/{id}/calendarView?"),
+                status,
                 body,
-            })
-            .collect();
+            ));
+        }
         let items: Vec<String> = cals
             .iter()
             .map(|(id, default, owner)| calendar_json(id, *default, owner))
@@ -7915,9 +8113,21 @@ mod tests {
         seed: impl FnOnce(&Store),
         options: EngineOptions,
     ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let routes = routes.into_iter().map(|r| (r, None)).collect();
+        spawn_calendar_engine_limited(tag, routes, seed, options)
+    }
+
+    /// [`spawn_calendar_engine_with`] on routes that may answer a limited
+    /// number of requests (`FakeServer::start_limited`).
+    fn spawn_calendar_engine_limited(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>)>,
+        seed: impl FnOnce(&Store),
+        options: EngineOptions,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
         let mut routes = routes;
-        routes.extend(backfill_routes());
-        let srv = FakeServer::start(routes);
+        routes.extend(backfill_routes().into_iter().map(|r| (r, None)));
+        let srv = FakeServer::start_limited(routes);
         let base = srv.base_url.clone();
         let dir = unique_dir(tag);
         let store_path = dir.join("mail.db");
@@ -7962,11 +8172,14 @@ mod tests {
             .collect()
     }
 
+    /// How many of `calendar`'s views were requested from request `from`
+    /// on: its `calendarView`, `calendarView/delta` and deltaLink rounds.
     fn view_requests(srv: &FakeServer, from: usize, calendar: &str) -> usize {
         let prefix = format!("/me/calendars/{calendar}/calendarView");
+        let link = format!("/cal-delta/{calendar}?");
         paths_from(srv, from)
             .iter()
-            .filter(|p| p.starts_with(&prefix))
+            .filter(|p| p.starts_with(&prefix) || p.starts_with(&link))
             .count()
     }
 
@@ -8198,6 +8411,502 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- calendarView delta over the kept window (#2013) ---
+    //
+    // A test that runs two passes and asserts the second used the stored
+    // link would see an initial round instead if the passes straddled
+    // 00:00 UTC (the window moves with the day). That window is a few
+    // milliseconds a day, so there is no clock seam.
+
+    /// Today's default window, as a pass computes it.
+    fn today_window() -> (String, String) {
+        calendar_window(SystemTime::now(), CalendarWindow::default())
+    }
+
+    /// The initial delta round's path of `calendar` over `[from, to)`.
+    fn initial_delta_path(calendar: &str, from: &str, to: &str) -> String {
+        format!("/me/calendars/{calendar}/calendarView/delta?startDateTime={from}&endDateTime={to}")
+    }
+
+    /// Every view request of `calendar` (`view_requests`' set), in order.
+    fn view_paths(srv: &FakeServer, calendar: &str) -> Vec<String> {
+        let prefix = format!("/me/calendars/{calendar}/calendarView");
+        let link = format!("/cal-delta/{calendar}?");
+        paths_from(srv, 0)
+            .into_iter()
+            .filter(|p| p.starts_with(&prefix) || p.starts_with(&link))
+            .collect()
+    }
+
+    /// A calendar delta page of `items` ending with deltaLink `link`.
+    fn calendar_delta_page(items: &[String], link: &str) -> String {
+        with_delta_link(&events_body(items), link)
+    }
+
+    /// A delta page's `@removed` item.
+    fn removed_json(id: &str) -> String {
+        format!(r#"{{"id":"{id}","@removed":{{"reason":"deleted"}}}}"#)
+    }
+
+    /// Seeds `store` as if a pass over `[from, to)` had synced `calendar`
+    /// (the default, owned by me@x) with `events`, ending with `link`.
+    fn seed_synced_calendar(
+        store: &Store,
+        calendar: &str,
+        events: Vec<NewEvent>,
+        (from, to): (&str, &str),
+        link: &str,
+    ) {
+        store
+            .replace_calendars(&[crate::graph::model::Calendar {
+                id: calendar.into(),
+                is_default: true,
+                owner_addr: "me@x".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        let fetched = FetchedCalendar {
+            calendar_id: calendar.into(),
+            attendees: events.iter().map(|e| (e.id.clone(), Vec::new())).collect(),
+            events,
+        };
+        store
+            .apply_calendar_sync(
+                from,
+                to,
+                &[SyncedCalendar {
+                    fetched,
+                    round: CalendarRound::Window,
+                    delta_link: link.into(),
+                }],
+                RangeStamp {
+                    at: 1,
+                    fresh_since: 0,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn refresh_calendar_first_pass_is_an_initial_delta_over_the_window() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("EA", 3600)]))],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-first", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let (from, to) = today_window();
+        assert_eq!(
+            view_paths(&srv, "CAL-A"),
+            [initial_delta_path("CAL-A", &from, &to)]
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap(),
+            Some(crate::store::CalendarDeltaState {
+                from_utc: from,
+                to_utc: to,
+                delta_link: delta_link_of("CAL-A"),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refresh_calendar_uses_the_custom_window_option() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        );
+        let window = CalendarWindow {
+            past_days: 2,
+            future_days: 5,
+        };
+        let options = EngineOptions {
+            calendar_window: window,
+            ..EngineOptions::without_prefetch()
+        };
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine_with("calendar-delta-custom", routes, |_| {}, options);
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let (from, to) = calendar_window(SystemTime::now(), window);
+        assert_ne!((from.clone(), to.clone()), today_window());
+        assert_eq!(
+            view_paths(&srv, "CAL-A"),
+            [initial_delta_path("CAL-A", &from, &to)]
+        );
+        let state = Store::open(&store_path)
+            .unwrap()
+            .calendar_delta("CAL-A")
+            .unwrap()
+            .unwrap();
+        assert_eq!((state.from_utc, state.to_utc), (from, to));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_adds_updates_and_removes_occurrences() {
+        let start = now_unix() + 3 * 3600;
+        let moved = calendar_event_json(
+            "E-CHANGE",
+            unix_to_iso8601(start).trim_end_matches('Z'),
+            unix_to_iso8601(start + 1800).trim_end_matches('Z'),
+        )
+        .replacen(r#""subject":"Standup""#, r#""subject":"Moved""#, 1);
+        let routes = vec![
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &calendar_delta_page(
+                    &[
+                        event_from_now("E-KEEP", 3600),
+                        event_from_now("E-CHANGE", 7200),
+                        event_from_now("E-GONE", 7200),
+                    ],
+                    "/cal-delta/CAL-A?token=1",
+                ),
+            ),
+            get_route(
+                "/cal-delta/CAL-A?token=1",
+                200,
+                &calendar_delta_page(
+                    &[event_from_now("E-NEW", 5400), moved, removed_json("E-GONE")],
+                    "/cal-delta/CAL-A?token=2",
+                ),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-changes", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 2);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let (from, to) = today_window();
+        assert_eq!(
+            view_paths(&srv, "CAL-A"),
+            [
+                initial_delta_path("CAL-A", &from, &to),
+                "/cal-delta/CAL-A?token=1".to_string()
+            ],
+            "the second pass runs the stored link"
+        );
+        let store = Store::open(&store_path).unwrap();
+        let mut ids = ids_in(&store, "CAL-A");
+        ids.sort();
+        assert_eq!(ids, ["E-CHANGE", "E-KEEP", "E-NEW"]);
+        let rows = store
+            .events_in_range(&from, &to, &["CAL-A".to_string()])
+            .unwrap();
+        let row = |id: &str| rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row("E-CHANGE").subject, "Moved");
+        assert_eq!(row("E-CHANGE").start_utc, unix_to_iso8601(start));
+        assert_eq!(row("E-KEEP").subject, "Standup", "not named: untouched");
+        // A link-round event is stored under the calendar it was fetched for.
+        assert_eq!(store.event_attendees("E-NEW").unwrap().len(), 1);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            "/cal-delta/CAL-A?token=2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_removed_series_master_removes_its_occurrences() {
+        let occurrence = |id: &str, from_now: u64| {
+            event_from_now(id, from_now).replacen(
+                r#""seriesMasterId":null"#,
+                r#""seriesMasterId":"MASTER""#,
+                1,
+            )
+        };
+        let routes = vec![
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &calendar_delta_page(
+                    &[
+                        occurrence("O1", 3600),
+                        occurrence("O2", 86400 + 3600),
+                        event_from_now("SINGLE", 7200),
+                    ],
+                    "/cal-delta/CAL-A?token=1",
+                ),
+            ),
+            get_route(
+                "/cal-delta/CAL-A?token=1",
+                200,
+                &calendar_delta_page(&[removed_json("MASTER")], "/cal-delta/CAL-A?token=2"),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-series", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let mut ids = ids_in(&Store::open(&store_path).unwrap(), "CAL-A");
+        ids.sort();
+        assert_eq!(ids, ["O1", "O2", "SINGLE"]);
+
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(
+            ids_in(&Store::open(&store_path).unwrap(), "CAL-A"),
+            ["SINGLE"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_410_restarts_with_an_initial_round() {
+        let (from, to) = today_window();
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("EA", 3600)]))],
+        );
+        routes.insert(
+            0,
+            get_route(
+                "/cal-delta/CAL-A?token=old",
+                410,
+                r#"{"error":{"code":"SyncStateNotFound","message":"gone"}}"#,
+            ),
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-410", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("STALE", "CAL-A", 7200)],
+                    (&from, &to),
+                    "/cal-delta/CAL-A?token=old",
+                );
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "an expired link is no error: {seen:?}"
+        );
+        assert_eq!(
+            view_paths(&srv, "CAL-A"),
+            [
+                "/cal-delta/CAL-A?token=old".to_string(),
+                initial_delta_path("CAL-A", &from, &to)
+            ]
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"], "the window was replaced");
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            delta_link_of("CAL-A")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_throttled_keeps_the_link_and_writes_nothing() {
+        let (from, to) = today_window();
+        let link = "/cal-delta/CAL-A?token=1";
+        let throttled = Route {
+            method: "GET".into(),
+            path_prefix: link.into(),
+            status: 429,
+            headers: vec![("Retry-After".into(), "30".into())],
+            body: "{}".into(),
+        };
+        let routes = vec![
+            (throttled, Some(1)),
+            (
+                get_route(
+                    link,
+                    200,
+                    &calendar_delta_page(
+                        &[event_from_now("E-NEW", 3600)],
+                        "/cal-delta/CAL-A?token=2",
+                    ),
+                ),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "calendar-delta-throttled",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("E-KEEP", "CAL-A", 7200)],
+                    (&from, &to),
+                    link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        // A bad range after it marks the end of the throttled pass.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E-KEEP"], "nothing written");
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            link,
+            "the link is kept"
+        );
+
+        // The next pass runs the same link.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(view_paths(&srv, "CAL-A"), [link, link]);
+        let mut ids = ids_in(&store, "CAL-A");
+        ids.sort();
+        assert_eq!(ids, ["E-KEEP", "E-NEW"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            "/cal-delta/CAL-A?token=2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_link_of_another_window_is_not_used() {
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("EA", 3600)]))],
+        );
+        // Yesterday's window, or another `calendar_window` option.
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-delta-other-window", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("STALE", "CAL-A", 7200)],
+                    ("2020-01-01T00:00:00Z", "2020-07-01T00:00:00Z"),
+                    "/cal-delta/CAL-A?token=old",
+                );
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let (from, to) = today_window();
+        assert_eq!(
+            view_paths(&srv, "CAL-A"),
+            [initial_delta_path("CAL-A", &from, &to)]
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap(),
+            Some(crate::store::CalendarDeltaState {
+                from_utc: from,
+                to_utc: to,
+                delta_link: delta_link_of("CAL-A"),
+            })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_event_quarantine_restores_the_event() {
+        // The DELETE always 403s, so the optimistic local delete never
+        // reached Graph. Every pass before the quarantine runs the stored
+        // link, which (Graph's event unchanged) never names the event: only
+        // the initial round the quarantine forces brings it back.
+        let (from, to) = today_window();
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/events/E1".into(),
+                status: 403,
+                headers: vec![],
+                body: r#"{"error":{"code":"ErrorAccessDenied"}}"#.into(),
+            },
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("delete-event-reconverge", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("E1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        Store::open(&store_path)
+            .unwrap()
+            .delete_event("E1")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteEvent { id: "E1".into() })
+            .unwrap();
+        for _ in 0..4 {
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        }
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"], "the row is back");
+        let views = view_paths(&srv, "CAL-A");
+        assert!(
+            views[..views.len() - 1]
+                .iter()
+                .all(|p| *p == delta_link_of("CAL-A")),
+            "before the quarantine, link rounds only: {views:?}"
+        );
+        assert_eq!(
+            views.last(),
+            Some(&initial_delta_path("CAL-A", &from, &to)),
+            "{views:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- Calendar ranges on demand (#2014) ---
 
     /// A query parameter's value in a recorded request path.
@@ -8226,12 +8935,13 @@ mod tests {
             .collect()
     }
 
-    /// How many calendar requests (the list and every view) were made from
-    /// request `from` on. The mail sync's own requests are not counted.
+    /// How many calendar requests (the list, every view and deltaLink
+    /// round) were made from request `from` on. The mail sync's own
+    /// requests are not counted.
     fn calendar_requests(srv: &FakeServer, from: usize) -> usize {
         paths_from(srv, from)
             .iter()
-            .filter(|p| p.starts_with("/me/calendars"))
+            .filter(|p| p.starts_with("/me/calendars") || p.starts_with("/cal-delta/"))
             .count()
     }
 
@@ -8257,9 +8967,9 @@ mod tests {
         )
     }
 
-    /// An event 60 days out: outside `calendar_window`.
+    /// An event 200 days out: outside `calendar_window` (181 days).
     fn far_event(id: &str) -> String {
-        let start = now_unix() + 60 * 86400;
+        let start = now_unix() + 200 * 86400;
         calendar_event_json(
             id,
             unix_to_iso8601(start).trim_end_matches('Z'),
@@ -8278,7 +8988,7 @@ mod tests {
         );
         let (srv, handle, store_path, dir) =
             spawn_calendar_engine("calendar-range-once", routes, |_| {});
-        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        let (from, to) = (iso_from_now(190), iso_from_now(210));
         // No calendar list stored yet: the command lists first.
         fetch_range(&handle, &from, &to);
         let seen = wait_for_range(&handle.evt_rx, &from, &to);
@@ -8337,7 +9047,7 @@ mod tests {
 
         // Partly in the window: only the part after it.
         let before = srv.requests().len();
-        let (from, to) = (iso_from_now(20), iso_from_now(40));
+        let (from, to) = (iso_from_now(170), iso_from_now(200));
         fetch_range(&handle, &from, &to);
         wait_for_range(&handle.evt_rx, &from, &to);
         assert_eq!(
@@ -8361,7 +9071,7 @@ mod tests {
         let (win_from, win_to) = view_ranges(&srv, 0, "CAL-A")[0].clone();
 
         let before = srv.requests().len();
-        let (from, to) = (iso_from_now(-30), iso_from_now(60));
+        let (from, to) = (iso_from_now(-40), iso_from_now(200));
         fetch_range(&handle, &from, &to);
         wait_for_range(&handle.evt_rx, &from, &to);
         assert_eq!(
@@ -8384,7 +9094,7 @@ mod tests {
         };
         let (srv, handle, _store_path, dir) =
             spawn_calendar_engine_with("calendar-range-stale", routes, |_| {}, options);
-        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        let (from, to) = (iso_from_now(190), iso_from_now(210));
         fetch_range(&handle, &from, &to);
         wait_for_range(&handle.evt_rx, &from, &to);
         // At once, within the same second: zero freshness is always stale.
@@ -8404,12 +9114,12 @@ mod tests {
         let (srv, handle, _store_path, dir) =
             spawn_calendar_engine("calendar-range-bad", routes, |_| {});
         let before = srv.requests().len();
-        let a = iso_from_now(50);
+        let a = iso_from_now(190);
         let bad = [
             ("2026-13-01T00:00:00Z".to_string(), a.clone()),
             (a.clone(), "2026-01-01".to_string()),
             (a.clone(), a.clone()),
-            (iso_from_now(60), a.clone()),
+            (iso_from_now(200), a.clone()),
         ];
         for (from, to) in &bad {
             fetch_range(&handle, from, to);
@@ -8440,7 +9150,7 @@ mod tests {
         );
         let (srv, handle, _store_path, dir) =
             spawn_calendar_engine("calendar-range-throttled", routes, |_| {});
-        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        let (from, to) = (iso_from_now(190), iso_from_now(210));
         fetch_range(&handle, &from, &to);
         // A bad range after it marks the end of the first command's events.
         fetch_range(&handle, "bad", "bad");
@@ -8488,7 +9198,7 @@ mod tests {
                 s.upsert_event(&stored_event("KEPT", "CAL-A", 60 * 86400))
                     .unwrap();
             });
-        let (from, to) = (iso_from_now(50), iso_from_now(70));
+        let (from, to) = (iso_from_now(190), iso_from_now(210));
         fetch_range(&handle, &from, &to);
         let seen = wait_for_range(&handle.evt_rx, &from, &to);
         assert!(
@@ -9011,8 +9721,14 @@ mod tests {
         // engine must refresh the calendar so the local status reverts to
         // whatever the server actually has ("none" here) — otherwise a
         // phantom RSVP stays on the books forever with nothing to correct
-        // it (unlike mail, which reconverges via delta links).
-        let mut routes = backfill_routes();
+        // it. Graph's event never changed, so a round from the stored
+        // deltaLink never names it (#2013): the refresh has to be an
+        // initial round.
+        let (from, to) = today_window();
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
         routes.insert(
             0,
             Route {
@@ -9025,42 +9741,14 @@ mod tests {
         );
         // Server truth: E1 is still unanswered ("none"), never
         // "accepted" — the optimistic local write never landed.
-        routes.splice(
-            0..0,
-            calendar_routes(
-                &[("CAL-A", true, "me@x")],
-                vec![(
-                    "CAL-A",
-                    200,
-                    format!(
-                        r#"{{"value":[{}]}}"#,
-                        calendar_event_json("E1", "2026-07-18T09:00:00", "2026-07-18T09:30:00")
-                    ),
-                )],
-            ),
-        );
-        let srv = FakeServer::start(routes);
-        let base = srv.base_url.clone();
-
-        let dir = unique_dir("respond-event-reconverge");
-        let store_path = dir.join("mail.db");
-        let token_path = dir.join("token.bin");
-        seed_token(&token_path);
-
-        let handle = spawn_with_bases(
-            store_path.clone(),
-            token_path,
-            test_cfg(),
-            3650,
-            base.clone(),
-            base,
-            Duration::from_secs(3600),
-        );
-
-        wait_for(
-            &handle.evt_rx,
-            |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
-        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("respond-event-reconverge", routes, |s| {
+                let e1 = NewEvent {
+                    response_status: "none".into(),
+                    ..stored_event("E1", "CAL-A", 3600)
+                };
+                seed_synced_calendar(s, "CAL-A", vec![e1], (&from, &to), &delta_link_of("CAL-A"));
+            });
 
         handle
             .cmd_tx
@@ -9092,6 +9780,12 @@ mod tests {
         assert_eq!(
             rows[0].response_status, "none",
             "local status should have reconverged to server truth, not stayed \"accepted\""
+        );
+        let views = view_paths(&srv, "CAL-A");
+        assert_eq!(
+            views.last(),
+            Some(&initial_delta_path("CAL-A", &from, &to)),
+            "{views:?}"
         );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
