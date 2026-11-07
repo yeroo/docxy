@@ -723,6 +723,9 @@ impl App {
             // calendar's, `events_in_window`), so a changed list or choice
             // has nothing to redraw (#1984).
             SyncEvent::CalendarsUpdated => {}
+            // lookxy never sends `FetchCalendarRange` (its agenda is the
+            // kept window), so no range ever lands (#2014).
+            SyncEvent::CalendarRangeFetched { .. } => {}
             // A send failed for good: the engine already put the message
             // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
             SyncEvent::SendFailed { error, .. } => {

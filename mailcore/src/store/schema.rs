@@ -253,6 +253,20 @@ CREATE TABLE IF NOT EXISTS calendars (
     position   INTEGER NOT NULL DEFAULT 0
 );
 
+-- What each calendar's events were fetched over and when (#2014), so a
+-- `FetchCalendarRange` serves a fresh range from the store. Per calendar
+-- the intervals `[from_utc, to_utc)` are disjoint (recording one trims the
+-- older ones it overlaps); `fetched_at` is unix seconds. Written by
+-- `apply_calendar_sync` (the window) and `apply_calendar_range`.
+CREATE TABLE IF NOT EXISTS calendar_ranges (
+    calendar_id TEXT NOT NULL,
+    from_utc    TEXT NOT NULL,
+    to_utc      TEXT NOT NULL,
+    fetched_at  INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_calendar_ranges ON calendar_ranges(calendar_id, from_utc);
+
 CREATE TABLE IF NOT EXISTS event_attendees (
     event_id TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     name     TEXT NOT NULL DEFAULT '',
