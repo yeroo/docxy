@@ -423,6 +423,8 @@ pub(crate) struct Builder<'b> {
     /// The open tables, innermost last: an RTF table (one, made on its
     /// first cell paragraph) or HTML's nested ones ([`Builder::begin_table`]).
     tables: Vec<TableAcc>,
+    /// The body's [`TableAcc::tail`].
+    body_tail: Tail,
 }
 
 #[derive(Default)]
@@ -436,6 +438,25 @@ struct TableAcc {
     /// An HTML table: laid out from specs ([`html_table::layout`]) instead
     /// of `rows` / `cells`.
     html: Option<HtmlAcc>,
+    /// What the importer said of `blocks`' last paragraph, and how many
+    /// blocks there were then ([`Builder::set_tail`]).
+    tail: Tail,
+}
+
+/// A flow's [`FlowTail`] and how many blocks it held when it was said.
+type Tail = Option<(usize, FlowTail)>;
+
+/// What an importer remembers of the paragraph it ended last in a flow
+/// (a cell's blocks or the body), kept with that flow so a dropped card or
+/// a nested table never lends it to another (#1979 r2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FlowTail {
+    /// Its bottom margin, in twips: what the next paragraph's top margin
+    /// collapses with.
+    pub(crate) margin_after: i32,
+    /// The user-agent bottom margin quirks mode drops from it if it ends
+    /// its flow.
+    pub(crate) quirk_bottom: Option<i32>,
 }
 
 /// An HTML table being read: its spec, its rows of raw cells, the cell
@@ -459,6 +480,7 @@ impl<'b> Builder<'b> {
             body: Vec::new(),
             para: Vec::new(),
             tables: Vec::new(),
+            body_tail: None,
         }
     }
 
@@ -642,6 +664,79 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// The blocks a paragraph ended now goes after: the open cell's (the
+    /// innermost table's) when `in_table`, else the body's, `None` when
+    /// tables are left open there (a body paragraph closes them first).
+    fn flow(&self, in_table: bool) -> Option<&Vec<Block>> {
+        match self.tables.last() {
+            Some(t) if in_table => Some(&t.blocks),
+            None if !in_table => Some(&self.body),
+            _ => None,
+        }
+    }
+
+    /// Whether a paragraph ended now would be the first block of its flow
+    /// ([`Builder::flow`]): its cell's or the body's (#1979).
+    pub(crate) fn flow_is_empty(&self, in_table: bool) -> bool {
+        match self.flow(in_table) {
+            Some(blocks) => blocks.is_empty(),
+            // A body paragraph after tables left open follows them.
+            None => in_table,
+        }
+    }
+
+    /// [`Builder::flow`], with its tail, to change.
+    fn flow_mut(&mut self, in_table: bool) -> Option<(&mut Vec<Block>, &mut Tail)> {
+        match self.tables.last_mut() {
+            Some(t) if in_table => Some((&mut t.blocks, &mut t.tail)),
+            None if !in_table => Some((&mut self.body, &mut self.body_tail)),
+            _ => None,
+        }
+    }
+
+    /// How many blocks the flow holds (#1979): with [`Builder::para_mut`],
+    /// where a paragraph ended now is found again.
+    pub(crate) fn flow_len(&self, in_table: bool) -> Option<usize> {
+        self.flow(in_table).map(Vec::len)
+    }
+
+    /// The properties of the paragraph at `index` of the flow, if that
+    /// block is one.
+    pub(crate) fn para_mut(&mut self, in_table: bool, index: usize) -> Option<&mut ParProps> {
+        match self.flow_mut(in_table)?.0.get_mut(index)? {
+            Block::Paragraph(p) => Some(&mut p.props),
+            _ => None,
+        }
+    }
+
+    /// Remember `tail` of the flow's last block, a paragraph just ended
+    /// (#1979 r2).
+    pub(crate) fn set_tail(&mut self, in_table: bool, tail: FlowTail) {
+        if let Some((blocks, slot)) = self.flow_mut(in_table) {
+            let ends_in_para = matches!(blocks.last(), Some(Block::Paragraph(_)));
+            *slot = ends_in_para.then_some((blocks.len(), tail));
+        }
+    }
+
+    /// The tail remembered of the flow's last block, while that is still
+    /// the paragraph it was said of: what a paragraph ended now follows.
+    pub(crate) fn tail(&self, in_table: bool) -> Option<FlowTail> {
+        let (blocks, slot) = match self.tables.last() {
+            Some(t) if in_table => (&t.blocks, t.tail),
+            None if !in_table => (&self.body, self.body_tail),
+            _ => return None,
+        };
+        slot.filter(|(len, _)| *len == blocks.len())
+            .filter(|_| matches!(blocks.last(), Some(Block::Paragraph(_))))
+            .map(|(_, tail)| tail)
+    }
+
+    /// The flow's last block's properties, if it is a paragraph.
+    pub(crate) fn flow_last_mut(&mut self, in_table: bool) -> Option<&mut ParProps> {
+        let index = self.flow_len(in_table)?.checked_sub(1)?;
+        self.para_mut(in_table, index)
+    }
+
     /// End the paragraph in progress only when it has content.
     pub(crate) fn end_para_if_any(&mut self, props: ParProps, in_table: bool) {
         if !self.para.is_empty() {
@@ -715,6 +810,7 @@ impl<'b> Builder<'b> {
         }
         let t = self.top();
         let blocks = std::mem::take(&mut t.blocks);
+        t.tail = None;
         t.cell_has_para = false;
         if let Some(h) = t.html.as_mut() {
             let cell = html_table::RawCell {

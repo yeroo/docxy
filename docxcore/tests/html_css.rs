@@ -117,7 +117,12 @@ fn a_newsletter_takes_its_style_sheet() {
     // Cell paragraphs: neither the wrapper's grey nor the cell's padding.
     for (p, in_cell) in paragraphs(&d) {
         if in_cell {
-            assert!(p.props.raw_props.is_empty(), "{:?}", p.props.raw_props);
+            // No shading; the mark's run look (#1979) is all they hold.
+            assert!(
+                p.props.raw_props.iter().all(|r| r.starts_with("<w:rPr>")),
+                "{:?}",
+                p.props.raw_props
+            );
             assert_eq!((p.props.indent, p.props.indent_right), (0, 0));
         }
     }
@@ -135,7 +140,13 @@ fn a_newsletter_takes_its_style_sheet() {
     );
     // `body`'s background is the page's: no paragraph outside the wrapper
     // is shaded.
-    assert!(para(&d, "This month").props.raw_props.is_empty());
+    assert!(
+        !para(&d, "This month")
+            .props
+            .raw_props
+            .iter()
+            .any(|r| r.starts_with("<w:shd"))
+    );
 }
 
 #[test]

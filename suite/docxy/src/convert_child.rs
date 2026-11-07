@@ -928,7 +928,14 @@ pub(crate) mod tests {
             .collect();
         // The GIF and the placeholder.
         assert_eq!(media.len(), 2, "{media:?}");
-        // The document was moved out of the package, not cloned.
-        assert_eq!(c.doc, pkg.document);
+        // The document was moved out of the package, not cloned. A load
+        // keeps the paragraph's `w:spacing` (#1979) as its shadow too.
+        let mut loaded = pkg.document;
+        for b in &mut loaded.body {
+            if let docxcore::model::Block::Paragraph(p) = b {
+                p.props.shadow.clear();
+            }
+        }
+        assert_eq!(c.doc, loaded);
     }
 }

@@ -39,7 +39,8 @@ issue number to find its notes.
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
-  nested cards (#1927), page margins (#1928).
+  nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
+  quirks-mode edges, list indents, item continuations, marker look (#1979).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

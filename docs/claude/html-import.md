@@ -1,6 +1,6 @@
 # HTML import
 
-Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images, nested cards, links and the page. This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
+Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::import::html`: tables, CSS, images, rounded images, nested cards, links, the page and Outlook mail (spacing, list items and markers). This file is not loaded automatically: the `CLAUDE.md` index (Area notes) points here. Paths are from the repository root. Add this area's new notes here as `##` sections.
 
 ## HTML import tables (#1878)
 
@@ -94,11 +94,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   ends only a paragraph with content (`after_block_object`), so
   `<p><img style="display:block"></p>` leaves no empty paragraph; `<p></p>`
   is still one. In a list item, the paragraphs past the item's numbered
-  one are unnumbered continuations at the level's indent (`Block`'s
-  `item_numbered` / `item_split` on the `li`'s own entry, `open_item`, not
-  across a cell), so the split adds no item and a nested list's items
-  leave their parent's flags alone; a picture opening its item carries the
-  number.
+  one are unnumbered continuations (any block, since #1979: see "HTML
+  import Outlook mail"); a picture opening its item carries the number.
 - Fixed-width blocks: a `Kind::Block` with an absolute CSS `width` (not a
   percentage or `auto`; a negative or invalid one leaves the width
   before it) and both side margins auto gets
@@ -138,16 +135,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `mso-hide:all` as `vanish`. Under a heading an explicit not-bold is
   `<w:b w:val="0"/>`. Paragraphs: alignment, line
   height (multiple → `auto`, length → `atLeast`, `exact` with
-  `mso-line-height-rule:exactly`), the innermost block's own top/bottom box
-  as spacing, every enclosing block's left/right box summed as indent
+  `mso-line-height-rule:exactly`; none is single, #1979), the innermost
+  block's own top/bottom box as spacing (with the user agent's margins and
+  a browser's collapse, #1979), every enclosing block's left/right box summed as indent
   (negative clamps at 0), `text-indent`, a block's background as `w:shd`.
 - Boundaries: `html`/`body` box and background are the page's, never read; a
   `td`/`th` starts a fresh indent, right indent, first line and shading (its
   padding is the cell's `tcMar`, below), while inherited run properties and
-  line height pass in; `ul`/`ol` and `table` boxes are not counted (the level
-  indent stands for the list's). An HTML `li` keeps the level's hanging
-  indent: with an enclosing box it writes `720*(lvl+1) + box`, first line
-  −360, else no indent. A `MsoList…` paragraph keeps its own CSS.
+  line height pass in; `table` boxes are not counted. A list's box is
+  counted (#1979): see "HTML import Outlook mail" for its items' indent. A
+  `MsoList…` paragraph (never an `li`) keeps its own CSS.
 - Malformed input: a block (and `ul ol dl table li dt dd …`) closes an open
   `p`, an `li` the open `li` of its list, `dt`/`dd` an open `dt`/`dd`, never
   across a cell or table, ending the paragraph only if it has content; a
@@ -423,3 +420,125 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `@page` margins (Word-saved HTML's `@page WordSection1 {margin: ...}`)
   are not read, as `css.rs` skips every at-rule; every import gets the same
   fixed page.
+
+## HTML import Outlook mail (#1979)
+
+A simple mail from Outlook on the web, new Outlook or classic Outlook
+imports as a browser lays it out. Slice 1 of #1979: the model. The
+suite's flow view drawing it (marker look, spacing, line height) is
+#1986, and `ext::DocView`'s page margin is #1987.
+
+- Spacing comes from CSS only. Every HTML paragraph writes `w:spacing`:
+  - `before`/`after` from its innermost block's top/bottom box, else 0.
+  - `line 240 auto` unless `line-height` says otherwise (`normal` and an
+    unreadable or non-positive value are single).
+  - So no Normal style's space after or 1.08 lines shows. The suite's
+    Styles gallery (`gallery_style_selected`) therefore shows an imported
+    `div` paragraph as No Spacing.
+  - A heading keeps its Heading style; its direct spacing overrides the
+    style's.
+- The user agent's vertical margins (`Cascade::user_agent`,
+  `ua_vmargin`) apply where a side is not declared
+  (`margin_declared`, per side, so `margin-top` alone keeps the UA bottom):
+  - `p`, `blockquote`, `pre`: 1em.
+  - `h1`-`h6`: 0.67, 0.83, 1, 1.33, 1.67, 2.33em. That em is the
+    heading's own declared size, else its UA size (2, 1.5, 1.17, 1, 0.83,
+    0.67 × the parent's). So an `<h1>` under 12pt is 322 twips.
+  - Every other block (`div`, `li`, `dd`, ...): none.
+  - `Look::ua_before`/`ua_after` keep the UA part, for the quirk below.
+- Adjacent margins collapse as a browser's do (Word and LibreOffice add
+  them; the suite adds them too):
+  - Only margins collapse, not padding (#1979 r1). A paragraph's written
+    `before` is `pad_top + max(0, margin_top − the margin_bottom of the
+    paragraph before it in its flow)` (`Html::flow_spacing`, `Look`'s
+    `margin_before`/`pad_before`/`margin_after`). The paragraph above
+    keeps its whole `after`. A negative top margin is only summed with
+    the padding.
+  - The margin above is the flow's own (`Builder::tail`, a `FlowTail` set
+    with `set_tail` after each paragraph, #1979 r2). The flow is the open
+    cell's blocks or the body. A tail counts only while its paragraph is
+    still the flow's last block, so there is no collapse across a table,
+    into a cell's or card's first paragraph, or from a dropped empty
+    card's paragraph.
+- Quirks mode (`quirks_mode`: no doctype, a non-`html` one, or the HTML
+  Standard's old public ids, its common entries; `<!DOCTYPE html>` and
+  XHTML are standards). Mail, Word and Outlook pages have none, and so do
+  clipboard fragments.
+  - The margin quirk: a block straight in `body` or a `td`/`th` (its
+    parent element is `html`, `body`, `td` or `th`: `Html::para_edges`;
+    not in a `div` or a card) loses its UA top margin when it is its
+    flow's first, and its UA bottom margin when it is its flow's last.
+  - The last is settled at the flow's end (`Html::flow_end_props`, at
+    `</td>`, `</tr>`, `</table>`, a card's end and the page's end). The
+    text in progress is ended first, as any paragraph, and then the flow's
+    last paragraph (`FlowTail::quirk_bottom`) is patched in place. The
+    props it returns are only for the paragraph an empty cell gets.
+  - A declared margin and padding stay.
+- List geometry, through the cascade:
+  - `ul ol dir menu` have a UA `padding-left: 40px`. `Kind::List` adds
+    its left and right box to `Look::indent`/`indent_right`, so an item's
+    text is at 600 twips per list (1200 nested), `<style>` rules and
+    `restyle` included.
+  - Every HTML item paragraph writes that `w:ind`, numbered or not. A
+    numbered one at the margin writes `ZERO_IND` (`w:left="0"
+    w:hanging="0"`, set as its load shadow, so an edit replaces it), or
+    Word and LibreOffice would take the level's 720 (#1979 r1).
+  - A numbered paragraph hangs a browser's outside marker with its space:
+    `DECIMAL_HANG` 1.1125em for an `ol`, `BULLET_HANG` 1.375em for a
+    `ul`, measured in Chrome. The em is the `li`'s own font (`item_elem`),
+    not a `div`'s in it: 267 / 330 twips at 12pt.
+  - The hang is clamped to the indent: `padding-left: 0` hangs nothing.
+    Word draws the number at `left − hang` and tabs to `left`.
+  - The Markdown numbering's own `w:ind` (720 per level) is overridden.
+- Item continuations (`end_para_with`): once an item has ended its
+  numbered paragraph, every later paragraph in it is an unnumbered
+  continuation at its text indent, `first_line 0`. That covers
+  `<li><div>a</div><div>b</div></li>`, `<li><p>a</p><p>b</p></li>`, and
+  text after a nested list or table in the item.
+  - The first paragraph with a line (text, a break, an object or a typed
+    marker) takes the number and sets `item_numbered`.
+    - An empty paragraph before it holds the number in the meantime
+      (`Block::item_held`, its flow's depth and index). The line's
+      paragraph takes the number from it (`release_number`), leaving the
+      empty one an unnumbered paragraph at the text indent.
+    - So `<li><p></p><p>x</p></li>` numbers x, and
+      `<li><p></p></li><li>b</li>` still counts the first item: b is 2,
+      as in a browser (#1979 r2).
+    - `<div><br></div>` is a line, so it keeps the number.
+  - A heading in an item is numbered too, keeping its Heading style
+    (#1979 r2). A typed-marker heading is unchanged.
+  - The shared steps are in `number_item`: number, level, the `li`'s
+    mark, and the zero indent.
+  - A flow's end ends its text in progress as any paragraph
+    (`flow_end_props` calls `end_para_if_any`, #1979 r1). So `<ol><li>a<li>b`
+    at the page's end and `<td><ul><li>x</td>` are numbered too.
+  - An `li` is an HTML item whatever its class. Classic Outlook's
+    `<li class=MsoListParagraph style="margin-left:0in">` sits at the
+    `ul`'s 600 with a hang, and the blocks in an item are never
+    `mso_list`. Filtered HTML's `<p class=MsoList…>` with typed markers is
+    unchanged.
+- The paragraph mark (`mark_rpr`, through `serialize::rpr_xml`): a
+  `w:rPr` in `raw_props`, written only when one of these is set: font,
+  size, colour, bold, italic.
+  - For a numbered item it comes from the `li`'s look, as a browser's
+    `::marker` (an item with none writes none); for any other paragraph,
+    from its paragraph look's run.
+  - No underline, strike, shading, highlight, `vanish` or link look.
+  - Word and LibreOffice draw the number in it, and an empty
+    `<div><br></div>`'s line in the div's size. It saves and loads
+    unchanged.
+- Tests: `outlook_tests` in `import/html.rs`; the issue's mail is
+  `outlook_simple_mail_imports_as_a_browser_lays_it_out`.
+- Known limits:
+  - The lists' own vertical margins (1em when not nested).
+  - Parent-child margin collapse (a `div`'s bottom with its last `p`'s,
+    through a card's top).
+  - An empty `<p></p>`'s margins collapsing through it.
+  - `<div>text<br></div>`'s trailing break.
+  - A number wider than its hang (10 and up).
+  - `list-style-type`; `<ol start>` and separate `<ol>`s sharing numId 2.
+  - A page's `em` margin on a heading resolves at the parent's size, as
+    before.
+  - The HTML Standard's rarer quirks public ids and the IBM system id.
+  - The suite's `eff_indent` adds `ilvl × 300` to a nested item until
+    #1986.
