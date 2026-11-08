@@ -739,7 +739,7 @@ fn help_groups() -> Vec<Group> {
             width: 29,
             rows: [
                 vec![
-                    btn("Help", 4, Help, "Help (F1)"),
+                    btn("Help", 4, Help, "Help — the manual (F1)"),
                     Seg::Gap("  "),
                     btn(
                         "Feedback",
