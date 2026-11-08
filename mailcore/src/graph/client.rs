@@ -706,14 +706,18 @@ impl GraphClient {
         loop {
             let resp = self.send(Method::Get, &target, None, &[])?;
             let v = parse_body(resp)?;
-            let items = value_array(&v, "value")?;
-            hits.extend(items.iter().filter_map(SearchHit::from_json));
+            let before = hits.len();
+            hits.extend(
+                value_array(&v, "value")?
+                    .iter()
+                    .filter_map(SearchHit::from_json),
+            );
             if hits.len() >= top {
                 hits.truncate(top);
                 break;
             }
             match v.get("@odata.nextLink").and_then(Value::as_str) {
-                Some(next) if !items.is_empty() => target = next.to_string(),
+                Some(next) if hits.len() > before => target = next.to_string(),
                 _ => break,
             }
         }
@@ -2437,6 +2441,20 @@ mod tests {
         let c = GraphClient::new(&srv.base_url, "AT");
         assert_eq!(c.search_messages(None, "budget", 50).unwrap().len(), 1);
         assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn search_messages_stops_at_a_page_without_hits() {
+        // Items without an id are no hits: a looping link over such a
+        // page ends there too.
+        let srv = FakeServer::start(vec![search_page(
+            "/me/messages?",
+            r#"{"subject":"no id"}"#,
+            Some("/me/messages?$skiptoken=1"),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.search_messages(None, "budget", 50).unwrap(), vec![]);
+        assert_eq!(srv.requests().len(), 1);
     }
 
     #[test]
