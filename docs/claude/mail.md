@@ -1756,7 +1756,8 @@ so the user's other devices follow.
   a `Prefer: odata.maxpagesize`. `top` is clamped to `1..=SEARCH_TOP_MAX`
   (1000, Graph's cap; `0` asks for one). `@odata.nextLink` is sent as is
   (through `full_url`, like a delta link) until `top` hits are in (the rest
-  truncated), a page has no link, or a page brings no item (a looping link).
+  truncated), a page has no link, or a page brings no hit (a looping link;
+  an item without an id is no hit).
 - `SearchHit { folder_id, message, fields }` (`graph::model`) is what a
   delta upsert carries plus `parentFolderId` (empty when Graph sent none).
   `SearchHit::from_json` drops an item without an id: `Message::from_json`
@@ -1787,12 +1788,19 @@ so the user's other devices follow.
     folder, as a fresh delta row is, under the id asked (as
     `repair_headerless` does).
   - A protected id whose row exists keeps its row (no merge: the queued
-    op's optimistic state and folder stay).
+    op's optimistic state and folder stay). So does a draft holding an
+    unsaved edit: `merge_message_unless_edited` returns `Ok(false)`, and
+    only the row's own folder gets `MessagesUpdated`.
   - The row's old folder is read first (`Store::message_folder`). When the
     merge re-filed it, `MessagesUpdated` goes out for the old folder, then
     for the row's folder.
-  - Then the body, via `fetch_and_store_body` (`BodyReady`, the #1933
-    headers). A body failure after the header still answers
+  - Then the body. A row stored before whose body satisfies the engine's
+    format (`get_body_for`, which a draft's local body always does, #1901)
+    keeps it: `BodyReady` with no request. A fetch would put Graph's older
+    body over a compose edit, and a queued `SaveDraft` would then push
+    that. An edited row with no such body is refused ("edited locally").
+    Any other row is fetched via `fetch_and_store_body` (`BodyReady`, the
+    #1933 headers). A body failure after the header still answers
     `MessageFetchFailed { id, reason }`, and the header stays stored.
 - A later delta or backfill of the folder upserts the same row (same PK), and
   a stored-link round does not count it as new mail (`message_exists`), so
