@@ -6003,6 +6003,15 @@ mod backstage_scroll_tests {
 /// lower left, as Office drops it, so the list never covers the arrow that
 /// toggles it. The pointer and `menu-open` both anchor here; `None` when the
 /// button has not been laid out.
+fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
+    if matches!(primary_id, menu::QAT_UNDO_ID | menu::QAT_REDO_ID) {
+        return qat_arrow_anchor(probes, primary_id);
+    }
+    probes
+        .current(&format!("ribbon-split:{primary_id}"))
+        .map(|b| b.bottom_left())
+}
+
 /// The menu a ribbon drop-down opens (`Docxy::split_menu_for`).
 enum DropdownMenu {
     /// The drop-down's own items: an extension's (#1870), or any not named.
@@ -6033,15 +6042,6 @@ fn dropdown_menu(id: &str, act: Act) -> DropdownMenu {
         (None, _) => hf_tab::menu_of(id).map_or(DropdownMenu::Items, DropdownMenu::Hf),
         _ => DropdownMenu::Items,
     }
-}
-
-fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
-    if matches!(primary_id, menu::QAT_UNDO_ID | menu::QAT_REDO_ID) {
-        return qat_arrow_anchor(probes, primary_id);
-    }
-    probes
-        .current(&format!("ribbon-split:{primary_id}"))
-        .map(|b| b.bottom_left())
 }
 
 #[cfg(test)]
