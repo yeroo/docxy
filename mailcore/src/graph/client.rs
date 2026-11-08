@@ -811,7 +811,9 @@ impl GraphClient {
             .ok_or_else(|| GraphError::Parse("move response has no id".to_string()))
     }
 
-    /// DELETE `/me/messages/{id}`.
+    /// DELETE `/me/messages/{id}`. Graph soft-deletes the message to the
+    /// mailbox's Recoverable Items, not to Deleted Items: "delete to Deleted
+    /// Items" is `move_message` to that folder (`deleteditems`).
     pub fn delete_message(&self, id: &str) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");

@@ -57,7 +57,7 @@ use crate::store::{
     NewEvent, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
     SyncedCalendar,
 };
-use crate::sync::outbox::{apply_op, apply_send, send_error_text};
+use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
 use crate::tokencache;
 use std::collections::{HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -111,10 +111,17 @@ pub enum SyncCommand {
         interval_minutes: i64,
     },
     /// Move a message to another folder: optimistic local re-file plus a queued
-    /// Graph op. Graph mints a new id on move, which the next delta reconciles
-    /// (old id `@removed`, new id added).
+    /// Graph op. Graph mints a new id on move: once the op drains, the
+    /// stored row is re-keyed to it (`Store::follow_move`, #1896) and
+    /// [`SyncEvent::MessageMoved`] is emitted. The old id stays resolvable,
+    /// so this and the other message commands (`MarkRead`, `SetFlag`,
+    /// `SetCategories`, `Delete`, another `Move` such as an undo) may still
+    /// name it. "Delete to Deleted Items" is a `Move` to that folder.
     Move { id: String, dest: String },
-    /// Delete a message (optimistic local delete + queued Graph op).
+    /// Delete a message (optimistic local delete + queued Graph op):
+    /// `DELETE /me/messages/{id}`, which Graph soft-deletes to the
+    /// mailbox's Recoverable Items, not to Deleted Items (a `Move` to the
+    /// Deleted Items folder does that).
     Delete { id: String },
     /// Fetch and store a message body in the engine's
     /// [`EngineOptions::body_format`], then emit [`SyncEvent::BodyReady`].
@@ -478,6 +485,14 @@ pub enum SyncEvent {
     /// Attachment metadata for `message_id` was fetched and stored;
     /// re-read `Store::attachments(message_id)`.
     AttachmentsUpdated { message_id: String },
+    /// A queued move reached Graph: the message Graph knew as `old_id` is
+    /// `new_id` now, and its stored row, if any, is stored as `new_id`
+    /// (#1896, `Store::follow_move`). Emitted once per move Graph made,
+    /// also for a message deleted locally while the move was in flight (a
+    /// host may still hold its old id in an undo record). `old_id` still
+    /// resolves (`Store::current_id`) for commands, but a host re-keys what
+    /// it holds by id: a selection, an undo record, an open read window.
+    MessageMoved { old_id: String, new_id: String },
     /// An attachment's bytes were fetched and written to `path` (the `dest`
     /// from the triggering [`SyncCommand::SaveAttachment`]).
     AttachmentSaved { path: PathBuf },
@@ -1479,15 +1494,22 @@ impl Engine {
                 self.fast_folders = set;
             }
             SyncCommand::SignIn => self.sign_in(),
+            // The message commands address the message under the id it is
+            // stored as now (`current_id`: a draft's reconciled `local:` id,
+            // an id from before a move, #1896); the store writes match the
+            // id only.
             SyncCommand::MarkRead { id, read } => {
+                let id = self.store.current_id(&id).unwrap_or(id);
                 self.store.set_read(&id, read);
                 self.enqueue_and_drain(OutboxOp::MarkRead { id, read });
             }
             SyncCommand::SetFlag { id, flagged } => {
+                let id = self.store.current_id(&id).unwrap_or(id);
                 self.store.set_flag(&id, flagged);
                 self.enqueue_and_drain(OutboxOp::SetFlag { id, flagged });
             }
             SyncCommand::SetCategories { id, categories } => {
+                let id = self.store.current_id(&id).unwrap_or(id);
                 self.store.set_categories(&id, &categories);
                 self.enqueue_and_drain(OutboxOp::SetCategories { id, categories });
             }
@@ -1500,13 +1522,14 @@ impl Engine {
             } => self.fetch_schedule(schedules, &start_utc, &end_utc, interval_minutes),
             SyncCommand::Move { id, dest } => {
                 // Optimistic local re-file, same pattern as MarkRead/SetFlag/
-                // Delete. Graph mints a new id on move; the next delta
-                // reconciles it (old id `@removed`, new id added), so we keep
-                // the local id and only update its folder here. Graph stays the
+                // Delete. Graph mints a new id on move; the drain re-keys the
+                // row to it once the op succeeds (`follow_move`, #1896), so
+                // only the folder changes here. Graph stays the
                 // source of truth, so we enqueue regardless — but a local
                 // failure (e.g. `dest` isn't a stored folder yet: `folder_id`
                 // is a NOT NULL foreign key) must be surfaced, not swallowed.
                 // `id`/`dest` are message/folder ids, never secrets.
+                let id = self.store.current_id(&id).unwrap_or(id);
                 if let Err(e) = self.store.move_message(&id, &dest) {
                     self.emit(SyncEvent::Error(format!(
                         "local move of {id} to {dest} failed: {e}"
@@ -1520,7 +1543,10 @@ impl Engine {
                 // (#1884), so the queued op carries the id of the row deleted.
                 // When the UI already deleted the row (with the id it sends
                 // here, as lookxy does), there is nothing to resolve against:
-                // `current_id` then leaves the id as it is.
+                // `current_id` then leaves the id as it is. An id from before
+                // a move is resolved first (#1896): `delete_message_resolved`
+                // does not follow moves, as the delta `@removed` path uses it.
+                let id = self.store.current_id(&id).unwrap_or(id);
                 let target = match self.store.delete_message_resolved(&id) {
                     Ok(Some(deleted)) => deleted,
                     _ => self.store.current_id(&id).unwrap_or(id),
@@ -2197,8 +2223,10 @@ impl Engine {
     }
 
     /// Merges a delta page's items into `folder_id`: upserts (skipping one
-    /// received before `cutoff`, when its `receivedDateTime` is known) and
-    /// `@removed` deletes. Returns how many upserts it walked past (within
+    /// received before `cutoff`, when its `receivedDateTime` is known, and
+    /// one of an id a stored message had before a move, #1896) and
+    /// `@removed` deletes (by the id only: the source folder's `@removed`
+    /// of a moved message's old id deletes nothing). Returns how many upserts it walked past (within
     /// the cutoff, whatever became of them); a row that fails to write is
     /// skipped.
     ///
@@ -2237,6 +2265,12 @@ impl Engine {
                         }
                     }
                     upserts += 1;
+                    // An id a stored message had before a move (#1896) is the
+                    // pre-move copy Graph has not removed yet (Graph never
+                    // reuses an id): the row lives on under its new id.
+                    if self.store.is_moved_alias(&m.id).unwrap_or(false) {
+                        continue;
+                    }
                     match protect {
                         Some(ids) if ids.binary_search(&m.id).is_ok() => {}
                         Some(_) => {
@@ -3000,9 +3034,12 @@ impl Engine {
         let mut deferred = false;
         for row in ops {
             match self.apply_op_with_retry(&row) {
-                Ok(()) => {
+                Ok(applied) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
+                    if let Applied::Moved { old_id, new_id } = applied {
+                        self.follow_move(old_id, new_id);
+                    }
                     // The calendars owe a reset (`calendar_reset_owed`).
                     if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
                         self.calendar_reset_owed = true;
@@ -3234,6 +3271,25 @@ impl Engine {
         self.refresh_calendar();
     }
 
+    /// Records the id Graph gave the message a move op just moved, re-keying
+    /// its stored row (#1896, `Store::follow_move`), and emits
+    /// [`SyncEvent::MessageMoved`]. Called after the op is dropped: Graph
+    /// already moved the message, so a store failure is reported and the
+    /// op still counts as done (the next deltas then bring the moved copy
+    /// in as a new row and remove the old one, as before #1896). The same id
+    /// back, or none, is nothing to follow. A message no longer stored
+    /// (deleted while the move was in flight) has no row to re-key, but its
+    /// old id is recorded all the same, so its `Delete` reaches Graph.
+    fn follow_move(&mut self, old_id: String, new_id: String) {
+        match self.store.follow_move(&old_id, &new_id) {
+            Ok(true) => self.emit(SyncEvent::MessageMoved { old_id, new_id }),
+            Ok(false) => {}
+            Err(e) => self.emit(SyncEvent::Error(format!(
+                "follow move of {old_id} to {new_id}: {e}"
+            ))),
+        }
+    }
+
     /// Applies one outbox op via `sync::outbox::apply_op`, refreshing the
     /// token once and retrying on a 401 — the same policy as `with_auth`,
     /// duplicated rather than reused because `apply_op` (unlike every other
@@ -3250,9 +3306,11 @@ impl Engine {
     /// A `SendDraft` goes through `apply_send` with the row's `seq`, so its
     /// `/send` POST is recorded and a later attempt checks delivery first
     /// (#1874).
-    fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<(), GraphError> {
+    fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
         let apply = |client: &GraphClient, store: &Store| match &row.op {
-            OutboxOp::SendDraft { id } => apply_send(client, store, id.as_str(), Some(row.seq)),
+            OutboxOp::SendDraft { id } => {
+                apply_send(client, store, id.as_str(), Some(row.seq)).map(|()| Applied::Done)
+            }
             op => apply_op(client, store, op),
         };
         let client = self.client();
@@ -5633,7 +5691,8 @@ mod tests {
 
         // The optimistic local re-file happens before the outbox drain POSTs
         // the move, so once the POST is observed the local row is already in
-        // DEST.
+        // DEST (under M1, or already re-keyed to the id the POST answered
+        // with, #1896).
         if !wait_until(ENGINE_WAIT, || {
             srv.requests()
                 .iter()
@@ -5644,7 +5703,22 @@ mod tests {
 
         let store = Store::open(&store_path).unwrap();
         assert!(store.messages_in_folder("F1", 50, 0).unwrap().is_empty());
-        assert_eq!(store.messages_in_folder("DEST", 50, 0).unwrap()[0].id, "M1");
+        assert_eq!(store.messages_in_folder("DEST", 50, 0).unwrap().len(), 1);
+
+        // Once the op drained, the row is stored under Graph's new id.
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MessageMoved { .. })
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::MessageMoved {
+                old_id: "M1".into(),
+                new_id: "M1-NEW".into()
+            })
+        );
+        let rows = store.messages_in_folder("DEST", 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "M1-NEW");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -16635,6 +16709,489 @@ mod tests {
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A moved message follows its new id (#1896) ----------------------
+
+    /// Engine tests for `follow_move`: Graph answers each move with a new
+    /// id; ids are never prefixes of one another, as `FakeServer` matches
+    /// by prefix, and every test checks the exact path.
+    mod moved {
+        use super::*;
+
+        fn post_route(path: &str, body: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: path.into(),
+                    status: 200,
+                    headers: vec![],
+                    body: body.into(),
+                },
+                Some(1),
+            )
+        }
+
+        fn ok_route(method: &str, path: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: method.into(),
+                    path_prefix: path.into(),
+                    status: if method == "DELETE" { 204 } else { 200 },
+                    headers: vec![],
+                    body: if method == "DELETE" { "" } else { "{}" }.into(),
+                },
+                None,
+            )
+        }
+
+        /// `OLD1` moves to `NEW1`, and `NEW1` to `NEW2`.
+        fn move_routes() -> Vec<(Route, Option<usize>)> {
+            vec![
+                post_route("/me/messages/OLD1/move", r#"{"id":"NEW1"}"#),
+                post_route("/me/messages/NEW1/move", r#"{"id":"NEW2"}"#),
+            ]
+        }
+
+        fn seed_old1(s: &Store) {
+            for (id, name) in [("F1", "Inbox"), ("F2", "Projects")] {
+                s.upsert_folder(&crate::graph::model::MailFolder {
+                    id: id.into(),
+                    display_name: name.into(),
+                    parent_id: None,
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: None,
+                })
+                .unwrap();
+            }
+            s.upsert_message(
+                "F1",
+                &Message {
+                    id: "OLD1".into(),
+                    conversation_id: "C".into(),
+                    subject: "Hello".into(),
+                    from: Default::default(),
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: String::new(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: String::new(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec![],
+                },
+            )
+            .unwrap();
+        }
+
+        fn spawn(
+            srv: &FakeServer,
+            tag: &str,
+            seed: impl FnOnce(&Store),
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            spawn_fast(srv, tag, HOUR, None, |s| {
+                seed_old1(s);
+                seed(s);
+            })
+        }
+
+        fn requests(srv: &FakeServer, method: &str) -> Vec<(String, String)> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == method)
+                .map(|r| (r.path, r.body))
+                .collect()
+        }
+
+        fn moved(old: &str, new: &str) -> SyncEvent {
+            SyncEvent::MessageMoved {
+                old_id: old.into(),
+                new_id: new.into(),
+            }
+        }
+
+        fn wait_moved(rx: &Receiver<SyncEvent>, old: &str, new: &str) -> Vec<SyncEvent> {
+            let want = moved(old, new);
+            wait_for(rx, |e| *e == want)
+        }
+
+        fn ids_in(store: &Store, folder: &str) -> Vec<String> {
+            store
+                .messages_in_folder(folder, 50, 0)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        }
+
+        fn row(store: &Store, id: &str) -> crate::store::MessageRow {
+            ["F1", "F2"]
+                .iter()
+                .flat_map(|f| store.messages_in_folder(f, 50, 0).unwrap())
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no row {id}"))
+        }
+
+        fn drained(store: &Store) -> bool {
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty())
+        }
+
+        #[test]
+        fn move_back_by_the_old_id_lands_in_the_source() {
+            let mut routes = move_routes();
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-back", |_| {});
+            let store = Store::open(&store_path).unwrap();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
+
+            // The undo still names the id the UI had.
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F1".into(),
+                })
+                .unwrap();
+            seen.extend(wait_moved(&handle.evt_rx, "NEW1", "NEW2"));
+
+            assert_eq!(
+                requests(&srv, "POST"),
+                [
+                    (
+                        "/me/messages/OLD1/move".to_string(),
+                        r#"{"destinationId":"F2"}"#.to_string()
+                    ),
+                    (
+                        "/me/messages/NEW1/move".to_string(),
+                        r#"{"destinationId":"F1"}"#.to_string()
+                    ),
+                ]
+            );
+            assert!(drained(&store));
+            assert_eq!(ids_in(&store, "F1"), ["NEW2"]);
+            assert!(ids_in(&store, "F2").is_empty());
+            assert_eq!(store.current_id("OLD1").unwrap(), "NEW2");
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn mark_read_by_the_old_id_after_a_move_reaches_the_new_id() {
+            let mut routes = move_routes();
+            routes.push(ok_route("PATCH", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-read", |_| {});
+            let store = Store::open(&store_path).unwrap();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::MarkRead {
+                    id: "OLD1".into(),
+                    read: true,
+                })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "PATCH").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "PATCH"),
+                [(
+                    "/me/messages/NEW1".to_string(),
+                    r#"{"isRead":true}"#.to_string()
+                )]
+            );
+            assert!(row(&store, "NEW1").is_read);
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn queued_moves_by_the_old_id_drain_in_order() {
+            // Offline: both moves were queued with the id the UI had before
+            // the engine came up.
+            let mut routes = move_routes();
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-queued", |s| {
+                for dest in ["F2", "F1"] {
+                    s.enqueue_op(&OutboxOp::Move {
+                        id: "OLD1".into(),
+                        dest: dest.into(),
+                    })
+                    .unwrap();
+                }
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            seen.extend(wait_moved(&handle.evt_rx, "NEW1", "NEW2"));
+            assert_eq!(
+                requests(&srv, "POST"),
+                [
+                    (
+                        "/me/messages/OLD1/move".to_string(),
+                        r#"{"destinationId":"F2"}"#.to_string()
+                    ),
+                    (
+                        "/me/messages/NEW1/move".to_string(),
+                        r#"{"destinationId":"F1"}"#.to_string()
+                    ),
+                ]
+            );
+            assert!(drained(&store));
+            assert_eq!(ids_in(&store, "F1"), ["NEW2"]);
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_delta_after_a_move_keeps_one_row_under_the_newest_id() {
+            // The source still lists the pre-move copy in one round and
+            // removes it in the next; the destination adds the moved copy
+            // under its new id.
+            let link_f1 = "/me/mailFolders/F1/messages/delta?token=D-F1";
+            let stale = delta_page(
+                &[full_message_json("OLD1", "Stale", "2026-07-16T10:00:00Z")],
+                link_f1,
+            );
+            let removed = delta_page(
+                &[r#"{"id":"OLD1","@removed":{"reason":"deleted"}}"#.to_string()],
+                link_f1,
+            );
+            let dest = delta_page(
+                &[full_message_json("NEW1", "Moved", "2026-07-16T10:00:00Z")],
+                "/me/mailFolders/F2/messages/delta?token=D-F2",
+            );
+            let mut routes = move_routes();
+            routes.extend(folder_routes(
+                F1_F2,
+                &[
+                    ("F1", stale.as_str()),
+                    ("F1", removed.as_str()),
+                    ("F2", dest.as_str()),
+                ],
+                &[],
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-delta", |_| {});
+            let store = Store::open(&store_path).unwrap();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            let mut sync = |folder: &str| {
+                let mark = srv.requests().len();
+                handle
+                    .cmd_tx
+                    .send(SyncCommand::SyncFolder { id: folder.into() })
+                    .unwrap();
+                seen.extend(wait_for_updates(&handle.evt_rx, folder, 1));
+                let link = format!("/me/mailFolders/{folder}/messages/delta?token=D-{folder}");
+                assert!(paths_from(&srv, mark).contains(&link), "{folder}");
+            };
+            // The stale upsert of the old id brings no second row back.
+            sync("F1");
+            assert!(!store.message_exists("OLD1").unwrap());
+            assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
+            // The old id's `@removed` deletes nothing: the re-keyed row is
+            // still there, as it was, before the destination's delta.
+            sync("F1");
+            assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
+            assert_eq!(row(&store, "NEW1").subject, "Hello");
+            sync("F2");
+
+            assert!(ids_in(&store, "F1").is_empty());
+            assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
+            assert_eq!(row(&store, "NEW1").subject, "Moved");
+            assert!(!store.message_exists("OLD1").unwrap());
+            assert_eq!(
+                seen.iter()
+                    .filter(|e| matches!(e, SyncEvent::MessageMoved { .. }))
+                    .count(),
+                1
+            );
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `Move{OLD1,F2}` queued and the row deleted locally (as the
+        /// `Delete` arm or lookxy does) before the move drained.
+        fn spawn_moved_then_deleted(
+            srv: &FakeServer,
+            tag: &str,
+            queue_delete: bool,
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            spawn(srv, tag, |s| {
+                s.enqueue_op(&OutboxOp::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+                s.delete_message("OLD1").unwrap();
+                if queue_delete {
+                    s.enqueue_op(&OutboxOp::Delete { id: "OLD1".into() })
+                        .unwrap();
+                }
+            })
+        }
+
+        fn delete_routes() -> Vec<(Route, Option<usize>)> {
+            let mut routes = move_routes();
+            routes.push(ok_route("DELETE", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            routes
+        }
+
+        #[test]
+        fn a_delete_queued_behind_a_move_reaches_the_new_id() {
+            let srv = FakeServer::start_limited(delete_routes());
+            let (handle, store_path, dir) = spawn_moved_then_deleted(&srv, "moved-del-q", true);
+            let store = Store::open(&store_path).unwrap();
+
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "DELETE").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "POST")
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect::<Vec<_>>(),
+                ["/me/messages/OLD1/move"]
+            );
+            assert_eq!(
+                requests(&srv, "DELETE"),
+                [("/me/messages/NEW1".to_string(), String::new())]
+            );
+            assert!(!store.message_exists("NEW1").unwrap());
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_delete_sent_after_the_move_drained_reaches_the_new_id() {
+            // The row went while the move was in flight (lookxy deletes on
+            // its own connection), and the `Delete` command by the old id
+            // comes after the drain.
+            let srv = FakeServer::start_limited(delete_routes());
+            let (handle, store_path, dir) =
+                spawn_moved_then_deleted(&srv, "moved-del-after", false);
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::Delete { id: "OLD1".into() })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "DELETE").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "DELETE"),
+                [("/me/messages/NEW1".to_string(), String::new())]
+            );
+            seen.extend(handle.evt_rx.try_iter());
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn set_flag_and_delete_by_the_old_id_reach_the_new_id() {
+            let mut routes = move_routes();
+            routes.push(ok_route("PATCH", "/me/messages/NEW1"));
+            routes.push(ok_route("DELETE", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-flag", |_| {});
+            let store = Store::open(&store_path).unwrap();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::SetFlag {
+                    id: "OLD1".into(),
+                    flagged: true,
+                })
+                .unwrap();
+            handle
+                .cmd_tx
+                .send(SyncCommand::SetCategories {
+                    id: "OLD1".into(),
+                    categories: vec!["Red".into()],
+                })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || requests(&srv, "PATCH").len() == 2));
+            assert!(drained(&store));
+            let patched: Vec<String> = requests(&srv, "PATCH")
+                .into_iter()
+                .map(|(p, _)| p)
+                .collect();
+            assert_eq!(patched, ["/me/messages/NEW1", "/me/messages/NEW1"]);
+            let r = row(&store, "NEW1");
+            assert!(r.is_flagged);
+            assert_eq!(r.categories, ["Red"]);
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Delete { id: "OLD1".into() })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "DELETE").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "DELETE"),
+                [("/me/messages/NEW1".to_string(), String::new())]
+            );
+            assert!(!store.message_exists("NEW1").unwrap());
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// The whole-mailbox download (#1871): a head delta per folder in the

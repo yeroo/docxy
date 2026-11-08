@@ -120,6 +120,7 @@ issue number to find its notes.
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),
   meeting message types, the referred event and Remove from Calendar (#2024),
   dismiss and snooze reminders on the server (#2025),
+  a moved message followed to its new id, its old ids still resolving (#1896),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 

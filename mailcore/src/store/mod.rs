@@ -230,10 +230,16 @@ pub enum OutboxOp {
         id: String,
         categories: Vec<String>,
     },
+    /// Move a message to the folder `dest` (`client.move_message`). The
+    /// drain re-keys the row to the id Graph answers with (#1896,
+    /// `Store::follow_move`).
     Move {
         id: String,
         dest: String,
     },
+    /// Delete a message (`client.delete_message`): Graph soft-deletes it to
+    /// the mailbox's Recoverable Items, not to Deleted Items, which is a
+    /// `Move` to that folder.
     Delete {
         id: String,
     },
@@ -1522,7 +1528,9 @@ impl Store {
     /// starts fresh (a head, a small folder's full delta, a backfill page)
     /// leaves them alone, as their optimistic local write (a read flag, a
     /// move, a delete, a draft's fields) has not reached Graph yet. Calendar
-    /// event ops name events, not messages, and are left out.
+    /// event ops name events, not messages, and are left out. Each id is
+    /// the one its message is stored under now (`current_id`: an op queued
+    /// before a move still protects the re-keyed row, #1896).
     pub fn pending_message_ids(&self) -> Result<Vec<String>, StoreError> {
         let mut ids: Vec<String> = self
             .pending_ops()?
@@ -1545,7 +1553,8 @@ impl Store {
                 | OutboxOp::DismissReminder { .. }
                 | OutboxOp::SnoozeReminder { .. } => None,
             })
-            .collect();
+            .map(|id| self.current_id(&id))
+            .collect::<Result<_, _>>()?;
         ids.sort();
         ids.dedup();
         Ok(ids)
@@ -1785,10 +1794,12 @@ impl Store {
     /// Unlike `set_read`/`set_flag` this returns a `Result`: the sync engine
     /// applies it in the same spot it enqueues the outbox op, where a store
     /// failure is worth surfacing. A mismatched/already-gone `id` just changes
-    /// zero rows (not an error). Graph mints a *new* id on move, but that's
-    /// reconciled by the next delta (old id `@removed`, new id added), so the
-    /// local id is left as-is here. A reconciled draft's `local:` id still
-    /// reaches it (#1884; `SendDraft`'s optimistic re-file into Sent Items).
+    /// zero rows (not an error). Graph mints a *new* id on move, which the
+    /// sync engine's drain applies with `follow_move` (#1896) once the op
+    /// succeeds, so the local id is left as-is here. A reconciled draft's
+    /// `local:` id still reaches it (#1884; `SendDraft`'s optimistic re-file
+    /// into Sent Items); an id from before a move does not (resolve it with
+    /// `current_id` first).
     pub fn move_message(&self, id: &str, dest_folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
@@ -2645,16 +2656,134 @@ impl Store {
         Ok(found)
     }
 
+    /// Records that Graph moved the message `old_id` and gave it `new_id`
+    /// (#1896), and re-keys its row when one is stored. `old_id` then
+    /// resolves to `new_id` through `moved_ids` (`current_id`), even once
+    /// the row is gone: a message deleted while its move was in flight
+    /// (the engine's queued `Delete`, lookxy's own delete) still has its
+    /// queued or later `Delete` by the old id reach the id Graph knows now.
+    /// Every earlier id that pointed at `old_id` points at `new_id` after
+    /// it, so a chain A -> B -> C resolves A and B to C in one lookup. An
+    /// alias never names its own row: a move that answers with an earlier
+    /// id of the message drops that alias.
+    ///
+    /// The row's body, stored headers, attachment metadata (whose
+    /// attachment ids stay the pre-move ones until the next
+    /// `FetchAttachments`) and outbound attachments follow, and the
+    /// `messages_fts` index through the triggers, as in `reconcile_id`; a
+    /// draft's `local_id` stays on the row. When a row `new_id` already
+    /// exists (a delta stored the moved copy first), it is kept: the old
+    /// row's children and `local_id` move onto it where it has none of its
+    /// own (a body, a header, an attachment of the same id), and the old
+    /// row is deleted. One transaction with `defer_foreign_keys` (see
+    /// `reconcile_id`).
+    ///
+    /// Returns whether it recorded the move: nothing happens when `old_id`
+    /// equals `new_id` or `new_id` is empty.
+    pub fn follow_move(&self, old_id: &str, new_id: &str) -> Result<bool, StoreError> {
+        if old_id == new_id || new_id.is_empty() {
+            return Ok(false);
+        }
+        let tx = self.write_tx()?;
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        let exists = |id: &str| -> rusqlite::Result<bool> {
+            tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )
+        };
+        const CHILDREN: [&str; 4] = [
+            "UPDATE OR IGNORE bodies SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE message_headers SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE attachments SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
+        ];
+        if exists(old_id)? {
+            if exists(new_id)? {
+                // `local_id` is UNIQUE: off the old row before onto the new.
+                let local: Option<String> = tx.query_row(
+                    "SELECT local_id FROM messages WHERE id = ?1",
+                    params![old_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE messages SET local_id = NULL WHERE id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute(
+                    "UPDATE messages SET local_id = COALESCE(local_id, ?2) WHERE id = ?1",
+                    params![new_id, local],
+                )?;
+                for sql in CHILDREN {
+                    tx.execute(sql, params![old_id, new_id])?;
+                }
+                // What the new row already had stays; the old row's copy
+                // goes (`outbound_attachments` has no foreign key).
+                tx.execute(
+                    "DELETE FROM outbound_attachments WHERE draft_id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute("DELETE FROM messages WHERE id = ?1", params![old_id])?;
+            } else {
+                tx.execute(
+                    "UPDATE messages SET id = ?2 WHERE id = ?1",
+                    params![old_id, new_id],
+                )?;
+                for sql in CHILDREN {
+                    tx.execute(sql, params![old_id, new_id])?;
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE moved_ids SET message_id = ?2 WHERE message_id = ?1",
+            params![old_id, new_id],
+        )?;
+        tx.execute("DELETE FROM moved_ids WHERE old_id = ?1", params![new_id])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO moved_ids (old_id, message_id) VALUES (?1, ?2)",
+            params![old_id, new_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Whether `id` is an id a message had before a move (#1896,
+    /// `follow_move`): a delta upsert of it is the pre-move copy Graph has
+    /// not removed yet, as Graph never reuses an id.
+    pub fn is_moved_alias(&self, id: &str) -> Result<bool, StoreError> {
+        let alias = self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM moved_ids WHERE old_id = ?1 AND message_id <> ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(alias)
+    }
+
     /// The id the message addressed by `id` is stored under now: the Graph
     /// id a draft's `local:` id was reconciled to (`reconcile_id`, #1884),
-    /// else `id` itself (a Graph id, which is never looked up, or a `local:`
-    /// id never reconciled or whose message has since been deleted).
+    /// then the latest id Graph gave a moved message (`follow_move`, #1896,
+    /// so a reconciled draft moved since resolves too; still so once the
+    /// message is deleted, for a `Delete` queued by the old id), else `id`
+    /// itself (an id never moved, or a `local:` id never reconciled or
+    /// whose message has since been deleted).
+    ///
+    /// Only this function follows a move: `draft_row_sql!`,
+    /// `current_id_sql!` and the calls built on them (`delete_message`,
+    /// which the delta `@removed` path uses, `set_read`, `move_message`, …)
+    /// do not, so a caller holding an id from before a move resolves it
+    /// here first.
     pub fn current_id(&self, id: &str) -> Result<String, StoreError> {
-        let current =
-            self.conn
-                .query_row(concat!("SELECT ", current_id_sql!()), params![id], |r| {
-                    r.get(0)
-                })?;
+        let current = self.conn.query_row(
+            concat!(
+                "SELECT COALESCE((SELECT message_id FROM moved_ids WHERE old_id = c.id), c.id)
+                 FROM (SELECT ",
+                current_id_sql!(),
+                " AS id) AS c"
+            ),
+            params![id],
+            |r| r.get(0),
+        )?;
         Ok(current)
     }
 
@@ -11459,5 +11588,361 @@ mod backfill_tests {
             .unwrap();
         s.clear_delta_links().unwrap();
         assert_eq!(history(&s, "F1").backfill_scope, None);
+    }
+}
+
+#[cfg(test)]
+mod moved_id_tests {
+    use super::*;
+    use crate::graph::model::{Body, MailFolder, Message, Recipient};
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn message(id: &str, subject: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: String::new(),
+            subject: subject.into(),
+            from: Recipient::default(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            received: "2026-01-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: Vec::new(),
+        }
+    }
+
+    /// A store with folders `SRC` and `DST` and one message `OLD1` in `SRC`.
+    fn store_with(id: &str) -> Store {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "SRC");
+        folder(&s, "DST");
+        s.upsert_message("SRC", &message(id, "Quarterly zebra report"))
+            .unwrap();
+        s
+    }
+
+    fn ids(s: &Store) -> Vec<String> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT id FROM messages ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    }
+
+    fn aliases(s: &Store) -> Vec<(String, String)> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT old_id, message_id FROM moved_ids ORDER BY old_id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn follow_move_rekeys_the_row_body_headers_and_attachments() {
+        let s = store_with("OLD1");
+        s.put_fetched_body_with_headers(
+            "OLD1",
+            &Body {
+                content_type: "text".into(),
+                content: "the giraffe minutes".into(),
+            },
+            BodyFormat::Text,
+            &[MessageHeader {
+                name: "x-ms-exchange-organization-authas".into(),
+                value: "Internal".into(),
+            }],
+        )
+        .unwrap();
+        s.put_attachments(
+            "OLD1",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "a.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 3,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::File,
+                source_url: None,
+            }],
+        )
+        .unwrap();
+        s.move_message("OLD1", "DST").unwrap();
+
+        assert!(s.follow_move("OLD1", "NEW1").unwrap());
+
+        assert_eq!(ids(&s), ["NEW1"]);
+        let row = &s.messages_in_folder("DST", 10, 0).unwrap()[0];
+        assert_eq!(row.id, "NEW1");
+        assert_eq!(row.subject, "Quarterly zebra report");
+        assert_eq!(
+            s.get_body("NEW1").unwrap().unwrap().content,
+            "the giraffe minutes"
+        );
+        assert!(s.get_body("OLD1").unwrap().is_none());
+        assert_eq!(
+            s.message_header("NEW1", "x-ms-exchange-organization-authas")
+                .unwrap()
+                .as_deref(),
+            Some("Internal")
+        );
+        assert_eq!(s.attachments("NEW1").unwrap().len(), 1);
+        assert!(s.attachments("OLD1").unwrap().is_empty());
+        // The index follows the row: subject and body both find it.
+        for q in ["zebra", "giraffe"] {
+            let hits = s.search(q, 10).unwrap();
+            assert_eq!(hits.len(), 1, "{q}");
+            assert_eq!(hits[0].id, "NEW1", "{q}");
+        }
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW1");
+        assert_eq!(s.current_id("NEW1").unwrap(), "NEW1");
+        assert!(s.is_moved_alias("OLD1").unwrap());
+        assert!(!s.is_moved_alias("NEW1").unwrap());
+    }
+
+    #[test]
+    fn follow_move_does_nothing_for_the_same_or_an_empty_id() {
+        let s = store_with("OLD1");
+        assert!(!s.follow_move("OLD1", "OLD1").unwrap());
+        assert!(!s.follow_move("OLD1", "").unwrap());
+        assert_eq!(ids(&s), ["OLD1"]);
+        assert!(aliases(&s).is_empty());
+    }
+
+    #[test]
+    fn follow_move_of_a_message_no_longer_stored_still_records_the_alias() {
+        // Deleted locally while its move was in flight: the queued (or a
+        // later) `Delete` by the old id must reach the id Graph knows now.
+        let s = store_with("OLD1");
+        s.delete_message("OLD1").unwrap();
+        assert!(s.follow_move("OLD1", "NEW1").unwrap());
+        assert!(ids(&s).is_empty());
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW1");
+        assert!(s.is_moved_alias("OLD1").unwrap());
+        // A chain through it still flattens.
+        assert!(s.follow_move("NEW1", "NEW2").unwrap());
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
+    }
+
+    #[test]
+    fn follow_move_chain_resolves_every_old_id_to_the_newest() {
+        let s = store_with("OLD1");
+        s.follow_move("OLD1", "NEW1").unwrap();
+        s.follow_move("NEW1", "NEW2").unwrap();
+        assert_eq!(ids(&s), ["NEW2"]);
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
+        assert_eq!(s.current_id("NEW1").unwrap(), "NEW2");
+        assert_eq!(
+            aliases(&s),
+            [
+                ("NEW1".to_string(), "NEW2".to_string()),
+                ("OLD1".to_string(), "NEW2".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_move_onto_an_existing_row_keeps_one_row() {
+        let s = store_with("OLD1");
+        s.follow_move("OLD1", "NEW1").unwrap();
+        // A delta stored the moved copy before the re-key.
+        s.upsert_message("DST", &message("NEW2", "From the delta"))
+            .unwrap();
+        s.follow_move("NEW1", "NEW2").unwrap();
+        assert_eq!(ids(&s), ["NEW2"]);
+        assert_eq!(
+            s.messages_in_folder("DST", 10, 0).unwrap()[0].subject,
+            "From the delta"
+        );
+        // The chain was flattened before the old row went.
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
+        assert_eq!(s.current_id("NEW1").unwrap(), "NEW2");
+    }
+
+    #[test]
+    fn follow_move_onto_an_existing_row_keeps_the_drafts_own_state() {
+        // A reconciled draft with a body, a header, an attachment and an
+        // outbound attachment; a delta stored the moved copy first, with
+        // a header of its own.
+        let s = Store::open_in_memory().unwrap();
+        let local = s
+            .create_local_draft("Subj", "a@x", "", "<p>draft</p>")
+            .unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        s.add_outbound_attachment(&local, "/tmp/a.pdf", "a.pdf", 1)
+            .unwrap();
+        s.put_attachments(
+            "G1",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "a.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 1,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::File,
+                source_url: None,
+            }],
+        )
+        .unwrap();
+        let folder_id = s.draft("G1").unwrap().unwrap().0.folder_id;
+        s.upsert_message(&folder_id, &message("G2", "From the delta"))
+            .unwrap();
+
+        assert!(s.follow_move("G1", "G2").unwrap());
+
+        assert_eq!(ids(&s), ["G2"]);
+        assert_eq!(s.current_id(&local).unwrap(), "G2");
+        let (row, body) = s.draft(&local).unwrap().expect("local id still loads");
+        assert_eq!(row.id, "G2");
+        assert_eq!(body.content, "<p>draft</p>");
+        assert_eq!(s.outbound_attachments("G2").unwrap().len(), 1);
+        assert_eq!(s.attachments("G2").unwrap().len(), 1);
+        let orphans: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_attachments WHERE draft_id = 'G1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn follow_move_onto_an_existing_row_keeps_that_rows_own_body() {
+        let s = store_with("OLD1");
+        s.put_body(
+            "OLD1",
+            &Body {
+                content_type: "text".into(),
+                content: "old".into(),
+            },
+        )
+        .unwrap();
+        s.upsert_message("DST", &message("NEW1", "From the delta"))
+            .unwrap();
+        s.put_body(
+            "NEW1",
+            &Body {
+                content_type: "text".into(),
+                content: "new".into(),
+            },
+        )
+        .unwrap();
+        assert!(s.follow_move("OLD1", "NEW1").unwrap());
+        assert_eq!(ids(&s), ["NEW1"]);
+        assert_eq!(s.get_body("NEW1").unwrap().unwrap().content, "new");
+        let bodies: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bodies, 1);
+    }
+
+    #[test]
+    fn follow_move_back_to_an_earlier_id_drops_that_alias() {
+        let s = store_with("OLD1");
+        s.follow_move("OLD1", "NEW1").unwrap();
+        s.follow_move("NEW1", "OLD1").unwrap();
+        assert_eq!(ids(&s), ["OLD1"]);
+        assert_eq!(s.current_id("NEW1").unwrap(), "OLD1");
+        assert_eq!(s.current_id("OLD1").unwrap(), "OLD1");
+        assert!(!s.is_moved_alias("OLD1").unwrap());
+        assert_eq!(aliases(&s), [("NEW1".to_string(), "OLD1".to_string())]);
+        // A delta upsert of the live id merges into its row.
+        s.upsert_message("SRC", &message("OLD1", "Merged")).unwrap();
+        assert_eq!(
+            s.messages_in_folder("SRC", 10, 0).unwrap()[0].subject,
+            "Merged"
+        );
+    }
+
+    #[test]
+    fn follow_move_of_a_reconciled_draft_keeps_its_local_id() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s
+            .create_local_draft("Subj", "a@x", "", "<p>draft</p>")
+            .unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        s.add_outbound_attachment(&local, "/tmp/a.pdf", "a.pdf", 1)
+            .unwrap();
+        s.follow_move("G1", "G2").unwrap();
+        assert_eq!(s.current_id(&local).unwrap(), "G2");
+        assert_eq!(s.current_id("G1").unwrap(), "G2");
+        let (row, body) = s.draft(&local).unwrap().expect("local id still loads");
+        assert_eq!(row.id, "G2");
+        assert_eq!(body.content, "<p>draft</p>");
+        assert_eq!(s.outbound_attachments("G2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_message_by_a_moved_alias_deletes_nothing() {
+        // The source folder's delta `@removed` of the pre-move id.
+        let s = store_with("OLD1");
+        s.follow_move("OLD1", "NEW1").unwrap();
+        s.delete_message("OLD1").unwrap();
+        assert_eq!(s.delete_message_resolved("OLD1").unwrap(), None);
+        assert_eq!(ids(&s), ["NEW1"]);
+    }
+
+    #[test]
+    fn moved_aliases_outlive_a_deleted_message() {
+        let s = store_with("OLD1");
+        s.follow_move("OLD1", "NEW1").unwrap();
+        s.follow_move("NEW1", "NEW2").unwrap();
+        s.delete_message("NEW2").unwrap();
+        assert!(ids(&s).is_empty());
+        assert_eq!(aliases(&s).len(), 2);
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
+        assert_eq!(s.current_id("NEW1").unwrap(), "NEW2");
+        assert!(s.is_moved_alias("OLD1").unwrap());
+    }
+
+    #[test]
+    fn pending_message_ids_resolves_moved_ids() {
+        let s = store_with("OLD1");
+        s.upsert_message("SRC", &message("OTHER", "x")).unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "OLD1".into(),
+            read: true,
+        })
+        .unwrap();
+        s.enqueue_op(&OutboxOp::SetFlag {
+            id: "OTHER".into(),
+            flagged: true,
+        })
+        .unwrap();
+        s.follow_move("OLD1", "NEW1").unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "NEW1".into(),
+            dest: "SRC".into(),
+        })
+        .unwrap();
+        assert_eq!(s.pending_message_ids().unwrap(), ["NEW1", "OTHER"]);
     }
 }
