@@ -121,6 +121,16 @@ mod tests {
         }
     }
 
+    /// An `$XDG_CONFIG_HOME` that is absolute on the host running the test
+    /// (`/x` has no drive on Windows), and how [`root`] shows it.
+    fn xdg() -> (&'static str, &'static str) {
+        if cfg!(windows) {
+            (r"C:\x", "C:/x")
+        } else {
+            ("/x", "/x")
+        }
+    }
+
     fn root(e: &Env, os: Os) -> Option<String> {
         config_root_from(e, os).map(|p| p.to_string_lossy().replace('\\', "/"))
     }
@@ -142,13 +152,14 @@ mod tests {
 
     #[test]
     fn each_platform_has_its_config_dir() {
-        let e = env("-", "/a", "/h", "/x");
+        let (x, shown) = xdg();
+        let e = env("-", "/a", "/h", x);
         assert_eq!(root(&e, Os::Windows).as_deref(), Some("/a"));
         assert_eq!(
             root(&e, Os::MacOs).as_deref(),
             Some("/h/Library/Application Support")
         );
-        assert_eq!(root(&e, Os::Other).as_deref(), Some("/x"));
+        assert_eq!(root(&e, Os::Other).as_deref(), Some(shown));
         // XDG must be absolute, as `dirs` has it; else HOME/.config.
         assert_eq!(
             root(&env("-", "-", "/h", "x"), Os::Other).as_deref(),
