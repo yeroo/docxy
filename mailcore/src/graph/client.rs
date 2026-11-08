@@ -1352,6 +1352,34 @@ impl GraphClient {
         Ok(())
     }
 
+    /// POST `/me/events/{id}/dismissReminder` (#2025): dismisses the event's
+    /// reminder on the server, so the user's other devices stop showing it.
+    /// Graph takes no request body; `send` frames the empty one as
+    /// `Content-Length: 0` (#1954). Graph answers `200` with no body.
+    pub fn dismiss_reminder(&self, id: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}/dismissReminder");
+        self.send(Method::Post, &path, None, &[])?;
+        Ok(())
+    }
+
+    /// POST `/me/events/{id}/snoozeReminder` with `{"newReminderTime":…}`
+    /// (#2025): the reminder fires again at `new_reminder_utc`, a store-shaped
+    /// UTC time (`YYYY-MM-DDTHH:MM:SSZ`) sent as its wall clock next to
+    /// `timeZone: "UTC"` (`graph_utc_wall_clock`). Graph answers `200` with no
+    /// body.
+    pub fn snooze_reminder(&self, id: &str, new_reminder_utc: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}/snoozeReminder");
+        let body = Value::Object(vec![(
+            "newReminderTime".to_string(),
+            graph_utc_wall_clock(new_reminder_utc),
+        )])
+        .to_string();
+        self.send(Method::Post, &path, Some(body), &[])?;
+        Ok(())
+    }
+
     /// GET `/me/people` (top 200, relevance-ordered). Each returned person's
     /// primary address is its first `scoredEmailAddresses` entry; people with
     /// no email address are skipped. `rank` is the entry's position in the
@@ -4592,6 +4620,90 @@ mod tests {
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(
             c.cancel_event("E1", None),
+            Err(GraphError::Http { status: 400, .. })
+        ));
+    }
+
+    /// Graph's answer to `dismissReminder` / `snoozeReminder`: `200`, no body.
+    fn ok_empty(path: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    #[test]
+    fn dismiss_reminder_posts_no_body() {
+        let srv = FakeServer::start(vec![ok_empty("/me/events/E1/dismissReminder")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.dismiss_reminder("E1").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/E1/dismissReminder");
+        // Without a length Exchange answers 411 (#1954).
+        assert_eq!(content_length(&reqs[0]), Some("0"));
+        assert_eq!(reqs[0].body, "");
+    }
+
+    #[test]
+    fn snooze_reminder_posts_new_time() {
+        let srv = FakeServer::start(vec![ok_empty("/me/events/E1/snoozeReminder")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.snooze_reminder("E1", "2026-11-08T10:15:00Z").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/E1/snoozeReminder");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"newReminderTime":{"dateTime":"2026-11-08T10:15:00","timeZone":"UTC"}}"#
+        );
+    }
+
+    #[test]
+    fn reminder_ids_are_percent_encoded() {
+        let srv = FakeServer::start(vec![
+            ok_empty("/me/events/AAMk%2Fid%2Bwith%3Dchars/dismissReminder"),
+            ok_empty("/me/events/AAMk%2Fid%2Bwith%3Dchars/snoozeReminder"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.dismiss_reminder("AAMk/id+with=chars").unwrap();
+        c.snooze_reminder("AAMk/id+with=chars", "2026-11-08T10:15:00Z")
+            .unwrap();
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "/me/events/AAMk%2Fid%2Bwith%3Dchars/dismissReminder",
+                "/me/events/AAMk%2Fid%2Bwith%3Dchars/snoozeReminder",
+            ]
+        );
+    }
+
+    #[test]
+    fn dismiss_reminder_refused_is_an_error() {
+        let refused = |path: &str| Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status: 400,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorInvalidRequest"}}"#.into(),
+        };
+        let srv = FakeServer::start(vec![
+            refused("/me/events/E1/dismissReminder"),
+            refused("/me/events/E1/snoozeReminder"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.dismiss_reminder("E1"),
+            Err(GraphError::Http { status: 400, .. })
+        ));
+        assert!(matches!(
+            c.snooze_reminder("E1", "2026-11-08T10:15:00Z"),
             Err(GraphError::Http { status: 400, .. })
         ));
     }
