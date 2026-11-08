@@ -251,7 +251,9 @@ pub(crate) mod tests {
 
     #[test]
     fn the_wheel_scrolls() {
-        let mut r = open_area(fixture(EDITOR), Some("Home")).unwrap();
+        // This editor's fixture is a manual; the word one is long enough to scroll.
+        assert!(!fixture(EDITOR).pages.is_empty());
+        let mut r = open_area(fixture("word"), Some("Home")).unwrap();
         r.layout(30, 3, &measure);
         let wheel = |kind| MouseEvent {
             kind,
