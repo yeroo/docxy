@@ -4840,8 +4840,6 @@ fn set_event_online_meeting_on(
     Ok(())
 }
 
-/// `graph::client::event_zone_error` for both ends of a host's fields
-/// (#2039), as a `StoreError` naming the end.
 /// The calendar `create_local_event` files a new event in (#2048): a named
 /// one only when it is stored and `can_edit`, else the default calendar's id
 /// (`''` before the calendar list is known).
@@ -4863,6 +4861,8 @@ fn create_calendar_on(conn: &Connection, chosen: &Option<String>) -> Result<Stri
     }
 }
 
+/// `graph::client::event_zone_error` for both ends of a host's fields
+/// (#2039), as a `StoreError` naming the end.
 fn check_event_zones(f: &LocalEventFields) -> Result<(), StoreError> {
     for (end, zone, local, utc) in [
         ("start", &f.start_time_zone, &f.start_local, &f.start_utc),
