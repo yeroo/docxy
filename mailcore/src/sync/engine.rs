@@ -155,8 +155,9 @@ pub enum SyncCommand {
     /// same row. Writes nothing and answers
     /// [`SyncEvent::MessageFetchFailed`] when signed out, when the id is
     /// one a move left behind (`Store::is_moved_alias`), when a queued op
-    /// deleted it locally, when its folder is not in the store, or when
-    /// Graph fails; a body that fails after the header was stored answers
+    /// deleted it locally, when its folder is not in the store, when a
+    /// draft holding an unsaved edit has no stored body in the engine's
+    /// format ("edited locally"), or when Graph fails; a body that fails after the header was stored answers
     /// `MessageFetchFailed` too. Served ahead of a running pass, as
     /// `FetchBody` is.
     FetchMessage { id: String },
