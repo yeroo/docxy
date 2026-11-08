@@ -697,9 +697,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `NewEvent` and `EventRow`, and the columns' `DEFAULT 1`. Graph's "no date"
   (`0001-01-01...`, a `noEnd` range's `endDate`, a never-responded attendee's
   `status.time`) reads as `""` (`graph_date_or_empty`).
-- Two recurrence columns: `events.recurrence` is the create-side `Recurrence`
-  that `event_for_send` re-sends on every create (and on a pre-#1994 queued
-  update read as `LEGACY_UPDATE`; an edit since #1994 never sends it);
+- Two recurrence columns: `events.recurrence` is the recurrence a local
+  create was given, which `event_for_send` re-sends on every create (and on a
+  pre-#1994 queued update read as `LEGACY_UPDATE`; an edit since #1994 never
+  sends it): the create-side `Recurrence` bare, or since #2034 a lossless
+  `EventRecurrence` wrapped as `{"graphRecurrence": ...}`;
   `events.graph_recurrence` is Graph's `EventRecurrence` (read side), written
   by `upsert_event_on`. Never write Graph's recurrence into `recurrence`: the
   lossy create-side type (three kinds, `numbered` becomes `noEnd`,
@@ -712,8 +714,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - `create_local_event` stores what the host set (#1994), else the fields
   Graph sets on create: `busy`,
   `normal` sensitivity and importance, organizer, both request flags on,
-  `singleInstance`, or `seriesMaster` with its recurrence in
-  `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
+  `singleInstance`, or `seriesMaster` with its recurrence (the lossless one
+  when set, #2034) in `graph_recurrence`, and the `join_url` `meeting_link_in` finds in the
   location or body. `update_event_fields` derives `join_url` again from the
   edited location and body, except on an online meeting (`is_online_meeting`),
   whose link is Graph's `onlineMeeting.joinUrl` and is kept. A series then
@@ -1329,6 +1331,41 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
+
+## Creating a series with any recurrence (#2034)
+
+- `LocalEventFields::series_recurrence` (`Option<EventRecurrence>`) is Graph's
+  whole recurrence on create: every pattern type, `noEnd`, `endDate` and
+  `numbered` ranges, `firstDayOfWeek`, `index`, `month`, `recurrenceTimeZone`,
+  as given. It wins over the create-side `recurrence` (kept: its callers
+  compile and send as before) when both are set; the losing one is not
+  stored. Both are create-only: `update_event_fields` ignores them.
+- `create_local_event` stores it in `events.recurrence` as
+  `{"graphRecurrence": <EventRecurrence::to_json>}` (`SEND_RECURRENCE_KEY`,
+  `encode_send_recurrence`), and in `graph_recurrence` as the row's
+  recurrence, with `event_type` `seriesMaster`. The wrapper keeps the shapes
+  apart: `Recurrence::from_json` would read a bare lossless daily, weekly or
+  absoluteMonthly text and drop its `index`, `month` and `numbered` range.
+  Not a new column (a migration, and two columns that can disagree), and not
+  `graph_recurrence`, which sync writes and must never be re-sent.
+- `decode_send_recurrence` reads the column for `event_for_send`: a wrapper is
+  `EventSendData::series_recurrence`, a bare object the create-side
+  `recurrence`, and anything else (corrupt text, a wrapper without a `pattern`
+  object, an unknown create-side type) neither, without an error.
+  `event_input_for` passes it as `EventInput::series_recurrence`, which
+  `event_body_json` sends with `to_send_json` under the `recurrence` group.
+- Not done: a pending `local:` series' recurrence cannot be changed before its
+  `CreateEvent` runs (the row edit never writes recurrence, and
+  `UpdateEventSeries` sends nothing for a `local:` id).
+- Tests: `store` `calendar_tests` `create_local_event_stores_a_lossless_recurrence`,
+  `create_local_event_lossless_recurrence_wins`,
+  `update_event_fields_never_changes_a_lossless_recurrence`,
+  `event_for_send_reads_neither_shape_as_no_recurrence`,
+  `create_local_event_round_trips_recurrence`; `outbox.rs`
+  `create_event_sends_every_lossless_recurrence_unchanged` (6 pattern types × 3
+  ranges), `create_event_sends_a_lossless_recurrence_as_given` (a JSON literal),
+  `create_event_with_create_side_recurrence_sends_as_before`,
+  `create_event_without_recurrence_sends_none`.
 
 ## Respond options and proposals (#2023)
 
