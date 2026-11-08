@@ -12,7 +12,7 @@ use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
     EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
     MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person, Recipient,
-    Recurrence, ScheduleEntry, plain_to_html, to_utc,
+    Recurrence, ScheduleEntry, SearchHit, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -674,6 +674,62 @@ impl GraphClient {
         let m = Message::from_json(&v)
             .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
         Ok((m, MessageFields::of(&v)))
+    }
+
+    /// Searches messages on the server (#2006): GET
+    /// `/me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…`,
+    /// or `/me/mailFolders/{id}/messages?…` with a folder. `query` is KQL as
+    /// the client wrote it; it goes in one quoted `$search` value
+    /// (`search_value`), so a `"` or `\` in it cannot end the clause.
+    /// Graph allows neither `$orderby` nor `$filter` with `$search`: the hits
+    /// come in Graph's own order. `top` is clamped to
+    /// `1..=`[`SEARCH_TOP_MAX`]; `@odata.nextLink` is followed (sent as is)
+    /// until `top` hits are in (the rest of a page dropped), a page has no
+    /// `nextLink`, or a page brings no hit (a link that loops). An item
+    /// without an id is dropped.
+    pub fn search_messages(
+        &self,
+        folder_id: Option<&str>,
+        query: &str,
+        top: usize,
+    ) -> Result<Vec<SearchHit>, GraphError> {
+        let top = top.clamp(1, SEARCH_TOP_MAX);
+        let collection = match folder_id {
+            Some(f) => format!("/me/mailFolders/{}/messages", encode_path_segment(f)),
+            None => "/me/messages".to_string(),
+        };
+        let mut target = format!(
+            "{collection}?$search={}&$select={MESSAGE_SELECT},parentFolderId&$top={top}",
+            search_value(query)
+        );
+        let mut hits = Vec::new();
+        loop {
+            let resp = self.send(Method::Get, &target, None, &[])?;
+            let v = parse_body(resp)?;
+            let items = value_array(&v, "value")?;
+            hits.extend(items.iter().filter_map(SearchHit::from_json));
+            if hits.len() >= top {
+                hits.truncate(top);
+                break;
+            }
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) if !items.is_empty() => target = next.to_string(),
+                _ => break,
+            }
+        }
+        Ok(hits)
+    }
+
+    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT,parentFolderId`: one
+    /// message as a [`SearchHit`], with the folder it is filed in, for the
+    /// engine to store a search hit the store does not have (#2006). A body
+    /// without an id is a `Parse` error.
+    pub fn get_message_hit(&self, message_id: &str) -> Result<SearchHit, GraphError> {
+        let message_id = encode_path_segment(message_id);
+        let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT},parentFolderId");
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        SearchHit::from_json(&v).ok_or_else(|| GraphError::Parse("malformed message".to_string()))
     }
 
     /// [`GraphClient::get_body_with_headers`] with the headers dropped: the
@@ -2004,6 +2060,26 @@ fn chunk_ranges(total: usize, chunk: usize) -> Vec<(usize, usize)> {
     v
 }
 
+/// The most hits [`GraphClient::search_messages`] returns: Graph's own cap
+/// on a message `$search` (#2006).
+pub const SEARCH_TOP_MAX: usize = 1000;
+
+/// A message `$search` value (#2006): `query` in double quotes, its `\`
+/// and `"` escaped with a backslash so it cannot end the quoted clause, the
+/// whole value percent-encoded ([`encode_path_segment`]).
+fn search_value(query: &str) -> String {
+    let mut quoted = String::with_capacity(query.len() + 2);
+    quoted.push('"');
+    for c in query.chars() {
+        if c == '\\' || c == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    encode_path_segment(&quoted)
+}
+
 /// Percent-encodes every byte except RFC 3986 unreserved characters
 /// (`A-Za-z0-9-._~`). Graph's REST-format message/folder/attachment ids
 /// commonly contain `/`, `+`, and trailing `=` (they're base64-ish), which
@@ -2200,6 +2276,230 @@ mod tests {
         ] {
             assert!(path.contains(field), "{field} selected: {path}");
         }
+    }
+
+    /// A `$search` page route: `prefix`, with these items and maybe a
+    /// `nextLink`.
+    fn search_page(prefix: &str, items: &str, next: Option<&str>) -> Route {
+        let next = next
+            .map(|n| format!(r#","@odata.nextLink":"{n}""#))
+            .unwrap_or_default();
+        Route {
+            method: "GET".into(),
+            path_prefix: prefix.into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"value":[{items}]{next}}}"#),
+        }
+    }
+
+    #[test]
+    fn search_value_quotes_escapes_and_encodes() {
+        assert_eq!(search_value("budget"), "%22budget%22");
+        assert_eq!(
+            search_value(r#"budget "q3" a\b"#),
+            "%22budget%20%5C%22q3%5C%22%20a%5C%5Cb%22"
+        );
+        // A query that tries to close the clause stays inside it.
+        assert_eq!(search_value(r#"x" OR "y"#), "%22x%5C%22%20OR%20%5C%22y%22");
+        assert_eq!(search_value(""), "%22%22");
+    }
+
+    #[test]
+    fn search_messages_mailbox_path_selects_parent_folder_and_top() {
+        let srv = FakeServer::start(vec![search_page("/me/messages?", "", None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.search_messages(None, "budget", 25).unwrap(), vec![]);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(
+            reqs[0].path,
+            format!(
+                "/me/messages?$search=%22budget%22&$select={MESSAGE_SELECT},parentFolderId&$top=25"
+            )
+        );
+    }
+
+    #[test]
+    fn search_messages_folder_path_is_percent_encoded() {
+        let srv = FakeServer::start(vec![search_page("/me/mailFolders/", "", None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_messages(Some("A/B+C="), "budget", 10).unwrap();
+        let path = &srv.requests()[0].path;
+        assert_eq!(
+            path,
+            &format!(
+                "/me/mailFolders/A%2FB%2BC%3D/messages?$search=%22budget%22\
+                 &$select={MESSAGE_SELECT},parentFolderId&$top=10"
+            )
+        );
+    }
+
+    #[test]
+    fn search_messages_escapes_quotes_and_backslashes() {
+        let srv = FakeServer::start(vec![search_page("/me/messages?", "", None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_messages(None, r#"budget "q3" a\b"#, 5).unwrap();
+        let path = &srv.requests()[0].path;
+        assert!(
+            path.starts_with(
+                "/me/messages?$search=%22budget%20%5C%22q3%5C%22%20a%5C%5Cb%22&$select="
+            ),
+            "{path}"
+        );
+        // Graph allows neither with `$search` on messages.
+        assert!(!path.contains("$orderby"), "{path}");
+        assert!(!path.contains("$filter"), "{path}");
+    }
+
+    #[test]
+    fn search_messages_clamps_top() {
+        let srv = FakeServer::start(vec![search_page("/me/messages?", "", None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_messages(None, "a", 0).unwrap();
+        c.search_messages(None, "a", 5000).unwrap();
+        c.search_messages(None, "a", SEARCH_TOP_MAX).unwrap();
+        let tops: Vec<String> = srv
+            .requests()
+            .iter()
+            .map(|r| r.path.rsplit("$top=").next().unwrap().to_string())
+            .collect();
+        assert_eq!(tops, ["1", "1000", "1000"]);
+    }
+
+    #[test]
+    fn search_messages_follows_next_link_until_top() {
+        let srv = FakeServer::start(vec![
+            search_page(
+                "/me/messages?$skiptoken=2",
+                r#"{"id":"M3","parentFolderId":"F1"},{"id":"M4","parentFolderId":"F1"}"#,
+                Some("/me/messages?$skiptoken=3"),
+            ),
+            search_page(
+                "/me/messages?$skiptoken=3",
+                r#"{"id":"M5","parentFolderId":"F1"}"#,
+                None,
+            ),
+            search_page(
+                "/me/messages?$search",
+                r#"{"id":"M1","parentFolderId":"F1"},{"id":"M2","parentFolderId":"F2"}"#,
+                Some("/me/messages?$skiptoken=2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hits = c.search_messages(None, "budget", 3).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.message.id.as_str()).collect();
+        assert_eq!(ids, ["M1", "M2", "M3"], "truncated to top");
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(paths.len(), 2, "top reached on page 2: {paths:?}");
+        assert_eq!(paths[1], "/me/messages?$skiptoken=2", "the link as is");
+    }
+
+    #[test]
+    fn search_messages_follows_next_link_to_the_end() {
+        let srv = FakeServer::start(vec![
+            search_page(
+                "/me/messages?$skiptoken=2",
+                r#"{"id":"M2"},{"subject":"no id"}"#,
+                Some("/me/messages?$skiptoken=3"),
+            ),
+            search_page("/me/messages?$skiptoken=3", r#"{"id":"M3"}"#, None),
+            search_page(
+                "/me/messages?$search",
+                r#"{"id":"M1"}"#,
+                Some("/me/messages?$skiptoken=2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hits = c.search_messages(None, "budget", 100).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.message.id.as_str()).collect();
+        assert_eq!(ids, ["M1", "M2", "M3"], "the item without an id dropped");
+        assert_eq!(srv.requests().len(), 3);
+    }
+
+    #[test]
+    fn search_messages_stops_at_a_page_without_items() {
+        // A link that loops (or a server that keeps sending one) ends at
+        // the first page that brings nothing.
+        let srv = FakeServer::start(vec![
+            search_page("/me/messages?$skiptoken=", "", Some("/me/messages?$skiptoken=1")),
+            search_page(
+                "/me/messages?$search",
+                r#"{"id":"M1"}"#,
+                Some("/me/messages?$skiptoken=1"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.search_messages(None, "budget", 50).unwrap().len(), 1);
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn search_messages_maps_errors() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages?".into(),
+            status: 403,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorAccessDenied"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.search_messages(None, "budget", 5) {
+            Err(GraphError::Http { status: 403, .. }) => {}
+            other => panic!("expected a 403, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_hit_carries_folder_and_delta_fields() {
+        let srv = FakeServer::start(vec![search_page(
+            "/me/messages?",
+            r#"{"id":"M1","parentFolderId":"F2","subject":"Budget","from":{"emailAddress":{"name":"A","address":"a@x"}},"receivedDateTime":"2026-01-01T00:00:00Z","isRead":true}"#,
+            None,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hits = c.search_messages(None, "budget", 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.folder_id, "F2");
+        assert_eq!(h.message.subject, "Budget");
+        assert_eq!(h.message.from.address, "a@x");
+        assert!(h.message.is_read);
+        assert!(h.fields.subject && h.fields.from && h.fields.is_read);
+        assert!(!h.fields.preview, "bodyPreview was not in the response");
+    }
+
+    #[test]
+    fn get_message_hit_selects_parent_folder() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"A/B+C=","parentFolderId":"F2","subject":"Hi"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hit = c.get_message_hit("A/B+C=").unwrap();
+        assert_eq!(hit.folder_id, "F2");
+        assert_eq!(hit.message.subject, "Hi");
+        assert_eq!(
+            srv.requests()[0].path,
+            format!("/me/messages/A%2FB%2BC%3D?$select={MESSAGE_SELECT},parentFolderId")
+        );
+    }
+
+    #[test]
+    fn get_message_hit_without_an_id_is_a_parse_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"subject":"Hi"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.get_message_hit("M1"), Err(GraphError::Parse(_))));
     }
 
     #[test]

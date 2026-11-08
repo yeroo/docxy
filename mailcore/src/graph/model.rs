@@ -753,6 +753,35 @@ pub enum DeltaItem {
     Delete(String),
 }
 
+/// One message a server search (`GraphClient::search_messages`, #2006)
+/// found, or one `GraphClient::get_message_hit` fetched: the folder it is
+/// filed in (`parentFolderId`, empty when Graph sent none) and what a delta
+/// row carries (`DeltaItem::Upsert`), so a client can scope the hits and
+/// show where each one lives, and the engine can store an opened one as a
+/// delta would.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    pub folder_id: String,
+    pub message: Message,
+    pub fields: MessageFields,
+}
+
+impl SearchHit {
+    /// `None` for an item without an id (`Message::from_json` takes any
+    /// object, with an empty id when it has none).
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let message = Message::from_json(v)?;
+        if message.id.is_empty() {
+            return None;
+        }
+        Some(SearchHit {
+            folder_id: str_field(v, "parentFolderId"),
+            message,
+            fields: MessageFields::of(v),
+        })
+    }
+}
+
 /// A page of results from Graph's delta query, plus the pagination/delta
 /// tokens to continue syncing.
 #[derive(Debug, Clone, PartialEq)]
@@ -1709,6 +1738,34 @@ fn recipient_list(v: &Value, key: &str) -> Vec<Recipient> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn search_hit_from_json_carries_folder_and_delta_fields() {
+        let v = parse(
+            r#"{"id":"M1","parentFolderId":"F2","subject":"Budget","isRead":false,"receivedDateTime":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let hit = SearchHit::from_json(&v).unwrap();
+        assert_eq!(hit.folder_id, "F2");
+        assert_eq!(hit.message, Message::from_json(&v).unwrap());
+        assert_eq!(hit.fields, MessageFields::of(&v));
+        assert!(hit.fields.subject && !hit.fields.from, "{:?}", hit.fields);
+    }
+
+    #[test]
+    fn search_hit_from_json_without_parent_folder_has_an_empty_folder() {
+        let v = parse(r#"{"id":"M1","parentFolderId":null}"#).unwrap();
+        assert_eq!(SearchHit::from_json(&v).unwrap().folder_id, "");
+        let v = parse(r#"{"id":"M1"}"#).unwrap();
+        assert_eq!(SearchHit::from_json(&v).unwrap().folder_id, "");
+    }
+
+    #[test]
+    fn search_hit_from_json_without_an_id_is_none() {
+        for raw in [r#"{"subject":"x"}"#, r#"{"id":"","subject":"x"}"#] {
+            assert_eq!(SearchHit::from_json(&parse(raw).unwrap()), None, "{raw}");
+        }
+    }
 
     #[test]
     fn meeting_message_type_maps_graph_values_and_is_lenient() {
