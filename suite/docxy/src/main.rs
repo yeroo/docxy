@@ -42230,7 +42230,7 @@ impl Docxy {
     fn ext_rail_entry(&self, e: ExtRailEntry, fg: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let id = e.id.clone();
         div()
-            .id(SharedString::from(format!("bs-ext:{}", e.id)))
+            .id(SharedString::from(backstage_ext_probe(&e.id)))
             .relative()
             .w_full()
             .px_4()
@@ -42248,11 +42248,7 @@ impl Docxy {
                     // The mask takes the entry's ink, the hover's too.
                     .when_some(e.icon, |d, icon| {
                         d.child(
-                            svg()
-                                .path(SharedString::from(format!("icons/{icon}.svg")))
-                                .size(px(16.))
-                                .flex_none()
-                                .text_color(fg)
+                            icon_svg(icon, 16., fg)
                                 .group_hover("bs-ext", |s| s.text_color(rgb(FILE_FG))),
                         )
                     })

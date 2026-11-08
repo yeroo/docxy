@@ -5587,8 +5587,6 @@ fn dispatch_verb(
             Done::ok(help_read_json(app))
         }
         "help-read" => Done::ok(help_read_json(app)),
-        // The test extension's embedded document view (#1873), on a Mail tab
-        // of a case that starts with `ext fixture`.
         // A File page of the test extension's (#1923): how many times it
         // rendered and where it last painted (null before it ever did).
         "ext-page-read" => {
@@ -5637,6 +5635,8 @@ fn dispatch_verb(
                 ("from", Json::Str(from.into())),
             ]))
         }
+        // The test extension's embedded document view (#1873), on a Mail tab
+        // of a case that starts with `ext fixture`.
         "ext-doc-read" => {
             let fixture = ext_fixture_view(app)?;
             let f = fixture.read(cx);

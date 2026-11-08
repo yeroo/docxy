@@ -96,11 +96,13 @@ pub trait TabSurface: 'static {
     /// is still called too.
     fn theme_changed(&self, _theme: &SuiteTheme, _cx: &mut App) {}
     /// The pages this tab adds to the suite's File backstage (#1923), in
-    /// order; none by default. Read every time File is drawn on this tab
-    /// (and by nothing else), so what it returns may change at any time with
-    /// no call to the suite: return the same views each time (cheap
-    /// [`AnyView`] clones of entities the surface keeps), not new entities,
-    /// or a page loses its state on every frame.
+    /// order; none by default. Read any number of times while the tab is
+    /// active (each time File is drawn, more than once a frame, and on each
+    /// key while File is up), so what it returns may change at any time with
+    /// no call to the suite. Keep it cheap and free of side effects, and
+    /// return the same views each time (cheap [`AnyView`] clones of entities
+    /// the surface keeps), not new entities, or a page loses its state on
+    /// every frame.
     ///
     /// [`BackstageGroup::Top`] entries go right after the rail's Back, ahead
     /// of the suite's own items, in this order; [`BackstageGroup::Bottom`]

@@ -392,9 +392,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Read per draw, not cached like the ribbon (#1870): a rail entry needs no
   `&'static` string (element ids and probes own theirs), and the icon goes
   through `ext_ribbon::register_icon`, interned per content hash, so a
-  re-read costs a hash. So no "pages changed" call and no stale entry; the
-  contract is that the surface returns the same views (`AnyView` clones),
-  not new entities. The icon is drawn as a 16 px mask in the entry's ink
+  re-read costs a hash. So no "pages changed" call and no stale entry. It
+  is read any number of times while the tab is active (each File draw,
+  twice a frame: `backstage_rail_now` and `shown_ext_page`, each key while
+  File is up, the harness's verbs): the contract is that it is cheap, free
+  of side effects, and returns the same views (`AnyView` clones), not new
+  entities. The icon is drawn as a 16 px mask in the entry's ink
   (`group_hover` gives it the hover's).
 - State: `bs_ext: Option<(EntityId, String)>`, the surface's view entity
   and the page id, set by `select_ext_backstage_page` (the entry's click).
