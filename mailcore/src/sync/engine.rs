@@ -44,11 +44,13 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
-    CalendarDeltaCursor, DeltaCursor, GraphClient, GraphError, RsvpKind, is_expired_sync_state,
+    CalendarDeltaCursor, DeltaCursor, EventInput, GraphClient, GraphError, RsvpKind,
+    event_body_json, is_expired_sync_state,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, EventDeltaItem, MailFolder, Me, Message, Recipient, ScheduleEntry,
+    AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, Message, Recipient,
+    ScheduleEntry,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -330,6 +332,44 @@ pub enum SyncCommand {
         to: Vec<Recipient>,
         comment: Option<String>,
     },
+    /// Open "the series" (#2022): GET the series master
+    /// (`GraphClient::get_event`, with its `recurrence`), which
+    /// `calendarView` never lists, and emit [`SyncEvent::EventSeriesFetched`].
+    /// `id` is an occurrence's (resolved to its stored `series_master_id`)
+    /// or the master's own. Direct call, nothing stored. Signed out, a
+    /// `local:` master (not on Graph yet) or an event that is not a series
+    /// master is a [`SyncEvent::Error`].
+    FetchEventSeries { id: String },
+    /// A series' occurrences over `[from_utc, to_utc)` (#2022, Graph's
+    /// `/instances`), exceptions included, emitted as
+    /// [`SyncEvent::EventInstancesFetched`]. `id` resolves as in
+    /// `FetchEventSeries`; the bounds are the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ` with `from < to`, else an `Error` and no
+    /// request. Nothing is stored: the kept window's occurrences come from
+    /// the calendar sync, and others from `FetchCalendarRange` (#2014).
+    FetchEventInstances {
+        id: String,
+        from_utc: String,
+        to_utc: String,
+    },
+    /// Edit the whole series (#2022): queue
+    /// [`crate::store::OutboxOp::UpdateEventSeries`], the PATCH of the
+    /// master with the groups in `input.fields` (`series_recurrence` for a
+    /// recurrence change, lossless), and drain. `id` resolves as in
+    /// `FetchEventSeries`, before anything is queued. No optimistic local
+    /// write: once the PATCH goes through (this drain or a later one) the
+    /// calendars are reset, and the initial rounds bring Graph's
+    /// occurrences. An empty `input.fields` queues nothing; a `local:`
+    /// master is an `Error` (a local series is edited through its row).
+    /// "This occurrence" is `UpdateEvent` / `DeleteEvent` on the
+    /// occurrence's id, "delete the series" `Store::delete_event_series`
+    /// then `DeleteEvent` on the master's id.
+    ///
+    /// Known gap: `TIMES` sends the UTC wall clock with `timeZone: "UTC"`,
+    /// so Graph moves the series into UTC and its local times drift across
+    /// DST. A host should leave `TIMES` out of a series edit until
+    /// zone-preserving series times land (follow-up).
+    UpdateEventSeries { id: String, input: EventInput },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -441,6 +481,22 @@ pub enum SyncEvent {
     /// view failed (a 404, HTTP or parse error) was reported by an earlier
     /// [`SyncEvent::Error`]; asking again fetches what is still missing.
     CalendarRangeFetched { from: String, to: String },
+    /// The series master a [`SyncCommand::FetchEventSeries`] asked for
+    /// (#2022): `id` is the command's (an occurrence's or the master's),
+    /// `master` Graph's master with its `recurrence`. Its `calendar_id` is
+    /// that of a stored row of the series, `""` when none is stored.
+    EventSeriesFetched { id: String, master: Event },
+    /// A [`SyncCommand::FetchEventInstances`] answer (#2022): `id` the
+    /// command's, `master_id` the series it resolved to, `[from, to)` its
+    /// bounds, `instances` Graph's occurrences in Graph's order. Their
+    /// `calendar_id` is as for `EventSeriesFetched`.
+    EventInstancesFetched {
+        id: String,
+        master_id: String,
+        from: String,
+        to: String,
+        instances: Vec<Event>,
+    },
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -1426,6 +1482,13 @@ impl Engine {
             }
             SyncCommand::CancelEvent { id, comment } => self.cancel_event(id, comment),
             SyncCommand::ForwardEvent { id, to, comment } => self.forward_event(id, to, comment),
+            SyncCommand::FetchEventSeries { id } => self.fetch_event_series(id),
+            SyncCommand::FetchEventInstances {
+                id,
+                from_utc,
+                to_utc,
+            } => self.fetch_event_instances(id, from_utc, to_utc),
+            SyncCommand::UpdateEventSeries { id, input } => self.update_event_series(id, input),
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2432,6 +2495,130 @@ impl Engine {
         self.enqueue_and_drain(OutboxOp::ForwardEvent { id, to, comment });
     }
 
+    /// The series master `id` belongs to (#2022): a stored occurrence's
+    /// `series_master_id`, else `id` itself (a master's id, or an event not
+    /// stored). A `local:` master is not on Graph yet: `Err` with why.
+    fn series_master_of(&self, id: &str) -> Result<String, String> {
+        let master = match self.store.event(id) {
+            Ok(Some(row)) => row.series_master_id.unwrap_or_else(|| id.to_string()),
+            Ok(None) => id.to_string(),
+            Err(e) => return Err(e.to_string()),
+        };
+        if master.starts_with("local:") {
+            return Err("the series is not on the server yet".to_string());
+        }
+        Ok(master)
+    }
+
+    /// The calendar of a stored row of the series `master` (#2022): Graph
+    /// names no calendar in `/me/events` answers, so a fetched master or
+    /// instance takes it from what the calendar sync stored. `""` when
+    /// none is stored.
+    fn series_calendar_of(&self, master: &str) -> String {
+        self.store
+            .series_calendar_id(master)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// [`SyncCommand::FetchEventSeries`].
+    fn fetch_event_series(&mut self, id: String) {
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!("fetch event series {id}: {why}")));
+                return;
+            }
+        };
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_event(&master_id)) {
+            Ok(mut master) => {
+                if !master.event_type.is_empty() && master.event_type != "seriesMaster" {
+                    self.emit(SyncEvent::Error(format!(
+                        "fetch event series {id}: not a recurring event"
+                    )));
+                    return;
+                }
+                if master.calendar_id.is_empty() {
+                    master.calendar_id = self.series_calendar_of(&master_id);
+                }
+                self.emit(SyncEvent::EventSeriesFetched { id, master });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// [`SyncCommand::FetchEventInstances`].
+    fn fetch_event_instances(&mut self, id: String, from: String, to: String) {
+        match (
+            crate::store::iso8601_to_unix_secs(&from),
+            crate::store::iso8601_to_unix_secs(&to),
+        ) {
+            (Some(a), Some(b)) if a < b => {}
+            _ => {
+                self.emit(SyncEvent::Error(format!(
+                    "fetch event instances {id}: invalid range {from} .. {to}"
+                )));
+                return;
+            }
+        }
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!(
+                    "fetch event instances {id}: {why}"
+                )));
+                return;
+            }
+        };
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.event_instances(&master_id, &from, &to)) {
+            Ok(mut instances) => {
+                let calendar = self.series_calendar_of(&master_id);
+                for e in instances.iter_mut().filter(|e| e.calendar_id.is_empty()) {
+                    e.calendar_id = calendar.clone();
+                }
+                self.emit(SyncEvent::EventInstancesFetched {
+                    id,
+                    master_id,
+                    from,
+                    to,
+                    instances,
+                });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// [`SyncCommand::UpdateEventSeries`].
+    fn update_event_series(&mut self, id: String, input: EventInput) {
+        if input.fields.is_empty() {
+            return;
+        }
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!("update event series {id}: {why}")));
+                return;
+            }
+        };
+        self.enqueue_and_drain(OutboxOp::UpdateEventSeries {
+            id: master_id,
+            body: event_body_json(&input),
+        });
+    }
+
     /// Optimistic local write already applied by the caller: persist the op,
     /// reflect the pending count, and (if signed in) try to push it now.
     fn enqueue_and_drain(&mut self, op: OutboxOp) {
@@ -2501,11 +2688,25 @@ impl Engine {
 
         let mut sent = Vec::new();
         let mut deferred = false;
+        let mut series_edited = false;
         for row in ops {
             match self.apply_op_with_retry(&row) {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
+                    // A series edit (#2022) changes occurrences no local
+                    // write predicted, and a pattern change mints new
+                    // occurrence ids: once it went through, initial rounds
+                    // take each window from Graph. The delta state goes at
+                    // once, on disk, so a drain that stops below still
+                    // leaves the next pass an initial one; the refresh runs
+                    // once, after the loop.
+                    if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
+                        if let Err(e) = self.store.clear_calendar_deltas() {
+                            self.emit(SyncEvent::Error(e.to_string()));
+                        }
+                        series_edited = true;
+                    }
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
                         sent.push(id.clone());
@@ -2615,6 +2816,9 @@ impl Engine {
                     // Keep draining the rest of the queue.
                 }
             }
+        }
+        if series_edited {
+            self.refresh_calendar();
         }
         if !sent.is_empty() && !self.sync_after_send(&sent) {
             return Drain::Aborted;
@@ -9660,6 +9864,572 @@ mod tests {
         assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
         assert!(
             srv.requests().iter().all(|r| r.method != "POST"),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Recurring series and occurrences (#2022) ------------------------
+
+    /// A stored occurrence of `master` in `CAL-A`, an hour from now.
+    fn occurrence(id: &str, master: &str) -> NewEvent {
+        NewEvent {
+            series_master_id: Some(master.into()),
+            event_type: "occurrence".into(),
+            ..stored_event(id, "CAL-A", 3600)
+        }
+    }
+
+    /// Graph's series master `id` (`/me/events/{id}`): weekly on Monday,
+    /// a `numbered` range.
+    fn series_master_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","subject":"Weekly","type":"seriesMaster",
+            "start":{{"dateTime":"2026-07-13T09:00:00.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"2026-07-13T09:30:00.0000000","timeZone":"UTC"}},
+            "recurrence":{{"pattern":{{"type":"weekly","interval":1,"month":0,"dayOfMonth":0,
+            "daysOfWeek":["monday"],"firstDayOfWeek":"monday","index":"first"}},
+            "range":{{"type":"numbered","startDate":"2026-07-13","endDate":"0001-01-01",
+            "recurrenceTimeZone":"","numberOfOccurrences":8}}}}}}"#
+        )
+    }
+
+    fn patch_route(path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    /// The requests' (method, path) pairs, in order.
+    fn method_paths(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect()
+    }
+
+    /// Whether, after the `nth` (0-based) PATCH of `path`, a request runs
+    /// `CAL-A`'s initial delta round over the window: the calendar reset.
+    fn initial_round_after_patch(srv: &FakeServer, path: &str, nth: usize) -> bool {
+        let (from, to) = today_window();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        let reqs = method_paths(srv);
+        let Some(at) = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, p))| m == "PATCH" && p == path)
+            .map(|(i, _)| i)
+            .nth(nth)
+        else {
+            return false;
+        };
+        reqs[at + 1..].iter().any(|(_, p)| *p == initial)
+    }
+
+    /// A series edit of the subject and recurrence (daily, no end).
+    fn series_edit() -> EventInput {
+        use crate::graph::client::EventFieldSet;
+        use crate::graph::model::{EventRecurrence, RecurrencePattern, RecurrenceRange};
+        EventInput {
+            subject: "Daily now".into(),
+            series_recurrence: Some(EventRecurrence {
+                pattern: RecurrencePattern {
+                    r#type: "daily".into(),
+                    interval: 1,
+                    ..Default::default()
+                },
+                range: RecurrenceRange {
+                    r#type: "noEnd".into(),
+                    start_date: "2026-07-13".into(),
+                    ..Default::default()
+                },
+            }),
+            fields: EventFieldSet::SUBJECT.union(EventFieldSet::RECURRENCE),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fetch_event_series_resolves_an_occurrence_to_its_master() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-series",
+            vec![get_route("/me/events/M1", 200, &series_master_json("M1"))],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventSeries { id: "OCC1".into() })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::EventSeriesFetched { .. })
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let Some(SyncEvent::EventSeriesFetched { id, master }) = seen.last() else {
+            unreachable!()
+        };
+        assert_eq!(id, "OCC1", "the command's id");
+        assert_eq!(master.id, "M1");
+        assert_eq!(master.event_type, "seriesMaster");
+        let rec = master.recurrence.as_ref().unwrap();
+        assert_eq!(rec.pattern.r#type, "weekly");
+        assert_eq!(rec.pattern.first_day_of_week, "monday");
+        assert_eq!(rec.range.number_of_occurrences, 8);
+        assert_eq!(
+            master.calendar_id, "CAL-A",
+            "the stored occurrence's calendar"
+        );
+        let gets: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(m, p)| m == "GET" && p.starts_with("/me/events/"))
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(gets, ["/me/events/M1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_series_of_a_single_event_is_an_error() {
+        let (_srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-series-single",
+            vec![get_route(
+                "/me/events/S1",
+                200,
+                r#"{"id":"S1","subject":"Once","type":"singleInstance"}"#,
+            )],
+            vec![meeting("S1", true)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventSeries { id: "S1".into() })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::Error(
+                "fetch event series S1: not a recurring event".into()
+            ))
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::EventSeriesFetched { .. })),
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_series_refuses_local_and_signed_out() {
+        // A local series: nothing to ask Graph, whichever command.
+        let (srv, handle, store_path, dir) =
+            spawn_meeting_engine("fetch-event-series-local", vec![], vec![]);
+        let local = Store::open(&store_path)
+            .unwrap()
+            .create_local_event(
+                &crate::store::LocalEventFields {
+                    subject: "Mine".into(),
+                    start_utc: "2026-07-20T09:00:00Z".into(),
+                    end_utc: "2026-07-20T10:00:00Z".into(),
+                    ..Default::default()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let (from, to) = today_window();
+        for cmd in [
+            SyncCommand::FetchEventSeries { id: local.clone() },
+            SyncCommand::FetchEventInstances {
+                id: local.clone(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            },
+            SyncCommand::UpdateEventSeries {
+                id: local.clone(),
+                input: series_edit(),
+            },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert!(
+                matches!(seen.last(), Some(SyncEvent::Error(m))
+                    if m.ends_with(&format!("{local}: the series is not on the server yet"))),
+                "{seen:?}"
+            );
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty(),
+            "nothing queued"
+        );
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Signed out: the direct calls say so with no request; a series
+        // edit waits in the outbox, on disk, for the next session.
+        let srv = FakeServer::start(vec![]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("fetch-event-series-signed-out");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        for cmd in [
+            SyncCommand::FetchEventSeries { id: "M1".into() },
+            SyncCommand::FetchEventInstances {
+                id: "M1".into(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+            );
+        }
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        let ops = Store::open(&dir.join("mail.db"))
+            .unwrap()
+            .pending_ops()
+            .unwrap();
+        assert_eq!(
+            ops.iter().map(|r| r.op.clone()).collect::<Vec<_>>(),
+            [OutboxOp::UpdateEventSeries {
+                id: "M1".into(),
+                body: event_body_json(&series_edit()),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_instances_emits_the_range() {
+        let (from, to) = (iso_from_now(190), iso_from_now(220));
+        let instances = events_body(&[
+            calendar_event_json("I1", "2026-07-13T09:00:00", "2026-07-13T09:30:00"),
+            calendar_event_json("I2", "2026-07-20T09:00:00", "2026-07-20T09:30:00"),
+        ]);
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "fetch-event-instances",
+            vec![get_route("/me/events/M1/instances?", 200, &instances)],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventInstances {
+                id: "OCC1".into(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::EventInstancesFetched { .. })
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let Some(SyncEvent::EventInstancesFetched {
+            id,
+            master_id,
+            from: f,
+            to: t,
+            instances,
+        }) = seen.last()
+        else {
+            unreachable!()
+        };
+        assert_eq!((id.as_str(), master_id.as_str()), ("OCC1", "M1"));
+        assert_eq!((f, t), (&from, &to));
+        let ids: Vec<&str> = instances.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["I1", "I2"]);
+        assert!(instances.iter().all(|e| e.calendar_id == "CAL-A"));
+        let gets: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(_, p)| p.starts_with("/me/events/"))
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            gets,
+            [format!(
+                "/me/events/M1/instances?startDateTime={from}&endDateTime={to}&$top=50"
+            )]
+        );
+        // Nothing stored: only the synced occurrence is.
+        assert_eq!(
+            ids_in(&Store::open(&store_path).unwrap(), "CAL-A"),
+            ["OCC1"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_instances_rejects_bad_bounds() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-instances-bounds",
+            vec![get_route("/me/events/", 200, r#"{"value":[]}"#)],
+            vec![],
+        );
+        let (from, to) = today_window();
+        for (f, t) in [
+            ("nope", to.as_str()),
+            (from.as_str(), "2026-07-01T00:00:00Z&$top=1"),
+            (to.as_str(), from.as_str()),
+            (from.as_str(), from.as_str()),
+        ] {
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchEventInstances {
+                    id: "M1".into(),
+                    from_utc: f.into(),
+                    to_utc: t.into(),
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::Error(format!(
+                    "fetch event instances M1: invalid range {f} .. {t}"
+                )))
+            );
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_queues_and_patches_the_master() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "update-event-series",
+            vec![patch_route("/me/events/M1", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        // Commands run in order: this one's `Error` comes after the edit's
+        // drain, and the reset's refresh, are done.
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "/me/events/M1");
+        assert_eq!(patches[0].body, event_body_json(&series_edit()));
+        assert!(
+            patches[0].body.contains(
+                r#""recurrence":{"pattern":{"type":"daily","interval":1},"range":{"type":"noEnd","startDate":"2026-07-13"}}"#
+            ),
+            "{}",
+            patches[0].body
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            initial_round_after_patch(&srv, "/me/events/M1", 0),
+            "no calendar reset after the PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_given_an_occurrence_patches_the_master() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "update-event-series-occurrence",
+            vec![patch_route("/me/events/", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "OCC1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(m, _)| m == "PATCH")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(patches, ["/me/events/M1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_queued_offline_resets_on_the_later_drain() {
+        // The first PATCH is throttled for a second, so the op stays queued
+        // and goes through on the pass after the wait: that drain resets.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "1".into())],
+                    ..patch_route("/me/events/M1", 429, "")
+                },
+                Some(1),
+            ),
+            (patch_route("/me/events/M1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, events_body(&[]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-later",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.pending_ops().unwrap().len(), 1, "still queued");
+        assert!(
+            !initial_round_after_patch(&srv, "/me/events/M1", 0),
+            "a throttled edit resets nothing: {:?}",
+            method_paths(&srv)
+        );
+        // The engine's own retry after the wait drains it.
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "the edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            initial_round_after_patch(&srv, "/me/events/M1", 1),
+            "no calendar reset after the later PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_with_no_fields_queues_nothing() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "update-event-series-empty",
+            vec![patch_route("/me/events/", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: EventInput {
+                    subject: "Unsent".into(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::State(SyncState::PendingOps(_)))),
+            "{seen:?}"
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !srv.requests().iter().any(|r| r.method == "PATCH"),
             "{:?}",
             srv.requests()
         );

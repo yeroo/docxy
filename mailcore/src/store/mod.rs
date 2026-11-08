@@ -3297,6 +3297,23 @@ impl Store {
         Ok(n)
     }
 
+    /// The non-empty `calendar_id` of a stored row of the series
+    /// `master_id` (#2022): the master's own row, else an occurrence whose
+    /// `series_master_id` it is. `None` when no such row is stored.
+    pub fn series_calendar_id(&self, master_id: &str) -> Result<Option<String>, StoreError> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT calendar_id FROM events
+                 WHERE (id = ?1 OR series_master_id = ?1) AND calendar_id <> ''
+                 ORDER BY id = ?1 DESC, id LIMIT 1",
+                params![master_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
     /// Reads a stored event's send-relevant fields (`None` if no such event).
     pub fn event_for_send(&self, id: &str) -> Result<Option<EventSendData>, StoreError> {
         event_for_send_on(&self.conn, id)
@@ -8060,6 +8077,8 @@ mod calendar_tests {
         );
         // A master with nothing stored is a no-op.
         assert_eq!(s.delete_event_series("GONE").unwrap(), 0);
+        assert_eq!(s.series_calendar_id("N").unwrap().as_deref(), Some("A"));
+        assert_eq!(s.series_calendar_id("M").unwrap(), None);
         assert_eq!(sorted_ids_of(&s, "A"), ["other", "single"]);
     }
 

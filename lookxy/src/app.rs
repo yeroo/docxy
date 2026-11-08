@@ -726,6 +726,9 @@ impl App {
             // lookxy never sends `FetchCalendarRange` (its agenda is the
             // kept window), so no range ever lands (#2014).
             SyncEvent::CalendarRangeFetched { .. } => {}
+            // lookxy never sends `FetchEventSeries` or `FetchEventInstances`
+            // (its agenda edits single events only), so neither lands (#2022).
+            SyncEvent::EventSeriesFetched { .. } | SyncEvent::EventInstancesFetched { .. } => {}
             // A send failed for good: the engine already put the message
             // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
             SyncEvent::SendFailed { error, .. } => {
