@@ -843,12 +843,17 @@ mod tests {
             16.0 + lines_w("Go", 11.0, &tw)
         );
         let dropdown = |icon| Control::Dropdown {
-            cmd: rs::cmd("x", icon, "Go", Act::Paste),
+            cmd: rs::cmd("x", icon, "G", Act::Paste),
             items: Vec::new(),
         };
-        assert!(
-            model_control_w(&dropdown(""), false, None, &tw)
-                <= model_control_w(&dropdown("bold"), false, None, &tw)
+        assert!(menu_label_w("G", 11.0, &tw) < 26.0);
+        assert_eq!(
+            model_control_w(&dropdown(""), false, None, &tw),
+            8.0 + menu_label_w("G", 11.0, &tw)
+        );
+        assert_eq!(
+            model_control_w(&dropdown("bold"), false, None, &tw),
+            8.0 + 26.0
         );
         let split = |icon| Control::Split {
             primary: rs::cmd("x", icon, "Go", Act::Paste),

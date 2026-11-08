@@ -1003,8 +1003,9 @@ pub enum Region {
     RibbonLaunch(&'static str),
     /// A bounded in-place swatch gallery's More button, by gallery id (#1823).
     GalleryMore(&'static str),
-    /// An extension ribbon's command drawn in place, by its id (#1870): a
-    /// button, a split's upper half, a drop-down, a gallery tile.
+    /// An extension ribbon's command, by its id (#1870): a button, a split's
+    /// upper half or a drop-down, in place or in an open group flyout, or a
+    /// gallery tile drawn in place.
     ExtRibbonCmd(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
@@ -1645,7 +1646,7 @@ fn ext_fixture_view(
 /// describes one), `actions` (the ids the suite ran), `flag`,
 /// `archive_enabled`, `density` (the checked gallery item's index),
 /// `theme_calls` and `theme` (the last told: `dark` and each colour as
-/// `rrggbb`, null before any).
+/// `rrggbb`, null before any); the verb adds `header_focused`.
 fn ext_ribbon_json(
     (state, themes): &(
         Option<std::rc::Rc<crate::ext_fixture::RibbonState>>,
@@ -2818,7 +2819,8 @@ pub(crate) fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
 /// Which ribbon the active tab draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RibbonSurface {
-    /// The declarative document/Project ribbon (`ribbon_for`).
+    /// The declarative ribbonspec model: the document's and Project's
+    /// (`ribbon_for`), or an extension's tab's (#1870, `ext_ribbon`).
     Model,
     /// The spreadsheet ribbon (`sheet_ribbon::SHEET_RIBBON`).
     Sheet,
@@ -5567,9 +5569,19 @@ fn dispatch_verb(
         // changes its state and says so through `ext::ribbon_changed`, as
         // an extension's own model would; the suite reads the ribbon again
         // before the next verb or frame.
-        "ext-ribbon-read" => Done::ok(ext_ribbon_json(
-            &ext_fixture_view(app)?.read(cx).clone_parts(),
-        )),
+        "ext-ribbon-read" => {
+            let fixture = ext_fixture_view(app)?;
+            let f = fixture.read(cx);
+            let mut reply = ext_ribbon_json(&f.clone_parts());
+            // Whether the fixture's header line has the keys (#1870 r1).
+            if let Json::Obj(fields) = &mut reply {
+                fields.push((
+                    "header_focused".into(),
+                    Json::Bool(f.header_focused(window)),
+                ));
+            }
+            Done::ok(reply)
+        }
         "ext-ribbon-set" => {
             let fixture = ext_fixture_view(app)?;
             let parts = fixture.read(cx).clone_parts();

@@ -278,6 +278,34 @@ test issue 1870 the extension reads the suite's theme and is told when it change
   call tab-list {}
   assert reply.count is 1
 
+test issue 1870 the KeyTips take the keys from a field beside the view and give them back
+  # The fixture's header line has a focus of its own, as an extension's
+  # search box beside the view would.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-doc-header"}
+  call ext-ribbon-read {}
+  assert reply.header_focused is true
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call ext-ribbon-read {}
+  assert reply.header_focused is false
+  call ext-doc-read {}
+  assert reply.focused is false
+  call real-key {"key":"escape"}
+  assert keytips_up is false
+  shot window
+  # Back to the header, not to the view.
+  call ext-ribbon-read {}
+  assert reply.header_focused is true
+  call ext-doc-read {}
+  assert reply.focused is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
 test issue 1870 a document tab beside it keeps its own ribbon, and the Mail tab its own
   # Last: the document it opens stays open.
   call backstage {"action":"open"}

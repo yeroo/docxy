@@ -51,12 +51,8 @@ impl ExtTab {
         self.cache.as_ref().and_then(|(_, r)| r.as_ref())
     }
 
-    /// Reads the surface's ribbon again when the cached one is older than
-    /// `generation` (or `force`). Whether it read.
-    pub(crate) fn refresh(&mut self, generation: u64, force: bool, cx: &App) -> bool {
-        if !self.needs_read(generation, force) {
-            return false;
-        }
+    /// Reads the surface's ribbon again, as of `generation`.
+    fn reread(&mut self, generation: u64, cx: &App) {
         // A ribbon with nothing left to draw is none: the view draws its own.
         let ribbon = self
             .surface
@@ -64,11 +60,8 @@ impl ExtTab {
             .map(|r| convert(&r))
             .filter(|r| !r.tabs.is_empty());
         self.cache = Some((generation, ribbon));
-        true
     }
-}
 
-impl ExtTab {
     /// Whether the cached ribbon is to be read again at `generation`.
     fn needs_read(&self, generation: u64, force: bool) -> bool {
         force || self.cache.as_ref().is_none_or(|(g, _)| *g != generation)
@@ -144,11 +137,21 @@ pub(crate) fn convert(r: &ext::Ribbon) -> ExtRibbon {
             })
             .collect();
         if !groups.is_empty() {
-            out.tabs
-                .push(rs::tab(intern(&tab.name), intern(&tab.key_tip), groups));
+            out.tabs.push(rs::tab(
+                intern(&tab.name),
+                intern(tab_key_tip(&tab.key_tip)),
+                groups,
+            ));
         }
     }
     out
+}
+
+/// A tab's KeyTip as the strip shows it: none for one starting with `F`
+/// (any case), which File's `F` would always take first, so it could
+/// never be typed.
+fn tab_key_tip(key: &str) -> &str {
+    if key.starts_with(['F', 'f']) { "" } else { key }
 }
 
 /// Whether a command can be part of an extension's ribbon.
@@ -378,7 +381,7 @@ impl Docxy {
                     .unwrap_or_default()
             };
             let old = names(e);
-            e.refresh(generation, force, cx);
+            e.reread(generation, cx);
             if let (true, RibbonTab::Ext(k)) = (i == active, self.ribbon_tab) {
                 reselected = Some(tab_index(reselect(&old, &names(e), usize::from(k))));
             }
@@ -436,6 +439,21 @@ impl Docxy {
         self.refresh_ext_ribbons(true, cx);
         cx.notify();
     }
+}
+
+/// The KeyTips' Tabs level on an extension's ribbon: File's `F` (as
+/// `Docxy::ribbon_tab_names` lists it, first), then its tabs' tips.
+pub(crate) fn tab_keytip_pick(r: &ExtRibbon, typed: &str) -> crate::TabPick {
+    let file = crate::ribbon_tab_set(crate::Kind::Look)[0];
+    let mut tips: Vec<(&str, Option<RibbonTab>)> = vec![(file.2, file.0)];
+    tips.extend(
+        r.tab_names()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (_, k))| !k.is_empty())
+            .map(|(i, (_, k))| (k, Some(RibbonTab::Ext(tab_index(i))))),
+    );
+    crate::pick_tab_keytip(&tips, typed)
 }
 
 /// A tab index as `RibbonTab::Ext` holds it (an extension with more than
@@ -692,14 +710,27 @@ mod tests {
             ExtTabDef::new("Message", "M", sample().tabs[0].groups.clone()),
             ExtTabDef::new("Folder", "F", sample().tabs[0].groups.clone()),
             ExtTabDef::new("View", "VW", sample().tabs[1].groups.clone()),
+            ExtTabDef::new("Format", "fo", sample().tabs[1].groups.clone()),
         ]));
-        let pick = |typed: &str| crate::ext_tab_keytip_pick(&r, typed);
+        // A tab KeyTip starting with F could never be typed past File's: it
+        // has none (the tab stays).
+        assert_eq!(
+            r.tab_names(),
+            vec![
+                ("Message", "M"),
+                ("Folder", ""),
+                ("View", "VW"),
+                ("Format", "")
+            ]
+        );
+        let pick = |typed: &str| tab_keytip_pick(&r, typed);
         assert_eq!(pick("m"), crate::TabPick::Tab(RibbonTab::Ext(0)));
         // File is first: an extension tab's `F` never takes it.
         assert_eq!(pick("F"), crate::TabPick::Backstage);
         assert_eq!(pick("V"), crate::TabPick::Wait);
         assert_eq!(pick("VW"), crate::TabPick::Tab(RibbonTab::Ext(2)));
         assert_eq!(pick("Q"), crate::TabPick::Off);
+        assert_eq!(pick("FO"), crate::TabPick::Off);
     }
 
     /// A surface the cache test never draws.

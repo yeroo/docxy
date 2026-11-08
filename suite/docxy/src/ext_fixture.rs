@@ -63,6 +63,11 @@ pub(crate) struct FixtureView {
 }
 
 impl FixtureView {
+    /// Whether its header line has the keys (#1870).
+    pub(crate) fn header_focused(&self, window: &Window) -> bool {
+        self.header_focus.is_focused(window)
+    }
+
     /// Its ribbon state and the themes it was told, for the harness.
     pub(crate) fn clone_parts(&self) -> (Option<Rc<RibbonState>>, Vec<SuiteTheme>) {
         (self.ribbon.clone(), self.themes.borrow().clone())

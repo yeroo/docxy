@@ -292,8 +292,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   extension). A surface with a ribbon has the suite draw File plus its tabs
   with the document ribbon's code: `render_group` / `render_control`,
   `ribbon_fit::fit_with` under `LabelsFirst`, Ctrl+F1 and the `ribbon-min`
-  chevron, flyouts, menus and KeyTips; File and its `F` are the backstage
-  (an extension tab's own `F` loses to File, first in `ext_tab_keytip_pick`).
+  chevron, flyouts, menus and KeyTips; File and its `F` are the backstage.
+  File's `F` is first in `ext_ribbon::tab_keytip_pick`, so an extension
+  tab's KeyTip starting with `F` (any case) could never be typed: it is
+  dropped at conversion (`tab_key_tip`), the tab kept with no badge.
   Double-click on a ribbon tab collapses no ribbon in the suite (a follow-up
   for every ribbon). A ribbon with nothing left to draw is `None`.
 - `ext_ribbon.rs`: `convert` makes `rs::Tab<Act>`s whose acts are
@@ -320,7 +322,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   hold) sets the status line and runs nothing, whether it came from a
   click, a KeyTip (`tab_keytip_cmd` checks no state), a menu or gallery
   item or `ribbon-click`. A drop-down's own id (its KeyTip runs the
-  button's act, as a built-in's does) opens its menu instead.
+  button's act, as a built-in's does) opens its menu instead, and that
+  menu is always its own items (`dropdown_menu`'s `Act::Ext` arm comes
+  before the id-keyed built-in menus: an id `hf-header` lists the
+  extension's items, not Word's Header menu).
 - Icons: `RibbonIcon` is SVG source, registered by content hash
   (`ext_ribbon::ICONS`) and named `ext/<hash>`; `DocxyAssets::load` serves
   `icons/ext/<hash>.svg` from it. It is drawn as a mask in the ribbon's ink,
@@ -330,10 +335,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   collapsed group's button takes the first icon there is
   (`model_group_icon`).
 - Focus: on an extension's tab with a ribbon, `focus_ext_surface` takes the
-  focus back to the root while the KeyTips are up, a menu or a ribbon
-  flyout is open, and is called at once where the KeyTips go up (Alt/F10)
-  and after each KeyTip letter, as gpui may run the next key before a
-  frame; render hands it back. A menu or flyout opened by the pointer is
+  focus to the root while the KeyTips are up, a menu or a ribbon flyout is
+  open, from whatever had it (the view, or a field of the extension's own
+  beside it), remembered in `ext_focus_back` with the surface's view; it is
+  called at once where the KeyTips go up (Alt/F10) and after each KeyTip
+  letter, as gpui may run the next key before a frame. When they close,
+  render gives the remembered handle back (while the same surface is
+  active; else its `focus_handle`). The dialog and more-tabs rule is
+  #1947's (only a focused view is taken from). A menu or flyout opened by the pointer is
   taken at the next frame. A tab without a ribbon keeps #1873's rule (a
   menu leaves the focus alone). A bare Alt already bubbles from `DocView`.
 - Theme: `ext::suite_theme(cx)` is `render`'s colours (`background`,
@@ -345,16 +354,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Harness: `ext fixture ribbon` (uiharness: the marker reads `ribbon`;
   `harness::ext_fixture_ribbon_requested`) has the fixture describe
   `fixture_ribbon`: Message (Respond: Reply with an SVG icon, a column,
-  the Flag toggle; Move: the Move split, Archive disabled until set) and
+  the Flag toggle; Move: the Move split, Archive disabled until set; Tags,
+  the lowest priority, which collapses into a flyout at 460 px) and
   View (Arrange: the Sort drop-down, the density gallery). `ext-ribbon-read`
   replies `ribbon`, `actions` (ids run), `flag`, `archive_enabled`,
   `density`, `theme_calls` and `theme` (`dark` and `rrggbb` colours);
   `ext-ribbon-set {archive_enabled}` changes it through
-  `ext::ribbon_changed`. The region `ext-ribbon-cmd:<id>` is a command
-  drawn in place (button, split's upper half, drop-down, gallery tile; only
-  `Act::Ext` commands draw its probe). `ribbon-read`, `ribbon-layout`,
-  `ribbon-click`, `ribbon-flyout` and `menu-open {"ribbon": ..}` take the
-  extension's tabs by name (`ribbon_tab_named`). `uiharness/cases/ext-ribbon.uit`
+  `ext::ribbon_changed`; `ext-ribbon-read` adds `header_focused` (the
+  fixture's header line has the keys). The region `ext-ribbon-cmd:<id>` is
+  a command: a button, a split's upper half or a drop-down, in place or in
+  an open group flyout, or a gallery tile in place (only `Act::Ext`
+  commands draw its probe). `ribbon-layout {"tab"}`, `ribbon-click` and
+  `menu-open {"ribbon": ..}` name the extension's tabs (`ribbon_tab_named`,
+  `ribbon_tab_def`); `ribbon-read` lists every one of them, and
+  `ribbon-flyout` acts on the tab shown. `uiharness/cases/ext-ribbon.uit`
   drives it.
 - Not done: contextual tabs, group launchers, Rows and combo cells, QAT
   entries, gallery live preview and colour icons for an extension; macOS

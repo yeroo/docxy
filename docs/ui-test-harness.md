@@ -1734,9 +1734,10 @@ More button of a UI plugin's swatch gallery drawn in place with more tiles
 than it shows (#1823); a click opens the whole gallery as a flyout. It is an
 error when the gallery draws no More button in place.
 `ext-ribbon-cmd:<command id>` (for example `ext-ribbon-cmd:fx.reply`) is a
-command of an extension's ribbon drawn in place (#1870): its button, a
-split's upper half, a drop-down or a gallery tile; an error while it is not
-drawn in place (another tab, a collapsed group, a collapsed ribbon).
+command of an extension's ribbon (#1870): its button, a split's upper half
+or a drop-down, drawn in place or in an open group flyout, or a gallery
+tile drawn in place; an error while it is not drawn (another tab, a
+collapsed group whose flyout is shut, a collapsed ribbon).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is

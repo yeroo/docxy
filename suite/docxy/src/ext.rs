@@ -42,7 +42,10 @@ pub trait TabSurface: 'static {
     /// The view drawn as the tab's body.
     fn view(&self) -> AnyView;
     /// What the suite focuses when the tab becomes active, so the view's
-    /// own key handling sees the keys first.
+    /// own key handling sees the keys first. While the suite's ribbon
+    /// (#1870) takes the keys (its KeyTips, a menu, a flyout), it takes them
+    /// from whatever in the view had them and gives them back to that, not
+    /// to this, when they close.
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     /// The tab's title (the folder shown, say). `None` keeps the suite's.
     fn title(&self, _cx: &App) -> Option<String> {
@@ -61,8 +64,9 @@ pub trait TabSurface: 'static {
     /// the life of the process, as the suite's ribbon model holds
     /// `&'static str`: use stable ids, and keep counters out of them. The
     /// ids `qat-undo` and `qat-redo`, and the gallery id `tablestyles`, are
-    /// the suite's: a control using one is left out. A tab's KeyTip `F` is
-    /// File's. While the KeyTips, a ribbon menu or a flyout are up the suite
+    /// the suite's: a control using one is left out. File's KeyTip is `F`,
+    /// so a tab's KeyTip starting with `F` (any case) is dropped: the tab
+    /// stays, with no KeyTip. While the KeyTips, a ribbon menu or a flyout are up the suite
     /// takes the keyboard from the view; let Alt and F10 bubble from the
     /// view's own key handling so the KeyTips can come up. A ribbon with no
     /// control left to draw is taken as `None`.
@@ -93,7 +97,8 @@ impl Ribbon {
     }
 }
 
-/// One ribbon tab: its name, its KeyTip (Alt, then this; empty for none) and
+/// One ribbon tab: its name, its KeyTip (Alt, then this; empty for none;
+/// one starting with `F` is dropped, as File's `F` would take it first) and
 /// its groups. A tab with no control is not drawn.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
