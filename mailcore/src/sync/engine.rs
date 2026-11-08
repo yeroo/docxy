@@ -44,11 +44,13 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
-    CalendarDeltaCursor, DeltaCursor, GraphClient, GraphError, RsvpKind, is_expired_sync_state,
+    CalendarDeltaCursor, DeltaCursor, EventInput, GraphClient, GraphError, RsvpKind,
+    event_body_json, is_expired_sync_state,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, EventDeltaItem, MailFolder, Me, Message, Recipient, ScheduleEntry,
+    AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, Message, Recipient,
+    ScheduleEntry,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -330,6 +332,48 @@ pub enum SyncCommand {
         to: Vec<Recipient>,
         comment: Option<String>,
     },
+    /// Open "the series" (#2022): GET the series master
+    /// (`GraphClient::get_event`, with its `recurrence`), which
+    /// `calendarView` never lists, and emit [`SyncEvent::EventSeriesFetched`].
+    /// `id` is an occurrence's (resolved to its stored `series_master_id`)
+    /// or the master's own. Direct call, nothing stored. Signed out, a
+    /// `local:` master (not on Graph yet) or an event that is not a series
+    /// master is a [`SyncEvent::Error`].
+    FetchEventSeries { id: String },
+    /// A series' occurrences over `[from_utc, to_utc)` (#2022, Graph's
+    /// `/instances`), exceptions included, emitted as
+    /// [`SyncEvent::EventInstancesFetched`]. `id` resolves as in
+    /// `FetchEventSeries`; the bounds are the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ` with `from < to`, else an `Error` and no
+    /// request. Nothing is stored: the kept window's occurrences come from
+    /// the calendar sync, and others from `FetchCalendarRange` (#2014).
+    FetchEventInstances {
+        id: String,
+        from_utc: String,
+        to_utc: String,
+    },
+    /// Edit the whole series (#2022): queue
+    /// [`crate::store::OutboxOp::UpdateEventSeries`], the PATCH of the
+    /// master with the groups in `input.fields` (`series_recurrence` for a
+    /// recurrence change, lossless), and drain. `id` resolves as in
+    /// `FetchEventSeries`, before anything is queued. No optimistic local
+    /// write: once the PATCH goes through (this drain or a later one) the
+    /// calendars owe a reset, and the first calendar refresh that finds no
+    /// `RespondEvent`, `UpdateEvent`, `DeleteEvent` or `CancelEvent` queued,
+    /// nor such a command waiting, runs initial rounds, which bring Graph's
+    /// occurrences. The owed reset
+    /// is in memory: a restart before then drops it, and the delta rounds
+    /// carry on. An empty `input.fields` queues nothing; a `local:`
+    /// master is an `Error` (a local series is edited through its row).
+    /// "This occurrence" is `UpdateEvent` / `DeleteEvent` on the
+    /// occurrence's id, "delete the series" `Store::delete_event_series`
+    /// then `DeleteEvent` on the master's id.
+    ///
+    /// Known gap: `TIMES` sends the UTC wall clock with `timeZone: "UTC"`,
+    /// so Graph moves the series into UTC and its local times drift across
+    /// DST. A host should leave `TIMES` out of a series edit until
+    /// zone-preserving series times land (follow-up).
+    UpdateEventSeries { id: String, input: EventInput },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -441,6 +485,22 @@ pub enum SyncEvent {
     /// view failed (a 404, HTTP or parse error) was reported by an earlier
     /// [`SyncEvent::Error`]; asking again fetches what is still missing.
     CalendarRangeFetched { from: String, to: String },
+    /// The series master a [`SyncCommand::FetchEventSeries`] asked for
+    /// (#2022): `id` is the command's (an occurrence's or the master's),
+    /// `master` Graph's master with its `recurrence`. Its `calendar_id` is
+    /// that of a stored row of the series, `""` when none is stored.
+    EventSeriesFetched { id: String, master: Event },
+    /// A [`SyncCommand::FetchEventInstances`] answer (#2022): `id` the
+    /// command's, `master_id` the series it resolved to, `[from, to)` its
+    /// bounds, `instances` Graph's occurrences in Graph's order. Their
+    /// `calendar_id` is as for `EventSeriesFetched`.
+    EventInstancesFetched {
+        id: String,
+        master_id: String,
+        from: String,
+        to: String,
+        instances: Vec<Event>,
+    },
     /// A status transition.
     State(SyncState),
     /// A non-fatal error worth surfacing (a skipped/quarantined op, a
@@ -603,6 +663,35 @@ enum Drain {
     /// Auth, throttle or transport, or the post-send sync stopping: the
     /// caller stops too and keeps the back-off.
     Aborted,
+}
+
+/// An event op whose command wrote the store first (an RSVP, edited
+/// fields, a deleted row): what a quarantine must undo with initial
+/// calendar rounds, and what a series edit's reset waits for (#2022), as
+/// an initial round would replace the row. `CreateEvent`'s `local:` row is
+/// never replaced, and `UpdateEventSeries` writes nothing locally.
+fn writes_event_locally(op: &OutboxOp) -> bool {
+    matches!(
+        op,
+        OutboxOp::RespondEvent { .. }
+            | OutboxOp::UpdateEvent { .. }
+            | OutboxOp::DeleteEvent { .. }
+            | OutboxOp::CancelEvent { .. }
+    )
+}
+
+/// A command that queues a `writes_event_locally` op, sent after its host
+/// wrote the row (`DeleteEvent`, `UpdateEvent`), or whose op the engine
+/// writes for (`RespondEvent`, `CancelEvent`): while one waits, a series
+/// edit's reset does not run (#2022).
+fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
+    matches!(
+        cmd,
+        SyncCommand::RespondEvent { .. }
+            | SyncCommand::UpdateEvent { .. }
+            | SyncCommand::DeleteEvent { .. }
+            | SyncCommand::CancelEvent { .. }
+    )
 }
 
 impl Drain {
@@ -830,6 +919,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backoff: BACKOFF_MIN,
         backfill_done: false,
         reconverge_pending,
+        series_reset_owed: false,
         parked: Vec::new(),
         expired: Vec::new(),
         next_tick: Instant::now(),
@@ -886,6 +976,17 @@ struct Engine {
     /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
+    /// A series edit went through (#2022) and the calendars owe the reset
+    /// it asks for: initial rounds over every window. The first calendar
+    /// refresh that finds no event op with a local write queued
+    /// (`writes_event_locally`) and no such command waiting
+    /// (`command_writes_event_locally`, taken off the channel first) runs
+    /// them (`refresh_calendar`). So the reset's initial rounds never run
+    /// while such an op is queued or its command has reached the engine; a
+    /// host that writes its row after the reset's refresh began has the
+    /// general race of any refresh. In memory only: a restart before then
+    /// drops it, and the delta rounds go on.
+    series_reset_owed: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
     parked: Vec<String>,
@@ -977,6 +1078,7 @@ impl Engine {
         }
         if self.token.is_some() {
             self.sync_pass(true);
+            self.refresh_if_series_reset_owed();
         }
     }
 
@@ -1255,6 +1357,7 @@ impl Engine {
                 // if it fails again.
                 self.op_retry = None;
                 self.sync_pass(true);
+                self.refresh_if_series_reset_owed();
                 self.after_pass_if_fast();
             }
             SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
@@ -1426,6 +1529,13 @@ impl Engine {
             }
             SyncCommand::CancelEvent { id, comment } => self.cancel_event(id, comment),
             SyncCommand::ForwardEvent { id, to, comment } => self.forward_event(id, to, comment),
+            SyncCommand::FetchEventSeries { id } => self.fetch_event_series(id),
+            SyncCommand::FetchEventInstances {
+                id,
+                from_utc,
+                to_utc,
+            } => self.fetch_event_instances(id, from_utc, to_utc),
+            SyncCommand::UpdateEventSeries { id, input } => self.update_event_series(id, input),
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -1554,7 +1664,10 @@ impl Engine {
             return;
         }
         self.set_state(SyncState::Syncing);
-        if self.drain_outbox().carry_on() && self.refresh_folder(id) {
+        if self.drain_outbox().carry_on()
+            && self.refresh_if_series_reset_owed()
+            && self.refresh_folder(id)
+        {
             self.clear_backoff();
             self.settle_state();
         }
@@ -1573,7 +1686,7 @@ impl Engine {
         if self.token.is_none() || self.next_retry.is_some_and(|t| Instant::now() < t) {
             return;
         }
-        if !self.drain_outbox().carry_on() {
+        if !self.drain_outbox().carry_on() || !self.refresh_if_series_reset_owed() {
             return;
         }
         let stored = match self.store.folders() {
@@ -2432,6 +2545,172 @@ impl Engine {
         self.enqueue_and_drain(OutboxOp::ForwardEvent { id, to, comment });
     }
 
+    /// The series master `id` belongs to (#2022): a stored occurrence's
+    /// `series_master_id`, else `id` itself (a master's id, or an event not
+    /// stored). A `local:` master is not on Graph yet: `Err` with why.
+    fn series_master_of(&self, id: &str) -> Result<String, String> {
+        let master = match self.store.event(id) {
+            Ok(Some(row)) => row.series_master_id.unwrap_or_else(|| id.to_string()),
+            Ok(None) => id.to_string(),
+            Err(e) => return Err(e.to_string()),
+        };
+        if master.starts_with("local:") {
+            return Err("the series is not on the server yet".to_string());
+        }
+        Ok(master)
+    }
+
+    /// The calendar of a stored row of the series `master` (#2022): Graph
+    /// names no calendar in `/me/events` answers, so a fetched master or
+    /// instance takes it from what the calendar sync stored. `""` when
+    /// none is stored.
+    fn series_calendar_of(&self, master: &str) -> String {
+        self.store
+            .series_calendar_id(master)
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// [`SyncCommand::FetchEventSeries`].
+    fn fetch_event_series(&mut self, id: String) {
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!("fetch event series {id}: {why}")));
+                return;
+            }
+        };
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.get_event(&master_id)) {
+            Ok(mut master) => {
+                if !master.event_type.is_empty() && master.event_type != "seriesMaster" {
+                    self.emit(SyncEvent::Error(format!(
+                        "fetch event series {id}: not a recurring event"
+                    )));
+                    return;
+                }
+                if master.calendar_id.is_empty() {
+                    master.calendar_id = self.series_calendar_of(&master_id);
+                }
+                self.emit(SyncEvent::EventSeriesFetched { id, master });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// [`SyncCommand::FetchEventInstances`].
+    fn fetch_event_instances(&mut self, id: String, from: String, to: String) {
+        match (
+            crate::store::iso8601_to_unix_secs(&from),
+            crate::store::iso8601_to_unix_secs(&to),
+        ) {
+            (Some(a), Some(b)) if a < b => {}
+            _ => {
+                self.emit(SyncEvent::Error(format!(
+                    "fetch event instances {id}: invalid range {from} .. {to}"
+                )));
+                return;
+            }
+        }
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!(
+                    "fetch event instances {id}: {why}"
+                )));
+                return;
+            }
+        };
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.event_instances(&master_id, &from, &to)) {
+            Ok(mut instances) => {
+                let calendar = self.series_calendar_of(&master_id);
+                for e in instances.iter_mut().filter(|e| e.calendar_id.is_empty()) {
+                    e.calendar_id = calendar.clone();
+                }
+                self.emit(SyncEvent::EventInstancesFetched {
+                    id,
+                    master_id,
+                    from,
+                    to,
+                    instances,
+                });
+            }
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// [`SyncCommand::UpdateEventSeries`].
+    fn update_event_series(&mut self, id: String, input: EventInput) {
+        if input.fields.is_empty() {
+            return;
+        }
+        let master_id = match self.series_master_of(&id) {
+            Ok(m) => m,
+            Err(why) => {
+                self.emit(SyncEvent::Error(format!("update event series {id}: {why}")));
+                return;
+            }
+        };
+        self.enqueue_and_drain(OutboxOp::UpdateEventSeries {
+            id: master_id,
+            body: event_body_json(&input),
+        });
+    }
+
+    /// Whether a series edit's reset (#2022) is owed and may run now: no
+    /// event op with a local write is queued, and no command that queues one
+    /// is waiting in `deferred` (its host wrote the row already). An initial
+    /// round would replace that row, and a queued `UpdateEvent` reads its
+    /// row at send time, so it would then send Graph's old values. A queue
+    /// that cannot be read counts as one that holds such an op. The caller
+    /// takes the waiting commands first (`checkpoint`).
+    fn series_reset_ready(&self) -> bool {
+        self.series_reset_owed
+            && !self.deferred.iter().any(command_writes_event_locally)
+            && self
+                .store
+                .pending_ops()
+                .is_ok_and(|ops| !ops.iter().any(|r| writes_event_locally(&r.op)))
+    }
+
+    /// After a drain on a path with no calendar refresh of its own (a
+    /// command's, a fast tick, `SyncFolder`, the startup, sign-in and
+    /// `Refresh` passes; `on_tick` refreshes after its pass anyway): runs
+    /// the refresh a series edit's reset is waiting for, when it may run
+    /// now (`series_reset_ready`), signed in and outside any wait. Returns
+    /// whether the caller carries on: false after a shutdown, or once the
+    /// refresh (or a body fetch its `checkpoint` ran) signed out or started
+    /// a wait, which the caller must not clear.
+    fn refresh_if_series_reset_owed(&mut self) -> bool {
+        let waiting = |e: &Self| e.next_retry.is_some_and(|t| Instant::now() < t);
+        if self.shutting_down {
+            return false;
+        }
+        if !self.series_reset_owed || self.token.is_none() || waiting(self) {
+            return true;
+        }
+        if !self.checkpoint() {
+            return false;
+        }
+        if !self.series_reset_ready() {
+            return true;
+        }
+        self.refresh_calendar();
+        self.token.is_some() && !waiting(self)
+    }
+
     /// Optimistic local write already applied by the caller: persist the op,
     /// reflect the pending count, and (if signed in) try to push it now.
     fn enqueue_and_drain(&mut self, op: OutboxOp) {
@@ -2448,8 +2727,12 @@ impl Engine {
         self.set_state(SyncState::PendingOps(self.pending_count()));
         // A 5xx defers the op under the outbox's own back-off (`op_retry`),
         // not an engine-wide Offline: the folders keep syncing.
-        if self.token.is_some() {
-            self.drain_outbox();
+        // A drain or refresh a sign-in, throttle or offline error stopped
+        // keeps the state that failure set.
+        if self.token.is_some()
+            && (!self.drain_outbox().carry_on() || !self.refresh_if_series_reset_owed())
+        {
+            return;
         }
         self.settle_state();
     }
@@ -2506,6 +2789,10 @@ impl Engine {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
+                    // The calendars owe a reset (`series_reset_owed`).
+                    if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
+                        self.series_reset_owed = true;
+                    }
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
                         sent.push(id.clone());
@@ -2583,13 +2870,7 @@ impl Engine {
                         let _ = self.store.clear_delta_links();
                         self.backfill_done = false;
                         self.reconverge_pending = true;
-                        let is_event_op = matches!(
-                            row.op,
-                            OutboxOp::RespondEvent { .. }
-                                | OutboxOp::UpdateEvent { .. }
-                                | OutboxOp::DeleteEvent { .. }
-                                | OutboxOp::CancelEvent { .. }
-                        );
+                        let is_event_op = writes_event_locally(&row.op);
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
@@ -2711,6 +2992,17 @@ impl Engine {
         self.store.pending_ops().map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Forgets every calendar's delta state and refreshes, so the rounds
+    /// are initial ones that replace each window with Graph's truth: what
+    /// undoes a dropped event op's optimistic local write, which no delta
+    /// round from a kept link would name (#2013).
+    fn reset_calendars(&mut self) {
+        if let Err(e) = self.store.clear_calendar_deltas() {
+            self.emit(SyncEvent::Error(e.to_string()));
+        }
+        self.refresh_calendar();
+    }
+
     /// Applies one outbox op via `sync::outbox::apply_op`, refreshing the
     /// token once and retrying on a 401 — the same policy as `with_auth`,
     /// duplicated rather than reused because `apply_op` (unlike every other
@@ -2727,17 +3019,6 @@ impl Engine {
     /// A `SendDraft` goes through `apply_send` with the row's `seq`, so its
     /// `/send` POST is recorded and a later attempt checks delivery first
     /// (#1874).
-    /// Forgets every calendar's delta state and refreshes, so the rounds
-    /// are initial ones that replace each window with Graph's truth: what
-    /// undoes a dropped event op's optimistic local write, which no delta
-    /// round from a kept link would name (#2013).
-    fn reset_calendars(&mut self) {
-        if let Err(e) = self.store.clear_calendar_deltas() {
-            self.emit(SyncEvent::Error(e.to_string()));
-        }
-        self.refresh_calendar();
-    }
-
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<(), GraphError> {
         let apply = |client: &GraphClient, store: &Store| match &row.op {
             OutboxOp::SendDraft { id } => apply_send(client, store, id.as_str(), Some(row.seq)),
@@ -3325,6 +3606,20 @@ impl Engine {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
+        // A series edit's reset (#2022), decided now, as these rounds would
+        // replace rows: only with no event op with a local write queued or
+        // its command waiting. The waiting commands are taken first; a
+        // shutdown or a body fetch that stopped the engine stops here too.
+        if self.series_reset_owed && !self.checkpoint() {
+            return;
+        }
+        if self.series_reset_ready() {
+            if let Err(e) = self.store.clear_calendar_deltas() {
+                self.emit(SyncEvent::Error(e.to_string()));
+            } else {
+                self.series_reset_owed = false;
+            }
+        }
         if !self.list_calendars_into_store() {
             return;
         }
@@ -3785,6 +4080,7 @@ impl Engine {
                 // succeeded, rather than staying stuck if the first sync fails.
                 self.set_state(SyncState::Syncing);
                 self.sync_pass(true);
+                self.refresh_if_series_reset_owed();
                 self.after_pass_if_fast();
             }
             Err(e) => {
@@ -8417,9 +8713,28 @@ mod tests {
         seed: impl FnOnce(&Store),
         options: EngineOptions,
     ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let routes = routes
+            .into_iter()
+            .map(|(r, left)| (r, left, Duration::ZERO))
+            .collect();
+        spawn_calendar_engine_paced(tag, routes, seed, options)
+    }
+
+    /// [`spawn_calendar_engine_limited`] on routes that may also wait
+    /// before they answer (`FakeServer::start_paced`).
+    fn spawn_calendar_engine_paced(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>, Duration)>,
+        seed: impl FnOnce(&Store),
+        options: EngineOptions,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
         let mut routes = routes;
-        routes.extend(backfill_routes().into_iter().map(|r| (r, None)));
-        let srv = FakeServer::start_limited(routes);
+        routes.extend(
+            backfill_routes()
+                .into_iter()
+                .map(|r| (r, None, Duration::ZERO)),
+        );
+        let srv = FakeServer::start_paced(routes);
         let base = srv.base_url.clone();
         let dir = unique_dir(tag);
         let store_path = dir.join("mail.db");
@@ -9660,6 +9975,1191 @@ mod tests {
         assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
         assert!(
             srv.requests().iter().all(|r| r.method != "POST"),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Recurring series and occurrences (#2022) ------------------------
+
+    /// A stored occurrence of `master` in `CAL-A`, an hour from now.
+    fn occurrence(id: &str, master: &str) -> NewEvent {
+        NewEvent {
+            series_master_id: Some(master.into()),
+            event_type: "occurrence".into(),
+            ..stored_event(id, "CAL-A", 3600)
+        }
+    }
+
+    /// Graph's series master `id` (`/me/events/{id}`): weekly on Monday,
+    /// a `numbered` range.
+    fn series_master_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","subject":"Weekly","type":"seriesMaster",
+            "start":{{"dateTime":"2026-07-13T09:00:00.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"2026-07-13T09:30:00.0000000","timeZone":"UTC"}},
+            "recurrence":{{"pattern":{{"type":"weekly","interval":1,"month":0,"dayOfMonth":0,
+            "daysOfWeek":["monday"],"firstDayOfWeek":"monday","index":"first"}},
+            "range":{{"type":"numbered","startDate":"2026-07-13","endDate":"0001-01-01",
+            "recurrenceTimeZone":"","numberOfOccurrences":8}}}}}}"#
+        )
+    }
+
+    fn patch_route(path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    /// The requests' (method, path) pairs, in order.
+    fn method_paths(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect()
+    }
+
+    /// Whether, after the `nth` (0-based) PATCH of `path`, a request runs
+    /// `CAL-A`'s initial delta round over the window: the calendar reset.
+    fn initial_round_after_patch(srv: &FakeServer, path: &str, nth: usize) -> bool {
+        let (from, to) = today_window();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        let reqs = method_paths(srv);
+        let Some(at) = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, p))| m == "PATCH" && p == path)
+            .map(|(i, _)| i)
+            .nth(nth)
+        else {
+            return false;
+        };
+        reqs[at + 1..].iter().any(|(_, p)| *p == initial)
+    }
+
+    /// A series edit of the subject and recurrence (daily, no end).
+    fn series_edit() -> EventInput {
+        use crate::graph::client::EventFieldSet;
+        use crate::graph::model::{EventRecurrence, RecurrencePattern, RecurrenceRange};
+        EventInput {
+            subject: "Daily now".into(),
+            series_recurrence: Some(EventRecurrence {
+                pattern: RecurrencePattern {
+                    r#type: "daily".into(),
+                    interval: 1,
+                    ..Default::default()
+                },
+                range: RecurrenceRange {
+                    r#type: "noEnd".into(),
+                    start_date: "2026-07-13".into(),
+                    ..Default::default()
+                },
+            }),
+            fields: EventFieldSet::SUBJECT.union(EventFieldSet::RECURRENCE),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fetch_event_series_resolves_an_occurrence_to_its_master() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-series",
+            vec![get_route("/me/events/M1", 200, &series_master_json("M1"))],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventSeries { id: "OCC1".into() })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::EventSeriesFetched { .. })
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let Some(SyncEvent::EventSeriesFetched { id, master }) = seen.last() else {
+            unreachable!()
+        };
+        assert_eq!(id, "OCC1", "the command's id");
+        assert_eq!(master.id, "M1");
+        assert_eq!(master.event_type, "seriesMaster");
+        let rec = master.recurrence.as_ref().unwrap();
+        assert_eq!(rec.pattern.r#type, "weekly");
+        assert_eq!(rec.pattern.first_day_of_week, "monday");
+        assert_eq!(rec.range.number_of_occurrences, 8);
+        assert_eq!(
+            master.calendar_id, "CAL-A",
+            "the stored occurrence's calendar"
+        );
+        let gets: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(m, p)| m == "GET" && p.starts_with("/me/events/"))
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(gets, ["/me/events/M1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_series_of_a_single_event_is_an_error() {
+        let (_srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-series-single",
+            vec![get_route(
+                "/me/events/S1",
+                200,
+                r#"{"id":"S1","subject":"Once","type":"singleInstance"}"#,
+            )],
+            vec![meeting("S1", true)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventSeries { id: "S1".into() })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::Error(
+                "fetch event series S1: not a recurring event".into()
+            ))
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::EventSeriesFetched { .. })),
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_series_refuses_local_and_signed_out() {
+        // A local series: nothing to ask Graph, whichever command.
+        let (srv, handle, store_path, dir) =
+            spawn_meeting_engine("fetch-event-series-local", vec![], vec![]);
+        let local = Store::open(&store_path)
+            .unwrap()
+            .create_local_event(
+                &crate::store::LocalEventFields {
+                    subject: "Mine".into(),
+                    start_utc: "2026-07-20T09:00:00Z".into(),
+                    end_utc: "2026-07-20T10:00:00Z".into(),
+                    ..Default::default()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let (from, to) = today_window();
+        for cmd in [
+            SyncCommand::FetchEventSeries { id: local.clone() },
+            SyncCommand::FetchEventInstances {
+                id: local.clone(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            },
+            SyncCommand::UpdateEventSeries {
+                id: local.clone(),
+                input: series_edit(),
+            },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert!(
+                matches!(seen.last(), Some(SyncEvent::Error(m))
+                    if m.ends_with(&format!("{local}: the series is not on the server yet"))),
+                "{seen:?}"
+            );
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty(),
+            "nothing queued"
+        );
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Signed out: the direct calls say so with no request; a series
+        // edit waits in the outbox, on disk, for the next session.
+        let srv = FakeServer::start(vec![]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("fetch-event-series-signed-out");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        for cmd in [
+            SyncCommand::FetchEventSeries { id: "M1".into() },
+            SyncCommand::FetchEventInstances {
+                id: "M1".into(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+            );
+        }
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::PendingOps(1)))
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        let ops = Store::open(&dir.join("mail.db"))
+            .unwrap()
+            .pending_ops()
+            .unwrap();
+        assert_eq!(
+            ops.iter().map(|r| r.op.clone()).collect::<Vec<_>>(),
+            [OutboxOp::UpdateEventSeries {
+                id: "M1".into(),
+                body: event_body_json(&series_edit()),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_instances_emits_the_range() {
+        let (from, to) = (iso_from_now(190), iso_from_now(220));
+        let instances = events_body(&[
+            calendar_event_json("I1", "2026-07-13T09:00:00", "2026-07-13T09:30:00"),
+            calendar_event_json("I2", "2026-07-20T09:00:00", "2026-07-20T09:30:00"),
+        ]);
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "fetch-event-instances",
+            vec![get_route("/me/events/M1/instances?", 200, &instances)],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchEventInstances {
+                id: "OCC1".into(),
+                from_utc: from.clone(),
+                to_utc: to.clone(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::EventInstancesFetched { .. })
+        });
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let Some(SyncEvent::EventInstancesFetched {
+            id,
+            master_id,
+            from: f,
+            to: t,
+            instances,
+        }) = seen.last()
+        else {
+            unreachable!()
+        };
+        assert_eq!((id.as_str(), master_id.as_str()), ("OCC1", "M1"));
+        assert_eq!((f, t), (&from, &to));
+        let ids: Vec<&str> = instances.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["I1", "I2"]);
+        assert!(instances.iter().all(|e| e.calendar_id == "CAL-A"));
+        let gets: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(_, p)| p.starts_with("/me/events/"))
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            gets,
+            [format!(
+                "/me/events/M1/instances?startDateTime={from}&endDateTime={to}&$top=50"
+            )]
+        );
+        // Nothing stored: only the synced occurrence is.
+        assert_eq!(
+            ids_in(&Store::open(&store_path).unwrap(), "CAL-A"),
+            ["OCC1"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_event_instances_rejects_bad_bounds() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-event-instances-bounds",
+            vec![get_route("/me/events/", 200, r#"{"value":[]}"#)],
+            vec![],
+        );
+        let (from, to) = today_window();
+        for (f, t) in [
+            ("nope", to.as_str()),
+            (from.as_str(), "2026-07-01T00:00:00Z&$top=1"),
+            (to.as_str(), from.as_str()),
+            (from.as_str(), from.as_str()),
+        ] {
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchEventInstances {
+                    id: "M1".into(),
+                    from_utc: f.into(),
+                    to_utc: t.into(),
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::Error(format!(
+                    "fetch event instances M1: invalid range {f} .. {t}"
+                )))
+            );
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_queues_and_patches_the_master() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "update-event-series",
+            vec![patch_route("/me/events/M1", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        // Commands run in order: this one's `Error` comes after the edit's
+        // drain, and the reset's refresh, are done.
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "/me/events/M1");
+        assert_eq!(patches[0].body, event_body_json(&series_edit()));
+        assert!(
+            patches[0].body.contains(
+                r#""recurrence":{"pattern":{"type":"daily","interval":1},"range":{"type":"noEnd","startDate":"2026-07-13"}}"#
+            ),
+            "{}",
+            patches[0].body
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            initial_round_after_patch(&srv, "/me/events/M1", 0),
+            "no calendar reset after the PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_given_an_occurrence_patches_the_master() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "update-event-series-occurrence",
+            vec![patch_route("/me/events/", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "OCC1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<String> = method_paths(&srv)
+            .into_iter()
+            .filter(|(m, _)| m == "PATCH")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(patches, ["/me/events/M1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_queued_offline_resets_on_the_later_drain() {
+        // The first PATCH is throttled for a second, so the op stays queued
+        // and goes through on the pass after the wait: that drain resets.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "1".into())],
+                    ..patch_route("/me/events/M1", 429, "")
+                },
+                Some(1),
+            ),
+            (patch_route("/me/events/M1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, events_body(&[]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-later",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.pending_ops().unwrap().len(), 1, "still queued");
+        assert!(
+            !initial_round_after_patch(&srv, "/me/events/M1", 0),
+            "a throttled edit resets nothing: {:?}",
+            method_paths(&srv)
+        );
+        // The engine's own retry after the wait drains it.
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "the edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            initial_round_after_patch(&srv, "/me/events/M1", 1),
+            "no calendar reset after the later PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `/me/events` or calendar view requests from the `nth` (0-based)
+    /// PATCH of `path` on, in order.
+    fn requests_after_patch(srv: &FakeServer, path: &str, nth: usize) -> Vec<(String, String)> {
+        let reqs = method_paths(srv);
+        let at = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, p))| m == "PATCH" && p == path)
+            .map(|(i, _)| i)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("no PATCH #{nth} of {path}: {reqs:?}"));
+        reqs[at + 1..].to_vec()
+    }
+
+    #[test]
+    fn update_event_series_reset_throttled_stops_the_pass() {
+        // The series PATCH goes through on a tick (the command's drain is
+        // throttled for a second), and the reset's initial round is
+        // throttled for 30 s: that tick makes no further Graph request,
+        // and no second refresh runs in it.
+        let (from, to) = today_window();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        let link = delta_link_of("CAL-A");
+        let routes: Vec<(Route, Option<usize>)> = vec![
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "1".into())],
+                    ..patch_route("/me/events/M1", 429, "")
+                },
+                Some(1),
+            ),
+            (patch_route("/me/events/M1", 200, "{}"), None),
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "30".into())],
+                    ..get_route("/me/calendars/CAL-A/calendarView/delta?", 429, "")
+                },
+                None,
+            ),
+            (
+                get_route(&link, 200, &calendar_delta_page(&[], &link)),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-reset-throttled",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || paths_from(&srv, 0).contains(&initial)),
+            "no initial round: {:?}",
+            method_paths(&srv)
+        );
+        // Commands run between ticks: this one's `Error` comes after the
+        // tick that sent the PATCH is over.
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let after = requests_after_patch(&srv, "/me/events/M1", 1);
+        assert_eq!(
+            after,
+            [
+                ("GET".to_string(), "/me/calendars?$select=id,name,color,hexColor,isDefaultCalendar,canEdit,owner&$top=100".to_string()),
+                ("GET".to_string(), initial.clone()),
+            ],
+            "after the throttled reset, nothing: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_waits_for_a_queued_event_edit() {
+        // A series edit goes through but an edit of event X behind it gets a
+        // 500 (deferred; a 503 would be a throttle): no initial round may
+        // replace X's edited row while its own PATCH waits. Once X's edit
+        // goes through, the reset is owed no more.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (patch_route("/me/events/M1", 200, "{}"), None),
+            (patch_route("/me/events/X1", 500, ""), Some(1)),
+            (patch_route("/me/events/X1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject ("Standup").
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-reset-waits",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1"), stored_event("X1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+                let row = s.event("X1").unwrap().unwrap();
+                let fields = s
+                    .update_event_fields(
+                        "X1",
+                        &crate::store::LocalEventFields {
+                            subject: "Edited".into(),
+                            start_utc: row.start_utc,
+                            end_utc: row.end_utc,
+                            location: row.location,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                s.enqueue_op(&OutboxOp::UpdateEventSeries {
+                    id: "M1".into(),
+                    body: event_body_json(&series_edit()),
+                })
+                .unwrap();
+                s.enqueue_op(&OutboxOp::UpdateEvent {
+                    id: "X1".into(),
+                    fields,
+                })
+                .unwrap();
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The first pass drained both ops; a calendar refresh after it is a
+        // round from the kept link, which leaves X's row alone.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's edit waits: {:?}",
+            method_paths(&srv)
+        );
+        assert!(
+            paths_from(&srv, 0).contains(&delta_link_of("CAL-A")),
+            "the refresh ran from the link: {:?}",
+            method_paths(&srv)
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        assert!(matches!(
+            &store.pending_ops().unwrap()[..],
+            [OutboxRow { op: OutboxOp::UpdateEvent { id, .. }, .. }] if id == "X1"
+        ));
+        assert!(store.calendar_delta("CAL-A").unwrap().is_some());
+
+        // F9 resends X's edit; the reset is then owed no more, and the next
+        // calendar refresh is an initial round.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "X's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            requests_after_patch(&srv, "/me/events/X1", 1)
+                .iter()
+                .any(|(_, p)| *p == initial),
+            "no reset after X's edit: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_skips_an_event_edit_queued_after_it() {
+        // The series edit goes through during a throttle wait, so no refresh
+        // follows it; then the user edits X, whose PATCH gets a 500. The
+        // first refresh after the wait must not run the reset's initial
+        // rounds over X's edited row. Once X's edit goes through, it does.
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "2".into())],
+                    ..get_route(&link, 429, "")
+                },
+                Some(1),
+            ),
+            (patch_route("/me/events/M1", 200, "{}"), None),
+            (patch_route("/me/events/X1", 500, ""), Some(1)),
+            (patch_route("/me/events/X1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject ("Standup").
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-reset-skips",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1"), stored_event("X1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // A throttled calendar refresh starts a two-second wait.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            store.pending_ops().unwrap().is_empty(),
+            "the series edit went"
+        );
+        let row = store.event("X1").unwrap().unwrap();
+        let fields = store
+            .update_event_fields(
+                "X1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        // The tick after the wait refreshes the calendars.
+        assert!(
+            wait_until(ENGINE_WAIT, || paths_from(&srv, 0)
+                .iter()
+                .filter(|p| **p == link)
+                .count()
+                >= 2),
+            "no refresh after the wait: {:?}",
+            method_paths(&srv)
+        );
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's edit waits: {:?}",
+            method_paths(&srv)
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        assert!(matches!(
+            &store.pending_ops().unwrap()[..],
+            [OutboxRow { op: OutboxOp::UpdateEvent { id, .. }, .. }] if id == "X1"
+        ));
+
+        // F9 resends X's edit; the reset then runs, after it.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(store.pending_ops().unwrap().is_empty(), "X's edit went");
+        assert!(
+            requests_after_patch(&srv, "/me/events/X1", 1)
+                .iter()
+                .any(|(_, p)| *p == initial),
+            "no reset after X's edit: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_sent_by_a_fast_tick_resets_the_calendars() {
+        // The command's PATCH is throttled for a second; the fast tick after
+        // the wait sends it, and refreshes the calendars itself (the next
+        // normal pass is an hour away).
+        let (from, to) = today_window();
+        let mut routes: Vec<Route> = vec![
+            Route {
+                headers: vec![("Retry-After".into(), "1".into())],
+                ..patch_route("/me/events/M1", 429, "")
+            },
+            patch_route("/me/events/M1", 200, "{}"),
+        ];
+        routes.extend(calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        ));
+        let limited: Vec<(Route, Option<usize>)> = routes
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, (i == 0).then_some(1)))
+            .collect();
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-fast-tick",
+            limited,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions {
+                fast_tick: Some(FAST),
+                ..EngineOptions::without_prefetch()
+            },
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || initial_round_after_patch(
+                &srv,
+                "/me/events/M1",
+                1
+            )),
+            "no reset after the fast tick's PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_waits_for_an_event_command_not_yet_queued() {
+        // The host wrote X's row and sent `UpdateEvent` right after the
+        // series edit, whose PATCH is slow: when the reset is decided, X's
+        // command is on the channel, its op not queued yet. No initial round
+        // may replace X's row, and X's PATCH sends the edit.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+            (
+                patch_route("/me/events/M1", 200, "{}"),
+                None,
+                Duration::from_millis(400),
+            ),
+            (patch_route("/me/events/X1", 500, ""), None, Duration::ZERO),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject ("Standup").
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| (r, None, Duration::ZERO)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "update-event-series-reset-command",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1"), stored_event("X1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The host writes X's row first (the engine is idle), then the two
+        // commands go out back to back.
+        let store = Store::open(&store_path).unwrap();
+        let row = store.event("X1").unwrap().unwrap();
+        let fields = store
+            .update_event_fields(
+                "X1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let reqs = method_paths(&srv);
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's command waited: {reqs:?}"
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        let x_patch = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PATCH" && r.path == "/me/events/X1")
+            .expect("X's PATCH");
+        assert!(
+            x_patch.body.contains(r#""subject":"Edited""#),
+            "{}",
+            x_patch.body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_offline_keeps_the_state() {
+        // A command's drain sends the series edit; the reset's refresh then
+        // fails at transport level (the list's next page is on a port
+        // nobody listens on). The state stays Offline: the drain must not
+        // settle it back to Idle.
+        let (from, to) = today_window();
+        let list = format!(
+            r#"{{"value":[{}],"@odata.nextLink":"http://127.0.0.1:1/me/calendars?page=2"}}"#,
+            calendar_json("CAL-A", true, "me@x")
+        );
+        let routes = vec![
+            patch_route("/me/events/M1", 200, "{}"),
+            get_route("/me/calendars?", 200, &list),
+        ];
+        let (srv, handle, _store_path, dir) =
+            spawn_calendar_engine("update-event-series-reset-offline", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            method_paths(&srv)
+                .iter()
+                .any(|(m, p)| m == "PATCH" && p == "/me/events/M1"),
+            "{:?}",
+            method_paths(&srv)
+        );
+        let last_state = seen.iter().rev().find_map(|e| match e {
+            SyncEvent::State(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(last_state, Some(SyncState::Offline), "{seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_does_not_refresh_after_a_shutdown() {
+        // F9's pass sends a queued series edit, whose PATCH is slow; a
+        // Shutdown arrives while it is in flight. The pass stops at its next
+        // checkpoint, and no calendar refresh follows the PATCH.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![(
+            patch_route("/me/events/M1", 200, "{}"),
+            None,
+            Duration::from_millis(400),
+        )];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, events_body(&[]))],
+            )
+            .into_iter()
+            .map(|r| (r, None, Duration::ZERO)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "update-event-series-reset-shutdown",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The engine is idle after its startup pass: queue the edit
+        // directly, so F9's pass is the one that sends it.
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        Store::open(&store_path)
+            .unwrap()
+            .enqueue_op(&OutboxOp::UpdateEventSeries {
+                id: "M1".into(),
+                body: event_body_json(&series_edit()),
+            })
+            .unwrap();
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || method_paths(&srv)
+                .iter()
+                .any(|(m, p)| m == "PATCH" && p == "/me/events/M1")),
+            "no PATCH: {:?}",
+            method_paths(&srv)
+        );
+        handle.cmd_tx.send(SyncCommand::Shutdown).unwrap();
+        // The engine thread ends: its event channel disconnects.
+        let deadline = Instant::now() + ENGINE_WAIT;
+        loop {
+            match handle
+                .evt_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(_) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => panic!("the engine never stopped"),
+            }
+        }
+        let after = requests_after_patch(&srv, "/me/events/M1", 0);
+        assert!(
+            !after.iter().any(|(_, p)| p.starts_with("/me/calendars")),
+            "a calendar refresh after the Shutdown: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_with_no_fields_queues_nothing() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "update-event-series-empty",
+            vec![patch_route("/me/events/", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: EventInput {
+                    subject: "Unsent".into(),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::State(SyncState::PendingOps(_)))),
+            "{seen:?}"
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !srv.requests().iter().any(|r| r.method == "PATCH"),
             "{:?}",
             srv.requests()
         );

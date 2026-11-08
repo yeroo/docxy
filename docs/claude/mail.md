@@ -728,9 +728,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `update_event_fields_follows_the_join_link_unless_online_meeting`,
   `events_without_1983_columns_migrate`); `engine.rs`
   `refresh_calendar_stores_calendar_client_fields`.
-- Not done: `calendarView` returns occurrences, never series masters, and nothing
-  fetches a synced master yet (a `/me/events/{seriesMasterId}` read would), so
-  `EventRow::recurrence` is `Some` in production only for a local series.
+- Not done: `calendarView` returns occurrences, never series masters; a synced
+  master is fetched only on demand (`FetchEventSeries`, #2022) and never stored,
+  so `EventRow::recurrence` is `Some` in production only for a local series.
   `calendar_id` is the calendar a pass fetched the event from since #1984
   (`calendar.id` in the JSON loses to it). Safe Links-wrapped links
   (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
@@ -815,7 +815,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `saving_an_untouched_synced_event_sends_no_update` (timed and all-day),
   `editing_only_the_title_sends_only_the_subject`.
 - Not done: lookxy's form has no controls for the new fields (the host API
-  has them). Recurring series stay create-only. Reading the calendar's
+  has them). A series is edited with `UpdateEventSeries` (#2022). Reading the calendar's
   `defaultOnlineMeetingProvider` / `allowedOnlineMeetingProviders`.
 
 ## Every calendar and calendar queries (#1984)
@@ -1060,7 +1060,7 @@ wider window fresh without downloading it again.
   next pass still runs initial rounds. `CreateEvent`'s `local:` row is
   never replaced either way.
 - Not done: no checkpoint between a round's pages (as before); series
-  masters are not fetched; `FetchCalendarRange` stays plain
+  masters are fetched only on demand and never stored (#2022); `FetchCalendarRange` stays plain
   `calendarView` (a range overlapping the window, when its record is
   stale, re-fetches that part, server truth either way). Two passes
   straddling 00:00 UTC make the second an initial round, so a test that
@@ -1217,6 +1217,118 @@ dismiss and snooze on the server (#2025).
   `cancel_event_404_brings_back_an_event_graph_still_has`,
   `cancel_event_404_after_a_lost_202_leaves_the_event_gone`, `forward_event_posts_forward`,
   `forward_event_refuses_local_id_and_no_recipients`.
+
+## Recurring series and occurrences (#2022)
+
+Item 3 of #1985: list a series' occurrences, open "the series", and edit or delete
+this occurrence or the whole series, as Outlook does.
+
+- `GraphClient::get_event(id)` GETs `/me/events/{encoded id}` with the UTC `Prefer`:
+  a master with its `recurrence` (`EventRecurrence`) and `event_type ==
+  "seriesMaster"`, which `calendarView` never lists. An answer without an `id` is a
+  `Parse` error. `event_instances(master, from, to)` GETs `/me/events/{encoded
+  id}/instances?startDateTime=&endDateTime=&$top=50`, paged and with the `Prefer`
+  of `calendar_view` (`calendar_view_paged`).
+- Which id: **this occurrence** is the occurrence's own id, through the existing
+  `UpdateEvent` (its PATCH never carries `recurrence`: `update_event_fields` never
+  reports the group, and a synced occurrence's row has none) and `DeleteEvent`.
+  **The series** is the master's id: `UpdateEventSeries`, and for a delete
+  `Store::delete_event_series(master)` (the row with that id, a local series' own,
+  and every row whose `series_master_id` it is, in any calendar, with attendees),
+  then `DeleteEvent { id: master }`.
+- A series edit sends Graph's own shape: `EventInput::series_recurrence`
+  (`Option<EventRecurrence>`), under the `recurrence` group, wins over the
+  create-side `recurrence` and is written by `EventRecurrence::to_send_json`. That
+  sends the pattern's `type` and `interval`, and `month`, `dayOfMonth`, `daysOfWeek`,
+  `firstDayOfWeek` and `index` only when non-zero or non-empty, as given (nothing
+  defaulted). It sends the range's `type` and `startDate`, plus `endDate` only for an
+  `endDate` range, `numberOfOccurrences` only for a `numbered` range, and
+  `recurrenceTimeZone` only when non-empty. `to_json` (the `graph_recurrence` column
+  text) is no write body: Graph refuses its `""` dates.
+- Engine: `FetchEventSeries { id }` → `EventSeriesFetched { id, master }`;
+  `FetchEventInstances { id, from_utc, to_utc }` → `EventInstancesFetched { id,
+  master_id, from, to, instances }`, with bounds checked as `FetchCalendarRange`
+  checks them (else an `Error`, no request); `UpdateEventSeries { id, input }`
+  queues `OutboxOp::UpdateEventSeries`. All three resolve `id` with
+  `series_master_of`: a stored occurrence's `series_master_id`, else the id itself.
+  A `local:` master is an `Error` with nothing sent or queued (a local series is
+  edited through its row). The two fetches are direct calls (signed out is
+  `Error("not signed in")`, a 401 or throttle goes through `react`) and store
+  nothing. A kept window's occurrences come from the calendar sync, and other dates
+  from `FetchCalendarRange`. A fetched event whose non-empty `event_type` is not
+  `seriesMaster` is an `Error`. Graph names no calendar in these answers, so the
+  master and each instance take the calendar of a stored row of the series
+  (`Store::series_calendar_id`), or `""` when none is stored.
+- `OutboxOp::UpdateEventSeries { id, body }` (`updateEventSeries`) stores the PATCH
+  body whole (`event_body_json` at command time), because the master is not
+  stored. `apply_op` sends it with `update_event_body`. An empty `input.fields`
+  queues nothing. There is no optimistic local write, so the op is not an event op
+  for the quarantine reset. Instead the calendars owe a reset once it went
+  through (`series_reset_owed`, in memory): a pattern change mints new occurrence
+  ids, and how calendarView delta reports a series change is the uncertain part
+  of #2013, so initial rounds take each window from Graph. The reset is decided
+  where it is used: every `refresh_calendar`, on any path (the drain's own
+  quarantine and cancel-404 `reset_calendars` included), first takes the waiting
+  commands (`checkpoint`, only while the reset is owed; a shutdown stops the
+  refresh), then checks (`series_reset_ready`). Only when no event op with a
+  local write (`writes_event_locally`: `RespondEvent`, `UpdateEvent`,
+  `DeleteEvent`, `CancelEvent`) is queued, and no command that queues one
+  (`command_writes_event_locally`) waits in `deferred`, does it clear every delta
+  state and run initial rounds; otherwise it runs from the kept links and the
+  reset stays owed. So the reset's initial rounds never run while such an op is
+  queued or its command has reached the engine: they would replace its row
+  (a host writes the row before it sends `UpdateEvent` or `DeleteEvent`), and a
+  queued `UpdateEvent`, which reads its row at send time, would send Graph's old
+  values. A host that writes its row after the reset's refresh began has the
+  general race of any refresh, and a delta round from a kept link can still upsert
+  a changed occurrence over a queued edit: both are the follow-up. The refresh
+  does not run in the drain's loop after a series edit, so a 401, throttle or
+  offline error it meets reaches the path as usual (a quarantine's or cancel-404's
+  reset in the loop does not stop the drain on one: pre-existing). `on_tick`
+  refreshes after its pass anyway; every other path that drains (a command's
+  `drain_queued`, a fast tick, `SyncFolder`, the startup, sign-in and `Refresh`
+  passes) calls `refresh_if_series_reset_owed` after its drain, which refreshes
+  when the reset may run, signed in, outside any wait and not shutting down, and
+  tells the caller to stop when that refresh signed out or started a wait;
+  `drain_queued` then leaves the state that failure set. A drain that quarantines
+  or cancels around a series edit can refresh twice. A restart before the reset
+  ran drops it, and the delta rounds carry on.
+- Masters are not stored: `calendarView` never returns one, so every window replace
+  would delete it, and `events_in_window` would show it on the series' first day.
+- Known gaps (follow-ups): a series edit with `TIMES` sends the UTC wall clock with
+  `timeZone: "UTC"`, so Graph moves the series into UTC and its local times drift
+  across DST. A host should leave `TIMES` out of a series edit until zone-preserving
+  times land. Cancelling a whole series (`CancelEvent` wants a stored row) and "this
+  and following" (an end-date edit plus a new series) are not done. No lookxy or
+  suite UI: lookxy ignores both new events.
+- Tests: `model.rs` `event_recurrence_send_json_drops_what_graph_refuses`; `client.rs`
+  `event_instances_gets_the_range_with_utc_and_pages`,
+  `get_event_returns_the_master_with_its_recurrence`,
+  `get_event_without_id_is_a_parse_error`,
+  `update_occurrence_patches_its_id_without_recurrence` (a pin),
+  `update_series_patches_the_master_with_its_full_recurrence`; `store`
+  `delete_event_series_removes_master_and_occurrences`,
+  `outbox_op_update_event_series_round_trips`; `outbox.rs`
+  `update_event_series_patches_master_with_stored_body`,
+  `update_event_series_local_id_makes_no_request`,
+  `delete_occurrence_and_series_delete_their_ids` (a pin); `engine.rs`
+  `fetch_event_series_resolves_an_occurrence_to_its_master`,
+  `fetch_event_series_of_a_single_event_is_an_error`,
+  `fetch_event_series_refuses_local_and_signed_out`,
+  `fetch_event_instances_emits_the_range`, `fetch_event_instances_rejects_bad_bounds`,
+  `update_event_series_queues_and_patches_the_master`,
+  `update_event_series_given_an_occurrence_patches_the_master`,
+  `update_event_series_queued_offline_resets_on_the_later_drain`,
+  `update_event_series_reset_throttled_stops_the_pass`,
+  `update_event_series_reset_waits_for_a_queued_event_edit`,
+  `update_event_series_reset_skips_an_event_edit_queued_after_it`,
+  `update_event_series_reset_waits_for_an_event_command_not_yet_queued` (a slow
+  series PATCH, `spawn_calendar_engine_paced`),
+  `update_event_series_reset_offline_keeps_the_state`,
+  `update_event_series_reset_does_not_refresh_after_a_shutdown`,
+  `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
+  `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
+  (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
 
 ## OAuth tokens in the platform secret store (#1877)
 
