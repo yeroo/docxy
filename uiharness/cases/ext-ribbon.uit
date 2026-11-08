@@ -7,7 +7,8 @@
 # `ext-ribbon-set` enables it) and Tags (lowest priority: three tags and two
 # large buttons with no icon), and View (V) with Arrange (the Sort
 # drop-down S with By Date D and By Sender N; the density gallery Y:
-# Compact, Cozy, Roomy). The extension records every command id the suite
+# Compact, Cozy, Roomy) and Window (Exit X, which closes the tab through
+# `ext::CloseTab`, #1923). The extension records every command id the suite
 # runs and the themes it was told (`ext-ribbon-read`). Keys go through
 # `real-key`, as the view sees them first; `ext-ribbon-cmd:<id>` is a
 # command drawn in place. Each test opens its own Mail tab and closes it.
@@ -328,3 +329,28 @@ test issue 1870 a document tab beside it keeps its own ribbon, and the Mail tab 
   assert reply.tabs.1.name is Message
   assert ribbon_tab is Message
   shot window
+
+test issue 1923 the extension's Exit command closes its tab and only it
+  # The test before leaves sample.docx, a Mail tab and basic.docx open.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call tab-list {}
+  assert reply.count is 4
+  assert reply.active is 3
+  assert reply.tabs.1.kind is mail
+  assert reply.tabs.3.kind is mail
+  call ribbon-read {}
+  assert reply.tabs.2.groups.1.title is Window
+  assert reply.tabs.2.groups.1.commands.0.id is fx.exit
+  call ribbon-layout {"tab":"View"}
+  shot window
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.exit"}
+  shot window
+  call tab-list {}
+  assert reply.count is 3
+  assert reply.tabs.0.kind is docx
+  assert reply.tabs.1.kind is mail
+  assert reply.tabs.2.kind is docx
