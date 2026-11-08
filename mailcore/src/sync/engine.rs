@@ -148,7 +148,10 @@ pub enum SyncCommand {
     /// (`Store::merge_message_unless_edited`, under the id asked), emit
     /// [`SyncEvent::MessagesUpdated`] (for the folder a stored row left
     /// too), then fetch and store its body as `FetchBody` does
-    /// ([`SyncEvent::BodyReady`]). A later delta of the folder upserts the
+    /// ([`SyncEvent::BodyReady`]). A row stored already whose body
+    /// satisfies the engine's format (`Store::get_body_for`: a draft's
+    /// local body always does) keeps both its unsaved edits and its body:
+    /// `BodyReady` comes with no body request. A later delta of the folder upserts the
     /// same row. Writes nothing and answers
     /// [`SyncEvent::MessageFetchFailed`] when signed out, when the id is
     /// one a move left behind (`Store::is_moved_alias`), when a queued op
@@ -3541,9 +3544,15 @@ impl Engine {
     /// writes nothing. The header is merged under the id asked (as
     /// `repair_headerless` keeps it) with `merge_message_unless_edited`, as
     /// a fresh delta row is, except for an id a queued op owns, whose row
-    /// keeps its optimistic state and folder. `MessagesUpdated` goes out
-    /// for the folder a re-filed row left, then for the row's folder; then
-    /// the body is fetched and stored as `FetchBody` does (`BodyReady`).
+    /// keeps its optimistic state and folder, as does a draft holding an
+    /// unsaved edit (the merge refuses it). `MessagesUpdated` goes out for
+    /// the folder a re-filed row left, then for the row's folder. Then the
+    /// body: a row stored before whose body satisfies the engine's format
+    /// (`Store::get_body_for`, which a draft's local body always does)
+    /// keeps it and gets `BodyReady` with no request, so a compose edit is
+    /// never replaced; an edited row with no such body is refused ("edited
+    /// locally"); any other is fetched and stored as `FetchBody` does
+    /// (`BodyReady`).
     /// Every failure is `MessageFetchFailed`, never a `SyncEvent::Error`.
     /// Returns `react`'s answer to an auth, throttle or transport failure,
     /// as `fetch_body` does, for `checkpoint`.
@@ -3595,28 +3604,57 @@ impl Engine {
             self.fetch_message_failed(id, reason);
             return false;
         }
-        let folder_id = match (protected, stored_in.clone()) {
-            // A queued op owns the row: it keeps its state and folder.
-            (true, Some(stored)) => stored,
-            _ => {
+        // `kept`: the stored row stays as it is, in its folder, as a fresh
+        // delta would leave it: a queued op owns it (no merge), or it holds
+        // an unsaved draft edit (`merge_message_unless_edited` refused).
+        let (folder_id, kept) = match (protected, stored_in.clone()) {
+            (true, Some(stored)) => (stored, true),
+            (_, stored) => {
                 let m = Message {
                     id: id.to_string(),
                     ..hit.message
                 };
-                if let Err(e) =
-                    self.store
-                        .merge_message_unless_edited(&hit.folder_id, &m, &hit.fields)
+                match self
+                    .store
+                    .merge_message_unless_edited(&hit.folder_id, &m, &hit.fields)
                 {
+                    Ok(true) => (hit.folder_id, false),
+                    Ok(false) => (stored.unwrap_or(hit.folder_id), true),
+                    Err(e) => {
+                        self.fetch_message_failed(id, format!("store: {e}"));
+                        return false;
+                    }
+                }
+            }
+        };
+        if let Some(old) = stored_in.as_ref().filter(|old| **old != folder_id) {
+            self.emit(SyncEvent::MessagesUpdated {
+                folder_id: old.clone(),
+            });
+        }
+        self.emit(SyncEvent::MessagesUpdated { folder_id });
+        // A row that was stored already keeps a body that satisfies the
+        // engine's format (`get_body_for`, the rule that keeps a draft's
+        // local body, #1901): fetching would replace a compose edit with
+        // Graph's older body, which a queued `SaveDraft` would then push.
+        if stored_in.is_some() {
+            let format = self.config.options.body_format;
+            match self.store.get_body_for(id, format) {
+                Ok(Some(_)) => {
+                    self.emit(SyncEvent::BodyReady { id: id.to_string() });
+                    return false;
+                }
+                Ok(None) if kept && !protected => {
+                    self.fetch_message_failed(id, "edited locally");
+                    return false;
+                }
+                Ok(None) => {}
+                Err(e) => {
                     self.fetch_message_failed(id, format!("store: {e}"));
                     return false;
                 }
-                hit.folder_id
             }
-        };
-        if let Some(old) = stored_in.filter(|old| *old != folder_id) {
-            self.emit(SyncEvent::MessagesUpdated { folder_id: old });
         }
-        self.emit(SyncEvent::MessagesUpdated { folder_id });
         match self.fetch_and_store_body(id) {
             Ok(true) => false,
             Ok(false) => {
@@ -20563,6 +20601,116 @@ mod tests {
                     assert!(r.is_read, "the optimistic read kept");
                     assert_eq!(r.subject, "H1", "no header merge");
                     assert!(store_in(&dir).get_body("H1").unwrap().is_some());
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                /// Inbox (`F1`), Archive (`F2`) and Drafts (`F3`, with the
+                /// draft `D1`), all small, with `extra` routes first.
+                fn with_a_draft(extra: Vec<(Route, Option<usize>)>) -> FakeServer {
+                    FakeServer::start_paced(mailbox(
+                        &[
+                            small(super::inbox()),
+                            small(fold("F2", "Archive", None)),
+                            small(Fold {
+                                pages: vec![vec![msg("D1", "2026-01-01T00:00:00Z")]],
+                                ..fold("F3", "Drafts", Some("drafts"))
+                            }),
+                        ],
+                        extra,
+                        Duration::ZERO,
+                    ))
+                }
+
+                /// Compose saves an edit of `D1` on its own connection.
+                fn edit_draft(dir: &std::path::Path) {
+                    store_in(dir)
+                        .update_draft_fields("D1", "My edit", "", "", "", "<p>mine</p>")
+                        .unwrap();
+                }
+
+                fn assert_draft_kept(dir: &std::path::Path) {
+                    let r = row(dir, "F3", "D1").expect("the draft stays in Drafts");
+                    assert_eq!(r.subject, "My edit");
+                    let body = store_in(dir).get_body("D1").unwrap().unwrap();
+                    assert_eq!(body.content, "<p>mine</p>", "the compose body kept");
+                }
+
+                #[test]
+                fn fetch_message_keeps_an_edited_drafts_body() {
+                    // The edit removed the search term, so a client lists the
+                    // draft as a server hit, filed elsewhere on the server.
+                    let srv = with_a_draft(vec![
+                        hit_route("D1", "F2", "Server subject"),
+                        (body_route("D1"), None),
+                    ]);
+                    let (handle, dir) = started(&srv, "fetch-edited-draft");
+                    edit_draft(&dir);
+                    fetch(&handle, "D1");
+                    let events = fetch_answer(&handle, "D1");
+                    assert!(
+                        matches!(events.last(), Some(SyncEvent::BodyReady { id }) if id == "D1"),
+                        "{events:?}"
+                    );
+                    assert_eq!(updates(&events), ["F3"], "only the draft's own folder");
+                    no_error(&events);
+                    assert_eq!(body_gets_of(&srv, "D1"), 0, "no body over the edit");
+                    stop(handle);
+                    assert_draft_kept(&dir);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_keeps_a_queued_drafts_body() {
+                    let srv = with_a_draft(vec![
+                        write_route("PATCH", "/me/messages/D1", 500),
+                        hit_route("D1", "F2", "Server subject"),
+                        (body_route("D1"), None),
+                    ]);
+                    let (handle, dir) = started(&srv, "fetch-queued-draft");
+                    edit_draft(&dir);
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::SaveDraft { id: "D1".into() })
+                        .unwrap();
+                    fetch(&handle, "D1");
+                    let events = fetch_answer(&handle, "D1");
+                    assert!(
+                        matches!(events.last(), Some(SyncEvent::BodyReady { .. })),
+                        "{events:?}"
+                    );
+                    assert!(
+                        srv.requests().iter().any(|r| r.method == "PATCH"),
+                        "the SaveDraft was sent and failed"
+                    );
+                    assert_eq!(body_gets_of(&srv, "D1"), 0);
+                    assert_eq!(updates(&events), ["F3"]);
+                    stop(handle);
+                    assert_draft_kept(&dir);
+                    assert_eq!(store_in(&dir).pending_message_ids().unwrap(), ["D1"]);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_of_a_stored_row_with_its_body_fetches_no_body() {
+                    let srv = two_folders(
+                        vec![msg("H1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            hit_route("H1", "F1", "Changed"),
+                            (body_route("H1"), Some(1)),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-stored-body");
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::FetchBody { id: "H1".into() })
+                        .unwrap();
+                    wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::BodyReady { .. }));
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(matches!(events.last(), Some(SyncEvent::BodyReady { .. })));
+                    assert_eq!(body_gets_of(&srv, "H1"), 1, "only FetchBody's");
+                    stop(handle);
+                    assert_eq!(row(&dir, "F1", "H1").unwrap().subject, "Changed");
                     let _ = std::fs::remove_dir_all(&dir);
                 }
 
