@@ -1267,23 +1267,32 @@ this occurrence or the whole series, as Outlook does.
   through (`series_reset_owed`, in memory): a pattern change mints new occurrence
   ids, and how calendarView delta reports a series change is the uncertain part
   of #2013, so initial rounds take each window from Graph. The reset is decided
-  where it is used: every `refresh_calendar`, on any path, checks the queue then
-  (`series_reset_ready`) and, only when no event op with a local write
-  (`writes_event_locally`: `RespondEvent`, `UpdateEvent`, `DeleteEvent`,
-  `CancelEvent`) is queued, clears every delta state and runs initial rounds;
-  otherwise it runs from the kept links and the reset stays owed. So the reset's
-  initial rounds never run while such an op waits: they would replace its row,
-  and a queued `UpdateEvent`, which reads its row at send time, would send
-  Graph's old values. (A delta round from a kept link can still upsert a changed
-  occurrence over a queued edit; that is a follow-up.) The refresh never runs
-  inside the drain, so a 401, throttle or offline error it meets reaches the
-  path as usual. `on_tick` refreshes after its pass anyway; every other path that
-  drains (a command's `drain_queued`, a fast tick, `SyncFolder`, the startup,
-  sign-in and `Refresh` passes) calls `refresh_if_series_reset_owed` after its
-  drain, which refreshes when the reset may run, signed in and outside any wait,
-  and tells the caller to stop when that refresh signed out or started a wait.
-  No path refreshes twice. A restart before the reset ran drops it, and the delta
-  rounds carry on.
+  where it is used: every `refresh_calendar`, on any path (the drain's own
+  quarantine and cancel-404 `reset_calendars` included), first takes the waiting
+  commands (`checkpoint`, only while the reset is owed; a shutdown stops the
+  refresh), then checks (`series_reset_ready`). Only when no event op with a
+  local write (`writes_event_locally`: `RespondEvent`, `UpdateEvent`,
+  `DeleteEvent`, `CancelEvent`) is queued, and no command that queues one
+  (`command_writes_event_locally`) waits in `deferred`, does it clear every delta
+  state and run initial rounds; otherwise it runs from the kept links and the
+  reset stays owed. So the reset's initial rounds never run while such an op is
+  queued or its command has reached the engine: they would replace its row
+  (a host writes the row before it sends `UpdateEvent` or `DeleteEvent`), and a
+  queued `UpdateEvent`, which reads its row at send time, would send Graph's old
+  values. A host that writes its row after the reset's refresh began has the
+  general race of any refresh, and a delta round from a kept link can still upsert
+  a changed occurrence over a queued edit: both are the follow-up. The refresh
+  does not run in the drain's loop after a series edit, so a 401, throttle or
+  offline error it meets reaches the path as usual (a quarantine's or cancel-404's
+  reset in the loop does not stop the drain on one: pre-existing). `on_tick`
+  refreshes after its pass anyway; every other path that drains (a command's
+  `drain_queued`, a fast tick, `SyncFolder`, the startup, sign-in and `Refresh`
+  passes) calls `refresh_if_series_reset_owed` after its drain, which refreshes
+  when the reset may run, signed in, outside any wait and not shutting down, and
+  tells the caller to stop when that refresh signed out or started a wait;
+  `drain_queued` then leaves the state that failure set. A drain that quarantines
+  or cancels around a series edit can refresh twice. A restart before the reset
+  ran drops it, and the delta rounds carry on.
 - Masters are not stored: `calendarView` never returns one, so every window replace
   would delete it, and `events_in_window` would show it on the series' first day.
 - Known gaps (follow-ups): a series edit with `TIMES` sends the UTC wall clock with
@@ -1313,6 +1322,8 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_reset_throttled_stops_the_pass`,
   `update_event_series_reset_waits_for_a_queued_event_edit`,
   `update_event_series_reset_skips_an_event_edit_queued_after_it`,
+  `update_event_series_reset_waits_for_an_event_command_not_yet_queued` (a slow
+  series PATCH, `spawn_calendar_engine_paced`),
   `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.

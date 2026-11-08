@@ -359,8 +359,9 @@ pub enum SyncCommand {
     /// `FetchEventSeries`, before anything is queued. No optimistic local
     /// write: once the PATCH goes through (this drain or a later one) the
     /// calendars owe a reset, and the first calendar refresh that finds no
-    /// `RespondEvent`, `UpdateEvent`, `DeleteEvent` or `CancelEvent` queued
-    /// runs initial rounds, which bring Graph's occurrences. The owed reset
+    /// `RespondEvent`, `UpdateEvent`, `DeleteEvent` or `CancelEvent` queued,
+    /// nor such a command waiting, runs initial rounds, which bring Graph's
+    /// occurrences. The owed reset
     /// is in memory: a restart before then drops it, and the delta rounds
     /// carry on. An empty `input.fields` queues nothing; a `local:`
     /// master is an `Error` (a local series is edited through its row).
@@ -679,6 +680,20 @@ fn writes_event_locally(op: &OutboxOp) -> bool {
     )
 }
 
+/// A command that queues a `writes_event_locally` op, sent after its host
+/// wrote the row (`DeleteEvent`, `UpdateEvent`), or whose op the engine
+/// writes for (`RespondEvent`, `CancelEvent`): while one waits, a series
+/// edit's reset does not run (#2022).
+fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
+    matches!(
+        cmd,
+        SyncCommand::RespondEvent { .. }
+            | SyncCommand::UpdateEvent { .. }
+            | SyncCommand::DeleteEvent { .. }
+            | SyncCommand::CancelEvent { .. }
+    )
+}
+
 impl Drain {
     /// Whether the caller's sync goes on after the drain.
     fn carry_on(self) -> bool {
@@ -964,9 +979,13 @@ struct Engine {
     /// A series edit went through (#2022) and the calendars owe the reset
     /// it asks for: initial rounds over every window. The first calendar
     /// refresh that finds no event op with a local write queued
-    /// (`writes_event_locally`) runs them (`refresh_calendar`), so the
-    /// reset's initial rounds never run while such an op waits. In memory
-    /// only: a restart before then drops it, and the delta rounds go on.
+    /// (`writes_event_locally`) and no such command waiting
+    /// (`command_writes_event_locally`, taken off the channel first) runs
+    /// them (`refresh_calendar`). So the reset's initial rounds never run
+    /// while such an op is queued or its command has reached the engine; a
+    /// host that writes its row after the reset's refresh began has the
+    /// general race of any refresh. In memory only: a restart before then
+    /// drops it, and the delta rounds go on.
     series_reset_owed: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
@@ -2651,12 +2670,15 @@ impl Engine {
     }
 
     /// Whether a series edit's reset (#2022) is owed and may run now: no
-    /// event op with a local write is queued, whose row an initial round
-    /// would replace (a queued `UpdateEvent` reads its row at send time, so
-    /// it would then send Graph's old values). A queue that cannot be read
-    /// counts as one that holds such an op.
+    /// event op with a local write is queued, and no command that queues one
+    /// is waiting in `deferred` (its host wrote the row already). An initial
+    /// round would replace that row, and a queued `UpdateEvent` reads its
+    /// row at send time, so it would then send Graph's old values. A queue
+    /// that cannot be read counts as one that holds such an op. The caller
+    /// takes the waiting commands first (`checkpoint`).
     fn series_reset_ready(&self) -> bool {
         self.series_reset_owed
+            && !self.deferred.iter().any(command_writes_event_locally)
             && self
                 .store
                 .pending_ops()
@@ -2668,11 +2690,21 @@ impl Engine {
     /// `Refresh` passes; `on_tick` refreshes after its pass anyway): runs
     /// the refresh a series edit's reset is waiting for, when it may run
     /// now (`series_reset_ready`), signed in and outside any wait. Returns
-    /// whether the caller carries on: false once the refresh signed out or
-    /// started a wait, which the caller must not clear.
+    /// whether the caller carries on: false after a shutdown, or once the
+    /// refresh (or a body fetch its `checkpoint` ran) signed out or started
+    /// a wait, which the caller must not clear.
     fn refresh_if_series_reset_owed(&mut self) -> bool {
         let waiting = |e: &Self| e.next_retry.is_some_and(|t| Instant::now() < t);
-        if !self.series_reset_ready() || self.token.is_none() || waiting(self) {
+        if self.shutting_down {
+            return false;
+        }
+        if !self.series_reset_owed || self.token.is_none() || waiting(self) {
+            return true;
+        }
+        if !self.checkpoint() {
+            return false;
+        }
+        if !self.series_reset_ready() {
             return true;
         }
         self.refresh_calendar();
@@ -2695,10 +2727,12 @@ impl Engine {
         self.set_state(SyncState::PendingOps(self.pending_count()));
         // A 5xx defers the op under the outbox's own back-off (`op_retry`),
         // not an engine-wide Offline: the folders keep syncing.
-        if self.token.is_some() {
-            if self.drain_outbox().carry_on() {
-                self.refresh_if_series_reset_owed();
-            }
+        // A drain or refresh a sign-in, throttle or offline error stopped
+        // keeps the state that failure set.
+        if self.token.is_some()
+            && (!self.drain_outbox().carry_on() || !self.refresh_if_series_reset_owed())
+        {
+            return;
         }
         self.settle_state();
     }
@@ -3573,7 +3607,12 @@ impl Engine {
             return;
         }
         // A series edit's reset (#2022), decided now, as these rounds would
-        // replace rows: only with no event op with a local write queued.
+        // replace rows: only with no event op with a local write queued or
+        // its command waiting. The waiting commands are taken first; a
+        // shutdown or a body fetch that stopped the engine stops here too.
+        if self.series_reset_owed && !self.checkpoint() {
+            return;
+        }
         if self.series_reset_ready() {
             if let Err(e) = self.store.clear_calendar_deltas() {
                 self.emit(SyncEvent::Error(e.to_string()));
@@ -8674,9 +8713,28 @@ mod tests {
         seed: impl FnOnce(&Store),
         options: EngineOptions,
     ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let routes = routes
+            .into_iter()
+            .map(|(r, left)| (r, left, Duration::ZERO))
+            .collect();
+        spawn_calendar_engine_paced(tag, routes, seed, options)
+    }
+
+    /// [`spawn_calendar_engine_limited`] on routes that may also wait
+    /// before they answer (`FakeServer::start_paced`).
+    fn spawn_calendar_engine_paced(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>, Duration)>,
+        seed: impl FnOnce(&Store),
+        options: EngineOptions,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
         let mut routes = routes;
-        routes.extend(backfill_routes().into_iter().map(|r| (r, None)));
-        let srv = FakeServer::start_limited(routes);
+        routes.extend(
+            backfill_routes()
+                .into_iter()
+                .map(|r| (r, None, Duration::ZERO)),
+        );
+        let srv = FakeServer::start_paced(routes);
         let base = srv.base_url.clone();
         let dir = unique_dir(tag);
         let store_path = dir.join("mail.db");
@@ -10838,6 +10896,100 @@ mod tests {
             method_paths(&srv)
         );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_waits_for_an_event_command_not_yet_queued() {
+        // The host wrote X's row and sent `UpdateEvent` right after the
+        // series edit, whose PATCH is slow: when the reset is decided, X's
+        // command is on the channel, its op not queued yet. No initial round
+        // may replace X's row, and X's PATCH sends the edit.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+            (
+                patch_route("/me/events/M1", 200, "{}"),
+                None,
+                Duration::from_millis(400),
+            ),
+            (patch_route("/me/events/X1", 500, ""), None, Duration::ZERO),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject ("Standup").
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| (r, None, Duration::ZERO)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "update-event-series-reset-command",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1"), stored_event("X1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The host writes X's row first (the engine is idle), then the two
+        // commands go out back to back.
+        let store = Store::open(&store_path).unwrap();
+        let row = store.event("X1").unwrap().unwrap();
+        let fields = store
+            .update_event_fields(
+                "X1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let reqs = method_paths(&srv);
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's command waited: {reqs:?}"
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        let x_patch = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PATCH" && r.path == "/me/events/X1")
+            .expect("X's PATCH");
+        assert!(
+            x_patch.body.contains(r#""subject":"Edited""#),
+            "{}",
+            x_patch.body
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
