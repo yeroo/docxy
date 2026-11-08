@@ -1528,7 +1528,8 @@ so the user's other devices follow.
 - Refusals are a `SyncEvent::Error` with nothing queued: a `local:` id (not on Graph,
   and a queued op's id is never retargeted when `CreateEvent` reconciles it), and a
   snooze time that, after `to_utc(t, "UTC")`, `iso8601_to_unix_secs` cannot read.
-  `to_utc` never fails (it makes a year-0000 time of any text), hence the check. The time
+  `to_utc` never fails: text that is not a time comes back malformed (padded, not
+  parsed), hence the check that the result reads as a time. The time
   is UTC: `strip_offset` drops a `+02:00` without converting it, as for RSVP proposals.
   A snooze queued offline goes out even if its time has passed by then.
 - Dedupe: an op equal to the **last** reminder op queued for the same id is not queued

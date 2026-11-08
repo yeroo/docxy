@@ -2718,8 +2718,9 @@ impl Engine {
             )));
             return;
         }
-        // `to_utc` never fails: it turns text that is not a time into a
-        // year-0000 one, which Graph would refuse.
+        // `to_utc` never fails: text that is not a time comes back
+        // malformed (padded, not parsed), which Graph would refuse, so the
+        // result must read as a time.
         let utc = crate::graph::model::to_utc(&new_reminder_utc, "UTC");
         if crate::store::iso8601_to_unix_secs(&utc).is_none() {
             self.emit(SyncEvent::Error(format!(
@@ -2952,8 +2953,11 @@ impl Engine {
     /// a non-retryable 4xx/parse bumps the attempt count and, past
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
     /// the rest of the queue proceeds, except a `SendDraft`, whose first
-    /// such failure returns the message to Drafts (`fail_send`, #1874) and
-    /// the queue proceeds too; a 5xx keeps the op and stops the
+    /// such failure returns the message to Drafts (`fail_send`, #1874), a
+    /// `CancelEvent` answered 404 (dropped, calendars reset, #1985) and a
+    /// reminder op (#2025), which its first such failure drops (with one
+    /// `Error`, none for a 404) and never quarantines; the queue proceeds
+    /// after each of them too. A 5xx keeps the op and stops the
     /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
     /// it must not stop the caller's sync either. It arms the outbox's own
     /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
