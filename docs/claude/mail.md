@@ -1509,6 +1509,56 @@ from the calendar without sending anything.
   `remove_from_calendar_of_a_removed_meeting_sends_nothing`,
   `meeting_message_commands_signed_out_send_nothing`.
 
+## Dismiss and snooze reminders (#2025)
+
+Item 6 of #1985: a reminder dismissed or snoozed here is dismissed or snoozed on Graph,
+so the user's other devices follow.
+
+- `GraphClient::dismiss_reminder(id)` POSTs `/me/events/{id}/dismissReminder` with no
+  body (`send` frames it as `Content-Length: 0`, #1954), and `snooze_reminder(id,
+  new_reminder_utc)` POSTs `.../snoozeReminder` with
+  `{"newReminderTime":{"dateTime":"2026-11-08T10:15:00","timeZone":"UTC"}}`
+  (`graph_utc_wall_clock`). Graph answers `200` with no body; the id is percent-encoded.
+- `SyncCommand::DismissReminder { id }` and `SnoozeReminder { id, new_reminder_utc }`
+  queue `OutboxOp::DismissReminder` / `SnoozeReminder` (kinds `dismissReminder`,
+  `snoozeReminder`; keys `id`, `newReminderUtc`) and drain, so an action taken offline or
+  signed out goes out later. `id` is the event the host showed the reminder for: for a
+  series, the occurrence id `calendarView` lists. Nothing tests whether Graph takes a
+  series master's id here.
+- Refusals are a `SyncEvent::Error` with nothing queued: a `local:` id (not on Graph,
+  and a queued op's id is never retargeted when `CreateEvent` reconciles it), and a
+  snooze time that, after `to_utc(t, "UTC")`, `iso8601_to_unix_secs` cannot read.
+  `to_utc` never fails: text that is not a time comes back malformed (padded, not
+  parsed), hence the check that the result reads as a time. The time
+  is UTC: `strip_offset` drops a `+02:00` without converting it, as for RSVP proposals.
+  A snooze queued offline goes out even if its time has passed by then.
+- Dedupe: an op equal to the **last** reminder op queued for the same id is not queued
+  again (a second Dismiss while the first waits, the same snooze time twice). Only the
+  last counts: with `[Dismiss, Snooze]` queued, a new Dismiss is queued, or the snooze
+  would land last and bring the reminder back.
+- No local write and no `CalendarUpdated`: the store keeps only `is_reminder_on` /
+  `reminder_minutes`, and what Exchange does to them comes back with the next calendar
+  round. Neither op is in `writes_event_locally`, so nothing resets the calendars.
+- Drain: a 404 drops the op silently (the event, and its reminder, are gone). Any other
+  refusal but a 5xx (a 400, a 403, a parse error) drops it at once with one
+  `Error("dismiss reminder {id}: {err}")` (`snooze reminder` for a snooze): no retry, no
+  quarantine, as a quarantine's mail reconverge re-enumerates the whole mailbox for an
+  op that wrote nothing. A 5xx keeps the outbox back-off; 401, throttle (429, 503) and
+  transport keep their central handling.
+- Not done: host UI (lookxy's Esc on the reminder banner only pops it; there is no
+  snooze, and the suite has no Mail reminders), and `GET /me/reminderView`, without
+  which a snooze made on another device does not move this device's reminder.
+- Tests: `client.rs` `dismiss_reminder_posts_no_body`, `snooze_reminder_posts_new_time`,
+  `reminder_ids_are_percent_encoded`, `dismiss_reminder_refused_is_an_error`; `store`
+  `outbox_op_dismiss_and_snooze_round_trip`; `outbox.rs`
+  `dismiss_reminder_posts_dismiss_reminder`, `snooze_reminder_posts_snooze_reminder`,
+  `reminder_ops_local_id_make_no_request`; `engine.rs` `dismiss_reminder_posts_to_graph`,
+  `snooze_reminder_posts_a_normalised_time`,
+  `reminder_commands_refuse_local_id_and_a_bad_time`,
+  `reminder_op_404_is_dropped_without_error`, `reminder_op_400_is_dropped_with_one_error`,
+  `dismiss_reminder_twice_while_queued_queues_one`,
+  `dismiss_after_a_queued_snooze_is_queued_again`.
+
 ## OAuth tokens in the platform secret store (#1877)
 
 - `tokencache` keeps the `TokenSet` in the platform's secret store when one is reachable: the

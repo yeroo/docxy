@@ -377,6 +377,37 @@ pub enum SyncCommand {
         to: Vec<Recipient>,
         comment: Option<String>,
     },
+    /// Dismiss a reminder on the server (#2025, Graph's
+    /// `.../dismissReminder`), so it stays dismissed on the user's other
+    /// devices: queue [`crate::store::OutboxOp::DismissReminder`] and drain.
+    /// `id` is the event a host showed the reminder for (an occurrence's id
+    /// for a series, as `calendarView` lists it). Nothing local changes, so
+    /// no `CalendarUpdated`: what Exchange does to the reminder comes back
+    /// with the next calendar round. Signed out or offline it waits in the
+    /// outbox. A `local:` id (not on Graph yet, and a queued op's id is
+    /// never retargeted when `CreateEvent` reconciles it) is a
+    /// [`SyncEvent::Error`] and nothing is queued. An op equal to the last
+    /// reminder op queued for `id` is not queued again; one after a
+    /// different op (a dismiss after a snooze) is, so the user's last action
+    /// is the one that lands. Graph answering 404 drops the op silently (the
+    /// event and its reminder are gone); any other refusal but a 5xx drops
+    /// it with one `Error`, with no retry and no quarantine, as it wrote
+    /// nothing locally.
+    DismissReminder { id: String },
+    /// Snooze a reminder on the server until `new_reminder_utc` (#2025,
+    /// Graph's `.../snoozeReminder`): queue
+    /// [`crate::store::OutboxOp::SnoozeReminder`] and drain, as
+    /// `DismissReminder` does, with the same refusals, dedupe and error
+    /// handling. The time is UTC, normalised to the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ` (`graph::model::to_utc`, which drops a numeric
+    /// offset without converting it, so pass UTC); one that does not read as
+    /// a time is an `Error` and nothing is queued. A snooze queued offline
+    /// goes out when the engine is back, even if its time has passed by
+    /// then: Graph decides what that means.
+    SnoozeReminder {
+        id: String,
+        new_reminder_utc: String,
+    },
     /// Open "the series" (#2022): GET the series master
     /// (`GraphClient::get_event`, with its `recurrence`), which
     /// `calendarView` never lists, and emit [`SyncEvent::EventSeriesFetched`].
@@ -722,6 +753,14 @@ enum Drain {
     /// Auth, throttle or transport, or the post-send sync stopping: the
     /// caller stops too and keeps the back-off.
     Aborted,
+}
+
+/// The event a reminder op (#2025) names; `None` for every other op.
+fn reminder_op_event(op: &OutboxOp) -> Option<&str> {
+    match op {
+        OutboxOp::DismissReminder { id } | OutboxOp::SnoozeReminder { id, .. } => Some(id),
+        _ => None,
+    }
 }
 
 /// An event op whose command wrote the store first (an RSVP, edited
@@ -1639,6 +1678,11 @@ impl Engine {
             }
             SyncCommand::CancelEvent { id, comment } => self.cancel_event(id, comment),
             SyncCommand::ForwardEvent { id, to, comment } => self.forward_event(id, to, comment),
+            SyncCommand::DismissReminder { id } => self.dismiss_reminder(id),
+            SyncCommand::SnoozeReminder {
+                id,
+                new_reminder_utc,
+            } => self.snooze_reminder(id, new_reminder_utc),
             SyncCommand::FetchEventSeries { id } => self.fetch_event_series(id),
             SyncCommand::FetchEventInstances {
                 id,
@@ -2655,6 +2699,60 @@ impl Engine {
         self.enqueue_and_drain(OutboxOp::ForwardEvent { id, to, comment });
     }
 
+    /// [`SyncCommand::DismissReminder`].
+    fn dismiss_reminder(&mut self, id: String) {
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "dismiss reminder {id}: the event is not on the server yet"
+            )));
+            return;
+        }
+        self.enqueue_reminder_op(OutboxOp::DismissReminder { id });
+    }
+
+    /// [`SyncCommand::SnoozeReminder`].
+    fn snooze_reminder(&mut self, id: String, new_reminder_utc: String) {
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "snooze reminder {id}: the event is not on the server yet"
+            )));
+            return;
+        }
+        // `to_utc` never fails: text that is not a time comes back
+        // malformed (padded, not parsed), which Graph would refuse, so the
+        // result must read as a time.
+        let utc = crate::graph::model::to_utc(&new_reminder_utc, "UTC");
+        if crate::store::iso8601_to_unix_secs(&utc).is_none() {
+            self.emit(SyncEvent::Error(format!(
+                "snooze reminder {id}: not a UTC time: {new_reminder_utc:?}"
+            )));
+            return;
+        }
+        self.enqueue_reminder_op(OutboxOp::SnoozeReminder {
+            id,
+            new_reminder_utc: utc,
+        });
+    }
+
+    /// Queues a reminder op (#2025) unless it equals the last reminder op
+    /// queued for the same event (a second Dismiss while the first waits
+    /// offline), then drains either way. Only the last one counts: with
+    /// `[Dismiss, Snooze]` queued, a new Dismiss is queued, or the snooze
+    /// would land last. A queue that cannot be read is queued to.
+    fn enqueue_reminder_op(&mut self, op: OutboxOp) {
+        let event = reminder_op_event(&op);
+        let last = self.store.pending_ops().ok().and_then(|rows| {
+            rows.into_iter()
+                .rev()
+                .find(|r| event.is_some() && reminder_op_event(&r.op) == event)
+        });
+        if last.is_some_and(|r| r.op == op) {
+            self.drain_queued();
+            return;
+        }
+        self.enqueue_and_drain(op);
+    }
+
     /// The series master `id` belongs to (#2022): a stored occurrence's
     /// `series_master_id`, else `id` itself (a master's id, or an event not
     /// stored). A `local:` master is not on Graph yet: `Err` with why.
@@ -2855,8 +2953,11 @@ impl Engine {
     /// a non-retryable 4xx/parse bumps the attempt count and, past
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
     /// the rest of the queue proceeds, except a `SendDraft`, whose first
-    /// such failure returns the message to Drafts (`fail_send`, #1874) and
-    /// the queue proceeds too; a 5xx keeps the op and stops the
+    /// such failure returns the message to Drafts (`fail_send`, #1874), a
+    /// `CancelEvent` answered 404 (dropped, calendars reset, #1985) and a
+    /// reminder op (#2025), which its first such failure drops (with one
+    /// `Error`, none for a 404) and never quarantines; the queue proceeds
+    /// after each of them too. A 5xx keeps the op and stops the
     /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
     /// it must not stop the caller's sync either. It arms the outbox's own
     /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
@@ -2937,6 +3038,23 @@ impl Engine {
                         self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
                         deferred = true;
                         break;
+                    }
+                    // A reminder op (#2025) wrote nothing locally, and a
+                    // retry of a 4xx or a parse failure changes nothing:
+                    // drop it at the first refusal, with no quarantine
+                    // (its mail reconverge would re-enumerate the whole
+                    // mailbox for nothing). A 404 is no error: the event is
+                    // gone, and so is its reminder.
+                    if let Some(event) = reminder_op_event(&row.op) {
+                        self.store.drop_op(row.seq);
+                        if !matches!(other, GraphError::NotFound) {
+                            let action = match row.op {
+                                OutboxOp::DismissReminder { .. } => "dismiss reminder",
+                                _ => "snooze reminder",
+                            };
+                            self.emit(SyncEvent::Error(format!("{action} {event}: {other}")));
+                        }
+                        continue;
                     }
                     // A cancel answered 404 (#1985) is either a retry after
                     // a lost 202 (Graph deleted the organizer's copy on the
@@ -10214,6 +10332,416 @@ mod tests {
             srv.requests().iter().all(|r| r.method != "POST"),
             "{:?}",
             srv.requests()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Reminders (#2025) -----------------------------------------------
+
+    /// [`spawn_meeting_engine`] on routes that may answer a limited number of
+    /// requests, with `E1` stored.
+    fn spawn_reminder_engine(
+        tag: &str,
+        extra: Vec<(Route, Option<usize>)>,
+    ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+        let (from, to) = today_window();
+        let mut routes = extra;
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, events_body(&[]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        spawn_calendar_engine_limited(
+            tag,
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![meeting("E1", false)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            },
+            EngineOptions::without_prefetch(),
+        )
+    }
+
+    /// Every POST's path, in order.
+    fn post_paths(srv: &FakeServer) -> Vec<String> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .map(|r| r.path)
+            .collect()
+    }
+
+    /// Sends a refused command and waits for its `Error`: every command sent
+    /// before it has run. Returns the events seen, the barrier's excluded.
+    fn reminder_barrier(handle: &SyncHandle) -> Vec<SyncEvent> {
+        let barrier = "dismiss reminder local:barrier: the event is not on the server yet";
+        handle
+            .cmd_tx
+            .send(SyncCommand::DismissReminder {
+                id: "local:barrier".into(),
+            })
+            .unwrap();
+        let mut seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m == barrier),
+        );
+        seen.pop();
+        seen
+    }
+
+    fn queued_ops(store: &Store) -> Vec<OutboxOp> {
+        store
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect()
+    }
+
+    #[test]
+    fn dismiss_reminder_posts_to_graph() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "dismiss-reminder",
+            vec![post_route("/me/events/E1/dismissReminder", 200, "")],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::DismissReminder { id: "E1".into() })
+            .unwrap();
+        let seen = reminder_barrier(&handle);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert!(queued_ops(&store).is_empty());
+        let posts = posts_to(&srv, "/me/events/E1/dismissReminder");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "");
+        // Nothing local changes.
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::CalendarUpdated | SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snooze_reminder_posts_a_normalised_time() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "snooze-reminder",
+            vec![post_route("/me/events/E1/snoozeReminder", 200, "")],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::SnoozeReminder {
+                id: "E1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00.0000000".into(),
+            })
+            .unwrap();
+        let seen = reminder_barrier(&handle);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert!(queued_ops(&store).is_empty());
+        let posts = posts_to(&srv, "/me/events/E1/snoozeReminder");
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].body,
+            r#"{"newReminderTime":{"dateTime":"2026-11-08T10:15:00","timeZone":"UTC"}}"#
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::CalendarUpdated | SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminder_commands_refuse_local_id_and_a_bad_time() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "reminder-refused",
+            vec![post_route("/me/events/", 200, "")],
+            vec![meeting("E1", false)],
+        );
+        let snooze = |id: &str, t: &str| SyncCommand::SnoozeReminder {
+            id: id.into(),
+            new_reminder_utc: t.into(),
+        };
+        for (cmd, error) in [
+            (
+                SyncCommand::DismissReminder {
+                    id: "local:e9".into(),
+                },
+                "dismiss reminder local:e9: the event is not on the server yet",
+            ),
+            (
+                snooze("local:e9", "2026-11-08T10:15:00Z"),
+                "snooze reminder local:e9: the event is not on the server yet",
+            ),
+            (
+                snooze("E1", ""),
+                r#"snooze reminder E1: not a UTC time: """#,
+            ),
+            (
+                snooze("E1", "   "),
+                r#"snooze reminder E1: not a UTC time: "   ""#,
+            ),
+            (
+                snooze("E1", "not a time"),
+                r#"snooze reminder E1: not a UTC time: "not a time""#,
+            ),
+            (
+                snooze("E1", "10:15"),
+                r#"snooze reminder E1: not a UTC time: "10:15""#,
+            ),
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert_eq!(seen.last(), Some(&SyncEvent::Error(error.into())));
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert!(queued_ops(&store).is_empty(), "nothing queued");
+        assert!(post_paths(&srv).is_empty(), "{:?}", srv.requests());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminder_op_404_is_dropped_without_error() {
+        let (from, to) = today_window();
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "reminder-404",
+            vec![
+                post_route(
+                    "/me/events/GONE/dismissReminder",
+                    404,
+                    r#"{"error":{"code":"ErrorItemNotFound"}}"#,
+                ),
+                post_route(
+                    "/me/events/GONE/snoozeReminder",
+                    404,
+                    r#"{"error":{"code":"ErrorItemNotFound"}}"#,
+                ),
+            ],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::DismissReminder { id: "GONE".into() })
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SnoozeReminder {
+                id: "GONE".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            })
+            .unwrap();
+        let seen = reminder_barrier(&handle);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(queued_ops(&store).is_empty(), "dropped, not retried");
+        assert_eq!(
+            post_paths(&srv),
+            [
+                "/me/events/GONE/dismissReminder",
+                "/me/events/GONE/snoozeReminder",
+            ]
+        );
+        // No calendar reset: the delta state stays, and no initial round ran.
+        assert!(store.calendar_delta("CAL-A").unwrap().is_some());
+        assert!(
+            !view_paths(&srv, "CAL-A").contains(&initial_delta_path("CAL-A", &from, &to)),
+            "{:?}",
+            view_paths(&srv, "CAL-A")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reminder_op_400_is_dropped_with_one_error() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "reminder-400",
+            vec![
+                post_route(
+                    "/me/events/E1/dismissReminder",
+                    400,
+                    r#"{"error":{"code":"ErrorInvalidRequest","message":"No reminder"}}"#,
+                ),
+                post_route(
+                    "/me/events/E1/snoozeReminder",
+                    403,
+                    r#"{"error":{"code":"ErrorAccessDenied","message":"Denied"}}"#,
+                ),
+            ],
+            vec![meeting("E1", false)],
+        );
+        let store = Store::open(&store_path).unwrap();
+        // The backfill's mail delta link, which a quarantine would clear.
+        assert!(wait_until(ENGINE_WAIT, || store
+            .get_delta_link("F1")
+            .unwrap()
+            .is_some()));
+        handle
+            .cmd_tx
+            .send(SyncCommand::DismissReminder { id: "E1".into() })
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SnoozeReminder {
+                id: "E1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            })
+            .unwrap();
+        let seen = reminder_barrier(&handle);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let errors: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::Error(_)))
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                &SyncEvent::Error("dismiss reminder E1: HTTP 400: No reminder".into()),
+                &SyncEvent::Error("snooze reminder E1: HTTP 403: Denied".into()),
+            ]
+        );
+        assert!(
+            queued_ops(&store).is_empty(),
+            "dropped at the first refusal"
+        );
+        assert_eq!(
+            post_paths(&srv),
+            [
+                "/me/events/E1/dismissReminder",
+                "/me/events/E1/snoozeReminder",
+            ]
+        );
+        assert!(
+            store.get_delta_link("F1").unwrap().is_some(),
+            "no quarantine reconverge"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dismiss_reminder_twice_while_queued_queues_one() {
+        // The POST cannot go out (a 500 defers the queue under the outbox's
+        // back-off; a 503 is a throttle, which every command resends), so the
+        // first dismiss is still queued when the second one runs.
+        let (srv, handle, store_path, dir) = spawn_reminder_engine(
+            "dismiss-reminder-twice",
+            vec![(post_route("/me/events/E1/", 500, ""), None)],
+        );
+        let snooze = || SyncCommand::SnoozeReminder {
+            id: "E1".into(),
+            new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+        };
+        for cmd in [
+            SyncCommand::DismissReminder { id: "E1".into() },
+            SyncCommand::DismissReminder { id: "E1".into() },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+        }
+        reminder_barrier(&handle);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            queued_ops(&store),
+            [OutboxOp::DismissReminder { id: "E1".into() }]
+        );
+        // The same snooze time twice is queued once too.
+        for cmd in [snooze(), snooze()] {
+            handle.cmd_tx.send(cmd).unwrap();
+        }
+        reminder_barrier(&handle);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(
+            queued_ops(&store),
+            [
+                OutboxOp::DismissReminder { id: "E1".into() },
+                OutboxOp::SnoozeReminder {
+                    id: "E1".into(),
+                    new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            post_paths(&srv),
+            ["/me/events/E1/dismissReminder"],
+            "the back-off holds the rest"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dismiss_after_a_queued_snooze_is_queued_again() {
+        // The first dismiss meets a 500, which defers the queue; the rest go
+        // through once `Refresh` resends it.
+        let (srv, handle, store_path, dir) = spawn_reminder_engine(
+            "dismiss-after-snooze",
+            vec![
+                (
+                    post_route("/me/events/E1/dismissReminder", 500, ""),
+                    Some(1),
+                ),
+                (post_route("/me/events/E1/", 200, ""), None),
+            ],
+        );
+        for cmd in [
+            SyncCommand::DismissReminder { id: "E1".into() },
+            SyncCommand::SnoozeReminder {
+                id: "E1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+            SyncCommand::DismissReminder { id: "E1".into() },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+        }
+        reminder_barrier(&handle);
+        let store = Store::open(&store_path).unwrap();
+        let dismiss = OutboxOp::DismissReminder { id: "E1".into() };
+        assert_eq!(
+            queued_ops(&store),
+            [
+                dismiss.clone(),
+                OutboxOp::SnoozeReminder {
+                    id: "E1".into(),
+                    new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+                },
+                dismiss,
+            ]
+        );
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || queued_ops(&store).is_empty()),
+            "not drained: {:?}",
+            srv.requests()
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        // The user's last action, the dismiss, lands last.
+        assert_eq!(
+            post_paths(&srv),
+            [
+                "/me/events/E1/dismissReminder",
+                "/me/events/E1/dismissReminder",
+                "/me/events/E1/snoozeReminder",
+                "/me/events/E1/dismissReminder",
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -145,6 +145,24 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             }
             client.update_event_body(id, body.clone()).map(|_| ())
         }
+        // A reminder (#2025): nothing local to reconcile. The engine refuses
+        // a `local:` id, so only a hand-edited row holds one, and it sends
+        // nothing. A 404 is returned as is: the drain drops the op.
+        OutboxOp::DismissReminder { id } => {
+            if id.starts_with("local:") {
+                return Ok(());
+            }
+            client.dismiss_reminder(id)
+        }
+        OutboxOp::SnoozeReminder {
+            id,
+            new_reminder_utc,
+        } => {
+            if id.starts_with("local:") {
+                return Ok(());
+            }
+            client.snooze_reminder(id, new_reminder_utc)
+        }
     }
 }
 
@@ -2257,6 +2275,73 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    /// A `dismissReminder` / `snoozeReminder` answer: `200`, no body.
+    fn reminder_route(path: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    #[test]
+    fn dismiss_reminder_posts_dismiss_reminder() {
+        let srv = FakeServer::start(vec![reminder_route("/me/events/EV1/dismissReminder")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(&c, &store, &OutboxOp::DismissReminder { id: "EV1".into() }).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/EV1/dismissReminder");
+        assert_eq!(reqs[0].body, "");
+    }
+
+    #[test]
+    fn snooze_reminder_posts_snooze_reminder() {
+        let srv = FakeServer::start(vec![reminder_route("/me/events/EV1/snoozeReminder")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SnoozeReminder {
+                id: "EV1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/EV1/snoozeReminder");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"newReminderTime":{"dateTime":"2026-11-08T10:15:00","timeZone":"UTC"}}"#
+        );
+    }
+
+    #[test]
+    fn reminder_ops_local_id_make_no_request() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        for op in [
+            OutboxOp::DismissReminder {
+                id: "local:never".into(),
+            },
+            OutboxOp::SnoozeReminder {
+                id: "local:never".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        ] {
+            apply_op(&c, &store, &op).unwrap();
+        }
         assert!(srv.requests().is_empty());
     }
 
