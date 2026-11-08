@@ -397,10 +397,12 @@ pub struct EventInput {
     /// The recurrence pattern for a repeating event, or `None` for a single
     /// event. Serialized into the create/update body by `event_body_json`.
     pub recurrence: Option<Recurrence>,
-    /// A series edit's recurrence (#2022), Graph's own lossless shape: when
-    /// `Some`, the `recurrence` group sends it (`to_send_json`) instead of
-    /// the create-side `recurrence`, so a `relativeMonthly` or `numbered`
-    /// series is not rewritten into one of the create side's three kinds.
+    /// Graph's own lossless recurrence: a series edit's (#2022), or the one a
+    /// local create was given (`LocalEventFields::series_recurrence`, #2034,
+    /// through `Store::event_for_send`). When `Some`, the `recurrence` group
+    /// sends it (`to_send_json`) instead of the create-side `recurrence`, so
+    /// a `relativeMonthly` or `numbered` series is not rewritten into one of
+    /// the create side's three kinds.
     pub series_recurrence: Option<EventRecurrence>,
     /// Graph `showAs`, `sensitivity`, `importance`; `""` is not sent (Graph
     /// refuses an empty enum).
