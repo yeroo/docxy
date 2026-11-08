@@ -368,20 +368,27 @@ impl Docxy {
             let Surface::Ext(e) = &mut t.surface else {
                 continue;
             };
-            let old: Vec<&'static str> = e
-                .ribbon()
-                .map(|r| r.tab_names().into_iter().map(|(n, _)| n).collect())
-                .unwrap_or_default();
-            if !e.refresh(generation, force_active && i == active, cx) || i != active {
+            let force = force_active && i == active;
+            if !e.needs_read(generation, force) {
                 continue;
             }
-            if let (RibbonTab::Ext(k), Some(r)) = (self.ribbon_tab, e.ribbon()) {
-                let new: Vec<&str> = r.tab_names().into_iter().map(|(n, _)| n).collect();
-                reselected = Some(tab_index(reselect(&old, &new, usize::from(k))));
+            let names = |e: &ExtTab| -> Vec<&'static str> {
+                e.ribbon()
+                    .map(|r| r.tab_names().into_iter().map(|(n, _)| n).collect())
+                    .unwrap_or_default()
+            };
+            let old = names(e);
+            e.refresh(generation, force, cx);
+            if let (true, RibbonTab::Ext(k)) = (i == active, self.ribbon_tab) {
+                reselected = Some(tab_index(reselect(&old, &names(e), usize::from(k))));
             }
         }
         if let Some(k) = reselected {
             self.ribbon_tab = RibbonTab::Ext(k);
+        }
+        // The active tab shows one of its tabs before any frame does.
+        if let Some(r) = self.active_ext_ribbon() {
+            self.ribbon_tab = valid_tab(self.ribbon_tab, r.tabs.len());
         }
     }
 

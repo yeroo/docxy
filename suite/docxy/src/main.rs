@@ -16823,18 +16823,19 @@ impl Docxy {
 
     /// The definition of the selected ribbon tab, contextual tabs included.
     fn active_ribbon_tab_def(&self) -> rs::Tab<Act> {
+        // An extension's tab (#1870): one of its own, whatever was selected
+        // before (it holds at least one).
+        if let Some(r) = self.active_ext_ribbon() {
+            let RibbonTab::Ext(i) = ext_ribbon::valid_tab(self.ribbon_tab, r.tabs.len()) else {
+                unreachable!("valid_tab gives an extension tab");
+            };
+            return r.tabs[usize::from(i)].clone();
+        }
         match self.ribbon_tab {
             RibbonTab::TableDesign => table_tab::table_design_tab(),
             RibbonTab::TableLayout => table_tab::table_layout_tab(),
             RibbonTab::HeaderFooter => hf_tab::hf_tab(),
             RibbonTab::GanttFormat => gantt_format_tab(),
-            RibbonTab::Ext(i) if self.active_ext_ribbon().is_some() => {
-                let tabs = &self.active_ext_ribbon().expect("checked").tabs;
-                tabs.get(usize::from(i))
-                    .or(tabs.first())
-                    .cloned()
-                    .expect("an extension ribbon has a tab")
-            }
             tab => {
                 let kind = self.ribbon_kind();
                 ribbon_for(kind)
