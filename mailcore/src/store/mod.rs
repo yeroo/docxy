@@ -2151,6 +2151,20 @@ impl Store {
             })?)
     }
 
+    /// The folder a stored message is filed in (by its current id), `None`
+    /// when no row has that id. The engine reads it before storing a search
+    /// hit (#2006), whose merge re-files a row Graph has elsewhere.
+    pub fn message_folder(&self, message_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT folder_id FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Up to `limit` ids of the messages the engine fetches a body for on
     /// its own (#1978), newest first: received at `since` or later (so a
     /// header-less row is out), not a draft (`get_body_for`'s rule: marked
@@ -5359,6 +5373,18 @@ mod tests {
             well_known_name: None,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn message_folder_reads_a_rows_folder() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "F2");
+        s.upsert_message("F1", &msg("01", false)).unwrap();
+        assert_eq!(s.message_folder("01").unwrap().as_deref(), Some("F1"));
+        s.move_message("01", "F2").unwrap();
+        assert_eq!(s.message_folder("01").unwrap().as_deref(), Some("F2"));
+        assert_eq!(s.message_folder("missing").unwrap(), None);
     }
 
     /// Every column of a message row, as SQLite holds it.
