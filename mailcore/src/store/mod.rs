@@ -983,6 +983,17 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Begins a write transaction: IMMEDIATE, so it takes the write lock at
+    /// `BEGIN` and waits out another connection's write (rusqlite's 5 s busy
+    /// timeout) before it reads. The engine and a host (lookxy, its tests)
+    /// each hold a connection to one WAL file; a DEFERRED transaction that
+    /// read first and then writes after the other connection committed gets
+    /// `SQLITE_BUSY_SNAPSHOT` ("database is locked") at once, with no busy
+    /// wait, as its snapshot is stale. Every store transaction writes.
+    fn write_tx(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+    }
+
     /// Opens an in-memory database — for tests only.
     pub fn open_in_memory() -> Result<Store, StoreError> {
         let conn = Connection::open_in_memory()?;
@@ -1226,7 +1237,7 @@ impl Store {
     pub fn retain_folders(&self, keep: &[String]) -> Result<usize, StoreError> {
         let keep_json =
             Value::Array(keep.iter().map(|id| Value::Str(id.clone())).collect()).to_string();
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let mut removed = tx.execute(
             "DELETE FROM folders
              WHERE id <> ?2 AND id NOT IN (SELECT value FROM json_each(?1))",
@@ -1663,7 +1674,7 @@ impl Store {
     /// `/me/outlook/masterCategories` is not a delta endpoint — each fetch is
     /// the full set, so replacing prunes deleted categories).
     pub fn replace_master_categories(&self, cats: &[MasterCategory]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM master_categories", [])?;
         for c in cats {
             tx.execute(
@@ -1783,7 +1794,7 @@ impl Store {
     /// restarted before the reconverge ends still runs it without the
     /// window's cutoff.
     pub fn clear_delta_links(&self) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
@@ -1960,7 +1971,7 @@ impl Store {
         asked: BodyFormat,
         headers: &[MessageHeader],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         write_body_on(&tx, message_id, b, Some(asked))?;
         tx.execute(
             "DELETE FROM message_headers WHERE message_id = ?1",
@@ -2227,7 +2238,7 @@ impl Store {
         // not there yet, or Drafts is) or after it (the sentinel holds this
         // draft and is kept), never between the sentinel's insert and the
         // draft's (#1886).
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let folder_id = drafts_folder_id_on(&tx)?;
         tx.execute(
             "INSERT INTO messages (
@@ -2276,7 +2287,7 @@ impl Store {
         bcc: &str,
         body_html: &str,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             concat!(
                 "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5,
@@ -2530,7 +2541,7 @@ impl Store {
     /// reaching the draft: see `current_id` and the calls that take a draft
     /// id. The alias goes with the row whenever the message is deleted.
     pub fn reconcile_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
             "UPDATE messages SET id = ?2,
@@ -2649,9 +2660,9 @@ impl Store {
     /// The delete-then-insert runs inside a single transaction (per spec §5
     /// on multi-row writes): `Store` only holds a shared `&Connection`
     /// (`put_attachments` takes `&self`, not `&mut self`, to match the
-    /// rest of this type's methods), so this uses
-    /// `Connection::unchecked_transaction` — rusqlite's transaction handle
-    /// for exactly that shared-borrow case — rather than
+    /// rest of this type's methods), so this uses `write_tx`
+    /// (`Transaction::new_unchecked`, IMMEDIATE) — rusqlite's transaction
+    /// handle for exactly that shared-borrow case — rather than
     /// `Connection::transaction`, which needs `&mut Connection`. If any
     /// statement fails, the `?` drops the transaction before `commit()`
     /// runs, which rolls it back and leaves the prior attachments
@@ -2661,7 +2672,7 @@ impl Store {
         message_id: &str,
         atts: &[AttachmentMeta],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM attachments WHERE message_id = ?1",
             params![message_id],
@@ -2845,10 +2856,10 @@ impl Store {
 
     /// Replaces the full set of attendees stored for an event. See
     /// `put_attachments` for why the delete-then-insert runs in one
-    /// transaction via `unchecked_transaction` (same shared-`&self`
+    /// transaction via `write_tx` (same shared-`&self`
     /// reasoning applies here).
     pub fn put_event_attendees(&self, id: &str, a: &[NewAttendee]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         put_event_attendees_on(&tx, id, a)?;
         tx.commit()?;
         Ok(())
@@ -2910,7 +2921,7 @@ impl Store {
         events: &[NewEvent],
         attendees: &[(String, Vec<NewAttendee>)],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1 AND id NOT LIKE 'local:%'",
             params![from_utc, to_utc],
@@ -3098,7 +3109,7 @@ impl Store {
         let reminder = f.reminder.unwrap_or_default();
         let enum_or =
             |v: &Option<String>, default: &str| non_empty(v).unwrap_or_else(|| default.to_string());
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         upsert_event_on(
             &tx,
             &NewEvent {
@@ -3186,7 +3197,7 @@ impl Store {
         id: &str,
         f: &LocalEventFields,
     ) -> Result<EventFieldSet, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let old = event_for_send_on(&tx, id)?
             .ok_or_else(|| StoreError::Sql(format!("no event stored for {id}")))?;
         let stored_attendees = event_attendees_on(&tx, id)?;
@@ -3290,7 +3301,7 @@ impl Store {
 
     /// Removes an event (and its attendees) locally.
     pub fn delete_event(&self, id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM event_attendees WHERE event_id = ?1",
             params![id],
@@ -3307,7 +3318,7 @@ impl Store {
     /// host calls it before `SyncCommand::DeleteEvent { id: master_id }`,
     /// as it calls `delete_event` before deleting one event.
     pub fn delete_event_series(&self, master_id: &str) -> Result<usize, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM event_attendees WHERE event_id IN
                 (SELECT id FROM events WHERE id = ?1 OR series_master_id = ?1)",
@@ -3355,7 +3366,7 @@ impl Store {
         created: &Event,
     ) -> Result<(), StoreError> {
         let graph_id = created.id.as_str();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
             "UPDATE events SET id = ?2 WHERE id = ?1",
@@ -3412,7 +3423,7 @@ impl Store {
     /// is kept apart from this list, so a chosen calendar that vanishes and
     /// comes back is still chosen.
     pub fn replace_calendars(&self, calendars: &[Calendar]) -> Result<bool, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let before = stored_calendars_on(&tx)?;
         let mut seen = HashSet::new();
         let after: Vec<Calendar> = calendars
@@ -3488,7 +3499,7 @@ impl Store {
     /// a host restoring its choice at startup, before the first list,
     /// deletes nothing. Returns whether the synced set changed.
     pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let before = synced_calendar_ids_on(&tx)?;
         match ids {
             Some(ids) => {
@@ -3555,7 +3566,7 @@ impl Store {
         fetched: &[SyncedCalendar],
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         for c in fetched {
             let cascaded = match &c.round {
@@ -3620,7 +3631,7 @@ impl Store {
         f: &FetchedCalendar,
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp)?;
         tx.commit()?;
@@ -3862,7 +3873,7 @@ impl Store {
             }
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         for (address, (name, last_seen, frequency)) in agg {
             self.upsert_contact(&Contact {
                 name,
@@ -3888,7 +3899,7 @@ impl Store {
     /// non-empty name winning. An empty slice empties the set. Never touches
     /// `contacts` (people and mined correspondents).
     pub fn replace_folder_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM folder_contacts", [])?;
         for c in contacts {
             let address = folder_contact_key(&c.address);
@@ -6023,6 +6034,73 @@ mod tests {
 #[cfg(test)]
 mod calendar_tests {
     use super::*;
+
+    /// Two connections to one WAL file, as the engine and a host hold
+    /// (#2023 r3): while one holds the write lock and then commits, the
+    /// other's read-then-write transactions wait it out instead of failing
+    /// with `database is locked` (a DEFERRED transaction's stale snapshot,
+    /// `SQLITE_BUSY_SNAPSHOT`, which no busy timeout waits out).
+    #[test]
+    fn writes_wait_out_another_connections_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-write-tx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let a = Store::open(&path).unwrap();
+        a.upsert_event(&ev("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"))
+            .unwrap();
+        // Each of A's writes runs while another connection holds the write
+        // lock, and that connection commits a change after A began.
+        let while_b_writes = |write: &dyn Fn(&Store)| {
+            let (locked, is_locked) = std::sync::mpsc::channel();
+            let p = path.clone();
+            let b = std::thread::spawn(move || {
+                let b = Connection::open(&p).unwrap();
+                b.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     UPDATE events SET location = 'by B' WHERE id = 'E1';",
+                )
+                .unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                b.execute_batch("COMMIT").unwrap();
+            });
+            is_locked.recv().unwrap();
+            write(&a);
+            b.join().unwrap();
+        };
+        while_b_writes(&|a| {
+            let row = a.event("E1").unwrap().unwrap();
+            a.update_event_fields(
+                "E1",
+                &LocalEventFields {
+                    subject: "by A".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: "by A".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
+        let row = a.event("E1").unwrap().unwrap();
+        assert_eq!(
+            (row.subject.as_str(), row.location.as_str()),
+            ("by A", "by A")
+        );
+        while_b_writes(&|a| {
+            a.create_local_event(&sample_fields(), "Me", "me@x")
+                .unwrap();
+        });
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ev(id: &str, start: &str, end: &str) -> NewEvent {
         NewEvent {

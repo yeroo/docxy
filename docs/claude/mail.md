@@ -1384,6 +1384,13 @@ proposal.
   event that disallows it (the engine refuses it and owes the reset), and does not show
   attendees' proposals. The organizer accepting a proposal is an `update_event` of the
   times.
+- Every `Store` transaction is IMMEDIATE (`Store::write_tx`; all of them write). The
+  engine and a host (lookxy, the engine tests) each hold a connection to one WAL file,
+  and a DEFERRED transaction that read first and then writes after the other connection
+  committed gets `SQLITE_BUSY_SNAPSHOT` ("database is locked") at once: rusqlite's 5 s
+  busy timeout never waits that out. IMMEDIATE takes the write lock at `BEGIN`, which
+  the timeout does wait for. This was the flaky `database is locked` in the engine tests
+  on macOS and Windows CI (`store` test `writes_wait_out_another_connections_write`).
 - Tests: `client.rs` `respond_event_tentative_with_proposed_time_sends_proposed_new_time`,
   `respond_event_accept_drops_a_proposed_time`, `rsvp_kind_from_status`,
   `rsvp_proposal_normalises_and_refuses`; `model.rs` `attendee_proposed_new_time`;
