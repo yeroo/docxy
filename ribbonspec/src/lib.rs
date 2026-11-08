@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 /// The whole ribbon for an app.
+#[derive(Clone)]
 pub struct Ribbon<A> {
     /// Quick Access Toolbar — a few always-visible commands (Save, Undo, Redo),
     /// rendered in the window chrome above/around the tabs.
@@ -53,6 +54,7 @@ impl<A> Ribbon<A> {
 }
 
 /// A persistent ribbon tab.
+#[derive(Clone)]
 pub struct Tab<A> {
     pub name: &'static str,
     /// The Alt-access badge (e.g. "H" for Home). Empty = none.
@@ -61,6 +63,7 @@ pub struct Tab<A> {
 }
 
 /// A contextual tab (Table Tools, Picture Tools, …) — shown only in-context.
+#[derive(Clone)]
 pub struct ContextTab<A> {
     pub name: &'static str,
     /// The context whose presence reveals this tab.
@@ -94,6 +97,7 @@ pub enum Accent {
 }
 
 /// A group of controls within a tab, drawn as a titled card with a divider.
+#[derive(Clone)]
 pub struct Group<A> {
     pub title: &'static str,
     /// The dialog-box launcher action (the small ⤢ at the group's corner), if the
@@ -112,6 +116,7 @@ pub struct Group<A> {
 
 /// A control placed in a group. The variant encodes *size/kind intent*; the
 /// renderer decides exact metrics per its skin.
+#[derive(Clone)]
 pub enum Control<A> {
     /// A big icon-over-label button (the group's headline command).
     Large(Cmd<A>),
@@ -135,12 +140,14 @@ pub enum Control<A> {
 
 /// One cell in a [`Control::Rows`] grid: a small icon button, or a combo box that
 /// shows the current value and opens a picker (Font name / Font size).
+#[derive(Clone)]
 pub enum Cell<A> {
     Btn(Cmd<A>),
     Combo { cmd: Cmd<A>, wide: bool },
 }
 
 /// A gallery control — a scrollable grid/row of visual choices.
+#[derive(Clone)]
 pub struct Gallery<A> {
     pub id: &'static str,
     pub tip: ScreenTip,
@@ -151,6 +158,7 @@ pub struct Gallery<A> {
 
 /// One gallery choice. `preview` is a renderer hint (e.g. a style id) for the live
 /// preview; `act` applies it.
+#[derive(Clone)]
 pub struct GalleryItem<A> {
     pub label: &'static str,
     pub preview: &'static str,
@@ -160,6 +168,7 @@ pub struct GalleryItem<A> {
 }
 
 /// A single command: what a button/menu-item invokes, plus its presentation.
+#[derive(Clone)]
 pub struct Cmd<A> {
     pub id: &'static str,
     pub label: &'static str,
