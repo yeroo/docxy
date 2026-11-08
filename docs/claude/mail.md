@@ -1324,6 +1324,8 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_reset_skips_an_event_edit_queued_after_it`,
   `update_event_series_reset_waits_for_an_event_command_not_yet_queued` (a slow
   series PATCH, `spawn_calendar_engine_paced`),
+  `update_event_series_reset_offline_keeps_the_state`,
+  `update_event_series_reset_does_not_refresh_after_a_shutdown`,
   `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
