@@ -2423,7 +2423,11 @@ mod tests {
         // A link that loops (or a server that keeps sending one) ends at
         // the first page that brings nothing.
         let srv = FakeServer::start(vec![
-            search_page("/me/messages?$skiptoken=", "", Some("/me/messages?$skiptoken=1")),
+            search_page(
+                "/me/messages?$skiptoken=",
+                "",
+                Some("/me/messages?$skiptoken=1"),
+            ),
             search_page(
                 "/me/messages?$search",
                 r#"{"id":"M1"}"#,
