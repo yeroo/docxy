@@ -277,3 +277,26 @@ test issue 1870 the extension reads the suite's theme and is told when it change
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
+
+test issue 1870 a document tab beside it keeps its own ribbon, and the Mail tab its own
+  # Last: the document it opens stays open.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ribbon-layout {"tab":"View"}
+  shot window
+  assert ribbon_tab is View
+  open copy:../fixtures/basic.docx
+  shot window
+  call ribbon-read {}
+  assert reply.tabs.1.name is Home
+  assert ribbon_tab is Home
+  call tab-list {}
+  assert reply.tabs.1.kind is mail
+  call tab-select {"tab":1}
+  shot window
+  call ribbon-read {}
+  assert reply.tabs.1.name is Message
+  assert ribbon_tab is Message
+  shot window
