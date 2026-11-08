@@ -192,8 +192,11 @@ pub enum SyncCommand {
     /// and drains: Graph gets `DELETE /me/events/{id}`, which for an
     /// attendee tells nobody. A failed local delete is an `Error`, and the
     /// rest still happens (the op is queued; the next calendar round removes
-    /// the row). The host must not delete the row first. The cancellation
-    /// message itself stays in mail: the host may delete it.
+    /// the row). A `DeleteEvent` of the same event already queued (a second
+    /// remove while the first waits offline) is not queued again, as its
+    /// DELETE would 404 once the first went out. The host must not delete the
+    /// row first. The cancellation message itself stays in mail: the host may
+    /// delete it.
     RemoveFromCalendar { message_id: String },
     /// Fetch the mailbox's automatic-replies config
     /// (`GraphClient::get_automatic_replies`) and emit
@@ -3598,9 +3601,18 @@ impl Engine {
         }
         // Queue first, as `cancel_event` does: a row deleted before a queue
         // that then fails would stay hidden, as delta reports no change for it.
-        if let Err(e) = self.store.enqueue_op(&OutboxOp::DeleteEvent {
+        // A remove of the same event still queued (offline, a back-off) is
+        // not queued twice: its second DELETE would 404 after the first went
+        // out, and a `DeleteEvent` 404 is retried into a quarantine. A queue
+        // that cannot be read is queued to.
+        let op = OutboxOp::DeleteEvent {
             id: event_id.clone(),
-        }) {
+        };
+        let queued = self
+            .store
+            .pending_ops()
+            .is_ok_and(|ops| ops.iter().any(|r| r.op == op));
+        if !queued && let Err(e) = self.store.enqueue_op(&op) {
             self.emit(SyncEvent::Error(format!(
                 "remove from calendar {message_id}: {e}"
             )));
@@ -10399,6 +10411,66 @@ mod tests {
         assert_eq!(
             non_gets(&srv),
             [("DELETE".to_string(), "/me/events/SM".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_from_calendar_twice_while_queued_queues_one_delete() {
+        // The DELETE cannot go out (503), so the first remove's op is still
+        // queued when the second one, of the same cancellation, runs.
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "remove-from-calendar-twice",
+            vec![
+                message_route(
+                    "M1",
+                    r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                        "event":{"id":"E1","isOrganizer":false}}"#,
+                ),
+                Route {
+                    status: 503,
+                    ..delete_route("/me/events/E1")
+                },
+            ],
+            vec![meeting("E1", false), meeting("E2", false)],
+        );
+        let store = Store::open(&store_path).unwrap();
+        for _ in 0..2 {
+            handle
+                .cmd_tx
+                .send(SyncCommand::RemoveFromCalendar {
+                    message_id: "M1".into(),
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(
+                    e,
+                    SyncEvent::RemovedFromCalendar { .. } | SyncEvent::Error(_)
+                )
+            });
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::RemovedFromCalendar {
+                    message_id: "M1".into(),
+                    event_id: Some("E1".into()),
+                })
+            );
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let ops: Vec<_> = store
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        assert_eq!(ops, [OutboxOp::DeleteEvent { id: "E1".into() }]);
+        assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+        assert!(
+            non_gets(&srv)
+                .iter()
+                .all(|(m, p)| m == "DELETE" && p == "/me/events/E1"),
+            "{:?}",
+            srv.requests()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

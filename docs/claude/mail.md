@@ -1482,7 +1482,11 @@ from the calendar without sending anything.
   is), emits `CalendarUpdated` and `RemovedFromCalendar { event_id: Some(..) }`, and
   drains. Graph gets `DELETE /me/events/{id}`, which for an attendee tells nobody; there
   is no `/decline` or `/cancel`. A failed local delete is an `Error`, and the rest still
-  runs: the op is queued, and the next calendar round removes the row. The host must not
+  runs: the op is queued, and the next calendar round removes the row. A `DeleteEvent` of
+  the same event already queued (a second remove while the first waits offline or in a
+  back-off) is not queued again: Graph still holds the event, so both would resolve it,
+  and the second DELETE would 404 after the first went out, which `DeleteEvent`'s drain
+  retries into a quarantine. A queue that cannot be read is queued to. The host must not
   delete the row first. The command is in `command_writes_event_locally`, next to
   `CancelEvent`. Both commands start with the signed-in guard (`Error("not signed in")`,
   nothing sent), and a failed GET goes through `react`.
@@ -1499,6 +1503,7 @@ from the calendar without sending anything.
   `fetch_meeting_message_emits_type_and_event`,
   `remove_from_calendar_deletes_the_event_without_sending`,
   `remove_from_calendar_removes_a_cancelled_series`,
+  `remove_from_calendar_twice_while_queued_queues_one_delete`,
   `remove_from_calendar_refuses_a_message_that_is_not_a_cancellation`,
   `remove_from_calendar_refuses_the_organizer`,
   `remove_from_calendar_of_a_removed_meeting_sends_nothing`,
