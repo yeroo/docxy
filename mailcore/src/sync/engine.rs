@@ -661,6 +661,21 @@ enum Drain {
     Aborted,
 }
 
+/// An event op whose command wrote the store first (an RSVP, edited
+/// fields, a deleted row): what a quarantine must undo with initial
+/// calendar rounds, and what a series edit's reset waits for (#2022), as
+/// an initial round would replace the row. `CreateEvent`'s `local:` row is
+/// never replaced, and `UpdateEventSeries` writes nothing locally.
+fn writes_event_locally(op: &OutboxOp) -> bool {
+    matches!(
+        op,
+        OutboxOp::RespondEvent { .. }
+            | OutboxOp::UpdateEvent { .. }
+            | OutboxOp::DeleteEvent { .. }
+            | OutboxOp::CancelEvent { .. }
+    )
+}
+
 impl Drain {
     /// Whether the caller's sync goes on after the drain.
     fn carry_on(self) -> bool {
@@ -886,6 +901,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backoff: BACKOFF_MIN,
         backfill_done: false,
         reconverge_pending,
+        series_reset_owed: false,
+        calendar_refresh_owed: false,
         parked: Vec::new(),
         expired: Vec::new(),
         next_tick: Instant::now(),
@@ -942,6 +959,14 @@ struct Engine {
     /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
+    /// A series edit went through (#2022) and the calendars still owe the
+    /// reset it asks for: cleared once no event op with a local write is
+    /// queued (`settle_series_reset`), so the initial rounds never replace
+    /// a row whose own edit still waits. In memory only.
+    series_reset_owed: bool,
+    /// The reset cleared every calendar's delta state, and no refresh has
+    /// run since: a command's drain (`drain_queued`) refreshes at once.
+    calendar_refresh_owed: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
     parked: Vec<String>,
@@ -2636,7 +2661,16 @@ impl Engine {
         // A 5xx defers the op under the outbox's own back-off (`op_retry`),
         // not an engine-wide Offline: the folders keep syncing.
         if self.token.is_some() {
-            self.drain_outbox();
+            let drained = self.drain_outbox();
+            // A series edit's reset (#2022): a tick's own calendar refresh
+            // runs after its drain, a command's has none, so it runs here,
+            // unless the drain stopped (sign-in, throttle, offline) or a
+            // wait is running.
+            let waiting = self.next_retry.is_some_and(|t| Instant::now() < t);
+            if self.calendar_refresh_owed && drained.carry_on() && self.token.is_some() && !waiting
+            {
+                self.refresh_calendar();
+            }
         }
         self.settle_state();
     }
@@ -2660,6 +2694,38 @@ impl Engine {
     /// transport, or that sync stopping), so the caller stops too and keeps
     /// the back-off.
     fn drain_outbox(&mut self) -> Drain {
+        let drained = self.drain_outbox_rows();
+        self.settle_series_reset();
+        drained
+    }
+
+    /// A series edit that went through (#2022) changed occurrences no local
+    /// write predicted, and a pattern change mints new occurrence ids, so
+    /// the calendars are reset: every delta state cleared, on disk, so the
+    /// next refresh runs initial rounds that take each window from Graph.
+    /// Not while an event op with a local write (`writes_event_locally`)
+    /// is still queued: an initial round would replace its row, and an
+    /// `UpdateEvent` would then send Graph's old values. A later drain
+    /// that leaves none settles it. Called after every drain, however it
+    /// ended; it calls no Graph, so a stopped drain stays stopped.
+    fn settle_series_reset(&mut self) {
+        if !self.series_reset_owed {
+            return;
+        }
+        match self.store.pending_ops() {
+            Ok(ops) if !ops.iter().any(|r| writes_event_locally(&r.op)) => {}
+            _ => return,
+        }
+        if let Err(e) = self.store.clear_calendar_deltas() {
+            self.emit(SyncEvent::Error(e.to_string()));
+            return;
+        }
+        self.series_reset_owed = false;
+        self.calendar_refresh_owed = true;
+    }
+
+    /// [`Engine::drain_outbox`] before the series reset.
+    fn drain_outbox_rows(&mut self) -> Drain {
         let ops = match self.store.pending_ops() {
             Ok(o) => o,
             // A row that won't deserialize can't be pinpointed through the
@@ -2688,24 +2754,14 @@ impl Engine {
 
         let mut sent = Vec::new();
         let mut deferred = false;
-        let mut series_edited = false;
         for row in ops {
             match self.apply_op_with_retry(&row) {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
-                    // A series edit (#2022) changes occurrences no local
-                    // write predicted, and a pattern change mints new
-                    // occurrence ids: once it went through, initial rounds
-                    // take each window from Graph. The delta state goes at
-                    // once, on disk, so a drain that stops below still
-                    // leaves the next pass an initial one; the refresh runs
-                    // once, after the loop.
+                    // The calendars owe a reset (`settle_series_reset`).
                     if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
-                        if let Err(e) = self.store.clear_calendar_deltas() {
-                            self.emit(SyncEvent::Error(e.to_string()));
-                        }
-                        series_edited = true;
+                        self.series_reset_owed = true;
                     }
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
@@ -2784,13 +2840,7 @@ impl Engine {
                         let _ = self.store.clear_delta_links();
                         self.backfill_done = false;
                         self.reconverge_pending = true;
-                        let is_event_op = matches!(
-                            row.op,
-                            OutboxOp::RespondEvent { .. }
-                                | OutboxOp::UpdateEvent { .. }
-                                | OutboxOp::DeleteEvent { .. }
-                                | OutboxOp::CancelEvent { .. }
-                        );
+                        let is_event_op = writes_event_locally(&row.op);
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
                             row.seq
@@ -2816,9 +2866,6 @@ impl Engine {
                     // Keep draining the rest of the queue.
                 }
             }
-        }
-        if series_edited {
-            self.refresh_calendar();
         }
         if !sent.is_empty() && !self.sync_after_send(&sent) {
             return Drain::Aborted;
@@ -3525,6 +3572,8 @@ impl Engine {
     /// to reconverge the optimistic local write with server truth (see the
     /// quarantine branch there), and by `set_calendars`.
     fn refresh_calendar(&mut self) {
+        // Every refresh after a series reset is an initial one (#2022).
+        self.calendar_refresh_owed = false;
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
@@ -10387,6 +10436,215 @@ mod tests {
         assert!(
             initial_round_after_patch(&srv, "/me/events/M1", 1),
             "no calendar reset after the later PATCH: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `/me/events` or calendar view requests from the `nth` (0-based)
+    /// PATCH of `path` on, in order.
+    fn requests_after_patch(srv: &FakeServer, path: &str, nth: usize) -> Vec<(String, String)> {
+        let reqs = method_paths(srv);
+        let at = reqs
+            .iter()
+            .enumerate()
+            .filter(|(_, (m, p))| m == "PATCH" && p == path)
+            .map(|(i, _)| i)
+            .nth(nth)
+            .unwrap_or_else(|| panic!("no PATCH #{nth} of {path}: {reqs:?}"));
+        reqs[at + 1..].to_vec()
+    }
+
+    #[test]
+    fn update_event_series_reset_throttled_stops_the_pass() {
+        // The series PATCH goes through on a tick (the command's drain is
+        // throttled for a second), and the reset's initial round is
+        // throttled for 30 s: that tick makes no further Graph request,
+        // and no second refresh runs in it.
+        let (from, to) = today_window();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        let link = delta_link_of("CAL-A");
+        let routes: Vec<(Route, Option<usize>)> = vec![
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "1".into())],
+                    ..patch_route("/me/events/M1", 429, "")
+                },
+                Some(1),
+            ),
+            (patch_route("/me/events/M1", 200, "{}"), None),
+            (
+                Route {
+                    headers: vec![("Retry-After".into(), "30".into())],
+                    ..get_route("/me/calendars/CAL-A/calendarView/delta?", 429, "")
+                },
+                None,
+            ),
+            (
+                get_route(&link, 200, &calendar_delta_page(&[], &link)),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-reset-throttled",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1")],
+                    (&from, &to),
+                    &link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "M1".into(),
+                input: series_edit(),
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || paths_from(&srv, 0).contains(&initial)),
+            "no initial round: {:?}",
+            method_paths(&srv)
+        );
+        // Commands run between ticks: this one's `Error` comes after the
+        // tick that sent the PATCH is over.
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let after = requests_after_patch(&srv, "/me/events/M1", 1);
+        assert_eq!(
+            after,
+            [
+                ("GET".to_string(), "/me/calendars?$select=id,name,color,hexColor,isDefaultCalendar,canEdit,owner&$top=100".to_string()),
+                ("GET".to_string(), initial.clone()),
+            ],
+            "after the throttled reset, nothing: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_reset_waits_for_a_queued_event_edit() {
+        // A series edit goes through but an edit of event X behind it gets a
+        // 500 (deferred; a 503 would be a throttle): no initial round may
+        // replace X's edited row while its own PATCH waits. Once X's edit
+        // goes through, the reset is owed no more.
+        let (from, to) = today_window();
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (patch_route("/me/events/M1", 200, "{}"), None),
+            (patch_route("/me/events/X1", 500, ""), Some(1)),
+            (patch_route("/me/events/X1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject ("Standup").
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "update-event-series-reset-waits",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![occurrence("OCC1", "M1"), stored_event("X1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+                let row = s.event("X1").unwrap().unwrap();
+                let fields = s
+                    .update_event_fields(
+                        "X1",
+                        &crate::store::LocalEventFields {
+                            subject: "Edited".into(),
+                            start_utc: row.start_utc,
+                            end_utc: row.end_utc,
+                            location: row.location,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                s.enqueue_op(&OutboxOp::UpdateEventSeries {
+                    id: "M1".into(),
+                    body: event_body_json(&series_edit()),
+                })
+                .unwrap();
+                s.enqueue_op(&OutboxOp::UpdateEvent {
+                    id: "X1".into(),
+                    fields,
+                })
+                .unwrap();
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The first pass drained both ops; a calendar refresh after it is a
+        // round from the kept link, which leaves X's row alone.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's edit waits: {:?}",
+            method_paths(&srv)
+        );
+        assert!(
+            paths_from(&srv, 0).contains(&delta_link_of("CAL-A")),
+            "the refresh ran from the link: {:?}",
+            method_paths(&srv)
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        assert!(matches!(
+            &store.pending_ops().unwrap()[..],
+            [OutboxRow { op: OutboxOp::UpdateEvent { id, .. }, .. }] if id == "X1"
+        ));
+        assert!(store.calendar_delta("CAL-A").unwrap().is_some());
+
+        // F9 resends X's edit; the reset is then owed no more, and the next
+        // calendar refresh is an initial round.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "X's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            requests_after_patch(&srv, "/me/events/X1", 1)
+                .iter()
+                .any(|(_, p)| *p == initial),
+            "no reset after X's edit: {:?}",
             method_paths(&srv)
         );
         let _ = std::fs::remove_dir_all(&dir);

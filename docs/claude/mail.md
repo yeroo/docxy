@@ -1263,11 +1263,21 @@ this occurrence or the whole series, as Outlook does.
   body whole (`event_body_json` at command time), because the master is not
   stored. `apply_op` sends it with `update_event_body`. An empty `input.fields`
   queues nothing. There is no optimistic local write, so the op is not an event op
-  for the quarantine reset. Instead, the drain that sends it (the command's or a
-  later tick's) clears every calendar's delta state at once, on disk, and runs one
-  `refresh_calendar` after its loop. A pattern change mints new occurrence ids,
-  and calendarView delta's report of a series change is the uncertain part of
-  #2013, so the initial rounds take each window from Graph.
+  for the quarantine reset. Instead the calendars owe a reset once it went
+  through (`series_reset_owed`, in memory): a pattern change mints new occurrence
+  ids, and how calendarView delta reports a series change is the uncertain part
+  of #2013, so initial rounds take each window from Graph. After every drain,
+  however it ended, `settle_series_reset` clears every calendar's delta state on
+  disk, but only when no event op with a local write (`writes_event_locally`:
+  `RespondEvent`, `UpdateEvent`, `DeleteEvent`, `CancelEvent`) is still queued.
+  An initial round would replace that op's row, and a queued `UpdateEvent`,
+  which reads its row at send time, would then send Graph's old values; a later
+  drain that leaves none settles it. The refresh itself never runs inside the
+  drain, so a 401, throttle or offline error it meets reaches the pass as usual:
+  a tick's own calendar refresh after its drain runs the initial rounds, and a
+  command's drain (`drain_queued`) refreshes at once (`calendar_refresh_owed`)
+  when it did not stop and no wait is running. A restart before the reset
+  settles forgets it, and the delta rounds go on.
 - Masters are not stored: `calendarView` never returns one, so every window replace
   would delete it, and `events_in_window` would show it on the series' first day.
 - Known gaps (follow-ups): a series edit with `TIMES` sends the UTC wall clock with
@@ -1294,7 +1304,10 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_queues_and_patches_the_master`,
   `update_event_series_given_an_occurrence_patches_the_master`,
   `update_event_series_queued_offline_resets_on_the_later_drain`,
-  `update_event_series_with_no_fields_queues_nothing`.
+  `update_event_series_reset_throttled_stops_the_pass`,
+  `update_event_series_reset_waits_for_a_queued_event_edit`,
+  `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
+  (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
 
 ## OAuth tokens in the platform secret store (#1877)
 
