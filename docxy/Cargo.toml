@@ -33,6 +33,8 @@ ctlcore = { version = "0.5.0", path = "../ctlcore" }
 ratatui = "0.29"
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
 backstagecore = { version = "0.1.0", path = "../backstagecore" }
+# The Word manual F1 shows (#1856): its layout, reader and locator.
+helpdocs = { version = "0.5.0", path = "../helpdocs" }
 # Editable HTML (*.docx.html): open and save bundles (always), and make new
 # ones (only with the `html-export` feature, which embeds the wasm engine).
 htmlbundle = { version = "0.5.0", path = "../htmlbundle" }
@@ -54,6 +56,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 
 [build-dependencies]
 htmlbundle = { version = "0.5.0", path = "../htmlbundle" }
+# Builds docs/manual/word/ into the binary (#1856).
+helpdocs = { version = "0.5.0", path = "../helpdocs" }
 
 [features]
 # Embed the docxwasm engine so `--html` and Save As *.docx.html can make new

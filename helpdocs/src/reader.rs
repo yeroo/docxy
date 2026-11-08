@@ -52,7 +52,7 @@ struct Place {
 
 /// The hints the footer shows when no link is selected.
 pub const HINTS: &str =
-    "↑↓ PgUp PgDn scroll · Tab link · Enter follow · Bksp back · c contents · F1 start · Esc close";
+    "↑↓ PgUp PgDn scroll · Tab link · Enter go · Bksp back · c contents · F1 start · Esc close";
 
 /// What the host draws.
 #[derive(Clone, Copy, Debug)]
