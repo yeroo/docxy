@@ -866,7 +866,8 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
   It emits `CalendarUpdated`, `CalendarsUpdated` when the synced set changed,
   and refreshes when signed in and not inside a throttle/back-off wait.
 - `create_local_event` stores the default calendar's id (`CreateEvent` POSTs
-  to `/me/events`), `''` before the list is known (step 1 adopts it).
+  to `/me/events`), `''` before the list is known (step 1 adopts it), unless
+  the host names another calendar (#2048, "Create in a chosen calendar").
 - Queries: `Store::events_in_range(from, to, calendar_ids)` (the
   `events_in_window` overlap rule and order; an empty slice is no events;
   `events_in_window` still returns every calendar, and lookxy keeps it), and
@@ -885,8 +886,9 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
   events is queued deletes the row, so `apply_op`'s `event_input_for` fails
   until the op is quarantined. A chosen calendar of another owner needs
   `Calendars.Read.Shared`, which the default scope lacks, so its view errors
-  on every pass (it is not synced unless chosen). Creating, editing and
-  deleting stay on `/me/events` (the default calendar). Each pass costs one
+  on every pass (it is not synced unless chosen). A create goes to the
+  calendar the host names since #2048; editing and deleting still address
+  `/me/events/{id}`. Each pass costs one
   list plus one view per synced calendar.
 - Tests: `model.rs` `calendar_reads_graph_fields`; `client.rs`
   `list_calendars_follows_next_link`, `list_calendars_fails_whole_when_a_page_fails`,
@@ -1440,6 +1442,56 @@ DST and on the right weekday. Also #2030: zone-preserving series time edits.
   `queued_update_without_times_sends_no_start_or_end`; `engine.rs`
   `update_event_series_sends_named_zones`,
   `update_event_series_refuses_a_malformed_wall_clock`.
+
+## Create in a chosen calendar (#2048)
+
+A host showing several calendars (#1984) files a new event in the one the
+person selected.
+
+- `LocalEventFields::calendar_id` (create-only): `None` or `Some("")` is the
+  default calendar (its id, `''` before the list is known, as before), and
+  `Some(id)` must be a stored calendar whose `can_edit` is set.
+  `create_local_event` refuses any other (`StoreError::Sql`, with no
+  `events` or `event_attendees` row written, before the row's upsert), and
+  never files it in another calendar. With no list stored, every named id is
+  refused. `update_event_fields` ignores the field: an edit never moves an
+  event between calendars, and the field is never in the changed set.
+- Where the POST goes is one rule, `Store::event_create_calendar(id)`: `None`
+  (`/me/events`) when the row's `calendar_id` is `''` or the stored default's
+  id, so every existing caller sends what it sent before, else `Some(id)`
+  (`GraphClient::create_event_in`, `POST /me/calendars/{encode_path_segment(id)}/events`,
+  the same body as `create_event`, and the returned event's `calendar_id` is
+  the id: the URL decides, as in `calendar_view_in`). The default is read at
+  drain time, so a `''` row a pass adopted since still goes to `/me/events`.
+- Sync needed no change. `reconcile_created_event` keeps the row's
+  `calendar_id`, and a pass replaces or deletes only rows of the calendar it
+  fetched (`local:` rows never). So the default calendar's round neither
+  drops nor claims the event, and its own calendar's round adopts it under
+  the Graph id. Startup runs no calendar pass (only the tick does), so in the
+  engine test the refresh after the create is an initial round per calendar
+  and the next one a delta round.
+- An editable calendar that does not sync (`synced_calendar_ids`) can be
+  chosen. The event shows while it is `local:`, and the first pass after the
+  reconcile deletes it (step 3), as its calendar is not shown.
+- Known gaps: `can_edit` is not checked again at drain time. A calendar that
+  turned read-only or vanished meanwhile gets a refused POST, then the usual
+  retry and quarantine. Creating in another owner's shared calendar needs
+  `Calendars.ReadWrite.Shared`, which the default scope lacks, so that POST is
+  refused and quarantined and its `local:` row stays. Updates and deletes
+  still address `/me/events/{id}`, which reaches only the user's own
+  mailbox's calendars, not a shared calendar's event. No lookxy control to
+  choose the calendar (lookxy passes `None`).
+- Tests: `client.rs` `create_event_in_posts_to_the_calendars_events`;
+  `store` `calendar_tests` `create_local_event_takes_a_chosen_calendar`,
+  `create_local_event_refuses_an_unknown_or_read_only_calendar`,
+  `event_create_calendar_is_none_for_blank_and_default`,
+  `update_event_fields_ignores_calendar_id`,
+  `create_local_event_takes_the_default_calendar` (unchanged); `outbox.rs`
+  `create_event_in_a_chosen_calendar_posts_to_its_events` (and its edit
+  PATCHes `/me/events/EV1`),
+  `create_event_in_the_default_calendar_posts_to_me_events`,
+  `create_event_encodes_the_calendar_id`; `engine.rs`
+  `created_event_in_a_second_calendar_stays_in_it_through_both_refreshes`.
 
 ## Respond options and proposals (#2023)
 

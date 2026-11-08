@@ -111,6 +111,7 @@ issue number to find its notes.
   with a fetched body (#1933, #2015),
   calendar sync keeps events' reminder settings (#1937), event fields a calendar client
   shows (#1983), creating and updating them, an update PATCHes only what changed (#1994),
+  an event created in a chosen calendar (#2048),
   every calendar, `SetCalendars`, events in a range and days with events (#1984),
   a calendar range on demand, fetched once while fresh (#2014),
   a 30/180-day window kept by calendarView delta per calendar (#2013),
