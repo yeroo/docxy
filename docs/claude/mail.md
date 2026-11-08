@@ -1445,6 +1445,70 @@ proposal.
   `respond_meeting_without_sending_a_response`, `respond_meeting_refusals_send_nothing`,
   `calendar_sync_stores_an_attendees_proposal`.
 
+## Meeting messages (#2024)
+
+Item 5 of #1985: a meeting message in mail (a request, a cancellation, a response) gives
+its `meetingMessageType` and the event it refers to, and a cancellation can be removed
+from the calendar without sending anything.
+
+- `GraphClient::meeting_message(message_id)` GETs `/me/messages/{id}?$expand=
+  microsoft.graph.eventMessage/event($select=id,isOrganizer)` and returns
+  `model::MeetingMessage { message_type, event_id, is_organizer }`. The `eventMessage`
+  cast covers `eventMessageRequest` and `eventMessageResponse`, which derive from it.
+  There is no top-level `$select`, as in `meeting_event_id`: `meetingMessageType` is a
+  derived-type property, which a plain GET returns. `RespondMeeting` keeps
+  `meeting_event_id`'s narrower `eventMessageRequest` cast on purpose.
+- `MeetingMessageType::from_graph` reads `meetingRequest`, `meetingCancelled`,
+  `meetingAccepted`, `meetingDeclined` and `meetingTenativelyAccepted` (Graph v1.0's own
+  spelling), plus the corrected `meetingTentativelyAccepted`. Graph's `none`, an unknown
+  value and an absent one are `None`, never an error. `MeetingMessage::from_json` never
+  fails either: a plain message is all `None` and `is_organizer: false`, and so is an
+  `event` without `isOrganizer` (for the organizer flag) or with an empty id (for the id).
+- Not stored. The type is a derived-type property, and the delta `$select`
+  (`MESSAGE_SELECT`) holds base `message` fields only; a type-cast select there would put
+  every sync round at risk. The reader needs the type only for the open message's banner,
+  so it asks with `SyncCommand::FetchMeetingMessage { message_id }`, which emits
+  `SyncEvent::MeetingMessageFetched { message_id, meeting }`. The stored
+  `Message::is_meeting_request` (from `@odata.type`) still marks invites in the list.
+- `SyncCommand::RemoveFromCalendar { message_id }` resolves the message when the remove
+  runs. Its refusals are a `SyncEvent::Error` with nothing queued or sent: a message whose
+  type is not `Cancelled` (removing a live meeting is a decline, or `DeleteEvent`), and an
+  event the user organizes (the organizer's `DELETE` sends every attendee a cancellation).
+  A cancellation with no `event` (removed already, here or elsewhere) sends nothing and
+  emits `RemovedFromCalendar { message_id, event_id: None }`: the user's goal holds.
+  Otherwise it queues `OutboxOp::DeleteEvent` **before** the local delete, as
+  `CancelEvent` does, then runs `Store::delete_event_series(event_id)` (the event, or a
+  cancelled series' master row and every stored occurrence whose `series_master_id` it
+  is), emits `CalendarUpdated` and `RemovedFromCalendar { event_id: Some(..) }`, and
+  drains. Graph gets `DELETE /me/events/{id}`, which for an attendee tells nobody; there
+  is no `/decline` or `/cancel`. A failed local delete is an `Error`, and the rest still
+  runs: the op is queued, and the next calendar round removes the row. A `DeleteEvent` of
+  the same event already queued (a second remove while the first waits offline or in a
+  back-off) is not queued again: Graph still holds the event, so both would resolve it,
+  and the second DELETE would 404 after the first went out, which `DeleteEvent`'s drain
+  retries into a quarantine. A queue that cannot be read is queued to. The host must not
+  delete the row first. The command is in `command_writes_event_locally`, next to
+  `CancelEvent`. Both commands start with the signed-in guard (`Error("not signed in")`,
+  nothing sent), and a failed GET goes through `react`.
+- Not done: the type is not stored, so there is no list icon. The cancellation message
+  stays in mail after a remove (Outlook moves it to Deleted Items; the host may delete
+  it). A `DELETE` answered 404 (the event removed between the GET and the drain) keeps
+  `DeleteEvent`'s drain policy. lookxy has no meeting banner: its `on_sync_event` takes
+  both new events as no-ops.
+- Tests: `model.rs` `meeting_message_type_maps_graph_values_and_is_lenient`,
+  `meeting_message_reads_type_and_event`; `client.rs`
+  `meeting_message_reads_cancellation_and_event`, `meeting_message_reads_a_response`,
+  `meeting_message_of_a_plain_message_is_none`, `meeting_message_id_is_percent_encoded`,
+  `meeting_message_missing_is_not_found`; `engine.rs`
+  `fetch_meeting_message_emits_type_and_event`,
+  `remove_from_calendar_deletes_the_event_without_sending`,
+  `remove_from_calendar_removes_a_cancelled_series`,
+  `remove_from_calendar_twice_while_queued_queues_one_delete`,
+  `remove_from_calendar_refuses_a_message_that_is_not_a_cancellation`,
+  `remove_from_calendar_refuses_the_organizer`,
+  `remove_from_calendar_of_a_removed_meeting_sends_nothing`,
+  `meeting_message_commands_signed_out_send_nothing`.
+
 ## OAuth tokens in the platform secret store (#1877)
 
 - `tokencache` keeps the `TokenSet` in the platform's secret store when one is reachable: the

@@ -142,6 +142,84 @@ impl Message {
     }
 }
 
+/// Graph `eventMessage.meetingMessageType` (#2024): what a meeting message
+/// in mail is. Graph's `none` (an `eventMessage` that is none of these) is
+/// no type at all, as is an absent or unknown value: see
+/// [`MeetingMessageType::from_graph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingMessageType {
+    /// `meetingRequest`: an invite the user can respond to.
+    Request,
+    /// `meetingCancelled`: the organizer cancelled the meeting; the user
+    /// may remove it from the calendar (`SyncCommand::RemoveFromCalendar`).
+    Cancelled,
+    /// `meetingAccepted`: an attendee's acceptance.
+    Accepted,
+    /// `meetingTenativelyAccepted` (Graph's spelling): an attendee's
+    /// tentative acceptance.
+    TentativelyAccepted,
+    /// `meetingDeclined`: an attendee's decline.
+    Declined,
+}
+
+impl MeetingMessageType {
+    /// Maps Graph's value. `meetingTenativelyAccepted` is the v1.0 enum's
+    /// own spelling; the corrected `meetingTentativelyAccepted` is read too.
+    /// `none`, an unknown value and `""` are `None`: lenient, never an error.
+    pub fn from_graph(s: &str) -> Option<MeetingMessageType> {
+        match s {
+            "meetingRequest" => Some(MeetingMessageType::Request),
+            "meetingCancelled" => Some(MeetingMessageType::Cancelled),
+            "meetingAccepted" => Some(MeetingMessageType::Accepted),
+            "meetingTenativelyAccepted" | "meetingTentativelyAccepted" => {
+                Some(MeetingMessageType::TentativelyAccepted)
+            }
+            "meetingDeclined" => Some(MeetingMessageType::Declined),
+            _ => None,
+        }
+    }
+}
+
+/// A message's meeting facts (#2024), from
+/// `GraphClient::meeting_message`: its `meetingMessageType` and the
+/// calendar event it refers to (the expanded `eventMessage/event`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MeetingMessage {
+    /// `None` for a message that is not a meeting message (no
+    /// `meetingMessageType`, or Graph's `none`).
+    pub message_type: Option<MeetingMessageType>,
+    /// The referred event's id. `None` when the message carries no `event`:
+    /// not a meeting message, or an event already removed from the calendar.
+    pub event_id: Option<String>,
+    /// The referred event's `isOrganizer`; false when absent or with no
+    /// event. Remove from Calendar refuses the organizer's event, whose
+    /// delete would send cancellations.
+    pub is_organizer: bool,
+}
+
+impl MeetingMessage {
+    /// Reads a message GET with the `eventMessage/event` expand. Never
+    /// fails: a plain message is all `None` / false.
+    pub fn from_json(v: &Value) -> MeetingMessage {
+        let event = v.get("event");
+        MeetingMessage {
+            message_type: v
+                .get("meetingMessageType")
+                .and_then(Value::as_str)
+                .and_then(MeetingMessageType::from_graph),
+            event_id: event
+                .and_then(|e| e.get("id"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            is_organizer: event
+                .and_then(|e| e.get("isOrganizer"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+}
+
 /// Which of a message's stored properties a Graph JSON object actually
 /// carried, by key (a key holding JSON `null` counts as carried: Graph said
 /// the value is empty). `Message::from_json` turns an absent key into an
@@ -1631,6 +1709,70 @@ fn recipient_list(v: &Value, key: &str) -> Vec<Recipient> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    #[test]
+    fn meeting_message_type_maps_graph_values_and_is_lenient() {
+        use MeetingMessageType as T;
+        let cases = [
+            ("meetingRequest", Some(T::Request)),
+            ("meetingCancelled", Some(T::Cancelled)),
+            ("meetingAccepted", Some(T::Accepted)),
+            // Graph v1.0's own spelling, and the corrected one.
+            ("meetingTenativelyAccepted", Some(T::TentativelyAccepted)),
+            ("meetingTentativelyAccepted", Some(T::TentativelyAccepted)),
+            ("meetingDeclined", Some(T::Declined)),
+            ("none", None),
+            ("", None),
+            ("meetingSomethingNew", None),
+            ("MeetingCancelled", None),
+        ];
+        for (wire, want) in cases {
+            assert_eq!(MeetingMessageType::from_graph(wire), want, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn meeting_message_reads_type_and_event() {
+        let v = parse(
+            r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                "event":{"id":"E9","isOrganizer":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            MeetingMessage::from_json(&v),
+            MeetingMessage {
+                message_type: Some(MeetingMessageType::Cancelled),
+                event_id: Some("E9".into()),
+                is_organizer: false,
+            }
+        );
+        let v = parse(
+            r#"{"meetingMessageType":"meetingRequest","event":{"id":"E1","isOrganizer":true}}"#,
+        )
+        .unwrap();
+        assert!(MeetingMessage::from_json(&v).is_organizer);
+        // An event without `isOrganizer` is not the organizer's.
+        let v = parse(r#"{"meetingMessageType":"meetingAccepted","event":{"id":"E2"}}"#).unwrap();
+        let m = MeetingMessage::from_json(&v);
+        assert_eq!(m.message_type, Some(MeetingMessageType::Accepted));
+        assert_eq!(m.event_id.as_deref(), Some("E2"));
+        assert!(!m.is_organizer);
+        // A plain message, a `none` one, an unknown type, a null event and
+        // an empty event id: all lenient.
+        for body in [
+            r#"{"id":"M2"}"#,
+            r#"{"meetingMessageType":"none"}"#,
+            r#"{"meetingMessageType":"other","event":null}"#,
+            r#"{"meetingMessageType":7,"event":{"id":""}}"#,
+        ] {
+            let v = parse(body).unwrap();
+            assert_eq!(
+                MeetingMessage::from_json(&v),
+                MeetingMessage::default(),
+                "{body}"
+            );
+        }
+    }
 
     #[test]
     fn msip_labels_is_a_stored_header() {
