@@ -1153,7 +1153,7 @@ pub(crate) fn copy_payload(
 }
 
 /// A colour as `rrggbb`, with no `#`: a case's `#` starts a comment.
-fn ink_hex(c: Hsla) -> String {
+pub(crate) fn ink_hex(c: Hsla) -> String {
     let c = Rgba::from(c);
     let b = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
     format!("{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b))

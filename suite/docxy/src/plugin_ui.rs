@@ -54,13 +54,16 @@ fn manifests() -> Vec<&'static ui::Manifest> {
 /// `s` as a `&'static str`, kept once per distinct string for the life of
 /// the process (the names a build's plugins declare are a small fixed set).
 pub(crate) fn intern(s: &str) -> &'static str {
-    static STRINGS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    // A set, not a list: an extension's ribbon (#1870) is interned on every
+    // refresh, so the lookup must not grow with the strings kept.
+    static STRINGS: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
     let mut strings = STRINGS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(found) = strings.iter().find(|k| **k == s) {
+    let strings = strings.get_or_insert_with(HashSet::new);
+    if let Some(found) = strings.get(s) {
         return found;
     }
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    strings.push(leaked);
+    strings.insert(leaked);
     leaked
 }
 
@@ -79,13 +82,14 @@ pub(crate) fn is_plugin(act: Act) -> bool {
 /// `ribbon_fit::gallery_geom` with no frame (#1685): one predicate for both.
 pub(crate) fn is_swatch_gallery<A: 'static>(gal: &rs::Gallery<A>) -> bool {
     // The width maths is generic over the ribbon's act type; only the
-    // Project ribbon's `Act` can hold a plugin's.
+    // suite's `Act` can hold a plugin's or an extension's.
     // The Table Styles gallery is drawn first by `render_control`.
     gal.id != "tablestyles"
         && gal.items.first().is_some_and(|it| {
             (&it.act as &dyn std::any::Any)
                 .downcast_ref::<Act>()
-                .is_some_and(|a| is_plugin(*a))
+                // An extension's gallery is drawn the same way (#1870).
+                .is_some_and(|a| is_plugin(*a) || matches!(a, Act::Ext(_)))
         })
 }
 
@@ -231,7 +235,7 @@ fn control_of(c: &ui::Control, manifests: &[&ui::Manifest]) -> Control<Act> {
 pub(crate) const CONTRIB_LABEL_MAX: usize = 24;
 
 /// `label` cut to [`CONTRIB_LABEL_MAX`] characters.
-fn capped_label(label: &str) -> String {
+pub(crate) fn capped_label(label: &str) -> String {
     if label.chars().count() <= CONTRIB_LABEL_MAX {
         return label.to_string();
     }

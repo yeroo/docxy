@@ -379,12 +379,13 @@ pub(crate) fn model_control_w<A: 'static>(
             cmd.icon.0.is_empty().then_some(cmd.label),
             tw,
         ),
-        // `large_btn`: `px_2` around the 26px icon or the label's lines.
-        Control::Large(cmd) => 16.0 + lines_w(cmd.label, 11.0, tw).max(26.0),
+        // `large_btn`: `px_2` around the 26px icon or the label's lines; an
+        // extension's command with no icon (#1870) draws its label alone.
+        Control::Large(cmd) => 16.0 + lines_w(cmd.label, 11.0, tw).max(icon_w(cmd)),
         // `split_btn` and `dropdown_btn`: `px_1` around the icon or the
-        // drop-down label.
+        // drop-down label (a split keeps the icon's room without one).
         Control::Split { primary: cmd, .. } => 8.0 + split_label_w(cmd.label, 11.0, tw).max(26.0),
-        Control::Dropdown { cmd, .. } => 8.0 + menu_label_w(cmd.label, 11.0, tw).max(26.0),
+        Control::Dropdown { cmd, .. } => 8.0 + menu_label_w(cmd.label, 11.0, tw).max(icon_w(cmd)),
         // Columns of at most three buttons, `gap_1` apart.
         Control::Column(cmds) => {
             let cols: Vec<f32> = cmds
@@ -460,9 +461,15 @@ pub(crate) fn model_spec<A: 'static>(g: &rs::Group<A>, tw: TextWidth) -> Spec {
     }
 }
 
-/// The icon a collapsed model group shows: its first command's.
+/// A large button's 26px icon, none when it has no icon.
+fn icon_w<A>(cmd: &rs::Cmd<A>) -> f32 {
+    if cmd.icon.0.is_empty() { 0.0 } else { 26.0 }
+}
+
+/// The icon a collapsed model group shows: its first command's (the first
+/// that has one: an extension's command may have none, #1870).
 pub(crate) fn model_group_icon<A>(g: &rs::Group<A>) -> Option<&'static str> {
-    g.items.iter().find_map(|c| match c {
+    let icon = |c: &Control<A>| match c {
         Control::Toggle(cmd) | Control::Large(cmd) => Some(cmd.icon.0),
         Control::Split { primary: cmd, .. } | Control::Dropdown { cmd, .. } => Some(cmd.icon.0),
         Control::Column(cmds) => cmds.first().map(|c| c.icon.0),
@@ -471,7 +478,10 @@ pub(crate) fn model_group_icon<A>(g: &rs::Group<A>) -> Option<&'static str> {
             rs::Cell::Combo { .. } => None,
         }),
         Control::Gallery(_) | Control::Separator => None,
-    })
+    };
+    g.items
+        .iter()
+        .find_map(|c| icon(c).filter(|i| !i.is_empty()))
 }
 
 // ---- the spreadsheet ribbon ----
@@ -812,6 +822,43 @@ mod tests {
             18.0 + tw("Plain", 12.0),
             "the label alone, no icon slot and no gap"
         );
+    }
+
+    /// #1870: an extension's large button or drop-down with no icon draws
+    /// its label alone, so a label narrower than the icon is estimated at
+    /// its own width; a split keeps the icon's room (its upper half is the
+    /// button). A collapsed group shows the first icon it has.
+    #[test]
+    fn a_large_button_without_an_icon_is_estimated_with_its_label() {
+        let large = |icon| Control::Large(rs::cmd("x", icon, "Go", Act::Paste));
+        assert!(tw("Go", 11.0) < 26.0);
+        assert_eq!(
+            model_control_w(&large("bold"), false, None, &tw),
+            16.0 + 26.0
+        );
+        assert_eq!(
+            model_control_w(&large(""), false, None, &tw),
+            16.0 + lines_w("Go", 11.0, &tw)
+        );
+        let dropdown = |icon| Control::Dropdown {
+            cmd: rs::cmd("x", icon, "Go", Act::Paste),
+            items: Vec::new(),
+        };
+        assert!(
+            model_control_w(&dropdown(""), false, None, &tw)
+                <= model_control_w(&dropdown("bold"), false, None, &tw)
+        );
+        let split = |icon| Control::Split {
+            primary: rs::cmd("x", icon, "Go", Act::Paste),
+            menu: Vec::new(),
+        };
+        assert_eq!(
+            model_control_w(&split(""), false, None, &tw),
+            model_control_w(&split("bold"), false, None, &tw)
+        );
+        let g = rs::group("G", 1, vec![large(""), large("bold")]);
+        assert_eq!(model_group_icon(&g), Some("bold"));
+        assert_eq!(model_group_icon(&rs::group("G", 1, vec![large("")])), None);
     }
 
     /// #1608 r1: a contributed group of the lowest priority collapses before
