@@ -288,7 +288,7 @@ fn event_input_for(store: &Store, id: &str) -> Result<(EventInput, bool), GraphE
         attendees: d.attendees,
         body_html: d.body_html,
         recurrence: d.recurrence,
-        series_recurrence: None,
+        series_recurrence: d.series_recurrence,
         show_as: d.show_as,
         sensitivity: d.sensitivity,
         importance: d.importance,
@@ -1686,6 +1686,186 @@ mod tests {
         // reconciled: the event now lives under "EV1"
         assert!(store.event_for_send("EV1").unwrap().is_some());
         assert!(store.event_for_send(&local_id).unwrap().is_none());
+    }
+
+    /// Creates a local event from `fields` in a fresh store, applies its
+    /// `CreateEvent` against a server answering `EV1`, and returns the POSTed
+    /// body and the local row as it was before the create.
+    fn create_event_body(
+        fields: &crate::store::LocalEventFields,
+    ) -> (Value, crate::store::EventRow) {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events".into(),
+            status: 201,
+            headers: vec![],
+            body: event_json("EV1", "Sync"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_event(fields, "Me", "me@x").unwrap();
+        let row = store
+            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == local_id)
+            .unwrap();
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            (reqs[0].method.as_str(), reqs[0].path.as_str()),
+            ("POST", "/me/events")
+        );
+        (json::parse(&reqs[0].body).unwrap(), row)
+    }
+
+    /// A lossless recurrence of pattern `kind` and range `range` (#2034),
+    /// with the fields a recurrence dialog fills for that kind.
+    fn lossless(kind: &str, range: &str) -> crate::graph::model::EventRecurrence {
+        use crate::graph::model::{EventRecurrence, RecurrencePattern, RecurrenceRange};
+        let mut pattern = RecurrencePattern {
+            r#type: kind.into(),
+            interval: 2,
+            ..Default::default()
+        };
+        match kind {
+            "daily" => {}
+            "weekly" => {
+                pattern.days_of_week = vec!["monday".into(), "wednesday".into()];
+                pattern.first_day_of_week = "monday".into();
+            }
+            "absoluteMonthly" => pattern.day_of_month = 15,
+            "relativeMonthly" => {
+                pattern.days_of_week = vec!["tuesday".into()];
+                pattern.index = "last".into();
+            }
+            "absoluteYearly" => {
+                pattern.month = 3;
+                pattern.day_of_month = 31;
+            }
+            "relativeYearly" => {
+                pattern.month = 11;
+                pattern.days_of_week = vec!["thursday".into()];
+                pattern.index = "fourth".into();
+            }
+            other => panic!("unknown kind {other}"),
+        }
+        let mut range = RecurrenceRange {
+            r#type: range.into(),
+            start_date: "2026-07-20".into(),
+            recurrence_time_zone: "W. Europe Standard Time".into(),
+            ..Default::default()
+        };
+        match range.r#type.as_str() {
+            "noEnd" => {}
+            "endDate" => range.end_date = "2027-07-20".into(),
+            "numbered" => range.number_of_occurrences = 7,
+            other => panic!("unknown range {other}"),
+        }
+        EventRecurrence { pattern, range }
+    }
+
+    #[test]
+    fn create_event_sends_every_lossless_recurrence_unchanged() {
+        for kind in [
+            "daily",
+            "weekly",
+            "absoluteMonthly",
+            "relativeMonthly",
+            "absoluteYearly",
+            "relativeYearly",
+        ] {
+            for range in ["noEnd", "endDate", "numbered"] {
+                let rec = lossless(kind, range);
+                let (body, row) = create_event_body(&crate::store::LocalEventFields {
+                    series_recurrence: Some(rec.clone()),
+                    ..sample_event_fields()
+                });
+                let what = format!("{kind} {range}");
+                let sent = body.get("recurrence").expect(&what);
+                assert_eq!(sent, &rec.to_send_json(), "{what}");
+                assert_eq!(
+                    crate::graph::model::EventRecurrence::from_json(sent)
+                        .map(|r| (r.pattern, r.range.r#type)),
+                    Some((rec.pattern.clone(), rec.range.r#type.clone())),
+                    "{what}"
+                );
+                let sent_range = sent.get("range").unwrap();
+                assert_eq!(
+                    sent_range.get("numberOfOccurrences").is_some(),
+                    range == "numbered",
+                    "{what}"
+                );
+                assert_eq!(
+                    sent_range.get("endDate").is_some(),
+                    range == "endDate",
+                    "{what}"
+                );
+                assert_eq!(row.recurrence, Some(rec), "{what}");
+                assert_eq!(row.event_type, "seriesMaster", "{what}");
+            }
+        }
+    }
+
+    #[test]
+    fn create_event_sends_a_lossless_recurrence_as_given() {
+        let (body, _) = create_event_body(&crate::store::LocalEventFields {
+            series_recurrence: Some(crate::graph::model::EventRecurrence {
+                pattern: crate::graph::model::RecurrencePattern {
+                    r#type: "relativeYearly".into(),
+                    interval: 1,
+                    month: 11,
+                    day_of_month: 0,
+                    days_of_week: vec!["friday".into()],
+                    first_day_of_week: "monday".into(),
+                    index: "last".into(),
+                },
+                range: crate::graph::model::RecurrenceRange {
+                    r#type: "numbered".into(),
+                    start_date: "2026-11-27".into(),
+                    end_date: String::new(),
+                    number_of_occurrences: 5,
+                    recurrence_time_zone: "Pacific Standard Time".into(),
+                },
+            }),
+            ..sample_event_fields()
+        });
+        let expected = json::parse(
+            r#"{"pattern":{"type":"relativeYearly","interval":1,"month":11,
+                "daysOfWeek":["friday"],"firstDayOfWeek":"monday","index":"last"},
+                "range":{"type":"numbered","startDate":"2026-11-27",
+                "numberOfOccurrences":5,"recurrenceTimeZone":"Pacific Standard Time"}}"#,
+        )
+        .unwrap();
+        assert_eq!(body.get("recurrence"), Some(&expected));
+    }
+
+    #[test]
+    fn create_event_with_create_side_recurrence_sends_as_before() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let rec = Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: Some("2026-08-31".into()),
+        };
+        let (body, row) = create_event_body(&crate::store::LocalEventFields {
+            recurrence: Some(rec.clone()),
+            ..sample_event_fields()
+        });
+        assert_eq!(body.get("recurrence"), Some(&rec.to_json()));
+        assert_eq!(row.event_type, "seriesMaster");
+    }
+
+    #[test]
+    fn create_event_without_recurrence_sends_none() {
+        let (body, row) = create_event_body(&sample_event_fields());
+        assert!(body.get("recurrence").is_none());
+        assert_eq!(row.recurrence, None);
+        assert_eq!(row.event_type, "singleInstance");
     }
 
     /// The keys of a sent JSON object, in order.
