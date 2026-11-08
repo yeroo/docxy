@@ -117,6 +117,7 @@ issue number to find its notes.
   the Contacts folder and `is_contact` (#1934), cancelling a meeting with a message and
   forwarding it (#1985), a series' occurrences, its master and editing either (#2022),
   a series created with any Graph recurrence (#2034),
+  event times in a named time zone, zone-preserving series edits (#2039, #2030),
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),
   meeting message types, the referred event and Remove from Calendar (#2024),
   dismiss and snooze reminders on the server (#2025),

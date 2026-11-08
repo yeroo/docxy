@@ -1299,10 +1299,12 @@ this occurrence or the whole series, as Outlook does.
   ran drops it, and the delta rounds carry on.
 - Masters are not stored: `calendarView` never returns one, so every window replace
   would delete it, and `events_in_window` would show it on the series' first day.
-- Known gaps (follow-ups): a series edit with `TIMES` sends the UTC wall clock with
-  `timeZone: "UTC"`, so Graph moves the series into UTC and its local times drift
-  across DST. A host should leave `TIMES` out of a series edit until zone-preserving
-  times land. Cancelling a whole series (`CancelEvent` wants a stored row) and "this
+- A series edit with `TIMES` names the master's zone and wall clocks
+  (`EventInput::start_time_zone` / `start_local` and the end's, #2039, which closes
+  #2030), so the series stays in its zone; with none named it is sent in UTC, and
+  Graph moves the series into UTC, where its local times drift across DST. See
+  "Event times in a named time zone (#2039)".
+- Known gaps (follow-ups): cancelling a whole series (`CancelEvent` wants a stored row) and "this
   and following" (an end-date edit plus a new series) are not done. No lookxy or
   suite UI: lookxy ignores both new events.
 - Tests: `model.rs` `event_recurrence_send_json_drops_what_graph_refuses`; `client.rs`
@@ -1368,6 +1370,72 @@ this occurrence or the whole series, as Outlook does.
   ranges), `create_event_sends_a_lossless_recurrence_as_given` (a JSON literal),
   `create_event_with_create_side_recurrence_sends_as_before`,
   `create_event_without_recurrence_sends_none`.
+
+## Event times in a named time zone (#2039)
+
+A host names the time zone of an event's start and of its end, so Graph keeps the
+event, and expands a series, in the organizer's zone: a weekly 09:00 stays 09:00 across
+DST and on the right weekday. Also #2030: zone-preserving series time edits.
+
+- `EventInput`, `LocalEventFields` and `EventSendData` carry `start_time_zone`,
+  `start_local`, `end_time_zone`, `end_local` (`String`, `""` by default). The zone is a
+  Windows time zone id (`W. Europe Standard Time`, the safe choice) or one of the IANA
+  names Graph lists for `dateTimeTimeZone.timeZone` (`Europe/Berlin`); Graph warns that a
+  create or update may not take every zone it reads. The wall clock is
+  `YYYY-MM-DDTHH:MM:SS` in that zone, given by the caller beside the UTC instant the store
+  keeps (`start_utc` / `end_utc`; the agenda, windows and delta stay UTC): mailcore has no
+  time zone database. Each end is independent (a flight). An all-day end's wall clock is
+  `T00:00:00` of its local date.
+- `graph::client::event_zone_error(zone, local, utc)` is the one rule: `None` for `""`;
+  a named end needs a real wall clock in that shape, a store-shaped `utc`, and
+  `local − utc` in Graph's range of zones, UTC−12 to UTC+14 (a wrong day or a swapped
+  field, not a wrong DST offset). `create_local_event` and `update_event_fields` refuse
+  what it refuses (`StoreError::Sql`, nothing written), and so does `UpdateEventSeries`
+  (a `SyncEvent::Error` before the master is resolved, nothing queued). A host may call
+  it first.
+- `event_body_json`: each end it accepts is sent as `{"dateTime": <local>, "timeZone":
+  <zone>}`, else the UTC wall clock with `timeZone: "UTC"` as before (lenient: a raw
+  `EventInput` with a refused pair sends UTC, never an error). When the start is sent in
+  its zone, the recurrence (either shape, with or without `TIMES` in the set) sends that
+  zone as `range.recurrenceTimeZone`, over a `series_recurrence`'s own, since Graph reads
+  `startDate` / `endDate` in it and `startDate` must match `start`; the create-side
+  `Recurrence` gains the key in `event_body_json` (`with_range_time_zone`). A start sent
+  in UTC sends the recurrence as before. With no zone named, the body is byte-for-byte
+  what it was.
+- Stored in `events.send_start_tz`, `send_start_local`, `send_end_tz`,
+  `send_end_local` (internal, `''` by default, added by `Store::init`'s `ALTER TABLE`
+  list, so an old row sends UTC). Not `original_start_tz`: that is Graph's report for a
+  synced row, with no wall clock beside it. `upsert_event_on` does not write them (a
+  refresh keeps them), nor does `reconcile_created_event`. `event_for_send` reads them
+  and `event_input_for` copies them, so a queued `CreateEvent` sends them, and a queued
+  `UpdateEvent` when its set has `TIMES`.
+- `update_event_fields`: `TIMES` is marked as before, only when `start_utc`, `end_utc`
+  or `is_all_day` changed, never by a zone or wall clock alone: a form always has a
+  zone and a synced row stores `""`, so a title edit would otherwise PATCH a meeting's
+  times. Per end, a named pair is always written (a pending `CreateEvent` reads it); a
+  `""` zone keeps the stored pair when `TIMES` is not marked and clears it when it is.
+  So a `TIMES` send never carries a stale wall clock (another client moved a reconciled
+  row): moving the times again names a new pair or clears it. Changing only the zone at
+  the same instant is not sent by `UpdateEvent`; `UpdateEventSeries` sends what the host
+  sets.
+- Not done: detecting the machine's zone (the caller names it), lookxy or suite UI,
+  reading events back in a zone other than UTC (`Prefer: outlook.timezone="UTC"` stays),
+  writing the zone into the stored `graph_recurrence` (the next sync brings Graph's).
+- Tests: `client.rs` `event_body_without_zones_is_unchanged` (pinned before the change),
+  `event_body_sends_each_end_in_its_named_zone`,
+  `event_body_series_recurrence_zone_is_the_start_zone`,
+  `event_body_malformed_zone_pair_sends_utc`, `event_zone_error_checks_each_named_end`;
+  `store` `calendar_tests` `create_local_event_stores_named_zones`,
+  `create_local_event_refuses_a_malformed_wall_clock`,
+  `update_event_fields_keeps_zones_when_times_unchanged`,
+  `update_event_fields_zone_alone_does_not_mark_times`,
+  `update_event_fields_clears_zones_when_times_move_without_one`,
+  `update_event_fields_refuses_a_malformed_wall_clock`,
+  `events_without_1983_columns_migrate` (the zones too); `outbox.rs`
+  `queued_create_event_sends_named_zones`,
+  `queued_update_without_times_sends_no_start_or_end`; `engine.rs`
+  `update_event_series_sends_named_zones`,
+  `update_event_series_refuses_a_malformed_wall_clock`.
 
 ## Respond options and proposals (#2023)
 
