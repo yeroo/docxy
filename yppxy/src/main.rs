@@ -33,6 +33,7 @@ use std::process::ExitCode;
 mod backstage;
 mod control;
 mod formats;
+mod help;
 mod mcp;
 mod ribbon;
 mod skill;
@@ -656,6 +657,13 @@ struct App {
     start_screen: bool,
     /// The shared centered start card (item list, selection, click rects).
     start: backstage::Start,
+    /// F1 help (#1856): the manual's reader, drawn over everything and
+    /// owning every key while open.
+    help: Option<helpdocs::reader::Reader>,
+    /// The manual a unit test gave F1 (none by default); the real one comes
+    /// from `help::manual`.
+    #[cfg(test)]
+    help_manual: Option<std::sync::Arc<helpdocs::Manual>>,
     // vim mode
     vim: bool,
     // geometry recorded during draw for mouse hit-testing
@@ -709,6 +717,9 @@ impl App {
             prompt_at: None,
             light: load_theme_pref(),
             start_screen,
+            help: None,
+            #[cfg(test)]
+            help_manual: None,
             start: backstage::Start::new(
                 "yppxy",
                 vec![
@@ -997,6 +1008,43 @@ impl App {
     }
 
     /// Run a ribbon command.
+    /// The manual F1 shows: a unit test's, else the installed or built-in one.
+    fn help_manual(&self) -> Option<std::sync::Arc<helpdocs::Manual>> {
+        #[cfg(test)]
+        return self.help_manual.clone();
+        #[cfg(not(test))]
+        help::manual()
+    }
+
+    /// The area F1 asks the manual for: the active ribbon tab's name, `File`
+    /// in the backstage, none on the start screen (the manual's root).
+    fn help_area(&self) -> Option<&'static str> {
+        if self.start_screen {
+            None
+        } else if self.backstage.is_some() {
+            Some("File")
+        } else {
+            self.ribbon.tab_label(self.ribbon.active_tab())
+        }
+    }
+
+    /// Open F1 help (#1856) on the current area's page, or (`help_page`, Help ›
+    /// Help) on the manual's Help page. Without a manual it says the
+    /// documentation is coming, as before.
+    fn open_help(&mut self, help_page: bool) {
+        let reader = self.help_manual().and_then(|m| {
+            if help_page {
+                help::open_help(m)
+            } else {
+                help::open_area(m, self.help_area())
+            }
+        });
+        match reader {
+            Some(r) => self.help = Some(r),
+            None => self.status = HELP_COMING.into(),
+        }
+    }
+
     fn apply_act(&mut self, act: Act) {
         self.status.clear();
         match act {
@@ -1071,7 +1119,7 @@ impl App {
             }
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
-            Act::Help => self.status = HELP_COMING.into(),
+            Act::Help => self.open_help(true),
             Act::ContactSupport | Act::Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -1850,6 +1898,11 @@ fn run_tui(
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
+    // F1 help swallows the mouse; its wheel scrolls (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        help::mouse(reader, &m);
+        return;
+    }
     // A modal confirmation (Exit, summary delete) owns the whole screen while open — before
     // the welcome screen or backstage, so it can appear over either.
     if app.confirm.is_some() {
@@ -1966,6 +2019,17 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
 }
 
 fn on_key(app: &mut App, k: KeyEvent) {
+    // F1 help owns every key while open, over every other surface (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        if help::key(reader, k) == helpdocs::reader::Outcome::Close {
+            app.help = None;
+        }
+        return;
+    }
+    if help::is_f1(&k) {
+        app.open_help(false);
+        return;
+    }
     // Prompt mode swallows keys until Enter/Esc.
     if let Some(mut prompt) = app.prompt.take() {
         match k.code {
@@ -2256,6 +2320,11 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_screen(f: &mut Frame, app: &mut App) {
+    // F1 help takes the whole screen; nothing under it is drawn (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        help::draw(f, reader, Color::Yellow);
+        return;
+    }
     let area = f.area();
     // A confirmation modal owns the whole screen — no content behind it.
     if let Some(c) = app.confirm.as_mut() {
@@ -3962,6 +4031,140 @@ mod tests {
         let uid = app.ed.selected_uid().unwrap();
         assert_eq!(app.ed.project().task(uid).unwrap().estimated, None);
         assert_eq!(duration_suffix(app.ed.project(), uid), "");
+    }
+
+    /// A schedule open in the editor (not the start screen), with the
+    /// helpdocs `editor` fixture as its manual (#1856).
+    fn help_app(editor: Option<&str>) -> App {
+        let mut app = App::new(new_project(), None, false);
+        app.start_screen = false;
+        app.help_manual = editor.map(help::tests::fixture);
+        app
+    }
+
+    fn help_page(app: &App) -> Option<&str> {
+        app.help.as_ref().and_then(|r| r.page_id())
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn f1_opens_help_on_the_ribbon_tabs_page() {
+        let mut app = help_app(Some("project"));
+        app.ribbon.set_active(1);
+        assert_eq!(app.ribbon.tab_label(1), Some("Task"));
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("task"));
+        on_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.help.is_none());
+        // A held F1 (a repeat) opens nothing.
+        let mut held = plain(KeyCode::F(1));
+        held.kind = KeyEventKind::Repeat;
+        on_key(&mut app, held);
+        assert!(app.help.is_none());
+        // Resource has no page: the root.
+        app.ribbon.set_active(2);
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("project"));
+        app.help = None;
+        // The backstage is File; the start screen has no area.
+        app.open_backstage();
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("project"));
+        on_key(&mut app, plain(KeyCode::Char('q')));
+        assert!(
+            app.backstage.is_some(),
+            "the backstage is still open under it"
+        );
+        app.backstage = None;
+        app.start_screen = true;
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("project"));
+        on_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.start_screen);
+    }
+
+    #[test]
+    fn help_help_opens_the_help_page_and_without_a_manual_says_it_is_coming() {
+        let mut app = help_app(Some("word"));
+        app.apply_act(Act::Help);
+        assert_eq!(help_page(&app), Some("help"));
+        let mut app = help_app(None);
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert!(app.help.is_none());
+        assert_eq!(app.status, HELP_COMING);
+        app.status.clear();
+        app.apply_act(Act::Help);
+        assert!(app.help.is_none());
+        assert_eq!(app.status, HELP_COMING);
+    }
+
+    #[test]
+    fn help_owns_every_key_and_the_mouse_while_open() {
+        let mut app = help_app(Some("project"));
+        app.ribbon.set_active(1);
+        let tasks = app.ed.project().tasks.len();
+        app.prompt = Some(Prompt::new(PromptKind::Rename, "Rename", "plan".into()));
+        on_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("task"));
+        for k in [
+            plain(KeyCode::Char('x')),
+            plain(KeyCode::Char('n')),
+            plain(KeyCode::Delete),
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            plain(KeyCode::Enter),
+            plain(KeyCode::F(9)),
+        ] {
+            on_key(&mut app, k);
+            assert!(!app.quit, "{k:?} quits nothing");
+        }
+        on_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(app.help.is_some());
+        on_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.help.is_none());
+        let p = app.prompt.as_ref().expect("the prompt is still open");
+        assert_eq!(p.buf, "plan");
+        assert_eq!(app.ed.project().tasks.len(), tasks);
+        assert!(!app.ed.dirty());
+        assert_eq!(app.rfocus, ribbon::Focus::None);
+    }
+
+    #[test]
+    fn help_draws_over_the_whole_screen() {
+        let mut app = help_app(Some("project"));
+        app.ribbon.set_active(1);
+        on_key(&mut app, plain(KeyCode::F(1)));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("Help: Task tab"), "{screen}");
+        assert!(screen.contains("Schedule tasks."), "{screen}");
+        assert!(screen.contains("Esc close"), "{screen}");
+        assert!(!screen.contains("Resource"), "{screen}");
+        for (w, h) in [(3, 2), (1, 1), (2, 5)] {
+            screen_of(&mut app, w, h);
+        }
+        on_key(&mut app, plain(KeyCode::Esc));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("Resource"), "{screen}");
     }
 
     /// #1021: Help › About opens File › Info, whose About section lists
