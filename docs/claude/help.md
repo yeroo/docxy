@@ -23,8 +23,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   walk: a launcher runs an act and carries no id. Their dialogs resolve as
   `dialog:<id>`: `every_dialog_has_a_help_target` reports every catalogued
   dialog's (#1855). `helpdocs::resolve_area` is F1's area-only resolve (the
-  area page, else the root; never a key). Terminal overlays (#1856) and build
-  pinning (#1857) are later slices.
+  area page, else the root; never a key). Build pinning (#1857) is a later
+  slice.
+- The terminal editors' F1 reader (#1856, notes in
+  `docs/claude/terminal-editors.md`) uses four more modules, all
+  dependency-free. `text::lay` lays a page out as wrapped lines of spans
+  with a look, the width measured by the host's closure: headings with
+  their slug's line, hanging list indents (an item's children of every kind
+  under it), verbatim hard-wrapped code, tables padded and aligned, else
+  stacked `Header: cell` lines, `[image: alt]`. Links are numbered in
+  `md::links` order. `reader::Reader` is the viewer's state: scroll, Tab
+  links, follow, Back/Forward, a synthetic Contents page. `locate` finds
+  the installed manual, else the built-in one. `embed` writes a build
+  script's `include_bytes!` list.
 
 ## Documentation tab (#1855)
 

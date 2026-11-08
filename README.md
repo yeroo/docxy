@@ -186,6 +186,7 @@ in docxy for now: the browser shows those ribbon commands dimmed.
 | Ctrl-F | find / replace (Tab toggles replace, Alt-A replaces all) |
 | Ctrl-S · Ctrl-Z · Ctrl-Y | save · undo · redo |
 | Ctrl-Q / Esc | quit |
+| F1 | help: the manual's page for the ribbon tab (Tab · Enter follow links, Backspace back, c contents, Esc closes) |
 | F2 · F3 · F4 | page view · show marks · table borders |
 | F6 · F7 | edit header · edit footer (Esc returns) |
 | F8 · F9 | insert landscape · portrait section at cursor |
@@ -250,7 +251,7 @@ xlsxy corpus/xlsx/*.xlsx --verify # conformance scoreboard: recalc + diff
                                   # on the LibreOffice-oracle corpus)
 ```
 
-Type to replace, `F2` to edit, `=` starts a formula; copy/paste and
+Type to replace, `F2` to edit, `=` starts a formula, `F1` opens the manual; copy/paste and
 fill-down translate relative references like Excel; insert/delete rows and
 columns rewrites every affected formula workbook-wide — and every chart
 reference with them; find, Save As, and
@@ -317,6 +318,7 @@ folder browser and live preview), a start screen, a light/dark theme toggle
 | T | toggle the light / dark theme |
 | Ctrl-F · F3 | find task by name · repeat |
 | Ctrl-Z · Ctrl-Y | undo · redo |
+| F1 | help: the manual's page for the ribbon tab (Tab · Enter follow links, Backspace back, c contents, Esc closes) |
 | F9 · Alt-F | engage the ribbon · open the File menu |
 | Ctrl-S · Ctrl-E | save · export a Markdown Gantt |
 | Ctrl-Q · q | quit (q warns on unsaved changes) |
