@@ -1742,3 +1742,67 @@ so the user's other devices follow.
   `a_delete_sent_after_the_move_drained_reaches_the_new_id`, and
   `move_command_optimistically_refiles_locally`. lookxy:
   `message_moved_rekeys_the_open_message_and_the_list`.
+
+## Server search and opening a hit (#2006)
+
+- `GraphClient::search_messages(folder_id, query, top)`: `GET
+  /me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…`, or
+  `/me/mailFolders/{id}/messages?…` with a folder (that folder only, not
+  its subfolders). `query` is KQL as the client wrote it: `search_value`
+  puts it in double quotes, escapes its `\` and `"` with a backslash so it
+  cannot end the clause, and percent-encodes the whole value with
+  `encode_path_segment`. Graph allows neither `$orderby` nor `$filter` with
+  a message `$search`, so the hits come in Graph's order; none is sent, nor
+  a `Prefer: odata.maxpagesize`. `top` is clamped to `1..=SEARCH_TOP_MAX`
+  (1000, Graph's cap; `0` asks for one). `@odata.nextLink` is sent as is
+  (through `full_url`, like a delta link) until `top` hits are in (the rest
+  truncated), a page has no link, or a page brings no item (a looping link).
+- `SearchHit { folder_id, message, fields }` (`graph::model`) is what a
+  delta upsert carries plus `parentFolderId` (empty when Graph sent none).
+  `SearchHit::from_json` drops an item without an id: `Message::from_json`
+  never returns `None`, so it checks the id itself.
+  `GraphClient::get_message_hit(id)` is `get_message` with
+  `parentFolderId` selected, and a body without an id is a `Parse` error.
+  `get_message` keeps its URL for the header repair.
+- `SyncCommand::SearchMessages { query, folder_id, top }` answers with
+  `SyncEvent::MessageSearchResults { query, folder_id, hits }`, echoing
+  the query and folder so a client can drop a stale answer. No matches is
+  an empty `hits`. The hits are not stored. A failure is
+  `SyncEvent::MessageSearchFailed { query, folder_id, reason }` (one line),
+  never `SyncEvent::Error`. Signed out ("not signed in") and a blank query
+  ("empty query") send no request. Auth, throttle and transport failures
+  also go through `react` (sign-in, `next_retry`, Offline), which emits no
+  `Error` for them. `Engine::react_quietly` is `react` for those classes and
+  nothing for the rest. Like `FetchBody`, neither command waits out a
+  back-off: a user's search or click is tried.
+- `SyncCommand::FetchMessage { id }` opens a hit the store lacks, in this
+  order:
+  - Refused with no request: signed out; an id a move left behind
+    (`is_moved_alias`, "moved; open its current id"); and an id a queued op
+    owns (`protected_ids`) whose row is gone ("deleted locally": a queued
+    `Delete` is never undone).
+  - Then `get_message_hit`. A folder that is empty or not in
+    `Store::folders()` writes nothing.
+  - The header is stored with `merge_message_unless_edited` in the hit's
+    folder, as a fresh delta row is, under the id asked (as
+    `repair_headerless` does).
+  - A protected id whose row exists keeps its row (no merge: the queued
+    op's optimistic state and folder stay).
+  - The row's old folder is read first (`Store::message_folder`). When the
+    merge re-filed it, `MessagesUpdated` goes out for the old folder, then
+    for the row's folder.
+  - Then the body, via `fetch_and_store_body` (`BodyReady`, the #1933
+    headers). A body failure after the header still answers
+    `MessageFetchFailed { id, reason }`, and the header stays stored.
+- A later delta or backfill of the folder upserts the same row (same PK), and
+  a stored-link round does not count it as new mail (`message_exists`), so
+  its body is not fetched again. Messages are never pruned by the window, so
+  a hit older than the cutoff stays.
+- Both commands are served at `Engine::checkpoint`, like `FetchBody`, so a
+  search during a pass waits only for the request in flight. A served
+  command's auth, throttle or transport failure stops the work.
+- A client dedupes server hits against its local ones (`Store::search`).
+  Pass each hit's id through `Store::current_id` first: a pre-move alias
+  would otherwise be listed beside its local row and could not be opened.
+- lookxy never sends the two commands. Its `on_sync_event` ignores the
+  three events.
