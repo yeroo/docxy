@@ -40203,7 +40203,12 @@ impl Docxy {
                             .children(
                                 chunk
                                     .iter()
-                                    .map(|cm| self.icon_btn(cm, !icon_only, pal, cx)),
+                                    // A button with no icon keeps its label
+                                    // (an extension's may have none, #1870).
+                                    .map(|cm| {
+                                        let label = !icon_only || cm.icon.0.is_empty();
+                                        self.icon_btn(cm, label, pal, cx)
+                                    }),
                             )
                             .into_any_element()
                     })

@@ -1,0 +1,279 @@
+# An extension tab's ribbon drawn by the suite (#1870). The script's
+# `ext fixture ribbon` line has this instance draw Mail tabs with the
+# suite's test extension, whose surface describes its ribbon as data:
+# Message (KeyTip M) with Respond (Reply, KeyTip R, with an SVG icon; a
+# column Reply All A / Forward W / Meeting; the Flag toggle G) and Move
+# (the Move split MV with Inbox I and Later L; Archive H, disabled until
+# `ext-ribbon-set` enables it) and Tags (lowest priority: three tags and two
+# large buttons with no icon), and View (V) with Arrange (the Sort
+# drop-down S with By Date D and By Sender N; the density gallery Y:
+# Compact, Cozy, Roomy). The extension records every command id the suite
+# runs and the themes it was told (`ext-ribbon-read`). Keys go through
+# `real-key`, as the view sees them first; `ext-ribbon-cmd:<id>` is a
+# command drawn in place. Each test opens its own Mail tab and closes it.
+ext fixture ribbon
+
+test issue 1870 the extension's ribbon is the suite's: File, its tabs, groups, KeyTips and states
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ribbon-read {}
+  assert reply.tab_count is 3
+  assert reply.tabs.0.name is File
+  assert reply.tabs.0.key_tip is F
+  assert reply.tabs.1.name is Message
+  assert reply.tabs.1.key_tip is M
+  assert reply.tabs.2.name is View
+  assert reply.tabs.2.key_tip is V
+  assert reply.tabs.1.groups.0.title is Respond
+  assert reply.tabs.1.groups.0.commands.0.id is fx.reply
+  assert reply.tabs.1.groups.0.commands.0.label is Reply
+  assert reply.tabs.1.groups.0.commands.0.key_tip is R
+  assert reply.tabs.1.groups.0.commands.0.tip.title is Reply to the sender
+  assert reply.tabs.1.groups.0.commands.0.enabled is true
+  assert reply.tabs.1.groups.0.commands.1.id is fx.reply-all
+  assert reply.tabs.1.groups.0.commands.3.id is fx.meeting
+  assert reply.tabs.1.groups.0.commands.4.id is fx.flag
+  assert reply.tabs.1.groups.0.commands.4.checked is false
+  assert reply.tabs.1.groups.1.title is Move
+  assert reply.tabs.1.groups.1.commands.0.id is fx.move
+  assert reply.tabs.1.groups.1.commands.1.id is fx.move.inbox
+  assert reply.tabs.1.groups.1.commands.1.menu is fx.move
+  assert reply.tabs.1.groups.1.commands.3.id is fx.archive
+  assert reply.tabs.1.groups.1.commands.3.enabled is false
+  assert reply.tabs.2.groups.0.title is Arrange
+  assert reply.tabs.2.groups.0.commands.0.id is fx.sort
+  assert reply.tabs.2.groups.0.galleries.0.id is fx.density
+  assert reply.tabs.2.groups.0.galleries.0.key_tip is Y
+  assert reply.tabs.2.groups.0.galleries.0.items.1 is Cozy
+  assert ribbon_tab is Message
+  call ext-ribbon-read {}
+  assert reply.ribbon is true
+  assert reply.actions is []
+  # Fitted as the suite's own: every group drawn whole at this width.
+  call ribbon-layout {"tab":"Message"}
+  shot window
+  shot window
+  call ribbon-layout {"tab":"Message"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.groups.0.title is Respond
+  assert reply.groups.0.state is full
+  assert reply.groups.1.state is full
+  assert reply.groups.2.title is Tags
+  assert reply.groups.2.state is full
+  shot ribbon
+  call ribbon-layout {"tab":"View"}
+  shot window
+  shot window
+  call ribbon-layout {"tab":"View"}
+  assert reply.settled is true
+  assert reply.groups.0.title is Arrange
+  shot ribbon
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1870 a click and a KeyTip both run the extension's command
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ribbon-click {"tab":"Message","command":"fx.reply"}
+  call ext-ribbon-read {}
+  assert reply.actions.0 is fx.reply
+  # A real press on the drawn button.
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.reply"}
+  call ext-ribbon-read {}
+  assert reply.actions.1 is fx.reply
+  # Alt, the tab's letter, the command's: the view never sees the letters.
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call ext-doc-read {}
+  assert reply.focused is false
+  shot window
+  call real-key {"key":"m"}
+  assert keytips_up is true
+  shot window
+  call real-key {"key":"w"}
+  assert keytips_up is false
+  call ext-ribbon-read {}
+  assert reply.actions.2 is fx.forward
+  # The view's text is untouched: no letter was typed into it.
+  call ext-doc-read {}
+  assert reply.selection is empty
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1870 a toggle draws its state, a disabled command runs nothing, a change redraws
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.flag"}
+  call ext-ribbon-read {}
+  assert reply.actions.0 is fx.flag
+  assert reply.flag is true
+  # The suite read the ribbon again after the command: the toggle is on.
+  call ribbon-read {}
+  assert reply.tabs.1.groups.0.commands.4.checked is true
+  shot ribbon
+  # Its KeyTip flips it back.
+  call real-key {"key":"alt"}
+  call real-key {"key":"m"}
+  call real-key {"key":"g"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.0.commands.4.checked is false
+  # Archive is disabled: neither its click, its KeyTip nor ribbon-click
+  # reaches the extension.
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.archive"}
+  call real-key {"key":"alt"}
+  call real-key {"key":"m"}
+  call real-key {"key":"h"}
+  assert status is That command is not available now
+  call ribbon-click {"tab":"Message","command":"fx.archive"}
+  call ext-ribbon-read {}
+  assert reply.actions is ["fx.flag","fx.flag"]
+  # The extension enables it through ext::ribbon_changed: the suite reads
+  # its ribbon again before the next verb.
+  call ext-ribbon-set {"archive_enabled":true}
+  assert reply.archive_enabled is true
+  call ribbon-read {}
+  assert reply.tabs.1.groups.1.commands.3.enabled is true
+  shot ribbon
+  call ribbon-click {"tab":"Message","command":"fx.archive"}
+  call ext-ribbon-read {}
+  assert reply.actions is ["fx.flag","fx.flag","fx.archive"]
+  call ext-ribbon-set {"archive_enabled":false}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1870 split and drop-down menu items and gallery tiles reach the extension
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call menu-open {"target":{"ribbon":["Message","Move","Move"]}}
+  shot window
+  call menu-click {"label":"Inbox"}
+  call ext-ribbon-read {}
+  assert reply.actions.0 is fx.move.inbox
+  # The split's KeyTip opens its menu; the item's letter runs it.
+  call real-key {"key":"alt"}
+  call real-key {"key":"m"}
+  call real-key {"key":"m"}
+  call real-key {"key":"v"}
+  call menu-read {}
+  assert reply.open is true
+  call ext-doc-read {}
+  assert reply.focused is false
+  call real-key {"key":"l"}
+  call ext-ribbon-read {}
+  assert reply.actions.1 is fx.move.later
+  # The drop-down's KeyTip opens its menu (its own id runs nothing).
+  call real-key {"key":"alt"}
+  call real-key {"key":"v"}
+  call real-key {"key":"s"}
+  call menu-read {}
+  assert reply.open is true
+  shot window
+  call real-key {"key":"d"}
+  call ext-ribbon-read {}
+  assert reply.actions is ["fx.move.inbox","fx.move.later","fx.sort.date"]
+  # A gallery tile, pressed in place; the checked one is drawn selected.
+  call ribbon-layout {"tab":"View"}
+  shot window
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.density.roomy"}
+  call ext-ribbon-read {}
+  assert reply.actions.3 is fx.density.roomy
+  assert reply.density is 2
+  call ribbon-read {}
+  assert reply.tabs.2.groups.0.commands.-1.checked is true
+  assert reply.tabs.2.groups.0.commands.-3.checked is false
+  shot ribbon
+  # The gallery's KeyTip opens it as a flyout.
+  call real-key {"key":"alt"}
+  call real-key {"key":"v"}
+  call real-key {"key":"y"}
+  call ribbon-flyout {}
+  assert reply.gallery is fx.density
+  shot window
+  call real-key {"key":"escape"}
+  call ribbon-flyout {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1870 the ribbon collapses, narrows into flyouts, and File is the backstage
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call real-key {"key":"ctrl+f1"}
+  call-error ribbon-read {} => the ribbon is collapsed
+  shot window
+  call real-key {"key":"ctrl+f1"}
+  call ribbon-read {}
+  assert reply.tab_count is 3
+  # A narrow window collapses the lowest-priority group, Tags, into a
+  # button whose flyout holds it; a command there reaches the extension.
+  call window-size {"w":460,"h":600}
+  call ribbon-layout {"tab":"Message"}
+  shot window
+  shot window
+  call ribbon-layout {"tab":"Message"}
+  assert reply.settled is true
+  assert reply.any_clipped is false
+  assert reply.groups.0.state is full
+  assert reply.groups.2.title is Tags
+  assert reply.groups.2.state is collapsed
+  shot window
+  call ribbon-flyout {"action":"open","group":"Tags"}
+  assert reply.open is true
+  shot window
+  call pointer-click {"region":"ext-ribbon-cmd:fx.tag.blue"}
+  call ext-ribbon-read {}
+  assert reply.actions is ["fx.tag.blue"]
+  call window-size {"w":1000,"h":700}
+  shot window
+  # File, and its KeyTip, open the suite's backstage.
+  call real-key {"key":"alt"}
+  call real-key {"key":"f"}
+  call backstage {"action":"read"}
+  assert reply.open is true
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1870 the extension reads the suite's theme and is told when it changes
+  call theme-set {"theme":"auto"}
+  call appearance-set {"appearance":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-ribbon-read {}
+  assert reply.theme.dark is false
+  assert reply.theme_calls is not 0
+  call appearance-set {"appearance":"dark"}
+  assert reply.applied is dark
+  call ext-ribbon-read {}
+  assert reply.theme.dark is true
+  assert reply.theme.background is not ffffff
+  shot window
+  call appearance-set {"appearance":"light"}
+  call ext-ribbon-read {}
+  assert reply.theme.dark is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1

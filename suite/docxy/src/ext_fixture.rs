@@ -92,10 +92,15 @@ const DENSITIES: [(&str, &str); 3] = [
 /// The Reply command's icon: an arrow, in the shape of Fluent's.
 const REPLY_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\" fill=\"currentColor\"><path d=\"M8.35 4.15a.5.5 0 0 1 0 .7L4.71 8.5H11a6 6 0 0 1 6 6v1a.5.5 0 0 1-1 0v-1a5 5 0 0 0-5-5H4.7l3.65 3.65a.5.5 0 0 1-.7.7l-4.5-4.5a.5.5 0 0 1 0-.7l4.5-4.5a.5.5 0 0 1 .7 0Z\"/></svg>";
 
+/// A tag's icon: a filled circle.
+const TAG_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\" fill=\"currentColor\"><circle cx=\"10\" cy=\"10\" r=\"6\"/></svg>";
+
 /// The ribbon the variant describes: Message (KeyTip `M`) with Respond
-/// (Reply, a column of three, the Flag toggle) and Move (the Move split,
-/// a disabled-until-set Archive), and View (`V`) with a Sort drop-down and
-/// the density gallery.
+/// (Reply, a column of three, the Flag toggle), Move (the Move split, a
+/// disabled-until-set Archive) and Tags (the lowest priority: a column of
+/// three tags and two large buttons with no icon, wide enough to collapse
+/// in a narrow window), and View (`V`) with a Sort drop-down and the
+/// density gallery.
 pub(crate) fn fixture_ribbon(state: &RibbonState) -> Ribbon {
     let c = RibbonCommand::new;
     Ribbon::new(vec![
@@ -143,6 +148,26 @@ pub(crate) fn fixture_ribbon(state: &RibbonState) -> Ribbon {
                     ],
                 )
                 .priority(40),
+                RibbonGroup::new(
+                    "Tags",
+                    vec![
+                        RibbonControl::Small(
+                            [
+                                ("fx.tag.red", "Red tag"),
+                                ("fx.tag.blue", "Blue tag"),
+                                ("fx.tag.green", "Green tag"),
+                            ]
+                            .into_iter()
+                            .map(|(id, label)| {
+                                c(id, label).icon(RibbonIcon::svg(TAG_SVG.as_bytes()))
+                            })
+                            .collect(),
+                        ),
+                        RibbonControl::Large(c("fx.categorize", "Assign Category")),
+                        RibbonControl::Large(c("fx.follow-up", "Follow Up Later")),
+                    ],
+                )
+                .priority(20),
             ],
         ),
         RibbonTab::new(

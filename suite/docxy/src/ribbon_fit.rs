@@ -394,9 +394,11 @@ pub(crate) fn model_control_w<A: 'static>(
                     chunk
                         .iter()
                         .map(|c| {
+                            // `render_control`: one with no icon keeps
+                            // its label when the group drops labels (#1870).
                             model_icon_btn_w(
                                 !c.icon.0.is_empty(),
-                                (!icon_only).then_some(c.label),
+                                (!icon_only || c.icon.0.is_empty()).then_some(c.label),
                                 tw,
                             )
                         })
@@ -855,6 +857,15 @@ mod tests {
         assert_eq!(
             model_control_w(&split(""), false, None, &tw),
             model_control_w(&split("bold"), false, None, &tw)
+        );
+        // A column's button with no icon keeps its label icon-only too.
+        let column = Control::Column(vec![
+            rs::cmd("a", "bold", "Alpha", Act::Paste),
+            rs::cmd("b", "", "Beta", Act::Paste),
+        ]);
+        assert_eq!(
+            model_control_w(&column, true, None, &tw),
+            34.0f32.max(18.0 + tw("Beta", 12.0))
         );
         let g = rs::group("G", 1, vec![large(""), large("bold")]);
         assert_eq!(model_group_icon(&g), Some("bold"));

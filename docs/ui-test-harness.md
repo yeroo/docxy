@@ -1704,7 +1704,7 @@ clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-timeline-box-left`,
 `project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
 `ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`,
-`gallery-more:<gallery id>`, `title-tabs`,
+`gallery-more:<gallery id>`, `ext-ribbon-cmd:<command id>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
 absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
@@ -1733,6 +1733,10 @@ group is not drawn in place (collapsed into a flyout, or on another tab).
 More button of a UI plugin's swatch gallery drawn in place with more tiles
 than it shows (#1823); a click opens the whole gallery as a flyout. It is an
 error when the gallery draws no More button in place.
+`ext-ribbon-cmd:<command id>` (for example `ext-ribbon-cmd:fx.reply`) is a
+command of an extension's ribbon drawn in place (#1870): its button, a
+split's upper half, a drop-down or a gallery tile; an error while it is not
+drawn in place (another tab, a collapsed group, a collapsed ribbon).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is
