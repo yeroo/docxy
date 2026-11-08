@@ -1025,6 +1025,65 @@ impl EventRecurrence {
             ("range".to_string(), range),
         ])
     }
+
+    /// Graph's `recurrence` as a write sends it (#2022, a series edit):
+    /// `to_json`'s column text writes `""` dates and zeros, which Graph
+    /// refuses on a write (`"endDate":""` is not a Date). So the pattern
+    /// sends `type` and `interval`, and `month`, `dayOfMonth`, `daysOfWeek`,
+    /// `firstDayOfWeek` and `index` only when non-zero / non-empty (as
+    /// given: nothing is defaulted, so a `monday` week stays `monday`); the
+    /// range sends `type` and `startDate`, `endDate` only for an `endDate`
+    /// range, `numberOfOccurrences` only for a `numbered` one, and
+    /// `recurrenceTimeZone` only when non-empty. Lenient: an unknown `type`
+    /// is sent as is, and nothing here errors.
+    pub fn to_send_json(&self) -> Value {
+        let s = |v: &str| Value::Str(v.to_string());
+        let n = |v: u32| Value::Num(v as f64);
+        let p = &self.pattern;
+        let r = &self.range;
+        let mut pattern = vec![
+            ("type".to_string(), s(&p.r#type)),
+            ("interval".to_string(), n(p.interval)),
+        ];
+        if p.month != 0 {
+            pattern.push(("month".to_string(), n(p.month)));
+        }
+        if p.day_of_month != 0 {
+            pattern.push(("dayOfMonth".to_string(), n(p.day_of_month)));
+        }
+        if !p.days_of_week.is_empty() {
+            pattern.push((
+                "daysOfWeek".to_string(),
+                Value::Array(p.days_of_week.iter().map(|d| s(d)).collect()),
+            ));
+        }
+        if !p.first_day_of_week.is_empty() {
+            pattern.push(("firstDayOfWeek".to_string(), s(&p.first_day_of_week)));
+        }
+        if !p.index.is_empty() {
+            pattern.push(("index".to_string(), s(&p.index)));
+        }
+        let mut range = vec![
+            ("type".to_string(), s(&r.r#type)),
+            ("startDate".to_string(), s(&r.start_date)),
+        ];
+        if r.r#type == "endDate" && !r.end_date.is_empty() {
+            range.push(("endDate".to_string(), s(&r.end_date)));
+        }
+        if r.r#type == "numbered" {
+            range.push((
+                "numberOfOccurrences".to_string(),
+                n(r.number_of_occurrences),
+            ));
+        }
+        if !r.recurrence_time_zone.is_empty() {
+            range.push(("recurrenceTimeZone".to_string(), s(&r.recurrence_time_zone)));
+        }
+        Value::Object(vec![
+            ("pattern".to_string(), Value::Object(pattern)),
+            ("range".to_string(), Value::Object(range)),
+        ])
+    }
 }
 
 /// One of the user's calendars, as `GET /me/calendars` lists it (#1984).
@@ -2490,6 +2549,52 @@ mod tests {
 
         // No pattern object: no recurrence.
         assert_eq!(ev(r#","recurrence":{"pattern":null}"#).recurrence, None);
+    }
+
+    #[test]
+    fn event_recurrence_send_json_drops_what_graph_refuses() {
+        let rec = |json: &str| {
+            EventRecurrence::from_json(&parse(json).unwrap())
+                .unwrap()
+                .to_send_json()
+                .to_string()
+        };
+        // noEnd: Graph's never date and zeros are not sent; a monday week
+        // stays monday, the unused `index` filler is kept (Graph ignores it).
+        assert_eq!(
+            rec(
+                r#"{"pattern":{"type":"weekly","interval":1,"month":0,"dayOfMonth":0,
+                "daysOfWeek":["monday","wednesday"],"firstDayOfWeek":"monday","index":"first"},
+                "range":{"type":"noEnd","startDate":"2026-07-13","endDate":"0001-01-01",
+                "recurrenceTimeZone":"","numberOfOccurrences":0}}"#
+            ),
+            r#"{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday","wednesday"],"firstDayOfWeek":"monday","index":"first"},"range":{"type":"noEnd","startDate":"2026-07-13"}}"#
+        );
+        // numbered: the count, never an end date.
+        assert_eq!(
+            rec(
+                r#"{"pattern":{"type":"relativeMonthly","interval":2,"month":0,"dayOfMonth":0,
+                "daysOfWeek":["tuesday"],"firstDayOfWeek":"sunday","index":"second"},
+                "range":{"type":"numbered","startDate":"2026-07-14","endDate":"0001-01-01",
+                "recurrenceTimeZone":"W. Europe Standard Time","numberOfOccurrences":6}}"#
+            ),
+            r#"{"pattern":{"type":"relativeMonthly","interval":2,"daysOfWeek":["tuesday"],"firstDayOfWeek":"sunday","index":"second"},"range":{"type":"numbered","startDate":"2026-07-14","numberOfOccurrences":6,"recurrenceTimeZone":"W. Europe Standard Time"}}"#
+        );
+        // endDate: the end date, no count; a yearly month and day.
+        assert_eq!(
+            rec(
+                r#"{"pattern":{"type":"absoluteYearly","interval":1,"month":3,"dayOfMonth":17},
+                "range":{"type":"endDate","startDate":"2026-03-17","endDate":"2030-03-17",
+                "numberOfOccurrences":0}}"#
+            ),
+            r#"{"pattern":{"type":"absoluteYearly","interval":1,"month":3,"dayOfMonth":17},"range":{"type":"endDate","startDate":"2026-03-17","endDate":"2030-03-17"}}"#
+        );
+        // An unknown type is sent as is.
+        assert_eq!(
+            rec(r#"{"pattern":{"type":"fortnightlyish","interval":1},
+                "range":{"type":"someday","startDate":"2026-01-01"}}"#),
+            r#"{"pattern":{"type":"fortnightlyish","interval":1},"range":{"type":"someday","startDate":"2026-01-01"}}"#
+        );
     }
 
     #[test]

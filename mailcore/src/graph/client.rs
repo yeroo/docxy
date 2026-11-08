@@ -10,8 +10,8 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
-    EventDeltaPage, FolderContact, FolderListing, MailFolder, MasterCategory, Me, Message,
-    MessageFields, MessageHeader, OofStatus, Person, Recipient, Recurrence, ScheduleEntry,
+    EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
+    Message, MessageFields, MessageHeader, OofStatus, Person, Recipient, Recurrence, ScheduleEntry,
     plain_to_html,
 };
 use crate::json::{self, Value};
@@ -341,6 +341,11 @@ pub struct EventInput {
     /// The recurrence pattern for a repeating event, or `None` for a single
     /// event. Serialized into the create/update body by `event_body_json`.
     pub recurrence: Option<Recurrence>,
+    /// A series edit's recurrence (#2022), Graph's own lossless shape: when
+    /// `Some`, the `recurrence` group sends it (`to_send_json`) instead of
+    /// the create-side `recurrence`, so a `relativeMonthly` or `numbered`
+    /// series is not rewritten into one of the create side's three kinds.
+    pub series_recurrence: Option<EventRecurrence>,
     /// Graph `showAs`, `sensitivity`, `importance`; `""` is not sent (Graph
     /// refuses an empty enum).
     pub show_as: String,
@@ -912,6 +917,42 @@ impl GraphClient {
         Ok(page)
     }
 
+    /// GET `/me/events/{id}/instances?startDateTime=&endDateTime=&$top=50`
+    /// (#2022): a series' occurrences in the range, exceptions included, the
+    /// master's id percent-encoded as a path segment, with `calendar_view`'s
+    /// UTC `Prefer` and paging (`calendar_view_paged`). `calendar_id` is what
+    /// the JSON gave (Graph sends no `calendar` unless expanded, so `""`).
+    pub fn event_instances(
+        &self,
+        master_id: &str,
+        from_utc: &str,
+        to_utc: &str,
+    ) -> Result<Vec<Event>, GraphError> {
+        let id = encode_path_segment(master_id);
+        self.calendar_view_paged(format!(
+            "/me/events/{id}/instances?startDateTime={from_utc}&endDateTime={to_utc}&$top=50"
+        ))
+    }
+
+    /// GET `/me/events/{id}` with the UTC `Prefer` (#2022): one event as
+    /// Graph holds it, a series master with its `recurrence`
+    /// (`calendarView` only lists occurrences). An answer without a
+    /// non-empty `id` is a `Parse` error.
+    pub fn get_event(&self, id: &str) -> Result<Event, GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/events/{id}");
+        let resp = self.send(
+            Method::Get,
+            &path,
+            None,
+            &[("Prefer", "outlook.timezone=\"UTC\"")],
+        )?;
+        let v = parse_body(resp)?;
+        Event::from_json(&v)
+            .filter(|e| !e.id.is_empty())
+            .ok_or_else(|| GraphError::Parse("malformed event".to_string()))
+    }
+
     /// Sends `Prefer: outlook.timezone="UTC"` so every returned event's
     /// `start`/`end` is already a UTC wall-clock time (see `Event::from_json`
     /// / `model::to_utc` for the fixed-width normalization this enables),
@@ -1177,9 +1218,17 @@ impl GraphClient {
     /// updated event; an answer without one (an empty 204, or a body with no
     /// `id`) is `Ok(None)`, never an error: the PATCH was applied.
     pub fn update_event(&self, id: &str, input: &EventInput) -> Result<Option<Event>, GraphError> {
+        self.update_event_body(id, event_body_json(input))
+    }
+
+    /// `update_event` with the PATCH body already serialized
+    /// (`event_body_json`): what a queued series edit stores and sends
+    /// (#2022, `OutboxOp::UpdateEventSeries`), as the master it edits is not
+    /// stored. The same answer rule as `update_event`.
+    pub fn update_event_body(&self, id: &str, body: String) -> Result<Option<Event>, GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/events/{id}");
-        let resp = self.send(Method::Patch, &path, Some(event_body_json(input)), &[])?;
+        let resp = self.send(Method::Patch, &path, Some(body), &[])?;
         Ok(parse_body(resp)
             .ok()
             .and_then(|v| Event::from_json(&v))
@@ -1695,7 +1744,7 @@ fn draft_body_json(
 /// wall clock (the `Z` suffix stripped) with `timeZone:"UTC"`, matching how
 /// `calendar_view` reads events back under the `Prefer:
 /// outlook.timezone="UTC"` header.
-fn event_body_json(input: &EventInput) -> String {
+pub(crate) fn event_body_json(input: &EventInput) -> String {
     let dt = |utc: &str| -> Value {
         Value::Object(vec![
             (
@@ -1760,7 +1809,9 @@ fn event_body_json(input: &EventInput) -> String {
         );
     }
     if has(EventFieldSet::RECURRENCE) {
-        if let Some(rec) = &input.recurrence {
+        if let Some(rec) = &input.series_recurrence {
+            put("recurrence", rec.to_send_json());
+        } else if let Some(rec) = &input.recurrence {
             put("recurrence", rec.to_json());
         }
     }
@@ -5100,5 +5151,179 @@ mod tests {
                 .iter()
                 .any(|r| r.method == "DELETE" && r.path.contains("/me/events/EV2"))
         );
+    }
+
+    fn has_utc_prefer(r: &crate::testserver::RecordedRequest) -> bool {
+        r.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("prefer") && v == "outlook.timezone=\"UTC\"")
+    }
+
+    #[test]
+    fn event_instances_gets_the_range_with_utc_and_pages() {
+        // The master id holds `/`, `+` and `=`; the second page is the more
+        // specific prefix, so it goes first (first prefix match wins).
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/events/M%2Fx%2B%3D/instances?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}]}}"#,
+                    sample_event_json("OCC2", "2026-07-21T09:00:00")
+                ),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/events/M%2Fx%2B%3D/instances?startDateTime=".into(),
+                status: 200,
+                headers: vec![],
+                body: format!(
+                    r#"{{"value":[{}],"@odata.nextLink":"/me/events/M%2Fx%2B%3D/instances?$skiptoken=P2"}}"#,
+                    sample_event_json("OCC1", "2026-07-14T09:00:00"),
+                ),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let events = c
+            .event_instances("M/x+=", "2026-07-01T00:00:00Z", "2026-08-01T00:00:00Z")
+            .unwrap();
+        let ids: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["OCC1", "OCC2"]);
+        assert_eq!(events[0].start_utc, "2026-07-14T09:00:00Z");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0].path,
+            "/me/events/M%2Fx%2B%3D/instances?startDateTime=2026-07-01T00:00:00Z\
+             &endDateTime=2026-08-01T00:00:00Z&$top=50"
+        );
+        assert_eq!(
+            reqs[1].path,
+            "/me/events/M%2Fx%2B%3D/instances?$skiptoken=P2"
+        );
+        assert!(reqs.iter().all(|r| r.method == "GET" && has_utc_prefer(r)));
+    }
+
+    #[test]
+    fn get_event_returns_the_master_with_its_recurrence() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/M%2F1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"M/1","subject":"Review","type":"seriesMaster",
+                "start":{"dateTime":"2026-07-14T09:00:00.0000000","timeZone":"UTC"},
+                "end":{"dateTime":"2026-07-14T10:00:00.0000000","timeZone":"UTC"},
+                "recurrence":{"pattern":{"type":"relativeMonthly","interval":1,"month":0,
+                "dayOfMonth":0,"daysOfWeek":["tuesday"],"firstDayOfWeek":"monday","index":"second"},
+                "range":{"type":"numbered","startDate":"2026-07-14","endDate":"0001-01-01",
+                "recurrenceTimeZone":"","numberOfOccurrences":10}}}"#
+                .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let master = c.get_event("M/1").unwrap();
+        assert_eq!(master.id, "M/1");
+        assert_eq!(master.event_type, "seriesMaster");
+        assert_eq!(master.start_utc, "2026-07-14T09:00:00Z");
+        let rec = master.recurrence.unwrap();
+        assert_eq!(rec.pattern.r#type, "relativeMonthly");
+        assert_eq!(rec.pattern.index, "second");
+        assert_eq!(rec.pattern.first_day_of_week, "monday");
+        assert_eq!(rec.range.r#type, "numbered");
+        assert_eq!(rec.range.number_of_occurrences, 10);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/me/events/M%2F1");
+        assert!(has_utc_prefer(&reqs[0]));
+    }
+
+    #[test]
+    fn get_event_without_id_is_a_parse_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/M".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"subject":"no id","type":"seriesMaster"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.get_event("M"), Err(GraphError::Parse(_))));
+    }
+
+    #[test]
+    fn update_occurrence_patches_its_id_without_recurrence() {
+        // Pin: an occurrence's edit is `update_event` on the occurrence's id
+        // with the changed groups; a synced occurrence carries no
+        // recurrence, so none is sent even with the group set.
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/OCC".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let input = EventInput {
+            subject: "Moved".into(),
+            fields: EventFieldSet::SUBJECT.union(EventFieldSet::RECURRENCE),
+            ..sample_input()
+        };
+        c.update_event("OCC", &input).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/events/OCC");
+        assert_eq!(keys(&reqs[0].body), ["subject"]);
+    }
+
+    #[test]
+    fn update_series_patches_the_master_with_its_full_recurrence() {
+        use crate::graph::model::{RecurrencePattern, RecurrenceRange};
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/MASTER".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let input = EventInput {
+            subject: "Review".into(),
+            series_recurrence: Some(EventRecurrence {
+                pattern: RecurrencePattern {
+                    r#type: "relativeMonthly".into(),
+                    interval: 1,
+                    days_of_week: vec!["tuesday".into()],
+                    first_day_of_week: "monday".into(),
+                    index: "second".into(),
+                    ..Default::default()
+                },
+                range: RecurrenceRange {
+                    r#type: "numbered".into(),
+                    start_date: "2026-07-14".into(),
+                    number_of_occurrences: 10,
+                    ..Default::default()
+                },
+            }),
+            fields: EventFieldSet::SUBJECT.union(EventFieldSet::RECURRENCE),
+            ..sample_input()
+        };
+        c.update_event("MASTER", &input).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/events/MASTER");
+        assert_eq!(keys(&reqs[0].body), ["subject", "recurrence"]);
+        let body = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            body.get("recurrence").unwrap().to_string(),
+            r#"{"pattern":{"type":"relativeMonthly","interval":1,"daysOfWeek":["tuesday"],"firstDayOfWeek":"monday","index":"second"},"range":{"type":"numbered","startDate":"2026-07-14","numberOfOccurrences":10}}"#
+        );
+        // The same body through `update_event_body`, as a queued series op
+        // sends it.
+        c.update_event_body("MASTER", event_body_json(&input))
+            .unwrap();
+        assert_eq!(srv.requests()[1].body, reqs[0].body);
     }
 }

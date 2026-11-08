@@ -278,6 +278,7 @@ fn event_input_for(store: &Store, id: &str) -> Result<(EventInput, bool), GraphE
         attendees: d.attendees,
         body_html: d.body_html,
         recurrence: d.recurrence,
+        series_recurrence: None,
         show_as: d.show_as,
         sensitivity: d.sensitivity,
         importance: d.importance,
