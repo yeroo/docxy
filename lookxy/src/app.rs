@@ -654,6 +654,7 @@ impl App {
                 }
             }
             SyncEvent::AttachmentSaved { path } => self.finish_attachment_save(path),
+            SyncEvent::MessageMoved { old_id, new_id } => self.follow_moved(&old_id, &new_id),
             SyncEvent::MeetingResponded { message_id, kind } => {
                 if self.selected_msg.as_deref() == Some(message_id.as_str()) {
                     self.attachment_notice = Some(
@@ -1813,6 +1814,29 @@ impl App {
         if let Some(form) = self.oof_form.as_mut() {
             form.error = Some(msg.to_string());
         }
+    }
+
+    /// A move reached Graph and the store holds the message as `new_id` now
+    /// (`SyncEvent::MessageMoved`, #1896): every id held for it (the open
+    /// message, a move picker or attachments popup opened on it) follows,
+    /// and the list re-reads the store, whose row changed id.
+    fn follow_moved(&mut self, old_id: &str, new_id: &str) {
+        let follow = |id: &mut String| {
+            if id == old_id {
+                *id = new_id.to_string();
+            }
+        };
+        if let Some(id) = self.selected_msg.as_mut() {
+            follow(id);
+        }
+        if let Some(p) = self.move_picker.as_mut() {
+            follow(&mut p.message_id);
+            p.thread_ids.iter_mut().flatten().for_each(follow);
+        }
+        if let Some(a) = self.attachments.as_mut() {
+            follow(&mut a.message_id);
+        }
+        self.reload_messages();
     }
 
     /// Opens message `id` in the reading pane: records it as `selected_msg`
@@ -4708,6 +4732,26 @@ pub(crate) mod tests {
         open_meeting_invite(&mut app);
         app.on_key_char('D');
         assert_eq!(app.rsvp_prompt.as_ref().unwrap().kind, "declined");
+    }
+
+    #[test]
+    fn message_moved_rekeys_the_open_message_and_the_list() {
+        let mut app = App::for_test_with_seeded_store();
+        app.open_message("m1");
+        app.store.follow_move("m1", "m1-moved").unwrap();
+        app.on_sync_event(SyncEvent::MessageMoved {
+            old_id: "m1".into(),
+            new_id: "m1-moved".into(),
+        });
+        assert_eq!(app.selected_msg.as_deref(), Some("m1-moved"));
+        assert!(app.messages.iter().any(|m| m.id == "m1-moved"));
+        assert!(!app.messages.iter().any(|m| m.id == "m1"));
+        // Another message's move leaves the open one alone.
+        app.on_sync_event(SyncEvent::MessageMoved {
+            old_id: "other".into(),
+            new_id: "other-moved".into(),
+        });
+        assert_eq!(app.selected_msg.as_deref(), Some("m1-moved"));
     }
 
     #[test]
