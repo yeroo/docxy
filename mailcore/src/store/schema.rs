@@ -285,7 +285,10 @@ CREATE TABLE IF NOT EXISTS event_attendees (
     type     TEXT NOT NULL DEFAULT '',
     response TEXT NOT NULL DEFAULT '',
     -- Graph `status.time`, `''` when never (#1983).
-    response_time TEXT NOT NULL DEFAULT ''
+    response_time TEXT NOT NULL DEFAULT '',
+    -- The attendee's `proposedNewTime` in canonical UTC, `''` when none (#2023).
+    proposed_start_utc TEXT NOT NULL DEFAULT '',
+    proposed_end_utc TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_event_attendees_event ON event_attendees(event_id);

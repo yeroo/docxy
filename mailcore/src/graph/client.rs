@@ -12,7 +12,7 @@ use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
     EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
     Message, MessageFields, MessageHeader, OofStatus, Person, Recipient, Recurrence, ScheduleEntry,
-    plain_to_html,
+    plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -213,6 +213,62 @@ pub enum RsvpKind {
     Accept,
     Decline,
     Tentative,
+}
+
+impl RsvpKind {
+    /// Maps the `response_status` vocabulary `Store::set_event_response`
+    /// writes locally (and `SyncCommand::RespondEvent`'s and
+    /// `OutboxOp::RespondEvent`'s `kind` carry) to the action
+    /// `respond_event` sends: `"accepted"` → `Accept`, `"declined"` →
+    /// `Decline`, `"tentativelyAccepted"` → `Tentative`. `None` for anything
+    /// else: an unknown value must never fall back to accepting a meeting.
+    pub fn from_status(status: &str) -> Option<RsvpKind> {
+        match status {
+            "accepted" => Some(RsvpKind::Accept),
+            "declined" => Some(RsvpKind::Decline),
+            "tentativelyAccepted" => Some(RsvpKind::Tentative),
+            _ => None,
+        }
+    }
+}
+
+/// Checks an RSVP's proposed new time before anything is sent or written
+/// (#2023), and returns the window to send, normalised to canonical UTC
+/// (`graph::model::to_utc`), or `None` when the response proposes nothing.
+/// `Some("")` counts as absent, so two empty fields are no proposal. A
+/// proposal is refused (the message says why) when it comes with an accept
+/// (Graph's `accept` takes none), with `send_response` false (Graph:
+/// proposing requires `sendResponse: true`), with only one end of the
+/// window, or with an end not after its start.
+///
+/// The sync engine runs this first for `SyncCommand::RespondEvent` and
+/// `RespondMeeting`; a host that writes the RSVP status locally before it
+/// sends the command should call it first too, so a refused response never
+/// leaves a status Graph was never told. The stored event's
+/// `allow_new_time_proposals` is the engine's check, not this one's.
+pub fn rsvp_proposal(
+    kind: RsvpKind,
+    send_response: bool,
+    start_utc: Option<&str>,
+    end_utc: Option<&str>,
+) -> Result<Option<(String, String)>, &'static str> {
+    let start = start_utc.filter(|s| !s.is_empty());
+    let end = end_utc.filter(|s| !s.is_empty());
+    let (start, end) = match (start, end) {
+        (None, None) => return Ok(None),
+        (Some(s), Some(e)) => (to_utc(s, "UTC"), to_utc(e, "UTC")),
+        _ => return Err("a proposed new time needs both a start and an end"),
+    };
+    if kind == RsvpKind::Accept {
+        return Err("an accept cannot propose a new time");
+    }
+    if !send_response {
+        return Err("proposing a new time requires sending a response");
+    }
+    if end <= start {
+        return Err("a proposed new time must end after it starts");
+    }
+    Ok(Some((start, end)))
 }
 
 /// The groups of event properties a create or update sends (#1994). An
@@ -1045,7 +1101,12 @@ impl GraphClient {
     /// POST `/me/events/{id}/accept|decline|tentativelyAccept` with
     /// `{"comment":…, "sendResponse":…}` — `comment` defaults to `""` when
     /// `None` rather than omitting the field, so the body shape is the same
-    /// for every call.
+    /// for every call. With `send_response` false Graph tells the organizer
+    /// nothing and ignores the comment. `proposed` (UTC start and end) goes
+    /// out as `proposedNewTime`, its `dateTime`s without the `Z` next to
+    /// `timeZone:"UTC"` as `event_body_json` sends them, on decline and
+    /// tentative only: Graph's `accept` takes no proposal, so an accept drops
+    /// it. Callers check a proposal first with [`rsvp_proposal`].
     pub fn respond_event(
         &self,
         id: &str,
@@ -1068,10 +1129,13 @@ impl GraphClient {
             ),
             ("sendResponse".to_string(), Value::Bool(send_response)),
         ];
-        if let Some((start, end)) = &proposed {
+        if let Some((start, end)) = proposed.as_ref().filter(|_| kind != RsvpKind::Accept) {
             let dt = |utc: &str| {
                 Value::Object(vec![
-                    ("dateTime".to_string(), Value::Str(utc.to_string())),
+                    (
+                        "dateTime".to_string(),
+                        Value::Str(utc.trim_end_matches('Z').to_string()),
+                    ),
                     ("timeZone".to_string(), Value::Str("UTC".to_string())),
                 ])
             };
@@ -4134,7 +4198,7 @@ mod tests {
                 .unwrap()
                 .get("dateTime")
                 .and_then(Value::as_str),
-            Some("2026-07-21T14:00:00Z")
+            Some("2026-07-21T14:00:00")
         );
         assert_eq!(
             pnt.get("end")
@@ -4142,6 +4206,119 @@ mod tests {
                 .get("timeZone")
                 .and_then(Value::as_str),
             Some("UTC")
+        );
+    }
+
+    #[test]
+    fn respond_event_tentative_with_proposed_time_sends_proposed_new_time() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/tentativelyAccept".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event(
+            "E1",
+            RsvpKind::Tentative,
+            Some("maybe later?"),
+            true,
+            Some(("2026-07-21T14:00:00Z".into(), "2026-07-21T15:00:00Z".into())),
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/events/E1/tentativelyAccept");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent.get("comment").and_then(Value::as_str),
+            Some("maybe later?")
+        );
+        assert_eq!(
+            sent.get("sendResponse").and_then(Value::as_bool),
+            Some(true)
+        );
+        let pnt = sent.get("proposedNewTime").unwrap();
+        for (side, want) in [
+            ("start", "2026-07-21T14:00:00"),
+            ("end", "2026-07-21T15:00:00"),
+        ] {
+            let dt = pnt.get(side).unwrap();
+            assert_eq!(dt.get("dateTime").and_then(Value::as_str), Some(want));
+            assert_eq!(dt.get("timeZone").and_then(Value::as_str), Some("UTC"));
+        }
+    }
+
+    #[test]
+    fn respond_event_accept_drops_a_proposed_time() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events/E1/accept".into(),
+            status: 202,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.respond_event(
+            "E1",
+            RsvpKind::Accept,
+            None,
+            true,
+            Some(("2026-07-21T14:00:00Z".into(), "2026-07-21T15:00:00Z".into())),
+        )
+        .unwrap();
+        let sent = json::parse(&srv.requests()[0].body).unwrap();
+        assert!(sent.get("proposedNewTime").is_none());
+    }
+
+    #[test]
+    fn rsvp_kind_from_status() {
+        assert_eq!(RsvpKind::from_status("accepted"), Some(RsvpKind::Accept));
+        assert_eq!(RsvpKind::from_status("declined"), Some(RsvpKind::Decline));
+        assert_eq!(
+            RsvpKind::from_status("tentativelyAccepted"),
+            Some(RsvpKind::Tentative)
+        );
+        assert_eq!(RsvpKind::from_status("none"), None);
+        assert_eq!(RsvpKind::from_status(""), None);
+    }
+
+    #[test]
+    fn rsvp_proposal_normalises_and_refuses() {
+        let (s, e) = ("2026-07-21T14:00:00.0000000", "2026-07-21T15:00:00Z");
+        let window = Some((
+            "2026-07-21T14:00:00Z".to_string(),
+            "2026-07-21T15:00:00Z".to_string(),
+        ));
+        for kind in [RsvpKind::Decline, RsvpKind::Tentative] {
+            assert_eq!(
+                rsvp_proposal(kind, true, Some(s), Some(e)),
+                Ok(window.clone())
+            );
+        }
+        // No proposal: nothing to check, whatever the kind or flag.
+        for (start, end) in [(None, None), (Some(""), Some("")), (Some(""), None)] {
+            assert_eq!(rsvp_proposal(RsvpKind::Accept, false, start, end), Ok(None));
+        }
+        let refused = |kind, send, start, end| rsvp_proposal(kind, send, start, end).is_err();
+        assert!(refused(RsvpKind::Accept, true, Some(s), Some(e)), "accept");
+        assert!(
+            refused(RsvpKind::Tentative, false, Some(s), Some(e)),
+            "no response"
+        );
+        assert!(refused(RsvpKind::Decline, true, Some(s), None), "no end");
+        assert!(
+            refused(RsvpKind::Decline, true, Some(""), Some(e)),
+            "no start"
+        );
+        assert!(
+            refused(RsvpKind::Decline, true, Some(e), Some(s)),
+            "end before start"
+        );
+        assert!(
+            refused(RsvpKind::Decline, true, Some(e), Some(e)),
+            "empty window"
         );
     }
 

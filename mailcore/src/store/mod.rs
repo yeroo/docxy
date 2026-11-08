@@ -251,16 +251,19 @@ pub enum OutboxOp {
         id: String,
     },
     /// Push an RSVP for a calendar event to Graph
-    /// (`.../accept`|`.../decline`|`.../tentativelyAccept`, always with
-    /// `sendResponse: true` — see `sync::outbox::apply_op`). `kind` is the
-    /// same response_status vocabulary `Store::set_event_response` writes
-    /// locally (`"accepted"`, `"declined"`, `"tentativelyAccepted"`);
-    /// `apply_op` converts it to a `graph::client::RsvpKind`. `comment` is
-    /// the optional note attendees see alongside the response.
+    /// (`.../accept`|`.../decline`|`.../tentativelyAccept` — see
+    /// `sync::outbox::apply_op`). `kind` is the same response_status
+    /// vocabulary `Store::set_event_response` writes locally (`"accepted"`,
+    /// `"declined"`, `"tentativelyAccepted"`); `apply_op` converts it with
+    /// `graph::client::RsvpKind::from_status`. `comment` is the optional note
+    /// attendees see alongside the response. `send_response` false is "Don't
+    /// send a response" (#2023): the JSON key `sendResponse`, which a row
+    /// queued before #2023 lacks and reads as `true`, the only behaviour then.
     RespondEvent {
         id: String,
         kind: String,
         comment: Option<String>,
+        send_response: bool,
         proposed_start_utc: Option<String>,
         proposed_end_utc: Option<String>,
     },
@@ -372,6 +375,7 @@ impl OutboxOp {
                 id,
                 kind,
                 comment,
+                send_response,
                 proposed_start_utc,
                 proposed_end_utc,
             } => Value::Object(vec![
@@ -385,6 +389,7 @@ impl OutboxOp {
                         None => Value::Null,
                     },
                 ),
+                ("sendResponse".to_string(), Value::Bool(*send_response)),
                 (
                     "proposedStart".to_string(),
                     match proposed_start_utc {
@@ -488,6 +493,10 @@ impl OutboxOp {
                 id: id()?,
                 kind: v.get("rsvp")?.as_str()?.to_string(),
                 comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+                send_response: v
+                    .get("sendResponse")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 proposed_start_utc: v
                     .get("proposedStart")
                     .and_then(Value::as_str)
@@ -651,6 +660,11 @@ pub struct AttendeeRow {
     pub response: String,
     /// Graph `status.time`; `""` when never (#1983).
     pub response_time: String,
+    /// The new time the attendee proposed, canonical UTC; both `""` when
+    /// none (Graph `attendees[].proposedNewTime`, the organizer's view,
+    /// #2023).
+    pub proposed_start_utc: String,
+    pub proposed_end_utc: String,
 }
 
 /// A stored calendar (`Store::calendars`, #1984): Graph's fields, and
@@ -824,6 +838,8 @@ pub struct NewAttendee {
     pub r#type: String,
     pub response: String,
     pub response_time: String,
+    pub proposed_start_utc: String,
+    pub proposed_end_utc: String,
 }
 
 /// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
@@ -879,6 +895,8 @@ impl From<&Attendee> for NewAttendee {
             r#type: a.r#type.clone(),
             response: a.response.clone(),
             response_time: a.response_time.clone(),
+            proposed_start_utc: a.proposed_start_utc.clone(),
+            proposed_end_utc: a.proposed_end_utc.clone(),
         }
     }
 }
@@ -1038,10 +1056,16 @@ impl Store {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
         }
-        let _ = conn.execute(
-            "ALTER TABLE event_attendees ADD COLUMN response_time TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        for column in [
+            "response_time TEXT NOT NULL DEFAULT ''",
+            "proposed_start_utc TEXT NOT NULL DEFAULT ''",
+            "proposed_end_utc TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE event_attendees ADD COLUMN {column}"),
+                [],
+            );
+        }
         // Same idempotent-migration pattern as `is_draft`/`body_html` above:
         // `messages` already includes `bcc_recipients` for freshly-created
         // databases; this brings an existing database up to date, erroring
@@ -4453,7 +4477,8 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
 /// `Store::event_attendees` on `conn`.
 fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT name, addr, type, response, response_time
+        "SELECT name, addr, type, response, response_time, proposed_start_utc,
+                proposed_end_utc
          FROM event_attendees WHERE event_id = ?1",
     )?;
     let rows = stmt
@@ -4464,6 +4489,8 @@ fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, S
                 r#type: row.get(2)?,
                 response: row.get(3)?,
                 response_time: row.get(4)?,
+                proposed_start_utc: row.get(5)?,
+                proposed_end_utc: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -4499,9 +4526,10 @@ fn non_empty(v: &Option<String>) -> Option<String> {
 
 /// The attendees a host's `LocalEventFields::attendees` stores, given the
 /// event's stored ones (`&[]` on a create): one whose address matches a
-/// stored attendee (case-insensitive) keeps that row's response and response
-/// time, and its type when the input's is `""` (#1994); a new one is
-/// `required` (or its given type) with no response.
+/// stored attendee (case-insensitive) keeps that row's response, response
+/// time and proposed new time (#2023), and its type when the input's is `""`
+/// (#1994); a new one is `required` (or its given type) with no response and
+/// no proposal.
 fn typed_attendees(input: &[AttendeeInput], stored: &[AttendeeRow]) -> Vec<NewAttendee> {
     input
         .iter()
@@ -4522,6 +4550,10 @@ fn typed_attendees(input: &[AttendeeInput], stored: &[AttendeeRow]) -> Vec<NewAt
                     .map(|s| s.response.clone())
                     .unwrap_or_else(|| "none".to_string()),
                 response_time: old.map(|s| s.response_time.clone()).unwrap_or_default(),
+                proposed_start_utc: old
+                    .map(|s| s.proposed_start_utc.clone())
+                    .unwrap_or_default(),
+                proposed_end_utc: old.map(|s| s.proposed_end_utc.clone()).unwrap_or_default(),
             }
         })
         .collect()
@@ -4760,15 +4792,18 @@ fn put_event_attendees_on(
     )?;
     for att in a {
         conn.execute(
-            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time,
+                                          proposed_start_utc, proposed_end_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 att.name,
                 att.addr,
                 att.r#type,
                 att.response,
-                att.response_time
+                att.response_time,
+                att.proposed_start_utc,
+                att.proposed_end_utc
             ],
         )?;
     }
@@ -6554,6 +6589,8 @@ mod calendar_tests {
             r#type: "resource".into(),
             response: "accepted".into(),
             response_time: "2026-07-18T08:01:02Z".into(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
         };
         s.replace_events_in_window(
             from,
@@ -6569,6 +6606,8 @@ mod calendar_tests {
         assert_eq!(atts[0].r#type, "resource");
         assert_eq!(atts[0].response, "accepted");
         assert_eq!(atts[0].response_time, "2026-07-18T08:01:02Z");
+        assert_eq!(atts[0].proposed_start_utc, "2026-07-21T14:00:00Z");
+        assert_eq!(atts[0].proposed_end_utc, "2026-07-21T15:00:00Z");
 
         // A later refresh that changes every field overwrites them.
         e = NewEvent {
@@ -6786,6 +6825,7 @@ mod calendar_tests {
                 r#type: "optional".into(),
                 response: "accepted".into(),
                 response_time: "2026-07-19T08:00:00Z".into(),
+                ..NewAttendee::default()
             }],
         )
         .unwrap();
@@ -7058,6 +7098,53 @@ mod calendar_tests {
         assert_eq!(atts[1].response_time, "2026-07-19T08:00:00Z");
     }
 
+    /// An attendee's proposed new time (#2023) survives a local attendee
+    /// edit, as their response does; a new attendee has none.
+    #[test]
+    fn update_event_fields_keeps_attendee_proposals() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        // `synced_event`'s Bob, now proposing a new time.
+        let bob = NewAttendee {
+            name: "Bob".into(),
+            addr: "Bob@X.com".into(),
+            r#type: "optional".into(),
+            response: "tentativelyAccepted".into(),
+            response_time: "2026-07-19T08:00:00Z".into(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
+        };
+        s.put_event_attendees("G1", &[bob]).unwrap();
+        let mut two = untouched.clone();
+        two.attendees.push(AttendeeInput {
+            name: "Ann".into(),
+            addr: "ann@x.com".into(),
+            r#type: String::new(),
+        });
+        assert_eq!(
+            s.update_event_fields("G1", &two).unwrap(),
+            EventFieldSet::ATTENDEES
+        );
+        let atts = s.event_attendees("G1").unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(
+            (
+                atts[0].proposed_start_utc.as_str(),
+                atts[0].proposed_end_utc.as_str()
+            ),
+            ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z"),
+            "Bob keeps his proposal"
+        );
+        assert_eq!(atts[1].addr, "ann@x.com");
+        assert_eq!(
+            (
+                atts[1].proposed_start_utc.as_str(),
+                atts[1].proposed_end_utc.as_str()
+            ),
+            ("", "")
+        );
+    }
+
     #[test]
     fn update_event_fields_of_a_missing_event_is_an_error() {
         let s = Store::open_in_memory().unwrap();
@@ -7255,6 +7342,8 @@ mod calendar_tests {
             assert_eq!(atts[0].name, "Bob");
             assert_eq!(atts[0].r#type, "optional");
             assert_eq!(atts[0].response_time, "");
+            assert_eq!(atts[0].proposed_start_utc, "", "no proposal (#2023)");
+            assert_eq!(atts[0].proposed_end_utc, "");
             // `reminder_unset` (#1994) reads 0: the old row's reminder
             // came from Graph.
             assert!(!s.event_for_send("E1").unwrap().unwrap().reminder_unset);
@@ -7274,6 +7363,21 @@ mod calendar_tests {
             .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
             .unwrap();
         assert_client_fields(&rows[0], &e);
+        // ...and `event_attendees` takes an attendee's proposal (#2023).
+        let proposing = NewAttendee {
+            name: "Bob".into(),
+            addr: "bob@x".into(),
+            r#type: "optional".into(),
+            response: "tentativelyAccepted".into(),
+            response_time: String::new(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
+        };
+        s.put_event_attendees("E1", std::slice::from_ref(&proposing))
+            .unwrap();
+        let atts = s.event_attendees("E1").unwrap();
+        assert_eq!(atts[0].proposed_start_utc, proposing.proposed_start_utc);
+        assert_eq!(atts[0].proposed_end_utc, proposing.proposed_end_utc);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8557,24 +8661,26 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("looking forward to it".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it","proposedStart":null,"proposedEnd":null}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it","sendResponse":true,"proposedStart":null,"proposedEnd":null}"#
         );
         assert_eq!(
             OutboxOp::RespondEvent {
                 id: "E1".into(),
                 kind: "declined".into(),
                 comment: None,
+                send_response: false,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"proposedStart":null,"proposedEnd":null}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"sendResponse":false,"proposedStart":null,"proposedEnd":null}"#
         );
     }
 
@@ -8604,6 +8710,7 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("ok".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -8611,6 +8718,7 @@ mod outbox_tests {
                 id: "E2".into(),
                 kind: "tentativelyAccepted".into(),
                 comment: None,
+                send_response: false,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -8622,6 +8730,7 @@ mod outbox_tests {
                 id: "E3".into(),
                 kind: "declined".into(),
                 comment: Some("can we push?".into()),
+                send_response: true,
                 proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
                 proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
             },
@@ -8631,6 +8740,27 @@ mod outbox_tests {
             let decoded = OutboxOp::from_json(&json::parse(&encoded).unwrap()).unwrap();
             assert_eq!(decoded, op);
         }
+    }
+
+    #[test]
+    fn respond_event_queued_before_send_response_reads_as_sending() {
+        // A row queued before #2023 has no `sendResponse` key: it was always
+        // sent, so it still is.
+        let v = json::parse(
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"proposedStart":null,"proposedEnd":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "declined".into(),
+                comment: None,
+                send_response: true,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            })
+        );
     }
 
     #[test]

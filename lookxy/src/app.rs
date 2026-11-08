@@ -1747,6 +1747,7 @@ impl App {
             message_id,
             kind,
             comment: None,
+            send_response: true,
             proposed_start_utc: None,
             proposed_end_utc: None,
         });
@@ -2196,6 +2197,7 @@ impl App {
                     id,
                     kind,
                     comment,
+                    send_response: true,
                     proposed_start_utc,
                     proposed_end_utc,
                 });
@@ -2210,6 +2212,7 @@ impl App {
                     message_id,
                     kind: rsvp,
                     comment,
+                    send_response: true,
                     proposed_start_utc,
                     proposed_end_utc,
                 });
@@ -7313,6 +7316,7 @@ pub(crate) mod tests {
                     r#type: "optional".into(),
                     response: "accepted".into(),
                     response_time: "2026-07-19T08:00:00Z".into(),
+                    ..Default::default()
                 }],
             )
             .unwrap();

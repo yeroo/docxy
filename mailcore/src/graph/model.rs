@@ -766,11 +766,18 @@ pub struct Attendee {
     /// as Graph sends it. `""` when absent or Graph's "never"
     /// (`0001-01-01T00:00:00Z`; see `graph_date_or_empty`).
     pub response_time: String,
+    /// The new time this attendee proposed (Graph
+    /// `attendees[].proposedNewTime`, the organizer's view, #2023), in
+    /// canonical UTC. Both `""` when they proposed none: a null, absent or
+    /// half slot is no proposal.
+    pub proposed_start_utc: String,
+    pub proposed_end_utc: String,
 }
 
 impl Attendee {
     pub fn from_json(v: &Value) -> Option<Self> {
         let addr = v.get("emailAddress")?;
+        let (proposed_start_utc, proposed_end_utc) = proposed_slot(v);
         Some(Attendee {
             name: str_field(addr, "name"),
             addr: str_field(addr, "address"),
@@ -787,7 +794,25 @@ impl Attendee {
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             ),
+            proposed_start_utc,
+            proposed_end_utc,
         })
+    }
+}
+
+/// An attendee's `proposedNewTime` slot as canonical UTC start and end, or
+/// `("", "")` unless both `start.dateTime` and `end.dateTime` are strings:
+/// `datetime_field_to_utc` on a missing side would read as
+/// `0000-00-00T00:00:00Z`, and half a slot is no proposal.
+fn proposed_slot(v: &Value) -> (String, String) {
+    let side = |k: &str| {
+        v.get("proposedNewTime")
+            .and_then(|p| p.get(k))
+            .filter(|d| d.get("dateTime").and_then(Value::as_str).is_some())
+    };
+    match (side("start"), side("end")) {
+        (Some(s), Some(e)) => (datetime_field_to_utc(s), datetime_field_to_utc(e)),
+        _ => (String::new(), String::new()),
     }
 }
 
@@ -2609,5 +2634,36 @@ mod tests {
         assert_eq!(e.attendees[1].r#type, "optional");
         assert_eq!(e.attendees[1].response, "declined");
         assert_eq!(e.attendees[1].response_time, "");
+    }
+
+    /// The organizer's view of a proposal (#2023): a full slot reads as
+    /// canonical UTC; null, absent and half slots read as no proposal.
+    #[test]
+    fn attendee_proposed_new_time() {
+        let e = ev(r#","attendees":[
+            {"type":"required","status":{"response":"tentativelyAccepted"},
+             "proposedNewTime":{
+               "start":{"dateTime":"2026-07-21T14:00:00.0000000","timeZone":"UTC"},
+               "end":{"dateTime":"2026-07-21T15:30:00.0000000","timeZone":"UTC"}},
+             "emailAddress":{"name":"Full","address":"full@x"}},
+            {"type":"required","status":{"response":"accepted"},"proposedNewTime":null,
+             "emailAddress":{"name":"Null","address":"null@x"}},
+            {"type":"required","status":{"response":"accepted"},
+             "emailAddress":{"name":"Absent","address":"absent@x"}},
+            {"type":"required","status":{"response":"declined"},
+             "proposedNewTime":{
+               "start":{"dateTime":"2026-07-21T14:00:00.0000000","timeZone":"UTC"},
+               "end":null},
+             "emailAddress":{"name":"Half","address":"half@x"}}]"#);
+        let slot = |i: usize| {
+            (
+                e.attendees[i].proposed_start_utc.as_str(),
+                e.attendees[i].proposed_end_utc.as_str(),
+            )
+        };
+        assert_eq!(slot(0), ("2026-07-21T14:00:00Z", "2026-07-21T15:30:00Z"));
+        assert_eq!(slot(1), ("", ""), "null");
+        assert_eq!(slot(2), ("", ""), "absent");
+        assert_eq!(slot(3), ("", ""), "half a slot is no proposal");
     }
 }
