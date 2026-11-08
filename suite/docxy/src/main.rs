@@ -722,6 +722,168 @@ fn backstage_rail_items(
         .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
 }
 
+/// An extension page's rail entry (#1923), as [`backstage_rail`] takes it:
+/// owned, from [`ext::BackstagePage`], its icon already registered.
+#[derive(Clone, Debug, PartialEq)]
+struct ExtRailEntry {
+    id: String,
+    label: String,
+    icon: Option<&'static str>,
+    group: ext::BackstageGroup,
+}
+
+/// One item of the File rail: the suite's own, or an extension page's.
+#[derive(Clone, Debug, PartialEq)]
+enum RailEntry {
+    Suite(&'static BackstageRailItem),
+    Ext(ExtRailEntry),
+}
+
+impl PartialEq for BackstageRailItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::fmt::Debug for BackstageRailItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id)
+    }
+}
+
+impl RailEntry {
+    /// What the rail shows (the harness's `items`).
+    fn label(&self) -> &str {
+        match self {
+            RailEntry::Suite(item) => item.display,
+            RailEntry::Ext(e) => &e.label,
+        }
+    }
+}
+
+/// The rail for the active tab with an extension's pages in place (#1923):
+/// Back, the extension's `Top` entries, the suite's items up to Account,
+/// Account, the `Bottom` entries, then Close. An entry with an empty id, or
+/// an id an earlier entry used, is left out. With no entries it is exactly
+/// [`backstage_rail_items`].
+fn backstage_rail(project: bool, doc: bool, ext: &[ExtRailEntry]) -> Vec<RailEntry> {
+    let mut seen = std::collections::HashSet::new();
+    let ext: Vec<&ExtRailEntry> = ext
+        .iter()
+        .filter(|e| !e.id.is_empty() && seen.insert(e.id.as_str()))
+        .collect();
+    let group = |g: ext::BackstageGroup| {
+        ext.iter()
+            .filter(move |e| e.group == g)
+            .map(|e| RailEntry::Ext((*e).clone()))
+    };
+    let mut rail = Vec::new();
+    for item in backstage_rail_items(project, doc) {
+        match item.action {
+            BackstageRailAction::Account => {
+                rail.push(RailEntry::Suite(item));
+                rail.extend(group(ext::BackstageGroup::Bottom));
+            }
+            BackstageRailAction::Back => {
+                rail.push(RailEntry::Suite(item));
+                rail.extend(group(ext::BackstageGroup::Top));
+            }
+            _ => rail.push(RailEntry::Suite(item)),
+        }
+    }
+    rail
+}
+
+#[cfg(test)]
+mod backstage_rail_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn entry(id: &str, group: ext::BackstageGroup) -> ExtRailEntry {
+        ExtRailEntry {
+            id: id.into(),
+            label: format!("L {id}"),
+            icon: None,
+            group,
+        }
+    }
+
+    fn labels(rail: &[RailEntry]) -> Vec<&str> {
+        rail.iter().map(RailEntry::label).collect()
+    }
+
+    #[test]
+    fn with_no_extension_pages_the_rail_is_the_suites_own() {
+        for project in [false, true] {
+            for doc in [false, true] {
+                let suite: Vec<RailEntry> = backstage_rail_items(project, doc)
+                    .map(RailEntry::Suite)
+                    .collect();
+                assert_eq!(backstage_rail(project, doc, &[]), suite, "{project} {doc}");
+            }
+        }
+    }
+
+    #[test]
+    fn top_pages_follow_back_and_bottom_pages_sit_between_account_and_close() {
+        use ext::BackstageGroup::{Bottom, Top};
+        let ext = [
+            entry("a", Top),
+            entry("o", Bottom),
+            entry("b", Top),
+            entry("p", Bottom),
+        ];
+        assert_eq!(
+            labels(&backstage_rail(false, false, &ext)),
+            [
+                "← Back",
+                "L a",
+                "L b",
+                "New",
+                "Open…",
+                "Save",
+                "Save As…",
+                "Account",
+                "L o",
+                "L p",
+                "Close"
+            ]
+        );
+        // A document's own Info comes after the extension's top pages.
+        let doc = backstage_rail(false, true, &ext);
+        let doc = labels(&doc);
+        assert_eq!(doc[..4], ["← Back", "L a", "L b", "Info"]);
+        assert_eq!(doc[doc.len() - 4..], ["Account", "L o", "L p", "Close"]);
+    }
+
+    #[test]
+    fn empty_and_repeated_ids_are_left_out_the_first_kept() {
+        use ext::BackstageGroup::{Bottom, Top};
+        let mut first = entry("a", Top);
+        first.label = "First".into();
+        let ext = [
+            entry("", Top),
+            first,
+            entry("a", Bottom),
+            entry("b", Bottom),
+        ];
+        assert_eq!(
+            labels(&backstage_rail(false, false, &ext)),
+            [
+                "← Back",
+                "First",
+                "New",
+                "Open…",
+                "Save",
+                "Save As…",
+                "Account",
+                "L b",
+                "Close"
+            ]
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum QatAction {
     Undo,
@@ -5450,6 +5612,11 @@ struct Docxy {
     /// The backstage shows the Account page: the build line and About (#1023).
     /// New, Info, Export and Account clear one another.
     bs_account: bool,
+    /// The backstage shows an extension's page (#1923): the active surface's
+    /// view (its entity) and the page's id. Drawn only while that surface is
+    /// the active tab's and still lists the page; else File shows its
+    /// default page. Every other page's setter clears it, and it clears them.
+    bs_ext: Option<(EntityId, String)>,
     /// The last page Help › Feedback or Contact Support opened (#1021); the
     /// harness's `last-url` reads it, since a harness run opens no browser.
     last_opened_url: Option<String>,
@@ -6288,6 +6455,12 @@ fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>
 /// harness's `ext-ribbon-cmd:<id>` region.
 fn ext_cmd_probe(id: &str) -> String {
     format!("ext-ribbon-cmd:{id}")
+}
+
+/// The probe an extension's File rail entry draws (#1923), the harness's
+/// `bs-ext:<id>` region.
+fn backstage_ext_probe(id: &str) -> String {
+    format!("bs-ext:{id}")
 }
 
 /// [`probe`] of an extension's command (`act` an `Act::Ext`), else none:
@@ -16476,6 +16649,7 @@ impl Docxy {
             bs_rail_scroll: ScrollHandle::new(),
             bs_info: false,
             bs_account: false,
+            bs_ext: None,
             last_opened_url: None,
             bs_info_status: None,
             clip: None,
@@ -16831,6 +17005,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_info = false;
         self.bs_account = false;
+        self.bs_ext = None;
         self.bs_info_status = None;
         self.reset_backstage_scroll();
     }
@@ -16848,6 +17023,7 @@ impl Docxy {
         self.bs_export = false;
         self.bs_templates = doc_templates::personal_templates(&doc_templates::templates_dir());
         self.bs_account = false;
+        self.bs_ext = None;
         self.bs_info = false;
         self.bs_info_status = None;
         self.reset_backstage_scroll();
@@ -16920,8 +17096,72 @@ impl Docxy {
         self.bs_info_status = None;
         self.bs_new = false;
         self.bs_export = false;
+        self.bs_ext = None;
         self.reset_backstage_scroll();
         cx.notify();
+    }
+
+    /// An extension's File page (#1923): the rail entry's click and the
+    /// harness's real click on it. The other pages' flags clear, as each of
+    /// theirs clears the others'.
+    fn select_ext_backstage_page(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(view) = self.active_ext_view() else {
+            return;
+        };
+        // Leaving Info applies a typed property first (#1364).
+        self.info_edit_apply_now();
+        self.bs_new = false;
+        self.bs_export = false;
+        self.bs_info = false;
+        self.bs_info_status = None;
+        self.bs_account = false;
+        self.bs_ext = Some((view, id));
+        cx.notify();
+    }
+
+    /// The active tab's extension view, by entity, when it is an extension's.
+    fn active_ext_view(&self) -> Option<EntityId> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Ext(e)) => Some(e.view().entity_id()),
+            _ => None,
+        }
+    }
+
+    /// The pages the active extension tab adds to File (#1923), none on any
+    /// other tab.
+    fn active_ext_pages(&self, cx: &App) -> Vec<ext::BackstagePage> {
+        match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Ext(e)) => e.backstage_pages(cx),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The File rail for the active tab, its extension's pages in place.
+    fn backstage_rail_now(&self, cx: &App) -> Vec<RailEntry> {
+        let ext: Vec<ExtRailEntry> = self
+            .active_ext_pages(cx)
+            .iter()
+            .map(|p| ExtRailEntry {
+                id: p.id.clone(),
+                label: p.label.clone(),
+                icon: p.icon.as_ref().map(ext_ribbon::register_icon),
+                group: p.group,
+            })
+            .collect();
+        backstage_rail(self.active_is_project(), self.active_is_doc(), &ext)
+    }
+
+    /// The extension page File shows now (#1923): `bs_ext` while the active
+    /// surface is the one it was chosen on and still lists it.
+    fn shown_ext_page(&self, cx: &App) -> Option<ext::BackstagePage> {
+        let (view, id) = self.bs_ext.as_ref()?;
+        if self.active_ext_view() != Some(*view) {
+            return None;
+        }
+        // The rail's filter: the first page with the id, a non-empty one.
+        self.active_ext_pages(cx)
+            .into_iter()
+            .find(|p| !p.id.is_empty() && &p.id == id)
     }
 
     fn backstage_rail_action(
@@ -16943,6 +17183,7 @@ impl Docxy {
                 self.bs_export = false;
                 self.reset_backstage_scroll();
                 self.bs_account = false;
+                self.bs_ext = None;
                 cx.notify();
             }
             BackstageRailAction::Account => self.open_account(cx),
@@ -19244,6 +19485,10 @@ impl Docxy {
                 .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
             Region::ExtRibbonCmd(id) => lookup(&self.probes.borrow(), &ext_cmd_probe(id))
                 .ok_or_else(|| format!("the extension's command {id} is not drawn in place")),
+            Region::BackstageExt(id) => lookup(&self.probes.borrow(), &backstage_ext_probe(id))
+                .ok_or_else(|| {
+                    format!("the File rail draws no extension page {id} (backstage open on its tab)")
+                }),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -25849,7 +26094,9 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A cancelled pick keeps the backstage on its page (#1078).
+        // A cancelled pick keeps the backstage on its page (#1078). An
+        // extension's page (`bs_ext`, #1923) is not in the snapshot and is
+        // left as it was, so File stays on it too.
         let page = open_mode::BackstagePage {
             backstage: self.backstage,
             new: self.bs_new,
@@ -28570,7 +28817,9 @@ impl Docxy {
                 let key = ev.keystroke.key.clone();
                 return self.info_edit_key(ev, m.control || m.platform, m.alt, &key, window, cx);
             }
-            if self.backstage_scroll_key(&ev.keystroke) {
+            // An extension's page scrolls itself (#1923): `bs_scroll` is
+            // not drawn under it.
+            if self.shown_ext_page(cx).is_none() && self.backstage_scroll_key(&ev.keystroke) {
                 cx.notify();
             }
             return;
@@ -41423,7 +41672,14 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut rail = v_flex().w_full().py_3().gap_1();
-        for item in backstage_rail_items(self.active_is_project(), self.active_is_doc()) {
+        for entry in self.backstage_rail_now(cx) {
+            let item = match entry {
+                RailEntry::Suite(item) => item,
+                RailEntry::Ext(e) => {
+                    rail = rail.child(self.ext_rail_entry(e, fg, cx));
+                    continue;
+                }
+            };
             let action = item.action;
             rail = rail.child(
                 div()
@@ -41448,7 +41704,12 @@ impl Docxy {
             );
         }
 
-        let pane = if self.bs_new {
+        // An extension's page (#1923) is its own view: the column below
+        // holds it as it is, so nothing of the suite's pages is built.
+        let ext_page = self.shown_ext_page(cx);
+        let pane = if ext_page.is_some() {
+            div().into_any_element()
+        } else if self.bs_new {
             let card = |cx: &mut Context<Self>,
                         id: &'static str,
                         glyph: &'static str,
@@ -41929,19 +42190,77 @@ impl Docxy {
             &self.bs_rail_scroll,
             rail,
         );
-        let content_col = self.backstage_scroll_column(
-            div().flex_1().min_w(px(0.)).bg(bg),
-            "backstage-content",
-            "backstage-content-scroll",
-            &self.bs_scroll,
-            pane,
-        );
+        // An extension's page fills the column and scrolls itself (#1923),
+        // as a tab body does: no scroll container of the suite's, so
+        // `bs_scroll` is not drawn (and not read) while it shows.
+        let content_col = match ext_page {
+            Some(page) => div()
+                .id("backstage-content")
+                .relative()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .min_h(px(0.))
+                .bg(bg)
+                .child(probe(&self.probes, "backstage-content"))
+                .child(div().size_full().child(page.view))
+                .into_any_element(),
+            None => self
+                .backstage_scroll_column(
+                    div().flex_1().min_w(px(0.)).bg(bg),
+                    "backstage-content",
+                    "backstage-content-scroll",
+                    &self.bs_scroll,
+                    pane,
+                )
+                .into_any_element(),
+        };
         h_flex()
             .size_full()
             .min_h(px(0.))
             .bg(bg)
             .child(rail_col)
             .child(content_col)
+            .into_any_element()
+    }
+
+    /// An extension page's rail entry (#1923): drawn as the suite's items
+    /// are (padding, hover), its icon left of the label, with the probe
+    /// `bs-ext:<id>` (the harness's region).
+    fn ext_rail_entry(&self, e: ExtRailEntry, fg: Hsla, cx: &mut Context<Self>) -> AnyElement {
+        let id = e.id.clone();
+        div()
+            .id(SharedString::from(format!("bs-ext:{}", e.id)))
+            .relative()
+            .w_full()
+            .px_4()
+            .py_2()
+            .cursor_pointer()
+            .rounded_sm()
+            .group("bs-ext")
+            .text_color(fg)
+            .hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
+            .child(probe(&self.probes, backstage_ext_probe(&e.id)))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    // The mask takes the entry's ink, the hover's too.
+                    .when_some(e.icon, |d, icon| {
+                        d.child(
+                            svg()
+                                .path(SharedString::from(format!("icons/{icon}.svg")))
+                                .size(px(16.))
+                                .flex_none()
+                                .text_color(fg)
+                                .group_hover("bs-ext", |s| s.text_color(rgb(FILE_FG))),
+                        )
+                    })
+                    .child(e.label),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.select_ext_backstage_page(id.clone(), cx)
+            }))
             .into_any_element()
     }
 
@@ -44174,6 +44493,11 @@ impl KeyRouting for Div {
             .on_key_down(cx.listener(Docxy::route_key))
             .on_action(cx.listener(|this, _: &ext::ShowBackstage, _window, cx| {
                 this.open_backstage(cx);
+            }))
+            // An extension's view, File page or ribbon command closes its tab
+            // (#1923); the root takes it whatever had the focus.
+            .on_action(cx.listener(|this, _: &ext::CloseTab, window, cx| {
+                this.close_ext_tab(window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),

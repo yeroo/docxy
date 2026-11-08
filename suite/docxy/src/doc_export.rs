@@ -182,6 +182,7 @@ impl Docxy {
         self.bs_info = false;
         self.bs_info_status = None;
         self.bs_account = false;
+        self.bs_ext = None;
         self.reset_backstage_scroll();
         cx.notify();
     }

@@ -725,6 +725,20 @@ impl Docxy {
         self.close_tab(self.active, window, cx);
     }
 
+    /// `ext::CloseTab` (#1923): the active tab closes as through its close
+    /// button, File with it, when it is an extension's; on any other tab
+    /// nothing happens. Only the active tab's view (or its File page) is
+    /// drawn, so the dispatcher is the active tab.
+    pub(super) fn close_ext_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(
+            self.tabs.get(self.active).map(|t| &t.surface),
+            Some(Surface::Ext(_))
+        ) {
+            return;
+        }
+        self.backstage_close(window, cx);
+    }
+
     pub(super) fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.close_tab_with(i, None, window, cx);
     }

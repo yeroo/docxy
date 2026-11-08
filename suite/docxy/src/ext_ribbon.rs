@@ -255,7 +255,7 @@ const ICON_DIR: &str = "ext/";
 
 /// `icon`'s name in the model (`ext/<hash>`), its bytes kept for
 /// [`icon_asset`].
-fn register_icon(icon: &ext::RibbonIcon) -> &'static str {
+pub(crate) fn register_icon(icon: &ext::RibbonIcon) -> &'static str {
     let mut h = DefaultHasher::new();
     icon.source().hash(&mut h);
     let key = h.finish();
