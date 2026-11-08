@@ -1663,18 +1663,25 @@ so the user's other devices follow.
   re-keys the row, its body, `message_headers`, `attachments` (which
   `reconcile_id` never renames), `outbound_attachments`, and FTS through
   the triggers. The engine then emits `SyncEvent::MessageMoved { old_id,
-  new_id }` once per move. Nothing happens for the same id, an empty id,
-  or a row no longer stored. A store failure emits an `Error`, and the op
+  new_id }` once per move Graph made. Nothing happens for the same id or an
+  empty one. A message no longer stored (deleted locally while its move
+  was in flight) has no row to re-key, but its alias is recorded and the
+  event emitted all the same: a `Delete` by the old id, queued behind the
+  move or sent after it, must reach the new id, not 404 into a quarantine
+  whose reconverge would bring the message back. A store failure emits an `Error`, and the op
   still counts as done: Graph already moved the message, so a retry would
   POST to a dead id. `apply_op` itself never writes the move to the store.
-- The old ids live in `moved_ids (old_id PK, message_id FK ON DELETE
-  CASCADE)`, a separate table and not `messages.local_id`: one row can
-  have many of them, and `draft_row_sql!` must not match them. The chain
-  is kept flat: A -> B -> C stores A -> C and B -> C. `follow_move`
-  repoints the chain first, because a cascade fires at once even under
-  `defer_foreign_keys`. It then drops an alias named `new` (an alias
-  never names its own row), and renames the row, or deletes it when a row
-  `new` already exists. Last, it records `old -> new`.
+- The old ids live in `moved_ids (old_id PK, message_id)`, a separate
+  table and not `messages.local_id`: one row can have many of them, and
+  `draft_row_sql!` must not match them. It has no foreign key on purpose:
+  an alias outlives its row (for that `Delete`), so its rows are never
+  pruned, one per move. The chain is kept flat: A -> B -> C stores
+  A -> C and B -> C. `follow_move` renames the row, or, when a row `new`
+  already exists (a delta stored the moved copy first), moves the old
+  row's children (`UPDATE OR IGNORE`: what the new row has stays) and
+  `local_id` (off the old row first, as it is UNIQUE) onto it and
+  deletes the old row. Then it repoints the chain, drops an alias named
+  `new` (an alias never names its own row) and records `old -> new`.
 - Only `Store::current_id` follows moves: the `local:` lookup, then
   `moved_ids`, so a reconciled draft that was then moved resolves too.
   `draft_row_sql!`, `current_id_sql!` and the store writes built on them
@@ -1710,16 +1717,18 @@ so the user's other devices follow.
   `SaveItemAttachment`, reply/forward and the meeting commands take the id
   as given, since the host re-keys on `MessageMoved`. Re-keyed
   `attachments` rows keep the pre-move attachment ids until the next
-  `FetchAttachments`. `moved_ids` rows are never pruned while their
-  message lives.
+  `FetchAttachments`. `moved_ids` rows are never pruned.
 - Tests. Store (`moved_id_tests`): `follow_move_rekeys_the_row_body_headers_and_attachments`,
-  `follow_move_does_nothing_for_the_same_an_empty_or_an_unknown_id`,
+  `follow_move_does_nothing_for_the_same_or_an_empty_id`,
+  `follow_move_of_a_message_no_longer_stored_still_records_the_alias`,
   `follow_move_chain_resolves_every_old_id_to_the_newest`,
   `follow_move_onto_an_existing_row_keeps_one_row`,
+  `follow_move_onto_an_existing_row_keeps_the_drafts_own_state`,
+  `follow_move_onto_an_existing_row_keeps_that_rows_own_body`,
   `follow_move_back_to_an_earlier_id_drops_that_alias`,
   `follow_move_of_a_reconciled_draft_keeps_its_local_id`,
   `delete_message_by_a_moved_alias_deletes_nothing`,
-  `moved_aliases_go_with_a_deleted_message`, `pending_message_ids_resolves_moved_ids`.
+  `moved_aliases_outlive_a_deleted_message`, `pending_message_ids_resolves_moved_ids`.
   Outbox: `apply_op_move_returns_the_new_id`,
   `apply_op_mark_read_of_a_moved_id_patches_the_new_id`,
   `apply_op_move_of_a_moved_id_posts_to_the_new_id`. Engine
@@ -1728,6 +1737,8 @@ so the user's other devices follow.
   `mark_read_by_the_old_id_after_a_move_reaches_the_new_id`,
   `queued_moves_by_the_old_id_drain_in_order`,
   `a_delta_after_a_move_keeps_one_row_under_the_newest_id`,
-  `set_flag_and_delete_by_the_old_id_reach_the_new_id`, and
+  `set_flag_and_delete_by_the_old_id_reach_the_new_id`,
+  `a_delete_queued_behind_a_move_reaches_the_new_id`,
+  `a_delete_sent_after_the_move_drained_reaches_the_new_id`, and
   `move_command_optimistically_refiles_locally`. lookxy:
   `message_moved_rekeys_the_open_message_and_the_list`.

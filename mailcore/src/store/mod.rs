@@ -2656,26 +2656,30 @@ impl Store {
         Ok(found)
     }
 
-    /// Re-keys the message stored as `old_id` to `new_id`, the id Graph
-    /// gave it on a move (#1896), and keeps `old_id` resolvable through
-    /// `moved_ids` (`current_id`). The row's body, stored headers,
-    /// attachment metadata (whose attachment ids stay the pre-move ones
-    /// until the next `FetchAttachments`) and outbound attachments follow,
-    /// and the `messages_fts` index through the triggers, as in
-    /// `reconcile_id`; a draft's `local_id` stays on the row. Every earlier
-    /// id that pointed at `old_id` points at `new_id` after it, so a chain
-    /// A -> B -> C resolves A and B to C in one lookup.
+    /// Records that Graph moved the message `old_id` and gave it `new_id`
+    /// (#1896), and re-keys its row when one is stored. `old_id` then
+    /// resolves to `new_id` through `moved_ids` (`current_id`), even once
+    /// the row is gone: a message deleted while its move was in flight
+    /// (the engine's queued `Delete`, lookxy's own delete) still has its
+    /// queued or later `Delete` by the old id reach the id Graph knows now.
+    /// Every earlier id that pointed at `old_id` points at `new_id` after
+    /// it, so a chain A -> B -> C resolves A and B to C in one lookup. An
+    /// alias never names its own row: a move that answers with an earlier
+    /// id of the message drops that alias.
     ///
-    /// One transaction with `defer_foreign_keys` (see `reconcile_id`). The
-    /// chain is flattened first: an `ON DELETE CASCADE` fires at once even
-    /// with the check deferred, so deleting the old row before would take
-    /// its aliases with it. An alias never names its own row: a move that
-    /// answers with an earlier id of the message drops that alias. When a
-    /// row `new_id` already exists (a delta stored the moved copy first),
-    /// the old row is deleted instead of renamed (its children with it).
+    /// The row's body, stored headers, attachment metadata (whose
+    /// attachment ids stay the pre-move ones until the next
+    /// `FetchAttachments`) and outbound attachments follow, and the
+    /// `messages_fts` index through the triggers, as in `reconcile_id`; a
+    /// draft's `local_id` stays on the row. When a row `new_id` already
+    /// exists (a delta stored the moved copy first), it is kept: the old
+    /// row's children and `local_id` move onto it where it has none of its
+    /// own (a body, a header, an attachment of the same id), and the old
+    /// row is deleted. One transaction with `defer_foreign_keys` (see
+    /// `reconcile_id`).
     ///
-    /// Returns whether it re-keyed a row: nothing happens when `old_id`
-    /// equals `new_id`, `new_id` is empty, or no row is stored as `old_id`.
+    /// Returns whether it recorded the move: nothing happens when `old_id`
+    /// equals `new_id` or `new_id` is empty.
     pub fn follow_move(&self, old_id: &str, new_id: &str) -> Result<bool, StoreError> {
         if old_id == new_id || new_id.is_empty() {
             return Ok(false);
@@ -2689,27 +2693,53 @@ impl Store {
                 |r| r.get(0),
             )
         };
-        if !exists(old_id)? {
-            return Ok(false);
+        const CHILDREN: [&str; 4] = [
+            "UPDATE OR IGNORE bodies SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE message_headers SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE attachments SET message_id = ?2 WHERE message_id = ?1",
+            "UPDATE OR IGNORE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
+        ];
+        if exists(old_id)? {
+            if exists(new_id)? {
+                // `local_id` is UNIQUE: off the old row before onto the new.
+                let local: Option<String> = tx.query_row(
+                    "SELECT local_id FROM messages WHERE id = ?1",
+                    params![old_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
+                    "UPDATE messages SET local_id = NULL WHERE id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute(
+                    "UPDATE messages SET local_id = COALESCE(local_id, ?2) WHERE id = ?1",
+                    params![new_id, local],
+                )?;
+                for sql in CHILDREN {
+                    tx.execute(sql, params![old_id, new_id])?;
+                }
+                // What the new row already had stays; the old row's copy
+                // goes (`outbound_attachments` has no foreign key).
+                tx.execute(
+                    "DELETE FROM outbound_attachments WHERE draft_id = ?1",
+                    params![old_id],
+                )?;
+                tx.execute("DELETE FROM messages WHERE id = ?1", params![old_id])?;
+            } else {
+                tx.execute(
+                    "UPDATE messages SET id = ?2 WHERE id = ?1",
+                    params![old_id, new_id],
+                )?;
+                for sql in CHILDREN {
+                    tx.execute(sql, params![old_id, new_id])?;
+                }
+            }
         }
         tx.execute(
             "UPDATE moved_ids SET message_id = ?2 WHERE message_id = ?1",
             params![old_id, new_id],
         )?;
         tx.execute("DELETE FROM moved_ids WHERE old_id = ?1", params![new_id])?;
-        if exists(new_id)? {
-            tx.execute("DELETE FROM messages WHERE id = ?1", params![old_id])?;
-        } else {
-            for sql in [
-                "UPDATE messages SET id = ?2 WHERE id = ?1",
-                "UPDATE bodies SET message_id = ?2 WHERE message_id = ?1",
-                "UPDATE message_headers SET message_id = ?2 WHERE message_id = ?1",
-                "UPDATE attachments SET message_id = ?2 WHERE message_id = ?1",
-                "UPDATE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
-            ] {
-                tx.execute(sql, params![old_id, new_id])?;
-            }
-        }
         tx.execute(
             "INSERT OR REPLACE INTO moved_ids (old_id, message_id) VALUES (?1, ?2)",
             params![old_id, new_id],
@@ -2718,7 +2748,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Whether `id` is an id a stored message had before a move (#1896,
+    /// Whether `id` is an id a message had before a move (#1896,
     /// `follow_move`): a delta upsert of it is the pre-move copy Graph has
     /// not removed yet, as Graph never reuses an id.
     pub fn is_moved_alias(&self, id: &str) -> Result<bool, StoreError> {
@@ -2732,10 +2762,11 @@ impl Store {
 
     /// The id the message addressed by `id` is stored under now: the Graph
     /// id a draft's `local:` id was reconciled to (`reconcile_id`, #1884),
-    /// then the id a moved message was re-keyed to (`follow_move`, #1896,
-    /// so a reconciled draft moved since resolves too), else `id` itself (an
-    /// id never reconciled or moved, or whose message has since been
-    /// deleted).
+    /// then the latest id Graph gave a moved message (`follow_move`, #1896,
+    /// so a reconciled draft moved since resolves too; still so once the
+    /// message is deleted, for a `Delete` queued by the old id), else `id`
+    /// itself (an id never moved, or a `local:` id never reconciled or
+    /// whose message has since been deleted).
     ///
     /// Only this function follows a move: `draft_row_sql!`,
     /// `current_id_sql!` and the calls built on them (`delete_message`,
@@ -11694,14 +11725,27 @@ mod moved_id_tests {
     }
 
     #[test]
-    fn follow_move_does_nothing_for_the_same_an_empty_or_an_unknown_id() {
+    fn follow_move_does_nothing_for_the_same_or_an_empty_id() {
         let s = store_with("OLD1");
         assert!(!s.follow_move("OLD1", "OLD1").unwrap());
         assert!(!s.follow_move("OLD1", "").unwrap());
-        assert!(!s.follow_move("GONE", "NEW1").unwrap());
         assert_eq!(ids(&s), ["OLD1"]);
         assert!(aliases(&s).is_empty());
-        assert_eq!(s.current_id("GONE").unwrap(), "GONE");
+    }
+
+    #[test]
+    fn follow_move_of_a_message_no_longer_stored_still_records_the_alias() {
+        // Deleted locally while its move was in flight: the queued (or a
+        // later) `Delete` by the old id must reach the id Graph knows now.
+        let s = store_with("OLD1");
+        s.delete_message("OLD1").unwrap();
+        assert!(s.follow_move("OLD1", "NEW1").unwrap());
+        assert!(ids(&s).is_empty());
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW1");
+        assert!(s.is_moved_alias("OLD1").unwrap());
+        // A chain through it still flattens.
+        assert!(s.follow_move("NEW1", "NEW2").unwrap());
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
     }
 
     #[test]
@@ -11737,6 +11781,87 @@ mod moved_id_tests {
         // The chain was flattened before the old row went.
         assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
         assert_eq!(s.current_id("NEW1").unwrap(), "NEW2");
+    }
+
+    #[test]
+    fn follow_move_onto_an_existing_row_keeps_the_drafts_own_state() {
+        // A reconciled draft with a body, a header, an attachment and an
+        // outbound attachment; a delta stored the moved copy first, with
+        // a header of its own.
+        let s = Store::open_in_memory().unwrap();
+        let local = s
+            .create_local_draft("Subj", "a@x", "", "<p>draft</p>")
+            .unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        s.add_outbound_attachment(&local, "/tmp/a.pdf", "a.pdf", 1)
+            .unwrap();
+        s.put_attachments(
+            "G1",
+            &[AttachmentMeta {
+                id: "a1".into(),
+                name: "a.pdf".into(),
+                content_type: "application/pdf".into(),
+                size: 1,
+                is_inline: false,
+                content_id: None,
+                kind: AttachmentKind::File,
+                source_url: None,
+            }],
+        )
+        .unwrap();
+        let folder_id = s.draft("G1").unwrap().unwrap().0.folder_id;
+        s.upsert_message(&folder_id, &message("G2", "From the delta"))
+            .unwrap();
+
+        assert!(s.follow_move("G1", "G2").unwrap());
+
+        assert_eq!(ids(&s), ["G2"]);
+        assert_eq!(s.current_id(&local).unwrap(), "G2");
+        let (row, body) = s.draft(&local).unwrap().expect("local id still loads");
+        assert_eq!(row.id, "G2");
+        assert_eq!(body.content, "<p>draft</p>");
+        assert_eq!(s.outbound_attachments("G2").unwrap().len(), 1);
+        assert_eq!(s.attachments("G2").unwrap().len(), 1);
+        let orphans: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_attachments WHERE draft_id = 'G1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn follow_move_onto_an_existing_row_keeps_that_rows_own_body() {
+        let s = store_with("OLD1");
+        s.put_body(
+            "OLD1",
+            &Body {
+                content_type: "text".into(),
+                content: "old".into(),
+            },
+        )
+        .unwrap();
+        s.upsert_message("DST", &message("NEW1", "From the delta"))
+            .unwrap();
+        s.put_body(
+            "NEW1",
+            &Body {
+                content_type: "text".into(),
+                content: "new".into(),
+            },
+        )
+        .unwrap();
+        assert!(s.follow_move("OLD1", "NEW1").unwrap());
+        assert_eq!(ids(&s), ["NEW1"]);
+        assert_eq!(s.get_body("NEW1").unwrap().unwrap().content, "new");
+        let bodies: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bodies, 1);
     }
 
     #[test]
@@ -11786,14 +11911,16 @@ mod moved_id_tests {
     }
 
     #[test]
-    fn moved_aliases_go_with_a_deleted_message() {
+    fn moved_aliases_outlive_a_deleted_message() {
         let s = store_with("OLD1");
         s.follow_move("OLD1", "NEW1").unwrap();
         s.follow_move("NEW1", "NEW2").unwrap();
         s.delete_message("NEW2").unwrap();
-        assert!(aliases(&s).is_empty());
-        assert_eq!(s.current_id("OLD1").unwrap(), "OLD1");
-        assert!(!s.is_moved_alias("OLD1").unwrap());
+        assert!(ids(&s).is_empty());
+        assert_eq!(aliases(&s).len(), 2);
+        assert_eq!(s.current_id("OLD1").unwrap(), "NEW2");
+        assert_eq!(s.current_id("NEW1").unwrap(), "NEW2");
+        assert!(s.is_moved_alias("OLD1").unwrap());
     }
 
     #[test]

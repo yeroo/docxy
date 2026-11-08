@@ -485,9 +485,11 @@ pub enum SyncEvent {
     /// Attachment metadata for `message_id` was fetched and stored;
     /// re-read `Store::attachments(message_id)`.
     AttachmentsUpdated { message_id: String },
-    /// A queued move reached Graph and the stored message, filed under
-    /// `old_id` until then, is now stored as `new_id`, the id Graph gave it
-    /// (#1896, `Store::follow_move`). Emitted once per move. `old_id` still
+    /// A queued move reached Graph: the message Graph knew as `old_id` is
+    /// `new_id` now, and its stored row, if any, is stored as `new_id`
+    /// (#1896, `Store::follow_move`). Emitted once per move Graph made,
+    /// also for a message deleted locally while the move was in flight (a
+    /// host may still hold its old id in an undo record). `old_id` still
     /// resolves (`Store::current_id`) for commands, but a host re-keys what
     /// it holds by id: a selection, an undo record, an open read window.
     MessageMoved { old_id: String, new_id: String },
@@ -3269,14 +3271,15 @@ impl Engine {
         self.refresh_calendar();
     }
 
-    /// Re-keys the message a move op just moved on Graph to the id Graph
-    /// gave it (#1896, `Store::follow_move`) and emits
+    /// Records the id Graph gave the message a move op just moved, re-keying
+    /// its stored row (#1896, `Store::follow_move`), and emits
     /// [`SyncEvent::MessageMoved`]. Called after the op is dropped: Graph
     /// already moved the message, so a store failure is reported and the
     /// op still counts as done (the next deltas then bring the moved copy
     /// in as a new row and remove the old one, as before #1896). The same id
-    /// back, or none, is nothing to follow, and a message no longer stored
-    /// (deleted while the move was in flight) has nothing to re-key.
+    /// back, or none, is nothing to follow. A message no longer stored
+    /// (deleted while the move was in flight) has no row to re-key, but its
+    /// old id is recorded all the same, so its `Delete` reaches Graph.
     fn follow_move(&mut self, old_id: String, new_id: String) {
         match self.store.follow_move(&old_id, &new_id) {
             Ok(true) => self.emit(SyncEvent::MessageMoved { old_id, new_id }),
@@ -17024,8 +17027,11 @@ mod tests {
             sync("F1");
             assert!(!store.message_exists("OLD1").unwrap());
             assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
-            // The old id's `@removed` deletes nothing.
+            // The old id's `@removed` deletes nothing: the re-keyed row is
+            // still there, as it was, before the destination's delta.
             sync("F1");
+            assert_eq!(ids_in(&store, "F2"), ["NEW1"]);
+            assert_eq!(row(&store, "NEW1").subject, "Hello");
             sync("F2");
 
             assert!(ids_in(&store, "F1").is_empty());
@@ -17038,6 +17044,89 @@ mod tests {
                     .count(),
                 1
             );
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `Move{OLD1,F2}` queued and the row deleted locally (as the
+        /// `Delete` arm or lookxy does) before the move drained.
+        fn spawn_moved_then_deleted(
+            srv: &FakeServer,
+            tag: &str,
+            queue_delete: bool,
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            spawn(srv, tag, |s| {
+                s.enqueue_op(&OutboxOp::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+                s.delete_message("OLD1").unwrap();
+                if queue_delete {
+                    s.enqueue_op(&OutboxOp::Delete { id: "OLD1".into() })
+                        .unwrap();
+                }
+            })
+        }
+
+        fn delete_routes() -> Vec<(Route, Option<usize>)> {
+            let mut routes = move_routes();
+            routes.push(ok_route("DELETE", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            routes
+        }
+
+        #[test]
+        fn a_delete_queued_behind_a_move_reaches_the_new_id() {
+            let srv = FakeServer::start_limited(delete_routes());
+            let (handle, store_path, dir) = spawn_moved_then_deleted(&srv, "moved-del-q", true);
+            let store = Store::open(&store_path).unwrap();
+
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "DELETE").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "POST")
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect::<Vec<_>>(),
+                ["/me/messages/OLD1/move"]
+            );
+            assert_eq!(
+                requests(&srv, "DELETE"),
+                [("/me/messages/NEW1".to_string(), String::new())]
+            );
+            assert!(!store.message_exists("NEW1").unwrap());
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_delete_sent_after_the_move_drained_reaches_the_new_id() {
+            // The row went while the move was in flight (lookxy deletes on
+            // its own connection), and the `Delete` command by the old id
+            // comes after the drain.
+            let srv = FakeServer::start_limited(delete_routes());
+            let (handle, store_path, dir) =
+                spawn_moved_then_deleted(&srv, "moved-del-after", false);
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::Delete { id: "OLD1".into() })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !requests(&srv, "DELETE").is_empty()));
+            assert!(drained(&store));
+            assert_eq!(
+                requests(&srv, "DELETE"),
+                [("/me/messages/NEW1".to_string(), String::new())]
+            );
+            seen.extend(handle.evt_rx.try_iter());
             no_quarantine(&seen);
 
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
