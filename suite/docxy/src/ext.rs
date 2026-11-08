@@ -16,6 +16,10 @@
 //! and calls [`TabSurface::ribbon_action`] with a command's id. Without one
 //! the view draws its own ribbon, as before. [`suite_theme`] reads the
 //! suite's colours; [`TabSurface::theme_changed`] says when they change.
+//!
+//! A surface may add pages to the suite's File backstage while its tab is
+//! active ([`TabSurface::backstage_pages`], #1923), and its view may close
+//! its own tab by dispatching [`CloseTab`].
 
 use gpui::{AnyView, App, FocusHandle, Global, Hsla, Window, actions};
 use std::rc::Rc;
@@ -33,7 +37,17 @@ actions!(
     [
         /// Opens the suite's File backstage (New, Open, Recent, Settings).
         /// An extension's own File command dispatches it from its view.
-        ShowBackstage
+        ShowBackstage,
+        /// Closes the extension tab that is active (#1923), as the tab
+        /// strip's close button does; File closes too when it is up. Dispatch
+        /// it with `window.dispatch_action(Box::new(ext::CloseTab), cx)` from
+        /// the view, from a [`BackstagePage`]'s view or from
+        /// [`TabSurface::ribbon_action`], in response to the user's own input:
+        /// it closes whichever extension tab is active when it runs, so a late
+        /// dispatch (from a spawned task, after the user moved to another tab)
+        /// closes that one. On a tab that is not an extension's it does
+        /// nothing.
+        CloseTab
     ]
 );
 
@@ -81,6 +95,72 @@ pub trait TabSurface: 'static {
     /// its colours, as [`suite_theme`] reads them. [`TabSurface::set_dark`]
     /// is still called too.
     fn theme_changed(&self, _theme: &SuiteTheme, _cx: &mut App) {}
+    /// The pages this tab adds to the suite's File backstage (#1923), in
+    /// order; none by default. Read any number of times while the tab is
+    /// active (each time File is drawn, more than once a frame, and on each
+    /// key while File is up), so what it returns may change at any time with
+    /// no call to the suite. Keep it cheap and free of side effects, and
+    /// return the same views each time (cheap [`AnyView`] clones of entities
+    /// the surface keeps), not new entities, or a page loses its state on
+    /// every frame.
+    ///
+    /// [`BackstageGroup::Top`] entries go right after the rail's Back, ahead
+    /// of the suite's own items, in this order; [`BackstageGroup::Bottom`]
+    /// entries go after the suite's Account and before Close. A page with an
+    /// empty id, or an id an earlier page already uses, is left out. Its view
+    /// fills File's content column and is not scrolled by the suite: it
+    /// scrolls itself, as a tab body does. Keys it does not stop bubble to
+    /// File as on the suite's own pages.
+    fn backstage_pages(&self, _cx: &App) -> Vec<BackstagePage> {
+        Vec::new()
+    }
+}
+
+/// Where a [`BackstagePage`]'s rail entry goes (#1923).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackstageGroup {
+    /// Right after Back, ahead of the suite's items (Outlook's Info).
+    #[default]
+    Top,
+    /// After the suite's Account, before Close (Outlook's Options).
+    Bottom,
+}
+
+/// A page an extension tab adds to the suite's File backstage (#1923): its
+/// rail entry (`label`, an optional `icon` drawn as a mask in the rail's
+/// ink, as ribbon icons are, and its `group`) and the `view` drawn as the
+/// page's body while the entry is selected. `id` names it: stable, unique
+/// among the tab's pages.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct BackstagePage {
+    pub id: String,
+    pub label: String,
+    pub icon: Option<RibbonIcon>,
+    pub group: BackstageGroup,
+    pub view: AnyView,
+}
+
+impl BackstagePage {
+    /// A [`BackstageGroup::Top`] page with no icon.
+    pub fn new(id: impl Into<String>, label: impl Into<String>, view: impl Into<AnyView>) -> Self {
+        BackstagePage {
+            id: id.into(),
+            label: label.into(),
+            icon: None,
+            group: BackstageGroup::Top,
+            view: view.into(),
+        }
+    }
+    pub fn icon(mut self, icon: RibbonIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    pub fn group(mut self, group: BackstageGroup) -> Self {
+        self.group = group;
+        self
+    }
 }
 
 /// An extension's ribbon (#1870): its tabs after the suite's File, left to

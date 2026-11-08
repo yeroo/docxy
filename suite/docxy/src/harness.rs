@@ -1007,6 +1007,8 @@ pub enum Region {
     /// upper half or a drop-down, in place or in an open group flyout, or a
     /// gallery tile drawn in place.
     ExtRibbonCmd(&'static str),
+    /// An extension page's File rail entry, by the page's id (#1923).
+    BackstageExt(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -1119,6 +1121,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .filter(|a| !a.is_empty())
                 .ok_or("'ext-ribbon-cmd' needs a command id, e.g. ext-ribbon-cmd:fx.reply")?;
             Ok(Region::ExtRibbonCmd(crate::plugin_ui::intern(a)))
+        }
+        "bs-ext" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'bs-ext' needs a File page id, e.g. bs-ext:fx.account")?;
+            Ok(Region::BackstageExt(crate::plugin_ui::intern(a)))
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
@@ -1273,6 +1281,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
         Region::GalleryMore(id) => format!("gallery-more:{id}"),
         Region::ExtRibbonCmd(id) => format!("ext-ribbon-cmd:{id}"),
+        Region::BackstageExt(id) => format!("bs-ext:{id}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
@@ -1519,7 +1528,7 @@ fn drag_events(path: &[Point<Pixels>]) -> Vec<PlatformInput> {
 
 /// `backstage-layout`'s reply: the open page, the content pane's viewport and
 /// content heights, its scroll offset, and the same for the rail.
-fn backstage_layout_json(app: &crate::Docxy) -> Json {
+fn backstage_layout_json(app: &crate::Docxy, cx: &App) -> Json {
     let pane = crate::BackstageLayout::read(&app.bs_scroll);
     let rail = crate::BackstageLayout::read(&app.bs_rail_scroll);
     let page = if app.bs_account {
@@ -1533,8 +1542,13 @@ fn backstage_layout_json(app: &crate::Docxy) -> Json {
     } else {
         "open"
     };
+    // An extension's page (#1923) draws no `bs_scroll`: the pane fields
+    // below are as the suite's page last drew them while it shows.
+    let ext_page = app.shown_ext_page(cx).map(|p| p.id);
+    let page = if ext_page.is_some() { "ext" } else { page };
     Json::obj(vec![
         ("page", Json::Str(page.into())),
+        ("ext_page", ext_page.map_or(Json::Null, Json::Str)),
         ("viewport_h", Json::Num(f64::from(pane.viewport_h))),
         ("content_h", Json::Num(f64::from(pane.content_h))),
         ("scroll_y", Json::Num(f64::from(pane.scroll_y))),
@@ -1622,6 +1636,17 @@ fn region_point(
     if let Some(part) = name.trim().strip_prefix("ext-doc-") {
         return ext_doc_point(app, part, cx).map_err(|e| format!("{name}: {e}"));
     }
+    // The Close tab button of a test extension's File page (#1923), where
+    // it last painted.
+    if let Some(id) = name.trim().strip_prefix("ext-page-close:") {
+        let page = ext_fixture_page(app, id, cx).map_err(|e| format!("{name}: {e}"))?;
+        return page
+            .read(cx)
+            .close_bounds
+            .get()
+            .map(|b| b.center())
+            .ok_or_else(|| format!("{name}: the page's Close tab button is not drawn yet"));
+    }
     let region = parse_region(name)?;
     let bounds = app
         .region_bounds_live(region, window)
@@ -1640,6 +1665,28 @@ fn ext_fixture_view(
     e.view()
         .downcast::<crate::ext_fixture::FixtureView>()
         .map_err(|_| "the active tab is not the test extension's".to_string())
+}
+
+/// A File page of the test extension's on the active tab (#1923), by id:
+/// reached through the surface's own `backstage_pages`, as the suite does.
+fn ext_fixture_page(
+    app: &crate::Docxy,
+    id: &str,
+    cx: &App,
+) -> Result<gpui::Entity<crate::ext_fixture::FixturePage>, String> {
+    ext_fixture_view(app)?;
+    let pages = app.active_ext_pages(cx);
+    let page = pages.iter().find(|p| p.id == id).ok_or_else(|| {
+        let ids: Vec<&str> = pages.iter().map(|p| p.id.as_str()).collect();
+        format!(
+            "the test extension has no File page '{id}' ({})",
+            ids.join(", ")
+        )
+    })?;
+    page.view
+        .clone()
+        .downcast::<crate::ext_fixture::FixturePage>()
+        .map_err(|_| format!("the File page '{id}' is not the test extension's"))
 }
 
 /// `ext-ribbon-read`'s reply (#1870): `ribbon` (whether the extension
@@ -5540,6 +5587,54 @@ fn dispatch_verb(
             Done::ok(help_read_json(app))
         }
         "help-read" => Done::ok(help_read_json(app)),
+        // A File page of the test extension's (#1923): how many times it
+        // rendered and where it last painted (null before it ever did).
+        "ext-page-read" => {
+            let id = arg_str(args, "page")?;
+            let page = ext_fixture_page(app, id, cx)?;
+            let p = page.read(cx);
+            let rect = |b: Option<gpui::Bounds<Pixels>>| {
+                b.map_or(Json::Null, |b| {
+                    Json::obj(vec![
+                        ("x", Json::Num(f64::from(b.origin.x))),
+                        ("y", Json::Num(f64::from(b.origin.y))),
+                        ("w", Json::Num(f64::from(b.size.width))),
+                        ("h", Json::Num(f64::from(b.size.height))),
+                    ])
+                })
+            };
+            Done::ok(Json::obj(vec![
+                ("page", Json::Str(id.into())),
+                ("renders", Json::Num(p.renders.get() as f64)),
+                ("bounds", rect(p.bounds.get())),
+                ("close_bounds", rect(p.close_bounds.get())),
+            ]))
+        }
+        // `ext::CloseTab` dispatched as an extension's view does (#1923):
+        // `window.dispatch_action` from the focused element. On the test
+        // extension's tab that must be inside its view (else it is refused);
+        // on any other tab it is whatever has the focus. gpui runs it after
+        // this reply: the case draws a frame (`shot window`) before reading
+        // the tabs.
+        "ext-close-tab" => {
+            app.refuse_under_dialog()?;
+            let from = match ext_fixture_view(app) {
+                Ok(fixture) => {
+                    let f = fixture.read(cx);
+                    let view = f.doc.read(cx).focus_handle();
+                    if !view.contains_focused(window, cx) && !f.header_focused(window) {
+                        return Err("the test extension's view does not have the focus".into());
+                    }
+                    "view"
+                }
+                Err(_) => "suite",
+            };
+            window.dispatch_action(Box::new(crate::ext::CloseTab), cx);
+            Done::ok(Json::obj(vec![
+                ("dispatched", Json::Bool(true)),
+                ("from", Json::Str(from.into())),
+            ]))
+        }
         // The test extension's embedded document view (#1873), on a Mail tab
         // of a case that starts with `ext fixture`.
         "ext-doc-read" => {
@@ -5720,14 +5815,43 @@ fn dispatch_verb(
                 "read" => {}
                 _ => return Err("'action' must be open, close or read".into()),
             }
-            let items = crate::backstage_rail_items(app.active_is_project(), app.active_is_doc());
+            let rail = app.backstage_rail_now(cx);
+            // The extension's entries (#1923), in rail order.
+            let ext_items = rail
+                .iter()
+                .filter_map(|e| match e {
+                    crate::RailEntry::Ext(e) => Some(Json::obj(vec![
+                        ("id", Json::Str(e.id.clone())),
+                        ("label", Json::Str(e.label.clone())),
+                        (
+                            "group",
+                            Json::Str(
+                                match e.group {
+                                    crate::ext::BackstageGroup::Bottom => "bottom",
+                                    _ => "top",
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ("icon", Json::Bool(e.icon.is_some())),
+                    ])),
+                    crate::RailEntry::Suite(_) => None,
+                })
+                .collect();
+            let ext_page = app
+                .backstage
+                .then(|| app.shown_ext_page(cx))
+                .flatten()
+                .map_or(Json::Null, |p| Json::Str(p.id));
             Done::ok(Json::obj(vec![
                 ("open", Json::Bool(app.backstage)),
                 ("new", Json::Bool(app.backstage && app.bs_new)),
                 (
                     "items",
-                    Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
+                    Json::Arr(rail.iter().map(|e| Json::Str(e.label().into())).collect()),
                 ),
+                ("ext_items", Json::Arr(ext_items)),
+                ("ext_page", ext_page),
                 // The New page's cards (#806), in order.
                 (
                     "cards",
@@ -6824,7 +6948,7 @@ fn dispatch_verb(
                     return Err("'page' must be new, info, account, export, open or close".into());
                 }
             }
-            Done::ok(backstage_layout_json(app))
+            Done::ok(backstage_layout_json(app, cx))
         }
         // The File screen's scroll state (#1028), read from the content and
         // rail scroll handles: their bounds, max offset and offset, as of the
@@ -6833,7 +6957,7 @@ fn dispatch_verb(
             if !app.backstage {
                 return Err("the File screen is not open (backstage open)".into());
             }
-            Done::ok(backstage_layout_json(app))
+            Done::ok(backstage_layout_json(app, cx))
         }
         // The recent files (#1194), read from the store as it is now, not
         // from the Backstage's copy: what the next Backstage will show.
@@ -10870,6 +10994,7 @@ mod tests {
             Region::RibbonLaunch("Page Setup"),
             Region::GalleryMore("fixture.wide"),
             Region::ExtRibbonCmd("fx.reply"),
+            Region::BackstageExt("fx.account"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),

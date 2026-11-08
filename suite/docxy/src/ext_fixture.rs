@@ -13,11 +13,18 @@
 //! `ext fixture ribbon` (#1870) has it describe a two-tab ribbon to the suite
 //! ([`fixture_ribbon`]): it records each command the suite runs, flips its
 //! Flag toggle and its density gallery on their commands, and keeps the
-//! last theme the suite told it ([`RibbonState`]).
+//! last theme the suite told it ([`RibbonState`]). Its View tab's Exit
+//! closes the tab through [`ext::CloseTab`] (#1923).
+//!
+//! Every variant adds two File pages (#1923, [`fixture_pages`]): Fixture
+//! Account (top, with an icon) and Fixture Options (bottom), each a
+//! [`FixturePage`] counting its renders and recording where it and its Close
+//! tab button painted; the button dispatches [`ext::CloseTab`].
 
 use crate::ext::{
-    self, DocView, Ribbon, RibbonCommand, RibbonControl, RibbonDropdown, RibbonGallery,
-    RibbonGroup, RibbonIcon, RibbonSplit, RibbonTab, SuiteTheme, TabSurface,
+    self, BackstageGroup, BackstagePage, DocView, Ribbon, RibbonCommand, RibbonControl,
+    RibbonDropdown, RibbonGallery, RibbonGroup, RibbonIcon, RibbonSplit, RibbonTab, SuiteTheme,
+    TabSurface,
 };
 use docxcore::model::Document;
 use docxcore::package::{Package, new_package};
@@ -178,35 +185,45 @@ pub(crate) fn fixture_ribbon(state: &RibbonState) -> Ribbon {
         RibbonTab::new(
             "View",
             "V",
-            vec![RibbonGroup::new(
-                "Arrange",
-                vec![
-                    RibbonControl::Dropdown(RibbonDropdown::new(
-                        c("fx.sort", "Sort").key_tip("S"),
-                        vec![
-                            c("fx.sort.date", "By Date").key_tip("D"),
-                            c("fx.sort.from", "By Sender").key_tip("N"),
-                        ],
-                    )),
-                    RibbonControl::Gallery(
-                        RibbonGallery::new(
-                            "fx.density",
-                            DENSITIES
-                                .iter()
-                                .enumerate()
-                                .map(|(i, (id, label))| {
-                                    c(id, label).checked(i == state.density.get())
-                                })
-                                .collect(),
-                        )
-                        .tip("Density")
-                        .key_tip("Y"),
-                    ),
-                ],
-            )],
+            vec![
+                RibbonGroup::new(
+                    "Arrange",
+                    vec![
+                        RibbonControl::Dropdown(RibbonDropdown::new(
+                            c("fx.sort", "Sort").key_tip("S"),
+                            vec![
+                                c("fx.sort.date", "By Date").key_tip("D"),
+                                c("fx.sort.from", "By Sender").key_tip("N"),
+                            ],
+                        )),
+                        RibbonControl::Gallery(
+                            RibbonGallery::new(
+                                "fx.density",
+                                DENSITIES
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, (id, label))| {
+                                        c(id, label).checked(i == state.density.get())
+                                    })
+                                    .collect(),
+                            )
+                            .tip("Density")
+                            .key_tip("Y"),
+                        ),
+                    ],
+                ),
+                // After Arrange, so what the case asserts of Arrange stays.
+                RibbonGroup::new(
+                    "Window",
+                    vec![RibbonControl::Large(c(EXIT_ID, "Exit").key_tip("X"))],
+                ),
+            ],
         ),
     ])
 }
+
+/// The View tab's Exit (#1923): closes the tab through [`ext::CloseTab`].
+pub(crate) const EXIT_ID: &str = "fx.exit";
 
 /// What a command of the variant's ribbon does to its state.
 fn run_ribbon_action(state: &RibbonState, id: &str) {
@@ -247,6 +264,85 @@ impl Render for FixtureView {
 
 struct FixtureMail {
     root: Entity<FixtureView>,
+    /// Its File pages (#1923), made once: each read returns the same views.
+    pages: Vec<BackstagePage>,
+}
+
+/// The top page's id and label, and the bottom page's (#1923).
+pub(crate) const ACCOUNT_PAGE: (&str, &str) = ("fx.account", "Fixture Account");
+pub(crate) const OPTIONS_PAGE: (&str, &str) = ("fx.options", "Fixture Options");
+
+/// A File page of the fixture's (#1923): its title, a Close tab button, how
+/// many times it rendered and where it and the button last painted (the
+/// harness's `ext-page-read` and `ext-page-close:<id>` region).
+pub(crate) struct FixturePage {
+    title: &'static str,
+    pub(crate) renders: Rc<Cell<usize>>,
+    pub(crate) bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(crate) close_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
+/// A canvas recording its bounds at paint into `cell`, filling its parent.
+fn record_bounds(cell: &Rc<Cell<Option<Bounds<Pixels>>>>) -> impl IntoElement {
+    let cell = cell.clone();
+    canvas(
+        move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| cell.set(Some(b)),
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .right_0()
+    .bottom_0()
+}
+
+impl Render for FixturePage {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div()
+            .relative()
+            .size_full()
+            .p_8()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(record_bounds(&self.bounds))
+            .child(div().text_size(px(20.)).child(self.title))
+            .child(
+                div()
+                    .id("ext-page-close")
+                    .relative()
+                    .px_3()
+                    .py_1()
+                    .border_1()
+                    .border_color(rgb(0x808080))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .child(record_bounds(&self.close_bounds))
+                    .child("Close tab")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ext::CloseTab), cx);
+                    }),
+            )
+    }
+}
+
+/// The fixture's File pages (#1923): Fixture Account at the top (with the
+/// Reply icon), Fixture Options at the bottom.
+fn fixture_pages(cx: &mut App) -> Vec<BackstagePage> {
+    let mut page = |(id, title): (&'static str, &'static str)| {
+        let view = cx.new(|_| FixturePage {
+            title,
+            renders: Rc::default(),
+            bounds: Rc::default(),
+            close_bounds: Rc::default(),
+        });
+        BackstagePage::new(id, title, view)
+    };
+    vec![
+        page(ACCOUNT_PAGE).icon(RibbonIcon::svg(REPLY_SVG.as_bytes())),
+        page(OPTIONS_PAGE).group(BackstageGroup::Bottom),
+    ]
 }
 
 impl FixtureMail {
@@ -268,14 +364,22 @@ impl TabSurface for FixtureMail {
         self.ribbon_state(cx).map(|s| fixture_ribbon(&s))
     }
 
-    fn ribbon_action(&self, id: &str, _window: &mut Window, cx: &mut App) {
+    fn ribbon_action(&self, id: &str, window: &mut Window, cx: &mut App) {
         if let Some(s) = self.ribbon_state(cx) {
             run_ribbon_action(&s, id);
+        }
+        // Exit closes the tab, as an extension's own Exit would (#1923).
+        if id == EXIT_ID {
+            window.dispatch_action(Box::new(ext::CloseTab), cx);
         }
     }
 
     fn theme_changed(&self, theme: &SuiteTheme, cx: &mut App) {
         self.root.read(cx).themes.borrow_mut().push(*theme);
+    }
+
+    fn backstage_pages(&self, _cx: &App) -> Vec<BackstagePage> {
+        self.pages.clone()
     }
 }
 
@@ -301,7 +405,8 @@ pub(crate) fn factory(ribbon: bool) -> ext::Factory {
             ribbon: ribbon.then(Rc::default),
             themes: Rc::default(),
         });
-        Ok(Box::new(FixtureMail { root }) as Box<dyn TabSurface>)
+        let pages = fixture_pages(cx);
+        Ok(Box::new(FixtureMail { root, pages }) as Box<dyn TabSurface>)
     })
 }
 

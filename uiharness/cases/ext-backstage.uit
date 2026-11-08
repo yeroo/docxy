@@ -1,0 +1,170 @@
+# An extension tab's own File (backstage) pages and its CloseTab (#1923).
+# The script's `ext fixture` line has this instance draw Mail tabs with the
+# suite's test extension, which adds two File pages: "Fixture Account"
+# (top, with an icon: right after Back) and "Fixture Options" (bottom:
+# after Account, before Close). Each page counts its renders and records
+# where it and its "Close tab" button painted (`ext-page-read`,
+# `ext-page-close:<id>`); the button dispatches `ext::CloseTab`.
+# `ext-close-tab` dispatches it from the focused element, which on a Mail
+# tab must be inside the extension's view; gpui runs a dispatched action
+# after the verb's reply, so a `shot window` follows it. The instance
+# starts with one document tab (the first test also opens basic.docx and
+# closes it); each test leaves only that one open.
+ext fixture
+
+test issue 1923 a Mail tab's File lists the extension's pages in place, a document's none
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call tab-list {}
+  assert reply.tabs.0.kind is docx
+  assert reply.tabs.1.kind is mail
+  assert reply.active is 1
+  call backstage {"action":"open"}
+  assert reply.items is ["← Back","Fixture Account","New","Open…","Save","Save As…","Account","Fixture Options","Close"]
+  assert reply.ext_items.0.id is fx.account
+  assert reply.ext_items.0.label is Fixture Account
+  assert reply.ext_items.0.group is top
+  assert reply.ext_items.0.icon is true
+  assert reply.ext_items.1.id is fx.options
+  assert reply.ext_items.1.group is bottom
+  assert reply.ext_items.1.icon is false
+  assert reply.ext_page is null
+  shot window
+  call backstage {"action":"close"}
+  # A document opened beside it: its rail is today's, with nothing of the
+  # extension's.
+  open copy:../fixtures/basic.docx
+  shot window
+  call tab-list {}
+  assert reply.count is 3
+  assert reply.tabs.2.kind is docx
+  assert reply.active is 2
+  call backstage {"action":"open"}
+  assert reply.items is ["← Back","Info","New","Open…","Save","Save As…","Export","Account","Close"]
+  assert reply.ext_items is []
+  assert reply.ext_page is null
+  shot window
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 2
+  call tab-select {"tab":1}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1923 a click on the rail entry draws the extension's page, and File opens on its own page after
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call backstage {"action":"open"}
+  shot window
+  call ext-page-read {"page":"fx.account"}
+  assert reply.renders is 0
+  assert reply.bounds is null
+  call pointer-click {"region":"bs-ext:fx.account"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is fx.account
+  call backstage-layout {}
+  assert reply.page is ext
+  assert reply.ext_page is fx.account
+  call ext-page-read {"page":"fx.account"}
+  assert reply.renders is not 0
+  assert reply.bounds is not null
+  assert reply.close_bounds is not null
+  call ext-page-read {"page":"fx.options"}
+  assert reply.renders is 0
+  assert reply.bounds is null
+  # The bottom entry's page, then a suite page clears the extension's.
+  call pointer-click {"region":"bs-ext:fx.options"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.ext_page is fx.options
+  call ext-page-read {"page":"fx.options"}
+  assert reply.renders is not 0
+  assert reply.bounds is not null
+  call account {"action":"open"}
+  call backstage {"action":"read"}
+  assert reply.ext_page is null
+  call pointer-click {"region":"bs-ext:fx.account"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.ext_page is fx.account
+  # Back leaves File; the next File is on the default page.
+  call backstage {"action":"close"}
+  assert reply.open is false
+  call backstage {"action":"open"}
+  assert reply.ext_page is null
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.ext_page is null
+  shot window
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1923 CloseTab from the extension's view closes its tab and only it
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  # The last Mail tab is told apart by its dark content.
+  call ext-doc-set {"content_dark":true}
+  call tab-select {"tab":1}
+  shot window
+  call ext-doc-read {}
+  assert reply.content_dark is false
+  assert reply.focused is true
+  call ext-close-tab {}
+  assert reply.from is view
+  shot window
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.tabs.0.kind is docx
+  assert reply.tabs.1.kind is mail
+  call tab-select {"tab":1}
+  shot window
+  call ext-doc-read {}
+  assert reply.content_dark is true
+  call ext-doc-set {"content_dark":false}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1923 the page's Close tab button closes the tab and File with it
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call backstage {"action":"open"}
+  shot window
+  call pointer-click {"region":"bs-ext:fx.options"}
+  shot window
+  call pointer-click {"region":"ext-page-close:fx.options"}
+  shot window
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+  call backstage {"action":"read"}
+  assert reply.open is false
+
+test issue 1923 CloseTab on a document tab does nothing
+  call tab-list {}
+  assert reply.tabs.0.kind is docx
+  call ext-close-tab {}
+  assert reply.from is suite
+  shot window
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+  call-error ext-page-read {"page":"fx.account"} => the active tab is not an extension's

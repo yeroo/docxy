@@ -244,3 +244,54 @@ fn an_extension_ribbon_is_public_api() {
     assert_eq!(g.priority(7).priority, 7);
     assert!(ext::Ribbon::default().tabs.is_empty());
 }
+
+/// A surface that adds pages to the suite's File backstage and closes its
+/// own tab (#1923): its pages are made once and handed out as clones.
+struct Account {
+    reader: Reader,
+    pages: Vec<ext::BackstagePage>,
+}
+
+impl TabSurface for Account {
+    fn view(&self) -> AnyView {
+        self.reader.view()
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.reader.focus_handle(cx)
+    }
+
+    fn backstage_pages(&self, _cx: &App) -> Vec<ext::BackstagePage> {
+        self.pages.clone()
+    }
+
+    fn ribbon_action(&self, id: &str, window: &mut Window, cx: &mut App) {
+        // An Exit command closes the tab.
+        if id == "exit" {
+            window.dispatch_action(Box::new(ext::CloseTab), cx);
+        }
+    }
+}
+
+/// The pages: an account page at the top with an icon, options at the
+/// bottom; both views are the reader's document view here.
+fn account_pages(view: Entity<DocView>) -> Vec<ext::BackstagePage> {
+    use ext::{BackstageGroup, BackstagePage, RibbonIcon};
+    let icon = RibbonIcon::svg(b"<svg xmlns='http://www.w3.org/2000/svg'/>".as_slice());
+    let info = BackstagePage::new("info", "Account Information", view.clone()).icon(icon);
+    let options = BackstagePage::new("options", "Options", view).group(BackstageGroup::Bottom);
+    // Its fields stay readable.
+    let _ids: [&str; 2] = [info.id.as_str(), options.id.as_str()];
+    let _view: AnyView = info.view.clone();
+    vec![info, options]
+}
+
+#[test]
+fn extension_backstage_pages_are_public_api() {
+    let _ =
+        <Account as TabSurface>::backstage_pages as fn(&Account, &App) -> Vec<ext::BackstagePage>;
+    let _ = account_pages as fn(Entity<DocView>) -> Vec<ext::BackstagePage>;
+    let _: Box<dyn gpui::Action> = Box::new(ext::CloseTab);
+    // A page is a top one unless set.
+    assert_eq!(ext::BackstageGroup::default(), ext::BackstageGroup::Top);
+}
