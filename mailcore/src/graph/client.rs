@@ -1070,22 +1070,13 @@ impl GraphClient {
         end_utc: &str,
         interval_minutes: i64,
     ) -> Result<Vec<ScheduleEntry>, GraphError> {
-        let dt = |utc: &str| {
-            Value::Object(vec![
-                (
-                    "dateTime".to_string(),
-                    Value::Str(utc.trim_end_matches('Z').to_string()),
-                ),
-                ("timeZone".to_string(), Value::Str("UTC".to_string())),
-            ])
-        };
         let body = Value::Object(vec![
             (
                 "schedules".to_string(),
                 Value::Array(schedules.iter().map(|s| Value::Str(s.clone())).collect()),
             ),
-            ("startTime".to_string(), dt(start_utc)),
-            ("endTime".to_string(), dt(end_utc)),
+            ("startTime".to_string(), graph_utc_wall_clock(start_utc)),
+            ("endTime".to_string(), graph_utc_wall_clock(end_utc)),
             (
                 "availabilityViewInterval".to_string(),
                 Value::Num(interval_minutes as f64),
@@ -1130,20 +1121,11 @@ impl GraphClient {
             ("sendResponse".to_string(), Value::Bool(send_response)),
         ];
         if let Some((start, end)) = proposed.as_ref().filter(|_| kind != RsvpKind::Accept) {
-            let dt = |utc: &str| {
-                Value::Object(vec![
-                    (
-                        "dateTime".to_string(),
-                        Value::Str(utc.trim_end_matches('Z').to_string()),
-                    ),
-                    ("timeZone".to_string(), Value::Str("UTC".to_string())),
-                ])
-            };
             obj.push((
                 "proposedNewTime".to_string(),
                 Value::Object(vec![
-                    ("start".to_string(), dt(start)),
-                    ("end".to_string(), dt(end)),
+                    ("start".to_string(), graph_utc_wall_clock(start)),
+                    ("end".to_string(), graph_utc_wall_clock(end)),
                 ]),
             ));
         }
@@ -1766,6 +1748,21 @@ fn automatic_replies_body(r: &AutomaticReplies) -> String {
     .to_string()
 }
 
+/// A Graph `dateTimeTimeZone` for a UTC instant as its wall clock: the
+/// `dateTime` without the `Z`, next to `timeZone: "UTC"`, matching how
+/// `calendar_view` reads times back under `Prefer: outlook.timezone="UTC"`.
+/// What `get_schedule`, `respond_event`'s `proposedNewTime` and
+/// `event_body_json` send.
+fn graph_utc_wall_clock(utc: &str) -> Value {
+    Value::Object(vec![
+        (
+            "dateTime".to_string(),
+            Value::Str(utc.trim_end_matches('Z').to_string()),
+        ),
+        ("timeZone".to_string(), Value::Str("UTC".to_string())),
+    ])
+}
+
 /// A Graph `{"dateTime": <utc>, "timeZone": "UTC"}` object for a canonical UTC
 /// timestamp.
 fn utc_datetime_obj(utc: &str) -> Value {
@@ -1809,15 +1806,6 @@ fn draft_body_json(
 /// `calendar_view` reads events back under the `Prefer:
 /// outlook.timezone="UTC"` header.
 pub(crate) fn event_body_json(input: &EventInput) -> String {
-    let dt = |utc: &str| -> Value {
-        Value::Object(vec![
-            (
-                "dateTime".to_string(),
-                Value::Str(utc.trim_end_matches('Z').to_string()),
-            ),
-            ("timeZone".to_string(), Value::Str("UTC".to_string())),
-        ])
-    };
     let has = |g: EventFieldSet| input.fields.contains(g);
     let mut obj: Vec<(String, Value)> = Vec::new();
     let mut put = |k: &str, v: Value| obj.push((k.to_string(), v));
@@ -1826,8 +1814,8 @@ pub(crate) fn event_body_json(input: &EventInput) -> String {
         put("subject", Value::Str(input.subject.clone()));
     }
     if has(EventFieldSet::TIMES) {
-        put("start", dt(&input.start_utc));
-        put("end", dt(&input.end_utc));
+        put("start", graph_utc_wall_clock(&input.start_utc));
+        put("end", graph_utc_wall_clock(&input.end_utc));
         put("isAllDay", Value::Bool(input.is_all_day));
     }
     if has(EventFieldSet::LOCATION) {

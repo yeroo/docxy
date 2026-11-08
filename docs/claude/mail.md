@@ -1264,13 +1264,13 @@ this occurrence or the whole series, as Outlook does.
   stored. `apply_op` sends it with `update_event_body`. An empty `input.fields`
   queues nothing. There is no optimistic local write, so the op is not an event op
   for the quarantine reset. Instead the calendars owe a reset once it went
-  through (`series_reset_owed`, in memory): a pattern change mints new occurrence
+  through (`calendar_reset_owed`, in memory; a refused `RespondEvent` owes it too, #2023): a pattern change mints new occurrence
   ids, and how calendarView delta reports a series change is the uncertain part
   of #2013, so initial rounds take each window from Graph. The reset is decided
   where it is used: every `refresh_calendar`, on any path (the drain's own
   quarantine and cancel-404 `reset_calendars` included), first takes the waiting
   commands (`checkpoint`, only while the reset is owed; a shutdown stops the
-  refresh), then checks (`series_reset_ready`). Only when no event op with a
+  refresh), then checks (`calendar_reset_ready`). Only when no event op with a
   local write (`writes_event_locally`: `RespondEvent`, `UpdateEvent`,
   `DeleteEvent`, `CancelEvent`) is queued, and no command that queues one
   (`command_writes_event_locally`) waits in `deferred`, does it clear every delta
@@ -1287,7 +1287,7 @@ this occurrence or the whole series, as Outlook does.
   reset in the loop does not stop the drain on one: pre-existing). `on_tick`
   refreshes after its pass anyway; every other path that drains (a command's
   `drain_queued`, a fast tick, `SyncFolder`, the startup, sign-in and `Refresh`
-  passes) calls `refresh_if_series_reset_owed` after its drain, which refreshes
+  passes) calls `refresh_if_calendar_reset_owed` after its drain, which refreshes
   when the reset may run, signed in, outside any wait and not shutting down, and
   tells the caller to stop when that refresh signed out or started a wait;
   `drain_queued` then leaves the state that failure set. A drain that quarantines
@@ -1351,11 +1351,16 @@ proposal.
 - The engine runs the checks first, before it writes, queues or calls anything:
   `rsvp_proposal`, an unknown `kind` (`RespondEvent`), and a proposal on a stored event
   whose `allow_new_time_proposals` is false (a missing row skips this; Graph has the last
-  word). A refusal is a `SyncEvent::Error`. A refused `RespondEvent` also resets the
-  calendars when signed in (`reset_calendars`), because a host such as lookxy writes the
-  status itself before it sends the command (`lookxy/src/app.rs` `dispatch_rsvp`), on a
-  row no delta round would name again (#2013). A host that writes first should call
-  `rsvp_proposal` before it writes. `RespondMeeting` checks `rsvp_proposal` before the
+  word). A refusal is a `SyncEvent::Error`. A refused `RespondEvent` also owes the
+  calendars a reset (`calendar_reset_owed`, then `refresh_if_calendar_reset_owed`),
+  because a host such as lookxy writes the status itself before it sends the command
+  (`lookxy/src/app.rs` `dispatch_rsvp`), on a row no delta round would name again
+  (#2013). It is #2022's gated reset, not `reset_calendars`: its initial rounds wait
+  until no event op with a local write is queued and no such command waits, so a
+  deferred `UpdateEvent` (which reads its row at send time) still sends its edit.
+  Signed out, it runs after the sign-in. In memory only, as #2022's: a restart before
+  it ran drops it, and the host-written status stays until Graph changes the event.
+  A host that writes first should call `rsvp_proposal` before it writes. `RespondMeeting` checks `rsvp_proposal` before the
   invite's `meeting_event_id` GET and the stored row once the event id is known; it
   writes nothing locally, so it does not reset.
 - `respond_event` sends `proposedNewTime`'s `dateTime`s without the `Z`, next to
@@ -1370,8 +1375,11 @@ proposal.
   matching attendee's proposal across a local attendee edit, as it keeps the response.
   The calendarView requests already ask for UTC and select every field, so no request
   changed.
+- lookxy maps an invite's response with `RsvpKind::from_status`: an unknown one is an
+  error notice and sends nothing, never an accept (`lookxy` test
+  `an_unknown_invite_response_errors_and_sends_nothing`).
 - Not yet: lookxy has no "Don't send a response" toggle, still offers a proposal on an
-  event that disallows it (the engine refuses it and resets), and does not show
+  event that disallows it (the engine refuses it and owes the reset), and does not show
   attendees' proposals. The organizer accepting a proposal is an `update_event` of the
   times.
 - Tests: `client.rs` `respond_event_tentative_with_proposed_time_sends_proposed_new_time`,
@@ -1386,6 +1394,8 @@ proposal.
   `respond_event_sends_a_normalised_proposal_on_tentative`,
   `respond_event_refusals_write_queue_and_send_nothing`,
   `a_refused_respond_event_restores_graphs_status`,
+  `a_refused_respond_event_resets_only_once_no_event_edit_waits`,
+  `a_respond_event_refused_signed_out_resets_after_sign_in`,
   `respond_meeting_without_sending_a_response`, `respond_meeting_refusals_send_nothing`,
   `calendar_sync_stores_an_attendees_proposal`.
 
