@@ -124,6 +124,19 @@ CREATE TABLE IF NOT EXISTS message_headers (
     PRIMARY KEY (message_id, name)
 );
 
+-- The ids a message had before a move (#1896): Graph mints a new id on
+-- move, and `Store::follow_move` re-keys the row to it, leaving one row
+-- here per earlier id, each pointing at the id the row is stored under now
+-- (a chain A -> B -> C is kept flat: A -> C, B -> C). `Store::current_id`
+-- follows it; the delta `@removed` path (`delete_message`) does not, and a
+-- delta upsert of an alias is skipped. The rows go with their message. A
+-- new table, so an older database gets it empty at the next `open`.
+CREATE TABLE IF NOT EXISTS moved_ids (
+    old_id     TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_moved_ids_message ON moved_ids(message_id);
+
 CREATE TABLE IF NOT EXISTS attachments (
     id           TEXT NOT NULL,
     message_id   TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
