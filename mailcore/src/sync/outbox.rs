@@ -11,14 +11,21 @@
 //! a draft to Graph needs its currently-stored subject/recipients/body, and a
 //! draft still addressed by a local (`local:`) id has to be reconciled to the
 //! Graph-minted id the moment it's created there — otherwise nothing else
-//! would ever do it (unlike `Move`, Graph never reports a `local:` id back
-//! through delta sync, so there's no later point where this reconciliation
-//! would happen for free). So `apply_op` takes a `&Store` too, used only by
-//! those two ops — plus `CreateEvent`/`UpdateEvent`, which need the same
-//! store access for the same reason: `event_input_for` reads the event's
-//! currently-stored fields to build the `EventInput` Graph is sent, and
-//! `CreateEvent` reconciles a `local:` id to its Graph id afterward exactly
-//! like `SaveDraft`/`SendDraft` do for drafts.
+//! would ever do it (Graph never reports a `local:` id back through delta
+//! sync, so there's no later point where this reconciliation would happen
+//! for free). So `apply_op` takes a `&Store` too, used by those two ops —
+//! plus `CreateEvent`/`UpdateEvent`, which need the same store access for
+//! the same reason: `event_input_for` reads the event's currently-stored
+//! fields to build the `EventInput` Graph is sent, and `CreateEvent`
+//! reconciles a `local:` id to its Graph id afterward exactly like
+//! `SaveDraft`/`SendDraft` do for drafts.
+//!
+//! The message ops (`MarkRead`, `SetFlag`, `SetCategories`, `Move`,
+//! `Delete`) read the store only to resolve their id (`Store::current_id`)
+//! at apply time, so an op queued with an id an earlier op moved reaches
+//! the message (#1896). `Move` hands the id Graph minted back to the
+//! caller ([`Applied::Moved`]), which re-keys the store: a store failure
+//! there must not turn into a retry of a move Graph already made.
 
 use crate::graph::client::{
     EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
@@ -27,28 +34,61 @@ use crate::graph::client::{
 use crate::graph::model::Recipient;
 use crate::store::{OutboxOp, Store};
 
+/// What an applied op left for the caller to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Nothing more.
+    Done,
+    /// A `Move` reached Graph: the message Graph knew as `old_id` (the op's
+    /// id, resolved) is `new_id` now. The caller re-keys the store
+    /// (`Store::follow_move`) and reports it (#1896).
+    Moved { old_id: String, new_id: String },
+}
+
+/// The id the message `id` names is stored under now (#1884, #1896).
+fn resolve(store: &Store, id: &str) -> Result<String, GraphError> {
+    store
+        .current_id(id)
+        .map_err(|e| GraphError::Parse(e.to_string()))
+}
+
 /// Dispatches `op` to the Graph mutation it represents.
 ///
-/// `Move` returns Graph's newly-minted message id, but nothing here needs
-/// it: the local row is reconciled by the next delta sync (which will see
-/// the old id removed and the new one added), so it's discarded.
-pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
+/// A message op addresses the message under the id it is stored as now
+/// (`Store::current_id`). `Move` returns [`Applied::Moved`] with the id
+/// Graph minted; this function does not write it to the store.
+pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Applied, GraphError> {
     match op {
-        OutboxOp::MarkRead { id, read } => client.mark_read(id, *read),
-        OutboxOp::SetFlag { id, flagged } => client.set_flag(id, *flagged),
-        OutboxOp::SetCategories { id, categories } => client.set_message_categories(id, categories),
-        OutboxOp::Move { id, dest } => client.move_message(id, dest).map(|_new_id| ()),
+        OutboxOp::Move { id, dest } => {
+            let old_id = resolve(store, id)?;
+            let new_id = client.move_message(&old_id, dest)?;
+            Ok(Applied::Moved { old_id, new_id })
+        }
+        op => apply_other(client, store, op).map(|()| Applied::Done),
+    }
+}
+
+/// `apply_op` for every op but `Move`.
+fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
+    match op {
+        OutboxOp::MarkRead { id, read } => client.mark_read(&resolve(store, id)?, *read),
+        OutboxOp::SetFlag { id, flagged } => client.set_flag(&resolve(store, id)?, *flagged),
+        OutboxOp::SetCategories { id, categories } => {
+            client.set_message_categories(&resolve(store, id)?, categories)
+        }
+        OutboxOp::Move { .. } => unreachable!("apply_op handles Move"),
         OutboxOp::Delete { id } => {
             // A reconciled draft's `local:` id is deleted under its Graph id
-            // (#1884). An id that still resolves to `local:` is treated as
+            // (#1884), a moved message's old id under its new one (#1896).
+            // Graph soft-deletes it to Recoverable Items, not to Deleted
+            // Items (a `Move` to that folder). An id that still resolves to
+            // `local:` is treated as
             // never having reached Graph, so nothing is deleted there (as
             // `DeleteEvent`). That is not an invariant: a delete on another
             // connection that lands while this engine's `create_draft` is in
             // flight leaves `reconcile_id` no row to rename, and the Graph
             // draft stays for a later sync to bring back.
-            let target = store
-                .current_id(id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            let target = resolve(store, id)?;
             if target.starts_with("local:") {
                 Ok(())
             } else {
@@ -549,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_op_dispatches_move_and_discards_new_id() {
+    fn apply_op_move_returns_the_new_id() {
         let srv = FakeServer::start(vec![Route {
             method: "POST".into(),
             path_prefix: "/me/messages/M1/move".into(),
@@ -567,9 +607,111 @@ mod tests {
                 dest: "DEST".into(),
             },
         );
-        assert_eq!(result, Ok(()));
+        assert_eq!(
+            result,
+            Ok(Applied::Moved {
+                old_id: "M1".into(),
+                new_id: "M1-NEW".into()
+            })
+        );
         let reqs = srv.requests();
         assert_eq!(reqs[0].body, r#"{"destinationId":"DEST"}"#);
+        // The store is the caller's to re-key.
+        assert_eq!(store.current_id("M1").unwrap(), "M1");
+    }
+
+    /// A store holding `OLD1`, re-keyed to `NEW1` by a move (#1896).
+    fn store_moved_old1_to_new1() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "F".into(),
+                display_name: "F".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        store
+            .upsert_message(
+                "F",
+                &Message {
+                    id: "OLD1".into(),
+                    conversation_id: String::new(),
+                    subject: String::new(),
+                    from: Recipient::default(),
+                    to: vec![],
+                    cc: vec![],
+                    received: String::new(),
+                    sent: String::new(),
+                    is_read: false,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: String::new(),
+                    preview: String::new(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec![],
+                },
+            )
+            .unwrap();
+        assert!(store.follow_move("OLD1", "NEW1").unwrap());
+        store
+    }
+
+    #[test]
+    fn apply_op_mark_read_of_a_moved_id_patches_the_new_id() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/NEW1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        let result = apply_op(
+            &c,
+            &store,
+            &OutboxOp::MarkRead {
+                id: "OLD1".into(),
+                read: true,
+            },
+        );
+        assert_eq!(result, Ok(Applied::Done));
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/me/messages/NEW1");
+    }
+
+    #[test]
+    fn apply_op_move_of_a_moved_id_posts_to_the_new_id() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/NEW1/move".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"NEW2"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        let result = apply_op(
+            &c,
+            &store,
+            &OutboxOp::Move {
+                id: "OLD1".into(),
+                dest: "F".into(),
+            },
+        );
+        assert_eq!(
+            result,
+            Ok(Applied::Moved {
+                old_id: "NEW1".into(),
+                new_id: "NEW2".into()
+            })
+        );
+        assert_eq!(srv.requests()[0].path, "/me/messages/NEW1/move");
     }
 
     #[test]
