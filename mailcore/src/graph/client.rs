@@ -469,7 +469,9 @@ pub struct EventInput {
     /// through `Store::event_for_send`). When `Some`, the `recurrence` group
     /// sends it (`to_send_json`) instead of the create-side `recurrence`, so
     /// a `relativeMonthly` or `numbered` series is not rewritten into one of
-    /// the create side's three kinds.
+    /// the create side's three kinds. Its `range.recurrence_time_zone` is
+    /// sent as given unless the start is sent in its named zone
+    /// (`start_time_zone`, #2039), whose zone then replaces it.
     pub series_recurrence: Option<EventRecurrence>,
     /// Graph `showAs`, `sensitivity`, `importance`; `""` is not sent (Graph
     /// refuses an empty enum).

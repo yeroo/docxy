@@ -966,9 +966,11 @@ pub struct LocalEventFields {
     pub recurrence: Option<Recurrence>,
     /// Graph's whole recurrence for a repeating event (create-only, #2034):
     /// every pattern type, `noEnd`/`endDate`/`numbered` ranges,
-    /// `firstDayOfWeek`, `index`, `month` and `recurrenceTimeZone` as given.
-    /// Its `CreateEvent` sends it with `EventRecurrence::to_send_json`, and it
-    /// wins over `recurrence`. `update_event_fields` ignores it.
+    /// `firstDayOfWeek`, `index`, `month` and `recurrenceTimeZone` as given,
+    /// except that a start sent in its named zone (`start_time_zone`, #2039)
+    /// sends that zone as `recurrenceTimeZone` instead. Its `CreateEvent`
+    /// sends it with `EventRecurrence::to_send_json`, and it wins over
+    /// `recurrence`. `update_event_fields` ignores it.
     pub series_recurrence: Option<EventRecurrence>,
     pub show_as: Option<String>,
     pub sensitivity: Option<String>,
@@ -7850,9 +7852,6 @@ mod calendar_tests {
         assert_eq!(row.online_meeting_provider, "teamsForBusiness");
     }
 
-    /// A database whose `events` / `event_attendees` tables are at their
-    /// last pre-#1983 shape gains the new columns in place: its rows stay,
-    /// read the new fields as their defaults, and a second open is fine.
     /// `sample_fields` named in two zones (#2039): 09:00 in Berlin's winter
     /// (UTC+1) is 08:00 UTC; the end, 08:30 in London (UTC+0).
     fn zoned_fields() -> LocalEventFields {
@@ -8081,6 +8080,9 @@ mod calendar_tests {
         assert_eq!(zones_of(&s, &id), zoned_pairs());
     }
 
+    /// A database whose `events` / `event_attendees` tables are at their
+    /// last pre-#1983 shape gains the new columns in place: its rows stay,
+    /// read the new fields as their defaults, and a second open is fine.
     #[test]
     fn events_without_1983_columns_migrate() {
         let dir = std::env::temp_dir().join(format!(

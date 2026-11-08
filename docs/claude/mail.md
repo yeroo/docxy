@@ -1405,8 +1405,12 @@ DST and on the right weekday. Also #2030: zone-preserving series time edits.
 - Stored in `events.send_start_tz`, `send_start_local`, `send_end_tz`,
   `send_end_local` (internal, `''` by default, added by `Store::init`'s `ALTER TABLE`
   list, so an old row sends UTC). Not `original_start_tz`: that is Graph's report for a
-  synced row, with no wall clock beside it. `upsert_event_on` does not write them (a
-  refresh keeps them), nor does `reconcile_created_event`. `event_for_send` reads them
+  synced row, with no wall clock beside it. `upsert_event_on` does not write them, so a
+  delta upsert keeps them, and nor does `reconcile_created_event`. A window or range
+  replace (`replace_events_in_window`, `replace_calendar_range_on`) deletes synced rows
+  and re-inserts them with `''`: harmless, as their times are Graph's again with them,
+  and `local:` rows (whose `CreateEvent` reads the pair) are never deleted there.
+  `event_for_send` reads them
   and `event_input_for` copies them, so a queued `CreateEvent` sends them, and a queued
   `UpdateEvent` when its set has `TIMES`.
 - `update_event_fields`: `TIMES` is marked as before, only when `start_utc`, `end_utc`
