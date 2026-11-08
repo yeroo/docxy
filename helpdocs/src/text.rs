@@ -161,8 +161,9 @@ impl Layout<'_> {
                     ..Look::default()
                 };
                 let prefix = format!("{pad}  ");
+                // A tab is four spaces: a terminal cell has no tab stops.
                 for src in text.split('\n') {
-                    self.hard(src, look, &prefix);
+                    self.hard(&src.replace('\t', "    "), look, &prefix);
                 }
             }
             Block::Table {
@@ -628,6 +629,8 @@ mod tests {
             ["  the grid d", "  raws **as ", "  typed**", "  ", "    x"]
         );
         assert!(l.lines[0].spans[1].look.code);
+        let l = lay_src("```\n\tx\n```", 20);
+        assert_eq!(texts(&l), ["      x"]);
     }
 
     #[test]
