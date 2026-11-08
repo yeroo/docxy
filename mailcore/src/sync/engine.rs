@@ -34,9 +34,11 @@
 //! of the messages it added, in the same cycle, and the idle loop prefetches
 //! the bodies of the newest `EngineOptions::prefetch_body_days` of mail, a
 //! small batch per step, before any backfill page. A `SyncCommand::FetchBody`
-//! never waits for a whole pass: long work calls `Engine::checkpoint` between
-//! folders, delta pages and body fetches, which serves it at once and keeps
-//! every other command for after the work, in order.
+//! (and a server search or the opening of a hit, `SyncCommand::SearchMessages`
+//! and `SyncCommand::FetchMessage`, #2006) never waits for a whole pass: long
+//! work calls `Engine::checkpoint` between folders, delta pages and body
+//! fetches, which serves it at once and keeps every other command for after
+//! the work, in order.
 //!
 //! All Graph/auth base URLs are injectable (see `spawn_with_bases`) so tests
 //! drive the whole engine against the in-process fake server with no network.
@@ -50,7 +52,7 @@ use crate::graph::client::{
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
-    MeetingMessageType, Message, Recipient, ScheduleEntry,
+    MeetingMessageType, Message, Recipient, ScheduleEntry, SearchHit,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -127,6 +129,34 @@ pub enum SyncCommand {
     /// [`EngineOptions::body_format`], then emit [`SyncEvent::BodyReady`].
     /// Served ahead of a running pass, between two of its requests (#1978).
     FetchBody { id: String },
+    /// Search the messages on the server (#2006, `GraphClient::search_messages`):
+    /// `query` is KQL as the client wrote it, `folder_id` scopes the search
+    /// to one folder (its subfolders are not searched), `top` caps the hits
+    /// (`1..=SEARCH_TOP_MAX`). Answers with
+    /// [`SyncEvent::MessageSearchResults`], or
+    /// [`SyncEvent::MessageSearchFailed`], never a [`SyncEvent::Error`].
+    /// The hits are not stored. Served ahead of a running pass, as
+    /// `FetchBody` is, and tried even during a back-off.
+    SearchMessages {
+        query: String,
+        folder_id: Option<String>,
+        top: usize,
+    },
+    /// Open a search hit the store does not have (#2006): fetch its header
+    /// (`GraphClient::get_message_hit`) and store it in the folder Graph
+    /// files it in, as a fresh delta row would
+    /// (`Store::merge_message_unless_edited`, under the id asked), emit
+    /// [`SyncEvent::MessagesUpdated`] (for the folder a stored row left
+    /// too), then fetch and store its body as `FetchBody` does
+    /// ([`SyncEvent::BodyReady`]). A later delta of the folder upserts the
+    /// same row. Writes nothing and answers
+    /// [`SyncEvent::MessageFetchFailed`] when signed out, when the id is
+    /// one a move left behind (`Store::is_moved_alias`), when a queued op
+    /// deleted it locally, when its folder is not in the store, or when
+    /// Graph fails; a body that fails after the header was stored answers
+    /// `MessageFetchFailed` too. Served ahead of a running pass, as
+    /// `FetchBody` is.
+    FetchMessage { id: String },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
     /// `Store::put_attachments` is otherwise never populated in production
@@ -538,6 +568,26 @@ pub enum SyncEvent {
     /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
     /// its free/busy grid.
     ScheduleFetched { entries: Vec<ScheduleEntry> },
+    /// The server's answer to [`SyncCommand::SearchMessages`] (#2006), with
+    /// the query and folder it was asked, so a client can drop an answer to
+    /// a query it has since changed. No hits is an empty `hits`.
+    MessageSearchResults {
+        query: String,
+        folder_id: Option<String>,
+        hits: Vec<SearchHit>,
+    },
+    /// [`SyncCommand::SearchMessages`] could not search the server (#2006):
+    /// signed out, a blank query, offline, throttled, a 4xx or 5xx. Not a
+    /// sync error: a client shows that the server could not be searched
+    /// beside its local hits. `reason` is one line.
+    MessageSearchFailed {
+        query: String,
+        folder_id: Option<String>,
+        reason: String,
+    },
+    /// [`SyncCommand::FetchMessage`] could not open the hit `id` (as the
+    /// command named it, #2006). `reason` is one line.
+    MessageFetchFailed { id: String, reason: String },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -1151,7 +1201,7 @@ struct Engine {
     /// drains it at each `checkpoint` (#1978).
     cmd_rx: Receiver<SyncCommand>,
     /// Commands a `checkpoint` took off the channel and kept for later
-    /// (every one but `FetchBody`), in arrival order: the main loop runs
+    /// (every one but `FetchBody`, `SearchMessages` and `FetchMessage`), in arrival order: the main loop runs
     /// them before it reads the channel again or does any idle work.
     deferred: VecDeque<SyncCommand>,
     /// A `Shutdown` came, or the UI dropped its handle, while work was
@@ -1265,11 +1315,12 @@ impl Engine {
     }
 
     /// Takes every command waiting on the channel, between two requests of
-    /// long work (#1978): a `FetchBody` is served at once, so a click costs
-    /// one round trip plus the request in flight, not a whole pass; every
+    /// long work (#1978): a `FetchBody`, a `SearchMessages` or a
+    /// `FetchMessage` (#2006) is served at once, so a click costs its own
+    /// round trips plus the request in flight, not a whole pass; every
     /// other command is kept (`deferred`) for the main loop, in order; a
     /// `Shutdown` or a dropped handle sets `shutting_down`. Returns whether
-    /// the work goes on: `false` when shutting down, or when a `FetchBody`
+    /// the work goes on: `false` when shutting down, or when a command
     /// served here hit an auth, throttle or transport failure (`react`
     /// returned true). A back-off set before the checkpoint does not stop
     /// it: `Refresh` runs a pass during one.
@@ -1282,6 +1333,20 @@ impl Engine {
             match self.cmd_rx.try_recv() {
                 Ok(SyncCommand::FetchBody { id }) => {
                     if self.fetch_body(&id) {
+                        carry_on = false;
+                    }
+                }
+                Ok(SyncCommand::SearchMessages {
+                    query,
+                    folder_id,
+                    top,
+                }) => {
+                    if self.search_messages(query, folder_id, top) {
+                        carry_on = false;
+                    }
+                }
+                Ok(SyncCommand::FetchMessage { id }) => {
+                    if self.fetch_message(&id) {
                         carry_on = false;
                     }
                 }
@@ -1555,6 +1620,16 @@ impl Engine {
             }
             SyncCommand::FetchBody { id } => {
                 self.fetch_body(&id);
+            }
+            SyncCommand::SearchMessages {
+                query,
+                folder_id,
+                top,
+            } => {
+                self.search_messages(query, folder_id, top);
+            }
+            SyncCommand::FetchMessage { id } => {
+                self.fetch_message(&id);
             }
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
@@ -3390,6 +3465,169 @@ impl Engine {
         }
         self.emit(SyncEvent::BodyReady { id: id.to_string() });
         Ok(true)
+    }
+
+    // --- Server search (#2006) -------------------------------------------
+
+    /// Serves [`SyncCommand::SearchMessages`]: the hits as
+    /// `MessageSearchResults`, or `MessageSearchFailed`, never a
+    /// `SyncEvent::Error`. Signed out or with a blank query it sends no
+    /// request. Like `fetch_body` it does not wait out a back-off: a user's
+    /// search is tried. Returns `react`'s answer to an auth, throttle or
+    /// transport failure (which emits no `Error`), for `checkpoint` to stop
+    /// the work it serves in; any other failure is only the event.
+    fn search_messages(&mut self, query: String, folder_id: Option<String>, top: usize) -> bool {
+        let refused = if self.token.is_none() {
+            Some("not signed in")
+        } else if query.trim().is_empty() {
+            Some("empty query")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.emit(SyncEvent::MessageSearchFailed {
+                query,
+                folder_id,
+                reason: reason.to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.search_messages(folder_id.as_deref(), &query, top)) {
+            Ok(hits) => {
+                self.emit(SyncEvent::MessageSearchResults {
+                    query,
+                    folder_id,
+                    hits,
+                });
+                false
+            }
+            Err(e) => {
+                self.emit(SyncEvent::MessageSearchFailed {
+                    query,
+                    folder_id,
+                    reason: e.to_string(),
+                });
+                self.react_quietly(e)
+            }
+        }
+    }
+
+    /// `react` for the failures it answers without a `SyncEvent::Error`
+    /// (auth → sign-in, throttle → `next_retry`, transport → offline):
+    /// `true` when the work must stop. Any other failure is the caller's
+    /// own event only, never a sync error (#2006).
+    fn react_quietly(&mut self, e: GraphError) -> bool {
+        match e {
+            GraphError::Unauthorized | GraphError::Throttled { .. } | GraphError::Transport(_) => {
+                self.react(e)
+            }
+            GraphError::NotFound | GraphError::Http { .. } | GraphError::Parse(_) => false,
+        }
+    }
+
+    /// Emits `MessageFetchFailed` for `id`.
+    fn fetch_message_failed(&self, id: &str, reason: impl Into<String>) {
+        self.emit(SyncEvent::MessageFetchFailed {
+            id: id.to_string(),
+            reason: reason.into(),
+        });
+    }
+
+    /// Serves [`SyncCommand::FetchMessage`] (#2006): opens a search hit.
+    /// In order: signed out, an id a move left behind (#1896: the row
+    /// lives on under its new id) and an id a queued op owns whose row is
+    /// gone (a queued `Delete`: never put back) are refused with no
+    /// request. Then the hit is fetched; a folder the store does not have
+    /// writes nothing. The header is merged under the id asked (as
+    /// `repair_headerless` keeps it) with `merge_message_unless_edited`, as
+    /// a fresh delta row is, except for an id a queued op owns, whose row
+    /// keeps its optimistic state and folder. `MessagesUpdated` goes out
+    /// for the folder a re-filed row left, then for the row's folder; then
+    /// the body is fetched and stored as `FetchBody` does (`BodyReady`).
+    /// Every failure is `MessageFetchFailed`, never a `SyncEvent::Error`.
+    /// Returns `react`'s answer to an auth, throttle or transport failure,
+    /// as `fetch_body` does, for `checkpoint`.
+    fn fetch_message(&mut self, id: &str) -> bool {
+        if self.token.is_none() {
+            self.fetch_message_failed(id, "not signed in");
+            return false;
+        }
+        if self.store.is_moved_alias(id).unwrap_or(false) {
+            self.fetch_message_failed(id, "moved; open its current id");
+            return false;
+        }
+        let protected = match self.protected_ids() {
+            Ok(ids) => ids.iter().any(|p| p == id),
+            Err(e) => {
+                self.fetch_message_failed(id, format!("store: {e}"));
+                return false;
+            }
+        };
+        let stored_in = match self.store.message_folder(id) {
+            Ok(f) => f,
+            Err(e) => {
+                self.fetch_message_failed(id, format!("store: {e}"));
+                return false;
+            }
+        };
+        if protected && stored_in.is_none() {
+            self.fetch_message_failed(id, "deleted locally");
+            return false;
+        }
+        let hit = match self.with_auth(|c| c.get_message_hit(id)) {
+            Ok(hit) => hit,
+            Err(e) => {
+                self.fetch_message_failed(id, e.to_string());
+                return self.react_quietly(e);
+            }
+        };
+        let known = !hit.folder_id.is_empty()
+            && self
+                .store
+                .folders()
+                .is_ok_and(|fs| fs.iter().any(|f| f.id == hit.folder_id));
+        if !known {
+            let reason = if hit.folder_id.is_empty() {
+                "Graph named no folder for it".to_string()
+            } else {
+                format!("its folder {} is not in the store", hit.folder_id)
+            };
+            self.fetch_message_failed(id, reason);
+            return false;
+        }
+        let folder_id = match (protected, stored_in.clone()) {
+            // A queued op owns the row: it keeps its state and folder.
+            (true, Some(stored)) => stored,
+            _ => {
+                let m = Message {
+                    id: id.to_string(),
+                    ..hit.message
+                };
+                if let Err(e) =
+                    self.store
+                        .merge_message_unless_edited(&hit.folder_id, &m, &hit.fields)
+                {
+                    self.fetch_message_failed(id, format!("store: {e}"));
+                    return false;
+                }
+                hit.folder_id
+            }
+        };
+        if let Some(old) = stored_in.filter(|old| *old != folder_id) {
+            self.emit(SyncEvent::MessagesUpdated { folder_id: old });
+        }
+        self.emit(SyncEvent::MessagesUpdated { folder_id });
+        match self.fetch_and_store_body(id) {
+            Ok(true) => false,
+            Ok(false) => {
+                self.fetch_message_failed(id, "could not store the body");
+                false
+            }
+            Err(e) => {
+                self.fetch_message_failed(id, e.to_string());
+                self.react_quietly(e)
+            }
+        }
     }
 
     /// The lower bound of the bodies the engine fetches on its own
@@ -19684,6 +19922,691 @@ mod tests {
                 ids.sort();
                 assert_eq!(ids, ["A", "N1"]);
                 let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            // --- Server search and opening a hit (#2006) ----------------
+
+            mod search {
+                use super::*;
+
+                /// A hit as `get_message_hit` and a `$search` page return
+                /// it: a full message filed in `folder`.
+                fn hit_json(id: &str, folder: &str, subject: &str) -> String {
+                    let m = full_message_json(id, subject, "2019-03-01T00:00:00Z");
+                    format!(r#"{{"parentFolderId":"{folder}",{}"#, &m[1..])
+                }
+
+                /// `GET /me/messages/{id}?$select=id,…`: the hit route.
+                fn hit_path(id: &str) -> String {
+                    format!("/me/messages/{id}?$select=id,")
+                }
+
+                fn hit_route(id: &str, folder: &str, subject: &str) -> (Route, Option<usize>) {
+                    (
+                        route(&hit_path(id), 200, &hit_json(id, folder, subject)),
+                        None,
+                    )
+                }
+
+                fn search_route(prefix: &str, status: u16, body: &str) -> (Route, Option<usize>) {
+                    (route(prefix, status, body), None)
+                }
+
+                fn write_route(method: &str, prefix: &str, status: u16) -> (Route, Option<usize>) {
+                    (
+                        Route {
+                            method: method.into(),
+                            path_prefix: prefix.into(),
+                            status,
+                            headers: vec![],
+                            body: "{}".into(),
+                        },
+                        None,
+                    )
+                }
+
+                /// Inbox (`F1`, with `inbox` messages) and Archive (`F2`,
+                /// empty), both small, with `extra` routes first.
+                fn two_folders(
+                    inbox: Vec<String>,
+                    extra: Vec<(Route, Option<usize>)>,
+                ) -> FakeServer {
+                    FakeServer::start_paced(mailbox(
+                        &[
+                            small(Fold {
+                                pages: vec![inbox],
+                                ..super::inbox()
+                            }),
+                            small(fold("F2", "Archive", None)),
+                        ],
+                        extra,
+                        Duration::ZERO,
+                    ))
+                }
+
+                /// The engine on `srv`, its startup pass settled.
+                fn started(srv: &FakeServer, tag: &str) -> (SyncHandle, PathBuf) {
+                    let dir = new_dir(tag);
+                    let handle = spawn_with(srv, &dir, EngineOptions::without_prefetch());
+                    wait_for(&handle.evt_rx, is_idle);
+                    (handle, dir)
+                }
+
+                fn search(handle: &SyncHandle, query: &str, folder: Option<&str>, top: usize) {
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::SearchMessages {
+                            query: query.into(),
+                            folder_id: folder.map(str::to_string),
+                            top,
+                        })
+                        .unwrap();
+                }
+
+                fn fetch(handle: &SyncHandle, id: &str) {
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::FetchMessage { id: id.into() })
+                        .unwrap();
+                }
+
+                fn is_search_answer(e: &SyncEvent) -> bool {
+                    matches!(
+                        e,
+                        SyncEvent::MessageSearchResults { .. }
+                            | SyncEvent::MessageSearchFailed { .. }
+                    )
+                }
+
+                /// Events until the search's answer, which must be a failure:
+                /// its reason, and every event seen.
+                fn search_failure(handle: &SyncHandle) -> (String, Vec<SyncEvent>) {
+                    let events = wait_for(&handle.evt_rx, is_search_answer);
+                    match events.last() {
+                        Some(SyncEvent::MessageSearchFailed { reason, .. }) => {
+                            (reason.clone(), events)
+                        }
+                        other => panic!("expected a failure, got {other:?}"),
+                    }
+                }
+
+                fn is_fetch_end(e: &SyncEvent, id: &str) -> bool {
+                    matches!(e, SyncEvent::MessageFetchFailed { id: f, .. } if f == id)
+                        || matches!(e, SyncEvent::BodyReady { id: b } if b == id)
+                }
+
+                /// Events until `id`'s `FetchMessage` is answered (`BodyReady`
+                /// or `MessageFetchFailed`).
+                fn fetch_answer(handle: &SyncHandle, id: &str) -> Vec<SyncEvent> {
+                    wait_for(&handle.evt_rx, |e| is_fetch_end(e, id))
+                }
+
+                fn fetch_failure(events: &[SyncEvent]) -> String {
+                    match events.last() {
+                        Some(SyncEvent::MessageFetchFailed { reason, .. }) => reason.clone(),
+                        other => panic!("expected a failure, got {other:?}"),
+                    }
+                }
+
+                fn no_error(events: &[SyncEvent]) {
+                    assert!(
+                        !events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+                        "no sync error: {events:?}"
+                    );
+                }
+
+                fn updates(events: &[SyncEvent]) -> Vec<String> {
+                    events
+                        .iter()
+                        .filter_map(|e| match e {
+                            SyncEvent::MessagesUpdated { folder_id } => Some(folder_id.clone()),
+                            _ => None,
+                        })
+                        .collect()
+                }
+
+                fn searched(srv: &FakeServer) -> Vec<String> {
+                    paths_from(srv, 0)
+                        .into_iter()
+                        .filter(|p| p.contains("?$search="))
+                        .collect()
+                }
+
+                fn hit_gets(srv: &FakeServer, id: &str) -> usize {
+                    paths_from(srv, 0)
+                        .iter()
+                        .filter(|p| p.starts_with(&hit_path(id)))
+                        .count()
+                }
+
+                fn body_gets_of(srv: &FakeServer, id: &str) -> usize {
+                    paths_from(srv, 0)
+                        .iter()
+                        .filter(|p| **p == body_path(id))
+                        .count()
+                }
+
+                #[test]
+                fn search_messages_answers_with_its_query_and_folder() {
+                    let page = format!(
+                        r#"{{"value":[{},{}]}}"#,
+                        hit_json("S1", "F2", "Budget"),
+                        hit_json("S2", "FX", "Budget 2")
+                    );
+                    let srv = two_folders(
+                        vec![],
+                        vec![
+                            search_route("/me/messages?$search", 200, &page),
+                            search_route(
+                                "/me/mailFolders/F2/messages?$search",
+                                200,
+                                r#"{"value":[]}"#,
+                            ),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "search-answers");
+                    search(&handle, "budget", None, 25);
+                    let events = wait_for(&handle.evt_rx, is_search_answer);
+                    no_error(&events);
+                    match events.last().unwrap() {
+                        SyncEvent::MessageSearchResults {
+                            query,
+                            folder_id,
+                            hits,
+                        } => {
+                            assert_eq!(query, "budget");
+                            assert_eq!(*folder_id, None);
+                            let got: Vec<(&str, &str, &str)> = hits
+                                .iter()
+                                .map(|h| {
+                                    (
+                                        h.message.id.as_str(),
+                                        h.folder_id.as_str(),
+                                        h.message.subject.as_str(),
+                                    )
+                                })
+                                .collect();
+                            assert_eq!(got, [("S1", "F2", "Budget"), ("S2", "FX", "Budget 2")]);
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                    // A folder search, and no matches: an empty answer, not a failure.
+                    search(&handle, "nothing", Some("F2"), 5);
+                    let events = wait_for(&handle.evt_rx, is_search_answer);
+                    assert_eq!(
+                        events.last().unwrap(),
+                        &SyncEvent::MessageSearchResults {
+                            query: "nothing".into(),
+                            folder_id: Some("F2".into()),
+                            hits: vec![],
+                        }
+                    );
+                    let paths = searched(&srv);
+                    assert_eq!(paths.len(), 2, "{paths:?}");
+                    assert!(
+                        paths[0].starts_with("/me/messages?$search=%22budget%22&$select=id,")
+                            && paths[0].ends_with(",parentFolderId&$top=25"),
+                        "{paths:?}"
+                    );
+                    assert!(
+                        paths[1].starts_with(
+                            "/me/mailFolders/F2/messages?$search=%22nothing%22&$select=id,"
+                        ) && paths[1].ends_with(",parentFolderId&$top=5"),
+                        "{paths:?}"
+                    );
+                    stop(handle);
+                    // The hits are not written to the store.
+                    let store = store_in(&dir);
+                    for id in ["S1", "S2"] {
+                        assert!(!store.message_exists(id).unwrap(), "{id}");
+                    }
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                fn search_failing_with(status: u16, tag: &str) {
+                    let srv = two_folders(
+                        vec![],
+                        vec![search_route(
+                            "/me/messages?$search",
+                            status,
+                            r#"{"error":{"code":"ErrorAccessDenied","message":"no"}}"#,
+                        )],
+                    );
+                    let (handle, dir) = started(&srv, tag);
+                    search(&handle, "budget", None, 10);
+                    let (reason, events) = search_failure(&handle);
+                    assert!(reason.contains(&status.to_string()), "{reason}");
+                    assert!(!reason.contains('\n'), "one line: {reason:?}");
+                    assert!(matches!(
+                        events.last().unwrap(),
+                        SyncEvent::MessageSearchFailed { query, folder_id: None, .. } if query == "budget"
+                    ));
+                    // The engine carries on: the next command is answered.
+                    handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                    let more = wait_for(&handle.evt_rx, is_idle);
+                    no_error(&events);
+                    no_error(&more);
+                    stop(handle);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn search_messages_403_answers_failed_not_error() {
+                    search_failing_with(403, "search-403");
+                }
+
+                #[test]
+                fn search_messages_500_answers_failed_not_error() {
+                    search_failing_with(500, "search-500");
+                }
+
+                #[test]
+                fn search_messages_transport_failure_answers_failed_not_error() {
+                    let srv = two_folders(vec![], vec![]);
+                    let (handle, dir) = started(&srv, "search-transport");
+                    // The server goes away: the search is a transport error.
+                    drop(srv);
+                    search(&handle, "budget", None, 10);
+                    let (_reason, events) = search_failure(&handle);
+                    no_error(&events);
+                    // `react` takes the engine offline, still without an error.
+                    let more = wait_for(&handle.evt_rx, |e| {
+                        matches!(e, SyncEvent::State(SyncState::Offline))
+                    });
+                    no_error(&more);
+                    stop(handle);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn search_messages_signed_out_sends_no_request() {
+                    let srv = two_folders(
+                        vec![],
+                        vec![search_route("/me/messages?$search", 200, r#"{"value":[]}"#)],
+                    );
+                    // No token: the engine waits for a sign-in.
+                    let dir = unique_dir("search-signed-out");
+                    let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                    wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+                    search(&handle, "budget", Some("F1"), 10);
+                    let (reason, events) = search_failure(&handle);
+                    assert_eq!(reason, "not signed in");
+                    assert!(matches!(
+                        events.last().unwrap(),
+                        SyncEvent::MessageSearchFailed { folder_id: Some(f), .. } if f == "F1"
+                    ));
+                    no_error(&events);
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert_eq!(fetch_failure(&events), "not signed in");
+                    no_error(&events);
+                    assert!(searched(&srv).is_empty(), "{:?}", paths_from(&srv, 0));
+                    assert_eq!(hit_gets(&srv, "H1"), 0);
+                    stop(handle);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn search_messages_blank_query_sends_no_request() {
+                    let srv = two_folders(
+                        vec![],
+                        vec![search_route("/me/messages?$search", 200, r#"{"value":[]}"#)],
+                    );
+                    let (handle, dir) = started(&srv, "search-blank");
+                    search(&handle, " \t ", None, 10);
+                    let (reason, events) = search_failure(&handle);
+                    assert_eq!(reason, "empty query");
+                    no_error(&events);
+                    assert!(searched(&srv).is_empty());
+                    stop(handle);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn search_and_fetch_message_are_served_during_a_slow_pass() {
+                    let folders: Vec<Fold> =
+                        [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                            .into_iter()
+                            .map(|(id, name)| {
+                                small(Fold {
+                                    pages: vec![vec![msg(
+                                        &format!("M-{id}"),
+                                        "2020-01-01T00:00:00Z",
+                                    )]],
+                                    ..fold(id, name, if id == "F1" { Some("inbox") } else { None })
+                                })
+                            })
+                            .collect();
+                    let srv = FakeServer::start_paced(mailbox(
+                        &folders,
+                        vec![
+                            search_route(
+                                "/me/messages?$search",
+                                200,
+                                &format!(r#"{{"value":[{}]}}"#, hit_json("H1", "F4", "Old")),
+                            ),
+                            hit_route("H1", "F4", "Old"),
+                            (body_route("H1"), None),
+                        ],
+                        Duration::from_millis(300),
+                    ));
+                    let dir = new_dir("search-in-pass");
+                    let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                    // The startup pass is under way: some folder's delta is out.
+                    assert!(wait_until(ENGINE_WAIT, || {
+                        paths_from(&srv, 0)
+                            .iter()
+                            .any(|p| p.contains("/messages/delta?$orderby"))
+                    }));
+                    search(&handle, "old", None, 10);
+                    fetch(&handle, "H1");
+                    let events = wait_for(&handle.evt_rx, is_idle);
+                    let answered = events
+                        .iter()
+                        .position(|e| matches!(e, SyncEvent::MessageSearchResults { hits, .. } if hits.len() == 1))
+                        .unwrap_or_else(|| panic!("search answered before the pass ended: {events:?}"));
+                    let opened = events
+                        .iter()
+                        .position(|e| matches!(e, SyncEvent::BodyReady { id } if id == "H1"))
+                        .unwrap_or_else(|| panic!("hit opened before the pass ended: {events:?}"));
+                    assert!(answered < opened, "in the order sent: {events:?}");
+                    let reqs = srv.requests();
+                    let at = |pred: &dyn Fn(&str) -> bool| {
+                        reqs.iter()
+                            .filter(|r| pred(&r.path))
+                            .map(|r| r.at)
+                            .collect::<Vec<_>>()
+                    };
+                    let last_delta = *at(&|p| p.contains("/messages/delta?$orderby"))
+                        .iter()
+                        .max()
+                        .unwrap();
+                    let search_at = at(&|p| p.contains("?$search="));
+                    let hit_at = at(&|p| p.starts_with(&hit_path("H1")));
+                    assert_eq!((search_at.len(), hit_at.len()), (1, 1));
+                    assert!(
+                        search_at[0] < last_delta,
+                        "the search came before the last delta"
+                    );
+                    assert!(hit_at[0] < last_delta, "the hit came before the last delta");
+                    stop(handle);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_stores_header_and_body_in_its_folder() {
+                    let srv = two_folders(
+                        vec![msg("M1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            hit_route("H1", "F2", "Old budget"),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-message");
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    no_error(&events);
+                    let at_update = events
+                        .iter()
+                        .position(|e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F2"))
+                        .unwrap_or_else(|| panic!("MessagesUpdated for F2: {events:?}"));
+                    assert_eq!(at_update, events.len() - 2, "then BodyReady: {events:?}");
+                    assert_eq!(updates(&events), ["F2"]);
+                    assert_eq!(body_gets_of(&srv, "H1"), 1);
+                    stop(handle);
+                    let r = row(&dir, "F2", "H1").expect("H1 stored in F2");
+                    assert_eq!(r.subject, "Old budget");
+                    assert_eq!(r.from_addr, "alice@x");
+                    assert_eq!(r.received_at, "2019-03-01T00:00:00Z");
+                    assert_eq!(stored_ids(&dir, "F1"), ["M1"], "the inbox untouched");
+                    let body = store_in(&dir).get_body("H1").unwrap().expect("a body");
+                    assert_eq!(body.content, "body of H1");
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_stores_the_row_under_the_id_asked() {
+                    // Graph answers for the id asked; the row keeps that id
+                    // even when the response names another (as the header
+                    // repair does), so `BodyReady` and the row agree.
+                    let srv = two_folders(
+                        vec![],
+                        vec![
+                            (
+                                route(&hit_path("H1"), 200, &hit_json("OTHER", "F2", "Old")),
+                                None,
+                            ),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-asked-id");
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(matches!(events.last(), Some(SyncEvent::BodyReady { .. })));
+                    stop(handle);
+                    assert_eq!(stored_ids(&dir, "F2"), ["H1"]);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_then_delta_with_the_same_id_keeps_one_row() {
+                    let changed = hit_json("H1", "F2", "Changed later")
+                        .replace(r#""parentFolderId":"F2","#, "");
+                    let srv = two_folders(
+                        vec![],
+                        vec![
+                            hit_route("H1", "F2", "Old budget"),
+                            (body_route("H1"), None),
+                            next_round("F2", &[changed]),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-then-delta");
+                    fetch(&handle, "H1");
+                    fetch_answer(&handle, "H1");
+                    // A round on F2's stored link brings the same id.
+                    refresh(&handle);
+                    stop(handle);
+                    let store = store_in(&dir);
+                    assert_eq!(stored_ids(&dir, "F2"), ["H1"], "one row");
+                    assert!(store.message_exists("H1").unwrap());
+                    assert_eq!(row(&dir, "F2", "H1").unwrap().subject, "Changed later");
+                    assert!(store.get_body("H1").unwrap().is_some(), "the body kept");
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_of_a_folder_not_in_the_store_writes_nothing() {
+                    let srv = two_folders(
+                        vec![],
+                        vec![
+                            hit_route("H1", "FX", "Elsewhere"),
+                            hit_route("H2", "", "Nowhere"),
+                            (body_route("H1"), None),
+                            (body_route("H2"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-unknown-folder");
+                    for id in ["H1", "H2"] {
+                        fetch(&handle, id);
+                        let events = fetch_answer(&handle, id);
+                        let reason = fetch_failure(&events);
+                        assert!(!reason.is_empty());
+                        assert!(updates(&events).is_empty(), "{events:?}");
+                        no_error(&events);
+                        assert_eq!(body_gets_of(&srv, id), 0, "{id}");
+                    }
+                    stop(handle);
+                    let store = store_in(&dir);
+                    for id in ["H1", "H2"] {
+                        assert!(!store.message_exists(id).unwrap(), "{id}");
+                    }
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_404_answers_failed_not_error() {
+                    let srv = two_folders(vec![], vec![(route(&hit_path("H1"), 404, "{}"), None)]);
+                    let (handle, dir) = started(&srv, "fetch-404");
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(!fetch_failure(&events).is_empty());
+                    no_error(&events);
+                    assert!(updates(&events).is_empty());
+                    // The engine carries on, still without a sync error.
+                    no_error(&refresh(&handle));
+                    stop(handle);
+                    assert!(!store_in(&dir).message_exists("H1").unwrap());
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_body_failure_after_the_header_answers_failed() {
+                    let srv = two_folders(
+                        vec![],
+                        vec![
+                            hit_route("H1", "F2", "Old budget"),
+                            (route(&body_path("H1"), 500, "{}"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-body-fails");
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(fetch_failure(&events).contains("500"));
+                    assert_eq!(updates(&events), ["F2"], "the header went out first");
+                    no_error(&events);
+                    stop(handle);
+                    assert!(row(&dir, "F2", "H1").is_some(), "the header stays stored");
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_refiles_a_row_stored_in_another_folder() {
+                    let srv = two_folders(
+                        vec![msg("H1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            hit_route("H1", "F2", "Moved on the server"),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-refile");
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert_eq!(updates(&events), ["F1", "F2"], "the old folder first");
+                    stop(handle);
+                    assert!(stored_ids(&dir, "F1").is_empty());
+                    assert_eq!(
+                        row(&dir, "F2", "H1").unwrap().subject,
+                        "Moved on the server"
+                    );
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_of_a_locally_deleted_id_sends_no_request() {
+                    let srv = two_folders(
+                        vec![msg("H1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            write_route("DELETE", "/me/messages/H1", 500),
+                            hit_route("H1", "F2", "Back from the dead"),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-deleted");
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::Delete { id: "H1".into() })
+                        .unwrap();
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert_eq!(fetch_failure(&events), "deleted locally");
+                    assert!(updates(&events).is_empty(), "{events:?}");
+                    assert!(
+                        srv.requests().iter().any(|r| r.method == "DELETE"),
+                        "the Delete was sent and failed"
+                    );
+                    assert_eq!(hit_gets(&srv, "H1"), 0);
+                    assert_eq!(body_gets_of(&srv, "H1"), 0);
+                    stop(handle);
+                    let store = store_in(&dir);
+                    assert!(!store.message_exists("H1").unwrap(), "not put back");
+                    assert_eq!(store.pending_message_ids().unwrap(), ["H1"]);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_of_a_protected_row_keeps_it_and_fetches_its_body() {
+                    let srv = two_folders(
+                        vec![msg("H1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            write_route("PATCH", "/me/messages/H1", 500),
+                            hit_route("H1", "F2", "Server subject"),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-protected");
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::MarkRead {
+                            id: "H1".into(),
+                            read: true,
+                        })
+                        .unwrap();
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(
+                        matches!(events.last(), Some(SyncEvent::BodyReady { .. })),
+                        "{events:?}"
+                    );
+                    assert_eq!(updates(&events), ["F1"], "the row's own folder");
+                    stop(handle);
+                    let r = row(&dir, "F1", "H1").expect("left in F1");
+                    assert!(r.is_read, "the optimistic read kept");
+                    assert_eq!(r.subject, "H1", "no header merge");
+                    assert!(store_in(&dir).get_body("H1").unwrap().is_some());
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+
+                #[test]
+                fn fetch_message_of_a_moved_alias_sends_no_request() {
+                    let srv = two_folders(
+                        vec![msg("H1", "2026-01-01T00:00:00Z")],
+                        vec![
+                            (
+                                Route {
+                                    method: "POST".into(),
+                                    path_prefix: "/me/messages/H1/move".into(),
+                                    status: 200,
+                                    headers: vec![],
+                                    body: r#"{"id":"H1N"}"#.into(),
+                                },
+                                Some(1),
+                            ),
+                            hit_route("H1", "F2", "Pre-move copy"),
+                            (body_route("H1"), None),
+                        ],
+                    );
+                    let (handle, dir) = started(&srv, "fetch-alias");
+                    handle
+                        .cmd_tx
+                        .send(SyncCommand::Move {
+                            id: "H1".into(),
+                            dest: "F2".into(),
+                        })
+                        .unwrap();
+                    wait_for(
+                        &handle.evt_rx,
+                        |e| matches!(e, SyncEvent::MessageMoved { new_id, .. } if new_id == "H1N"),
+                    );
+                    fetch(&handle, "H1");
+                    let events = fetch_answer(&handle, "H1");
+                    assert!(fetch_failure(&events).starts_with("moved"));
+                    assert_eq!(hit_gets(&srv, "H1"), 0);
+                    stop(handle);
+                    let store = store_in(&dir);
+                    assert!(!store.message_exists("H1").unwrap());
+                    assert_eq!(stored_ids(&dir, "F2"), ["H1N"]);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
             }
         }
     }

@@ -702,6 +702,10 @@ impl App {
                     v.loading = false;
                 }
             }
+            // lookxy never sends `SearchMessages`/`FetchMessage` (#2006).
+            SyncEvent::MessageSearchResults { .. }
+            | SyncEvent::MessageSearchFailed { .. }
+            | SyncEvent::MessageFetchFailed { .. } => {}
             SyncEvent::Error(msg) => {
                 // A fetch failure while the OOF form / free-busy overlay is open
                 // must clear its loading state so it isn't stuck on "loading…".
