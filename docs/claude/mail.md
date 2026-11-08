@@ -1330,6 +1330,65 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
 
+## Respond options and proposals (#2023)
+
+Item 4 of #1985: every response can skip telling the organizer, carry a comment, and
+propose a new time on tentative as well as decline. The organizer sees each attendee's
+proposal.
+
+- `SyncCommand::RespondEvent`, `SyncCommand::RespondMeeting` and `OutboxOp::RespondEvent`
+  carry `send_response` ("Don't send a response" when false). The op's JSON key is
+  `sendResponse`; a row queued before #2023 has none and reads as `true`, the only
+  behaviour then. The local status (`set_event_response`) changes either way. With
+  `sendResponse: false` Graph ignores the comment: documented, not refused.
+- `graph::client::rsvp_proposal(kind, send_response, start, end)` checks a proposal and
+  returns the window **normalised** to canonical UTC (`model::to_utc`), which is what the
+  engine queues and sends. `Some("")` counts as absent. It refuses a proposal with an
+  accept (Graph's `accept` takes none), with `send_response` false (Graph requires
+  `sendResponse: true` to propose), with half a window, or with an end not after its
+  start. `RsvpKind::from_status` maps the `response_status` words to a kind (it replaced
+  `outbox.rs`'s private `rsvp_kind`).
+- The engine runs the checks first, before it writes, queues or calls anything:
+  `rsvp_proposal`, an unknown `kind` (`RespondEvent`), and a proposal on a stored event
+  whose `allow_new_time_proposals` is false (a missing row skips this; Graph has the last
+  word). A refusal is a `SyncEvent::Error`. A refused `RespondEvent` also resets the
+  calendars when signed in (`reset_calendars`), because a host such as lookxy writes the
+  status itself before it sends the command (`lookxy/src/app.rs` `dispatch_rsvp`), on a
+  row no delta round would name again (#2013). A host that writes first should call
+  `rsvp_proposal` before it writes. `RespondMeeting` checks `rsvp_proposal` before the
+  invite's `meeting_event_id` GET and the stored row once the event id is known; it
+  writes nothing locally, so it does not reset.
+- `respond_event` sends `proposedNewTime`'s `dateTime`s without the `Z`, next to
+  `timeZone: "UTC"`, as `event_body_json` and `get_schedule` do, and drops a proposal on
+  accept as a second guard.
+- The organizer's view: `Attendee`, `NewAttendee` and `AttendeeRow` carry
+  `proposed_start_utc`/`proposed_end_utc` (canonical UTC, both `""` for none), from
+  `attendees[].proposedNewTime`. Both are set only when `start.dateTime` and
+  `end.dateTime` are both strings: `datetime_field_to_utc` on a missing side would read
+  `0000-00-00T00:00:00Z`, and half a slot is no proposal. They are two `event_attendees`
+  columns (the `ALTER TABLE` list beside `response_time`); `typed_attendees` keeps a
+  matching attendee's proposal across a local attendee edit, as it keeps the response.
+  The calendarView requests already ask for UTC and select every field, so no request
+  changed.
+- Not yet: lookxy has no "Don't send a response" toggle, still offers a proposal on an
+  event that disallows it (the engine refuses it and resets), and does not show
+  attendees' proposals. The organizer accepting a proposal is an `update_event` of the
+  times.
+- Tests: `client.rs` `respond_event_tentative_with_proposed_time_sends_proposed_new_time`,
+  `respond_event_accept_drops_a_proposed_time`, `rsvp_kind_from_status`,
+  `rsvp_proposal_normalises_and_refuses`; `model.rs` `attendee_proposed_new_time`;
+  `store` `op_json_round_trips_exactly`,
+  `respond_event_queued_before_send_response_reads_as_sending`,
+  `replace_events_in_window_writes_calendar_client_fields`,
+  `update_event_fields_keeps_attendee_proposals`, `events_without_1983_columns_migrate`;
+  `outbox.rs` `apply_op_respond_event_without_sending_a_response`; `engine.rs`
+  `respond_event_without_sending_a_response`,
+  `respond_event_sends_a_normalised_proposal_on_tentative`,
+  `respond_event_refusals_write_queue_and_send_nothing`,
+  `a_refused_respond_event_restores_graphs_status`,
+  `respond_meeting_without_sending_a_response`, `respond_meeting_refusals_send_nothing`,
+  `calendar_sync_stores_an_attendees_proposal`.
+
 ## OAuth tokens in the platform secret store (#1877)
 
 - `tokencache` keeps the `TokenSet` in the platform's secret store when one is reachable: the
