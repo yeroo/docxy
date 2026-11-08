@@ -996,6 +996,14 @@ pub struct LocalEventFields {
     /// The same for the end, which may be in another zone.
     pub end_time_zone: String,
     pub end_local: String,
+    /// The calendar a create files the event in (#2048), create-only:
+    /// `None` or `Some("")` is the default calendar (its id, or `''` before
+    /// the calendar list is known), and `Some(id)` must be a stored calendar
+    /// whose `can_edit` is set, or `create_local_event` refuses it. Its
+    /// `CreateEvent` POSTs to that calendar's `/events`
+    /// (`Store::event_create_calendar`). `update_event_fields` ignores it:
+    /// an edit never moves an event between calendars.
+    pub calendar_id: Option<String>,
 }
 
 /// An event's reminder: Graph `isReminderOn` and `reminderMinutesBeforeStart`.
@@ -3318,7 +3326,11 @@ impl Store {
     /// `CreateEvent` sends none, and `reconcile_created_event` writes back
     /// Graph's). Each end's named zone and wall clock (#2039) are stored for
     /// its `CreateEvent`; a pair `graph::client::event_zone_error` refuses
-    /// is an error, with nothing written.
+    /// is an error, with nothing written. The row is filed in
+    /// `f.calendar_id` (#2048), or the default calendar when it is `None` or
+    /// `""` (`''` until the calendar list is known; the next sync pass
+    /// adopts it then); a named calendar that is not stored or not
+    /// `can_edit` is an error, with nothing written.
     pub fn create_local_event(
         &self,
         f: &LocalEventFields,
@@ -3331,6 +3343,7 @@ impl Store {
         let enum_or =
             |v: &Option<String>, default: &str| non_empty(v).unwrap_or_else(|| default.to_string());
         let tx = self.write_tx()?;
+        let calendar_id = create_calendar_on(&tx, &f.calendar_id)?;
         upsert_event_on(
             &tx,
             &NewEvent {
@@ -3377,10 +3390,7 @@ impl Store {
                 }),
                 is_organizer: true,
                 join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
-                // `CreateEvent` POSTs to `/me/events`: the default calendar
-                // (#1984). `''` until the calendar list is known; the next
-                // sync pass adopts it then.
-                calendar_id: default_calendar_id_on(&tx)?.unwrap_or_default(),
+                calendar_id,
                 ..NewEvent::default()
             },
         )?;
@@ -3622,6 +3632,31 @@ impl Store {
             )
             .optional()?;
         Ok(id)
+    }
+
+    /// Where a stored event's `CreateEvent` POSTs (#2048): `None` for
+    /// `/me/events` (the default calendar) when its `calendar_id` is `''`
+    /// or the stored default calendar's id, so a create in the default
+    /// calendar sends what it sent before #2048, else `Some(id)` for
+    /// `/me/calendars/{id}/events`. Read at send time, so a `''` row a sync
+    /// pass adopted since still goes to `/me/events`. `None` for no such
+    /// event.
+    pub fn event_create_calendar(&self, id: &str) -> Result<Option<String>, StoreError> {
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT calendar_id FROM events WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(calendar) = stored.filter(|c| !c.is_empty()) else {
+            return Ok(None);
+        };
+        if default_calendar_id_on(&self.conn)?.as_deref() == Some(calendar.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(calendar))
     }
 
     /// Reads a stored event's send-relevant fields (`None` if no such event).
@@ -4803,6 +4838,27 @@ fn set_event_online_meeting_on(
         )?;
     }
     Ok(())
+}
+
+/// The calendar `create_local_event` files a new event in (#2048): a named
+/// one only when it is stored and `can_edit`, else the default calendar's id
+/// (`''` before the calendar list is known).
+fn create_calendar_on(conn: &Connection, chosen: &Option<String>) -> Result<String, StoreError> {
+    let Some(id) = non_empty(chosen) else {
+        return Ok(default_calendar_id_on(conn)?.unwrap_or_default());
+    };
+    let can_edit: Option<bool> = conn
+        .query_row(
+            "SELECT can_edit FROM calendars WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match can_edit {
+        None => Err(StoreError::Sql(format!("no calendar {id} is stored"))),
+        Some(false) => Err(StoreError::Sql(format!("calendar {id} is read-only"))),
+        Some(true) => Ok(id),
+    }
 }
 
 /// `graph::client::event_zone_error` for both ends of a host's fields
@@ -9375,6 +9431,158 @@ mod calendar_tests {
                 .len(),
             1
         );
+    }
+
+    /// A default `CAL1`, an editable `CAL2` and a read-only `RO` (#2048).
+    fn store_with_calendars() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[
+            cal("CAL1", true, "me@x"),
+            cal("CAL2", false, "me@x"),
+            Calendar {
+                can_edit: false,
+                ..cal("RO", false, "me@x")
+            },
+        ])
+        .unwrap();
+        s
+    }
+
+    fn in_calendar(id: &str) -> LocalEventFields {
+        LocalEventFields {
+            calendar_id: Some(id.into()),
+            ..sample_fields()
+        }
+    }
+
+    fn calendar_of(s: &Store, id: &str) -> String {
+        all_events(s)
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .calendar_id
+    }
+
+    #[test]
+    fn create_local_event_takes_a_chosen_calendar() {
+        let s = store_with_calendars();
+        let id = s
+            .create_local_event(&in_calendar("CAL2"), "Me", "me@x")
+            .unwrap();
+        assert_eq!(calendar_of(&s, &id), "CAL2");
+        // `None` and `""` are the default calendar, as before #2048.
+        for chosen in [None, Some(String::new())] {
+            let f = LocalEventFields {
+                calendar_id: chosen,
+                ..sample_fields()
+            };
+            let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+            assert_eq!(calendar_of(&s, &id), "CAL1");
+        }
+        // Reconciling the create keeps the calendar.
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        s.reconcile_created_event(&id, &created).unwrap();
+        assert_eq!(calendar_of(&s, "EV1"), "CAL2");
+        let cal2 = ["CAL2".to_string()];
+        let ids: Vec<String> = s
+            .events_in_range("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z", &cal2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, ["EV1"]);
+    }
+
+    #[test]
+    fn create_local_event_refuses_an_unknown_or_read_only_calendar() {
+        let counts = |s: &Store| {
+            let n = |table: &str| -> i64 {
+                s.conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap()
+            };
+            (
+                n("events"),
+                n("event_attendees"),
+                s.pending_ops().unwrap().len(),
+            )
+        };
+        let s = store_with_calendars();
+        for chosen in ["NOPE", "RO"] {
+            let err = s.create_local_event(&in_calendar(chosen), "Me", "me@x");
+            assert!(
+                matches!(&err, Err(StoreError::Sql(m)) if m.contains(chosen)),
+                "{chosen}: {err:?}"
+            );
+            assert_eq!(counts(&s), (0, 0, 0), "{chosen} wrote something");
+        }
+        // With no calendar list stored, no named calendar is known.
+        let empty = Store::open_in_memory().unwrap();
+        assert!(
+            empty
+                .create_local_event(&in_calendar("CAL2"), "Me", "me@x")
+                .is_err()
+        );
+        assert_eq!(counts(&empty), (0, 0, 0));
+        // The attendee count checks something: a create that is let through
+        // writes one.
+        s.create_local_event(&in_calendar("CAL2"), "Me", "me@x")
+            .unwrap();
+        assert_eq!(counts(&s), (1, 1, 0));
+    }
+
+    #[test]
+    fn event_create_calendar_is_none_for_blank_and_default() {
+        let s = Store::open_in_memory().unwrap();
+        let blank = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        assert_eq!(s.event_create_calendar(&blank).unwrap(), None);
+        s.replace_calendars(&[cal("CAL1", true, "me@x"), cal("CAL2", false, "me@x")])
+            .unwrap();
+        let default = s
+            .create_local_event(&in_calendar("CAL1"), "Me", "me@x")
+            .unwrap();
+        let other = s
+            .create_local_event(&in_calendar("CAL2"), "Me", "me@x")
+            .unwrap();
+        assert_eq!(s.event_create_calendar(&blank).unwrap(), None);
+        assert_eq!(s.event_create_calendar(&default).unwrap(), None);
+        assert_eq!(
+            s.event_create_calendar(&other).unwrap(),
+            Some("CAL2".to_string())
+        );
+        assert_eq!(s.event_create_calendar("missing").unwrap(), None);
+    }
+
+    #[test]
+    fn update_event_fields_ignores_calendar_id() {
+        let s = store_with_calendars();
+        let untouched = synced_event(&s);
+        s.conn
+            .execute("UPDATE events SET calendar_id = 'CAL1' WHERE id = 'G1'", [])
+            .unwrap();
+        let moved = LocalEventFields {
+            calendar_id: Some("CAL2".into()),
+            ..untouched.clone()
+        };
+        assert_eq!(
+            s.update_event_fields("G1", &moved).unwrap(),
+            EventFieldSet::default()
+        );
+        assert_eq!(calendar_of(&s, "G1"), "CAL1");
+        let renamed = LocalEventFields {
+            subject: "Sync v2".into(),
+            ..moved
+        };
+        assert_eq!(
+            s.update_event_fields("G1", &renamed).unwrap(),
+            EventFieldSet::SUBJECT
+        );
+        assert_eq!(calendar_of(&s, "G1"), "CAL1");
     }
 }
 

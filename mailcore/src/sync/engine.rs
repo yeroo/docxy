@@ -367,7 +367,9 @@ pub enum SyncCommand {
     /// [`crate::store::OutboxOp::CreateEvent`] and drain, then emit
     /// [`SyncEvent::CalendarUpdated`]. A `local:` id is reconciled to the
     /// Graph-minted id by `sync::outbox::apply_op`, same pattern as
-    /// `SaveDraft`.
+    /// `SaveDraft`. It POSTs to the calendar the row was filed in
+    /// (`LocalEventFields::calendar_id`, #2048): `/me/events` for the
+    /// default, `/me/calendars/{id}/events` for another.
     CreateEvent { id: String },
     /// Push an edited event's currently-stored fields
     /// (`Store::update_event_fields`, already applied by the caller) to
@@ -9520,6 +9522,133 @@ mod tests {
             .iter()
             .filter(|p| p.starts_with(&prefix) || p.starts_with(&link))
             .count()
+    }
+
+    #[test]
+    fn created_event_in_a_second_calendar_stays_in_it_through_both_refreshes() {
+        // #2048. Startup runs no calendar pass (only the tick does), so the
+        // first refresh after the create is an initial round for each
+        // calendar, whose view lists NEW1 in CAL-B only, and the second a
+        // delta round each, CAL-B's naming NEW1 again with a new subject.
+        let created = event_from_now("NEW1", 3600);
+        let initial = created.replacen("Standup", "Adopted", 1);
+        let delta = created.replacen("Standup", "Adopted again", 1);
+        let mut routes = vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/calendars/CAL-B/events".into(),
+                status: 201,
+                headers: vec![],
+                body: created,
+            },
+            get_route(
+                &delta_link_of("CAL-B"),
+                200,
+                &with_delta_link(&events_body(&[delta]), &delta_link_of("CAL-B")),
+            ),
+        ];
+        routes.extend(calendar_routes(
+            &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+            vec![
+                ("CAL-A", 200, events_body(&[event_from_now("EA", 7200)])),
+                ("CAL-B", 200, events_body(&[initial])),
+            ],
+        ));
+        let start = now_unix() + 3600;
+        let mut local_id = String::new();
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-create-in", routes, |s| {
+                let cal = |id: &str, default: bool| crate::graph::model::Calendar {
+                    id: id.into(),
+                    is_default: default,
+                    can_edit: true,
+                    owner_addr: "me@x".into(),
+                    ..Default::default()
+                };
+                s.replace_calendars(&[cal("CAL-A", true), cal("CAL-B", false)])
+                    .unwrap();
+                local_id = s
+                    .create_local_event(
+                        &crate::store::LocalEventFields {
+                            subject: "Standup".into(),
+                            start_utc: unix_to_iso8601(start),
+                            end_utc: unix_to_iso8601(start + 1800),
+                            calendar_id: Some("CAL-B".into()),
+                            ..Default::default()
+                        },
+                        "Me",
+                        "me@x",
+                    )
+                    .unwrap();
+            });
+        let subject_in_b = || {
+            let rows = Store::open(&store_path)
+                .unwrap()
+                .events_in_range(
+                    "2000-01-01T00:00:00Z",
+                    "2100-01-01T00:00:00Z",
+                    &["CAL-B".to_string()],
+                )
+                .unwrap();
+            rows.into_iter()
+                .map(|r| (r.id, r.subject))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(subject_in_b(), [(local_id.clone(), "Standup".to_string())]);
+        handle
+            .cmd_tx
+            .send(SyncCommand::CreateEvent {
+                id: local_id.clone(),
+            })
+            .unwrap();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        // One `CalendarUpdated` for the create, one for the refresh.
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 2);
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let initial_end = srv.requests().len();
+        assert_eq!(
+            subject_in_b(),
+            [("NEW1".to_string(), "Adopted".to_string())]
+        );
+        assert_eq!(ids_in(&Store::open(&store_path).unwrap(), "CAL-A"), ["EA"]);
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let reqs = srv.requests();
+        let paths: Vec<&str> = reqs.iter().map(|r| r.path.as_str()).collect();
+        let post = reqs
+            .iter()
+            .position(|r| r.method == "POST")
+            .expect("the create was sent");
+        assert_eq!(reqs[post].path, "/me/calendars/CAL-B/events");
+        assert_eq!(reqs.iter().filter(|r| r.method == "POST").count(), 1);
+        for cal in ["CAL-A", "CAL-B"] {
+            // The first refresh: an initial round, after the create.
+            let initial = format!("/me/calendars/{cal}/calendarView/delta?");
+            assert!(
+                paths[post..initial_end]
+                    .iter()
+                    .any(|p| p.starts_with(&initial)),
+                "no initial {cal} round after the create: {paths:?}"
+            );
+            // The second: a delta round.
+            assert!(
+                paths[initial_end..].contains(&delta_link_of(cal).as_str()),
+                "no {cal} delta round: {paths:?}"
+            );
+        }
+        assert_eq!(
+            subject_in_b(),
+            [("NEW1".to_string(), "Adopted again".to_string())]
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
+        assert!(store.event_for_send(&local_id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
