@@ -357,6 +357,10 @@ fn event_input_for(store: &Store, id: &str) -> Result<(EventInput, bool), GraphE
         online_meeting_provider: d.online_meeting_provider,
         response_requested: d.response_requested,
         allow_new_time_proposals: d.allow_new_time_proposals,
+        start_time_zone: d.start_time_zone,
+        start_local: d.start_local,
+        end_time_zone: d.end_time_zone,
+        end_local: d.end_local,
         fields: EventFieldSet::default(),
     };
     Ok((input, d.reminder_unset))
@@ -2325,6 +2329,157 @@ mod tests {
         )
         .unwrap();
         assert!(srv.requests().is_empty());
+    }
+
+    /// `sample_event_fields` named in two zones (#2039): 09:00 in Berlin's
+    /// summer (UTC+2) is 07:00 UTC; the end, 08:30 in London (UTC+1).
+    fn zoned_event_fields() -> crate::store::LocalEventFields {
+        crate::store::LocalEventFields {
+            start_utc: "2026-07-20T07:00:00Z".into(),
+            end_utc: "2026-07-20T07:30:00Z".into(),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-07-20T09:00:00".into(),
+            end_time_zone: "Europe/London".into(),
+            end_local: "2026-07-20T08:30:00".into(),
+            ..sample_event_fields()
+        }
+    }
+
+    #[test]
+    fn queued_create_event_sends_named_zones() {
+        let (body, _) = create_event_body(&crate::store::LocalEventFields {
+            series_recurrence: Some(lossless("weekly", "numbered")),
+            ..zoned_event_fields()
+        });
+        assert_eq!(
+            body.get("start").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T09:00:00","timeZone":"W. Europe Standard Time"}"#
+        );
+        assert_eq!(
+            body.get("end").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T08:30:00","timeZone":"Europe/London"}"#
+        );
+        assert_eq!(
+            body.get("recurrence")
+                .and_then(|r| r.get("range"))
+                .and_then(|r| r.get("recurrenceTimeZone"))
+                .and_then(Value::as_str),
+            Some("W. Europe Standard Time")
+        );
+        // The create-side recurrence names the start's zone too.
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let (body, _) = create_event_body(&crate::store::LocalEventFields {
+            recurrence: Some(Recurrence {
+                kind: RecurrenceKind::Weekly,
+                interval: 1,
+                days_of_week: vec!["monday".into()],
+                day_of_month: 0,
+                start_date: "2026-07-20".into(),
+                until: None,
+            }),
+            ..zoned_event_fields()
+        });
+        assert_eq!(
+            body.get("recurrence")
+                .and_then(|r| r.get("range"))
+                .unwrap()
+                .to_string(),
+            r#"{"type":"noEnd","startDate":"2026-07-20","recurrenceTimeZone":"W. Europe Standard Time"}"#
+        );
+    }
+
+    #[test]
+    fn queued_update_without_times_sends_no_start_or_end() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events".into(),
+                status: 201,
+                headers: vec![],
+                body: event_json("EV1", "Sync"),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/EV1".into(),
+                status: 200,
+                headers: vec![],
+                body: "{}".into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_event(&zoned_event_fields(), "Me", "me@x")
+            .unwrap();
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        // Edit `EV1` as a host does, then send its queued `UpdateEvent`;
+        // returns the PATCH body.
+        let n = std::cell::Cell::new(1);
+        let edit = |f: crate::store::LocalEventFields| {
+            let fields = store.update_event_fields("EV1", &f).unwrap();
+            apply_op(
+                &c,
+                &store,
+                &OutboxOp::UpdateEvent {
+                    id: "EV1".into(),
+                    fields,
+                },
+            )
+            .unwrap();
+            let reqs = srv.requests();
+            n.set(n.get() + 1);
+            assert_eq!(reqs.len(), n.get());
+            assert_eq!(reqs[n.get() - 1].method, "PATCH");
+            reqs[n.get() - 1].body.clone()
+        };
+        let unnamed = |f: crate::store::LocalEventFields| crate::store::LocalEventFields {
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            ..f
+        };
+        // A title edit, with no zone or with the form's: no `start`/`end`.
+        let body = edit(unnamed(crate::store::LocalEventFields {
+            subject: "Sync v2".into(),
+            ..zoned_event_fields()
+        }));
+        assert_eq!(sent_keys(&body), ["subject"]);
+        let body = edit(crate::store::LocalEventFields {
+            subject: "Sync v3".into(),
+            ..zoned_event_fields()
+        });
+        assert_eq!(sent_keys(&body), ["subject"]);
+        // A move that names the zones sends their new wall clocks.
+        let body = edit(crate::store::LocalEventFields {
+            subject: "Sync v3".into(),
+            start_utc: "2026-07-20T08:00:00Z".into(),
+            start_local: "2026-07-20T10:00:00".into(),
+            ..zoned_event_fields()
+        });
+        let sent = json::parse(&body).unwrap();
+        assert_eq!(sent_keys(&body), ["start", "end", "isAllDay"]);
+        assert_eq!(
+            sent.get("start").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T10:00:00","timeZone":"W. Europe Standard Time"}"#
+        );
+        assert_eq!(
+            sent.get("end").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T08:30:00","timeZone":"Europe/London"}"#
+        );
+        // A move without a zone sends UTC, never the stored wall clock.
+        let body = edit(unnamed(crate::store::LocalEventFields {
+            subject: "Sync v3".into(),
+            start_utc: "2026-07-20T06:00:00Z".into(),
+            ..zoned_event_fields()
+        }));
+        let sent = json::parse(&body).unwrap();
+        assert_eq!(
+            sent.get("start").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T06:00:00","timeZone":"UTC"}"#
+        );
+        assert_eq!(
+            sent.get("end").unwrap().to_string(),
+            r#"{"dateTime":"2026-07-20T07:30:00","timeZone":"UTC"}"#
+        );
     }
 
     #[test]

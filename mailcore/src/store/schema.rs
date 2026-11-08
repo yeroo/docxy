@@ -246,7 +246,15 @@ CREATE TABLE IF NOT EXISTS events (
     -- sends none, so Graph applies the mailbox default, and the reconcile
     -- writes Graph's back and clears this. Internal: not in `EventRow`, not
     -- written by `upsert_event_on`.
-    reminder_unset           INTEGER NOT NULL DEFAULT 0
+    reminder_unset           INTEGER NOT NULL DEFAULT 0,
+    -- Each end's named time zone and its wall clock there (#2039), what a
+    -- `CreateEvent` / `UpdateEvent` sends as `start`/`end`; `''` sends UTC.
+    -- Internal, as `reminder_unset`: not written by `upsert_event_on`, so a
+    -- refresh keeps them.
+    send_start_tz            TEXT NOT NULL DEFAULT '',
+    send_start_local         TEXT NOT NULL DEFAULT '',
+    send_end_tz              TEXT NOT NULL DEFAULT '',
+    send_end_local           TEXT NOT NULL DEFAULT ''
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`

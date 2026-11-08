@@ -271,6 +271,73 @@ pub fn rsvp_proposal(
     Ok(Some((start, end)))
 }
 
+/// Why one end of an event cannot be sent in its named time zone (#2039),
+/// or `None` when it can, or when `zone` is `""` (sent in UTC, nothing to
+/// check). A named end needs `local`, its wall clock, as
+/// `YYYY-MM-DDTHH:MM:SS` and a real date and time, `utc` as the store's
+/// `YYYY-MM-DDTHH:MM:SSZ`, and `local − utc` within Graph's range of zones,
+/// UTC−12 to UTC+14. That catches a wall clock built from the wrong day or
+/// a swapped field, not a wrong DST offset: mailcore has no time zone
+/// database, so the wall clock is the caller's.
+///
+/// `Store::create_local_event`, `Store::update_event_fields` and the
+/// engine's `SyncCommand::UpdateEventSeries` refuse an end this refuses;
+/// a host may call it first, as `rsvp_proposal`. `event_body_json` sends
+/// such an end of a hand-built `EventInput` in UTC instead, never erring.
+pub fn event_zone_error(zone: &str, local: &str, utc: &str) -> Option<&'static str> {
+    if zone.is_empty() {
+        return None;
+    }
+    // Digits only where digits go (the parser would take a `+1` month) and
+    // no leap second, which no one types.
+    let digits = local.len() == 19
+        && local
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| matches!(i, 4 | 7 | 10 | 13 | 16) || b.is_ascii_digit());
+    let local_secs = (digits && !local.ends_with(":60"))
+        .then(|| crate::store::iso8601_to_unix_secs(&format!("{local}Z")))
+        .flatten();
+    let Some(local_secs) = local_secs else {
+        return Some("a time in a named time zone needs its wall clock as YYYY-MM-DDTHH:MM:SS");
+    };
+    let Some(utc_secs) = crate::store::iso8601_to_unix_secs(utc) else {
+        return Some("a time in a named time zone needs its UTC time as YYYY-MM-DDTHH:MM:SSZ");
+    };
+    if !(-12 * 3600..=14 * 3600).contains(&(local_secs - utc_secs)) {
+        return Some("a wall clock must be within UTC-12 to UTC+14 of its UTC time");
+    }
+    None
+}
+
+/// The Graph `dateTimeTimeZone` one end is sent as in its named zone, or
+/// `None` to send it in UTC: the zone is `""` or `event_zone_error`
+/// refuses it. The one rule for `start`/`end` and `recurrenceTimeZone`.
+fn zoned_end(zone: &str, local: &str, utc: &str) -> Option<Value> {
+    if zone.is_empty() || event_zone_error(zone, local, utc).is_some() {
+        return None;
+    }
+    Some(Value::Object(vec![
+        ("dateTime".to_string(), Value::Str(local.to_string())),
+        ("timeZone".to_string(), Value::Str(zone.to_string())),
+    ]))
+}
+
+/// A recurrence `Value` with `zone` as its `range.recurrenceTimeZone`: the
+/// create-side `Recurrence::to_json` sends none of its own.
+fn with_range_time_zone(mut rec: Value, zone: &str) -> Value {
+    if let Value::Object(o) = &mut rec {
+        if let Some((_, Value::Object(range))) = o.iter_mut().find(|(k, _)| k == "range") {
+            range.retain(|(k, _)| k != "recurrenceTimeZone");
+            range.push((
+                "recurrenceTimeZone".to_string(),
+                Value::Str(zone.to_string()),
+            ));
+        }
+    }
+    rec
+}
+
 /// The groups of event properties a create or update sends (#1994). An
 /// update sends only the groups an edit changed (`Store::update_event_fields`
 /// returns them), so editing a title does not rewrite the attendees. Each
@@ -418,6 +485,23 @@ pub struct EventInput {
     pub online_meeting_provider: String,
     pub response_requested: bool,
     pub allow_new_time_proposals: bool,
+    /// The time zone the start is sent in (#2039): a Windows time zone id
+    /// (`W. Europe Standard Time`, the safe choice) or one of the IANA
+    /// names Graph lists for `dateTimeTimeZone.timeZone` (`Europe/Berlin`).
+    /// `""` sends the UTC wall clock with `timeZone: "UTC"`, as before. A
+    /// series whose start is sent in a zone sends it as its
+    /// `recurrence.range.recurrenceTimeZone` too (see `event_body_json`).
+    pub start_time_zone: String,
+    /// The start's wall clock in `start_time_zone`, `YYYY-MM-DDTHH:MM:SS`
+    /// (no `Z`, no offset, no fraction): what the person typed. Sent only
+    /// when `event_zone_error` accepts it with `start_utc`; ignored when the
+    /// zone is `""`. An all-day end's wall clock is `T00:00:00` of its
+    /// local date (Graph requires midnight in the event's zone).
+    pub start_local: String,
+    /// `start_time_zone` and `start_local` for the end, which may be in
+    /// another zone (a flight).
+    pub end_time_zone: String,
+    pub end_local: String,
     /// The groups this call sends.
     pub fields: EventFieldSet,
 }
@@ -1912,10 +1996,16 @@ fn draft_body_json(
 /// Serializes an `EventInput` to the JSON body shared by `create_event` and
 /// `update_event`: only the groups in `input.fields` (#1994), and never an
 /// empty enum string (`showAs`, `sensitivity`, `importance`,
-/// `onlineMeetingProvider`: Graph refuses `""`). `start`/`end` carry the UTC
-/// wall clock (the `Z` suffix stripped) with `timeZone:"UTC"`, matching how
-/// `calendar_view` reads events back under the `Prefer:
-/// outlook.timezone="UTC"` header.
+/// `onlineMeetingProvider`: Graph refuses `""`). Each of `start`/`end` is
+/// its wall clock in its named zone (`start_time_zone`/`start_local`, #2039)
+/// when `event_zone_error` accepts it, else the UTC wall clock (the `Z`
+/// suffix stripped) with `timeZone:"UTC"`, matching how `calendar_view`
+/// reads events back under the `Prefer: outlook.timezone="UTC"` header.
+/// When the start is sent in its zone, the recurrence (either shape, with
+/// or without `TIMES` in the set) sends that zone as
+/// `range.recurrenceTimeZone`, over a `series_recurrence`'s own: Graph
+/// takes `startDate`/`endDate` as dates in it, and `startDate` must match
+/// the start. With no zone named, the body is what it was before #2039.
 pub(crate) fn event_body_json(input: &EventInput) -> String {
     let has = |g: EventFieldSet| input.fields.contains(g);
     let mut obj: Vec<(String, Value)> = Vec::new();
@@ -1924,9 +2014,19 @@ pub(crate) fn event_body_json(input: &EventInput) -> String {
     if has(EventFieldSet::SUBJECT) {
         put("subject", Value::Str(input.subject.clone()));
     }
+    let start_zoned = zoned_end(&input.start_time_zone, &input.start_local, &input.start_utc);
     if has(EventFieldSet::TIMES) {
-        put("start", graph_utc_wall_clock(&input.start_utc));
-        put("end", graph_utc_wall_clock(&input.end_utc));
+        let end_zoned = zoned_end(&input.end_time_zone, &input.end_local, &input.end_utc);
+        put(
+            "start",
+            start_zoned
+                .clone()
+                .unwrap_or_else(|| graph_utc_wall_clock(&input.start_utc)),
+        );
+        put(
+            "end",
+            end_zoned.unwrap_or_else(|| graph_utc_wall_clock(&input.end_utc)),
+        );
         put("isAllDay", Value::Bool(input.is_all_day));
     }
     if has(EventFieldSet::LOCATION) {
@@ -1972,10 +2072,23 @@ pub(crate) fn event_body_json(input: &EventInput) -> String {
         );
     }
     if has(EventFieldSet::RECURRENCE) {
+        let zone = start_zoned
+            .is_some()
+            .then_some(input.start_time_zone.as_str());
         if let Some(rec) = &input.series_recurrence {
-            put("recurrence", rec.to_send_json());
+            match zone {
+                Some(zone) => {
+                    let mut rec = rec.clone();
+                    rec.range.recurrence_time_zone = zone.to_string();
+                    put("recurrence", rec.to_send_json());
+                }
+                None => put("recurrence", rec.to_send_json()),
+            }
         } else if let Some(rec) = &input.recurrence {
-            put("recurrence", rec.to_json());
+            match zone {
+                Some(zone) => put("recurrence", with_range_time_zone(rec.to_json(), zone)),
+                None => put("recurrence", rec.to_json()),
+            }
         }
     }
     if has(EventFieldSet::SHOW_AS) {
@@ -5848,6 +5961,240 @@ mod tests {
                 r#""responseRequested":false,"allowNewTimeProposals":false}"#,
             )
         );
+    }
+
+    /// `sample_input` named in two zones (#2039): 09:00 in Berlin's winter
+    /// (UTC+1) is 08:00 UTC, and the end is 08:30 in London (UTC+0).
+    fn zoned_input() -> EventInput {
+        EventInput {
+            start_utc: "2026-01-12T08:00:00Z".into(),
+            end_utc: "2026-01-12T08:30:00Z".into(),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-01-12T09:00:00".into(),
+            end_time_zone: "Europe/London".into(),
+            end_local: "2026-01-12T08:30:00".into(),
+            ..sample_input()
+        }
+    }
+
+    #[test]
+    fn event_body_sends_each_end_in_its_named_zone() {
+        let sent = json::parse(&event_body_json(&zoned_input())).unwrap();
+        assert_eq!(
+            sent.get("start").unwrap().to_string(),
+            r#"{"dateTime":"2026-01-12T09:00:00","timeZone":"W. Europe Standard Time"}"#
+        );
+        assert_eq!(
+            sent.get("end").unwrap().to_string(),
+            r#"{"dateTime":"2026-01-12T08:30:00","timeZone":"Europe/London"}"#
+        );
+        // One end named, the other in UTC as before.
+        let input = EventInput {
+            end_time_zone: String::new(),
+            ..zoned_input()
+        };
+        let sent = json::parse(&event_body_json(&input)).unwrap();
+        assert_eq!(
+            sent.get("start")
+                .and_then(|v| v.get("timeZone"))
+                .and_then(Value::as_str),
+            Some("W. Europe Standard Time")
+        );
+        assert_eq!(
+            sent.get("end").unwrap().to_string(),
+            r#"{"dateTime":"2026-01-12T08:30:00","timeZone":"UTC"}"#
+        );
+        // `TIMES` not in the set: no `start`/`end`, zoned or not.
+        let input = EventInput {
+            fields: EventFieldSet::SUBJECT,
+            ..zoned_input()
+        };
+        assert_eq!(keys(&event_body_json(&input)), ["subject"]);
+    }
+
+    /// The `range.recurrenceTimeZone` of a body's recurrence, if any.
+    fn range_zone(body: &str) -> Option<String> {
+        json::parse(body)
+            .unwrap()
+            .get("recurrence")?
+            .get("range")?
+            .get("recurrenceTimeZone")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn weekly_monday() -> crate::graph::model::Recurrence {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-01-12".into(),
+            until: Some("2026-06-29".into()),
+        }
+    }
+
+    fn lossless_monday(zone: &str) -> EventRecurrence {
+        use crate::graph::model::{RecurrencePattern, RecurrenceRange};
+        EventRecurrence {
+            pattern: RecurrencePattern {
+                r#type: "weekly".into(),
+                interval: 1,
+                days_of_week: vec!["monday".into()],
+                first_day_of_week: "monday".into(),
+                ..Default::default()
+            },
+            range: RecurrenceRange {
+                r#type: "numbered".into(),
+                start_date: "2026-01-12".into(),
+                number_of_occurrences: 10,
+                recurrence_time_zone: zone.into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn event_body_series_recurrence_zone_is_the_start_zone() {
+        // The create-side recurrence gains the start's zone, after its
+        // range's own keys.
+        let input = EventInput {
+            recurrence: Some(weekly_monday()),
+            ..zoned_input()
+        };
+        let body = event_body_json(&input);
+        assert_eq!(
+            json::parse(&body)
+                .unwrap()
+                .get("recurrence")
+                .unwrap()
+                .to_string(),
+            concat!(
+                r#"{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"],"#,
+                r#""firstDayOfWeek":"sunday"},"range":{"type":"endDate","#,
+                r#""startDate":"2026-01-12","endDate":"2026-06-29","#,
+                r#""recurrenceTimeZone":"W. Europe Standard Time"}}"#,
+            )
+        );
+        // A lossless recurrence's own zone gives way to the start's.
+        for own in ["", "Pacific Standard Time"] {
+            let input = EventInput {
+                series_recurrence: Some(lossless_monday(own)),
+                ..zoned_input()
+            };
+            assert_eq!(
+                range_zone(&event_body_json(&input)).as_deref(),
+                Some("W. Europe Standard Time"),
+                "own zone {own:?}"
+            );
+        }
+        // So does a series edit that sends only the recurrence.
+        let input = EventInput {
+            series_recurrence: Some(lossless_monday("UTC")),
+            fields: EventFieldSet::RECURRENCE,
+            ..zoned_input()
+        };
+        let body = event_body_json(&input);
+        assert_eq!(keys(&body), ["recurrence"]);
+        assert_eq!(
+            range_zone(&body).as_deref(),
+            Some("W. Europe Standard Time")
+        );
+        // The end's zone plays no part: a start in UTC sends the
+        // recurrence as before.
+        let input = EventInput {
+            start_time_zone: String::new(),
+            series_recurrence: Some(lossless_monday("Pacific Standard Time")),
+            ..zoned_input()
+        };
+        assert_eq!(
+            range_zone(&event_body_json(&input)).as_deref(),
+            Some("Pacific Standard Time")
+        );
+        let input = EventInput {
+            start_time_zone: String::new(),
+            recurrence: Some(weekly_monday()),
+            ..zoned_input()
+        };
+        assert_eq!(range_zone(&event_body_json(&input)), None);
+    }
+
+    #[test]
+    fn event_body_malformed_zone_pair_sends_utc() {
+        let utc = |s: &str| format!(r#"{{"dateTime":"{s}","timeZone":"UTC"}}"#);
+        for bad in [
+            "",
+            "2026-01-12 09:00:00",
+            "2026-01-12T09:00:00Z",
+            "2026-01-12T09:00:00.0000000",
+            "2026-02-30T09:00:00",
+            "2026-01-12T24:00:00",
+            // 25 h ahead of its UTC time: the wrong day.
+            "2026-01-13T09:00:00",
+        ] {
+            let input = EventInput {
+                start_local: bad.into(),
+                end_local: bad.into(),
+                recurrence: Some(weekly_monday()),
+                ..zoned_input()
+            };
+            let body = event_body_json(&input);
+            let sent = json::parse(&body).unwrap();
+            assert_eq!(
+                sent.get("start").unwrap().to_string(),
+                utc("2026-01-12T08:00:00"),
+                "{bad:?}"
+            );
+            assert_eq!(
+                sent.get("end").unwrap().to_string(),
+                utc("2026-01-12T08:30:00"),
+                "{bad:?}"
+            );
+            // A start sent in UTC names no recurrence zone either, so
+            // `startDate` is never read in a zone `start` is not in.
+            assert_eq!(range_zone(&body), None, "{bad:?}");
+            let input = EventInput {
+                start_local: bad.into(),
+                series_recurrence: Some(lossless_monday("Pacific Standard Time")),
+                ..zoned_input()
+            };
+            assert_eq!(
+                range_zone(&event_body_json(&input)).as_deref(),
+                Some("Pacific Standard Time"),
+                "{bad:?}: the series' own zone, as before"
+            );
+        }
+    }
+
+    #[test]
+    fn event_zone_error_checks_each_named_end() {
+        let utc = "2026-01-12T08:00:00Z";
+        let zone = "W. Europe Standard Time";
+        // No zone: nothing to check, whatever the wall clock.
+        assert_eq!(event_zone_error("", "junk", "junk"), None);
+        assert_eq!(event_zone_error(zone, "2026-01-12T09:00:00", utc), None);
+        // Graph's range of zones, UTC−12 to UTC+14, both ends included.
+        assert_eq!(event_zone_error(zone, "2026-01-12T22:00:00", utc), None);
+        assert_eq!(event_zone_error(zone, "2026-01-11T20:00:00", utc), None);
+        assert!(event_zone_error(zone, "2026-01-12T22:00:01", utc).is_some());
+        assert!(event_zone_error(zone, "2026-01-11T19:59:59", utc).is_some());
+        // Not the wall clock's shape, or not a real date and time.
+        for bad in [
+            "",
+            "2026-01-12T09:00",
+            "2026-01-12T09:00:00Z",
+            "2026-01-12T09:00:00+01:00",
+            "2026-13-12T09:00:00",
+            "0000-00-00T00:00:00",
+            "2026-+1-12T09:00:00",
+            "2026-01-12T09:00:60",
+        ] {
+            assert!(event_zone_error(zone, bad, utc).is_some(), "{bad:?}");
+        }
+        // A named end needs its UTC time in the store's shape.
+        assert!(event_zone_error(zone, "2026-01-12T09:00:00", "2026-01-12T08:00:00").is_some());
+        assert!(event_zone_error(zone, "2026-01-12T09:00:00", "").is_some());
     }
 
     #[test]

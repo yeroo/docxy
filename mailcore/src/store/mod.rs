@@ -12,7 +12,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::graph::client::{AttendeeInput, EventFieldSet};
+use crate::graph::client::{AttendeeInput, EventFieldSet, event_zone_error};
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, Event, EventRecurrence,
     FolderContact, MailFolder, MasterCategory, Message, MessageFields, MessageHeader, Recipient,
@@ -980,6 +980,20 @@ pub struct LocalEventFields {
     pub online_meeting_provider: Option<String>,
     pub response_requested: Option<bool>,
     pub allow_new_time_proposals: Option<bool>,
+    /// The time zone the start is sent to Graph in, and its wall clock there
+    /// (#2039), as `EventInput::start_time_zone` / `start_local` take them:
+    /// a Windows time zone id or an IANA name Graph lists, and
+    /// `YYYY-MM-DDTHH:MM:SS`. `start_utc` stays the stored instant. `""`
+    /// sends UTC. A named pair `graph::client::event_zone_error` refuses is
+    /// a `StoreError`, with nothing written. On `update_event_fields` a
+    /// named pair is always written but never marks `TIMES` by itself, and
+    /// a `""` zone keeps the stored pair unless the times change (then it
+    /// is cleared, and the update sends UTC).
+    pub start_time_zone: String,
+    pub start_local: String,
+    /// The same for the end, which may be in another zone.
+    pub end_time_zone: String,
+    pub end_local: String,
 }
 
 /// An event's reminder: Graph `isReminderOn` and `reminderMinutesBeforeStart`.
@@ -1019,6 +1033,12 @@ pub struct EventSendData {
     /// A `local:` event created without a reminder (`events.reminder_unset`):
     /// its `CreateEvent` sends none, so Graph applies the mailbox default.
     pub reminder_unset: bool,
+    /// Each end's named zone and wall clock (#2039, `events.send_start_tz`,
+    /// `send_start_local`, `send_end_tz`, `send_end_local`), `""` for UTC.
+    pub start_time_zone: String,
+    pub start_local: String,
+    pub end_time_zone: String,
+    pub end_local: String,
 }
 
 /// The local mail database. Single-threaded access is assumed (the sync
@@ -1116,6 +1136,11 @@ impl Store {
             "original_end_tz TEXT NOT NULL DEFAULT ''",
             "calendar_id TEXT NOT NULL DEFAULT ''",
             "reminder_unset INTEGER NOT NULL DEFAULT 0",
+            // Each end's named zone and wall clock (#2039).
+            "send_start_tz TEXT NOT NULL DEFAULT ''",
+            "send_start_local TEXT NOT NULL DEFAULT ''",
+            "send_end_tz TEXT NOT NULL DEFAULT ''",
+            "send_end_local TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
         }
@@ -3289,13 +3314,16 @@ impl Store {
     /// Graph sets on create (#1983, #1994); a `None` reminder, which Graph
     /// takes from the mailbox's default, is marked `reminder_unset` (its
     /// `CreateEvent` sends none, and `reconcile_created_event` writes back
-    /// Graph's).
+    /// Graph's). Each end's named zone and wall clock (#2039) are stored for
+    /// its `CreateEvent`; a pair `graph::client::event_zone_error` refuses
+    /// is an error, with nothing written.
     pub fn create_local_event(
         &self,
         f: &LocalEventFields,
         organizer_name: &str,
         organizer_addr: &str,
     ) -> Result<String, StoreError> {
+        check_event_zones(f)?;
         let id = local_draft_id(); // a unique "local:<hex>" id
         let reminder = f.reminder.unwrap_or_default();
         let enum_or =
@@ -3356,11 +3384,18 @@ impl Store {
         )?;
         put_event_attendees_on(&tx, &id, &typed_attendees(&f.attendees, &[]))?;
         tx.execute(
-            "UPDATE events SET recurrence = ?2, reminder_unset = ?3 WHERE id = ?1",
+            "UPDATE events SET recurrence = ?2, reminder_unset = ?3,
+                    send_start_tz = ?4, send_start_local = ?5,
+                    send_end_tz = ?6, send_end_local = ?7
+             WHERE id = ?1",
             params![
                 id,
                 encode_send_recurrence(f.recurrence.as_ref(), f.series_recurrence.as_ref()),
-                f.reminder.is_none()
+                f.reminder.is_none(),
+                f.start_time_zone,
+                zone_local(&f.start_time_zone, &f.start_local),
+                f.end_time_zone,
+                zone_local(&f.end_time_zone, &f.end_local),
             ],
         )?;
         tx.commit()?;
@@ -3383,11 +3418,25 @@ impl Store {
     /// online meeting, whose join link is Graph's `onlineMeeting.joinUrl`,
     /// which no location or body edit changes (#1983), and which Graph keeps
     /// even when an edit sends `isOnlineMeeting: false`.
+    ///
+    /// Each end's named zone (#2039): `TIMES` is marked only when
+    /// `start_utc`, `end_utc` or `is_all_day` changed, never by a zone or
+    /// wall clock alone (a form always has a zone, and a synced row stores
+    /// `""`, so a title edit would otherwise re-send a meeting's times). A
+    /// named pair is always written; a `""` zone keeps the stored pair when
+    /// `TIMES` is not marked and clears it when it is. So whenever `TIMES`
+    /// is sent, each end's pair was given with the edit that last moved the
+    /// times, or later, or is `""` (UTC): a stale wall clock is never sent.
+    /// Changing only the zone at the same instant is therefore not sent to
+    /// Graph (a series can, through `SyncCommand::UpdateEventSeries`). A
+    /// named pair `graph::client::event_zone_error` refuses is an error,
+    /// with nothing written.
     pub fn update_event_fields(
         &self,
         id: &str,
         f: &LocalEventFields,
     ) -> Result<EventFieldSet, StoreError> {
+        check_event_zones(f)?;
         let tx = self.write_tx()?;
         let old = event_for_send_on(&tx, id)?
             .ok_or_else(|| StoreError::Sql(format!("no event stored for {id}")))?;
@@ -3486,6 +3535,39 @@ impl Store {
         if attendees_differ {
             put_event_attendees_on(&tx, id, &attendees)?;
         }
+        // Each end's named zone (#2039): a named pair is written as given; a
+        // `""` one keeps the stored pair, unless the times changed, which
+        // clears it so `TIMES` is sent in UTC and never with a stale wall
+        // clock. A zone alone never marks `TIMES` (a form always has one,
+        // and a synced row stores `""`).
+        let times_changed = changed.contains(EventFieldSet::TIMES);
+        let end_pair = |zone: &str, local: &str, old_zone: &str, old_local: &str| {
+            if !zone.is_empty() {
+                (zone.to_string(), local.to_string())
+            } else if times_changed {
+                (String::new(), String::new())
+            } else {
+                (old_zone.to_string(), old_local.to_string())
+            }
+        };
+        let (start_tz, start_local) = end_pair(
+            &f.start_time_zone,
+            &f.start_local,
+            &old.start_time_zone,
+            &old.start_local,
+        );
+        let (end_tz, end_local) = end_pair(
+            &f.end_time_zone,
+            &f.end_local,
+            &old.end_time_zone,
+            &old.end_local,
+        );
+        tx.execute(
+            "UPDATE events SET send_start_tz = ?2, send_start_local = ?3,
+                    send_end_tz = ?4, send_end_local = ?5
+             WHERE id = ?1",
+            params![id, start_tz, start_local, end_tz, end_local],
+        )?;
         tx.commit()?;
         Ok(changed)
     }
@@ -4626,7 +4708,8 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
             "SELECT subject, start_utc, end_utc, is_all_day, location, body_html, recurrence,
                     show_as, sensitivity, importance, categories, is_reminder_on,
                     reminder_minutes, is_online_meeting, online_meeting_provider,
-                    response_requested, allow_new_time_proposals, reminder_unset
+                    response_requested, allow_new_time_proposals, reminder_unset,
+                    send_start_tz, send_start_local, send_end_tz, send_end_local
              FROM events WHERE id = ?1",
             params![id],
             |r| {
@@ -4653,6 +4736,10 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
                     response_requested: r.get(15)?,
                     allow_new_time_proposals: r.get(16)?,
                     reminder_unset: r.get(17)?,
+                    start_time_zone: r.get(18)?,
+                    start_local: r.get(19)?,
+                    end_time_zone: r.get(20)?,
+                    end_local: r.get(21)?,
                 })
             },
         )
@@ -4714,6 +4801,30 @@ fn set_event_online_meeting_on(
         )?;
     }
     Ok(())
+}
+
+/// `graph::client::event_zone_error` for both ends of a host's fields
+/// (#2039), as a `StoreError` naming the end.
+fn check_event_zones(f: &LocalEventFields) -> Result<(), StoreError> {
+    for (end, zone, local, utc) in [
+        ("start", &f.start_time_zone, &f.start_local, &f.start_utc),
+        ("end", &f.end_time_zone, &f.end_local, &f.end_utc),
+    ] {
+        if let Some(why) = event_zone_error(zone, local, utc) {
+            return Err(StoreError::Sql(format!("event {end} in {zone}: {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// The wall clock stored with a zone: none without one (`""` sends UTC
+/// and ignores it, so a stray one is not kept).
+fn zone_local(zone: &str, local: &str) -> String {
+    if zone.is_empty() {
+        String::new()
+    } else {
+        local.to_string()
+    }
 }
 
 /// A host's enum string, `Some("")` read as `None` (Graph refuses `""`).
@@ -7742,6 +7853,234 @@ mod calendar_tests {
     /// A database whose `events` / `event_attendees` tables are at their
     /// last pre-#1983 shape gains the new columns in place: its rows stay,
     /// read the new fields as their defaults, and a second open is fine.
+    /// `sample_fields` named in two zones (#2039): 09:00 in Berlin's winter
+    /// (UTC+1) is 08:00 UTC; the end, 08:30 in London (UTC+0).
+    fn zoned_fields() -> LocalEventFields {
+        LocalEventFields {
+            start_utc: "2026-01-12T08:00:00Z".into(),
+            end_utc: "2026-01-12T08:30:00Z".into(),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-01-12T09:00:00".into(),
+            end_time_zone: "Europe/London".into(),
+            end_local: "2026-01-12T08:30:00".into(),
+            ..sample_fields()
+        }
+    }
+
+    /// A stored event's four zone fields, start then end.
+    fn zones_of(s: &Store, id: &str) -> [String; 4] {
+        let d = s.event_for_send(id).unwrap().unwrap();
+        [
+            d.start_time_zone,
+            d.start_local,
+            d.end_time_zone,
+            d.end_local,
+        ]
+    }
+
+    fn zoned_pairs() -> [String; 4] {
+        [
+            "W. Europe Standard Time".into(),
+            "2026-01-12T09:00:00".into(),
+            "Europe/London".into(),
+            "2026-01-12T08:30:00".into(),
+        ]
+    }
+
+    #[test]
+    fn create_local_event_stores_named_zones() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+        assert_eq!(zones_of(&s, &id), zoned_pairs());
+        // The stored instant is still UTC.
+        let d = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(d.start_utc, "2026-01-12T08:00:00Z");
+        // No zone: a stray wall clock is not kept.
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    start_local: "2026-07-20T13:00:00".into(),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        assert_eq!(zones_of(&s, &id), <[String; 4]>::default());
+    }
+
+    #[test]
+    fn create_local_event_refuses_a_malformed_wall_clock() {
+        let s = Store::open_in_memory().unwrap();
+        let bad_start = |local: &str| LocalEventFields {
+            start_local: local.into(),
+            ..zoned_fields()
+        };
+        for f in [
+            bad_start("2026-01-12 09:00:00"),
+            bad_start("2026-02-30T09:00:00"),
+            bad_start("2026-01-12T09:00:00Z"),
+            // A day ahead, and 13 h behind: outside UTC−12..UTC+14.
+            bad_start("2026-01-13T09:00:00"),
+            bad_start("2026-01-11T19:00:00"),
+            LocalEventFields {
+                end_local: "".into(),
+                ..zoned_fields()
+            },
+            // A named end needs a UTC time it can be checked against.
+            LocalEventFields {
+                start_utc: "2026-01-12T08:00:00".into(),
+                ..zoned_fields()
+            },
+        ] {
+            let err = s.create_local_event(&f, "Me", "me@x").unwrap_err();
+            assert!(
+                err.to_string().contains("named time zone") || err.to_string().contains("UTC-12"),
+                "{err}"
+            );
+        }
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "nothing written");
+    }
+
+    #[test]
+    fn update_event_fields_keeps_zones_when_times_unchanged() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+        // A host that sends no zone, editing the title only.
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    subject: "Sync v2".into(),
+                    start_time_zone: String::new(),
+                    start_local: String::new(),
+                    end_time_zone: String::new(),
+                    end_local: String::new(),
+                    ..zoned_fields()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::SUBJECT);
+        assert_eq!(
+            zones_of(&s, &id),
+            zoned_pairs(),
+            "the pending create keeps them"
+        );
+    }
+
+    #[test]
+    fn update_event_fields_zone_alone_does_not_mark_times() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        // A form always has a zone; the synced row stores none. 11:00 UTC is
+        // 13:00 in Berlin's summer (UTC+2).
+        let form = LocalEventFields {
+            subject: "Sync v2".into(),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-07-20T13:00:00".into(),
+            end_time_zone: "W. Europe Standard Time".into(),
+            end_local: "2026-07-20T14:00:00".into(),
+            ..untouched
+        };
+        assert_eq!(
+            s.update_event_fields("G1", &form).unwrap(),
+            EventFieldSet::SUBJECT
+        );
+        // The named pair is written all the same, for a later `TIMES` send.
+        assert_eq!(
+            zones_of(&s, "G1"),
+            [
+                "W. Europe Standard Time".to_string(),
+                "2026-07-20T13:00:00".into(),
+                "W. Europe Standard Time".into(),
+                "2026-07-20T14:00:00".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_event_fields_clears_zones_when_times_move_without_one() {
+        let no_zone = |f: LocalEventFields| LocalEventFields {
+            start_time_zone: String::new(),
+            end_time_zone: String::new(),
+            ..f
+        };
+        // The instant moves, or the event becomes all-day: each clears.
+        for f in [
+            LocalEventFields {
+                start_utc: "2026-01-12T07:00:00Z".into(),
+                ..zoned_fields()
+            },
+            LocalEventFields {
+                is_all_day: true,
+                ..zoned_fields()
+            },
+        ] {
+            let s = Store::open_in_memory().unwrap();
+            let id = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+            assert_eq!(
+                s.update_event_fields(&id, &no_zone(f)).unwrap(),
+                EventFieldSet::TIMES
+            );
+            assert_eq!(zones_of(&s, &id), <[String; 4]>::default());
+        }
+        // A move that names the start only: the start's new pair, and the
+        // unnamed end cleared.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+        let moved = LocalEventFields {
+            start_utc: "2026-01-12T07:00:00Z".into(),
+            start_local: "2026-01-12T08:00:00".into(),
+            end_time_zone: String::new(),
+            ..zoned_fields()
+        };
+        assert_eq!(
+            s.update_event_fields(&id, &moved).unwrap(),
+            EventFieldSet::TIMES
+        );
+        assert_eq!(
+            zones_of(&s, &id),
+            [
+                "W. Europe Standard Time".to_string(),
+                "2026-01-12T08:00:00".into(),
+                String::new(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_event_fields_refuses_a_malformed_wall_clock() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+        let err = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    subject: "Sync v2".into(),
+                    start_utc: "2026-01-12T07:00:00Z".into(),
+                    end_local: "2026-01-13T08:30:00".into(),
+                    ..zoned_fields()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("event end in Europe/London"),
+            "{err}"
+        );
+        let d = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(
+            (d.subject.as_str(), d.start_utc.as_str()),
+            ("Sync", "2026-01-12T08:00:00Z"),
+            "nothing written"
+        );
+        assert_eq!(zones_of(&s, &id), zoned_pairs());
+    }
+
     #[test]
     fn events_without_1983_columns_migrate() {
         let dir = std::env::temp_dir().join(format!(
@@ -7811,6 +8150,8 @@ mod calendar_tests {
             // `reminder_unset` (#1994) reads 0: the old row's reminder
             // came from Graph.
             assert!(!s.event_for_send("E1").unwrap().unwrap().reminder_unset);
+            // No named zone (#2039): the old row is sent in UTC.
+            assert_eq!(zones_of(&s, "E1"), <[String; 4]>::default());
         }
         // The migrated table takes every new column, `reminder_unset` too.
         let s = Store::open(&path).unwrap();
@@ -7818,6 +8159,10 @@ mod calendar_tests {
             .create_local_event(&sample_fields(), "Me", "me@x")
             .unwrap();
         assert!(s.event_for_send(&local).unwrap().unwrap().reminder_unset);
+        s.delete_event(&local).unwrap();
+        // ...and each end's zone (#2039).
+        let local = s.create_local_event(&zoned_fields(), "Me", "me@x").unwrap();
+        assert_eq!(zones_of(&s, &local), zoned_pairs());
         s.delete_event(&local).unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();
