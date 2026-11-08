@@ -8,7 +8,8 @@
 # `ext-close-tab` dispatches it from the focused element, which on a Mail
 # tab must be inside the extension's view; gpui runs a dispatched action
 # after the verb's reply, so a `shot window` follows it. The instance
-# starts with one document tab; each test leaves only that one open.
+# starts with one document tab (the first test also opens basic.docx and
+# closes it); each test leaves only that one open.
 ext fixture
 
 test issue 1923 a Mail tab's File lists the extension's pages in place, a document's none
@@ -32,13 +33,23 @@ test issue 1923 a Mail tab's File lists the extension's pages in place, a docume
   assert reply.ext_page is null
   shot window
   call backstage {"action":"close"}
-  # The document tab's rail is today's, with nothing of the extension's.
-  call tab-select {"tab":0}
+  # A document opened beside it: its rail is today's, with nothing of the
+  # extension's.
+  open copy:../fixtures/basic.docx
+  shot window
+  call tab-list {}
+  assert reply.count is 3
+  assert reply.tabs.2.kind is docx
+  assert reply.active is 2
   call backstage {"action":"open"}
   assert reply.items is ["← Back","Info","New","Open…","Save","Save As…","Export","Account","Close"]
   assert reply.ext_items is []
+  assert reply.ext_page is null
   shot window
   call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 2
   call tab-select {"tab":1}
   call real-key {"key":"ctrl+w"}
   call tab-list {}
