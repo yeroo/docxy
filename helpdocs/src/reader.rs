@@ -189,10 +189,12 @@ impl Reader {
         let step = self.height.saturating_sub(1).max(1);
         match key {
             Key::Up => self.scroll = self.scroll.saturating_sub(1),
-            Key::Down => self.scroll += 1,
+            Key::Down => self.scroll = self.scroll.saturating_add(1),
             Key::PageUp => self.scroll = self.scroll.saturating_sub(step),
-            Key::PageDown => self.scroll += step,
+            Key::PageDown => self.scroll = self.scroll.saturating_add(step),
             Key::Home => self.scroll = 0,
+            // The largest scroll: the next layout clamps it to the bottom,
+            // and the keys before that saturate (#1856 r1).
             Key::End => self.scroll = usize::MAX,
             Key::NextLink => self.step_link(true),
             Key::PrevLink => self.step_link(false),
@@ -235,12 +237,14 @@ impl Reader {
         if n == 0 {
             return;
         }
-        let (top, bottom) = (self.scroll, self.scroll + self.height);
+        let (top, bottom) = (self.scroll, self.scroll.saturating_add(self.height));
         let at = match self.selected {
             Some(i) if next => (i + 1) % n,
             Some(i) => (i + n - 1) % n,
-            // Nothing selected: the first link on screen (the last one going
-            // back), else the first (last) of the page.
+            // Nothing selected: the first link starting at or below the top
+            // of the view, even one below the screen, else the page's first;
+            // going back, the last link starting above the bottom of the
+            // view, else the page's last.
             None if next => self.links().iter().position(|l| l.line >= top).unwrap_or(0),
             None => self
                 .links()
@@ -252,7 +256,7 @@ impl Reader {
         let line = self.links()[at].line;
         if line < self.scroll {
             self.scroll = line;
-        } else if line >= self.scroll + self.height {
+        } else if line >= self.scroll.saturating_add(self.height) {
             self.scroll = line + 1 - self.height;
         }
         self.footer = self.describe(at);
@@ -611,6 +615,26 @@ mod tests {
         assert_eq!(r.page_id(), Some("tables"));
         assert_eq!(r.key(Key::Close), Outcome::Close);
         assert_eq!(r.key(Key::Down), Outcome::Stay);
+    }
+
+    #[test]
+    fn keys_before_any_layout_never_overflow_and_end_wins() {
+        let m = long();
+        let mut r = Reader::open(m, "long", None).unwrap();
+        for k in [
+            Key::End,
+            Key::Down,
+            Key::PageDown,
+            Key::NextLink,
+            Key::PrevLink,
+            Key::Down,
+        ] {
+            assert_eq!(r.key(k), Outcome::Stay, "{k:?}");
+        }
+        r.wheel(isize::MAX);
+        r.layout(40, 10, &cols);
+        let lines = r.laid().unwrap().lines.len();
+        assert_eq!(r.scroll(), lines - 10, "at the bottom, End wins");
     }
 
     #[test]
