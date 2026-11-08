@@ -11,8 +11,8 @@
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
     EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
-    Message, MessageFields, MessageHeader, OofStatus, Person, Recipient, Recurrence, ScheduleEntry,
-    plain_to_html, to_utc,
+    MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person, Recipient,
+    Recurrence, ScheduleEntry, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -1156,6 +1156,25 @@ impl GraphClient {
             .map(str::to_string))
     }
 
+    /// GET `/me/messages/{id}?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)`
+    /// (#2024): a meeting message's `meetingMessageType` and the calendar
+    /// event it refers to. The `eventMessage` cast covers requests,
+    /// cancellations and responses (`eventMessageRequest`,
+    /// `eventMessageResponse` derive from it); a message of another type
+    /// carries neither, and reads as all `None`. No top-level `$select`, as
+    /// in `meeting_event_id`: `meetingMessageType` is a derived-type
+    /// property, which a plain GET returns. `RespondMeeting` keeps
+    /// `meeting_event_id`'s narrower `eventMessageRequest` cast.
+    pub fn meeting_message(&self, message_id: &str) -> Result<MeetingMessage, GraphError> {
+        let id = encode_path_segment(message_id);
+        let path = format!(
+            "/me/messages/{id}?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)"
+        );
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Ok(MeetingMessage::from_json(&v))
+    }
+
     /// GET `/me/outlook/masterCategories` — the mailbox's master category list.
     pub fn get_master_categories(&self) -> Result<Vec<MasterCategory>, GraphError> {
         let resp = self.send(Method::Get, "/me/outlook/masterCategories", None, &[])?;
@@ -2060,6 +2079,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::model::MeetingMessageType;
     use crate::testserver::{FakeServer, Route};
 
     #[test]
@@ -4119,6 +4139,102 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert_eq!(c.meeting_event_id("M2").unwrap(), None);
+    }
+
+    #[test]
+    fn meeting_message_reads_cancellation_and_event() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M1?$expand=microsoft.graph.eventMessage/event(".into(),
+            status: 200,
+            headers: vec![],
+            body: r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessage",
+                "meetingMessageType":"meetingCancelled",
+                "event":{"id":"E9","isOrganizer":false}}"##
+                .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.meeting_message("M1").unwrap(),
+            MeetingMessage {
+                message_type: Some(MeetingMessageType::Cancelled),
+                event_id: Some("E9".into()),
+                is_organizer: false,
+            }
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(
+            reqs[0].path,
+            "/me/messages/M1?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)"
+        );
+    }
+
+    #[test]
+    fn meeting_message_reads_a_response() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M3".into(),
+            status: 200,
+            headers: vec![],
+            body: r##"{"id":"M3","@odata.type":"#microsoft.graph.eventMessageResponse",
+                "meetingMessageType":"meetingAccepted",
+                "event":{"id":"E3","isOrganizer":true}}"##
+                .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let m = c.meeting_message("M3").unwrap();
+        assert_eq!(m.message_type, Some(MeetingMessageType::Accepted));
+        assert_eq!(m.event_id.as_deref(), Some("E3"));
+        assert!(m.is_organizer);
+    }
+
+    #[test]
+    fn meeting_message_of_a_plain_message_is_none() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/M2".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"M2","subject":"Lunch?"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let m = c.meeting_message("M2").unwrap();
+        assert_eq!(m.message_type, None);
+        assert_eq!(m.event_id, None);
+        assert!(!m.is_organizer);
+    }
+
+    #[test]
+    fn meeting_message_id_is_percent_encoded() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/AAMk%2Fid%2Bwith%3Dchars?".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"meetingMessageType":"meetingRequest","event":{"id":"E1"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let m = c.meeting_message("AAMk/id+with=chars").unwrap();
+        assert_eq!(m.message_type, Some(MeetingMessageType::Request));
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[test]
+    fn meeting_message_missing_is_not_found() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/messages/GONE".into(),
+            status: 404,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.meeting_message("GONE"),
+            Err(GraphError::NotFound)
+        ));
     }
 
     #[test]
