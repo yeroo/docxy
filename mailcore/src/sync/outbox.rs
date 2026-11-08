@@ -61,6 +61,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             id,
             kind,
             comment,
+            send_response,
             proposed_start_utc,
             proposed_end_utc,
         } => {
@@ -73,10 +74,10 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
             // is retried, then quarantined after `MAX_OP_ATTEMPTS` like any
             // other op Graph keeps rejecting, without ever calling Graph
             // with a guessed action.
-            let rsvp = rsvp_kind(kind)
+            let rsvp = RsvpKind::from_status(kind)
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
             let proposed = proposed_start_utc.clone().zip(proposed_end_utc.clone());
-            client.respond_event(id, rsvp, comment.as_deref(), true, proposed)
+            client.respond_event(id, rsvp, comment.as_deref(), *send_response, proposed)
         }
         OutboxOp::CreateEvent { id } => {
             // Every group, read at send time, so an edit of the `local:`
@@ -326,21 +327,6 @@ fn content_type_for(name: &str) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
-}
-
-/// Maps the `response_status` vocabulary `Store::set_event_response` writes
-/// locally — and `OutboxOp::RespondEvent`'s `kind` field carries — to the
-/// RSVP action `GraphClient::respond_event` sends: `"accepted"` → `Accept`,
-/// `"declined"` → `Decline`, `"tentativelyAccepted"` → `Tentative`. `None`
-/// for anything else — see `apply_op`'s `RespondEvent` arm for why an
-/// unrecognized value must error rather than silently pick one.
-fn rsvp_kind(kind: &str) -> Option<RsvpKind> {
-    match kind {
-        "accepted" => Some(RsvpKind::Accept),
-        "declined" => Some(RsvpKind::Decline),
-        "tentativelyAccepted" => Some(RsvpKind::Tentative),
-        _ => None,
-    }
 }
 
 /// Ensures the draft addressed by `id` exists on Graph with its
@@ -602,6 +588,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("looking forward to it".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -639,6 +626,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "declined".into(),
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -650,12 +638,63 @@ mod tests {
         assert_eq!(sent.get("comment").and_then(Value::as_str), Some(""));
     }
 
+    /// "Don't send a response" (#2023): every kind's POST carries
+    /// `sendResponse: false`.
+    #[test]
+    fn apply_op_respond_event_without_sending_a_response() {
+        let actions = [
+            ("accepted", "accept"),
+            ("declined", "decline"),
+            ("tentativelyAccepted", "tentativelyAccept"),
+        ];
+        let srv = FakeServer::start(
+            actions
+                .iter()
+                .map(|(_, action)| Route {
+                    method: "POST".into(),
+                    path_prefix: format!("/me/events/E1/{action}"),
+                    status: 202,
+                    headers: vec![],
+                    body: "".into(),
+                })
+                .collect(),
+        );
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        for (kind, _) in actions {
+            apply_op(
+                &c,
+                &store,
+                &OutboxOp::RespondEvent {
+                    id: "E1".into(),
+                    kind: kind.into(),
+                    comment: None,
+                    send_response: false,
+                    proposed_start_utc: None,
+                    proposed_end_utc: None,
+                },
+            )
+            .unwrap();
+        }
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 3);
+        for (req, (_, action)) in reqs.iter().zip(actions) {
+            assert_eq!(req.path, format!("/me/events/E1/{action}"));
+            let sent = json::parse(&req.body).unwrap();
+            assert_eq!(
+                sent.get("sendResponse").and_then(Value::as_bool),
+                Some(false),
+                "{action}"
+            );
+        }
+    }
+
     #[test]
     fn apply_op_respond_event_rejects_an_unrecognized_kind_without_calling_graph() {
         // A corrupt/unexpected outbox row (`kind` not one of the three
         // `Store::set_event_response` vocabulary values) must NOT default to
-        // accepting the meeting — see `rsvp_kind`'s doc comment. No route is
-        // stubbed at all: if this silently defaulted to `Accept` and called
+        // accepting the meeting — see `RsvpKind::from_status`'s doc
+        // comment. No route is stubbed at all: if this silently defaulted to `Accept` and called
         // `.../accept`, the fake server would 404 and the test would still
         // catch it via the empty-requests assertion below, but the point is
         // Graph is never even reached.
@@ -669,6 +708,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "garbage".into(),
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },

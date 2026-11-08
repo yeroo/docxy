@@ -251,16 +251,19 @@ pub enum OutboxOp {
         id: String,
     },
     /// Push an RSVP for a calendar event to Graph
-    /// (`.../accept`|`.../decline`|`.../tentativelyAccept`, always with
-    /// `sendResponse: true` — see `sync::outbox::apply_op`). `kind` is the
-    /// same response_status vocabulary `Store::set_event_response` writes
-    /// locally (`"accepted"`, `"declined"`, `"tentativelyAccepted"`);
-    /// `apply_op` converts it to a `graph::client::RsvpKind`. `comment` is
-    /// the optional note attendees see alongside the response.
+    /// (`.../accept`|`.../decline`|`.../tentativelyAccept` — see
+    /// `sync::outbox::apply_op`). `kind` is the same response_status
+    /// vocabulary `Store::set_event_response` writes locally (`"accepted"`,
+    /// `"declined"`, `"tentativelyAccepted"`); `apply_op` converts it with
+    /// `graph::client::RsvpKind::from_status`. `comment` is the optional note
+    /// attendees see alongside the response. `send_response` false is "Don't
+    /// send a response" (#2023): the JSON key `sendResponse`, which a row
+    /// queued before #2023 lacks and reads as `true`, the only behaviour then.
     RespondEvent {
         id: String,
         kind: String,
         comment: Option<String>,
+        send_response: bool,
         proposed_start_utc: Option<String>,
         proposed_end_utc: Option<String>,
     },
@@ -372,6 +375,7 @@ impl OutboxOp {
                 id,
                 kind,
                 comment,
+                send_response,
                 proposed_start_utc,
                 proposed_end_utc,
             } => Value::Object(vec![
@@ -385,6 +389,7 @@ impl OutboxOp {
                         None => Value::Null,
                     },
                 ),
+                ("sendResponse".to_string(), Value::Bool(*send_response)),
                 (
                     "proposedStart".to_string(),
                     match proposed_start_utc {
@@ -488,6 +493,10 @@ impl OutboxOp {
                 id: id()?,
                 kind: v.get("rsvp")?.as_str()?.to_string(),
                 comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+                send_response: v
+                    .get("sendResponse")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
                 proposed_start_utc: v
                     .get("proposedStart")
                     .and_then(Value::as_str)
@@ -651,6 +660,11 @@ pub struct AttendeeRow {
     pub response: String,
     /// Graph `status.time`; `""` when never (#1983).
     pub response_time: String,
+    /// The new time the attendee proposed, canonical UTC; both `""` when
+    /// none (Graph `attendees[].proposedNewTime`, the organizer's view,
+    /// #2023).
+    pub proposed_start_utc: String,
+    pub proposed_end_utc: String,
 }
 
 /// A stored calendar (`Store::calendars`, #1984): Graph's fields, and
@@ -824,6 +838,8 @@ pub struct NewAttendee {
     pub r#type: String,
     pub response: String,
     pub response_time: String,
+    pub proposed_start_utc: String,
+    pub proposed_end_utc: String,
 }
 
 /// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
@@ -879,6 +895,8 @@ impl From<&Attendee> for NewAttendee {
             r#type: a.r#type.clone(),
             response: a.response.clone(),
             response_time: a.response_time.clone(),
+            proposed_start_utc: a.proposed_start_utc.clone(),
+            proposed_end_utc: a.proposed_end_utc.clone(),
         }
     }
 }
@@ -965,6 +983,17 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Begins a write transaction: IMMEDIATE, so it takes the write lock at
+    /// `BEGIN` and waits out another connection's write (rusqlite's 5 s busy
+    /// timeout) before it reads. The engine and a host (lookxy, its tests)
+    /// each hold a connection to one WAL file; a DEFERRED transaction that
+    /// read first and then writes after the other connection committed gets
+    /// `SQLITE_BUSY_SNAPSHOT` ("database is locked") at once, with no busy
+    /// wait, as its snapshot is stale. Every store transaction writes.
+    fn write_tx(&self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+    }
+
     /// Opens an in-memory database — for tests only.
     pub fn open_in_memory() -> Result<Store, StoreError> {
         let conn = Connection::open_in_memory()?;
@@ -1038,10 +1067,16 @@ impl Store {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
         }
-        let _ = conn.execute(
-            "ALTER TABLE event_attendees ADD COLUMN response_time TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        for column in [
+            "response_time TEXT NOT NULL DEFAULT ''",
+            "proposed_start_utc TEXT NOT NULL DEFAULT ''",
+            "proposed_end_utc TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(
+                &format!("ALTER TABLE event_attendees ADD COLUMN {column}"),
+                [],
+            );
+        }
         // Same idempotent-migration pattern as `is_draft`/`body_html` above:
         // `messages` already includes `bcc_recipients` for freshly-created
         // databases; this brings an existing database up to date, erroring
@@ -1202,7 +1237,7 @@ impl Store {
     pub fn retain_folders(&self, keep: &[String]) -> Result<usize, StoreError> {
         let keep_json =
             Value::Array(keep.iter().map(|id| Value::Str(id.clone())).collect()).to_string();
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let mut removed = tx.execute(
             "DELETE FROM folders
              WHERE id <> ?2 AND id NOT IN (SELECT value FROM json_each(?1))",
@@ -1639,7 +1674,7 @@ impl Store {
     /// `/me/outlook/masterCategories` is not a delta endpoint — each fetch is
     /// the full set, so replacing prunes deleted categories).
     pub fn replace_master_categories(&self, cats: &[MasterCategory]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM master_categories", [])?;
         for c in cats {
             tx.execute(
@@ -1759,7 +1794,7 @@ impl Store {
     /// restarted before the reconverge ends still runs it without the
     /// window's cutoff.
     pub fn clear_delta_links(&self) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
@@ -1936,7 +1971,7 @@ impl Store {
         asked: BodyFormat,
         headers: &[MessageHeader],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         write_body_on(&tx, message_id, b, Some(asked))?;
         tx.execute(
             "DELETE FROM message_headers WHERE message_id = ?1",
@@ -2203,7 +2238,7 @@ impl Store {
         // not there yet, or Drafts is) or after it (the sentinel holds this
         // draft and is kept), never between the sentinel's insert and the
         // draft's (#1886).
-        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let tx = self.write_tx()?;
         let folder_id = drafts_folder_id_on(&tx)?;
         tx.execute(
             "INSERT INTO messages (
@@ -2252,7 +2287,7 @@ impl Store {
         bcc: &str,
         body_html: &str,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             concat!(
                 "UPDATE messages SET subject = ?2, to_recipients = ?3, cc_recipients = ?4, bcc_recipients = ?5,
@@ -2506,7 +2541,7 @@ impl Store {
     /// reaching the draft: see `current_id` and the calls that take a draft
     /// id. The alias goes with the row whenever the message is deleted.
     pub fn reconcile_id(&self, local_id: &str, graph_id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
             "UPDATE messages SET id = ?2,
@@ -2625,9 +2660,9 @@ impl Store {
     /// The delete-then-insert runs inside a single transaction (per spec §5
     /// on multi-row writes): `Store` only holds a shared `&Connection`
     /// (`put_attachments` takes `&self`, not `&mut self`, to match the
-    /// rest of this type's methods), so this uses
-    /// `Connection::unchecked_transaction` — rusqlite's transaction handle
-    /// for exactly that shared-borrow case — rather than
+    /// rest of this type's methods), so this uses `write_tx`
+    /// (`Transaction::new_unchecked`, IMMEDIATE) — rusqlite's transaction
+    /// handle for exactly that shared-borrow case — rather than
     /// `Connection::transaction`, which needs `&mut Connection`. If any
     /// statement fails, the `?` drops the transaction before `commit()`
     /// runs, which rolls it back and leaves the prior attachments
@@ -2637,7 +2672,7 @@ impl Store {
         message_id: &str,
         atts: &[AttachmentMeta],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM attachments WHERE message_id = ?1",
             params![message_id],
@@ -2821,10 +2856,10 @@ impl Store {
 
     /// Replaces the full set of attendees stored for an event. See
     /// `put_attachments` for why the delete-then-insert runs in one
-    /// transaction via `unchecked_transaction` (same shared-`&self`
+    /// transaction via `write_tx` (same shared-`&self`
     /// reasoning applies here).
     pub fn put_event_attendees(&self, id: &str, a: &[NewAttendee]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         put_event_attendees_on(&tx, id, a)?;
         tx.commit()?;
         Ok(())
@@ -2886,7 +2921,7 @@ impl Store {
         events: &[NewEvent],
         attendees: &[(String, Vec<NewAttendee>)],
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM events WHERE start_utc < ?2 AND end_utc > ?1 AND id NOT LIKE 'local:%'",
             params![from_utc, to_utc],
@@ -3074,7 +3109,7 @@ impl Store {
         let reminder = f.reminder.unwrap_or_default();
         let enum_or =
             |v: &Option<String>, default: &str| non_empty(v).unwrap_or_else(|| default.to_string());
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         upsert_event_on(
             &tx,
             &NewEvent {
@@ -3162,7 +3197,7 @@ impl Store {
         id: &str,
         f: &LocalEventFields,
     ) -> Result<EventFieldSet, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let old = event_for_send_on(&tx, id)?
             .ok_or_else(|| StoreError::Sql(format!("no event stored for {id}")))?;
         let stored_attendees = event_attendees_on(&tx, id)?;
@@ -3266,7 +3301,7 @@ impl Store {
 
     /// Removes an event (and its attendees) locally.
     pub fn delete_event(&self, id: &str) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM event_attendees WHERE event_id = ?1",
             params![id],
@@ -3283,7 +3318,7 @@ impl Store {
     /// host calls it before `SyncCommand::DeleteEvent { id: master_id }`,
     /// as it calls `delete_event` before deleting one event.
     pub fn delete_event_series(&self, master_id: &str) -> Result<usize, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute(
             "DELETE FROM event_attendees WHERE event_id IN
                 (SELECT id FROM events WHERE id = ?1 OR series_master_id = ?1)",
@@ -3331,7 +3366,7 @@ impl Store {
         created: &Event,
     ) -> Result<(), StoreError> {
         let graph_id = created.id.as_str();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
             "UPDATE events SET id = ?2 WHERE id = ?1",
@@ -3388,7 +3423,7 @@ impl Store {
     /// is kept apart from this list, so a chosen calendar that vanishes and
     /// comes back is still chosen.
     pub fn replace_calendars(&self, calendars: &[Calendar]) -> Result<bool, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let before = stored_calendars_on(&tx)?;
         let mut seen = HashSet::new();
         let after: Vec<Calendar> = calendars
@@ -3464,7 +3499,7 @@ impl Store {
     /// a host restoring its choice at startup, before the first list,
     /// deletes nothing. Returns whether the synced set changed.
     pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         let before = synced_calendar_ids_on(&tx)?;
         match ids {
             Some(ids) => {
@@ -3531,7 +3566,7 @@ impl Store {
         fetched: &[SyncedCalendar],
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         for c in fetched {
             let cascaded = match &c.round {
@@ -3596,7 +3631,7 @@ impl Store {
         f: &FetchedCalendar,
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp)?;
         tx.commit()?;
@@ -3838,7 +3873,7 @@ impl Store {
             }
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         for (address, (name, last_seen, frequency)) in agg {
             self.upsert_contact(&Contact {
                 name,
@@ -3864,7 +3899,7 @@ impl Store {
     /// non-empty name winning. An empty slice empties the set. Never touches
     /// `contacts` (people and mined correspondents).
     pub fn replace_folder_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.write_tx()?;
         tx.execute("DELETE FROM folder_contacts", [])?;
         for c in contacts {
             let address = folder_contact_key(&c.address);
@@ -4453,7 +4488,8 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
 /// `Store::event_attendees` on `conn`.
 fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT name, addr, type, response, response_time
+        "SELECT name, addr, type, response, response_time, proposed_start_utc,
+                proposed_end_utc
          FROM event_attendees WHERE event_id = ?1",
     )?;
     let rows = stmt
@@ -4464,6 +4500,8 @@ fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, S
                 r#type: row.get(2)?,
                 response: row.get(3)?,
                 response_time: row.get(4)?,
+                proposed_start_utc: row.get(5)?,
+                proposed_end_utc: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -4499,9 +4537,10 @@ fn non_empty(v: &Option<String>) -> Option<String> {
 
 /// The attendees a host's `LocalEventFields::attendees` stores, given the
 /// event's stored ones (`&[]` on a create): one whose address matches a
-/// stored attendee (case-insensitive) keeps that row's response and response
-/// time, and its type when the input's is `""` (#1994); a new one is
-/// `required` (or its given type) with no response.
+/// stored attendee (case-insensitive) keeps that row's response, response
+/// time and proposed new time (#2023), and its type when the input's is `""`
+/// (#1994); a new one is `required` (or its given type) with no response and
+/// no proposal.
 fn typed_attendees(input: &[AttendeeInput], stored: &[AttendeeRow]) -> Vec<NewAttendee> {
     input
         .iter()
@@ -4522,6 +4561,10 @@ fn typed_attendees(input: &[AttendeeInput], stored: &[AttendeeRow]) -> Vec<NewAt
                     .map(|s| s.response.clone())
                     .unwrap_or_else(|| "none".to_string()),
                 response_time: old.map(|s| s.response_time.clone()).unwrap_or_default(),
+                proposed_start_utc: old
+                    .map(|s| s.proposed_start_utc.clone())
+                    .unwrap_or_default(),
+                proposed_end_utc: old.map(|s| s.proposed_end_utc.clone()).unwrap_or_default(),
             }
         })
         .collect()
@@ -4760,15 +4803,18 @@ fn put_event_attendees_on(
     )?;
     for att in a {
         conn.execute(
-            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time,
+                                          proposed_start_utc, proposed_end_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 id,
                 att.name,
                 att.addr,
                 att.r#type,
                 att.response,
-                att.response_time
+                att.response_time,
+                att.proposed_start_utc,
+                att.proposed_end_utc
             ],
         )?;
     }
@@ -5989,6 +6035,73 @@ mod tests {
 mod calendar_tests {
     use super::*;
 
+    /// Two connections to one WAL file, as the engine and a host hold
+    /// (#2023 r3): while one holds the write lock and then commits, the
+    /// other's read-then-write transactions wait it out instead of failing
+    /// with `database is locked` (a DEFERRED transaction's stale snapshot,
+    /// `SQLITE_BUSY_SNAPSHOT`, which no busy timeout waits out).
+    #[test]
+    fn writes_wait_out_another_connections_write() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-write-tx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let a = Store::open(&path).unwrap();
+        a.upsert_event(&ev("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z"))
+            .unwrap();
+        // Each of A's writes runs while another connection holds the write
+        // lock, and that connection commits a change after A began.
+        let while_b_writes = |write: &dyn Fn(&Store)| {
+            let (locked, is_locked) = std::sync::mpsc::channel();
+            let p = path.clone();
+            let b = std::thread::spawn(move || {
+                let b = Connection::open(&p).unwrap();
+                b.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     UPDATE events SET location = 'by B' WHERE id = 'E1';",
+                )
+                .unwrap();
+                locked.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                b.execute_batch("COMMIT").unwrap();
+            });
+            is_locked.recv().unwrap();
+            write(&a);
+            b.join().unwrap();
+        };
+        while_b_writes(&|a| {
+            let row = a.event("E1").unwrap().unwrap();
+            a.update_event_fields(
+                "E1",
+                &LocalEventFields {
+                    subject: "by A".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: "by A".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        });
+        let row = a.event("E1").unwrap().unwrap();
+        assert_eq!(
+            (row.subject.as_str(), row.location.as_str()),
+            ("by A", "by A")
+        );
+        while_b_writes(&|a| {
+            a.create_local_event(&sample_fields(), "Me", "me@x")
+                .unwrap();
+        });
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn ev(id: &str, start: &str, end: &str) -> NewEvent {
         NewEvent {
             id: id.into(),
@@ -6554,6 +6667,8 @@ mod calendar_tests {
             r#type: "resource".into(),
             response: "accepted".into(),
             response_time: "2026-07-18T08:01:02Z".into(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
         };
         s.replace_events_in_window(
             from,
@@ -6569,6 +6684,8 @@ mod calendar_tests {
         assert_eq!(atts[0].r#type, "resource");
         assert_eq!(atts[0].response, "accepted");
         assert_eq!(atts[0].response_time, "2026-07-18T08:01:02Z");
+        assert_eq!(atts[0].proposed_start_utc, "2026-07-21T14:00:00Z");
+        assert_eq!(atts[0].proposed_end_utc, "2026-07-21T15:00:00Z");
 
         // A later refresh that changes every field overwrites them.
         e = NewEvent {
@@ -6786,6 +6903,7 @@ mod calendar_tests {
                 r#type: "optional".into(),
                 response: "accepted".into(),
                 response_time: "2026-07-19T08:00:00Z".into(),
+                ..NewAttendee::default()
             }],
         )
         .unwrap();
@@ -7058,6 +7176,53 @@ mod calendar_tests {
         assert_eq!(atts[1].response_time, "2026-07-19T08:00:00Z");
     }
 
+    /// An attendee's proposed new time (#2023) survives a local attendee
+    /// edit, as their response does; a new attendee has none.
+    #[test]
+    fn update_event_fields_keeps_attendee_proposals() {
+        let s = Store::open_in_memory().unwrap();
+        let untouched = synced_event(&s);
+        // `synced_event`'s Bob, now proposing a new time.
+        let bob = NewAttendee {
+            name: "Bob".into(),
+            addr: "Bob@X.com".into(),
+            r#type: "optional".into(),
+            response: "tentativelyAccepted".into(),
+            response_time: "2026-07-19T08:00:00Z".into(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
+        };
+        s.put_event_attendees("G1", &[bob]).unwrap();
+        let mut two = untouched.clone();
+        two.attendees.push(AttendeeInput {
+            name: "Ann".into(),
+            addr: "ann@x.com".into(),
+            r#type: String::new(),
+        });
+        assert_eq!(
+            s.update_event_fields("G1", &two).unwrap(),
+            EventFieldSet::ATTENDEES
+        );
+        let atts = s.event_attendees("G1").unwrap();
+        assert_eq!(atts.len(), 2);
+        assert_eq!(
+            (
+                atts[0].proposed_start_utc.as_str(),
+                atts[0].proposed_end_utc.as_str()
+            ),
+            ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z"),
+            "Bob keeps his proposal"
+        );
+        assert_eq!(atts[1].addr, "ann@x.com");
+        assert_eq!(
+            (
+                atts[1].proposed_start_utc.as_str(),
+                atts[1].proposed_end_utc.as_str()
+            ),
+            ("", "")
+        );
+    }
+
     #[test]
     fn update_event_fields_of_a_missing_event_is_an_error() {
         let s = Store::open_in_memory().unwrap();
@@ -7255,6 +7420,8 @@ mod calendar_tests {
             assert_eq!(atts[0].name, "Bob");
             assert_eq!(atts[0].r#type, "optional");
             assert_eq!(atts[0].response_time, "");
+            assert_eq!(atts[0].proposed_start_utc, "", "no proposal (#2023)");
+            assert_eq!(atts[0].proposed_end_utc, "");
             // `reminder_unset` (#1994) reads 0: the old row's reminder
             // came from Graph.
             assert!(!s.event_for_send("E1").unwrap().unwrap().reminder_unset);
@@ -7274,6 +7441,21 @@ mod calendar_tests {
             .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
             .unwrap();
         assert_client_fields(&rows[0], &e);
+        // ...and `event_attendees` takes an attendee's proposal (#2023).
+        let proposing = NewAttendee {
+            name: "Bob".into(),
+            addr: "bob@x".into(),
+            r#type: "optional".into(),
+            response: "tentativelyAccepted".into(),
+            response_time: String::new(),
+            proposed_start_utc: "2026-07-21T14:00:00Z".into(),
+            proposed_end_utc: "2026-07-21T15:00:00Z".into(),
+        };
+        s.put_event_attendees("E1", std::slice::from_ref(&proposing))
+            .unwrap();
+        let atts = s.event_attendees("E1").unwrap();
+        assert_eq!(atts[0].proposed_start_utc, proposing.proposed_start_utc);
+        assert_eq!(atts[0].proposed_end_utc, proposing.proposed_end_utc);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8557,24 +8739,26 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("looking forward to it".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it","proposedStart":null,"proposedEnd":null}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"accepted","comment":"looking forward to it","sendResponse":true,"proposedStart":null,"proposedEnd":null}"#
         );
         assert_eq!(
             OutboxOp::RespondEvent {
                 id: "E1".into(),
                 kind: "declined".into(),
                 comment: None,
+                send_response: false,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             }
             .to_json()
             .to_string(),
-            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"proposedStart":null,"proposedEnd":null}"#
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"sendResponse":false,"proposedStart":null,"proposedEnd":null}"#
         );
     }
 
@@ -8604,6 +8788,7 @@ mod outbox_tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("ok".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -8611,6 +8796,7 @@ mod outbox_tests {
                 id: "E2".into(),
                 kind: "tentativelyAccepted".into(),
                 comment: None,
+                send_response: false,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             },
@@ -8622,6 +8808,7 @@ mod outbox_tests {
                 id: "E3".into(),
                 kind: "declined".into(),
                 comment: Some("can we push?".into()),
+                send_response: true,
                 proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
                 proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
             },
@@ -8631,6 +8818,27 @@ mod outbox_tests {
             let decoded = OutboxOp::from_json(&json::parse(&encoded).unwrap()).unwrap();
             assert_eq!(decoded, op);
         }
+    }
+
+    #[test]
+    fn respond_event_queued_before_send_response_reads_as_sending() {
+        // A row queued before #2023 has no `sendResponse` key: it was always
+        // sent, so it still is.
+        let v = json::parse(
+            r#"{"kind":"respondEvent","id":"E1","rsvp":"declined","comment":null,"proposedStart":null,"proposedEnd":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::RespondEvent {
+                id: "E1".into(),
+                kind: "declined".into(),
+                comment: None,
+                send_response: true,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            })
+        );
     }
 
     #[test]

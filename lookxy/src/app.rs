@@ -1747,6 +1747,7 @@ impl App {
             message_id,
             kind,
             comment: None,
+            send_response: true,
             proposed_start_utc: None,
             proposed_end_utc: None,
         });
@@ -2175,7 +2176,8 @@ impl App {
 
     /// The shared dispatch: `Event` → optimistic `set_event_response` +
     /// `reload_agenda` + `RespondEvent`; `Message` → `RespondMeeting` (kind
-    /// mapped from the status string to `RsvpKind`). The UI never enqueues the
+    /// mapped from the status string by `RsvpKind::from_status`; an unknown
+    /// one is an error notice and sends nothing). The UI never enqueues the
     /// outbox op itself.
     fn dispatch_rsvp(
         &mut self,
@@ -2196,20 +2198,22 @@ impl App {
                     id,
                     kind,
                     comment,
+                    send_response: true,
                     proposed_start_utc,
                     proposed_end_utc,
                 });
             }
             RsvpTarget::Message(message_id) => {
-                let rsvp = match kind.as_str() {
-                    "declined" => RsvpKind::Decline,
-                    "tentativelyAccepted" => RsvpKind::Tentative,
-                    _ => RsvpKind::Accept,
+                // An unknown status must never become an accept.
+                let Some(rsvp) = RsvpKind::from_status(&kind) else {
+                    self.error_notice = Some("Unknown RSVP response".to_string());
+                    return;
                 };
                 let _ = self.sync.cmd_tx.send(SyncCommand::RespondMeeting {
                     message_id,
                     kind: rsvp,
                     comment,
+                    send_response: true,
                     proposed_start_utc,
                     proposed_end_utc,
                 });
@@ -4620,6 +4624,23 @@ pub(crate) mod tests {
             }
             other => panic!("expected RespondMeeting, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_unknown_invite_response_errors_and_sends_nothing() {
+        use crate::app::{RsvpField, RsvpTarget};
+        let mut app = App::for_test_with_seeded_store();
+        app.rsvp_prompt = Some(crate::app::RsvpPrompt {
+            target: RsvpTarget::Message("invite1".into()),
+            kind: "maybe".into(),
+            comment: String::new(),
+            proposed_start: String::new(),
+            proposed_end: String::new(),
+            focus: RsvpField::Comment,
+        });
+        app.submit_rsvp();
+        assert!(app.test_cmd_rx.as_ref().unwrap().try_recv().is_err());
+        assert_eq!(app.error_notice.as_deref(), Some("Unknown RSVP response"));
     }
 
     #[test]
@@ -7313,6 +7334,7 @@ pub(crate) mod tests {
                     r#type: "optional".into(),
                     response: "accepted".into(),
                     response_time: "2026-07-19T08:00:00Z".into(),
+                    ..Default::default()
                 }],
             )
             .unwrap();

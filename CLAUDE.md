@@ -115,6 +115,7 @@ issue number to find its notes.
   a 30/180-day window kept by calendarView delta per calendar (#2013),
   the Contacts folder and `is_contact` (#1934), cancelling a meeting with a message and
   forwarding it (#1985), a series' occurrences, its master and editing either (#2022),
+  respond options: no response, a proposal on tentative, attendees' proposals (#2023),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 

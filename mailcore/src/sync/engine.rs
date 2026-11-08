@@ -45,7 +45,7 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     CalendarDeltaCursor, DeltaCursor, EventInput, GraphClient, GraphError, RsvpKind,
-    event_body_json, is_expired_sync_state,
+    event_body_json, is_expired_sync_state, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
@@ -148,16 +148,20 @@ pub enum SyncCommand {
         dest_base: PathBuf,
     },
     /// RSVP to a meeting-invite email: resolve the invite's underlying event
-    /// (`GraphClient::meeting_event_id`) and `respond_event` on it
-    /// (`send_response = true`, no comment). A direct Graph call like
-    /// `SaveAttachment` — not an optimistic-local outbox op — since there's no
-    /// local event row to update from the mail side. Emits
-    /// [`SyncEvent::MeetingResponded`] on success, or [`SyncEvent::Error`] when
-    /// the message resolves to no event.
+    /// (`GraphClient::meeting_event_id`) and `respond_event` on it, with
+    /// `comment`, `send_response` (false: "Don't send a response", #2023)
+    /// and the proposed window. A direct Graph call like `SaveAttachment` —
+    /// not an optimistic-local outbox op — since there's no local event row
+    /// to update from the mail side. Emits [`SyncEvent::MeetingResponded`] on
+    /// success, or [`SyncEvent::Error`] when the message resolves to no
+    /// event or the response is refused: by `graph::client::rsvp_proposal`
+    /// before any Graph call, or, once the invite's event id is fetched and
+    /// before the response POST, by a stored event that disallows proposals.
     RespondMeeting {
         message_id: String,
         kind: RsvpKind,
         comment: Option<String>,
+        send_response: bool,
         proposed_start_utc: Option<String>,
         proposed_end_utc: Option<String>,
     },
@@ -268,11 +272,19 @@ pub enum SyncCommand {
     /// [`crate::store::OutboxOp::RespondEvent`] and drain. `kind` is the
     /// response_status vocabulary `Store::set_event_response` accepts
     /// (`"accepted"`/`"declined"`/`"tentativelyAccepted"`); `comment` is an
-    /// optional note sent alongside the RSVP.
+    /// optional note sent alongside the RSVP; `send_response` false is
+    /// "Don't send a response" (#2023), and the status changes locally
+    /// either way. A response `graph::client::rsvp_proposal` refuses, an
+    /// unknown `kind`, or a proposal on a stored event that disallows them
+    /// is refused before anything is written or queued: a
+    /// [`SyncEvent::Error`], and the calendars owe a reset (initial rounds,
+    /// once no event edit waits), since a host may have written the status
+    /// itself first.
     RespondEvent {
         id: String,
         kind: String,
         comment: Option<String>,
+        send_response: bool,
         proposed_start_utc: Option<String>,
         proposed_end_utc: Option<String>,
     },
@@ -667,8 +679,9 @@ enum Drain {
 
 /// An event op whose command wrote the store first (an RSVP, edited
 /// fields, a deleted row): what a quarantine must undo with initial
-/// calendar rounds, and what a series edit's reset waits for (#2022), as
-/// an initial round would replace the row. `CreateEvent`'s `local:` row is
+/// calendar rounds, and what an owed calendar reset waits for
+/// (`calendar_reset_owed`: a series edit's, #2022, or a refused
+/// response's, #2023), as an initial round would replace the row. `CreateEvent`'s `local:` row is
 /// never replaced, and `UpdateEventSeries` writes nothing locally.
 fn writes_event_locally(op: &OutboxOp) -> bool {
     matches!(
@@ -682,8 +695,9 @@ fn writes_event_locally(op: &OutboxOp) -> bool {
 
 /// A command that queues a `writes_event_locally` op, sent after its host
 /// wrote the row (`DeleteEvent`, `UpdateEvent`), or whose op the engine
-/// writes for (`RespondEvent`, `CancelEvent`): while one waits, a series
-/// edit's reset does not run (#2022).
+/// writes for (`RespondEvent`, `CancelEvent`): while one waits, an owed
+/// calendar reset (`calendar_reset_owed`: a series edit's, #2022, or a
+/// refused response's, #2023) does not run.
 fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
     matches!(
         cmd,
@@ -919,7 +933,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backoff: BACKOFF_MIN,
         backfill_done: false,
         reconverge_pending,
-        series_reset_owed: false,
+        calendar_reset_owed: false,
         parked: Vec::new(),
         expired: Vec::new(),
         next_tick: Instant::now(),
@@ -976,8 +990,10 @@ struct Engine {
     /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
-    /// A series edit went through (#2022) and the calendars owe the reset
-    /// it asks for: initial rounds over every window. The first calendar
+    /// The calendars owe a reset: initial rounds over every window. Owed
+    /// when a series edit went through (#2022), and when a `RespondEvent`
+    /// was refused (#2023), whose host may have written the status itself
+    /// on a row no delta round would name again. The first calendar
     /// refresh that finds no event op with a local write queued
     /// (`writes_event_locally`) and no such command waiting
     /// (`command_writes_event_locally`, taken off the channel first) runs
@@ -985,8 +1001,12 @@ struct Engine {
     /// while such an op is queued or its command has reached the engine; a
     /// host that writes its row after the reset's refresh began has the
     /// general race of any refresh. In memory only: a restart before then
-    /// drops it, and the delta rounds go on.
-    series_reset_owed: bool,
+    /// drops it, and the delta rounds go on. Signed out, it waits for the
+    /// sign-in's refresh. The initial rounds cover the kept window only: a
+    /// refused response's host-written status on a range-fetched row
+    /// outside it (#2014) stays until that range is stale and fetched
+    /// again.
+    calendar_reset_owed: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
     parked: Vec<String>,
@@ -1078,7 +1098,7 @@ impl Engine {
         }
         if self.token.is_some() {
             self.sync_pass(true);
-            self.refresh_if_series_reset_owed();
+            self.refresh_if_calendar_reset_owed();
         }
     }
 
@@ -1357,7 +1377,7 @@ impl Engine {
                 // if it fails again.
                 self.op_retry = None;
                 self.sync_pass(true);
-                self.refresh_if_series_reset_owed();
+                self.refresh_if_calendar_reset_owed();
                 self.after_pass_if_fast();
             }
             SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
@@ -1437,13 +1457,15 @@ impl Engine {
                 message_id,
                 kind,
                 comment,
+                send_response,
                 proposed_start_utc,
                 proposed_end_utc,
             } => self.respond_meeting(
                 &message_id,
                 kind,
                 comment,
-                proposed_start_utc.zip(proposed_end_utc),
+                send_response,
+                (proposed_start_utc, proposed_end_utc),
             ),
             SyncCommand::FetchAutomaticReplies => self.fetch_automatic_replies(),
             SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
@@ -1499,9 +1521,43 @@ impl Engine {
                 id,
                 kind,
                 comment,
+                send_response,
                 proposed_start_utc,
                 proposed_end_utc,
             } => {
+                let checked = match RsvpKind::from_status(&kind) {
+                    None => Err("unrecognized RSVP kind".to_string()),
+                    Some(rsvp) => rsvp_proposal(
+                        rsvp,
+                        send_response,
+                        proposed_start_utc.as_deref(),
+                        proposed_end_utc.as_deref(),
+                    )
+                    .map_err(str::to_string),
+                }
+                .and_then(|window| match self.proposals_refused(&id, &window) {
+                    Some(e) => Err(e),
+                    None => Ok(window),
+                });
+                let proposed = match checked {
+                    Ok(p) => p,
+                    Err(e) => {
+                        // Nothing written or queued. A host such as lookxy
+                        // wrote the status itself before it sent this, on a
+                        // row no delta round would name again (#2013): the
+                        // calendars owe initial rounds, which put Graph's
+                        // status back once no event edit waits (#2022's
+                        // gate; signed out, after the sign-in). Only for
+                        // rows in the kept window: a range-fetched row
+                        // outside it (#2014) is corrected by its next range
+                        // fetch once stale.
+                        self.emit(SyncEvent::Error(e));
+                        self.calendar_reset_owed = true;
+                        self.refresh_if_calendar_reset_owed();
+                        return;
+                    }
+                };
+                let (proposed_start_utc, proposed_end_utc) = proposed.unzip();
                 // Optimistic local write, same pattern as MarkRead/SetFlag/
                 // Move/Delete: reflect the RSVP immediately, before the
                 // outbox drain even reaches Graph.
@@ -1511,6 +1567,7 @@ impl Engine {
                     id,
                     kind,
                     comment,
+                    send_response,
                     proposed_start_utc,
                     proposed_end_utc,
                 });
@@ -1665,7 +1722,7 @@ impl Engine {
         }
         self.set_state(SyncState::Syncing);
         if self.drain_outbox().carry_on()
-            && self.refresh_if_series_reset_owed()
+            && self.refresh_if_calendar_reset_owed()
             && self.refresh_folder(id)
         {
             self.clear_backoff();
@@ -1686,7 +1743,7 @@ impl Engine {
         if self.token.is_none() || self.next_retry.is_some_and(|t| Instant::now() < t) {
             return;
         }
-        if !self.drain_outbox().carry_on() || !self.refresh_if_series_reset_owed() {
+        if !self.drain_outbox().carry_on() || !self.refresh_if_calendar_reset_owed() {
             return;
         }
         let stored = match self.store.folders() {
@@ -2669,15 +2726,16 @@ impl Engine {
         });
     }
 
-    /// Whether a series edit's reset (#2022) is owed and may run now: no
+    /// Whether the calendars' reset (a series edit's, #2022, or a refused
+    /// response's, #2023) is owed and may run now: no
     /// event op with a local write is queued, and no command that queues one
     /// is waiting in `deferred` (its host wrote the row already). An initial
     /// round would replace that row, and a queued `UpdateEvent` reads its
     /// row at send time, so it would then send Graph's old values. A queue
     /// that cannot be read counts as one that holds such an op. The caller
     /// takes the waiting commands first (`checkpoint`).
-    fn series_reset_ready(&self) -> bool {
-        self.series_reset_owed
+    fn calendar_reset_ready(&self) -> bool {
+        self.calendar_reset_owed
             && !self.deferred.iter().any(command_writes_event_locally)
             && self
                 .store
@@ -2687,24 +2745,26 @@ impl Engine {
 
     /// After a drain on a path with no calendar refresh of its own (a
     /// command's, a fast tick, `SyncFolder`, the startup, sign-in and
-    /// `Refresh` passes; `on_tick` refreshes after its pass anyway): runs
-    /// the refresh a series edit's reset is waiting for, when it may run
-    /// now (`series_reset_ready`), signed in and outside any wait. Returns
+    /// `Refresh` passes; `on_tick` refreshes after its pass anyway), and in
+    /// the refused `RespondEvent` arm, with no drain before it and its
+    /// return value ignored, as the arm returns right after: runs
+    /// the refresh an owed calendar reset is waiting for, when it may run
+    /// now (`calendar_reset_ready`), signed in and outside any wait. Returns
     /// whether the caller carries on: false after a shutdown, or once the
     /// refresh (or a body fetch its `checkpoint` ran) signed out or started
     /// a wait, which the caller must not clear.
-    fn refresh_if_series_reset_owed(&mut self) -> bool {
+    fn refresh_if_calendar_reset_owed(&mut self) -> bool {
         let waiting = |e: &Self| e.next_retry.is_some_and(|t| Instant::now() < t);
         if self.shutting_down {
             return false;
         }
-        if !self.series_reset_owed || self.token.is_none() || waiting(self) {
+        if !self.calendar_reset_owed || self.token.is_none() || waiting(self) {
             return true;
         }
         if !self.checkpoint() {
             return false;
         }
-        if !self.series_reset_ready() {
+        if !self.calendar_reset_ready() {
             return true;
         }
         self.refresh_calendar();
@@ -2730,7 +2790,7 @@ impl Engine {
         // A drain or refresh a sign-in, throttle or offline error stopped
         // keeps the state that failure set.
         if self.token.is_some()
-            && (!self.drain_outbox().carry_on() || !self.refresh_if_series_reset_owed())
+            && (!self.drain_outbox().carry_on() || !self.refresh_if_calendar_reset_owed())
         {
             return;
         }
@@ -2789,9 +2849,9 @@ impl Engine {
                 Ok(()) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
-                    // The calendars owe a reset (`series_reset_owed`).
+                    // The calendars owe a reset (`calendar_reset_owed`).
                     if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
-                        self.series_reset_owed = true;
+                        self.calendar_reset_owed = true;
                     }
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
@@ -3357,10 +3417,26 @@ impl Engine {
         }
     }
 
+    /// Why a proposed `window` on event `id` is refused (#2023): the stored
+    /// row's organizer disallows proposals (`allow_new_time_proposals`). A
+    /// missing row refuses nothing: Graph has the last word.
+    fn proposals_refused(&self, id: &str, window: &Option<(String, String)>) -> Option<String> {
+        (window.is_some()
+            && self
+                .store
+                .event(id)
+                .is_ok_and(|row| row.is_some_and(|r| !r.allow_new_time_proposals)))
+        .then(|| "the organizer does not allow new time proposals".to_string())
+    }
+
     /// Resolve a meeting-invite message's underlying event
     /// (`GraphClient::meeting_event_id`) and RSVP to it via `respond_event`
-    /// (`send_response = true`, no comment) — a direct Graph call like
-    /// `save_attachment`, not an outbox op. On success emit
+    /// with `comment`, `send_response` and the proposed window — a direct
+    /// Graph call like `save_attachment`, not an outbox op. The response is
+    /// checked first (`rsvp_proposal`, before the event id's GET; the stored
+    /// event's `allow_new_time_proposals` once the id is known): a refusal
+    /// emits `SyncEvent::Error` and sends nothing, and needs no reset, as
+    /// nothing was written locally. On success emit
     /// `SyncEvent::MeetingResponded`; a message that resolves to no event
     /// emits `SyncEvent::Error` ("not a meeting invite"); a Graph failure goes
     /// through `react` for the standard auth/throttle/transport handling. Same
@@ -3370,12 +3446,20 @@ impl Engine {
         message_id: &str,
         kind: RsvpKind,
         comment: Option<String>,
-        proposed: Option<(String, String)>,
+        send_response: bool,
+        (start, end): (Option<String>, Option<String>),
     ) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
+        let proposed = match rsvp_proposal(kind, send_response, start.as_deref(), end.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
         let event_id = match self.with_auth(|c| c.meeting_event_id(message_id)) {
             Ok(Some(id)) => id,
             Ok(None) => {
@@ -3387,8 +3471,18 @@ impl Engine {
                 return;
             }
         };
+        if let Some(e) = self.proposals_refused(&event_id, &proposed) {
+            self.emit(SyncEvent::Error(e));
+            return;
+        }
         match self.with_auth(|c| {
-            c.respond_event(&event_id, kind, comment.as_deref(), true, proposed.clone())
+            c.respond_event(
+                &event_id,
+                kind,
+                comment.as_deref(),
+                send_response,
+                proposed.clone(),
+            )
         }) {
             Ok(()) => self.emit(SyncEvent::MeetingResponded {
                 message_id: message_id.to_string(),
@@ -3606,18 +3700,18 @@ impl Engine {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        // A series edit's reset (#2022), decided now, as these rounds would
+        // An owed reset (#2022, #2023), decided now, as these rounds would
         // replace rows: only with no event op with a local write queued or
         // its command waiting. The waiting commands are taken first; a
         // shutdown or a body fetch that stopped the engine stops here too.
-        if self.series_reset_owed && !self.checkpoint() {
+        if self.calendar_reset_owed && !self.checkpoint() {
             return;
         }
-        if self.series_reset_ready() {
+        if self.calendar_reset_ready() {
             if let Err(e) = self.store.clear_calendar_deltas() {
                 self.emit(SyncEvent::Error(e.to_string()));
             } else {
-                self.series_reset_owed = false;
+                self.calendar_reset_owed = false;
             }
         }
         if !self.list_calendars_into_store() {
@@ -4080,7 +4174,7 @@ impl Engine {
                 // succeeded, rather than staying stuck if the first sync fails.
                 self.set_state(SyncState::Syncing);
                 self.sync_pass(true);
-                self.refresh_if_series_reset_owed();
+                self.refresh_if_calendar_reset_owed();
                 self.after_pass_if_fast();
             }
             Err(e) => {
@@ -6189,6 +6283,7 @@ mod tests {
                 message_id: "M1".into(),
                 kind: RsvpKind::Accept,
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             })
@@ -6250,6 +6345,7 @@ mod tests {
                 message_id: "M1".into(),
                 kind: RsvpKind::Decline,
                 comment: Some("push please".into()),
+                send_response: true,
                 proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
                 proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
             })
@@ -6309,6 +6405,7 @@ mod tests {
                 message_id: "M1".into(),
                 kind: RsvpKind::Decline,
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             })
@@ -11827,6 +11924,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: Some("see you there".into()),
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             })
@@ -11912,6 +12010,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             })
@@ -12081,6 +12180,7 @@ mod tests {
                 id: "E1".into(),
                 kind: "accepted".into(),
                 comment: None,
+                send_response: true,
                 proposed_start_utc: None,
                 proposed_end_utc: None,
             })
@@ -12113,6 +12213,565 @@ mod tests {
             "{views:?}"
         );
 
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Respond options and proposals (#2023) ---------------------------
+
+    /// The POSTed body of the first request to `path`, waiting for it.
+    fn posted_body(srv: &FakeServer, path: &str) -> crate::json::Value {
+        if !wait_until(ENGINE_WAIT, || {
+            srv.requests().iter().any(|r| r.path == path)
+        }) {
+            panic!("no POST to {path}; requests: {:?}", srv.requests());
+        }
+        let req = srv.requests().into_iter().find(|r| r.path == path).unwrap();
+        crate::json::parse(&req.body).unwrap()
+    }
+
+    fn respond(id: &str, kind: &str, send: bool, window: (&str, &str)) -> SyncCommand {
+        let some = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        SyncCommand::RespondEvent {
+            id: id.into(),
+            kind: kind.into(),
+            comment: None,
+            send_response: send,
+            proposed_start_utc: some(window.0),
+            proposed_end_utc: some(window.1),
+        }
+    }
+
+    /// A stored, answerable event `id` (status `none`), optionally one whose
+    /// organizer disallows proposals.
+    fn answerable(id: &str, allow_new_time_proposals: bool) -> NewEvent {
+        NewEvent {
+            response_status: "none".into(),
+            allow_new_time_proposals,
+            ..stored_event(id, "CAL-A", 3600)
+        }
+    }
+
+    #[test]
+    fn respond_event_without_sending_a_response() {
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "respond-event-no-response",
+            vec![post_route("/me/events/E1/tentativelyAccept", 202, "")],
+            |s| s.upsert_event(&answerable("E1", true)).unwrap(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::RespondEvent {
+                id: "E1".into(),
+                kind: "tentativelyAccepted".into(),
+                comment: Some("not sure yet".into()),
+                send_response: false,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let sent = posted_body(&srv, "/me/events/E1/tentativelyAccept");
+        assert_eq!(
+            sent.get("sendResponse")
+                .and_then(crate::json::Value::as_bool),
+            Some(false)
+        );
+        assert!(sent.get("proposedNewTime").is_none());
+        // The user's own status changes whether or not the organizer hears.
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            store.event("E1").unwrap().unwrap().response_status,
+            "tentativelyAccepted"
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn respond_event_sends_a_normalised_proposal_on_tentative() {
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine(
+            "respond-event-tentative-proposal",
+            vec![post_route("/me/events/E1/tentativelyAccept", 202, "")],
+            |s| s.upsert_event(&answerable("E1", true)).unwrap(),
+        );
+        handle
+            .cmd_tx
+            .send(respond(
+                "E1",
+                "tentativelyAccepted",
+                true,
+                ("2026-07-21T14:00:00.0000000", "2026-07-21T15:00:00Z"),
+            ))
+            .unwrap();
+        let sent = posted_body(&srv, "/me/events/E1/tentativelyAccept");
+        let pnt = sent.get("proposedNewTime").unwrap();
+        let dt = |side: &str| {
+            pnt.get(side)
+                .and_then(|d| d.get("dateTime"))
+                .and_then(crate::json::Value::as_str)
+                .map(str::to_string)
+        };
+        assert_eq!(dt("start").as_deref(), Some("2026-07-21T14:00:00"));
+        assert_eq!(dt("end").as_deref(), Some("2026-07-21T15:00:00"));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every refused response: an `Error` saying why, nothing written by the
+    /// engine (the seeded `none` stays: no calendar routes answer, so the
+    /// reset's refresh changes nothing either), nothing queued, and nothing
+    /// sent to Graph.
+    #[test]
+    fn respond_event_refusals_write_queue_and_send_nothing() {
+        let window = ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z");
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("respond-event-refusals", vec![], |s| {
+                s.upsert_event(&answerable("E1", true)).unwrap();
+                s.upsert_event(&answerable("E2", false)).unwrap();
+            });
+        let cases = [
+            (
+                respond("E1", "maybe", true, ("", "")),
+                "unrecognized RSVP kind",
+            ),
+            (respond("E1", "accepted", true, window), "an accept cannot"),
+            (
+                respond("E1", "tentativelyAccepted", false, window),
+                "requires sending a response",
+            ),
+            (
+                respond("E1", "declined", true, (window.0, "")),
+                "both a start and an end",
+            ),
+            (
+                respond("E1", "declined", true, ("", window.1)),
+                "both a start and an end",
+            ),
+            (
+                respond("E1", "declined", true, (window.1, window.0)),
+                "must end after it starts",
+            ),
+            (
+                respond("E2", "declined", true, window),
+                "does not allow new time proposals",
+            ),
+        ];
+        for (cmd, why) in cases {
+            handle.cmd_tx.send(cmd).unwrap();
+            let seen = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains(why)),
+            );
+            assert!(
+                !seen.iter().any(|e| matches!(e, SyncEvent::CalendarUpdated)),
+                "{why}: the engine wrote nothing before refusing: {seen:?}"
+            );
+        }
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        for id in ["E1", "E2"] {
+            assert_eq!(store.event(id).unwrap().unwrap().response_status, "none");
+        }
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events/")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host such as lookxy writes the status before it sends the command;
+    /// a refused response resets the calendars, so an initial round puts
+    /// Graph's status back on a row no delta round would name (#2013).
+    #[test]
+    fn a_refused_respond_event_restores_graphs_status() {
+        let (from, to) = today_window();
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("respond-event-refusal-reset", routes, |s| {
+                // The host's own optimistic write.
+                let e1 = NewEvent {
+                    response_status: "tentativelyAccepted".into(),
+                    ..stored_event("E1", "CAL-A", 3600)
+                };
+                seed_synced_calendar(s, "CAL-A", vec![e1], (&from, &to), &delta_link_of("CAL-A"));
+            });
+        handle
+            .cmd_tx
+            .send(respond(
+                "E1",
+                "tentativelyAccepted",
+                false,
+                ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z"),
+            ))
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("requires sending a response")),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.event("E1").unwrap().unwrap().response_status, "none");
+        assert_eq!(
+            view_paths(&srv, "CAL-A").last(),
+            Some(&initial_delta_path("CAL-A", &from, &to))
+        );
+        assert!(store.pending_ops().unwrap().is_empty());
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused response owes the calendars a reset (#2023), behind
+    /// #2022's gate: while an edit of another event waits under the
+    /// outbox's back-off (a 500), no initial round replaces its edited row,
+    /// so the PATCH that goes out still carries the edit. Once the queue is
+    /// empty the reset runs, and the refused event's host-written status
+    /// is Graph's again.
+    #[test]
+    fn a_refused_respond_event_resets_only_once_no_event_edit_waits() {
+        let (from, to) = today_window();
+        let initial = initial_delta_path("CAL-A", &from, &to);
+        let mut routes: Vec<(Route, Option<usize>)> = vec![
+            (patch_route("/me/events/X1", 500, ""), Some(1)),
+            (patch_route("/me/events/X1", 200, "{}"), None),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                // Graph still holds X's old subject and E1 unanswered.
+                vec![(
+                    "CAL-A",
+                    200,
+                    events_body(&[event_from_now("X1", 3600), event_from_now("E1", 7200)]),
+                )],
+            )
+            .into_iter()
+            .map(|r| (r, None)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "respond-event-refusal-waits",
+            routes,
+            |s| {
+                // E1: the host's own optimistic write of a refused response.
+                let e1 = NewEvent {
+                    response_status: "tentativelyAccepted".into(),
+                    ..stored_event("E1", "CAL-A", 7200)
+                };
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("X1", "CAL-A", 3600), e1],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+                let row = s.event("X1").unwrap().unwrap();
+                let fields = s
+                    .update_event_fields(
+                        "X1",
+                        &crate::store::LocalEventFields {
+                            subject: "Edited".into(),
+                            start_utc: row.start_utc,
+                            end_utc: row.end_utc,
+                            location: row.location,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                s.enqueue_op(&OutboxOp::UpdateEvent {
+                    id: "X1".into(),
+                    fields,
+                })
+                .unwrap();
+            },
+            EngineOptions::without_prefetch(),
+        );
+        // The startup pass met the 500: X's edit waits under the back-off.
+        handle
+            .cmd_tx
+            .send(respond(
+                "E1",
+                "tentativelyAccepted",
+                false,
+                ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z"),
+            ))
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("requires sending a response")),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            !paths_from(&srv, 0).contains(&initial),
+            "an initial round ran while X's edit waits: {:?}",
+            method_paths(&srv)
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        assert_eq!(
+            store.event("E1").unwrap().unwrap().response_status,
+            "tentativelyAccepted",
+            "the reset waits too"
+        );
+        assert!(matches!(
+            &store.pending_ops().unwrap()[..],
+            [OutboxRow { op: OutboxOp::UpdateEvent { id, .. }, .. }] if id == "X1"
+        ));
+
+        // F9 resends X's edit, which carries the edited subject; the owed
+        // reset then runs.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "X's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        assert!(
+            wait_until(ENGINE_WAIT, || {
+                store.event("E1").unwrap().unwrap().response_status == "none"
+            }),
+            "E1's status never came back: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH" && r.path == "/me/events/X1")
+            .collect();
+        assert_eq!(patches.len(), 2, "{:?}", method_paths(&srv));
+        let sent = crate::json::parse(&patches[1].body).unwrap();
+        assert_eq!(
+            sent.get("subject").and_then(crate::json::Value::as_str),
+            Some("Edited")
+        );
+        assert!(
+            requests_after_patch(&srv, "/me/events/X1", 1)
+                .iter()
+                .any(|(_, p)| *p == initial),
+            "no reset after X's edit: {:?}",
+            method_paths(&srv)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A response refused while signed out owes the reset until the
+    /// sign-in, whose refresh then puts Graph's status back.
+    #[test]
+    fn a_respond_event_refused_signed_out_resets_after_sign_in() {
+        let (from, to) = today_window();
+        let mut routes = vec![token_route(
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        )];
+        routes.extend(calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        ));
+        routes.extend(backfill_routes());
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("respond-event-refused-signed-out");
+        let store_path = dir.join("mail.db");
+        {
+            let s = Store::open(&store_path).unwrap();
+            let e1 = NewEvent {
+                response_status: "tentativelyAccepted".into(),
+                ..stored_event("E1", "CAL-A", 3600)
+            };
+            seed_synced_calendar(&s, "CAL-A", vec![e1], (&from, &to), &delta_link_of("CAL-A"));
+        }
+        // No token: the engine starts signed out.
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        handle
+            .cmd_tx
+            .send(respond(
+                "E1",
+                "accepted",
+                true,
+                ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z"),
+            ))
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("an accept cannot")),
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            store.event("E1").unwrap().unwrap().response_status,
+            "tentativelyAccepted"
+        );
+        sign_in_through_loopback(&handle);
+        assert!(
+            wait_until(ENGINE_WAIT, || {
+                store.event("E1").unwrap().unwrap().response_status == "none"
+            }),
+            "E1's status never came back: {:?}",
+            method_paths(&srv)
+        );
+        assert!(paths_from(&srv, 0).contains(&initial_delta_path("CAL-A", &from, &to)));
+        finish(handle, dir);
+    }
+
+    fn invite_route() -> Route {
+        get_route("/me/messages/M1", 200, r#"{"id":"M1","event":{"id":"E1"}}"#)
+    }
+
+    fn respond_meeting(kind: RsvpKind, send: bool, window: Option<(&str, &str)>) -> SyncCommand {
+        SyncCommand::RespondMeeting {
+            message_id: "M1".into(),
+            kind,
+            comment: Some("from the invite".into()),
+            send_response: send,
+            proposed_start_utc: window.map(|w| w.0.to_string()),
+            proposed_end_utc: window.map(|w| w.1.to_string()),
+        }
+    }
+
+    #[test]
+    fn respond_meeting_without_sending_a_response() {
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine(
+            "respond-meeting-no-response",
+            vec![invite_route(), post_route("/me/events/E1/decline", 202, "")],
+            |_| {},
+        );
+        handle
+            .cmd_tx
+            .send(respond_meeting(RsvpKind::Decline, false, None))
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MeetingResponded { .. })
+        });
+        let sent = posted_body(&srv, "/me/events/E1/decline");
+        assert_eq!(
+            sent.get("sendResponse")
+                .and_then(crate::json::Value::as_bool),
+            Some(false)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refused invite response never asks for the invite's event (the
+    /// proposal checks), or stops before the POST once the event's stored
+    /// row disallows proposals.
+    #[test]
+    fn respond_meeting_refusals_send_nothing() {
+        let window = ("2026-07-21T14:00:00Z", "2026-07-21T15:00:00Z");
+        let (srv, handle, _store_path, dir) = spawn_calendar_engine(
+            "respond-meeting-refusals",
+            vec![invite_route(), post_route("/me/events/E1/", 202, "")],
+            |s| s.upsert_event(&answerable("E1", false)).unwrap(),
+        );
+        let early = [
+            (
+                respond_meeting(RsvpKind::Accept, true, Some(window)),
+                "an accept cannot",
+            ),
+            (
+                respond_meeting(RsvpKind::Tentative, false, Some(window)),
+                "requires sending a response",
+            ),
+            (
+                respond_meeting(RsvpKind::Decline, true, Some((window.0, ""))),
+                "both a start and an end",
+            ),
+            (
+                respond_meeting(RsvpKind::Decline, true, Some((window.1, window.0))),
+                "must end after it starts",
+            ),
+        ];
+        for (cmd, why) in early {
+            handle.cmd_tx.send(cmd).unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains(why)),
+            );
+        }
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/messages/M1")),
+            "no event id was asked for: {:?}",
+            srv.requests()
+        );
+        handle
+            .cmd_tx
+            .send(respond_meeting(RsvpKind::Tentative, true, Some(window)))
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.contains("does not allow new time proposals")),
+        );
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events/")),
+            "{:?}",
+            srv.requests()
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The organizer's view: a calendar sync stores each attendee's
+    /// proposed new time.
+    #[test]
+    fn calendar_sync_stores_an_attendees_proposal() {
+        let proposing = r#""attendees":[
+            {"type":"required","status":{"response":"tentativelyAccepted"},
+             "proposedNewTime":{
+               "start":{"dateTime":"2026-07-21T14:00:00.0000000","timeZone":"UTC"},
+               "end":{"dateTime":"2026-07-21T15:00:00.0000000","timeZone":"UTC"}},
+             "emailAddress":{"name":"Bob","address":"bob@x"}},
+            {"type":"required","status":{"response":"accepted"},"proposedNewTime":null,
+             "emailAddress":{"name":"Ann","address":"ann@x"}}]"#;
+        let event = event_from_now("E1", 3600).replace(
+            r#""attendees":[{"type":"required","status":{"response":"none"},"emailAddress":{"name":"Bob","address":"bob@x"}}]"#,
+            proposing,
+        );
+        assert!(event.contains("proposedNewTime"));
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event]))],
+        );
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-sync-proposal", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarUpdated));
+        let store = Store::open(&store_path).unwrap();
+        let atts = store.event_attendees("E1").unwrap();
+        let slot = |addr: &str| {
+            let a = atts.iter().find(|a| a.addr == addr).unwrap();
+            (a.proposed_start_utc.clone(), a.proposed_end_utc.clone())
+        };
+        assert_eq!(
+            slot("bob@x"),
+            (
+                "2026-07-21T14:00:00Z".to_string(),
+                "2026-07-21T15:00:00Z".to_string()
+            )
+        );
+        assert_eq!(slot("ann@x"), (String::new(), String::new()));
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
