@@ -9,8 +9,16 @@
 //! [`crate::ext`] (`tests/ext_doc_view_api.rs` holds the same surface to that
 //! from outside the crate), records every link the view hands it and counts
 //! its change events (#1947).
+//!
+//! `ext fixture ribbon` (#1870) has it describe a two-tab ribbon to the suite
+//! ([`fixture_ribbon`]): it records each command the suite runs, flips its
+//! Flag toggle and its density gallery on their commands, and keeps the
+//! last theme the suite told it ([`RibbonState`]).
 
-use crate::ext::{self, DocView, TabSurface};
+use crate::ext::{
+    self, DocView, Ribbon, RibbonCommand, RibbonControl, RibbonDropdown, RibbonGallery,
+    RibbonGroup, RibbonIcon, RibbonSplit, RibbonTab, SuiteTheme, TabSurface,
+};
 use docxcore::model::Document;
 use docxcore::package::{Package, new_package};
 use gpui::prelude::FluentBuilder as _;
@@ -48,6 +56,167 @@ pub(crate) struct FixtureView {
     /// The header line's own focus, as a host's chrome beside the view may
     /// have (a press on it takes the keys from the view, #2003).
     header_focus: FocusHandle,
+    /// The ribbon it describes to the suite, in `ext fixture ribbon` (#1870).
+    pub(crate) ribbon: Option<Rc<RibbonState>>,
+    /// Every theme the suite told it, the last one last (#1870).
+    pub(crate) themes: Rc<RefCell<Vec<SuiteTheme>>>,
+}
+
+impl FixtureView {
+    /// Whether its header line has the keys (#1870).
+    pub(crate) fn header_focused(&self, window: &Window) -> bool {
+        self.header_focus.is_focused(window)
+    }
+
+    /// Its ribbon state and the themes it was told, for the harness.
+    pub(crate) fn clone_parts(&self) -> (Option<Rc<RibbonState>>, Vec<SuiteTheme>) {
+        (self.ribbon.clone(), self.themes.borrow().clone())
+    }
+}
+
+/// The ribbon variant's state (#1870).
+#[derive(Default)]
+pub(crate) struct RibbonState {
+    /// Each command id the suite ran, in order.
+    pub(crate) actions: RefCell<Vec<String>>,
+    /// The Flag toggle, flipped by its own command.
+    pub(crate) flag: Cell<bool>,
+    /// Whether Archive is enabled (`ext-ribbon-set`).
+    pub(crate) archive_enabled: Cell<bool>,
+    /// The density gallery's checked item.
+    pub(crate) density: Cell<usize>,
+}
+
+/// The density gallery's items: id and label.
+const DENSITIES: [(&str, &str); 3] = [
+    ("fx.density.compact", "Compact"),
+    ("fx.density.cozy", "Cozy"),
+    ("fx.density.roomy", "Roomy"),
+];
+
+/// The Reply command's icon: an arrow, in the shape of Fluent's.
+const REPLY_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\" fill=\"currentColor\"><path d=\"M8.35 4.15a.5.5 0 0 1 0 .7L4.71 8.5H11a6 6 0 0 1 6 6v1a.5.5 0 0 1-1 0v-1a5 5 0 0 0-5-5H4.7l3.65 3.65a.5.5 0 0 1-.7.7l-4.5-4.5a.5.5 0 0 1 0-.7l4.5-4.5a.5.5 0 0 1 .7 0Z\"/></svg>";
+
+/// A tag's icon: a filled circle.
+const TAG_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\" fill=\"currentColor\"><circle cx=\"10\" cy=\"10\" r=\"6\"/></svg>";
+
+/// The ribbon the variant describes: Message (KeyTip `M`) with Respond
+/// (Reply, a column of three, the Flag toggle), Move (the Move split, a
+/// disabled-until-set Archive) and Tags (the lowest priority: a column of
+/// three tags and two large buttons with no icon, wide enough to collapse
+/// in a narrow window), and View (`V`) with a Sort drop-down and the
+/// density gallery.
+pub(crate) fn fixture_ribbon(state: &RibbonState) -> Ribbon {
+    let c = RibbonCommand::new;
+    Ribbon::new(vec![
+        RibbonTab::new(
+            "Message",
+            "M",
+            vec![
+                RibbonGroup::new(
+                    "Respond",
+                    vec![
+                        RibbonControl::Large(
+                            c("fx.reply", "Reply")
+                                .icon(RibbonIcon::svg(REPLY_SVG.as_bytes()))
+                                .tip("Reply to the sender")
+                                .key_tip("R"),
+                        ),
+                        RibbonControl::Small(vec![
+                            c("fx.reply-all", "Reply All")
+                                .icon(RibbonIcon::svg(REPLY_SVG.as_bytes()))
+                                .key_tip("A"),
+                            c("fx.forward", "Forward").key_tip("W"),
+                            c("fx.meeting", "Meeting"),
+                        ]),
+                        RibbonControl::Toggle(
+                            c("fx.flag", "Flag").key_tip("G").checked(state.flag.get()),
+                        ),
+                    ],
+                )
+                .priority(100),
+                RibbonGroup::new(
+                    "Move",
+                    vec![
+                        RibbonControl::Split(RibbonSplit::new(
+                            c("fx.move", "Move").key_tip("MV"),
+                            vec![
+                                c("fx.move.inbox", "Inbox").key_tip("I"),
+                                c("fx.move.later", "Later").key_tip("L"),
+                            ],
+                        )),
+                        RibbonControl::Large(
+                            c("fx.archive", "Archive")
+                                .key_tip("H")
+                                .enabled(state.archive_enabled.get()),
+                        ),
+                    ],
+                )
+                .priority(40),
+                RibbonGroup::new(
+                    "Tags",
+                    vec![
+                        RibbonControl::Small(
+                            [
+                                ("fx.tag.red", "Red tag"),
+                                ("fx.tag.blue", "Blue tag"),
+                                ("fx.tag.green", "Green tag"),
+                            ]
+                            .into_iter()
+                            .map(|(id, label)| {
+                                c(id, label).icon(RibbonIcon::svg(TAG_SVG.as_bytes()))
+                            })
+                            .collect(),
+                        ),
+                        RibbonControl::Large(c("fx.categorize", "Assign Category")),
+                        RibbonControl::Large(c("fx.follow-up", "Follow Up Later")),
+                    ],
+                )
+                .priority(20),
+            ],
+        ),
+        RibbonTab::new(
+            "View",
+            "V",
+            vec![RibbonGroup::new(
+                "Arrange",
+                vec![
+                    RibbonControl::Dropdown(RibbonDropdown::new(
+                        c("fx.sort", "Sort").key_tip("S"),
+                        vec![
+                            c("fx.sort.date", "By Date").key_tip("D"),
+                            c("fx.sort.from", "By Sender").key_tip("N"),
+                        ],
+                    )),
+                    RibbonControl::Gallery(
+                        RibbonGallery::new(
+                            "fx.density",
+                            DENSITIES
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (id, label))| {
+                                    c(id, label).checked(i == state.density.get())
+                                })
+                                .collect(),
+                        )
+                        .tip("Density")
+                        .key_tip("Y"),
+                    ),
+                ],
+            )],
+        ),
+    ])
+}
+
+/// What a command of the variant's ribbon does to its state.
+fn run_ribbon_action(state: &RibbonState, id: &str) {
+    state.actions.borrow_mut().push(id.to_string());
+    if id == "fx.flag" {
+        state.flag.set(!state.flag.get());
+    }
+    if let Some(i) = DENSITIES.iter().position(|(d, _)| *d == id) {
+        state.density.set(i);
+    }
 }
 
 impl Render for FixtureView {
@@ -80,6 +249,12 @@ struct FixtureMail {
     root: Entity<FixtureView>,
 }
 
+impl FixtureMail {
+    fn ribbon_state(&self, cx: &App) -> Option<Rc<RibbonState>> {
+        self.root.read(cx).ribbon.clone()
+    }
+}
+
 impl TabSurface for FixtureMail {
     fn view(&self) -> AnyView {
         self.root.clone().into()
@@ -88,11 +263,26 @@ impl TabSurface for FixtureMail {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.root.read(cx).doc.read(cx).focus_handle()
     }
+
+    fn ribbon(&self, cx: &App) -> Option<Ribbon> {
+        self.ribbon_state(cx).map(|s| fixture_ribbon(&s))
+    }
+
+    fn ribbon_action(&self, id: &str, _window: &mut Window, cx: &mut App) {
+        if let Some(s) = self.ribbon_state(cx) {
+            run_ribbon_action(&s, id);
+        }
+    }
+
+    fn theme_changed(&self, theme: &SuiteTheme, cx: &mut App) {
+        self.root.read(cx).themes.borrow_mut().push(*theme);
+    }
 }
 
-/// The fixture's Mail factory.
-pub(crate) fn factory() -> ext::Factory {
-    Rc::new(|cx: &mut App| {
+/// The fixture's Mail factory; with `ribbon` its surface describes
+/// [`fixture_ribbon`] to the suite (#1870).
+pub(crate) fn factory(ribbon: bool) -> ext::Factory {
+    Rc::new(move |cx: &mut App| {
         let (doc, pkg) = fixture_document();
         let calls: Rc<RefCell<Vec<String>>> = Rc::default();
         let changes: Rc<Cell<usize>> = Rc::default();
@@ -108,6 +298,8 @@ pub(crate) fn factory() -> ext::Factory {
             link_calls: calls,
             change_calls: changes,
             header_focus: cx.focus_handle(),
+            ribbon: ribbon.then(Rc::default),
+            themes: Rc::default(),
         });
         Ok(Box::new(FixtureMail { root }) as Box<dyn TabSurface>)
     })
@@ -292,6 +484,22 @@ mod tests {
         // A table cell's paragraph is reached by its path.
         let a2 = docxcore::editor::resolve_para(&doc.body, &[5, 1, 0, 0]).expect("A2");
         assert_eq!(a2.plain_text(), "A2");
+    }
+
+    #[test]
+    fn the_fixture_ribbon_flips_its_toggle_and_gallery_and_records_ids() {
+        let state = RibbonState::default();
+        let r = crate::ext_ribbon::convert(&fixture_ribbon(&state));
+        assert_eq!(r.tab_names(), vec![("Message", "M"), ("View", "V")]);
+        assert!(!r.checked("fx.flag") && !r.enabled("fx.archive"));
+        assert!(r.checked("fx.density.compact"));
+        run_ribbon_action(&state, "fx.flag");
+        run_ribbon_action(&state, "fx.density.roomy");
+        state.archive_enabled.set(true);
+        let r = crate::ext_ribbon::convert(&fixture_ribbon(&state));
+        assert!(r.checked("fx.flag") && r.enabled("fx.archive"));
+        assert!(r.checked("fx.density.roomy") && !r.checked("fx.density.compact"));
+        assert_eq!(*state.actions.borrow(), ["fx.flag", "fx.density.roomy"]);
     }
 
     #[test]

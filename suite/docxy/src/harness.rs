@@ -352,6 +352,13 @@ pub fn ext_fixture_requested() -> bool {
     ext_fixture_marker(&crate::config_root()).is_file()
 }
 
+/// Whether the marker asks for the test extension's ribbon (#1870): it
+/// reads `ribbon` (`uiharness`'s `ext fixture ribbon` line).
+pub fn ext_fixture_ribbon_requested() -> bool {
+    std::fs::read(ext_fixture_marker(&crate::config_root()))
+        .is_ok_and(|b| b.trim_ascii() == b"ribbon")
+}
+
 /// Start the control server for a config root at `root`, named for the mode
 /// it serves (see [`instance_name`]).
 pub fn start(
@@ -996,6 +1003,10 @@ pub enum Region {
     RibbonLaunch(&'static str),
     /// A bounded in-place swatch gallery's More button, by gallery id (#1823).
     GalleryMore(&'static str),
+    /// An extension ribbon's command, by its id (#1870): a button, a split's
+    /// upper half or a drop-down, in place or in an open group flyout, or a
+    /// gallery tile drawn in place.
+    ExtRibbonCmd(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// The File screen's scrolling content pane (#1028).
@@ -1102,6 +1113,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .filter(|a| !a.is_empty())
                 .ok_or("'gallery-more' needs a gallery id, e.g. gallery-more:fixture.wide")?;
             Ok(Region::GalleryMore(crate::plugin_ui::intern(a)))
+        }
+        "ext-ribbon-cmd" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'ext-ribbon-cmd' needs a command id, e.g. ext-ribbon-cmd:fx.reply")?;
+            Ok(Region::ExtRibbonCmd(crate::plugin_ui::intern(a)))
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
@@ -1255,6 +1272,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonGroup(i) => format!("ribbon-group:{i}"),
         Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
         Region::GalleryMore(id) => format!("gallery-more:{id}"),
+        Region::ExtRibbonCmd(id) => format!("ext-ribbon-cmd:{id}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
@@ -1622,6 +1640,48 @@ fn ext_fixture_view(
     e.view()
         .downcast::<crate::ext_fixture::FixtureView>()
         .map_err(|_| "the active tab is not the test extension's".to_string())
+}
+
+/// `ext-ribbon-read`'s reply (#1870): `ribbon` (whether the extension
+/// describes one), `actions` (the ids the suite ran), `flag`,
+/// `archive_enabled`, `density` (the checked gallery item's index),
+/// `theme_calls` and `theme` (the last told: `dark` and each colour as
+/// `rrggbb`, null before any); the verb adds `header_focused`.
+fn ext_ribbon_json(
+    (state, themes): &(
+        Option<std::rc::Rc<crate::ext_fixture::RibbonState>>,
+        Vec<crate::ext::SuiteTheme>,
+    ),
+) -> Json {
+    let hex = |c| Json::Str(crate::doc_view::ink_hex(c));
+    let theme = themes.last().map_or(Json::Null, |t| {
+        Json::obj(vec![
+            ("dark", Json::Bool(t.dark)),
+            ("background", hex(t.background)),
+            ("panel", hex(t.panel)),
+            ("border", hex(t.border)),
+            ("accent", hex(t.accent)),
+            ("text", hex(t.text)),
+            ("muted_text", hex(t.muted_text)),
+            ("selection", hex(t.selection)),
+        ])
+    });
+    let mut fields = vec![("ribbon", Json::Bool(state.is_some()))];
+    if let Some(s) = state {
+        let actions = s
+            .actions
+            .borrow()
+            .iter()
+            .map(|a| Json::Str(a.clone()))
+            .collect();
+        fields.push(("actions", Json::Arr(actions)));
+        fields.push(("flag", Json::Bool(s.flag.get())));
+        fields.push(("archive_enabled", Json::Bool(s.archive_enabled.get())));
+        fields.push(("density", Json::Num(s.density.get() as f64)));
+    }
+    fields.push(("theme_calls", Json::Num(themes.len() as f64)));
+    fields.push(("theme", theme));
+    Json::obj(fields)
 }
 
 /// `ext-doc-set`'s page inset and background, each `None` when not given
@@ -2759,7 +2819,8 @@ pub(crate) fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
 /// Which ribbon the active tab draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RibbonSurface {
-    /// The declarative document/Project ribbon (`ribbon_for`).
+    /// The declarative ribbonspec model: the document's and Project's
+    /// (`ribbon_for`), or an extension's tab's (#1870, `ext_ribbon`).
     Model,
     /// The spreadsheet ribbon (`sheet_ribbon::SHEET_RIBBON`).
     Sheet,
@@ -2775,6 +2836,10 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<RibbonSurface, String> {
     }
     match app.tabs.get(app.active).map(|t| &t.surface) {
         Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(RibbonSurface::Model),
+        // An extension's tab whose surface describes a ribbon (#1870).
+        Some(crate::Surface::Ext(_)) if app.active_ext_ribbon().is_some() => {
+            Ok(RibbonSurface::Model)
+        }
         Some(crate::Surface::Sheet(_)) => Ok(RibbonSurface::Sheet),
         _ => Err("the active tab has no ribbon".into()),
     }
@@ -3524,6 +3589,17 @@ fn set_live_qat(json: &mut Json, state: crate::QatState) {
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
     let (kind, in_table) = (app.ribbon_kind(), app.caret_in_table());
+    // An extension's ribbon (#1870): File, then its tabs.
+    if let Some(r) = app.active_ext_ribbon() {
+        let checked = |command: &RibbonCommand| app.act_active(command.act);
+        let enabled = |act| app.act_enabled_now(act);
+        let mut tabs = vec![file_tab_json(kind)];
+        tabs.extend(r.tabs.iter().map(|t| tab_json(t, &checked, &enabled)));
+        let mut json = ribbon_reply(tabs);
+        set_live_qat(&mut json, app.qat_state());
+        add_drawn_galleries(&mut json, &app.drawn_galleries.borrow());
+        return json;
+    }
     let mut json = ribbon_json_with(
         kind,
         in_table,
@@ -3633,6 +3709,19 @@ fn add_combo_values(json: &mut Json, app: &crate::Docxy) {
     }
 }
 
+/// The ribbon tab `name` names on the active tab: an extension's own
+/// (#1870), else one of its kind's.
+fn ribbon_tab_named(app: &crate::Docxy, name: &str) -> Result<crate::RibbonTab, String> {
+    if app.active_ext_ribbon().is_some() {
+        return app
+            .ribbon_tab_names()
+            .into_iter()
+            .find_map(|(tab, label, _)| (label == name).then_some(tab).flatten())
+            .ok_or_else(|| format!("'{name}' is not a ribbon tab of the extension"));
+    }
+    ribbon_tab_by_name(app.ribbon_kind(), name)
+}
+
 /// Resolve a currently valid tab name before a synthetic ribbon click.
 fn ribbon_tab_by_name(kind: crate::Kind, name: &str) -> Result<crate::RibbonTab, String> {
     crate::ribbon_tab_set(kind)
@@ -3681,6 +3770,15 @@ fn ribbon_tab_def(
     tab_name: &str,
 ) -> Result<crate::rs::Tab<crate::Act>, String> {
     let kind = app.ribbon_kind();
+    // An extension's tab (#1870).
+    if let Some(r) = app.active_ext_ribbon() {
+        return r
+            .tabs
+            .iter()
+            .find(|t| t.name == tab_name)
+            .cloned()
+            .ok_or_else(|| format!("'{tab_name}' is not a ribbon tab of the extension"));
+    }
     ribbon_tab_by_name(kind, tab_name)?;
     let in_table = app.caret_in_table();
     let tab = if tab_name == crate::table_tab::DESIGN_TAB
@@ -3976,7 +4074,7 @@ fn menu_open(
                 }
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
-                app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
+                app.select_ribbon_tab(ribbon_tab_named(app, tab)?, window, cx);
                 // Where the pointer's press on the arrow opens it too.
                 open_ribbon_split_menu(app, id, window, cx)
             }
@@ -4225,7 +4323,7 @@ fn help_open(
     };
     let area = match text("area")? {
         Some(a) => a,
-        None => crate::ribbon_tab_name(app.ribbon_tab).to_string(),
+        None => app.ribbon_tab_label(app.ribbon_tab).to_string(),
     };
     let (at, via) = if let Some(page) = text("page")? {
         if bundle.manual.page(&page).is_none() {
@@ -4514,16 +4612,7 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
         ("fx_expanded", Json::Bool(app.fx_expanded)),
         (
             "ribbon_tab",
-            Json::Str(
-                crate::ribbon_tab_name(crate::valid_ribbon_tab(
-                    app.ribbon_kind(),
-                    app.ribbon_tab,
-                    app.caret_in_table(),
-                    app.project_gantt_showing(),
-                    app.hf_active(),
-                ))
-                .into(),
-            ),
+            Json::Str(app.ribbon_tab_label(app.valid_ribbon_tab_now()).into()),
         ),
         (
             "title",
@@ -4944,6 +5033,9 @@ fn dispatch_verb(
     // or not a frame ran in between. The verb that asks for one replies
     // before it runs, with `app_state` "Busy".
     app.flush_project_passes(cx);
+    // An extension's ribbon read before `ext::ribbon_changed` is read again
+    // (#1870), so a verb never answers from a stale one without a frame.
+    app.refresh_ext_ribbons(false, cx);
     // A converted tab restored from the session converts before a verb can
     // reach its placeholder (#633), as `select_tab` does for a person.
     if let Some(t) = app.tabs.get_mut(app.active) {
@@ -5471,6 +5563,39 @@ fn dispatch_verb(
             ));
             Done::ok(Json::Obj(reply))
         }
+        // The test extension's side of the suite's ribbon (#1870): the
+        // commands the suite ran, its toggle and Archive state, and the
+        // themes the suite told it. `ext-ribbon-set {archive_enabled}`
+        // changes its state and says so through `ext::ribbon_changed`, as
+        // an extension's own model would; the suite reads the ribbon again
+        // before the next verb or frame.
+        "ext-ribbon-read" => {
+            let fixture = ext_fixture_view(app)?;
+            let f = fixture.read(cx);
+            let mut reply = ext_ribbon_json(&f.clone_parts());
+            // Whether the fixture's header line has the keys (#1870 r1).
+            if let Json::Obj(fields) = &mut reply {
+                fields.push((
+                    "header_focused".into(),
+                    Json::Bool(f.header_focused(window)),
+                ));
+            }
+            Done::ok(reply)
+        }
+        "ext-ribbon-set" => {
+            let fixture = ext_fixture_view(app)?;
+            let parts = fixture.read(cx).clone_parts();
+            let state = parts.0.as_ref().ok_or(
+                "the test extension describes no ribbon (start the case with 'ext fixture ribbon')",
+            )?;
+            match args.get("archive_enabled") {
+                Some(Json::Bool(on)) => state.archive_enabled.set(*on),
+                Some(_) => return Err("'archive_enabled' must be true or false".into()),
+                None => return Err("ext-ribbon-set takes 'archive_enabled'".into()),
+            }
+            crate::ext::ribbon_changed(cx);
+            Done::ok(ext_ribbon_json(&parts))
+        }
         // The host's calls on the view (#1947): one formatting command, an
         // undo or a redo, an insert, a copy or a cut (#1977), through the
         // view's public API; the reply is what it
@@ -5740,11 +5865,10 @@ fn dispatch_verb(
                 // Showing a tab is a press; the plain read works under a dialog.
                 app.refuse_under_dialog()?;
                 let want = want.as_str().ok_or("'tab' must be a tab name")?;
-                let kind = match surface {
-                    RibbonSurface::Sheet => crate::Kind::Xlsx,
-                    RibbonSurface::Model => app.ribbon_kind(),
+                let tab = match surface {
+                    RibbonSurface::Sheet => ribbon_tab_by_name(crate::Kind::Xlsx, want)?,
+                    RibbonSurface::Model => ribbon_tab_named(app, want)?,
                 };
-                let tab = ribbon_tab_by_name(kind, want)?;
                 // The model ribbon's contextual tabs exist only in context.
                 if surface == RibbonSurface::Model {
                     ribbon_tab_def(app, want)?;
@@ -5862,7 +5986,7 @@ fn dispatch_verb(
                 return Done::ok(state_for_selection(app, window, cx));
             }
             let act = resolve_ribbon_command(app, &tab, &command)?;
-            app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
+            app.select_ribbon_tab(ribbon_tab_named(app, &tab)?, window, cx);
             let group = ribbon_group_of(app, &tab, &command);
             open_flyout_of(app, group, window);
             app.dispatch(act, window, cx);
@@ -10745,6 +10869,7 @@ mod tests {
             Region::RibbonLaunch("Number"),
             Region::RibbonLaunch("Page Setup"),
             Region::GalleryMore("fixture.wide"),
+            Region::ExtRibbonCmd("fx.reply"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),

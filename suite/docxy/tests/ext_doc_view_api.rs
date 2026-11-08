@@ -141,3 +141,106 @@ fn the_document_view_is_public_api() {
     let _ = compose as fn(Document, Package, &mut App) -> Rc<Cell<usize>>;
     assert_eq!(LinkClick::default(), LinkClick::CtrlClick);
 }
+
+/// A surface that describes its ribbon to the suite and reads the suite's
+/// theme (#1870), every control kind built through the public constructors
+/// only, as an extension crate must (the types are `#[non_exhaustive]`).
+struct Mailbox {
+    reader: Reader,
+    flagged: Rc<Cell<bool>>,
+    theme: Rc<Cell<Option<ext::SuiteTheme>>>,
+}
+
+impl TabSurface for Mailbox {
+    fn view(&self) -> AnyView {
+        self.reader.view()
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.reader.focus_handle(cx)
+    }
+
+    fn ribbon(&self, _cx: &App) -> Option<ext::Ribbon> {
+        use ext::{
+            Ribbon, RibbonCommand, RibbonControl, RibbonDropdown, RibbonGallery, RibbonGroup,
+            RibbonIcon, RibbonSplit, RibbonTab,
+        };
+        let icon = RibbonIcon::svg(b"<svg xmlns='http://www.w3.org/2000/svg'/>".as_slice());
+        let _source: &[u8] = icon.source();
+        let reply = RibbonCommand::new("reply", "Reply")
+            .icon(icon)
+            .tip("Reply to the sender")
+            .key_tip("R");
+        let respond = RibbonGroup::new(
+            "Respond",
+            vec![
+                RibbonControl::Large(reply),
+                RibbonControl::Small(vec![
+                    RibbonCommand::new("forward", "Forward"),
+                    RibbonCommand::new("junk", "Junk").enabled(false),
+                ]),
+                RibbonControl::Toggle(
+                    RibbonCommand::new("flag", "Flag").checked(self.flagged.get()),
+                ),
+                RibbonControl::Split(RibbonSplit::new(
+                    RibbonCommand::new("move", "Move"),
+                    vec![RibbonCommand::new("move.inbox", "Inbox")],
+                )),
+                RibbonControl::Dropdown(RibbonDropdown::new(
+                    RibbonCommand::new("sort", "Sort"),
+                    vec![RibbonCommand::new("sort.date", "By Date")],
+                )),
+                RibbonControl::Gallery(
+                    RibbonGallery::new("density", vec![RibbonCommand::new("d1", "Compact")])
+                        .tip("Density")
+                        .key_tip("D"),
+                ),
+            ],
+        )
+        .priority(120);
+        let mut ribbon = Ribbon::new(vec![RibbonTab::new("Message", "M", vec![respond])]);
+        // Its fields stay readable and writable.
+        ribbon.tabs[0].groups[0].title.push_str(" now");
+        let _names: Vec<&str> = ribbon.tabs.iter().map(|t| t.name.as_str()).collect();
+        Some(ribbon)
+    }
+
+    fn ribbon_action(&self, id: &str, _window: &mut Window, cx: &mut App) {
+        if id == "flag" {
+            self.flagged.set(!self.flagged.get());
+        }
+        // The window-free call a model or a background task makes too.
+        ext::ribbon_changed(cx);
+    }
+
+    fn theme_changed(&self, theme: &ext::SuiteTheme, cx: &mut App) {
+        let now: ext::SuiteTheme = ext::suite_theme(cx);
+        let _colours: [Hsla; 7] = [
+            now.background,
+            now.panel,
+            now.border,
+            now.accent,
+            now.text,
+            now.muted_text,
+            now.selection,
+        ];
+        let _dark: bool = theme.dark;
+        self.theme.set(Some(*theme));
+    }
+}
+
+#[test]
+fn an_extension_ribbon_is_public_api() {
+    let _ = <Mailbox as TabSurface>::ribbon as fn(&Mailbox, &App) -> Option<ext::Ribbon>;
+    let _ = ext::suite_theme as fn(&App) -> ext::SuiteTheme;
+    let _ = ext::ribbon_changed as fn(&mut App);
+    // A command is enabled and not checked unless set; a group's priority
+    // is the middle of the suite's.
+    let c = ext::RibbonCommand::new("id", "Label");
+    assert!(c.enabled && !c.checked && c.icon.is_none());
+    assert!(c.tip.is_empty() && c.key_tip.is_empty());
+    let g = ext::RibbonGroup::new("Group", vec![ext::RibbonControl::Large(c)]);
+    assert_eq!(g.priority, 50);
+    assert_eq!(g.priority(7).priority, 7);
+    assert!(ext::Ribbon::default().tabs.is_empty());
+}

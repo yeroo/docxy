@@ -77,7 +77,8 @@ key and mouse bytes into its terminal (#1204). A suite script may start with
 `plugin <name>` lines: each format plugin named (yppx_fixture, the test
 fixture) is copied from beside uiharness into the sandbox's docxy/plugins
 before the suite starts. An `ext fixture` line has its Mail tabs drawn by
-the suite's test extension, an embedded document view (#1873).
+the suite's test extension, an embedded document view (#1873); `ext fixture
+ribbon` has it describe its ribbon to the suite (#1870).
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -499,7 +500,8 @@ fn run_scripts(a: &Args) -> Result<String, String> {
             break;
         }
         if script.ext_fixture
-            && let Err(e) = uiharness::launch::request_ext_fixture(&sandbox)
+            && let Err(e) =
+                uiharness::launch::request_ext_fixture(&sandbox, script.ext_fixture_ribbon)
         {
             all_passed = false;
             out.push_str(&format!("  ERROR {e}\n"));

@@ -56,6 +56,7 @@ mod doc_templates_tests;
 mod doc_view;
 pub mod ext;
 mod ext_fixture;
+mod ext_ribbon;
 mod field_edit;
 mod file_keys;
 mod font_box;
@@ -204,6 +205,10 @@ impl AssetSource for DocxyAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         if let Some(f) = Icons::get(path) {
             return Ok(Some(f.data));
+        }
+        // An extension's ribbon icon (#1870), `icons/ext/<hash>.svg`.
+        if let Some(svg) = ext_ribbon::icon_asset(path) {
+            return Ok(Some(Cow::Owned(svg.to_vec())));
         }
         gpui_component_assets::Assets.load(path)
     }
@@ -602,6 +607,9 @@ enum RibbonTab {
     GanttFormat,
     /// The Help tab every ribbon ends with (#1021).
     Help,
+    /// An extension's ribbon tab (#1870), by its index among the tabs the
+    /// active surface describes (`ext_ribbon`).
+    Ext(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -754,7 +762,8 @@ enum Surface {
     Placeholder,
     /// A tab body an extension draws (`ext`): a Mail tab when a build links
     /// a Mail surface. Saved as nothing, like the placeholder it replaces.
-    Ext(Box<dyn ext::TabSurface>),
+    /// It holds the ribbon the surface describes, if any (#1870).
+    Ext(ext_ribbon::ExtTab),
     /// An editor's manual (#1855). Saves as nothing.
     Help(Box<help_view::HelpView>),
 }
@@ -5409,6 +5418,10 @@ struct Docxy {
     tab_first: usize,
     tab_layout: tabstrip::StripLayout,
     tab_more_open: bool,
+    /// What had the keys on an extension's tab when its ribbon's KeyTips, a
+    /// menu or a flyout took them (#1870): its view's entity and the
+    /// handle, given back when they close.
+    ext_focus_back: Option<(gpui::EntityId, FocusHandle)>,
     focus: FocusHandle,
     focused: bool,
     /// Dead-key and IME composition from the platform (#1072).
@@ -5999,6 +6012,66 @@ fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>>
         .map(|b| b.bottom_left())
 }
 
+/// The menu a ribbon drop-down opens (`Docxy::split_menu_for`).
+enum DropdownMenu {
+    /// The drop-down's own items: an extension's (#1870), or any not named.
+    Items,
+    Cover,
+    InsertTable,
+    Layout(layout_tab::LayoutMenu),
+    Design(design_tab::DesignMenu),
+    Mail(mailings_tab::MailMenu),
+    Hf(hf_tab::HfMenu),
+}
+
+/// Which menu the drop-down `id` with the act `act` opens. An extension's
+/// lists its own items whatever its id: one named `hf-header` must not open
+/// Word's Header menu (#1870).
+fn dropdown_menu(id: &str, act: Act) -> DropdownMenu {
+    match (layout_tab::menu_of(id), act) {
+        (_, Act::Ext(_)) => DropdownMenu::Items,
+        (_, Act::Cover(_)) => DropdownMenu::Cover,
+        (_, Act::InsertTable) => DropdownMenu::InsertTable,
+        (Some(m), Act::Layout(_)) => DropdownMenu::Layout(m),
+        (_, Act::Design(_)) if design_tab::menu_of(id).is_some() => {
+            design_tab::menu_of(id).map_or(DropdownMenu::Items, DropdownMenu::Design)
+        }
+        (_, Act::Mail(_)) if mailings_tab::menu_of(id).is_some() => {
+            mailings_tab::menu_of(id).map_or(DropdownMenu::Items, DropdownMenu::Mail)
+        }
+        (None, _) => hf_tab::menu_of(id).map_or(DropdownMenu::Items, DropdownMenu::Hf),
+        _ => DropdownMenu::Items,
+    }
+}
+
+#[cfg(test)]
+mod dropdown_menu_tests {
+    use super::{Act, DropdownMenu, dropdown_menu};
+
+    /// #1870: an extension's drop-down lists its own items, even with an id
+    /// a built-in menu is named by; the built-in keeps its menu.
+    #[test]
+    fn an_extension_dropdown_lists_its_own_items_whatever_its_id() {
+        assert!(matches!(
+            dropdown_menu("hf-header", Act::Ext("hf-header")),
+            DropdownMenu::Items
+        ));
+        assert!(matches!(
+            dropdown_menu("hf-header", Act::Paste),
+            DropdownMenu::Hf(_)
+        ));
+        assert!(crate::layout_tab::menu_of("margins").is_some());
+        assert!(matches!(
+            dropdown_menu("margins", Act::Ext("margins")),
+            DropdownMenu::Items
+        ));
+        assert!(matches!(
+            dropdown_menu("anything", Act::Ext("x")),
+            DropdownMenu::Items
+        ));
+    }
+}
+
 #[cfg(test)]
 mod probes_tests {
     use super::{Probes, split_menu_anchor};
@@ -6209,6 +6282,24 @@ mod menu_key_tests {
 /// of the one on screen.
 fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>) -> AnyElement {
     probe_with_reflow(cell, name, |_| false)
+}
+
+/// The probe an extension ribbon's command draws (#1870), the
+/// harness's `ext-ribbon-cmd:<id>` region.
+fn ext_cmd_probe(id: &str) -> String {
+    format!("ext-ribbon-cmd:{id}")
+}
+
+/// [`probe`] of an extension's command (`act` an `Act::Ext`), else none:
+/// the built-in buttons draw no probe of their own.
+fn ext_cmd_probe_el(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    act: Act,
+) -> Option<AnyElement> {
+    match act {
+        Act::Ext(id) => Some(probe(cell, ext_cmd_probe(id))),
+        _ => None,
+    }
 }
 
 /// Record fresh bounds during prepaint and request one more frame if the
@@ -16368,6 +16459,7 @@ impl Docxy {
             tab_first: 0,
             tab_layout: tabstrip::layout(0.0, 0, 0, 0),
             tab_more_open: false,
+            ext_focus_back: None,
             focus: cx.focus_handle(),
             focused: false,
             ime: text_input::ImeState::default(),
@@ -16796,6 +16888,14 @@ impl Docxy {
 
     /// The definition of the selected ribbon tab, contextual tabs included.
     fn active_ribbon_tab_def(&self) -> rs::Tab<Act> {
+        // An extension's tab (#1870): one of its own, whatever was selected
+        // before (it holds at least one).
+        if let Some(r) = self.active_ext_ribbon() {
+            let RibbonTab::Ext(i) = ext_ribbon::valid_tab(self.ribbon_tab, r.tabs.len()) else {
+                unreachable!("valid_tab gives an extension tab");
+            };
+            return r.tabs[usize::from(i)].clone();
+        }
         match self.ribbon_tab {
             RibbonTab::TableDesign => table_tab::table_design_tab(),
             RibbonTab::TableLayout => table_tab::table_layout_tab(),
@@ -16973,6 +17073,9 @@ impl Docxy {
                     e.set_dark(dark, cx);
                 }
             }
+            // Its colours too (#1870); on the first frame this tells the
+            // surfaces `attach_ext_surfaces` just attached.
+            self.tell_ext_theme(cx);
         }
     }
 
@@ -19139,6 +19242,8 @@ impl Docxy {
             }
             Region::GalleryMore(id) => lookup(&self.probes.borrow(), &format!("gallery-more-{id}"))
                 .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
+            Region::ExtRibbonCmd(id) => lookup(&self.probes.borrow(), &ext_cmd_probe(id))
+                .ok_or_else(|| format!("the extension's command {id} is not drawn in place")),
             Region::RibbonGroup(i) => {
                 let now = self.ribbon_fit_now(window);
                 let title = now
@@ -20507,7 +20612,10 @@ impl Docxy {
     pub(crate) fn ribbon_body_hidden(&self) -> bool {
         self.ribbon_min
             || self.ribbon_locked()
-            || !(self.active_is_doc() || self.active_is_sheet() || self.active_is_project())
+            || !(self.active_is_doc()
+                || self.active_is_sheet()
+                || self.active_is_project()
+                || self.active_ext_ribbon().is_some())
     }
 
     /// Whether the active tab takes no edits: Protected View (#610), or a
@@ -28615,6 +28723,8 @@ impl Docxy {
             } else {
                 KeyTip::Off
             };
+            // On an extension's tab the root takes the next letter (#1870).
+            self.focus_ext_surface(window, cx);
             cx.notify();
             return;
         }
@@ -31629,7 +31739,7 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         Title => e.set_para_style(Some("Title")),
         Subtitle => e.set_para_style(Some("Subtitle")),
         ClearFmt => e.clear_run_formatting(),
-        Project(_) | Sheet(_) | Cut | Copy | Paste | PasteKeepSource | PasteTextOnly
+        Project(_) | Ext(_) | Sheet(_) | Cut | Copy | Paste | PasteKeepSource | PasteTextOnly
         | PasteSpecial | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName
         | FontSize | NewComment | ShowHide | ToggleComments | ResolveComment
         | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow | ArrangeAll
@@ -32847,6 +32957,9 @@ mod repeat_tests {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Act {
     Project(ProjectAct),
+    /// A command of an extension's ribbon (#1870), by its id: the active
+    /// surface's `ribbon_action` runs it (`Docxy::ext_dispatch`).
+    Ext(&'static str),
     /// A sheet command from a menu: the sheet ribbon's menus (#707) and the
     /// cell menu (#690, #691), drawn and clicked through the shared menu
     /// model, whose items run `Act`s.
@@ -33570,6 +33683,12 @@ fn tab_keytip_pick(kind: Kind, typed: &str, ctx: TabKeyCtx) -> TabPick {
     if kind == Kind::Project && ctx.gantt {
         tips.push((GANTT_FORMAT_KEYTIP, Some(RibbonTab::GanttFormat)));
     }
+    pick_tab_keytip(&tips, typed)
+}
+
+/// The tab whose KeyTip is `typed`, the first of them; a wait while a
+/// longer tip starts with it.
+fn pick_tab_keytip(tips: &[(&str, Option<RibbonTab>)], typed: &str) -> TabPick {
     if let Some((_, t)) = tips.iter().find(|(k, _)| k.eq_ignore_ascii_case(typed)) {
         return t.map_or(TabPick::Backstage, TabPick::Tab);
     }
@@ -33637,6 +33756,8 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::Report => "Report",
         RibbonTab::Project => "Project",
         RibbonTab::Help => "Help",
+        // Its name is the extension's: `Docxy::ribbon_tab_label`.
+        RibbonTab::Ext(_) => "",
     }
 }
 
@@ -36902,10 +37023,11 @@ impl Docxy {
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
         // A Help tab (#1855) has no ribbon; File stays, the one way to
         // Backstage's Settings (the Theme row) there.
-        let names = match ribbon_tab_set(self.ribbon_kind()) {
-            set if self.active_is_help() => &set[..1],
-            set => set,
-        };
+        // An extension's tab with a ribbon lists its own tabs (#1870).
+        let mut names = self.ribbon_tab_names();
+        if self.active_is_help() {
+            names.truncate(1);
+        }
         let mut strip = h_flex()
             .w_full()
             .items_end()
@@ -36949,7 +37071,10 @@ impl Docxy {
                     })
                     .when(!active && !is_file, |d| d.text_color(fg))
                     .child(name)
-                    .when(show_kt, |d| d.child(keytip_badge(tab_key)))
+                    // An extension's tab may have no KeyTip: no empty badge.
+                    .when(show_kt && !tab_key.is_empty(), |d| {
+                        d.child(keytip_badge(tab_key))
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_file {
                             this.open_backstage(cx);
@@ -37437,28 +37562,24 @@ impl Docxy {
                         group: group.title.into(),
                         label: cmd.label.into(),
                     },
-                    match (layout_tab::menu_of(cmd.id), cmd.act) {
-                        (_, Act::Cover(_)) => cover_page::menu_items(self.tabs.get(self.active)),
-                        (_, Act::InsertTable) => table_tab::insert_table_menu(
+                    match dropdown_menu(cmd.id, cmd.act) {
+                        DropdownMenu::Cover => cover_page::menu_items(self.tabs.get(self.active)),
+                        DropdownMenu::InsertTable => table_tab::insert_table_menu(
                             self.edit_target_ref()
                                 .is_some_and(|e| e.has_selection() && e.cell_range().is_none()),
                         ),
-                        (Some(m), Act::Layout(_)) => {
+                        DropdownMenu::Layout(m) => {
                             layout_tab::menu_items(m, |a| self.act_active(a))
                         }
-                        (_, Act::Design(_)) if design_tab::menu_of(cmd.id).is_some() => {
-                            design_tab::menu_items(design_tab::menu_of(cmd.id)?, |a| {
-                                self.act_active(a)
-                            })
+                        DropdownMenu::Design(m) => {
+                            design_tab::menu_items(m, |a| self.act_active(a))
                         }
-                        (_, Act::Mail(_)) if mailings_tab::menu_of(cmd.id).is_some() => {
+                        DropdownMenu::Mail(m) => {
                             let tab = self.tabs.get(self.active)?;
-                            mailings_tab::menu_items(&tab.mail, mailings_tab::menu_of(cmd.id)?)
+                            mailings_tab::menu_items(&tab.mail, m)
                         }
-                        (None, _) if hf_tab::menu_of(cmd.id).is_some() => {
-                            hf_tab::menu_items(self.tabs.get(self.active), hf_tab::menu_of(cmd.id)?)
-                        }
-                        _ => menu::split_menu(
+                        DropdownMenu::Hf(m) => hf_tab::menu_items(self.tabs.get(self.active), m),
+                        DropdownMenu::Items => menu::split_menu(
                             items,
                             |a| self.act_enabled_now(a),
                             |a| self.act_active(a),
@@ -38000,6 +38121,13 @@ impl Docxy {
     /// Handle a letter pressed while KeyTips are showing: pick a tab (Tabs level)
     /// or run a command (Commands level).
     fn keytip_input(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.keytip_pick(c, window, cx);
+        // A menu or flyout a letter opened keeps the keys from an
+        // extension's view at once (#1870); render hands them back after.
+        self.focus_ext_surface(window, cx);
+    }
+
+    fn keytip_pick(&mut self, c: &str, window: &mut Window, cx: &mut Context<Self>) {
         match self.keytips {
             KeyTip::Tabs => {
                 let typed = format!("{}{c}", self.keytip_prefix);
@@ -38010,7 +38138,11 @@ impl Docxy {
                     hf: self.hf_active(),
                     gantt: self.project_gantt_showing(),
                 };
-                match tab_keytip_pick(kind, &typed, ctx) {
+                let pick = match self.active_ext_ribbon() {
+                    Some(r) => ext_ribbon::tab_keytip_pick(r, &typed),
+                    None => tab_keytip_pick(kind, &typed, ctx),
+                };
+                match pick {
                     TabPick::Backstage => {
                         self.keytips = KeyTip::Off;
                         return self.open_backstage(cx);
@@ -38105,6 +38237,10 @@ impl Docxy {
         // a live preview (#764): a tile's click applies what it previewed.
         self.close_menu();
         self.doc_preview = None;
+        // An extension's command is its surface's (#1870).
+        if let Act::Ext(id) = act {
+            return self.ext_dispatch(id, window, cx);
+        }
         // Protected View (#633): the ribbon is hidden, but shortcuts, KeyTips,
         // context menus and the harness's `ribbon-click` still come here.
         // Resolve and Delete all hold no text of the view: only Protected View
@@ -38275,10 +38411,26 @@ impl Docxy {
         }
     }
 
-    /// Whether the active tab's ribbon is the ribbonspec model (a document or
-    /// a Project) rather than the spreadsheet table, as `render` draws it.
+    /// The ribbon tab the active tab shows (`valid_ribbon_tab`): on an
+    /// extension's tab with a ribbon, one of its tabs (#1870).
+    pub(crate) fn valid_ribbon_tab_now(&self) -> RibbonTab {
+        if let Some(r) = self.active_ext_ribbon() {
+            return ext_ribbon::valid_tab(self.ribbon_tab, r.tabs.len());
+        }
+        valid_ribbon_tab(
+            self.ribbon_kind(),
+            self.ribbon_tab,
+            self.caret_in_table(),
+            self.project_gantt_showing(),
+            self.hf_active(),
+        )
+    }
+
+    /// Whether the active tab's ribbon is the ribbonspec model (a document, a
+    /// Project, or an extension's tab that describes its ribbon, #1870)
+    /// rather than the spreadsheet table, as `render` draws it.
     fn ribbon_is_model(&self) -> bool {
-        self.active_is_doc() || self.active_is_project()
+        self.active_is_doc() || self.active_is_project() || self.active_ext_ribbon().is_some()
     }
 
     /// How the active ribbon fits (#1608): Project's collapses whole groups,
@@ -40099,7 +40251,12 @@ impl Docxy {
                             .children(
                                 chunk
                                     .iter()
-                                    .map(|cm| self.icon_btn(cm, !icon_only, pal, cx)),
+                                    // A button with no icon keeps its label
+                                    // (an extension's may have none, #1870).
+                                    .map(|cm| {
+                                        let label = !icon_only || cm.icon.0.is_empty();
+                                        self.icon_btn(cm, label, pal, cx)
+                                    }),
                             )
                             .into_any_element()
                     })
@@ -40151,6 +40308,10 @@ impl Docxy {
     /// Whether the Styles gallery shows `act`'s item as selected for the caret's
     /// paragraph; the renderer and the UI harness both read it.
     fn gallery_item_selected(&self, act: Act) -> bool {
+        // An extension gallery's checked item (#1870).
+        if let Act::Ext(id) = act {
+            return self.active_ext_ribbon().is_some_and(|r| r.checked(id));
+        }
         // A plugin gallery's checked swatch is its `yppx_ui_state`'s (#1532).
         if let Act::Project(ProjectAct::Plugin(id)) = act {
             return self.tabs.get(self.active).is_some_and(
@@ -40234,8 +40395,15 @@ impl Docxy {
                     .into_any_element(),
             };
             let label = it.label;
+            // In place only: a flyout's copy of the tile is another region.
+            let probe_el = max_w
+                .is_none()
+                .then(|| ext_cmd_probe_el(&self.probes, act))
+                .flatten();
             v_flex()
                 .id(it.label)
+                .relative()
+                .children(probe_el)
                 .flex_none()
                 .justify_between()
                 .items_start()
@@ -40618,8 +40786,12 @@ impl Docxy {
             })
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
-            .child(icon_svg(cmd.icon.0, 26., pal.fg))
+            // An extension's command may have no icon (#1870): its label.
+            .when(!cmd.icon.0.is_empty(), |d| {
+                d.child(icon_svg(cmd.icon.0, 26., pal.fg))
+            })
             .child(label)
+            .children(ext_cmd_probe_el(&self.probes, act))
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .when(enabled, |d| {
@@ -40640,6 +40812,8 @@ impl Docxy {
         let primary_id = cmd.id;
         let top = div()
             .id(cmd.id)
+            .relative()
+            .children(ext_cmd_probe_el(&self.probes, act))
             .flex()
             .justify_center()
             .w_full()
@@ -40647,7 +40821,13 @@ impl Docxy {
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
-            .child(icon_svg(cmd.icon.0, 26., fg))
+            // An extension's command may have no icon (#1870): the upper
+            // half keeps the icon's room, so it can still be pressed.
+            .child(if cmd.icon.0.is_empty() {
+                div().size(px(26.)).flex_none().into_any_element()
+            } else {
+                icon_svg(cmd.icon.0, 26., fg).into_any_element()
+            })
             .when(enabled, |d| {
                 d.on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
             });
@@ -40701,7 +40881,10 @@ impl Docxy {
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
-            .child(icon_svg(cmd.icon.0, 26., fg))
+            .children(ext_cmd_probe_el(&self.probes, cmd.act))
+            .when(!cmd.icon.0.is_empty(), |d| {
+                d.child(icon_svg(cmd.icon.0, 26., fg))
+            })
             .child(menu_button_label(cmd.label, 11., fg))
             .when(enabled, |d| {
                 d.on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
@@ -40729,6 +40912,10 @@ impl Docxy {
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| mailings_tab::mail_enabled(&t.mail, a));
+        }
+        // As the extension's ribbon says (#1870).
+        if let Act::Ext(id) = act {
+            return self.active_ext_ribbon().is_some_and(|r| r.enabled(id));
         }
         act_enabled(act)
             && match act {
@@ -40759,6 +40946,8 @@ impl Docxy {
             Project(act) => self.tabs.get(self.active).is_some_and(
                 |t| matches!(&t.surface, Surface::Project(v) if project_act_active(v, act)),
             ),
+            // As the extension's ribbon says (#1870).
+            Ext(id) => self.active_ext_ribbon().is_some_and(|r| r.checked(id)),
             // Over the styles' bold and italic (#1427).
             Bold => doc.is_some_and(|ed| ed.caret_props_shown().bold),
             Italic => doc.is_some_and(|ed| ed.caret_props_shown().italic),
@@ -40862,6 +41051,7 @@ impl Docxy {
                         .child(SharedString::from(cmd.label)),
                 )
             })
+            .children(ext_cmd_probe_el(&self.probes, act))
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
             .when(enabled, |d| {
@@ -41982,6 +42172,8 @@ impl Render for Docxy {
         // Extension tabs (a Mail surface) get their view, and the keys while
         // active, before anything is drawn.
         self.attach_ext_surfaces(cx);
+        // An extension's ribbon read before `ext::ribbon_changed` (#1870).
+        self.refresh_ext_ribbons(false, cx);
         self.focus_ext_surface(window, cx);
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
@@ -42452,13 +42644,7 @@ impl Render for Docxy {
         );
         // The contextual tabs are only valid in their context: Table while the
         // caret is in a table, Gantt Chart Format while a Project Gantt shows.
-        self.ribbon_tab = valid_ribbon_tab(
-            self.ribbon_kind(),
-            self.ribbon_tab,
-            self.caret_in_table(),
-            self.project_gantt_showing(),
-            self.hf_active(),
-        );
+        self.ribbon_tab = self.valid_ribbon_tab_now();
         // An open ribbon flyout closes once its group is drawn in place again
         // (a wider window), or the window shows another tab or document (#1020).
         if let Some(f) = self.ribbon_flyout {
@@ -42474,7 +42660,7 @@ impl Render for Docxy {
         // them out; its message bar takes their place.
         let protected = self.ribbon_locked();
         let ribbon_body = (!self.ribbon_body_hidden()).then(|| {
-            if is_doc || self.active_is_project() {
+            if self.ribbon_is_model() {
                 self.ribbon_body(window, pal, cx)
             } else {
                 self.sheet_ribbon_body(window, pal, cx)
@@ -43903,11 +44089,13 @@ impl Render for Docxy {
                 self.tab_more_open,
             ))
             .child(title_bar)
-            // An extension's tab draws its own ribbon below the strip; its
-            // File reaches the suite's backstage through `ext::ShowBackstage`.
-            .when(!self.active_is_ext() || self.backstage, |d| {
-                d.child(ribbon_tabs)
-            })
+            // An extension's tab draws its own ribbon below the strip, unless
+            // it describes one for the suite to draw (#1870); its File
+            // reaches the suite's backstage through `ext::ShowBackstage`.
+            .when(
+                !self.active_is_ext() || self.backstage || self.active_ext_ribbon().is_some(),
+                |d| d.child(ribbon_tabs),
+            )
             .when_some(ribbon_body, |d, r| d.child(r))
             .when_some(protected_bar, |d, b| d.child(b))
             .when_some(find_bar, |d, f| d.child(f))
@@ -48102,7 +48290,8 @@ pub fn run(extensions: ext::Extensions) {
             // A harness case that asks for the test extension (#1873) gets it
             // as Mail, unless the build links a Mail of its own.
             if want_harness && extensions.mail.is_none() && harness::ext_fixture_requested() {
-                extensions.mail = Some(ext_fixture::factory());
+                extensions.mail =
+                    Some(ext_fixture::factory(harness::ext_fixture_ribbon_requested()));
             }
             ext::install(cx, extensions);
         }
@@ -53638,10 +53827,15 @@ impl Docxy {
                             .is_dark()
                     });
                     surface.set_dark(dark, cx);
+                    // Its colours (#1870), once a theme is drawn: before
+                    // the first, `apply_theme` tells it right after.
+                    if self.applied.is_some() {
+                        surface.theme_changed(&ext::suite_theme(cx), cx);
+                    }
                     if let Some(title) = surface.title(cx) {
                         self.tabs[i].title = title.into();
                     }
-                    self.tabs[i].surface = Surface::Ext(surface);
+                    self.tabs[i].surface = Surface::Ext(ext_ribbon::ExtTab::new(surface));
                 }
                 Some(Err(e)) => self.tabs[i].status = format!("{REFUSED}{e}").into(),
             }
@@ -53664,22 +53858,54 @@ impl Docxy {
     /// the root keeps the focus, and takes it back from a surface that had
     /// it when one opened: an editable document view (#1947) would type
     /// under the dialog what it sees first.
+    ///
+    /// The suite's ribbon on an extension's tab (#1870) takes the keys the
+    /// same way: while the KeyTips are up, a menu or a ribbon flyout is
+    /// open, the root keeps them, so the view never types a KeyTip letter
+    /// or a menu's arrows and Enter. It takes them from whatever had them
+    /// (the view, or a field of the extension's own beside it) and gives
+    /// them back to that when they close (`ext_focus_back`, while the same
+    /// surface is active; else to its `focus_handle`). The places that raise
+    /// them call this at once too, as gpui may run the next key before a
+    /// frame.
     fn focus_ext_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.backstage || self.menu.is_some() {
+        // A tab with no ribbon of the suite's keeps the old rule: a menu
+        // leaves the focus where it is.
+        let ribbon = self.active_ext_ribbon().is_some();
+        if self.backstage || (self.menu.is_some() && !ribbon) {
             return;
         }
         let Some(Surface::Ext(e)) = self.tabs.get(self.active).map(|t| &t.surface) else {
             return;
         };
         let handle = e.focus_handle(cx);
+        let view = e.view().entity_id();
         if self.tab_more_open || self.active_dialogs().is_some_and(|d| d.top_takes_keys()) {
             if handle.contains_focused(window, cx) {
                 window.focus(&self.focus, cx);
             }
             return;
         }
+        let ribbon_keys = ribbon
+            && (self.menu.is_some() || self.ribbon_flyout.is_some() || self.keytips != KeyTip::Off);
+        if ribbon_keys {
+            // Whatever has the keys, the view or a field of the extension's
+            // own beside it, gives them up, and gets them back after.
+            if !self.focus.is_focused(window) {
+                if let Some(had) = window.focused(cx) {
+                    self.ext_focus_back = Some((view, had));
+                }
+                window.focus(&self.focus, cx);
+            }
+            return;
+        }
         if self.focus.is_focused(window) {
-            window.focus(&handle, cx);
+            let back = self
+                .ext_focus_back
+                .take()
+                .filter(|(owner, _)| *owner == view)
+                .map_or(handle, |(_, had)| had);
+            window.focus(&back, cx);
         }
     }
 

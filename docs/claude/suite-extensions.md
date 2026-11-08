@@ -16,7 +16,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   File > New > Mail), and a refusal stays on the tab's status line
   (`Mail: ...`), not asked again. It saves as nothing (`hot_bytes`, the
   session's placeholder rule). While the tab is active the suite draws no
-  ribbon row (the view draws its own), its root focus goes on to the view
+  ribbon row (the view draws its own) unless the surface describes one
+  (#1870, below), its root focus goes on to the view
   (`focus_ext_surface`), keys the view does not stop bubble to `route_key`,
   and `ext::ShowBackstage` opens File. The theme's light/dark reaches it in
   `apply_theme`.
@@ -277,3 +278,97 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The `issue 2003` test in `uiharness/cases/ext-doc-view.uit` (a 1000 px
   window) checks 904 → 956 px of text, column at 48 → 22 and the page
   `262626` dark / `ffffff` light, and shoots each.
+
+## Extension ribbons and the suite theme (#1870)
+
+- `TabSurface::ribbon(&self, cx) -> Option<ext::Ribbon>` (default `None`),
+  `ribbon_action(id, window, cx)` and `theme_changed(&SuiteTheme, cx)`, all
+  default methods. The data types (`Ribbon`, `RibbonTab`, `RibbonGroup`
+  with `priority` 50 by default, `RibbonControl::{Large, Small, Toggle,
+  Split(RibbonSplit), Dropdown(RibbonDropdown), Gallery(RibbonGallery)}`,
+  `RibbonCommand` enabled and unchecked by default, `RibbonIcon::svg`) own
+  their strings, are `#[non_exhaustive]` and are built through their
+  constructors (no struct-like variants, so a later field breaks no
+  extension). A surface with a ribbon has the suite draw File plus its tabs
+  with the document ribbon's code: `render_group` / `render_control`,
+  `ribbon_fit::fit_with` under `LabelsFirst`, Ctrl+F1 and the `ribbon-min`
+  chevron, flyouts, menus and KeyTips; File and its `F` are the backstage.
+  File's `F` is first in `ext_ribbon::tab_keytip_pick`, so an extension
+  tab's KeyTip starting with `F` (any case) could never be typed: it is
+  dropped at conversion (`tab_key_tip`), the tab kept with no badge.
+  Double-click on a ribbon tab collapses no ribbon in the suite (a follow-up
+  for every ribbon). A ribbon with nothing left to draw is `None`.
+- `ext_ribbon.rs`: `convert` makes `rs::Tab<Act>`s whose acts are
+  `Act::Ext(id)`, every string interned (`plugin_ui::intern`, a `HashSet`
+  now, as this interns on every refresh; each distinct string is kept for
+  the process's life, said on `ribbon()`), with a state map (enabled,
+  checked) and the drop-downs' ids. Left out: an empty id, `qat-undo` /
+  `qat-redo` (which `open_split_menu` and `split_menu_anchor` read as the
+  QAT's), a gallery `tablestyles` (`render_control`'s Table Styles), then
+  empty groups and tabs. A `Small` of more than three is several
+  `Column`s; Small and Toggle labels are cut with `capped_label`, the full
+  text the tip's title. A gallery's tiles are the bare swatch tiles
+  (`is_swatch_gallery` takes `Act::Ext`), each showing its label.
+- The cache is on the tab: `Surface::Ext(ExtTab)` holds the surface (it
+  derefs to it) and `(generation, Option<ExtRibbon>)`, so it travels with a
+  torn-off tab. `ext::ribbon_changed(cx)` needs no window: it bumps the
+  `RibbonGeneration` global and refreshes the windows; it never calls into
+  `Docxy` (`ribbon_action` runs inside a `Docxy` update).
+  `refresh_ext_ribbons` reads a stale tab again at the top of `render`, at
+  every harness verb's entry, and (forced) after `ribbon_action`; on the
+  active tab the selected `RibbonTab::Ext(i)` follows its tab's name
+  (`reselect`), else the first. Never converted per frame.
+- `ext_dispatch` is the one guard: a disabled id (or one the ribbon does not
+  hold) sets the status line and runs nothing, whether it came from a
+  click, a KeyTip (`tab_keytip_cmd` checks no state), a menu or gallery
+  item or `ribbon-click`. A drop-down's own id (its KeyTip runs the
+  button's act, as a built-in's does) opens its menu instead, and that
+  menu is always its own items (`dropdown_menu`'s `Act::Ext` arm comes
+  before the id-keyed built-in menus: an id `hf-header` lists the
+  extension's items, not Word's Header menu).
+- Icons: `RibbonIcon` is SVG source, registered by content hash
+  (`ext_ribbon::ICONS`) and named `ext/<hash>`; `DocxyAssets::load` serves
+  `icons/ext/<hash>.svg` from it. It is drawn as a mask in the ribbon's ink,
+  as the Fluent icons are (no colour icons). A command with no icon: the
+  large button and drop-down draw the label alone and are estimated so
+  (`ribbon_fit::icon_w`), a split keeps a blank 26 px upper half, the
+  collapsed group's button takes the first icon there is
+  (`model_group_icon`).
+- Focus: on an extension's tab with a ribbon, `focus_ext_surface` takes the
+  focus to the root while the KeyTips are up, a menu or a ribbon flyout is
+  open, from whatever had it (the view, or a field of the extension's own
+  beside it), remembered in `ext_focus_back` with the surface's view; it is
+  called at once where the KeyTips go up (Alt/F10) and after each KeyTip
+  letter, as gpui may run the next key before a frame. When they close,
+  render gives the remembered handle back (while the same surface is
+  active; else its `focus_handle`). The dialog and more-tabs rule is
+  #1947's (only a focused view is taken from). A menu or flyout opened by the pointer is
+  taken at the next frame. A tab without a ribbon keeps #1873's rule (a
+  menu leaves the focus alone). A bare Alt already bubbles from `DocView`.
+- Theme: `ext::suite_theme(cx)` is `render`'s colours (`background`,
+  `secondary` as `panel`, `border`, `foreground`, `muted_foreground`,
+  `selection`) plus `accent::for_kind(Some(Kind::Look), dark)`.
+  `apply_theme` calls `theme_changed` beside `set_dark` (on the first frame
+  too, as `applied` starts `None`); `attach_ext_surfaces` calls it once a
+  theme is drawn.
+- Harness: `ext fixture ribbon` (uiharness: the marker reads `ribbon`;
+  `harness::ext_fixture_ribbon_requested`) has the fixture describe
+  `fixture_ribbon`: Message (Respond: Reply with an SVG icon, a column,
+  the Flag toggle; Move: the Move split, Archive disabled until set; Tags,
+  the lowest priority, which collapses into a flyout at 460 px) and
+  View (Arrange: the Sort drop-down, the density gallery). `ext-ribbon-read`
+  replies `ribbon`, `actions` (ids run), `flag`, `archive_enabled`,
+  `density`, `theme_calls` and `theme` (`dark` and `rrggbb` colours);
+  `ext-ribbon-set {archive_enabled}` changes it through
+  `ext::ribbon_changed`; `ext-ribbon-read` adds `header_focused` (the
+  fixture's header line has the keys). The region `ext-ribbon-cmd:<id>` is
+  a command: a button, a split's upper half or a drop-down, in place or in
+  an open group flyout, or a gallery tile in place (only `Act::Ext`
+  commands draw its probe). `ribbon-layout {"tab"}`, `ribbon-click` and
+  `menu-open {"ribbon": ..}` name the extension's tabs (`ribbon_tab_named`,
+  `ribbon_tab_def`); `ribbon-read` lists every one of them, and
+  `ribbon-flyout` acts on the tab shown. `uiharness/cases/ext-ribbon.uit`
+  drives it.
+- Not done: contextual tabs, group launchers, Rows and combo cells, QAT
+  entries, gallery live preview and colour icons for an extension; macOS
+  menu-bar entries for its commands.
