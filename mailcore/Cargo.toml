@@ -25,3 +25,17 @@ editcore = { version = "0.1.0", path = "../editcore" }
 [target.'cfg(windows)'.dependencies]
 # DPAPI (CryptProtectData / CryptUnprotectData) for the token cache at rest.
 windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The Secret Service (org.freedesktop.secrets) for the token cache (#1877):
+# a pure-Rust D-Bus client, so no libdbus and no daemon at build time.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+# Waiting for a Secret Service prompt against a timer, on the calling thread
+# (both already in zbus's tree).
+futures-lite = "2"
+async-io = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The login Keychain for the token cache (#1877); already in the macOS tree
+# through rustls-native-certs.
+security-framework = "2.11"

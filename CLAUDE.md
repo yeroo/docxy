@@ -114,7 +114,8 @@ issue number to find its notes.
   a calendar range on demand, fetched once while fresh (#2014),
   a 30/180-day window kept by calendarView delta per calendar (#2013),
   the Contacts folder and `is_contact` (#1934), cancelling a meeting with a message and
-  forwarding it (#1985).
+  forwarding it (#1985), OAuth tokens in the platform secret store, a plaintext fallback and its
+  warning (#1877).
 
 ## Build and test
 

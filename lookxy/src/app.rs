@@ -589,12 +589,12 @@ impl App {
     /// read yet, e.g. before the first sign-in ever completes). Called on
     /// construction and whenever a sync pass completes successfully — see
     /// `on_sync_event`.
+    ///
+    /// Reads the file only (`tokencache::account`, #1877): with the token
+    /// in the platform secret store, loading it here could block this UI
+    /// thread on a keyring prompt.
     fn reload_account(&mut self) {
-        self.account = mailcore::tokencache::load(&self.token_path)
-            .ok()
-            .flatten()
-            .map(|t| t.account)
-            .filter(|a| !a.is_empty());
+        self.account = mailcore::tokencache::account(&self.token_path).filter(|a| !a.is_empty());
     }
 
     /// Dispatches one `SyncEvent` from the background sync engine: reloads
@@ -765,6 +765,9 @@ impl App {
             | SyncEvent::ProfileFetched { .. }
             | SyncEvent::PhotoFetched { .. }
             | SyncEvent::Scopes { .. }
+            // A client may tell the user the sign-in is stored unencrypted
+            // (#1877); lookxy does not.
+            | SyncEvent::TokenStoredUnencrypted
             | SyncEvent::ContactsUpdated
             | SyncEvent::FolderProgress { .. } => {}
         }
