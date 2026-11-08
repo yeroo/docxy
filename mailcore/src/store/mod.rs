@@ -920,8 +920,16 @@ pub struct LocalEventFields {
     /// attendee with the same address on an update, and is `required`
     /// otherwise.
     pub attendees: Vec<AttendeeInput>,
-    /// The recurrence pattern for a repeating event (create-only), or `None`.
+    /// The recurrence pattern for a repeating event (create-only), or `None`:
+    /// three kinds and two range types (`Recurrence`). `series_recurrence`
+    /// wins when both are set.
     pub recurrence: Option<Recurrence>,
+    /// Graph's whole recurrence for a repeating event (create-only, #2034):
+    /// every pattern type, `noEnd`/`endDate`/`numbered` ranges,
+    /// `firstDayOfWeek`, `index`, `month` and `recurrenceTimeZone` as given.
+    /// Its `CreateEvent` sends it with `EventRecurrence::to_send_json`, and it
+    /// wins over `recurrence`. `update_event_fields` ignores it.
+    pub series_recurrence: Option<EventRecurrence>,
     pub show_as: Option<String>,
     pub sensitivity: Option<String>,
     pub importance: Option<String>,
@@ -952,8 +960,12 @@ pub struct EventSendData {
     pub location: String,
     pub body_html: String,
     pub attendees: Vec<AttendeeInput>,
-    /// The recurrence pattern for a repeating event (create-only), or `None`.
+    /// The create-side recurrence a repeating event was created with, or
+    /// `None` (also when it was created with `series_recurrence`).
     pub recurrence: Option<Recurrence>,
+    /// The lossless recurrence a repeating event was created with
+    /// (`LocalEventFields::series_recurrence`, #2034), or `None`.
+    pub series_recurrence: Option<EventRecurrence>,
     pub show_as: String,
     pub sensitivity: String,
     pub importance: String,
@@ -3141,17 +3153,19 @@ impl Store {
                 online_meeting_provider: non_empty(&f.online_meeting_provider).unwrap_or_default(),
                 response_requested: f.response_requested.unwrap_or(true),
                 allow_new_time_proposals: f.allow_new_time_proposals.unwrap_or(true),
-                event_type: if f.recurrence.is_some() {
+                event_type: if f.series_recurrence.is_some() || f.recurrence.is_some() {
                     "seriesMaster"
                 } else {
                     "singleInstance"
                 }
                 .to_string(),
-                // The create-side recurrence is already in Graph's shape.
-                recurrence: f
-                    .recurrence
-                    .as_ref()
-                    .and_then(|r| EventRecurrence::from_json(&r.to_json())),
+                // The lossless recurrence as given (#2034), else the
+                // create-side one, which is already in Graph's shape.
+                recurrence: f.series_recurrence.clone().or_else(|| {
+                    f.recurrence
+                        .as_ref()
+                        .and_then(|r| EventRecurrence::from_json(&r.to_json()))
+                }),
                 is_organizer: true,
                 join_url: meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
                 // `CreateEvent` POSTs to `/me/events`: the default calendar
@@ -3166,10 +3180,7 @@ impl Store {
             "UPDATE events SET recurrence = ?2, reminder_unset = ?3 WHERE id = ?1",
             params![
                 id,
-                f.recurrence
-                    .as_ref()
-                    .map(|r| r.to_json().to_string())
-                    .unwrap_or_default(),
+                encode_send_recurrence(f.recurrence.as_ref(), f.series_recurrence.as_ref()),
                 f.reminder.is_none()
             ],
         )?;
@@ -3184,8 +3195,9 @@ impl Store {
     /// (its create would otherwise send none). Attendees are rewritten only when they changed (as the
     /// ordered list of name, address and type), and each one whose address
     /// matches a stored one (case-insensitive) keeps its response and
-    /// response time, and its type when the input's is `""`. Recurrence is
-    /// create-only: never written here, never in the set.
+    /// response time, and its type when the input's is `""`. Recurrence,
+    /// `recurrence` and `series_recurrence` alike, is create-only: never
+    /// written here, never in the set.
     ///
     /// `join_url` follows the new location and body (`meeting_link_in`, as
     /// `create_local_event` derives it), except on an event stored as an
@@ -4439,14 +4451,8 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
              FROM events WHERE id = ?1",
             params![id],
             |r| {
-                let recurrence_raw: String = r.get(6)?;
-                let recurrence = if recurrence_raw.is_empty() {
-                    None
-                } else {
-                    crate::json::parse(&recurrence_raw)
-                        .ok()
-                        .and_then(|v| Recurrence::from_json(&v))
-                };
+                let (recurrence, series_recurrence) =
+                    decode_send_recurrence(&r.get::<_, String>(6)?);
                 Ok(EventSendData {
                     subject: r.get(0)?,
                     start_utc: r.get(1)?,
@@ -4456,6 +4462,7 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
                     body_html: r.get(5)?,
                     attendees: Vec::new(),
                     recurrence,
+                    series_recurrence,
                     show_as: r.get(7)?,
                     sensitivity: r.get(8)?,
                     importance: r.get(9)?,
@@ -4599,6 +4606,48 @@ fn decode_categories(s: &str) -> Vec<String> {
         return Vec::new();
     }
     s.split('\u{1f}').map(str::to_string).collect()
+}
+
+/// The key `events.recurrence` wraps a lossless recurrence in (#2034):
+/// `{"graphRecurrence": <EventRecurrence::to_json>}`. A bare object is the
+/// create-side `Recurrence::to_json`, as rows before #2034 hold it. The
+/// wrapper keeps the two apart: `Recurrence::from_json` would read a bare
+/// lossless daily, weekly or absoluteMonthly text, dropping its `index`,
+/// `month` and `numbered` range and reading `"endDate":""` as an end date.
+const SEND_RECURRENCE_KEY: &str = "graphRecurrence";
+
+/// The `events.recurrence` text `create_local_event` stores: the lossless
+/// recurrence wrapped (`SEND_RECURRENCE_KEY`) when set, else the create-side
+/// one bare, else `''`.
+fn encode_send_recurrence(
+    recurrence: Option<&Recurrence>,
+    series_recurrence: Option<&EventRecurrence>,
+) -> String {
+    if let Some(r) = series_recurrence {
+        Value::Object(vec![(SEND_RECURRENCE_KEY.to_string(), r.to_json())]).to_string()
+    } else {
+        recurrence
+            .map(|r| r.to_json().to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Reads `events.recurrence` (`encode_send_recurrence`) as
+/// `(recurrence, series_recurrence)`, at most one of them `Some`. Lenient:
+/// `''`, text that does not parse, a wrapper whose value has no `pattern`
+/// object, and a bare object `Recurrence::from_json` does not read are all
+/// `(None, None)`.
+fn decode_send_recurrence(s: &str) -> (Option<Recurrence>, Option<EventRecurrence>) {
+    if s.is_empty() {
+        return (None, None);
+    }
+    let Ok(v) = json::parse(s) else {
+        return (None, None);
+    };
+    match v.get(SEND_RECURRENCE_KEY) {
+        Some(inner) => (None, EventRecurrence::from_json(inner)),
+        None => (Recurrence::from_json(&v), None),
+    }
 }
 
 /// Reads `events.graph_recurrence` (`EventRecurrence::to_json` text, `''`
@@ -6479,12 +6528,158 @@ mod calendar_tests {
         let id = s.create_local_event(&f, "Me", "me@x").unwrap();
         let sent = s.event_for_send(&id).unwrap().unwrap();
         assert_eq!(sent.recurrence, Some(rec));
+        assert_eq!(sent.series_recurrence, None);
 
         // A non-recurring event round-trips to None.
         let id2 = s
             .create_local_event(&sample_fields(), "Me", "me@x")
             .unwrap();
-        assert_eq!(s.event_for_send(&id2).unwrap().unwrap().recurrence, None);
+        let sent2 = s.event_for_send(&id2).unwrap().unwrap();
+        assert_eq!(sent2.recurrence, None);
+        assert_eq!(sent2.series_recurrence, None);
+    }
+
+    /// A lossless recurrence none of the create-side `Recurrence` can hold
+    /// (#2034): relativeYearly, a Monday week, a numbered range, a zone.
+    fn lossless_recurrence() -> EventRecurrence {
+        use crate::graph::model::{RecurrencePattern, RecurrenceRange};
+        EventRecurrence {
+            pattern: RecurrencePattern {
+                r#type: "relativeYearly".into(),
+                interval: 1,
+                month: 11,
+                day_of_month: 0,
+                days_of_week: vec!["thursday".into()],
+                first_day_of_week: "monday".into(),
+                index: "fourth".into(),
+            },
+            range: RecurrenceRange {
+                r#type: "numbered".into(),
+                start_date: "2026-11-26".into(),
+                end_date: String::new(),
+                number_of_occurrences: 5,
+                recurrence_time_zone: "Pacific Standard Time".into(),
+            },
+        }
+    }
+
+    /// The local row `id` as `events_in_window` lists it.
+    fn local_row(s: &Store, id: &str) -> EventRow {
+        s.events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn create_local_event_stores_a_lossless_recurrence() {
+        let s = Store::open_in_memory().unwrap();
+        let rec = lossless_recurrence();
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    series_recurrence: Some(rec.clone()),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.series_recurrence, Some(rec.clone()));
+        assert_eq!(sent.recurrence, None);
+        let row = local_row(&s, &id);
+        assert_eq!(row.recurrence, Some(rec));
+        assert_eq!(row.event_type, "seriesMaster");
+    }
+
+    #[test]
+    fn create_local_event_lossless_recurrence_wins() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let rec = lossless_recurrence();
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    recurrence: Some(Recurrence {
+                        kind: RecurrenceKind::Daily,
+                        interval: 3,
+                        days_of_week: Vec::new(),
+                        day_of_month: 0,
+                        start_date: "2026-07-20".into(),
+                        until: None,
+                    }),
+                    series_recurrence: Some(rec.clone()),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.series_recurrence, Some(rec.clone()));
+        assert_eq!(sent.recurrence, None);
+        assert_eq!(local_row(&s, &id).recurrence, Some(rec));
+    }
+
+    #[test]
+    fn update_event_fields_never_changes_a_lossless_recurrence() {
+        let s = Store::open_in_memory().unwrap();
+        let rec = lossless_recurrence();
+        let id = s
+            .create_local_event(
+                &LocalEventFields {
+                    series_recurrence: Some(rec.clone()),
+                    ..sample_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap();
+        let mut other = rec.clone();
+        other.pattern.r#type = "daily".into();
+        other.range.r#type = "noEnd".into();
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    subject: "Renamed".into(),
+                    series_recurrence: Some(other),
+                    ..sample_fields()
+                },
+            )
+            .unwrap();
+        assert!(!changed.contains(EventFieldSet::RECURRENCE));
+        assert!(changed.contains(EventFieldSet::SUBJECT));
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.series_recurrence, Some(rec.clone()));
+        assert_eq!(local_row(&s, &id).recurrence, Some(rec));
+    }
+
+    #[test]
+    fn event_for_send_reads_neither_shape_as_no_recurrence() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        for text in [
+            "{\"pattern\":",
+            "{\"graphRecurrence\":1}",
+            "{\"graphRecurrence\":{\"range\":{}}}",
+            "{\"pattern\":{\"type\":\"relativeYearly\"},\"range\":{}}",
+            "[1,2]",
+        ] {
+            s.conn
+                .execute(
+                    "UPDATE events SET recurrence = ?2 WHERE id = ?1",
+                    params![id, text],
+                )
+                .unwrap();
+            let sent = s.event_for_send(&id).unwrap().unwrap();
+            assert_eq!(sent.recurrence, None, "{text}");
+            assert_eq!(sent.series_recurrence, None, "{text}");
+        }
     }
 
     #[test]

@@ -947,14 +947,16 @@ impl Recurrence {
     }
 }
 
-/// A series' recurrence as Graph reports it (`event.recurrence`), read side
-/// only (#1983). Lenient: every enum Graph uses is kept as its raw string,
-/// so a value this crate does not know is kept, not dropped. Not the
-/// create-side `Recurrence`: that one is what `Store::event_for_send` sends
-/// back to Graph on every create and update, and its three kinds and
-/// `to_json` (a `numbered` range becomes `noEnd`, `firstDayOfWeek` is forced
-/// to `sunday`) would rewrite a synced series. The store keeps this one in
-/// its own column, `events.graph_recurrence`.
+/// A series' recurrence in Graph's whole shape (`event.recurrence`): read
+/// from Graph (#1983), sent by a series edit (#2022) and by the create of a
+/// local event given it as `LocalEventFields::series_recurrence` (#2034),
+/// both with `to_send_json`. Lenient: every enum Graph uses is kept as its
+/// raw string, so a value this crate does not know is kept, not dropped.
+/// Not the create-side `Recurrence`, whose three kinds and `to_json` (a
+/// `numbered` range becomes `noEnd`, `firstDayOfWeek` is forced to `sunday`)
+/// would rewrite a synced series. The store keeps what Graph reports in its
+/// own column, `events.graph_recurrence`, which is never re-sent; what a
+/// create sends is in `events.recurrence` (`Store::event_for_send`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EventRecurrence {
     pub pattern: RecurrencePattern,
