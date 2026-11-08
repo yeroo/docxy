@@ -772,7 +772,11 @@ impl App {
             // (#1877); lookxy does not.
             | SyncEvent::TokenStoredUnencrypted
             | SyncEvent::ContactsUpdated
-            | SyncEvent::FolderProgress { .. } => {}
+            | SyncEvent::FolderProgress { .. }
+            // lookxy has no meeting banner yet, so it never asks for a
+            // message's meeting type or a Remove from Calendar (#2024).
+            | SyncEvent::MeetingMessageFetched { .. }
+            | SyncEvent::RemovedFromCalendar { .. } => {}
         }
     }
 
