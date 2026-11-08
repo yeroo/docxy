@@ -307,6 +307,20 @@ pub enum OutboxOp {
         id: String,
         body: String,
     },
+    /// Dismiss the event's reminder on the server (#2025,
+    /// `.../dismissReminder`), so the user's other devices stop showing it.
+    /// Nothing local changes: what Exchange does to the reminder comes back
+    /// with the next calendar round. A `local:` id sends nothing.
+    DismissReminder {
+        id: String,
+    },
+    /// Snooze the event's reminder until `new_reminder_utc` (#2025,
+    /// `.../snoozeReminder`), the store's `YYYY-MM-DDTHH:MM:SSZ`. Nothing
+    /// local changes. A `local:` id sends nothing.
+    SnoozeReminder {
+        id: String,
+        new_reminder_utc: String,
+    },
 }
 
 impl OutboxOp {
@@ -329,6 +343,8 @@ impl OutboxOp {
             OutboxOp::CancelEvent { .. } => "cancelEvent",
             OutboxOp::ForwardEvent { .. } => "forwardEvent",
             OutboxOp::UpdateEventSeries { .. } => "updateEventSeries",
+            OutboxOp::DismissReminder { .. } => "dismissReminder",
+            OutboxOp::SnoozeReminder { .. } => "snoozeReminder",
         }
     }
 
@@ -419,7 +435,9 @@ impl OutboxOp {
                     ),
                 ),
             ]),
-            OutboxOp::CreateEvent { id } | OutboxOp::DeleteEvent { id } => Value::Object(vec![
+            OutboxOp::CreateEvent { id }
+            | OutboxOp::DeleteEvent { id }
+            | OutboxOp::DismissReminder { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
@@ -432,6 +450,17 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
                 ("body".to_string(), Value::Str(body.clone())),
+            ]),
+            OutboxOp::SnoozeReminder {
+                id,
+                new_reminder_utc,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "newReminderUtc".to_string(),
+                    Value::Str(new_reminder_utc.clone()),
+                ),
             ]),
             OutboxOp::ForwardEvent { id, to, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -547,6 +576,11 @@ impl OutboxOp {
             "updateEventSeries" => Some(OutboxOp::UpdateEventSeries {
                 id: id()?,
                 body: v.get("body")?.as_str()?.to_string(),
+            }),
+            "dismissReminder" => Some(OutboxOp::DismissReminder { id: id()? }),
+            "snoozeReminder" => Some(OutboxOp::SnoozeReminder {
+                id: id()?,
+                new_reminder_utc: v.get("newReminderUtc")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -1507,7 +1541,9 @@ impl Store {
                 | OutboxOp::DeleteEvent { .. }
                 | OutboxOp::CancelEvent { .. }
                 | OutboxOp::ForwardEvent { .. }
-                | OutboxOp::UpdateEventSeries { .. } => None,
+                | OutboxOp::UpdateEventSeries { .. }
+                | OutboxOp::DismissReminder { .. }
+                | OutboxOp::SnoozeReminder { .. } => None,
             })
             .collect();
         ids.sort();
@@ -9151,6 +9187,44 @@ mod outbox_tests {
                 comment: None,
             })
         );
+    }
+
+    #[test]
+    fn outbox_op_dismiss_and_snooze_round_trip() {
+        let dismiss = OutboxOp::DismissReminder { id: "EV1".into() };
+        assert_eq!(
+            dismiss.to_json().to_string(),
+            r#"{"kind":"dismissReminder","id":"EV1"}"#
+        );
+        let snooze = OutboxOp::SnoozeReminder {
+            id: "EV1".into(),
+            new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+        };
+        assert_eq!(
+            snooze.to_json().to_string(),
+            r#"{"kind":"snoozeReminder","id":"EV1","newReminderUtc":"2026-11-08T10:15:00Z"}"#
+        );
+        for op in [dismiss, snooze] {
+            let stored = op.to_json().to_string();
+            assert_eq!(
+                OutboxOp::from_json(&json::parse(&stored).unwrap()),
+                Some(op),
+                "{stored}"
+            );
+        }
+        // No id, or a snooze without its time, is a corrupt row.
+        for corrupt in [
+            r#"{"kind":"dismissReminder"}"#,
+            r#"{"kind":"snoozeReminder","newReminderUtc":"2026-11-08T10:15:00Z"}"#,
+            r#"{"kind":"snoozeReminder","id":"EV1"}"#,
+            r#"{"kind":"snoozeReminder","id":"EV1","newReminderUtc":null}"#,
+        ] {
+            assert_eq!(
+                OutboxOp::from_json(&json::parse(corrupt).unwrap()),
+                None,
+                "{corrupt}"
+            );
+        }
     }
 
     #[test]
