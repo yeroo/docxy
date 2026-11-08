@@ -90,8 +90,10 @@
 //!
 //! A suite script may start with an `ext fixture` line (before its first
 //! case): the suite then draws Mail tabs with its built-in test extension, an
-//! embedded read-only document view (#1873). The runner puts a marker in the
-//! sandbox before it launches ([`crate::launch::request_ext_fixture`]).
+//! embedded read-only document view (#1873). `ext fixture ribbon` is the same
+//! extension describing its ribbon to the suite (#1870). The runner puts a
+//! marker in the sandbox before it launches
+//! ([`crate::launch::request_ext_fixture`]).
 //!
 //! ## Assertions
 //!
@@ -129,6 +131,9 @@ pub struct Script {
     pub start_screen: bool,
     /// An `ext fixture` line: Mail tabs are the test extension's (#1873).
     pub ext_fixture: bool,
+    /// The line was `ext fixture ribbon`: the test extension describes its
+    /// ribbon to the suite (#1870).
+    pub ext_fixture_ribbon: bool,
     /// `manual <editor> <dir>` lines: the help manuals the suite starts with
     /// (#1855), `dir` relative to the script ([`crate::launch::install_manuals`]).
     pub manuals: Vec<Manual>,
@@ -324,6 +329,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut plugins: Vec<String> = Vec::new();
     let mut start_screen = false;
     let mut ext_fixture = false;
+    let mut ext_fixture_ribbon = false;
     let mut manuals: Vec<Manual> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
@@ -402,9 +408,21 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         }
 
         if head.eq_ignore_ascii_case("ext") {
-            if !rest.eq_ignore_ascii_case("fixture") {
-                return Err(err(line, "the only 'ext' line is 'ext fixture'"));
-            }
+            let mut words = rest.split_whitespace();
+            let ribbon = match (words.next(), words.next(), words.next()) {
+                (Some(f), None, None) if f.eq_ignore_ascii_case("fixture") => false,
+                (Some(f), Some(r), None)
+                    if f.eq_ignore_ascii_case("fixture") && r.eq_ignore_ascii_case("ribbon") =>
+                {
+                    true
+                }
+                _ => {
+                    return Err(err(
+                        line,
+                        "the only 'ext' lines are 'ext fixture' and 'ext fixture ribbon'",
+                    ));
+                }
+            };
             if !cases.is_empty() {
                 return Err(err(line, "'ext fixture' comes before the first case"));
             }
@@ -412,6 +430,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
                 return Err(err(line, "'ext fixture' is named twice"));
             }
             ext_fixture = true;
+            ext_fixture_ribbon = ribbon;
             continue;
         }
 
@@ -503,6 +522,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         plugins,
         start_screen,
         ext_fixture,
+        ext_fixture_ribbon,
         manuals,
         cases,
     })
@@ -1974,6 +1994,30 @@ test t
         assert!(e.to_string().contains("ext fixture"), "{e}");
         let e = parse_script("terminal docxy\next fixture\ntest t\n  key f1\n").unwrap_err();
         assert!(e.to_string().contains("a terminal script has none"), "{e}");
+        assert!(
+            !parse_script(&format!("ext fixture\n{VALID}"))
+                .unwrap()
+                .ext_fixture_ribbon
+        );
+    }
+
+    /// #1870: `ext fixture ribbon` asks for the test extension with its
+    /// ribbon; anything else after `ext fixture` is refused.
+    #[test]
+    fn an_ext_fixture_ribbon_line_asks_for_the_extension_ribbon() {
+        let s = parse_script(&format!("ext fixture ribbon\n{VALID}")).unwrap();
+        assert!(s.ext_fixture && s.ext_fixture_ribbon);
+        let s = parse_script(&format!("EXT Fixture Ribbon\n{VALID}")).unwrap();
+        assert!(s.ext_fixture_ribbon);
+        for junk in ["ext fixture tabs", "ext fixture ribbon now", "ext ribbon"] {
+            let e = parse_script(&format!("{junk}\n{VALID}")).unwrap_err();
+            assert!(
+                e.to_string().contains("'ext fixture ribbon'"),
+                "{junk}: {e}"
+            );
+        }
+        let e = parse_script(&format!("ext fixture\next fixture ribbon\n{VALID}")).unwrap_err();
+        assert!(e.to_string().contains("twice"), "{e}");
     }
 
     #[test]

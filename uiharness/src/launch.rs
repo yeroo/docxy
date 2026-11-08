@@ -683,13 +683,16 @@ pub fn request_start_screen(sandbox: &Path) -> Result<(), String> {
 
 /// Ask the suite started in `sandbox` to draw Mail tabs with its test
 /// extension (#1873): a marker file in its config root, read once at start
-/// by a harness instance only, as [`request_start_screen`]'s is.
-pub fn request_ext_fixture(sandbox: &Path) -> Result<(), String> {
+/// by a harness instance only, as [`request_start_screen`]'s is. With
+/// `ribbon` the marker reads `ribbon` and the extension describes its ribbon
+/// to the suite (#1870); otherwise it is empty.
+pub fn request_ext_fixture(sandbox: &Path, ribbon: bool) -> Result<(), String> {
     let marker = sandbox.join("docxy").join("ext-fixture");
     if let Some(dir) = marker.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    std::fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))
+    let body: &[u8] = if ribbon { b"ribbon" } else { b"" };
+    std::fs::write(&marker, body).map_err(|e| format!("{}: {e}", marker.display()))
 }
 
 /// Where the suite started in `sandbox` reads `editor`'s help manual from
@@ -1033,8 +1036,12 @@ mod tests {
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&sandbox);
-        request_ext_fixture(&sandbox).unwrap();
-        assert!(sandbox.join("docxy").join("ext-fixture").is_file());
+        let marker = sandbox.join("docxy").join("ext-fixture");
+        request_ext_fixture(&sandbox, false).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"");
+        // #1870: the ribbon variant says so in the marker.
+        request_ext_fixture(&sandbox, true).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"ribbon");
         let _ = std::fs::remove_dir_all(&sandbox);
     }
 
