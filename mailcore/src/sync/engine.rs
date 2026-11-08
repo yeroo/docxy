@@ -47,7 +47,7 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     CalendarDeltaCursor, DeltaCursor, EventInput, GraphClient, GraphError, RsvpKind,
-    event_body_json, is_expired_sync_state, rsvp_proposal,
+    event_body_json, event_zone_error, is_expired_sync_state, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
@@ -486,10 +486,15 @@ pub enum SyncCommand {
     /// occurrence's id, "delete the series" `Store::delete_event_series`
     /// then `DeleteEvent` on the master's id.
     ///
-    /// Known gap: `TIMES` sends the UTC wall clock with `timeZone: "UTC"`,
-    /// so Graph moves the series into UTC and its local times drift across
-    /// DST. A host should leave `TIMES` out of a series edit until
-    /// zone-preserving series times land (follow-up).
+    /// Times (#2039, #2030): Graph takes the series' time zone from
+    /// `start.timeZone`, so a `TIMES` edit names the master's zone and wall
+    /// clocks (`input.start_time_zone`/`start_local`, and the end's) and
+    /// the series stays in that zone; with none named it is sent in UTC,
+    /// and Graph moves the series into UTC, where its local times drift
+    /// across DST. A named start also sends its zone as the recurrence's
+    /// `recurrenceTimeZone`. A named end that
+    /// `graph::client::event_zone_error` refuses is an `Error`, before the
+    /// master is resolved, and nothing is queued.
     UpdateEventSeries { id: String, input: EventInput },
     /// Exit the sync thread cleanly.
     Shutdown,
@@ -2976,6 +2981,27 @@ impl Engine {
     fn update_event_series(&mut self, id: String, input: EventInput) {
         if input.fields.is_empty() {
             return;
+        }
+        for (end, zone, local, utc) in [
+            (
+                "start",
+                &input.start_time_zone,
+                &input.start_local,
+                &input.start_utc,
+            ),
+            (
+                "end",
+                &input.end_time_zone,
+                &input.end_local,
+                &input.end_utc,
+            ),
+        ] {
+            if let Some(why) = event_zone_error(zone, local, utc) {
+                self.emit(SyncEvent::Error(format!(
+                    "update event series {id}: {end} in {zone}: {why}"
+                )));
+                return;
+            }
         }
         let master_id = match self.series_master_of(&id) {
             Ok(m) => m,
@@ -12652,6 +12678,131 @@ mod tests {
         assert!(
             !after.iter().any(|(_, p)| p.starts_with("/me/calendars")),
             "a calendar refresh after the Shutdown: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `series_edit` moved to 09:00–09:30 in Berlin's summer (UTC+2), its
+    /// times named in the series' zone (#2039, #2030).
+    fn zoned_series_edit() -> EventInput {
+        use crate::graph::client::EventFieldSet;
+        EventInput {
+            start_utc: "2026-07-13T07:00:00Z".into(),
+            end_utc: "2026-07-13T07:30:00Z".into(),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-07-13T09:00:00".into(),
+            end_time_zone: "W. Europe Standard Time".into(),
+            end_local: "2026-07-13T09:30:00".into(),
+            fields: EventFieldSet::SUBJECT
+                .union(EventFieldSet::TIMES)
+                .union(EventFieldSet::RECURRENCE),
+            ..series_edit()
+        }
+    }
+
+    #[test]
+    fn update_event_series_sends_named_zones() {
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "update-event-series-zones",
+            vec![patch_route("/me/events/M1", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEventSeries {
+                id: "OCC1".into(),
+                input: zoned_series_edit(),
+            })
+            .unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].path, "/me/events/M1");
+        let body = &patches[0].body;
+        for part in [
+            r#""start":{"dateTime":"2026-07-13T09:00:00","timeZone":"W. Europe Standard Time"}"#,
+            r#""end":{"dateTime":"2026-07-13T09:30:00","timeZone":"W. Europe Standard Time"}"#,
+            r#""range":{"type":"noEnd","startDate":"2026-07-13","recurrenceTimeZone":"W. Europe Standard Time"}"#,
+        ] {
+            assert!(body.contains(part), "{part} not in {body}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_event_series_refuses_a_malformed_wall_clock() {
+        let (srv, handle, store_path, dir) = spawn_meeting_engine(
+            "update-event-series-bad-zone",
+            vec![patch_route("/me/events/", 200, "{}")],
+            vec![occurrence("OCC1", "M1")],
+        );
+        for (id, input) in [
+            (
+                "OCC1",
+                EventInput {
+                    start_local: "2026-07-13 09:00:00".into(),
+                    ..zoned_series_edit()
+                },
+            ),
+            // Refused before the master is resolved: an unknown id is
+            // still the wall clock's error.
+            (
+                "NOPE",
+                EventInput {
+                    end_local: "2026-07-14T09:30:00".into(),
+                    ..zoned_series_edit()
+                },
+            ),
+        ] {
+            handle
+                .cmd_tx
+                .send(SyncCommand::UpdateEventSeries {
+                    id: id.into(),
+                    input,
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            let Some(SyncEvent::Error(m)) = seen.last() else {
+                unreachable!()
+            };
+            assert!(
+                m.starts_with(&format!("update event series {id}: "))
+                    && m.contains(" in W. Europe Standard Time: "),
+                "{m}"
+            );
+        }
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::State(SyncState::PendingOps(_)))),
+            "{seen:?}"
+        );
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !srv.requests().iter().any(|r| r.method == "PATCH"),
+            "{:?}",
+            srv.requests()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
