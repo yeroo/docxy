@@ -1418,12 +1418,27 @@ impl GraphClient {
     /// POST `/me/events` with the event body; returns the created `Event`
     /// (with its Graph-minted id). Graph sends invites to any attendees.
     pub fn create_event(&self, input: &EventInput) -> Result<Event, GraphError> {
-        let resp = self.send(
-            Method::Post,
-            "/me/events",
-            Some(event_body_json(input)),
-            &[],
-        )?;
+        self.create_event_at("/me/events", input)
+    }
+
+    /// `create_event` in the given calendar (#2048): POST
+    /// `/me/calendars/{encoded id}/events` with the same body. The returned
+    /// event's `calendar_id` is `calendar_id`: the URL decides, as in
+    /// `calendar_view_in`.
+    pub fn create_event_in(
+        &self,
+        calendar_id: &str,
+        input: &EventInput,
+    ) -> Result<Event, GraphError> {
+        let path = format!("/me/calendars/{}/events", encode_path_segment(calendar_id));
+        let mut e = self.create_event_at(&path, input)?;
+        e.calendar_id = calendar_id.to_string();
+        Ok(e)
+    }
+
+    /// The POST `create_event` and `create_event_in` share.
+    fn create_event_at(&self, path: &str, input: &EventInput) -> Result<Event, GraphError> {
+        let resp = self.send(Method::Post, path, Some(event_body_json(input)), &[])?;
         let v = parse_body(resp)?;
         Event::from_json(&v).ok_or_else(|| GraphError::Parse("malformed created event".to_string()))
     }
@@ -5684,6 +5699,41 @@ mod tests {
         plain.recurrence = None;
         let body = json::parse(&event_body_json(&plain)).unwrap();
         assert!(body.get("recurrence").is_none());
+    }
+
+    #[test]
+    fn create_event_in_posts_to_the_calendars_events() {
+        // #2048: the calendar id is encoded as `calendarView`'s is, and the
+        // body is `create_event`'s.
+        let answer = r#"{"id":"EV1","subject":"Sync"}"#;
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/calendars/A%2Fb%2B%3D/events".into(),
+                status: 201,
+                headers: vec![],
+                body: answer.into(),
+            },
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events".into(),
+                status: 201,
+                headers: vec![],
+                body: answer.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let ev = c.create_event_in("A/b+=", &sample_input()).unwrap();
+        assert_eq!(ev.id, "EV1");
+        assert_eq!(ev.calendar_id, "A/b+=", "the URL decides the calendar");
+        let default = c.create_event(&sample_input()).unwrap();
+        assert_eq!(default.calendar_id, "");
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/calendars/A%2Fb%2B%3D/events");
+        assert_eq!(reqs[1].path, "/me/events");
+        assert_eq!(reqs[0].body, reqs[1].body);
+        assert_eq!(reqs[0].body, event_body_json(&sample_input()));
     }
 
     #[test]

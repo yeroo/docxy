@@ -129,7 +129,15 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
                 fields.remove(EventFieldSet::REMINDER);
             }
             input.fields = fields;
-            let created = client.create_event(&input)?;
+            // The calendar the event was filed in (#2048): `/me/events` for
+            // the default, as before.
+            let calendar = store
+                .event_create_calendar(id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            let created = match calendar {
+                Some(cal) => client.create_event_in(&cal, &input)?,
+                None => client.create_event(&input)?,
+            };
             store
                 .reconcile_created_event(id, &created)
                 .map_err(|e| GraphError::Parse(e.to_string()))?;
@@ -1815,6 +1823,147 @@ mod tests {
             recurrence: None,
             ..Default::default()
         }
+    }
+
+    /// A store whose calendar list holds a default `CAL1` and editable
+    /// `CAL2` and `A/b+=` (#2048).
+    fn store_with_calendars() -> Store {
+        let cal = |id: &str, default: bool| crate::graph::model::Calendar {
+            id: id.into(),
+            is_default: default,
+            can_edit: true,
+            owner_addr: "me@x".into(),
+            ..Default::default()
+        };
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_calendars(&[cal("CAL1", true), cal("CAL2", false), cal("A/b+=", false)])
+            .unwrap();
+        store
+    }
+
+    /// Answers a create in any calendar, or `/me/events`, with `EV1`, and
+    /// a PATCH of it.
+    fn create_routes() -> Vec<Route> {
+        let post = |prefix: &str| Route {
+            method: "POST".into(),
+            path_prefix: prefix.into(),
+            status: 201,
+            headers: vec![],
+            body: event_json("EV1", "Sync"),
+        };
+        vec![
+            post("/me/calendars/"),
+            post("/me/events"),
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/EV1".into(),
+                status: 200,
+                headers: vec![],
+                body: event_json("EV1", "Sync v2"),
+            },
+        ]
+    }
+
+    fn create_in(store: &Store, calendar: Option<&str>) -> String {
+        store
+            .create_local_event(
+                &crate::store::LocalEventFields {
+                    calendar_id: calendar.map(String::from),
+                    ..sample_event_fields()
+                },
+                "Me",
+                "me@x",
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn create_event_in_a_chosen_calendar_posts_to_its_events() {
+        let srv = FakeServer::start(create_routes());
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_calendars();
+        let local_id = create_in(&store, Some("CAL2"));
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/calendars/CAL2/events");
+        let rows = store
+            .events_in_range(
+                "2026-07-20T00:00:00Z",
+                "2026-07-21T00:00:00Z",
+                &["CAL2".to_string()],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "EV1");
+        assert_eq!(rows[0].calendar_id, "CAL2");
+        // An edit still addresses `/me/events/{id}`, in any calendar.
+        let changed = store
+            .update_event_fields(
+                "EV1",
+                &crate::store::LocalEventFields {
+                    subject: "Sync v2".into(),
+                    ..sample_event_fields()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::SUBJECT);
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: changed,
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[1].method, "PATCH");
+        assert_eq!(reqs[1].path, "/me/events/EV1");
+    }
+
+    #[test]
+    fn create_event_in_the_default_calendar_posts_to_me_events() {
+        let with_list = |chosen: Option<&str>| (store_with_calendars(), chosen.map(String::from));
+        let cases = [
+            with_list(None),
+            with_list(Some("")),
+            with_list(Some("CAL1")),
+            // No calendar list yet: the row's calendar is `''`.
+            (Store::open_in_memory().unwrap(), None),
+        ];
+        for (store, chosen) in cases {
+            let srv = FakeServer::start(create_routes());
+            let c = GraphClient::new(&srv.base_url, "AT");
+            let local_id = create_in(&store, chosen.as_deref());
+            apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+            let reqs = srv.requests();
+            assert_eq!(reqs.len(), 1, "{chosen:?}");
+            assert_eq!(reqs[0].path, "/me/events", "{chosen:?}");
+            assert!(store.event_for_send("EV1").unwrap().is_some(), "{chosen:?}");
+        }
+    }
+
+    #[test]
+    fn create_event_encodes_the_calendar_id() {
+        let srv = FakeServer::start(create_routes());
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_calendars();
+        let local_id = create_in(&store, Some("A/b+="));
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id: local_id }).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].path, "/me/calendars/A%2Fb%2B%3D/events");
+        let rows = store
+            .events_in_range(
+                "2026-07-20T00:00:00Z",
+                "2026-07-21T00:00:00Z",
+                &["A/b+=".to_string()],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "EV1");
     }
 
     #[test]
