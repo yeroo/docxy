@@ -117,6 +117,7 @@ issue number to find its notes.
   forwarding it (#1985), a series' occurrences, its master and editing either (#2022),
   a series created with any Graph recurrence (#2034),
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),
+  meeting message types, the referred event and Remove from Calendar (#2024),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 
