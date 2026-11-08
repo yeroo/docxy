@@ -6,12 +6,20 @@
 //! - [`search`] ranks pages for a query.
 //! - [`context`] resolves a ribbon command, dialog or area id to a page.
 //! - [`coverage`] is the `every_ribbon_command_has_a_help_target` report.
+//! - [`text`] lays a page out as wrapped lines and [`reader`] is a text
+//!   viewer's state (the terminal editors' F1 overlay, #1856).
+//! - [`locate`] finds an editor's installed or built-in manual, and
+//!   [`embed`] is the build-script half of building one in.
 
 pub mod bundle;
 pub mod context;
 pub mod coverage;
+pub mod embed;
+pub mod locate;
 pub mod md;
+pub mod reader;
 pub mod search;
+pub mod text;
 
 pub use bundle::{Entry, Manual, Page, Problem};
 pub use context::{Target, Via, resolve, resolve_area};
