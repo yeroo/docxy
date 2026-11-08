@@ -19,7 +19,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   ribbon row (the view draws its own) unless the surface describes one
   (#1870, below), its root focus goes on to the view
   (`focus_ext_surface`), keys the view does not stop bubble to `route_key`,
-  and `ext::ShowBackstage` opens File. The theme's light/dark reaches it in
+  and `ext::ShowBackstage` opens File (where the tab may add its own pages,
+  and `ext::CloseTab` closes it: #1923, below). The theme's light/dark reaches it in
   `apply_theme`.
 - Tearing a tab off (`tab_tear.rs`): a chip's drag (#545) noted by
   `on_drag_move` and let go away from the strip (more than `MARGIN` above or
@@ -356,7 +357,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `fixture_ribbon`: Message (Respond: Reply with an SVG icon, a column,
   the Flag toggle; Move: the Move split, Archive disabled until set; Tags,
   the lowest priority, which collapses into a flyout at 460 px) and
-  View (Arrange: the Sort drop-down, the density gallery). `ext-ribbon-read`
+  View (Arrange: the Sort drop-down, the density gallery; Window: Exit,
+  #1923's `ext::CloseTab`). `ext-ribbon-read`
   replies `ribbon`, `actions` (ids run), `flag`, `archive_enabled`,
   `density`, `theme_calls` and `theme` (`dark` and `rrggbb` colours);
   `ext-ribbon-set {archive_enabled}` changes it through
@@ -372,3 +374,76 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Not done: contextual tabs, group launchers, Rows and combo cells, QAT
   entries, gallery live preview and colour icons for an extension; macOS
   menu-bar entries for its commands.
+
+## Backstage pages and closing a tab (#1923)
+
+- `TabSurface::backstage_pages(&self, cx) -> Vec<ext::BackstagePage>`
+  (default empty) adds pages to File while the tab is active. A
+  `BackstagePage` (`#[non_exhaustive]`, built by `new(id, label, view)`,
+  `.icon(RibbonIcon)`, `.group(BackstageGroup)`) is a rail entry and the
+  view drawn as the page body. `BackstageGroup::Top` (the default) entries
+  go right after Back, ahead of the suite's items (Outlook's Info leads its
+  rail; a document's Info would follow them, but an extension tab is never
+  a document); `Bottom` entries go after Account, before Close (Outlook's
+  Office Account, Options, Exit). An empty id or one an earlier page used
+  is left out. `backstage_rail` (pure, `backstage_rail_tests`) composes the
+  list; with no pages it is exactly `backstage_rail_items`, so the public
+  `suite` binary's rail is unchanged.
+- Read per draw, not cached like the ribbon (#1870): a rail entry needs no
+  `&'static` string (element ids and probes own theirs), and the icon goes
+  through `ext_ribbon::register_icon`, interned per content hash, so a
+  re-read costs a hash. So no "pages changed" call and no stale entry; the
+  contract is that the surface returns the same views (`AnyView` clones),
+  not new entities. The icon is drawn as a 16 px mask in the entry's ink
+  (`group_hover` gives it the hover's).
+- State: `bs_ext: Option<(EntityId, String)>`, the surface's view entity
+  and the page id, set by `select_ext_backstage_page` (the entry's click).
+  Every other page setter (`show_backstage_open_page`,
+  `show_backstage_new_page`, `open_account`, Info, `open_export`) clears
+  it, and it clears their flags, so `open_backstage` and Back reset it.
+  `shown_ext_page` draws it only while the active surface is that entity
+  and still lists the id; else File shows its default page. A cancelled
+  Open… pick (`finish_open_file`) leaves it, so File stays on the page
+  (#1078).
+- The page body is not in `backstage_scroll_column`: a `backstage-content`
+  column (same id and probe) holding the view `size_full`, which scrolls
+  itself as a tab body does. `backstage_scroll_key` is skipped under it
+  (`bs_scroll` is not drawn). Keys the view does not stop bubble to
+  `on_key`'s backstage branch as on the suite's pages; Esc does nothing
+  there, as on theirs (Esc → Back for every File page is a follow-up).
+  `focus_ext_surface` returns early while File is up, so the tab's view
+  does not take the focus back from the page.
+- `ext::CloseTab` (an action) is handled on the window root
+  (`KeyRouting`, both renders) by `close_ext_tab` (`close.rs`): on an
+  extension tab it is `backstage_close` (the Info edit applied, File
+  closed, `close_tab` of the active tab: the close button's path), on any
+  other tab nothing. Only the active tab's view or File page is drawn, so
+  a dispatch from the view, its page or `ribbon_action` (where the focus
+  may be the suite root under KeyTips) is the active tab's. A late
+  dispatch (a spawned task, after the user switched tabs) closes whichever
+  extension tab is active then: the doc says to dispatch in response to
+  the user's own input. Rejected: an `ext::close_tab(entity_id)` naming
+  the tab (more API; the issue asks for an action).
+- Fixture: every variant adds `fx.account` "Fixture Account" (Top, the
+  Reply icon) and `fx.options` "Fixture Options" (Bottom), each a
+  `FixturePage` (made once in `factory`) counting its renders and
+  recording where it and its "Close tab" button (which dispatches
+  `CloseTab`) painted. `ext fixture ribbon`'s View tab has Window: Exit
+  (`fx.exit`), whose `ribbon_action` dispatches `CloseTab`.
+- Harness: `backstage` replies `items` (the composed rail), `ext_items`
+  (`id`, `label`, `group` top/bottom, `icon`) and `ext_page` (the shown
+  page's id, or null); `backstage-layout` (and `backstage-page`) add
+  `ext_page` and report `page` `ext` while one shows (their scroll fields
+  are as the suite's page last drew them). `ext-page-read {"page"}`
+  replies `renders`, `bounds` and `close_bounds` (null until painted),
+  reached through the surface's own `backstage_pages`. `ext-close-tab {}`
+  dispatches `CloseTab` from the focused element (`window.dispatch_action`),
+  which on the fixture's tab must be inside its view (refused otherwise),
+  and replies `from` (`view` or `suite`); gpui runs it after the reply, so
+  a case draws a frame before reading the tabs. Regions: `bs-ext:<id>`
+  (`Region::BackstageExt`, the entry's probe) and `ext-page-close:<id>`
+  (the page's button, from the fixture). `uiharness/cases/ext-backstage.uit`
+  drives it, and `ext-ribbon.uit`'s `issue 1923` test the ribbon's Exit.
+- Not done: opening File straight on an extension's page, a selected state
+  drawn in the rail (the suite's items draw none), colour icons, macOS
+  menu-bar entries, extension entries on the Start screen (no tab).
