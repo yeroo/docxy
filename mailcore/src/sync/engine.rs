@@ -679,8 +679,9 @@ enum Drain {
 
 /// An event op whose command wrote the store first (an RSVP, edited
 /// fields, a deleted row): what a quarantine must undo with initial
-/// calendar rounds, and what a series edit's reset waits for (#2022), as
-/// an initial round would replace the row. `CreateEvent`'s `local:` row is
+/// calendar rounds, and what an owed calendar reset waits for
+/// (`calendar_reset_owed`: a series edit's, #2022, or a refused
+/// response's, #2023), as an initial round would replace the row. `CreateEvent`'s `local:` row is
 /// never replaced, and `UpdateEventSeries` writes nothing locally.
 fn writes_event_locally(op: &OutboxOp) -> bool {
     matches!(
@@ -694,8 +695,9 @@ fn writes_event_locally(op: &OutboxOp) -> bool {
 
 /// A command that queues a `writes_event_locally` op, sent after its host
 /// wrote the row (`DeleteEvent`, `UpdateEvent`), or whose op the engine
-/// writes for (`RespondEvent`, `CancelEvent`): while one waits, a series
-/// edit's reset does not run (#2022).
+/// writes for (`RespondEvent`, `CancelEvent`): while one waits, an owed
+/// calendar reset (`calendar_reset_owed`: a series edit's, #2022, or a
+/// refused response's, #2023) does not run.
 fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
     matches!(
         cmd,
@@ -1000,7 +1002,10 @@ struct Engine {
     /// host that writes its row after the reset's refresh began has the
     /// general race of any refresh. In memory only: a restart before then
     /// drops it, and the delta rounds go on. Signed out, it waits for the
-    /// sign-in's refresh.
+    /// sign-in's refresh. The initial rounds cover the kept window only: a
+    /// refused response's host-written status on a range-fetched row
+    /// outside it (#2014) stays until that range is stale and fetched
+    /// again.
     calendar_reset_owed: bool,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
@@ -1542,7 +1547,10 @@ impl Engine {
                         // row no delta round would name again (#2013): the
                         // calendars owe initial rounds, which put Graph's
                         // status back once no event edit waits (#2022's
-                        // gate; signed out, after the sign-in).
+                        // gate; signed out, after the sign-in). Only for
+                        // rows in the kept window: a range-fetched row
+                        // outside it (#2014) is corrected by its next range
+                        // fetch once stale.
                         self.emit(SyncEvent::Error(e));
                         self.calendar_reset_owed = true;
                         self.refresh_if_calendar_reset_owed();
@@ -2737,7 +2745,9 @@ impl Engine {
 
     /// After a drain on a path with no calendar refresh of its own (a
     /// command's, a fast tick, `SyncFolder`, the startup, sign-in and
-    /// `Refresh` passes; `on_tick` refreshes after its pass anyway): runs
+    /// `Refresh` passes; `on_tick` refreshes after its pass anyway), and in
+    /// the refused `RespondEvent` arm, with no drain before it and its
+    /// return value ignored, as the arm returns right after: runs
     /// the refresh an owed calendar reset is waiting for, when it may run
     /// now (`calendar_reset_ready`), signed in and outside any wait. Returns
     /// whether the caller carries on: false after a shutdown, or once the

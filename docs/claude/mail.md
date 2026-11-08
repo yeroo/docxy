@@ -1360,6 +1360,8 @@ proposal.
   deferred `UpdateEvent` (which reads its row at send time) still sends its edit.
   Signed out, it runs after the sign-in. In memory only, as #2022's: a restart before
   it ran drops it, and the host-written status stays until Graph changes the event.
+  Graph's status comes back for rows in the kept window; a range-fetched row outside
+  it (#2014) is corrected by its next range fetch once stale.
   A host that writes first should call `rsvp_proposal` before it writes. `RespondMeeting` checks `rsvp_proposal` before the
   invite's `meeting_event_id` GET and the stored row once the event id is known; it
   writes nothing locally, so it does not reset.
