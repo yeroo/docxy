@@ -26,8 +26,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   area page, else the root; never a key). Build pinning (#1857) is a later
   slice.
 - The terminal editors' F1 reader (#1856, notes in
-  `docs/claude/terminal-editors.md`) uses four more modules, all
-  dependency-free. `text::lay` lays a page out as wrapped lines of spans
+  `docs/claude/terminal-editors.md`; its ratatui side is
+  `backstagecore::help`) uses four more modules, all dependency-free. `text::lay` lays a page out as wrapped lines of spans
   with a look, the width measured by the host's closure: headings with
   their slug's line, hanging list indents (an item's children of every kind
   under it), verbatim hard-wrapped code, tables padded and aligned, else

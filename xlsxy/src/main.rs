@@ -7500,7 +7500,6 @@ impl App {
         text
     }
 
-    /// Dispatch a ribbon command to the matching editor operation.
     /// The manual F1 shows: a unit test's, else the installed or built-in one.
     fn help_manual(&self) -> Option<std::sync::Arc<helpdocs::Manual>> {
         #[cfg(test)]
@@ -7521,23 +7520,30 @@ impl App {
         }
     }
 
-    /// Open F1 help (#1856) on the current area's page, or (`help_page`, Help ›
-    /// Help) on the manual's Help page. Without a manual it says the
-    /// documentation is coming, as before.
-    fn open_help(&mut self, help_page: bool) {
-        let reader = self.help_manual().and_then(|m| {
-            if help_page {
-                help::open_help(m)
-            } else {
-                help::open_area(m, self.help_area())
-            }
-        });
-        match reader {
+    /// F1 (#1856): help on the current area's page.
+    fn open_help_area(&mut self) {
+        let area = self.help_area();
+        self.show_help(|m| backstagecore::help::open_area(m, area));
+    }
+
+    /// Help › Help (#1856): help on the manual's Help page.
+    fn open_help_page(&mut self) {
+        self.show_help(backstagecore::help::open_help);
+    }
+
+    /// Open help with `open`, which picks the page in the manual. Without a
+    /// manual it says the documentation is coming, as before.
+    fn show_help(
+        &mut self,
+        open: impl FnOnce(std::sync::Arc<helpdocs::Manual>) -> Option<helpdocs::reader::Reader>,
+    ) {
+        match self.help_manual().and_then(open) {
             Some(r) => self.help = Some(r),
             None => self.status = Some(HELP_COMING.to_string()),
         }
     }
 
+    /// Dispatch a ribbon command to the matching editor operation.
     fn ribbon_act(&mut self, act: ribbon::Act) {
         if self.protected_view.is_some() && !ribbon::allowed_in_protected_view(act) {
             self.status = Some(PROTECTED_STATUS.to_string());
@@ -7661,7 +7667,7 @@ impl App {
                     .to_string(),
                 );
             }
-            Help => self.open_help(true),
+            Help => self.open_help_page(),
             ContactSupport | Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -11213,7 +11219,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
     // F1 help takes the whole screen, at any size; nothing under it is drawn
     // (#1856).
     if let Some(reader) = app.help.as_mut() {
-        help::draw(f, reader, Color::Green);
+        backstagecore::help::draw(f, reader, Color::Green);
         return;
     }
     let area = f.area();
@@ -12949,14 +12955,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     // F1 help owns every key while open, over every other surface (#1856).
     if let Some(reader) = app.help.as_mut() {
-        if help::key(reader, key) == helpdocs::reader::Outcome::Close {
+        if backstagecore::help::key(reader, key) == helpdocs::reader::Outcome::Close {
             app.help = None;
         }
         return false;
     }
-    if help::is_f1(&key) {
+    if backstagecore::help::is_f1(&key) {
         app.status = None;
-        app.open_help(false);
+        app.open_help_area();
         return false;
     }
     app.status = None;
@@ -13583,7 +13589,7 @@ fn char_index(s: &str, char_pos: usize) -> usize {
 fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
     // F1 help swallows the mouse; its wheel scrolls (#1856).
     if let Some(reader) = app.help.as_mut() {
-        help::mouse(reader, &m);
+        backstagecore::help::mouse(reader, &m);
         return false;
     }
     // A data-validation alert is answered from the keyboard.

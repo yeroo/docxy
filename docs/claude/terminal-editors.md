@@ -129,9 +129,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the terminal edi
   editor's manual (word, excel, project) on `helpdocs::resolve_area` of the
   active ribbon tab's label (`File` in the backstage, none on the start
   screen, so the root); Help › Help opens `resolve("help", "Help")`. Without
-  a manual both set `HELP_COMING` as before. Each editor's `help.rs` is the
-  same glue (only `EDITOR` and the accent differ): key and mouse mapping and
-  the ratatui draw. The layout and the reader's state (scroll, links,
+  a manual both set `HELP_COMING` as before. `backstagecore::help` is the
+  shared glue: `is_f1`, `open_area`, `open_help`, the key and mouse mapping
+  and `draw(f, reader, accent)` (`backstagecore` now depends on `helpdocs`,
+  which is dependency-free). Each editor's `help.rs` only says where its
+  manual comes from (`EDITOR`, the built-in list, `manual()`), and its
+  `main.rs` holds the hooks, `help_area`, `open_help_area`, `open_help_page`
+  and `show_help`. The layout and the reader's state (scroll, links,
   Back/Forward, Contents) are `helpdocs::text` and `helpdocs::reader`.
 - `App.help` is checked first in the key handler (docxy `on_key`, xlsxy
   `handle_key` after its Release check, yppxy `on_key`), in the mouse

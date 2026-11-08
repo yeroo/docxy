@@ -2,7 +2,9 @@
 //! no-file start dialog, used by docxy/xlsxy/yppxy. The crate owns all state,
 //! navigation, layout and rendering; each app supplies format-specific content
 //! via [`BackstageHost`] and acts on the returned [`BackstageEvent`].
+//! [`help`] is their F1 help reader (#1856).
 mod confirm;
+pub mod help;
 mod host;
 mod input;
 mod menu;

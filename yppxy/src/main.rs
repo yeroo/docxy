@@ -1007,7 +1007,6 @@ impl App {
         }
     }
 
-    /// Run a ribbon command.
     /// The manual F1 shows: a unit test's, else the installed or built-in one.
     fn help_manual(&self) -> Option<std::sync::Arc<helpdocs::Manual>> {
         #[cfg(test)]
@@ -1028,23 +1027,30 @@ impl App {
         }
     }
 
-    /// Open F1 help (#1856) on the current area's page, or (`help_page`, Help ›
-    /// Help) on the manual's Help page. Without a manual it says the
-    /// documentation is coming, as before.
-    fn open_help(&mut self, help_page: bool) {
-        let reader = self.help_manual().and_then(|m| {
-            if help_page {
-                help::open_help(m)
-            } else {
-                help::open_area(m, self.help_area())
-            }
-        });
-        match reader {
+    /// F1 (#1856): help on the current area's page.
+    fn open_help_area(&mut self) {
+        let area = self.help_area();
+        self.show_help(|m| backstagecore::help::open_area(m, area));
+    }
+
+    /// Help › Help (#1856): help on the manual's Help page.
+    fn open_help_page(&mut self) {
+        self.show_help(backstagecore::help::open_help);
+    }
+
+    /// Open help with `open`, which picks the page in the manual. Without a
+    /// manual it says the documentation is coming, as before.
+    fn show_help(
+        &mut self,
+        open: impl FnOnce(std::sync::Arc<helpdocs::Manual>) -> Option<helpdocs::reader::Reader>,
+    ) {
+        match self.help_manual().and_then(open) {
             Some(r) => self.help = Some(r),
             None => self.status = HELP_COMING.into(),
         }
     }
 
+    /// Run a ribbon command.
     fn apply_act(&mut self, act: Act) {
         self.status.clear();
         match act {
@@ -1119,7 +1125,7 @@ impl App {
             }
             Act::ShowSubtasks => self.show_subtasks(),
             Act::HideSubtasks => self.hide_subtasks(),
-            Act::Help => self.open_help(true),
+            Act::Help => self.open_help_page(),
             Act::ContactSupport | Act::Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -1900,7 +1906,7 @@ fn run_tui(
 fn on_mouse(app: &mut App, m: MouseEvent) {
     // F1 help swallows the mouse; its wheel scrolls (#1856).
     if let Some(reader) = app.help.as_mut() {
-        help::mouse(reader, &m);
+        backstagecore::help::mouse(reader, &m);
         return;
     }
     // A modal confirmation (Exit, summary delete) owns the whole screen while open — before
@@ -2021,13 +2027,13 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
 fn on_key(app: &mut App, k: KeyEvent) {
     // F1 help owns every key while open, over every other surface (#1856).
     if let Some(reader) = app.help.as_mut() {
-        if help::key(reader, k) == helpdocs::reader::Outcome::Close {
+        if backstagecore::help::key(reader, k) == helpdocs::reader::Outcome::Close {
             app.help = None;
         }
         return;
     }
-    if help::is_f1(&k) {
-        app.open_help(false);
+    if backstagecore::help::is_f1(&k) {
+        app.open_help_area();
         return;
     }
     // Prompt mode swallows keys until Enter/Esc.
@@ -2322,7 +2328,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 fn draw_screen(f: &mut Frame, app: &mut App) {
     // F1 help takes the whole screen; nothing under it is drawn (#1856).
     if let Some(reader) = app.help.as_mut() {
-        help::draw(f, reader, Color::Yellow);
+        backstagecore::help::draw(f, reader, Color::Yellow);
         return;
     }
     let area = f.area();

@@ -2521,7 +2521,7 @@ impl App {
                 self.status = Some(format!("Applied style: {id}"));
             }
             StylesDialog => self.open_styles_dialog(),
-            Help => self.open_help(true),
+            Help => self.open_help_page(),
             ContactSupport | Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -5877,19 +5877,25 @@ impl App {
         }
     }
 
-    /// Open F1 help (#1856) on the current area's page, or (`help_page`, Help ›
-    /// Help) on the manual's Help page. Without a manual it says the
-    /// documentation is coming, as before.
-    fn open_help(&mut self, help_page: bool) {
+    /// F1 (#1856): help on the current area's page.
+    fn open_help_area(&mut self) {
+        let area = self.help_area();
+        self.show_help(|m| backstagecore::help::open_area(m, area));
+    }
+
+    /// Help › Help (#1856): help on the manual's Help page.
+    fn open_help_page(&mut self) {
+        self.show_help(backstagecore::help::open_help);
+    }
+
+    /// Open help with `open`, which picks the page in the manual. Without a
+    /// manual it says the documentation is coming, as before.
+    fn show_help(
+        &mut self,
+        open: impl FnOnce(std::sync::Arc<helpdocs::Manual>) -> Option<helpdocs::reader::Reader>,
+    ) {
         self.dirty = true;
-        let reader = self.help_manual().and_then(|m| {
-            if help_page {
-                help::open_help(m)
-            } else {
-                help::open_area(m, self.help_area())
-            }
-        });
-        match reader {
+        match self.help_manual().and_then(open) {
             Some(r) => self.help = Some(r),
             None => self.status = Some(HELP_COMING.to_string()),
         }
@@ -5898,7 +5904,7 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         // F1 help swallows the mouse; its wheel scrolls (#1856).
         if let Some(reader) = self.help.as_mut() {
-            help::mouse(reader, &m);
+            backstagecore::help::mouse(reader, &m);
             self.dirty = true;
             return;
         }
@@ -6897,14 +6903,14 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) -> bool {
         // F1 help owns every key while open, over every other surface (#1856).
         if let Some(reader) = self.help.as_mut() {
-            if help::key(reader, key) == helpdocs::reader::Outcome::Close {
+            if backstagecore::help::key(reader, key) == helpdocs::reader::Outcome::Close {
                 self.help = None;
             }
             self.dirty = true;
             return false;
         }
-        if help::is_f1(&key) {
-            self.open_help(false);
+        if backstagecore::help::is_f1(&key) {
+            self.open_help_area();
             return false;
         }
         // Keyboard actions should keep the caret on screen; wheel/drag don't.
@@ -7316,7 +7322,7 @@ impl App {
     fn draw_screen(&mut self, f: &mut Frame) {
         // F1 help takes the whole screen; nothing under it is drawn (#1856).
         if let Some(reader) = self.help.as_mut() {
-            help::draw(f, reader, Color::LightBlue);
+            backstagecore::help::draw(f, reader, Color::LightBlue);
             return;
         }
         // The welcome screen overlays everything when launched with no file.
