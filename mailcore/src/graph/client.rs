@@ -5770,6 +5770,86 @@ mod tests {
         assert!(k.iter().any(|x| x == "isOnlineMeeting"));
     }
 
+    /// Pinned before #2039 named time zones: with no zone named, a full
+    /// create's body, both recurrence shapes, is byte-for-byte this.
+    #[test]
+    fn event_body_without_zones_is_unchanged() {
+        use crate::graph::model::{Recurrence, RecurrenceKind, RecurrencePattern, RecurrenceRange};
+        let weekly = EventInput {
+            recurrence: Some(Recurrence {
+                kind: RecurrenceKind::Weekly,
+                interval: 1,
+                days_of_week: vec!["monday".into()],
+                day_of_month: 0,
+                start_date: "2026-07-20".into(),
+                until: Some("2026-12-21".into()),
+            }),
+            ..full_input()
+        };
+        assert_eq!(
+            event_body_json(&weekly),
+            concat!(
+                r#"{"subject":"Sync","start":{"dateTime":"2026-07-20T11:00:00","timeZone":"UTC"},"#,
+                r#""end":{"dateTime":"2026-07-20T12:00:00","timeZone":"UTC"},"isAllDay":false,"#,
+                r#""location":{"displayName":"Room 1"},"#,
+                r#""attendees":[{"emailAddress":{"address":"bob@x.com","name":"Bob"},"type":"optional"},"#,
+                r#"{"emailAddress":{"address":"room@x.com","name":"Room"},"type":"resource"},"#,
+                r#"{"emailAddress":{"address":"ann@x.com","name":"Ann"},"type":"required"}],"#,
+                r#""body":{"contentType":"HTML","content":"<p>agenda</p>"},"#,
+                r#""recurrence":{"pattern":{"type":"weekly","interval":1,"daysOfWeek":["monday"],"#,
+                r#""firstDayOfWeek":"sunday"},"range":{"type":"endDate","startDate":"2026-07-20","#,
+                r#""endDate":"2026-12-21"}},"#,
+                r#""showAs":"tentative","sensitivity":"private","importance":"high","#,
+                r#""categories":["Red","Travel"],"isReminderOn":true,"reminderMinutesBeforeStart":30,"#,
+                r#""isOnlineMeeting":true,"onlineMeetingProvider":"teamsForBusiness","#,
+                r#""responseRequested":false,"allowNewTimeProposals":false}"#,
+            )
+        );
+        let numbered = EventInput {
+            series_recurrence: Some(EventRecurrence {
+                pattern: RecurrencePattern {
+                    r#type: "relativeMonthly".into(),
+                    interval: 1,
+                    days_of_week: vec!["monday".into()],
+                    first_day_of_week: "monday".into(),
+                    index: "third".into(),
+                    ..Default::default()
+                },
+                range: RecurrenceRange {
+                    r#type: "numbered".into(),
+                    start_date: "2026-07-20".into(),
+                    number_of_occurrences: 6,
+                    recurrence_time_zone: "W. Europe Standard Time".into(),
+                    ..Default::default()
+                },
+            }),
+            is_all_day: true,
+            start_utc: "2026-07-20T00:00:00Z".into(),
+            end_utc: "2026-07-21T00:00:00Z".into(),
+            ..full_input()
+        };
+        assert_eq!(
+            event_body_json(&numbered),
+            concat!(
+                r#"{"subject":"Sync","start":{"dateTime":"2026-07-20T00:00:00","timeZone":"UTC"},"#,
+                r#""end":{"dateTime":"2026-07-21T00:00:00","timeZone":"UTC"},"isAllDay":true,"#,
+                r#""location":{"displayName":"Room 1"},"#,
+                r#""attendees":[{"emailAddress":{"address":"bob@x.com","name":"Bob"},"type":"optional"},"#,
+                r#"{"emailAddress":{"address":"room@x.com","name":"Room"},"type":"resource"},"#,
+                r#"{"emailAddress":{"address":"ann@x.com","name":"Ann"},"type":"required"}],"#,
+                r#""body":{"contentType":"HTML","content":"<p>agenda</p>"},"#,
+                r#""recurrence":{"pattern":{"type":"relativeMonthly","interval":1,"daysOfWeek":["monday"],"#,
+                r#""firstDayOfWeek":"monday","index":"third"},"range":{"type":"numbered","#,
+                r#""startDate":"2026-07-20","numberOfOccurrences":6,"#,
+                r#""recurrenceTimeZone":"W. Europe Standard Time"}},"#,
+                r#""showAs":"tentative","sensitivity":"private","importance":"high","#,
+                r#""categories":["Red","Travel"],"isReminderOn":true,"reminderMinutesBeforeStart":30,"#,
+                r#""isOnlineMeeting":true,"onlineMeetingProvider":"teamsForBusiness","#,
+                r#""responseRequested":false,"allowNewTimeProposals":false}"#,
+            )
+        );
+    }
+
     #[test]
     fn event_field_set_names_round_trip() {
         assert_eq!(
