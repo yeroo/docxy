@@ -118,6 +118,7 @@ issue number to find its notes.
   a series created with any Graph recurrence (#2034),
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),
   meeting message types, the referred event and Remove from Calendar (#2024),
+  dismiss and snooze reminders on the server (#2025),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 
