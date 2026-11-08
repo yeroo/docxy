@@ -1266,18 +1266,24 @@ this occurrence or the whole series, as Outlook does.
   for the quarantine reset. Instead the calendars owe a reset once it went
   through (`series_reset_owed`, in memory): a pattern change mints new occurrence
   ids, and how calendarView delta reports a series change is the uncertain part
-  of #2013, so initial rounds take each window from Graph. After every drain,
-  however it ended, `settle_series_reset` clears every calendar's delta state on
-  disk, but only when no event op with a local write (`writes_event_locally`:
-  `RespondEvent`, `UpdateEvent`, `DeleteEvent`, `CancelEvent`) is still queued.
-  An initial round would replace that op's row, and a queued `UpdateEvent`,
-  which reads its row at send time, would then send Graph's old values; a later
-  drain that leaves none settles it. The refresh itself never runs inside the
-  drain, so a 401, throttle or offline error it meets reaches the pass as usual:
-  a tick's own calendar refresh after its drain runs the initial rounds, and a
-  command's drain (`drain_queued`) refreshes at once (`calendar_refresh_owed`)
-  when it did not stop and no wait is running. A restart before the reset
-  settles forgets it, and the delta rounds go on.
+  of #2013, so initial rounds take each window from Graph. The reset is decided
+  where it is used: every `refresh_calendar`, on any path, checks the queue then
+  (`series_reset_ready`) and, only when no event op with a local write
+  (`writes_event_locally`: `RespondEvent`, `UpdateEvent`, `DeleteEvent`,
+  `CancelEvent`) is queued, clears every delta state and runs initial rounds;
+  otherwise it runs from the kept links and the reset stays owed. So the reset's
+  initial rounds never run while such an op waits: they would replace its row,
+  and a queued `UpdateEvent`, which reads its row at send time, would send
+  Graph's old values. (A delta round from a kept link can still upsert a changed
+  occurrence over a queued edit; that is a follow-up.) The refresh never runs
+  inside the drain, so a 401, throttle or offline error it meets reaches the
+  path as usual. `on_tick` refreshes after its pass anyway; every other path that
+  drains (a command's `drain_queued`, a fast tick, `SyncFolder`, the startup,
+  sign-in and `Refresh` passes) calls `refresh_if_series_reset_owed` after its
+  drain, which refreshes when the reset may run, signed in and outside any wait,
+  and tells the caller to stop when that refresh signed out or started a wait.
+  No path refreshes twice. A restart before the reset ran drops it, and the delta
+  rounds carry on.
 - Masters are not stored: `calendarView` never returns one, so every window replace
   would delete it, and `events_in_window` would show it on the series' first day.
 - Known gaps (follow-ups): a series edit with `TIMES` sends the UTC wall clock with
@@ -1306,6 +1312,8 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_queued_offline_resets_on_the_later_drain`,
   `update_event_series_reset_throttled_stops_the_pass`,
   `update_event_series_reset_waits_for_a_queued_event_edit`,
+  `update_event_series_reset_skips_an_event_edit_queued_after_it`,
+  `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
 
