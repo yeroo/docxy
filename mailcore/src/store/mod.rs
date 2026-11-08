@@ -295,6 +295,15 @@ pub enum OutboxOp {
         to: Vec<Recipient>,
         comment: Option<String>,
     },
+    /// A series edit (#2022): PATCH the series master `id` with `body`, the
+    /// JSON `event_body_json` built at command time. The body is stored
+    /// whole because the master is not (`calendarView` only lists
+    /// occurrences), so nothing is read at send time. No local write goes
+    /// with it. A `local:` id sends nothing.
+    UpdateEventSeries {
+        id: String,
+        body: String,
+    },
 }
 
 impl OutboxOp {
@@ -316,6 +325,7 @@ impl OutboxOp {
             OutboxOp::DeleteEvent { .. } => "deleteEvent",
             OutboxOp::CancelEvent { .. } => "cancelEvent",
             OutboxOp::ForwardEvent { .. } => "forwardEvent",
+            OutboxOp::UpdateEventSeries { .. } => "updateEventSeries",
         }
     }
 
@@ -412,6 +422,11 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
                 ("comment".to_string(), optional_str(comment)),
+            ]),
+            OutboxOp::UpdateEventSeries { id, body } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("body".to_string(), Value::Str(body.clone())),
             ]),
             OutboxOp::ForwardEvent { id, to, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -519,6 +534,10 @@ impl OutboxOp {
                     })
                     .collect::<Option<Vec<_>>>()?,
                 comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+            }),
+            "updateEventSeries" => Some(OutboxOp::UpdateEventSeries {
+                id: id()?,
+                body: v.get("body")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -1440,7 +1459,8 @@ impl Store {
                 | OutboxOp::UpdateEvent { .. }
                 | OutboxOp::DeleteEvent { .. }
                 | OutboxOp::CancelEvent { .. }
-                | OutboxOp::ForwardEvent { .. } => None,
+                | OutboxOp::ForwardEvent { .. }
+                | OutboxOp::UpdateEventSeries { .. } => None,
             })
             .collect();
         ids.sort();
@@ -3254,6 +3274,27 @@ impl Store {
         tx.execute("DELETE FROM events WHERE id = ?1", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Removes a series locally (#2022): the row `master_id` (a local
+    /// series is its own row; a synced master is not stored) and every row
+    /// whose `series_master_id` it is, in any calendar, with their
+    /// attendees, in one transaction. Returns how many events went. The
+    /// host calls it before `SyncCommand::DeleteEvent { id: master_id }`,
+    /// as it calls `delete_event` before deleting one event.
+    pub fn delete_event_series(&self, master_id: &str) -> Result<usize, StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM event_attendees WHERE event_id IN
+                (SELECT id FROM events WHERE id = ?1 OR series_master_id = ?1)",
+            params![master_id],
+        )?;
+        let n = tx.execute(
+            "DELETE FROM events WHERE id = ?1 OR series_master_id = ?1",
+            params![master_id],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Reads a stored event's send-relevant fields (`None` if no such event).
@@ -7967,6 +8008,62 @@ mod calendar_tests {
     }
 
     #[test]
+    fn delete_event_series_removes_master_and_occurrences() {
+        let s = Store::open_in_memory().unwrap();
+        let occurrence = |id: &str, cal: &str, master: &str, day: u32| NewEvent {
+            series_master_id: Some(master.into()),
+            ..in_cal(
+                id,
+                cal,
+                &format!("2026-07-{day}T09:00:00Z"),
+                &format!("2026-07-{day}T10:00:00Z"),
+            )
+        };
+        for e in [
+            // A row with the master's own id (a local series is its own row).
+            in_cal("M", "A", "2026-07-13T09:00:00Z", "2026-07-13T10:00:00Z"),
+            occurrence("o1", "A", "M", 20),
+            occurrence("o2", "A", "M", 27),
+            occurrence("b-o1", "B", "M", 20),
+            occurrence("other", "A", "N", 20),
+            in_cal(
+                "single",
+                "A",
+                "2026-07-21T09:00:00Z",
+                "2026-07-21T10:00:00Z",
+            ),
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        let bob = NewAttendee {
+            name: "Bob".into(),
+            addr: "bob@x".into(),
+            r#type: "required".into(),
+            ..Default::default()
+        };
+        for id in ["o1", "M", "other"] {
+            s.put_event_attendees(id, std::slice::from_ref(&bob))
+                .unwrap();
+        }
+        assert_eq!(s.delete_event_series("M").unwrap(), 4);
+        assert_eq!(sorted_ids_of(&s, "A"), ["other", "single"]);
+        assert!(
+            ids_of(&s, "B").is_empty(),
+            "every calendar's occurrences go"
+        );
+        assert!(s.event_attendees("o1").unwrap().is_empty());
+        assert!(s.event_attendees("M").unwrap().is_empty());
+        assert_eq!(
+            s.event_attendees("other").unwrap().len(),
+            1,
+            "another series keeps its"
+        );
+        // A master with nothing stored is a no-op.
+        assert_eq!(s.delete_event_series("GONE").unwrap(), 0);
+        assert_eq!(sorted_ids_of(&s, "A"), ["other", "single"]);
+    }
+
+    #[test]
     fn apply_calendar_sync_delta_cascade_drops_the_delta_state_and_records_no_range() {
         // A master Graph lists as removed may only have changed: after the
         // cascade the next pass must run an initial round.
@@ -8530,6 +8627,35 @@ mod outbox_tests {
             OutboxOp::DeleteEvent { id: "EV2".into() },
         ] {
             assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op));
+        }
+    }
+
+    #[test]
+    fn outbox_op_update_event_series_round_trips() {
+        let op = OutboxOp::UpdateEventSeries {
+            id: "M/1".into(),
+            body: r#"{"subject":"Review","recurrence":{"pattern":{"type":"daily","interval":1}}}"#
+                .into(),
+        };
+        let stored = op.to_json().to_string();
+        assert_eq!(
+            stored,
+            r#"{"kind":"updateEventSeries","id":"M/1","body":"{\"subject\":\"Review\",\"recurrence\":{\"pattern\":{\"type\":\"daily\",\"interval\":1}}}"}"#
+        );
+        assert_eq!(
+            OutboxOp::from_json(&json::parse(&stored).unwrap()),
+            Some(op.clone())
+        );
+        // It survives the outbox table, as a restart reads it.
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue_op(&op).unwrap();
+        assert_eq!(s.pending_ops().unwrap()[0].op, op);
+        // A row without a body, or without an id, is corrupt.
+        for corrupt in [
+            r#"{"kind":"updateEventSeries","id":"M"}"#,
+            r#"{"kind":"updateEventSeries","body":"{}"}"#,
+        ] {
+            assert_eq!(OutboxOp::from_json(&json::parse(corrupt).unwrap()), None);
         }
     }
 

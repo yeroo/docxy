@@ -135,6 +135,15 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<()
         OutboxOp::ForwardEvent { id, to, comment } => {
             client.forward_event(id, to, comment.as_deref())
         }
+        // A series edit (#2022) sends the body built at command time: the
+        // master is not stored. A `local:` series is edited through its row
+        // (`UpdateEvent`, or its pending `CreateEvent`), so nothing goes.
+        OutboxOp::UpdateEventSeries { id, body } => {
+            if id.starts_with("local:") {
+                return Ok(());
+            }
+            client.update_event_body(id, body.clone()).map(|_| ())
+        }
     }
 }
 
@@ -1936,6 +1945,82 @@ mod tests {
         )
         .unwrap();
         assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn update_event_series_patches_master_with_stored_body() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/M%2F1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        // No row stored: the op carries everything it sends.
+        let store = Store::open_in_memory().unwrap();
+        let body = r#"{"subject":"Review","recurrence":{"pattern":{"type":"daily","interval":1},"range":{"type":"noEnd","startDate":"2026-07-14"}}}"#;
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEventSeries {
+                id: "M/1".into(),
+                body: body.into(),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/events/M%2F1");
+        assert_eq!(reqs[0].body, body);
+    }
+
+    #[test]
+    fn update_event_series_local_id_makes_no_request() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEventSeries {
+                id: "local:series".into(),
+                body: r#"{"subject":"x"}"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn delete_occurrence_and_series_delete_their_ids() {
+        // Pin (#2022): "delete this occurrence" is `DeleteEvent` on the
+        // occurrence's id, "delete the series" on the master's.
+        let srv = FakeServer::start(vec![Route {
+            method: "DELETE".into(),
+            path_prefix: "/me/events/".into(),
+            status: 204,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        for id in ["OCC=1", "MASTER"] {
+            apply_op(&c, &store, &OutboxOp::DeleteEvent { id: id.into() }).unwrap();
+        }
+        let paths: Vec<(String, String)> = srv
+            .requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("DELETE".to_string(), "/me/events/OCC%3D1".to_string()),
+                ("DELETE".to_string(), "/me/events/MASTER".to_string()),
+            ]
+        );
     }
 
     #[test]
