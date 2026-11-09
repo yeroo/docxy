@@ -2348,7 +2348,12 @@ series' first day.
   `BODY` PATCH sends exactly what the row holds, so clearing an occurrence's shown
   body sends it cleared. Known transient: until the next sync stores that occurrence
   as an `exception` (which has no fallback), `event_body` still shows the master's
-  body; a marker would need a new column. Copying it would have duplicated the
+  body; a marker would need a new column. An edit that leaves the body alone (no
+  `BODY`) writes the row's own body, not the shown one (r5): a subject-only edit of
+  a filled occurrence keeps `''`, so it still follows its master, and an edit during
+  the transient does not write the master's body back for the queued clear to send.
+  Its join link is still read from the shown body (the master's link, already
+  copied). Copying it would have duplicated the
   Teams HTML of each master into every occurrence.
 - **A missing master is fetched** (`Engine::fetch_missing_masters`, after a round
   and before the write). It fetches the masters of the round's occurrences and of
@@ -2437,7 +2442,8 @@ series' first day.
   `a_series_master_leaves_the_grid_once_its_series_has_a_row`,
   `a_created_series_stays_on_the_grid_through_its_reconcile`,
   `apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences`,
-  `update_event_fields_clearing_an_occurrences_body_sends_it_empty`; `outbox.rs`
+  `update_event_fields_clearing_an_occurrences_body_sends_it_empty`,
+  `update_event_fields_leaving_an_occurrences_body_keeps_its_own`; `outbox.rs`
   `update_event_clearing_an_occurrences_shown_body_sends_it_empty`; `engine.rs`
   `calendar_delta_occurrences_take_their_masters_fields`,
   `calendar_delta_repairs_blank_occurrences_in_one_pass`,
