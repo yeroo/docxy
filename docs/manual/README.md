@@ -109,7 +109,9 @@ both. The config root is `DOCXY_CONFIG_DIR`, else the OS's config directory
 ## Context help
 
 F1 resolves a context id to a page:
-- A ribbon command id is used bare (`bold`).
+- A ribbon command id is used bare (`bold`). F1 asks for it while the
+  pointer rests on the command (its ScreenTip need not be up), with the
+  ribbon tab shown as the area.
 - A dialog id is `dialog:<id>` (`dialog:font`).
 - An area is the ribbon tab's name, slugified by the heading rule
   (`Home` → `home`, `Page Layout` → `page-layout`,

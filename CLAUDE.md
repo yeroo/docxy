@@ -64,7 +64,7 @@ issue number to find its notes.
   a help target (`every_ribbon_command_has_a_help_target`: `docs/claude/help.md`).
 - `docs/claude/help.md`: before changing the help manuals or the Documentation tab:
   manual bundles (#1022), the Help tab and F1 (#1855), the manual revision in
-  About and the Help footer (#1857).
+  About and the Help footer (#1857), F1 on a hovered ribbon command (#1869).
 - `docs/claude/ui-plugins.md`: before changing the UI plugin ABI, the plan's formatting
   model (`projcore::formatting`, `formatting.xml`) or the plugin dialogs and their layout:
   UI plugins (#1532, #1553, #1572, #1609), dialog values that follow (#1670), overlay text

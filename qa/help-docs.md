@@ -41,6 +41,29 @@ the ribbon tab shown, or of the open dialog.
 **Fails when:** F1 does nothing, opens a second Help tab, opens a browser, closes
 the dialog, or lands on the wrong page.
 
+## F1 on the command under the pointer
+
+**Guards:** #1869 requires F1 with the pointer resting on a ribbon command to open
+that command's page, and the pointer leaving the window to end it.
+
+**Steps:**
+1. On the document's Home tab rest the pointer on **Bold** (no click) and press
+   **F1**. Go back to the document tab.
+2. Rest the pointer on Insert › **Symbol** and press **F1**. Go back.
+3. Rest the pointer on Home › **Bold**, then move it straight up out of the
+   window, across the title bar's edge onto the desktop, and press **F1** (on
+   Windows and Linux click nothing: the window keeps the keyboard).
+
+**Expect:**
+- Step 1 shows the Font formatting page (`home-font`).
+- Step 2 shows the Insert tab page: Symbol has no page of its own.
+- Step 3 shows the Home tab page, not Font formatting: a pointer outside the
+  window rests on no command.
+
+**Fails when:** F1 over a command opens its tab's page, or F1 with the pointer
+outside the window still opens the page of the command it last rested on (the
+Windows check: gpui sends no `MouseExited` there).
+
 ## Search, links and history work with no network
 
 **Guards:** #1855 requires full-text search, links between pages, back/forward
