@@ -677,8 +677,10 @@ impl App {
             }
             // A reply/forward draft (`SyncCommand::ComposeReply`/
             // `ComposeForward`) just landed in the store — open the composer
-            // on it (see `open_draft`).
-            SyncEvent::DraftReady { id } => self.open_draft(&id),
+            // on it (see `open_draft`). lookxy opens every draft it is
+            // handed, so the request it answers (`original`, `kind`, #2085)
+            // is not compared.
+            SyncEvent::DraftReady { id, .. } => self.open_draft(&id),
             SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
             SyncEvent::SignInStarted { authorize_url } => {
                 self.open_url_with_os_handler(&authorize_url);
@@ -4138,6 +4140,7 @@ fn signature_body_html(sig: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use mailcore::graph::model::AttachmentKind;
+    use mailcore::sync::engine::DraftKind;
 
     /// Seeds a meeting-invite message into the seeded fixture's inbox, pulls it
     /// into `app.messages` (`reload_messages`), and opens it.
@@ -6786,7 +6789,11 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        app.on_sync_event(SyncEvent::DraftReady { id: id.clone() });
+        app.on_sync_event(SyncEvent::DraftReady {
+            id: id.clone(),
+            original: "M1".into(),
+            kind: DraftKind::Reply,
+        });
 
         let compose = app.compose.as_ref().expect("compose should be open");
         assert_eq!(compose.subject, "Re: Hi");
@@ -6801,6 +6808,8 @@ pub(crate) mod tests {
         let mut app = App::for_test_with_seeded_store();
         app.on_sync_event(SyncEvent::DraftReady {
             id: "no-such-draft".into(),
+            original: "M1".into(),
+            kind: DraftKind::Forward,
         });
         assert!(app.compose.is_none());
     }

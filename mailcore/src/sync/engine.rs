@@ -295,9 +295,14 @@ pub enum SyncCommand {
     /// Fetch a pre-quoted reply draft for `id` (`createReply`/
     /// `createReplyAll` depending on `all`), store it, and emit
     /// [`SyncEvent::DraftReady`] so the UI can open the compose editor on it.
+    /// The event names this `id` as sent and the kind ([`DraftKind::Reply`]
+    /// or [`DraftKind::ReplyAll`]), so a host can tell it from the draft of
+    /// another request (#2085). Graph is addressed by the id the message is
+    /// stored under now (`current_id`: an id from before a move, #1896).
     ComposeReply { id: String, all: bool },
     /// Fetch a pre-quoted forward draft for `id` (`createForward`), store
-    /// it, and emit [`SyncEvent::DraftReady`].
+    /// it, and emit [`SyncEvent::DraftReady`] naming this `id` as sent and
+    /// [`DraftKind::Forward`] (#2085), as [`SyncCommand::ComposeReply`] does.
     ComposeForward { id: String },
     /// List the user's calendars (`Store::replace_calendars`, emitting
     /// [`SyncEvent::CalendarsUpdated`] when the list changed), then bring
@@ -582,6 +587,18 @@ pub enum SyncState {
     SignInRequired,
 }
 
+/// The answer a [`SyncEvent::DraftReady`] draft was made as (#2085).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind {
+    /// A reply to the sender: `ComposeReply { all: false }` (`createReply`).
+    Reply,
+    /// A reply to the sender and every recipient: `ComposeReply { all: true }`
+    /// (`createReplyAll`).
+    ReplyAll,
+    /// A forward: `ComposeForward` (`createForward`).
+    Forward,
+}
+
 /// An event sent from the sync thread up to the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncEvent {
@@ -711,8 +728,20 @@ pub enum SyncEvent {
     },
     /// A reply/forward draft (from [`SyncCommand::ComposeReply`]/
     /// [`SyncCommand::ComposeForward`]) was stored; the UI should load it
-    /// (`Store::draft`) and open the compose editor.
-    DraftReady { id: String },
+    /// (`Store::draft`, by `id`) and open the compose editor.
+    ///
+    /// `original` and `kind` name the request it answers (#2085): `original`
+    /// is the message id exactly as the command carried it (never the id
+    /// Graph was addressed by after a move, nor a reconciled `local:` id),
+    /// and `kind` the answer asked for. A host that stopped waiting for a
+    /// request (a timeout, the form closed) compares them with the request
+    /// it waits for now and drops a late draft of an earlier one. A request
+    /// that fails emits no `DraftReady`.
+    DraftReady {
+        id: String,
+        original: String,
+        kind: DraftKind,
+    },
     /// The draft `id` (the same id the triggering [`SyncCommand::SendDraft`]
     /// was addressed with — not necessarily its final Graph id, if it was
     /// still a `local:` id when send started) was successfully handed to
@@ -4755,13 +4784,21 @@ impl Engine {
 
     /// Fetch a pre-quoted reply draft for `id` from Graph (`createReply`, or
     /// `createReplyAll` when `all`) and store it — see `store_composed_draft`.
+    /// Graph is addressed by the id the message is stored under now
+    /// (`current_id`, #1896); the event names `id` as the command sent it.
     fn compose_reply(&mut self, id: &str, all: bool) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        match self.with_auth(|c| c.create_reply(id, all)) {
-            Ok(draft) => self.store_composed_draft(draft),
+        let kind = if all {
+            DraftKind::ReplyAll
+        } else {
+            DraftKind::Reply
+        };
+        let graph_id = self.store.current_id(id).unwrap_or_else(|_| id.to_string());
+        match self.with_auth(|c| c.create_reply(&graph_id, all)) {
+            Ok(draft) => self.store_composed_draft(draft, id, kind),
             Err(e) => {
                 self.react(e);
             }
@@ -4769,14 +4806,15 @@ impl Engine {
     }
 
     /// Fetch a pre-quoted forward draft for `id` from Graph (`createForward`)
-    /// and store it — see `store_composed_draft`.
+    /// and store it — see `store_composed_draft`. Ids as in `compose_reply`.
     fn compose_forward(&mut self, id: &str) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
-        match self.with_auth(|c| c.create_forward(id)) {
-            Ok(draft) => self.store_composed_draft(draft),
+        let graph_id = self.store.current_id(id).unwrap_or_else(|_| id.to_string());
+        match self.with_auth(|c| c.create_forward(&graph_id)) {
+            Ok(draft) => self.store_composed_draft(draft, id, DraftKind::Forward),
             Err(e) => {
                 self.react(e);
             }
@@ -4790,7 +4828,9 @@ impl Engine {
     /// (`Store::drafts_folder_id`, the same resolution `create_local_draft`
     /// uses — real folder if synced, sentinel otherwise), stores the body,
     /// and emits `DraftReady` so the UI can open the compose editor on it.
-    fn store_composed_draft(&mut self, draft: Message) {
+    /// `original` is the message id as the command carried it, unresolved,
+    /// and `kind` the answer asked for: the event names its request (#2085).
+    fn store_composed_draft(&mut self, draft: Message, original: &str, kind: DraftKind) {
         let body = match self.with_auth(|c| c.get_body(&draft.id, false)) {
             Ok(b) => b,
             Err(e) => {
@@ -4813,7 +4853,11 @@ impl Engine {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
         }
-        self.emit(SyncEvent::DraftReady { id: draft.id });
+        self.emit(SyncEvent::DraftReady {
+            id: draft.id,
+            original: original.to_string(),
+            kind,
+        });
     }
 
     // --- Calendar ----------------------------------------------------------
@@ -9673,10 +9717,12 @@ mod tests {
                 all: false,
             })
             .unwrap();
-        wait_for(
-            &handle.evt_rx,
-            |e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT1"),
-        );
+        let want = SyncEvent::DraftReady {
+            id: "DRAFT1".into(),
+            original: "M1".into(),
+            kind: DraftKind::Reply,
+        };
+        wait_for(&handle.evt_rx, |e| *e == want);
 
         let store = Store::open(&store_path).unwrap();
         assert!(!store.draft("DRAFT1").unwrap().unwrap().0.is_draft);
@@ -9860,10 +9906,13 @@ mod tests {
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::DraftReady { .. })
         });
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT1"))
+        assert_eq!(
+            events.last(),
+            Some(&SyncEvent::DraftReady {
+                id: "DRAFT1".into(),
+                original: "M1".into(),
+                kind: DraftKind::Reply,
+            })
         );
 
         let store = Store::open(&store_path).unwrap();
@@ -10005,10 +10054,13 @@ mod tests {
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::DraftReady { .. })
         });
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, SyncEvent::DraftReady { id } if id == "DRAFT2"))
+        assert_eq!(
+            events.last(),
+            Some(&SyncEvent::DraftReady {
+                id: "DRAFT2".into(),
+                original: "M1".into(),
+                kind: DraftKind::Forward,
+            })
         );
 
         let store = Store::open(&store_path).unwrap();
@@ -10018,6 +10070,97 @@ mod tests {
             .expect("forward draft should be stored");
         assert_eq!(row.subject, "Fwd: Hi");
         assert_eq!(body.content, "<p>fwd body</p>");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reply/forward draft's JSON as `createReply`/`createForward` return
+    /// it (no body).
+    fn composed_draft_json(id: &str, subject: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","conversationId":"C1","subject":"{subject}","from":{{"emailAddress":{{"name":"Alice","address":"alice@x"}}}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}}"#
+        )
+    }
+
+    /// Each `DraftReady` names the request it answers (#2085): the original
+    /// message id as the command carried it, and the answer asked for, so a
+    /// host can tell a late draft of an earlier request from its current
+    /// one's. Two originals, `all` false and true, and a forward.
+    #[test]
+    fn compose_draft_ready_names_its_original_and_kind() {
+        let mut routes = vec![get_route("/me/mailFolders", 200, r#"{"value":[]}"#)];
+        for (original, action, draft) in [
+            ("M1", "createReply", "D1"),
+            ("M2", "createReplyAll", "D2"),
+            ("M3", "createForward", "D3"),
+        ] {
+            routes.push(Route {
+                method: "POST".into(),
+                path_prefix: format!("/me/messages/{original}/{action}"),
+                status: 200,
+                headers: vec![],
+                body: composed_draft_json(draft, "Re: Hi"),
+            });
+            routes.push(get_route(
+                &format!("/me/messages/{draft}"),
+                200,
+                r#"{"body":{"contentType":"html","content":"<p>quoted</p>"}}"#,
+            ));
+        }
+        let srv = FakeServer::start(routes);
+        let base = srv.base_url.clone();
+
+        let dir = unique_dir("compose-draft-ready-request");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        seed_token(&token_path);
+
+        let handle = spawn_with_bases(
+            store_path,
+            token_path,
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+
+        for cmd in [
+            SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: false,
+            },
+            SyncCommand::ComposeReply {
+                id: "M2".into(),
+                all: true,
+            },
+            SyncCommand::ComposeForward { id: "M3".into() },
+        ] {
+            handle.cmd_tx.send(cmd).unwrap();
+        }
+
+        let mut ready = Vec::new();
+        wait_for(&handle.evt_rx, |e| {
+            if matches!(e, SyncEvent::DraftReady { .. }) {
+                ready.push(e.clone());
+            }
+            ready.len() == 3
+        });
+        let ready_event = |id: &str, original: &str, kind| SyncEvent::DraftReady {
+            id: id.into(),
+            original: original.into(),
+            kind,
+        };
+        assert_eq!(
+            ready,
+            [
+                ready_event("D1", "M1", DraftKind::Reply),
+                ready_event("D2", "M2", DraftKind::ReplyAll),
+                ready_event("D3", "M3", DraftKind::Forward),
+            ]
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -21251,6 +21394,68 @@ mod tests {
                 )]
             );
             assert!(row(&store, "NEW1").is_read);
+            no_quarantine(&seen);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A reply asked for by the id the UI had before a move is made on
+        /// the message's new id, and its `DraftReady` still names the id the
+        /// command carried (#2085), so the host matches it to its request.
+        #[test]
+        fn compose_reply_by_the_old_id_after_a_move_names_the_old_id() {
+            let mut routes = move_routes();
+            routes.push(post_route(
+                "/me/messages/NEW1/createReply",
+                &composed_draft_json("D1", "Re: Hello"),
+            ));
+            routes.push((
+                get_route(
+                    "/me/messages/D1",
+                    200,
+                    r#"{"body":{"contentType":"html","content":"<p>quoted</p>"}}"#,
+                ),
+                None,
+            ));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, _store_path, dir) = spawn(&srv, "moved-reply", |_| {});
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let mut seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::ComposeReply {
+                    id: "OLD1".into(),
+                    all: false,
+                })
+                .unwrap();
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::DraftReady { .. })
+            }));
+
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::DraftReady {
+                    id: "D1".into(),
+                    original: "OLD1".into(),
+                    kind: DraftKind::Reply,
+                })
+            );
+            assert_eq!(
+                requests(&srv, "POST")
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .collect::<Vec<_>>(),
+                ["/me/messages/OLD1/move", "/me/messages/NEW1/createReply"]
+            );
             no_quarantine(&seen);
 
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
