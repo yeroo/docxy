@@ -943,13 +943,13 @@ impl DocView {
         })
     }
 
-    /// The scrolling area's bounds as last painted.
     /// A scrollbar region (#2080): `vbar`, `hbar-thumb`, `vbar-down`, ...
     /// ([`crate::doc_scrollbar::bar_region`]).
     pub(crate) fn bar_region(&self, part: &str) -> Result<Bounds<Pixels>, String> {
         crate::doc_scrollbar::bar_region(&self.vbar, &self.hbar, part)
     }
 
+    /// The scrolling area's bounds as last painted.
     pub(crate) fn viewport(&self) -> Option<Bounds<Pixels>> {
         self.viewport.get()
     }

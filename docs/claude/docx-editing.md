@@ -204,9 +204,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   stretched root would hide a wide table from it. Both flow scroll areas
   scroll on both axes under the document scrollbars (#2080, was
   gpui-component's `doc-hscrollbar` / `ext-doc-hscrollbar`); the doc tab's
-  `ruler_scroll_view(.., shrink: true)` sets `min_w(0)`, else the flex item
-  would widen to the table. Print Layout passes true too since #2080: it
-  scrolls a wide sheet sideways instead of widening to it.
+  `ruler_scroll_view` sets `min_w(0)`, else the flex item would widen to
+  the table. Print Layout's view does too since #2080 (the parameter that
+  let it widen to a wide sheet is gone): it scrolls the sheet sideways.
 - The flow view's caret follow is y only (#1895 r1): gpui's
   `scroll_to_item` also moves x on a scroll area that scrolls sideways
   (back to a wide block's left on every key), so `scroll_to_caret` only
@@ -217,8 +217,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   after the edit. The last layout's bounds are not used: after an Enter or
   a delete they can be another block's. A caret in a cell scrolled out of
   view sideways does not scroll x. Print Layout follows the same way since
-  it scrolls sideways (#2080): `scroll_to_caret` sets its own
-  `Docxy::page_follow` (the Print Layout render clears `doc_follow`), and
+  it scrolls sideways (#2080): `scroll_to_caret` (and `scroll_to_hf`, an
+  open header or footer's page) sets its own `Docxy::page_follow` (the Print Layout render clears `doc_follow`), and
   the follow runs in the followed page's own probe (`page_follow_el`),
   from the page's laid-out bounds (`follow_bounds_y`), as the pages are not
   the scroll area's children. gpui's default strategy was FirstVisible

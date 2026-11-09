@@ -5806,9 +5806,10 @@ struct Docxy {
     /// The flow view's block the caret moved into (#1895), followed in y by
     /// the scroll area's probe once the next layout has laid it out.
     doc_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
-    /// Print Layout's page the caret moved onto (#2080), followed in y by
-    /// page 0's probe once the next layout has laid it out: the flow view's
-    /// `doc_follow`, for pages.
+    /// Print Layout's page the caret (or an open header or footer) moved
+    /// onto (#2080), followed in y by that page's own `page_follow_el` once
+    /// the next layout has laid it out: the flow view's `doc_follow`, for
+    /// pages.
     page_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
     /// The document views' scrollbars (#2080): one pair for the tab, as
     /// Print Layout and the flow view never draw at once.
@@ -7275,14 +7276,12 @@ impl Docxy {
 /// The document's scroll area under the probe of its viewport, which the
 /// ruler and the harness read.
 ///
-/// `shrink`: the view is no wider than the window, whatever it holds (the
-/// flow view, #1895: a table wider than the view scrolls inside it). Print
-/// Layout passes false, so its area still widens to a sheet wider than the
-/// window, as it always has.
+/// The view is no wider than the window, whatever it holds: a table wider
+/// than the flow view scrolls inside it (#1895), and so does a Print Layout
+/// sheet wider than the window (#2080), which the area once widened to.
 fn ruler_scroll_view(
     scroll: AnyElement,
     probe: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
-    shrink: bool,
 ) -> AnyElement {
     v_flex()
         .relative()
@@ -7291,7 +7290,7 @@ fn ruler_scroll_view(
         .min_h(px(0.))
         // A flex item is at least as wide as its content unless told
         // otherwise.
-        .when(shrink, |d| d.min_w(px(0.)))
+        .min_w(px(0.))
         .child(scroll)
         .child(ruler_probe_el(probe, |state, rect| {
             state.viewport = Some(rect)
@@ -27848,7 +27847,6 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// A fixed strip beside the scroll viewport, painted from the tracked page.
     /// Print Layout's pages for its page tip and `doc`'s `top_page`
     /// (#2080), from the page rects the last frame painted.
     pub(crate) fn print_pages(&self) -> doc_scrollbar::Pages {
@@ -27912,6 +27910,7 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// A fixed strip beside the scroll viewport, painted from the tracked page.
     fn vruler(&self, pal: Pal) -> AnyElement {
         let zoom = self.zoom;
         let colors = ruler_colors(pal, self.applied == Some(ThemeMode::Dark));
@@ -44097,7 +44096,7 @@ impl Render for Docxy {
                                     .children(sheets),
                             )
                             .into_any_element();
-                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe, true);
+                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
                         let scroll_view = self.print_bars(scroll_view, cx);
                         if self.show_ruler {
                             h_flex()
@@ -44214,7 +44213,7 @@ impl Render for Docxy {
                                 doc_scrollbar::BarColors::of(cx),
                             ))
                             .into_any_element();
-                        ruler_scroll_view(scroll, &self.ruler_probe, true)
+                        ruler_scroll_view(scroll, &self.ruler_probe)
                     }
                 }
                 Surface::Sheet(v) => sheet_el(

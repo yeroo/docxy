@@ -327,8 +327,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   strip only ever shrinks the view, so this settles. The flow view and
   DocView lay theirs over the padding (`overlay_bars`), which keeps the
   text width. An unshown overlay paints nothing and takes no input.
-- Print Layout scrolls both axes. `ruler_scroll_view(.., true)` bounds the
-  view to the window, and the pages sit in a column (`min_w_full`,
+- Print Layout scrolls both axes. `ruler_scroll_view` bounds the view to
+  the window, and the pages sit in a column (`min_w_full`,
   `items_center`) inside the scroll area. A page narrower than the view is
   centred, and a wider one starts at the left, so it overflows to the right
   only. Auto margins (`mx_auto`) or centring in the scroll area itself
