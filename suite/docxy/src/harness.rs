@@ -2773,6 +2773,24 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
         fields.push(("line_numbers".into(), line_numbers_state(app)));
         fields.push(("flow".into(), flow_state(app)));
         fields.push(("scroll".into(), scroll_state(app)));
+        // The page the document last drew on (#2079): Word's dark mode
+        // (`dark`) or not (`light`), its colour (Print Layout's sheet, Web
+        // Layout's ground), and the body's runs' inks on what they sit on.
+        let page = app.painted_page.get();
+        fields.push((
+            "page_mode".into(),
+            page.map_or(Json::Null, |(_, dark)| {
+                Json::Str(if dark { "dark" } else { "light" }.into())
+            }),
+        ));
+        fields.push((
+            "page_color".into(),
+            page.map_or(Json::Null, |(c, _)| Json::Str(format!("{c:06x}"))),
+        ));
+        fields.push((
+            "inks".into(),
+            crate::painted_inks_json(&app.painted_inks.borrow()),
+        ));
         if let Some(tab) = app.tabs.get(app.active) {
             fields.push(("mail".into(), mail_state(tab)));
         }

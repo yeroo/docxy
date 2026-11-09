@@ -220,7 +220,11 @@ fn floored(rgb: u32, ground: u32, min: f32) -> u32 {
     let light = takes_light(ground);
     let up = || {
         let cap = hsl(AUTO_DARK).2;
-        let from = if l < 0.5 { (1.0 - l).min(cap).max(l) } else { l };
+        let from = if l < 0.5 {
+            (1.0 - l).min(cap).max(l)
+        } else {
+            l
+        };
         lighten(h, s, from, ground, min)
     };
     let down = || darken(h, s, l, ground, min);
@@ -299,7 +303,9 @@ mod tests {
 
     #[test]
     fn hsl_round_trips() {
-        for rgb in [0x000000, 0xFFFFFF, 0x4472C4, 0x0047FF, 0xEEF3FF, 0x595959, 0xFFC000] {
+        for rgb in [
+            0x000000, 0xFFFFFF, 0x4472C4, 0x0047FF, 0xEEF3FF, 0x595959, 0xFFC000,
+        ] {
             let (h, s, l) = hsl(rgb);
             assert_eq!(from_hsl(h, s, l), rgb, "{rgb:06x}");
         }
@@ -469,7 +475,10 @@ mod tests {
             }
             assert!(contrast(auto_text(g), g) >= TEXT_FLOOR, "auto on {g:06x}");
             assert!(contrast(dim_text(g), g) >= TEXT_FLOOR, "dim on {g:06x}");
-            assert!(contrast(border(None, g), g) >= BORDER_FLOOR, "border on {g:06x}");
+            assert!(
+                contrast(border(None, g), g) >= BORDER_FLOOR,
+                "border on {g:06x}"
+            );
         }
     }
 }

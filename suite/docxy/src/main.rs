@@ -1478,6 +1478,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::ToggleNotes
             | Act::Markup(_)
             | Act::DarkMode
+            | Act::SwitchModes
             | Act::AutoHideRibbon
             | Act::PrintLayout
             | Act::ToggleRuler
@@ -5712,6 +5713,9 @@ struct Docxy {
     /// snapshot and its prune keeps these sidecars (#1224).
     unregistered_own: std::cell::RefCell<Vec<PersistTab>>,
     applied: Option<ThemeMode>,
+    /// View > Switch Modes (#2079): on a dark theme, the document shows its
+    /// light page instead of Word's dark mode. Per window, not persisted.
+    light_page: bool,
     /// The OS appearance Auto follows: seeded when the window opens, updated
     /// by gpui's appearance observer (#1075).
     os_appearance: gpui::WindowAppearance,
@@ -5801,6 +5805,12 @@ struct Docxy {
     /// The document tab's top-level paragraphs as its flow view last painted
     /// them, in a harness instance (#1986), for `doc`'s `flow.layout`.
     painted_paras: PaintedParas,
+    /// The body's runs' inks as last painted, both views (#2079): a
+    /// harness instance only.
+    painted_inks: PaintedInks,
+    /// The ground the document last drew on and whether Word's dark mode
+    /// was on (#2079), for the harness's `doc` `page_color` / `page_mode`.
+    painted_page: std::cell::Cell<Option<(u32, bool)>>,
     /// The document tab's body pictures as last drawn (#1926), for the
     /// harness's `doc` read.
     drawn_pictures: pictures::DrawnPictures,
@@ -7505,6 +7515,115 @@ mod link_colour_tests {
             let r = contrast(rgb(LINK_DARK), rgb(sheet));
             assert!(r >= 4.5, "{sheet:06x}: {r:.2}");
         }
+    }
+
+    /// A run of colour `c` (`None`: automatic).
+    fn coloured(c: Option<&str>) -> RunProps {
+        RunProps {
+            color: c.map(str::to_string),
+            ..RunProps::default()
+        }
+    }
+
+    #[test]
+    fn a_dark_page_maps_a_runs_colour_and_a_light_one_keeps_it_2079() {
+        let sel = hsla_u(0x123456);
+        let dark = dark_page_pal(dark_page::PAGE_DARK, sel);
+        assert!(dark.dark);
+        assert_eq!(dark.ground, dark_page::PAGE_DARK);
+        // Explicit black and a dark grey: lightened, the floor kept.
+        for c in ["000000", "595959", "0047FF", "0563C1"] {
+            let ink = rgb_u(run_ink(&coloured(Some(c)), false, &dark));
+            assert_eq!(
+                ink,
+                dark_page::text(hex_rgb(c).unwrap(), dark_page::PAGE_DARK)
+            );
+            assert!(
+                dark_page::contrast(ink, dark_page::PAGE_DARK) >= dark_page::TEXT_FLOOR,
+                "{c}"
+            );
+        }
+        // Automatic text: the light automatic ink; an uncoloured link the
+        // light link blue.
+        assert_eq!(
+            rgb_u(run_ink(&coloured(None), false, &dark)),
+            dark_page::AUTO_DARK
+        );
+        assert_eq!(run_ink(&coloured(None), true, &dark), dark.link);
+        // On the light page every colour is its own, as before.
+        let light = page_pal(0xffffff, sel);
+        assert!(!light.dark);
+        assert_eq!(light.ground, 0xffffff);
+        assert_eq!(
+            run_ink(&coloured(Some("000000")), false, &light),
+            hsla_u(0x000000)
+        );
+        assert_eq!(
+            run_ink(&coloured(Some("595959")), false, &light),
+            hsla_u(0x595959)
+        );
+    }
+
+    #[test]
+    fn a_cell_on_a_dark_page_shows_its_mapped_fill_and_reads_on_it_2079() {
+        let sel = hsla_u(0x123456);
+        let dark = dark_page_pal(dark_page::PAGE_DARK, sel);
+        // A very light callout: darkened, and its text light on it.
+        let shown = dark.shown_fill(0xEEF3FF);
+        assert_eq!(shown, dark_page::fill(0xEEF3FF));
+        let cell = cell_pal(dark, Some(0xEEF3FF));
+        assert!(cell.dark);
+        assert_eq!(cell.ground, shown);
+        for ink in [cell.fg, cell.dim, cell.link] {
+            assert!(dark_page::contrast(rgb_u(ink), shown) >= dark_page::TEXT_FLOOR);
+        }
+        // Black text in it reads on the mapped fill, not the page.
+        let ink = rgb_u(run_ink(&coloured(Some("000000")), false, &cell));
+        assert!(dark_page::contrast(ink, shown) >= dark_page::TEXT_FLOOR);
+        // A saturated fill is kept, and dark text on it stays dark.
+        let blue = cell_pal(dark, Some(0x5B9BD5));
+        assert_eq!(blue.ground, 0x5B9BD5);
+        assert_eq!(
+            run_ink(&coloured(Some("000000")), false, &blue),
+            hsla_u(0x000000)
+        );
+        // No fill: the page's palette.
+        assert_eq!(cell_pal(dark, None).ground, dark_page::PAGE_DARK);
+        // Borders: an automatic one the visible grey, not the white ink.
+        assert_eq!(
+            dark.border_ink(None, dark_page::PAGE_DARK),
+            hsla_u(dark_page::BORDER_DARK)
+        );
+        // On the light page the fill and border are the document's own.
+        let light = page_pal(0xffffff, sel);
+        assert_eq!(light.shown_fill(0xEEF3FF), 0xEEF3FF);
+        assert_eq!(cell_pal(light, Some(0xEEF3FF)).ground, 0xEEF3FF);
+        assert_eq!(light.border_ink(None, 0xffffff), light.fg);
+        assert_eq!(light.border_ink(Some(0xBFBFBF), 0xffffff), hsla_u(0xBFBFBF));
+    }
+
+    #[test]
+    fn painted_inks_report_the_least_readable_run_2079() {
+        let ink = |text: &str, ink: u32, ground: u32| PaintedInk {
+            text: text.into(),
+            ink,
+            ground,
+        };
+        let j = painted_inks_json(&[]);
+        assert_eq!(j.get("runs").and_then(|v| v.as_f64()), Some(0.));
+        assert_eq!(j.get("all_readable").and_then(|v| v.as_bool()), Some(true));
+        let j = painted_inks_json(&[
+            ink("ok", 0xF2F2F2, 0x262626),
+            ink("dim", 0x000000, 0x262626),
+        ]);
+        assert_eq!(j.get("runs").and_then(|v| v.as_f64()), Some(2.));
+        assert_eq!(j.get("all_readable").and_then(|v| v.as_bool()), Some(false));
+        let worst = j.get("worst").unwrap();
+        assert_eq!(worst.get_str("text"), Some("dim"));
+        assert_eq!(worst.get_str("ink"), Some("000000"));
+        assert_eq!(worst.get_str("ground"), Some("262626"));
+        let j = painted_inks_json(&[ink("ok", 0xF2F2F2, 0x262626)]);
+        assert_eq!(j.get("all_readable").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[test]
@@ -10157,6 +10276,9 @@ struct RenderCtx<'a> {
     /// Where each top-level paragraph's painted layout goes, for the
     /// harness (#1986); `None` records none.
     paras: Option<&'a PaintedParas>,
+    /// Where each body run's ink and ground go, for the harness (#2079);
+    /// `None` records none.
+    inks: Option<&'a PaintedInks>,
 }
 
 /// Each top-level table's block and painted bounds in the frame last drawn.
@@ -10196,6 +10318,57 @@ struct PaintedRun {
 /// The [`PaintedPara`]s of the frame last drawn.
 type PaintedParas = std::rc::Rc<std::cell::RefCell<Vec<PaintedPara>>>;
 
+/// A run (or list number) of the body's text as last painted, top-level or
+/// in a table cell, for the harness's `doc` `inks` (#2079): its text, its
+/// ink and what it sits on (the palette's ground: the page or the cell's
+/// shown fill), `0xRRGGBB`. A highlighted run is not recorded: its
+/// highlight picks its own ink.
+#[derive(Clone, Debug, PartialEq)]
+struct PaintedInk {
+    text: String,
+    ink: u32,
+    ground: u32,
+}
+
+/// The [`PaintedInk`]s of the frame last drawn.
+type PaintedInks = std::rc::Rc<std::cell::RefCell<Vec<PaintedInk>>>;
+
+/// The harness's `doc` `inks` (#2079) over the runs a frame painted:
+/// `runs` (how many), `min_contrast` (the least WCAG contrast of a run's ink
+/// on its ground, two decimals; `null` with none), `all_readable` (every run
+/// at [`dark_page::TEXT_FLOOR`] or more: a case asserts only `is`) and
+/// `worst` (that run's `text`, `ink` and `ground`, `rrggbb`; `null` with
+/// none).
+fn painted_inks_json(inks: &[PaintedInk]) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let rated = |i: &PaintedInk| dark_page::contrast(i.ink, i.ground);
+    let worst = inks.iter().min_by(|a, b| rated(a).total_cmp(&rated(b)));
+    let hex = |c: u32| Json::Str(format!("{c:06x}"));
+    Json::obj(vec![
+        ("runs", Json::Num(inks.len() as f64)),
+        (
+            "min_contrast",
+            worst.map_or(Json::Null, |w| {
+                Json::Num((f64::from(rated(w)) * 100.).floor() / 100.)
+            }),
+        ),
+        (
+            "all_readable",
+            Json::Bool(worst.is_none_or(|w| rated(w) >= dark_page::TEXT_FLOOR)),
+        ),
+        (
+            "worst",
+            worst.map_or(Json::Null, |w| {
+                Json::obj(vec![
+                    ("text", Json::Str(w.text.clone())),
+                    ("ink", hex(w.ink)),
+                    ("ground", hex(w.ground)),
+                ])
+            }),
+        ),
+    ])
+}
+
 /// How the flow view draws a paragraph (#1986): `flow` draws a fully spaced
 /// one exactly, `gap_below` gives a top-level one the column's 4 px below
 /// it, and `record` takes its painted layout under its block.
@@ -10204,6 +10377,8 @@ struct FlowPara<'a> {
     flow: bool,
     gap_below: bool,
     record: Option<(&'a PaintedParas, usize)>,
+    /// Where its runs' inks go (#2079).
+    inks: Option<&'a PaintedInks>,
 }
 
 /// A canvas filling its (relative) parent that takes its bounds at prepaint.
@@ -10340,6 +10515,13 @@ struct Pal {
     /// The colour of a link run with no colour of its own (#1906): one that
     /// reads on the ground this palette draws on.
     link: Hsla,
+    /// What the text drawn in this palette sits on (`0xRRGGBB`): the page,
+    /// the sheet, or a cell's shown fill (#2079). Paragraph and run shading
+    /// are not painted, so nothing else is under a run.
+    ground: u32,
+    /// Word's dark mode for the document (#2079): a document colour drawn in
+    /// this palette goes through [`dark_page`] against [`Pal::ground`].
+    dark: bool,
 }
 
 impl Pal {
@@ -10364,8 +10546,35 @@ impl Pal {
             hover: Hsla { a: 0.12, ..fg },
             sel: t.selection,
             link: hsla_u(theme_link(dark)),
+            ground: rgb_u(t.background),
+            dark: false,
         }
     }
+
+    /// The colour a fill of `rgb` draws in: mapped for a dark page
+    /// ([`dark_page::fill`]), else its own. The cell's painted background and
+    /// the ground its text is chosen against both come from here (#2079).
+    fn shown_fill(&self, rgb: u32) -> u32 {
+        if self.dark { dark_page::fill(rgb) } else { rgb }
+    }
+
+    /// The colour a border or rule of colour `rgb` (`None`: automatic) draws
+    /// in on `ground`: on a dark page one that stays visible
+    /// ([`dark_page::border`]), else its own, an automatic one in the ink.
+    fn border_ink(&self, rgb: Option<u32>, ground: u32) -> Hsla {
+        if self.dark {
+            hsla_u(dark_page::border(rgb, ground))
+        } else {
+            rgb.map_or(self.fg, hsla_u)
+        }
+    }
+}
+
+/// `c` as `0xRRGGBB`, its alpha dropped.
+fn rgb_u(c: Hsla) -> u32 {
+    let c = Rgba::from(c);
+    let b = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+    (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
 }
 
 /// The link colour on a theme's own ground (#1906): the light blue on a dark
@@ -10391,6 +10600,39 @@ fn page_pal(sheet: u32, sel: Hsla) -> Pal {
         },
         sel,
         link: hsla_u(design_tab::page_link(sheet)),
+        ground: sheet,
+        dark: false,
+    }
+}
+
+/// The palette a document draws in on a dark page of colour `ground`, as
+/// Word's dark mode draws it (#2079): automatic text and dimmed text that
+/// read on it, a visible mid-grey border, washes that show on it, the light
+/// link blue floor-checked against it, and [`Pal::dark`] on, so the
+/// document's own colours map through [`dark_page`] as they draw. `ground`
+/// is the mapped page ([`dark_page::page_sheet`]) or a cell's mapped fill.
+fn dark_page_pal(ground: u32, sel: Hsla) -> Pal {
+    let wash = if dark_page::takes_light(ground) {
+        0xffffff
+    } else {
+        0x000000
+    };
+    Pal {
+        fg: hsla_u(dark_page::auto_text(ground)),
+        dim: hsla_u(dark_page::dim_text(ground)),
+        border: hsla_u(dark_page::border(None, ground)),
+        panel: Hsla {
+            a: 0.10,
+            ..hsla_u(wash)
+        },
+        hover: Hsla {
+            a: 0.12,
+            ..hsla_u(wash)
+        },
+        sel,
+        link: hsla_u(dark_page::text(LINK_DARK, ground)),
+        ground,
+        dark: true,
     }
 }
 
@@ -16691,6 +16933,12 @@ fn startup_tabs(restored: Vec<DocTab>, sample_fallback: bool) -> Startup {
 }
 
 impl Docxy {
+    /// Whether the document draws as Word's dark mode does (#2079): the
+    /// applied theme is dark and View > Switch Modes is off.
+    fn page_is_dark(&self) -> bool {
+        self.applied == Some(ThemeMode::Dark) && !self.light_page
+    }
+
     fn new(sample_fallback: bool, cx: &mut Context<Self>) -> Self {
         let root = config_root();
         let session = startup_session(&root, std::time::SystemTime::now());
@@ -16826,6 +17074,7 @@ impl Docxy {
             last_persist: std::cell::Cell::new(std::time::Instant::now()),
             unregistered_own: Default::default(),
             applied: None,
+            light_page: false,
             os_appearance: gpui::WindowAppearance::Light,
             find_open: false,
             find_query: String::new(),
@@ -16865,6 +17114,8 @@ impl Docxy {
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             painted_tables: PaintedTables::default(),
             painted_paras: PaintedParas::default(),
+            painted_inks: PaintedInks::default(),
+            painted_page: std::cell::Cell::new(None),
             drawn_pictures: pictures::DrawnPictures::default(),
             doc_follow: std::rc::Rc::default(),
             page_follow: std::rc::Rc::default(),
@@ -32236,10 +32487,10 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         | PasteSpecial | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName
         | FontSize | NewComment | ShowHide | ToggleComments | ResolveComment
         | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow | ArrangeAll
-        | DarkMode | AutoHideRibbon | InsertField | PageBreak | BlankPage | Cover(_)
-        | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing | Hf(_)
-        | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout | ToggleRuler
-        | UndoTo(_) | RedoTo(_) => {}
+        | DarkMode | SwitchModes | AutoHideRibbon | InsertField | PageBreak | BlankPage
+        | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
+        | Hf(_) | Design(_) | Layout(_) | Mail(_) | Help(_) | Table(_) | PrintLayout
+        | ToggleRuler | UndoTo(_) | RedoTo(_) => {}
     }
 }
 
@@ -33519,6 +33770,9 @@ enum Act {
     /// strip of this window's display.
     ArrangeAll,
     DarkMode,
+    /// View › Appearance › Switch Modes (#2079): on a dark theme, show the
+    /// document's light page instead of Word's dark mode, and back.
+    SwitchModes,
     AutoHideRibbon,
     InsertField,
     PageBreak,
@@ -34032,6 +34286,9 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             "Ctrl+F1",
                         )
                         .key("A"),
+                        // The column's third row (#2079), so the group keeps
+                        // its width.
+                        cmdt("switchmodes", "page-color", "Switch Modes", SwitchModes, "").key("S"),
                     ])],
                 ),
                 rs::group(
@@ -35155,7 +35412,15 @@ fn run_ink(props: &RunProps, is_link: bool, pal: &Pal) -> Hsla {
         .color
         .as_deref()
         .and_then(hex_rgb)
-        .map(hsla_u)
+        // On a dark page the run's own colour reads against what it sits on
+        // (#2079); the document keeps it.
+        .map(|c| {
+            hsla_u(if pal.dark {
+                dark_page::text(c, pal.ground)
+            } else {
+                c
+            })
+        })
         .unwrap_or(if is_link { pal.link } else { pal.fg })
 }
 
@@ -36531,6 +36796,13 @@ fn paragraph_el(
             ),
             LeadingItem::ListMarker => {
                 let m = marker.expect("marker descriptor requires a marker");
+                if let Some(inks) = flow.inks {
+                    inks.borrow_mut().push(PaintedInk {
+                        text: m.to_string(),
+                        ink: rgb_u(look.ink),
+                        ground: pal.ground,
+                    });
+                }
                 // The marker isn't document content and must not map clicks to offsets.
                 let probe = flow.record.map(|_| {
                     let at = UnitCell::default();
@@ -36594,6 +36866,15 @@ fn paragraph_el(
                     &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
                     pal, caret_h, zoom,
                 );
+                if let Some(inks) = flow.inks.filter(|_| shown.highlight.is_none()) {
+                    if !r.text.trim().is_empty() {
+                        inks.borrow_mut().push(PaintedInk {
+                            text: r.text.clone(),
+                            ink: rgb_u(run_ink(&shown, in_link, &pal)),
+                            ground: pal.ground,
+                        });
+                    }
+                }
                 if flow.record.is_some() {
                     painted_runs.push(PaintedRun {
                         off: idx_before,
@@ -36920,7 +37201,16 @@ fn paragraph_el(
         .pr(px(pad_r))
         .when(pbox.heading_mt, |d| d.mt_2())
         .when(flow.gap_below, |d| d.mb(px(4.)))
-        .when(has_border, |d| d.border_b_1().border_color(pal.fg).pb_1())
+        // The rule carries no colour of its own: the ink, or on a dark page
+        // the visible mid grey (#2079).
+        .when(has_border, |d| {
+            let rule = if pal.dark {
+                pal.border_ink(None, pal.ground)
+            } else {
+                pal.fg
+            };
+            d.border_b_1().border_color(rule).pb_1()
+        })
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
@@ -36986,6 +37276,28 @@ enum TableClick {
 /// The palette a cell's text draws in (see [`design_tab::cell_ink`]): its
 /// ink, and chips and hover washes that read under it.
 fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
+    // On a dark page (#2079) the fill is mapped and the cell's palette is the
+    // dark one on it: its text is chosen against the fill as shown, with a
+    // dim that keeps the floor too (not `cell_ink`'s fixed light grey).
+    if pal.dark {
+        return match fill {
+            Some(f) => {
+                let shown = pal.shown_fill(f);
+                let ink = design_tab::cell_ink(Some(shown));
+                let chip = ink.map(|i| Hsla {
+                    a: i.chip.1,
+                    ..hsla_u(i.chip.0)
+                });
+                let cell = dark_page_pal(shown, pal.sel);
+                Pal {
+                    panel: chip.unwrap_or(cell.panel),
+                    hover: chip.unwrap_or(cell.hover),
+                    ..cell
+                }
+            }
+            None => pal,
+        };
+    }
     match design_tab::cell_ink(fill) {
         Some(ink) => {
             let chip = Hsla {
@@ -36998,6 +37310,7 @@ fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
                 panel: chip,
                 hover: chip,
                 link: hsla_u(ink.link),
+                ground: fill.unwrap_or(pal.ground),
                 ..pal
             }
         }
@@ -37059,7 +37372,6 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         .unwrap_or_default();
     let zoom = ctx.zoom;
     let w = |tw: u32| px(tw_px(tw as i32, zoom));
-    let fg = ctx.pal.fg;
     let grid_color = hsla_u(0x9fb8e0);
     let click = |what: TableClick| {
         let ent = ctx.ent.clone();
@@ -37115,6 +37427,10 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             // side keeps its own colour and thickness and a double line
             // draws as two (#765).
             let strokes = cb.strokes_at(zoom);
+            // A border's ink: its own colour, an automatic one the ink; on a
+            // dark page one that stays visible on the cell as shown (#2079).
+            let ground = cell_ctx.pal.ground;
+            let line_ink = move |c: Option<u32>| ctx.pal.border_ink(c, ground);
             let side = |which: u8, l: Option<table_view::Line>| -> Vec<AnyElement> {
                 let placed = |d: Div, s: table_view::Stroke| {
                     let (inset, thick) = (px(s.inset), px(s.thick));
@@ -37131,7 +37447,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                         .iter()
                         .map(|&s| {
                             placed(div().absolute(), s)
-                                .bg(l.color.map_or(fg, hsla_u))
+                                .bg(line_ink(l.color))
                                 .into_any_element()
                         })
                         .collect(),
@@ -37169,23 +37485,26 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             .collect();
             let diagonals = (cb.diag_down.is_some() || cb.diag_up.is_some()).then(|| {
                 let (down, up) = (cb.diag_down, cb.diag_up);
+                let inks = [down, up].map(|l| l.map(|l| line_ink(l.color)));
                 canvas(
                     |_, _, _| {},
                     move |b, _, window, _| {
                         let o = b.origin;
                         let (x1, y1) = (o.x + b.size.width, o.y + b.size.height);
-                        for (l, from, to) in [
-                            (down, o, point(x1, y1)),
-                            (up, point(x1, o.y), point(o.x, y1)),
+                        for ((l, ink), from, to) in [
+                            ((down, inks[0]), o, point(x1, y1)),
+                            ((up, inks[1]), point(x1, o.y), point(o.x, y1)),
                         ] {
-                            let Some(l) = l else { continue };
+                            let (Some(l), Some(ink)) = (l, ink) else {
+                                continue;
+                            };
                             // A diagonal is one stroke whatever its style.
                             let mut pb =
                                 PathBuilder::stroke(px((l.stroke_width() * zoom).max(1.0)));
                             pb.move_to(from);
                             pb.line_to(to);
                             if let Ok(path) = pb.build() {
-                                window.paint_path(path, l.color.map_or(fg, hsla_u));
+                                window.paint_path(path, ink);
                             }
                         }
                     },
@@ -37236,7 +37555,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                         .when(band(2) > h, |d| d.pl(px(band(2))))
                         .when(band(3) > h, |d| d.pr(px(band(3))))
                 })
-                .when_some(cb.fill, |d, f| d.bg(hsla_u(f)))
+                .when_some(cb.fill, |d, f| d.bg(hsla_u(ctx.pal.shown_fill(f))))
                 .map(|d| match cb.valign {
                     VAlign::Top => d.justify_start(),
                     VAlign::Center => d.justify_center(),
@@ -37488,6 +37807,7 @@ fn block_el_numbered(
                         .paras
                         .filter(|_| ctx.active && ctx.hf_width.is_none())
                         .zip(top.then(|| path[0])),
+                    inks: ctx.inks.filter(|_| ctx.hf_width.is_none()),
                 },
             )
         }
@@ -38759,6 +39079,7 @@ impl Docxy {
                 | Act::NewWindow
                 | Act::ArrangeAll
                 | Act::DarkMode
+                | Act::SwitchModes
                 | Act::AutoHideRibbon
                 | Act::ToggleRuler
                 | Act::ToggleComments
@@ -38880,6 +39201,14 @@ impl Docxy {
             }
             ToggleRuler => {
                 self.show_ruler = !self.show_ruler;
+                self.refocus(window, cx);
+            }
+            // Only on a dark theme (`act_enabled_now`): a light theme has
+            // only the light page.
+            SwitchModes => {
+                if self.applied == Some(ThemeMode::Dark) {
+                    self.light_page = !self.light_page;
+                }
                 self.refocus(window, cx);
             }
             PageBreak => self.insert_page_break(window, cx),
@@ -41452,6 +41781,10 @@ impl Docxy {
         if let Act::Ext(id) = act {
             return self.active_ext_ribbon().is_some_and(|r| r.enabled(id));
         }
+        // A light theme has no dark page to switch from (#2079).
+        if matches!(act, Act::SwitchModes) {
+            return self.applied == Some(ThemeMode::Dark);
+        }
         act_enabled(act)
             && match act {
                 Act::Table(a) => table_tab::table_enabled(self.edit_target_ref(), a),
@@ -41506,6 +41839,7 @@ impl Docxy {
             ToggleNotes => self.show_notes,
             PrintLayout => self.page_view,
             ToggleRuler => self.show_ruler,
+            SwitchModes => self.applied == Some(ThemeMode::Dark) && self.light_page,
             Layout(act) => self
                 .tabs
                 .get(self.active)
@@ -43338,9 +43672,23 @@ impl Render for Docxy {
                     // In Print Layout the sheet is white, or the document's page
                     // colour (#651), whatever the app theme, like Word's document
                     // surface; its ink comes from `design_tab::page_ink`.
+                    // On a dark theme the document draws as Word's dark
+                    // mode does (#2079): a dark page, its colours mapped
+                    // (`dark_page`), unless View > Switch Modes shows the
+                    // light page.
                     let doc_pal = if self.page_view {
-                        // Automatic text stays readable on a dark page colour.
-                        page_pal(design_tab::page_sheet_color(tab), pal.sel)
+                        if self.page_is_dark() {
+                            let page = design_tab::page_background(tab).map(|b| b.color);
+                            dark_page_pal(dark_page::page_sheet(page), pal.sel)
+                        } else {
+                            // Automatic text stays readable on a dark page colour.
+                            page_pal(design_tab::page_sheet_color(tab), pal.sel)
+                        }
+                    } else if self.page_is_dark() {
+                        dark_page_pal(dark_page::PAGE_DARK, pal.sel)
+                    } else if self.applied == Some(ThemeMode::Dark) {
+                        // Switch Modes in Web Layout: the light page.
+                        page_pal(0xffffff, pal.sel)
                     } else {
                         pal
                     };
@@ -43366,6 +43714,10 @@ impl Render for Docxy {
                     // The flow view's paragraphs, for the harness (#1986).
                     let painted_paras = self.painted_paras.clone();
                     painted_paras.borrow_mut().clear();
+                    // The body's inks (#2079), both views.
+                    let painted_inks = self.painted_inks.clone();
+                    painted_inks.borrow_mut().clear();
+                    self.painted_page.set(Some((doc_pal.ground, doc_pal.dark)));
                     // The body's pictures as drawn, for the harness (#1926).
                     let drawn_pictures = self.drawn_pictures.clone();
                     drawn_pictures.borrow_mut().clear();
@@ -43396,6 +43748,7 @@ impl Render for Docxy {
                         flow: false,
                         gap_below: false,
                         paras: None,
+                        inks: doc_view::harness().then_some(&painted_inks),
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -43403,10 +43756,16 @@ impl Render for Docxy {
                         // each section with its own page size, margins and columns
                         // (#745), stacked on a grey canvas. A sheet is white, or the
                         // document's page colour (#651).
-                        let sheet = hsla_u(design_tab::page_sheet_color(tab));
+                        // The palette's ground: the sheet as `doc_pal` maps
+                        // it (#2079).
+                        let sheet = hsla_u(doc_pal.ground);
                         let zoom = self.zoom;
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
-                        let canvas = if self.applied == Some(ThemeMode::Dark) {
+                        // A dark page sits on a darker canvas, so its edge
+                        // shows (#2079).
+                        let canvas = if self.page_is_dark() {
+                            hsla_u(dark_page::CANVAS_DARK)
+                        } else if self.applied == Some(ThemeMode::Dark) {
                             hsla_u(0x2b2b2b)
                         } else {
                             hsla_u(0x9a9a9a)
@@ -43686,6 +44045,7 @@ impl Render for Docxy {
                                     flow: false,
                                     gap_below: false,
                                     paras: None,
+                                    inks: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -44187,8 +44547,16 @@ impl Render for Docxy {
                             // Both axes: a table wider than the view scrolls
                             // sideways (#1895).
                             .overflow_scroll()
-                            .bg(bg)
-                            .text_color(fg)
+                            // On a dark theme the ground is the page the
+                            // palette maps against (#2079): dark, or light
+                            // with Switch Modes.
+                            .map(|d| {
+                                if self.applied == Some(ThemeMode::Dark) {
+                                    d.bg(hsla_u(doc_pal.ground)).text_color(doc_pal.fg)
+                                } else {
+                                    d.bg(bg).text_color(fg)
+                                }
+                            })
                             .px(px(48.))
                             .py(px(28.))
                             .children(blocks)
