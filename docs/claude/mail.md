@@ -1988,12 +1988,20 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
 - A refused expand reads no reminders and keeps the stored ones: what the fallback
   returns is `MessageFields::reminder_unasked` (`writes_reminder` is false unless the
   item carries the key; `flag_due_at` still follows the flag). A delta first call that
-  fell back sets `DeltaPage::expand_refused`, and the engine marks the folder
-  (`folders.reminder_expand_refused`, `Store::mark_reminder_expand_refused`), as every
-  link Graph mints from that call lacks the expand too: while marked, every item of the
-  folder's pages and rounds is merged `reminder_unasked`. The mark goes when the links
-  do (`clear_delta_links`; the migration adds it at 0), the only paths that NULL
-  `delta_link`; the next first call then asks again, with no retry loop of its own.
+  fell back sets `DeltaPage::expand_refused`, and every link Graph mints from it lacks
+  the expand too, so the refusal belongs to the walk, and the mark follows the first
+  call of the link stored as `delta_link`:
+  - a head or small-folder walk (`run_delta`) keeps its first page's refusal in memory
+    for its nextLink pages (`DeltaRun::expand_refused`), and stores it, 1 or 0, with
+    its link (`Store::set_reminder_expand_refused`, `folders.reminder_expand_refused`);
+  - a backfill walk spans idle steps, so its first page's refusal is kept next to
+    `backfill_link` (`folders.backfill_expand_refused`) for its later pages, and
+    `complete_backfill` moves it to the folder's mark with its link; `reset_backfill`
+    drops it;
+  - a round on the stored link merges as that link's mark says.
+  An accepted first page never clears the mark while the refused walk's link is still
+  `delta_link`. `clear_delta_links` clears both (the migration adds them at 0); the next
+  first call then asks again, with no retry loop of its own.
 - Parse (`model::parse_message_reminder`), lenient and never an error: property ids
   match ASCII-case-insensitively (Graph may lower-case the GUID); on is only `"true"`
   (any case) or JSON `true`; a time is read only when it ends in `Z` or has nothing
@@ -2068,7 +2076,8 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `snooze_message_reminder_patches_signal_time`, `message_reminder_refused_is_an_error`;
   `store` `message_reminder_tests` (round trip through every reader, partial and
   complete merges, a merge read without the reminder, the flag invariant, `set_flag`,
-  the due query, its index and a bad `now`, the refused-expand mark, the migration, the
+  the due query, its index and a bad `now`, the refused-expand marks and their move with
+  the backfill's link, the migration, the
   op round trip, `pending_message_ids`) and
   `upsert_writes_every_column`; `outbox.rs`
   `dismiss_message_reminder_patches_the_resolved_id`,
@@ -2077,6 +2086,7 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `tests::message_reminders` (delta store and clear, a refused expand keeping reminders
   through a link round, the migrated store's re-enumeration, dismiss, snooze, refusals
   with an offset time, 404, 400 with the re-read, no re-read of a row a queued op owns,
-  dedupe, unflag) and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
+  dedupe, unflag), `tests::backfill` `an_accepted_backfill_link_unmarks_a_refused_head`,
+  `a_refused_backfill_keeps_reminders_and_leaves_an_accepted_head_unmarked` and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
   `message_reminder_commands_by_the_old_id_write_and_reach_the_new_id`,
   `a_dismiss_by_the_new_id_dedupes_against_one_queued_by_the_old_id`.

@@ -51,7 +51,7 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, DeltaPage, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
+    AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
     MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry, SearchHit,
 };
 use crate::store::{
@@ -812,6 +812,10 @@ struct DeltaRun {
     walked: u64,
     new_ids: Vec<String>,
     stopped: bool,
+    /// The walk's pages were read without the reminder `$expand` (#2054):
+    /// its first call's was refused, or it ran on a stored link whose walk
+    /// was (`Store::reminder_expand_refused`). Stored with its link.
+    expand_refused: bool,
 }
 
 /// What `Engine::background_body` did with one id.
@@ -2297,10 +2301,16 @@ impl Engine {
                     .complete_backfill(folder_id, &delta, scope, run.walked as i64)
                     .is_ok()
                 {
+                    let _ = self
+                        .store
+                        .set_reminder_expand_refused(folder_id, run.expand_refused);
                     self.emit_progress(folder_id, run.walked, true);
                 }
-            } else {
-                let _ = self.store.set_head_link(folder_id, &delta);
+            } else if self.store.set_head_link(folder_id, &delta).is_ok() {
+                // The mark follows the link now stored (#2054): 1 or 0.
+                let _ = self
+                    .store
+                    .set_reminder_expand_refused(folder_id, run.expand_refused);
             }
         }
         self.emit(SyncEvent::MessagesUpdated {
@@ -2333,10 +2343,27 @@ impl Engine {
     ) -> Result<DeltaRun, GraphError> {
         let mut walked = 0;
         let mut new_ids = Vec::new();
+        // A round on a stored link follows the walk that minted it; a first
+        // call's walk follows its own first page (#2054). A store error
+        // reads as refused, which only keeps reminders.
+        let mut expand_refused = match &cursor {
+            DeltaCursor::Link(_) => self
+                .store
+                .reminder_expand_refused(folder_id)
+                .unwrap_or(true),
+            _ => false,
+        };
         loop {
             let page = self.with_auth(|c| c.delta(cursor.clone()))?;
-            self.note_expand_refused(folder_id, &page);
-            walked += self.merge_delta_items(folder_id, &page.items, cutoff, protect, &mut new_ids);
+            expand_refused |= page.expand_refused;
+            walked += self.merge_delta_items(
+                folder_id,
+                &page.items,
+                cutoff,
+                protect,
+                expand_refused,
+                &mut new_ids,
+            );
             match page.next_link {
                 Some(next) => {
                     if !self.checkpoint() {
@@ -2345,6 +2372,7 @@ impl Engine {
                             walked,
                             new_ids,
                             stopped: true,
+                            expand_refused,
                         });
                     }
                     cursor = DeltaCursor::Link(next);
@@ -2355,6 +2383,7 @@ impl Engine {
                         walked,
                         new_ids,
                         stopped: false,
+                        expand_refused,
                     });
                 }
             }
@@ -2385,23 +2414,21 @@ impl Engine {
     /// of upserts that were not stored before go to `new_ids` (#1978): the
     /// new mail, whose bodies the round fetches. This thread is the only
     /// writer of delta rows, so the check right before the write holds.
+    ///
+    /// With `unasked` (#2054) the page's walk was read without the
+    /// reminder `$expand` (its first call's refused, or a link minted from
+    /// such a call): every upsert is merged `MessageFields::reminder_unasked`,
+    /// so its lack of the reminder keeps the stored one.
     fn merge_delta_items(
         &self,
         folder_id: &str,
         items: &[DeltaItem],
         cutoff: Option<&str>,
         protect: Option<&[String]>,
+        unasked: bool,
         new_ids: &mut Vec<String>,
     ) -> u64 {
         let note_new = self.config.options.prefetch_body_days > 0;
-        // A folder whose first call found the reminder expand refused
-        // (#2054): its links carry none, so an item without the reminder
-        // keeps the stored one. A store error reads as marked, which only
-        // keeps reminders.
-        let unasked = self
-            .store
-            .reminder_expand_refused(folder_id)
-            .unwrap_or(true);
         let mut upserts = 0;
         for item in items {
             match item {
@@ -2466,19 +2493,6 @@ impl Engine {
     /// it in the statement that writes.
     fn protected_ids(&self) -> Result<Vec<String>, StoreError> {
         self.store.pending_message_ids()
-    }
-
-    /// Marks `folder_id` when `page` came from a first call whose reminder
-    /// `$expand` Graph refused (#2054, `DeltaPage::expand_refused`), so its
-    /// later pages and rounds, on links that carry no expand, keep the
-    /// stored reminders too. A store failure is surfaced; the page's own
-    /// items are marked `reminder_unasked` either way.
-    fn note_expand_refused(&mut self, folder_id: &str, page: &DeltaPage) {
-        if page.expand_refused {
-            if let Err(e) = self.store.mark_reminder_expand_refused(folder_id) {
-                self.emit(SyncEvent::Error(e.to_string()));
-            }
-        }
     }
 
     /// The quarantine reconverge is over: the flag is cleared, in memory and
@@ -2653,7 +2667,18 @@ impl Engine {
                 return;
             }
         };
-        self.note_expand_refused(&id, &page);
+        // The walk's first call decides how all its pages merge (#2054):
+        // a refusal is kept next to its `backfill_link`, across idle steps,
+        // and becomes the folder's mark with its link (`complete_backfill`).
+        // A store error reads as refused, which only keeps reminders.
+        if page.expand_refused {
+            if let Err(e) = self.store.set_backfill_expand_refused(&id) {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+        }
+        let unasked =
+            page.expand_refused || self.store.backfill_expand_refused(&id).unwrap_or(true);
         let cutoff = self.backfill_cutoff();
         let page_scope = if cutoff.is_some() {
             SCOPE_WINDOW
@@ -2672,6 +2697,7 @@ impl Engine {
             &page.items,
             cutoff.as_deref(),
             Some(&pending),
+            unasked,
             &mut Vec::new(),
         );
         let synced = u64::try_from(h.synced).unwrap_or(0) + walked;
@@ -17834,7 +17860,8 @@ mod tests {
                          ALTER TABLE messages DROP COLUMN reminder_at;
                          ALTER TABLE messages DROP COLUMN reminder_signal_at;
                          ALTER TABLE messages DROP COLUMN flag_due_at;
-                         ALTER TABLE folders DROP COLUMN reminder_expand_refused;",
+                         ALTER TABLE folders DROP COLUMN reminder_expand_refused;
+                         ALTER TABLE folders DROP COLUMN backfill_expand_refused;",
                     )
                     .unwrap();
             }
@@ -19313,6 +19340,137 @@ mod tests {
                     .any(|e| matches!(e, SyncEvent::State(_))),
                 "no state change during the backfill: {events:?}"
             );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A flagged message whose reminder is on, as Graph sends it with
+        /// the expand (#2054), or complete without the properties.
+        fn reminded(id: &str, with_props: bool) -> String {
+            let plain = message_json(id, false, true, &[]);
+            if !with_props {
+                return plain;
+            }
+            format!(
+                r#"{},"singleValueExtendedProperties":[{{"id":"Boolean {{00062008-0000-0000-C000-000000000046}} Id 0x8503","value":"true"}},{{"id":"SystemTime {{00062008-0000-0000-C000-000000000046}} Id 0x8560","value":"2026-11-08T10:15:00Z"}}]}}"#,
+                plain.strip_suffix('}').unwrap()
+            )
+        }
+
+        /// Stores `ids` in `F1`, flagged with their reminder on.
+        fn seed_reminded(dir: &std::path::Path, ids: &[&str]) {
+            let s = store_in(dir);
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: BIG,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            for id in ids {
+                let v = crate::json::parse(&reminded(id, true)).unwrap();
+                s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                    .unwrap();
+                assert!(s.message_row(id).unwrap().unwrap().is_reminder_on);
+            }
+        }
+
+        fn reminder_on(dir: &std::path::Path, id: &str) -> bool {
+            store_in(dir)
+                .message_row(id)
+                .unwrap()
+                .unwrap()
+                .is_reminder_on
+        }
+
+        #[test]
+        fn an_accepted_backfill_link_unmarks_a_refused_head() {
+            // F1's head refuses the reminder expand (its retry stores M1
+            // without it: kept); the backfill's first call accepts it. Once
+            // its link is the folder's, a round on it clears a reminder
+            // Graph no longer has.
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let extra = vec![
+                (route(&format!("{delta}?$filter"), 400, "{}"), Some(1)),
+                (
+                    route(
+                        &full_link("F1"),
+                        200,
+                        &page(&[reminded("M1", false)], None, Some(&full_link("F1"))),
+                    ),
+                    None,
+                ),
+            ];
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![reminded("M1", false)],
+                    pages: vec![vec![msg("X1", "2025-06-01T00:00:00Z")]],
+                    ..inbox()
+                }],
+                extra,
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reminder-unmark");
+            seed_reminded(&dir, &["M1"]);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, TICK, None);
+            until_complete(&handle, "F1");
+            let store = store_in(&dir);
+            assert!(
+                !store.reminder_expand_refused("F1").unwrap(),
+                "the stored link is the accepted backfill's"
+            );
+            assert!(wait_until(TICK_WAIT, || !reminder_on(&dir, "M1")));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_refused_backfill_keeps_reminders_and_leaves_an_accepted_head_unmarked() {
+            // F1's head accepts the expand; its backfill's first call is
+            // refused. The walk's pages (M2 on page 2) keep stored
+            // reminders, while the round on the head's link before the walk
+            // completes (M1, no reminder) clears one: that link was asked.
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let extra = vec![
+                (route(&format!("{delta}?$orderby"), 400, "{}"), Some(1)),
+                (
+                    route(
+                        &head_link("F1"),
+                        200,
+                        &page(&[reminded("M1", false)], None, Some(&head_link("F1"))),
+                    ),
+                    Some(1),
+                ),
+            ];
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("X1", "2025-06-01T00:00:00Z")],
+                        vec![reminded("M2", false)],
+                    ],
+                    ..inbox()
+                }],
+                extra,
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reminder-refused-walk");
+            seed_reminded(&dir, &["M1", "M2"]);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert!(
+                paths_from(&srv, 0).iter().any(|p| p == &head_link("F1")),
+                "a round on the head's link ran"
+            );
+            assert!(!reminder_on(&dir, "M1"), "the accepted head's round clears");
+            assert!(reminder_on(&dir, "M2"), "the refused walk's page keeps");
+            let store = store_in(&dir);
+            assert!(
+                store.reminder_expand_refused("F1").unwrap(),
+                "the refused walk's link is the folder's now"
+            );
+            assert!(!store.backfill_expand_refused("F1").unwrap());
             stop(handle);
             let _ = std::fs::remove_dir_all(&dir);
         }

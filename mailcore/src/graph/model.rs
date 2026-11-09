@@ -926,8 +926,9 @@ pub struct DeltaPage {
     /// The first call asked for the reminder `$expand` and Graph refused it
     /// (#2054): the page came from the call sent again without it, and
     /// every upsert's `MessageFields::reminder_unasked` is set. The engine
-    /// marks the folder, as the links Graph mints from this call carry no
-    /// expand either.
+    /// keeps the refusal with the walk and stores it with the walk's link
+    /// (`Store::set_reminder_expand_refused`), as the links Graph mints
+    /// from this call carry no expand either.
     pub expand_refused: bool,
 }
 

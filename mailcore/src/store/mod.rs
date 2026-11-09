@@ -1985,27 +1985,59 @@ impl Store {
         Ok(link)
     }
 
-    /// Marks `folder_id` as read without the reminder `$expand` (#2054):
-    /// a first delta call of it found Graph refusing the expand, so the
-    /// links Graph mints for it carry none. Until its links are cleared
-    /// (`clear_delta_links`, the #2054 migration: the only paths that
-    /// reset `delta_link`), the engine merges its delta items as
-    /// `MessageFields::reminder_unasked`, keeping the stored reminders.
-    pub fn mark_reminder_expand_refused(&self, folder_id: &str) -> Result<(), StoreError> {
+    /// Records whether the first call of the walk whose link `folder_id`
+    /// stores as `delta_link` found Graph refusing the reminder `$expand`
+    /// (#2054): the engine sets it with the head's or a small folder's
+    /// link, 1 or 0, and `complete_backfill` from the backfill's own
+    /// record. While it is set, a round on that link (which carries no
+    /// expand) merges its items as `MessageFields::reminder_unasked`,
+    /// keeping the stored reminders. `clear_delta_links` clears it.
+    pub fn set_reminder_expand_refused(
+        &self,
+        folder_id: &str,
+        refused: bool,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET reminder_expand_refused = 1 WHERE id = ?1",
+            "UPDATE folders SET reminder_expand_refused = ?2 WHERE id = ?1",
+            params![folder_id, refused],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `folder_id`'s `delta_link` came from a walk whose reminder
+    /// `$expand` was refused ([`Store::set_reminder_expand_refused`]);
+    /// false for an unknown folder.
+    pub fn reminder_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
+        self.folder_flag(folder_id, "reminder_expand_refused")
+    }
+
+    /// Records that the backfill walk under way for `folder_id` had its
+    /// first call's reminder `$expand` refused (#2054), so its later pages,
+    /// on links that carry none, keep stored reminders too. Moved to the
+    /// folder's mark by `complete_backfill`; cleared by `reset_backfill`
+    /// and `clear_delta_links`.
+    pub fn set_backfill_expand_refused(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET backfill_expand_refused = 1 WHERE id = ?1",
             params![folder_id],
         )?;
         Ok(())
     }
 
-    /// Whether `folder_id` is marked by
-    /// [`Store::mark_reminder_expand_refused`]; false for an unknown folder.
-    pub fn reminder_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
-        let marked = self
+    /// Whether the backfill walk under way for `folder_id` was refused the
+    /// expand ([`Store::set_backfill_expand_refused`]); false for an
+    /// unknown folder.
+    pub fn backfill_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
+        self.folder_flag(folder_id, "backfill_expand_refused")
+    }
+
+    /// One boolean `folders` column of `folder_id`, false for an unknown
+    /// folder. `column` is one of this file's literals, never input.
+    fn folder_flag(&self, folder_id: &str, column: &str) -> Result<bool, StoreError> {
+        let flag = self
             .conn
             .query_row(
-                "SELECT reminder_expand_refused FROM folders WHERE id = ?1",
+                &format!("SELECT {column} FROM folders WHERE id = ?1"),
                 params![folder_id],
                 |r| r.get::<_, bool>(0),
             )
@@ -2016,7 +2048,7 @@ impl Store {
                     Err(e)
                 }
             })?;
-        Ok(marked)
+        Ok(flag)
     }
 
     /// Stores the delta link for a folder (used to resume delta sync).
@@ -2036,9 +2068,8 @@ impl Store {
     ///
     /// It also clears every folder's backfill (#1871): its link, count and
     /// scope, so each folder runs its head and then its full delta again.
-    /// It clears every folder's refused-expand mark (#2054,
-    /// [`Store::mark_reminder_expand_refused`]) with them, so each next
-    /// first call asks for the reminder again.
+    /// It clears every folder's refused-expand marks (#2054,
+    /// [`Store::set_reminder_expand_refused`]) with them.
     ///
     /// And it marks a reconverge pending (`meta.reconverge_pending`, read by
     /// [`Store::reconverge_pending`]), in the same transaction, so an engine
@@ -2049,7 +2080,8 @@ impl Store {
         tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
-                                backfill_scope = NULL, reminder_expand_refused = 0",
+                                backfill_scope = NULL, reminder_expand_refused = 0,
+                                backfill_expand_refused = 0",
             [],
         )?;
         tx.execute(
@@ -2115,7 +2147,10 @@ impl Store {
     /// Ends a folder's backfill (#1871), in one statement: the full
     /// delta's `deltaLink` becomes the folder's `delta_link` (replacing the
     /// head's), `scope` records what it covers, the backfill link is
-    /// cleared and `synced` is set to the final count.
+    /// cleared and `synced` is set to the final count. The walk's refused
+    /// reminder expand (#2054, `backfill_expand_refused`) becomes the
+    /// folder's mark, as its link is now `delta_link`; a small folder's
+    /// caller sets the mark after it (`set_reminder_expand_refused`).
     pub fn complete_backfill(
         &self,
         folder_id: &str,
@@ -2126,7 +2161,9 @@ impl Store {
         self.conn.execute(
             "UPDATE folders SET delta_link = ?2, history_scope = ?3,
                                 backfill_link = NULL, backfill_synced = ?4,
-                                backfill_scope = NULL
+                                backfill_scope = NULL,
+                                reminder_expand_refused = backfill_expand_refused,
+                                backfill_expand_refused = 0
              WHERE id = ?1",
             params![folder_id, delta_link, scope, synced],
         )?;
@@ -2135,12 +2172,12 @@ impl Store {
 
     /// Restarts a folder's backfill from a fresh full delta (#1871: its
     /// page link expired, or a window walk resumed in whole-mailbox mode):
-    /// clears the link, the count and the walk's scope, and keeps the
-    /// head's `delta_link`.
+    /// clears the link, the count, the walk's scope and its refused
+    /// reminder expand (#2054), and keeps the head's `delta_link`.
     pub fn reset_backfill(&self, folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET backfill_link = NULL, backfill_synced = 0,
-                                backfill_scope = NULL
+                                backfill_scope = NULL, backfill_expand_refused = 0
              WHERE id = ?1",
             params![folder_id],
         )?;
@@ -4924,6 +4961,7 @@ fn migrate_message_reminders(conn: &Connection) -> Result<bool, StoreError> {
          ALTER TABLE messages ADD COLUMN reminder_signal_at TEXT NOT NULL DEFAULT '';
          ALTER TABLE messages ADD COLUMN flag_due_at TEXT NOT NULL DEFAULT '';
          ALTER TABLE folders ADD COLUMN reminder_expand_refused INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE folders ADD COLUMN backfill_expand_refused INTEGER NOT NULL DEFAULT 0;
          UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                             backfill_synced = 0, history_scope = NULL,
                             backfill_scope = NULL;",
@@ -13444,15 +13482,52 @@ mod message_reminder_tests {
         folder(&s, "G");
         assert!(!s.reminder_expand_refused("F").unwrap());
         assert!(!s.reminder_expand_refused("NOPE").unwrap());
-        s.mark_reminder_expand_refused("F").unwrap();
+        s.set_reminder_expand_refused("F", true).unwrap();
         assert!(s.reminder_expand_refused("F").unwrap());
         assert!(!s.reminder_expand_refused("G").unwrap());
-        // Links set or replaced keep it; clearing them clears it.
+        // A round's new link (minted from the same walk) keeps it.
         s.set_delta_link("F", "LINK").unwrap();
-        s.set_head_link("F", "HEAD").unwrap();
         assert!(s.reminder_expand_refused("F").unwrap());
+        s.set_reminder_expand_refused("F", false).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        // Clearing the links clears both marks.
+        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_backfill_expand_refused("F").unwrap();
         s.clear_delta_links().unwrap();
         assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(!s.backfill_expand_refused("F").unwrap());
+    }
+
+    #[test]
+    fn the_backfill_expand_refusal_moves_with_its_link() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        assert!(!s.backfill_expand_refused("NOPE").unwrap());
+        // A refused head, then a backfill whose first call was accepted:
+        // its link replaces the head's, and so does its (clear) record.
+        s.set_head_link("F", "HEAD").unwrap();
+        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_backfill_progress("F", "PAGE2", 10, SCOPE_ALL)
+            .unwrap();
+        assert!(
+            s.reminder_expand_refused("F").unwrap(),
+            "the head's link is still stored"
+        );
+        s.complete_backfill("F", "FULL", SCOPE_ALL, 20).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        // The reverse: an accepted head, a refused backfill under way, then
+        // its link stored.
+        s.set_backfill_expand_refused("F").unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(s.backfill_expand_refused("F").unwrap());
+        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20).unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        assert!(!s.backfill_expand_refused("F").unwrap(), "moved");
+        // `reset_backfill` drops the walk's record, and keeps the folder's.
+        s.set_backfill_expand_refused("F").unwrap();
+        s.reset_backfill("F").unwrap();
+        assert!(!s.backfill_expand_refused("F").unwrap());
+        assert!(s.reminder_expand_refused("F").unwrap());
     }
 
     #[test]
@@ -13507,7 +13582,8 @@ mod message_reminder_tests {
                      ALTER TABLE messages DROP COLUMN reminder_at;
                      ALTER TABLE messages DROP COLUMN reminder_signal_at;
                      ALTER TABLE messages DROP COLUMN flag_due_at;
-                     ALTER TABLE folders DROP COLUMN reminder_expand_refused;",
+                     ALTER TABLE folders DROP COLUMN reminder_expand_refused;
+                     ALTER TABLE folders DROP COLUMN backfill_expand_refused;",
                 )
                 .unwrap();
         }
