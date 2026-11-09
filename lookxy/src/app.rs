@@ -2231,7 +2231,9 @@ impl App {
         };
         match target {
             RsvpTarget::Event(id) => {
-                self.store.set_event_response(&id, &kind);
+                // Stamped with now, as the engine and Graph do (#2068).
+                self.store
+                    .set_event_response(&id, &kind, &crate::ui::calendar::now_utc());
                 self.reload_agenda();
                 let _ = self.sync.cmd_tx.send(SyncCommand::RespondEvent {
                     id,

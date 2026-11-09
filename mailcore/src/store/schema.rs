@@ -344,7 +344,12 @@ CREATE TABLE IF NOT EXISTS events (
     send_start_tz            TEXT NOT NULL DEFAULT '',
     send_start_local         TEXT NOT NULL DEFAULT '',
     send_end_tz              TEXT NOT NULL DEFAULT '',
-    send_end_local           TEXT NOT NULL DEFAULT ''
+    send_end_local           TEXT NOT NULL DEFAULT '',
+    -- When the user answered the event (Graph `responseStatus.time`) and
+    -- when it was created (`createdDateTime`), canonical UTC or `''` (#2068).
+    -- Added to an older database by `Store::init`, as the #1983 columns.
+    response_time            TEXT NOT NULL DEFAULT '',
+    created_utc              TEXT NOT NULL DEFAULT ''
 );
 
 -- Supports `events_in_window`'s `start_utc < ?to AND end_utc > ?from`

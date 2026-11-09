@@ -1215,6 +1215,14 @@ fn graph_date_or_empty(s: &str) -> String {
     }
 }
 
+/// A UTC time Graph sent as a `DateTimeOffset` (`responseStatus.time`,
+/// `createdDateTime`, #2068) as `YYYY-MM-DDTHH:MM:SSZ`, or `""` for Graph's
+/// "never" (`0001-01-01…`, caught first: it is otherwise a readable date)
+/// and for anything `reminder_time` cannot read (a numeric offset, garbage).
+fn graph_utc_or_empty(s: &str) -> String {
+    reminder_time(&graph_date_or_empty(s))
+}
+
 /// The recurrence pattern kind lookxy can create — a subset of Graph's
 /// `recurrencePattern.type` (`absoluteMonthly` for `Monthly`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1557,6 +1565,15 @@ pub struct Event {
     pub organizer_name: String,
     pub organizer_addr: String,
     pub response_status: String,
+    /// Graph `responseStatus.time`: when the signed-in user answered the
+    /// event (#2068), canonical UTC `YYYY-MM-DDTHH:MM:SSZ`; `""` when never
+    /// answered (Graph's `0001-01-01T00:00:00Z`), absent or unreadable
+    /// (`graph_utc_or_empty`).
+    pub response_time: String,
+    /// Graph `createdDateTime`: when the event was created, which a calendar
+    /// client shows as a meeting's "Sent" date (#2068); canonical UTC, `""`
+    /// when absent or unreadable.
+    pub created_utc: String,
     pub series_master_id: Option<String>,
     pub body_preview: String,
     pub web_link: String,
@@ -1623,6 +1640,8 @@ impl Default for Event {
             organizer_name: String::new(),
             organizer_addr: String::new(),
             response_status: String::new(),
+            response_time: String::new(),
+            created_utc: String::new(),
             series_master_id: None,
             body_preview: String::new(),
             web_link: String::new(),
@@ -1706,6 +1725,17 @@ impl Event {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            response_time: v
+                .get("responseStatus")
+                .and_then(|r| r.get("time"))
+                .and_then(Value::as_str)
+                .map(graph_utc_or_empty)
+                .unwrap_or_default(),
+            created_utc: v
+                .get("createdDateTime")
+                .and_then(Value::as_str)
+                .map(graph_utc_or_empty)
+                .unwrap_or_default(),
             series_master_id: opt_str_field(v, "seriesMasterId"),
             body_preview: str_field(v, "bodyPreview"),
             web_link: str_field(v, "webLink"),
@@ -2169,6 +2199,61 @@ mod tests {
         let e2 = Event::from_json(&v2).unwrap();
         assert_eq!(e2.reminder_minutes, 0);
         assert!(!e2.is_reminder_on);
+    }
+
+    /// An event JSON with `extra` spliced in after its times (#2068).
+    fn event_with(extra: &str) -> Event {
+        let v = parse(&format!(
+            r#"{{"id":"E1","subject":"Sync",
+                "start":{{"dateTime":"2026-08-20T09:00:00.0000000","timeZone":"UTC"}},
+                "end":{{"dateTime":"2026-08-20T10:00:00.0000000","timeZone":"UTC"}}{extra}}}"#
+        ))
+        .unwrap();
+        Event::from_json(&v).unwrap()
+    }
+
+    #[test]
+    fn event_own_response_time_and_created_utc() {
+        let e = event_with(
+            r#","responseStatus":{"response":"accepted","time":"2026-08-13T19:19:00.1234567Z"},
+               "createdDateTime":"2026-08-01T08:00:05.52Z""#,
+        );
+        assert_eq!(e.response_status, "accepted");
+        assert_eq!(e.response_time, "2026-08-13T19:19:00Z");
+        assert_eq!(e.created_utc, "2026-08-01T08:00:05Z");
+        // Without a fraction, and without the `Z` (read as UTC).
+        let e = event_with(
+            r#","responseStatus":{"response":"declined","time":"2026-08-13T19:19:00Z"},
+               "createdDateTime":"2026-08-01T08:00:05""#,
+        );
+        assert_eq!(e.response_time, "2026-08-13T19:19:00Z");
+        assert_eq!(e.created_utc, "2026-08-01T08:00:05Z");
+    }
+
+    #[test]
+    fn event_response_time_never_and_absent_are_empty() {
+        for never in ["0001-01-01T00:00:00Z", "0001-01-01T00:00:00.0000000Z"] {
+            let e = event_with(&format!(
+                r#","responseStatus":{{"response":"none","time":"{never}"}},
+                   "createdDateTime":"{never}""#
+            ));
+            assert_eq!(e.response_time, "", "{never}");
+            assert_eq!(e.created_utc, "", "{never}");
+        }
+        for extra in [
+            "",
+            r#","responseStatus":{"response":"none"}"#,
+            r#","responseStatus":{"response":"none","time":null},"createdDateTime":null"#,
+            r#","responseStatus":{"response":"none","time":5},"createdDateTime":7"#,
+            r#","responseStatus":"accepted""#,
+            r#","responseStatus":{"time":"2026-08-13T21:19:00+02:00"},
+               "createdDateTime":"2026-08-01T10:00:05+02:00""#,
+            r#","responseStatus":{"time":"soon"},"createdDateTime":"2026-08-01""#,
+        ] {
+            let e = event_with(extra);
+            assert_eq!(e.response_time, "", "{extra}");
+            assert_eq!(e.created_utc, "", "{extra}");
+        }
     }
 
     #[test]
