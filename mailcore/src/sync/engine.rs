@@ -3972,7 +3972,8 @@ impl Engine {
         match self.fetch_and_store_body(id) {
             Ok(stored) => {
                 // As before #1978, `BodyReady` answers a `FetchBody` even
-                // when the store refused the body.
+                // when the store failed to write the body (a draft's body
+                // it keeps, #2082, is answered by `fetch_and_store_body`).
                 if !stored {
                     self.emit(SyncEvent::BodyReady { id: id.to_string() });
                 }
@@ -3986,8 +3987,10 @@ impl Engine {
     /// share, so a reader cannot tell their bodies apart: `get_body_with_headers`
     /// in the engine's format, `Store::put_fetched_body_with_headers` (the
     /// format asked for in `fetched_as`, and the Exchange headers that came
-    /// with the body, #1933), then `BodyReady`. `Ok(false)`: the store refused the
-    /// body (no `BodyReady` sent).
+    /// with the body, #1933), then `BodyReady`. A draft's unpushed body the
+    /// store keeps over the fetch (#2082) is an answer too: the stored body
+    /// is the one to show, so `BodyReady` and `Ok(true)`, and the fetched one
+    /// is dropped. `Ok(false)`: the store failed (no `BodyReady` sent).
     fn fetch_and_store_body(&mut self, id: &str) -> Result<bool, GraphError> {
         let format = self.config.options.body_format;
         let (body, headers) =
@@ -19607,6 +19610,145 @@ mod tests {
             sent_at.elapsed() < Duration::from_secs(4),
             "Refresh resent it before its 5 s back-off: {:?}",
             sent_at.elapsed()
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A draft's unpushed body against a fetch (#2082) ---
+
+    /// The reply draft `createReply` left on Graph and in the store.
+    const REPLY_G: &str = "G1";
+    /// Its body as `createReply` made it: only the quoted original.
+    const QUOTE_ONLY: &str = "<p>Alice wrote: the original</p>";
+    /// Its body once the user typed the reply above the quote.
+    const USERS_BODY: &str = "<p>USER-REPLY-TEXT</p><p>Alice wrote: the original</p>";
+
+    /// A reply draft as `store_composed_draft` files it (`createReply`'s
+    /// quote-only body through `put_body`), then the user's reply written by
+    /// compose (`update_draft_fields`) and its `SendDraft` queued.
+    fn seed_reply_draft(s: &Store) {
+        let folder = s.drafts_folder_id().unwrap();
+        s.upsert_message(
+            &folder,
+            &Message {
+                id: REPLY_G.into(),
+                conversation_id: "C1".into(),
+                subject: "RE: Hello".into(),
+                from: Recipient::default(),
+                to: vec![Recipient {
+                    name: "Alice".into(),
+                    address: "alice@x".into(),
+                }],
+                cc: Vec::new(),
+                received: String::new(),
+                sent: String::new(),
+                is_read: true,
+                is_flagged: false,
+                has_attachments: false,
+                importance: "normal".into(),
+                preview: String::new(),
+                is_draft: true,
+                is_meeting_request: false,
+                categories: Vec::new(),
+                is_reminder_on: false,
+                reminder_at: String::new(),
+                reminder_signal_at: String::new(),
+                flag_due_at: String::new(),
+            },
+        )
+        .unwrap();
+        s.put_body(
+            REPLY_G,
+            &crate::graph::model::Body {
+                content_type: "html".into(),
+                content: QUOTE_ONLY.into(),
+            },
+        )
+        .unwrap();
+        s.update_draft_fields(REPLY_G, "RE: Hello", "Alice <alice@x>", "", "", USERS_BODY)
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SendDraft { id: REPLY_G.into() })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_deferred_send_keeps_the_users_body_over_a_fetch() {
+        // #2082: the send's first PATCH fails (the op waits under its 5 s
+        // back-off), a `FetchBody` of the draft lands meanwhile and Graph
+        // answers with the quote-only body it still has. The store keeps
+        // the user's body, so the resend PATCHes it before `/send`.
+        let draft_path = format!("/me/messages/{REPLY_G}");
+        let send = format!("{draft_path}/send");
+        let patch = |status: u16| Route {
+            method: "PATCH".into(),
+            path_prefix: draft_path.clone(),
+            status,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let mut routes = vec![
+            (patch(500), Some(1)),
+            (patch(200), None),
+            (post_route(&send, 202, ""), None),
+            (
+                get_route(
+                    &body_get_path(REPLY_G),
+                    200,
+                    &format!(r#"{{"body":{{"contentType":"html","content":"{QUOTE_ONLY}"}}}}"#),
+                ),
+                None,
+            ),
+        ];
+        routes.extend(folder_routes(DRAFTS_SENT, &[], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "deferred-send-fetch", HOUR, None, seed_reply_draft);
+        // The startup drain sends it and its PATCH gets the 500 (the pass
+        // then ends in `PendingOps`, not `Idle`).
+        assert!(wait_until(ENGINE_WAIT, || patch_count(&srv) >= 1));
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchBody { id: REPLY_G.into() })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::BodyReady { id } if id == REPLY_G),
+        );
+        assert_eq!(
+            hits(&srv, "GET", &body_get_path(REPLY_G)),
+            1,
+            "the body was fetched"
+        );
+        assert_eq!(
+            patch_count(&srv),
+            1,
+            "the fetch landed while the send was deferred"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            store.get_body(REPLY_G).unwrap().unwrap().content,
+            USERS_BODY,
+            "the fetch kept the user's body"
+        );
+
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(wait_until(ENGINE_WAIT, || hits(&srv, "POST", &send) >= 1));
+        let requests = srv.requests();
+        let sent_at = requests
+            .iter()
+            .position(|r| r.method == "POST" && r.path == send)
+            .unwrap();
+        let last_patch = requests[..sent_at]
+            .iter()
+            .rev()
+            .find(|r| r.method == "PATCH" && r.path == draft_path)
+            .expect("a PATCH before the send");
+        assert!(
+            last_patch.body.contains("USER-REPLY-TEXT"),
+            "the send carries the user's body: {}",
+            last_patch.body
         );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);

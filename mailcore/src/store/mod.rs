@@ -2337,6 +2337,10 @@ impl Store {
     /// [`Store::get_body_for`]). The schema's `bodies_fts_*` triggers (see
     /// `schema.rs`) keep `messages_fts` in step with this automatically, so
     /// `search` sees the new content right away.
+    ///
+    /// A local write always lands: the rule that keeps a draft's unpushed
+    /// body against a fetch (#2082, [`Store::put_fetched_body_with_headers`])
+    /// is not this method's, as this body *is* the local one.
     pub fn put_body(&self, message_id: &str, b: &Body) -> Result<(), StoreError> {
         write_body_on(&self.conn, message_id, b, None)
     }
@@ -2346,16 +2350,23 @@ impl Store {
     /// for `Html` can differ from the content type that came back (a
     /// plain-text message's native body is text). Leaves the message's
     /// stored headers as they are, an earlier fetch's included: the engine
-    /// stores a fetched body with [`Store::put_fetched_body_with_headers`].
-    /// Tests use it.
+    /// stores a fetched body with [`Store::put_fetched_body_with_headers`],
+    /// whose rule for a draft's unpushed body (#2082) this follows too
+    /// (`Ok(false)`: kept, nothing written). Tests use it.
     #[cfg(test)]
     pub fn put_fetched_body(
         &self,
         message_id: &str,
         b: &Body,
         asked: BodyFormat,
-    ) -> Result<(), StoreError> {
-        write_body_on(&self.conn, message_id, b, Some(asked))
+    ) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        if fetched_body_is_kept_on(&tx, message_id)? {
+            return Ok(false);
+        }
+        write_body_on(&tx, message_id, b, Some(asked))?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Inserts or replaces the body of a message as `FetchBody` fetched it,
@@ -2367,14 +2378,28 @@ impl Store {
     /// header Graph no longer sends reads `None` after a refetch), names
     /// lowercased, values trimmed, the first of a name kept. Read them with
     /// [`Store::message_header`].
+    ///
+    /// A draft's body Graph has not got yet is kept (#2082): when a body is
+    /// stored for `message_id` and the row has an unsaved compose edit
+    /// (`local_edit > 0`) or a queued `SaveDraft` / `SendDraft` names it (by
+    /// the id it is stored under now, [`Store::current_id`]), nothing is
+    /// written, neither the body nor the headers, and this returns
+    /// `Ok(false)`. That op PATCHes the stored body at drain time, so Graph's
+    /// older body written here would be sent back as the draft's. Other ops
+    /// push no body and keep nothing; a row with no body yet takes the fetch,
+    /// as it holds no user text. The check and the write share one
+    /// transaction. `Ok(true)`: written.
     pub fn put_fetched_body_with_headers(
         &self,
         message_id: &str,
         b: &Body,
         asked: BodyFormat,
         headers: &[MessageHeader],
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
+        if fetched_body_is_kept_on(&tx, message_id)? {
+            return Ok(false);
+        }
         write_body_on(&tx, message_id, b, Some(asked))?;
         tx.execute(
             "DELETE FROM message_headers WHERE message_id = ?1",
@@ -2387,7 +2412,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// The value of the internet header `name` stored with the message's
@@ -2435,6 +2460,10 @@ impl Store {
     /// Drafts folder (the synced one, or the local sentinel): a complete
     /// delta item resets `is_draft` to 0, as `isDraft` is not in
     /// `MESSAGE_SELECT`, so the flag alone would not last past a sync.
+    ///
+    /// This decides whether an embedder asks; a fetch that comes anyway
+    /// still keeps a draft's unpushed body
+    /// ([`Store::put_fetched_body_with_headers`], #2082).
     pub fn get_body_for(
         &self,
         message_id: &str,
@@ -3198,17 +3227,7 @@ impl Store {
     /// do not, so a caller holding an id from before a move resolves it
     /// here first.
     pub fn current_id(&self, id: &str) -> Result<String, StoreError> {
-        let current = self.conn.query_row(
-            concat!(
-                "SELECT COALESCE((SELECT message_id FROM moved_ids WHERE old_id = c.id), c.id)
-                 FROM (SELECT ",
-                current_id_sql!(),
-                " AS id) AS c"
-            ),
-            params![id],
-            |r| r.get(0),
-        )?;
-        Ok(current)
+        current_id_on(&self.conn, id)
     }
 
     /// Resolves the Drafts folder's id, for filing a new local draft (or a
@@ -4994,6 +5013,72 @@ fn tidy_contact_fields(f: &ContactFields) -> ContactFields {
     }
 }
 
+/// `Store::current_id` on `conn` (a transaction in
+/// `fetched_body_is_kept_on`'s callers).
+fn current_id_on(conn: &Connection, id: &str) -> Result<String, StoreError> {
+    let current = conn.query_row(
+        concat!(
+            "SELECT COALESCE((SELECT message_id FROM moved_ids WHERE old_id = c.id), c.id)
+             FROM (SELECT ",
+            current_id_sql!(),
+            " AS id) AS c"
+        ),
+        params![id],
+        |r| r.get(0),
+    )?;
+    Ok(current)
+}
+
+/// One `outbox.payload` decoded (`pending_ops_on`,
+/// `fetched_body_is_kept_on`).
+fn decode_outbox_payload(payload: &str) -> Result<OutboxOp, StoreError> {
+    let v = json::parse(payload).map_err(|e| StoreError::Decode(e.to_string()))?;
+    OutboxOp::from_json(&v)
+        .ok_or_else(|| StoreError::Decode(format!("unrecognized outbox payload: {payload}")))
+}
+
+/// Whether a fetched body for `message_id` must leave the stored one alone
+/// (#2082, `Store::put_fetched_body_with_headers`): a body is stored, and
+/// the row has an unsaved compose edit (`local_edit > 0`) or a queued
+/// `SaveDraft` / `SendDraft` names it by the id it is stored under now
+/// (`current_id_on`: an op queued under a `local:` id since reconciled, or
+/// before a move, #1896). Cheapest test first: most fetches are of a
+/// message with no body yet, and those never read the outbox. An outbox row
+/// that does not decode is skipped, as it is no draft op this build knows:
+/// one bad row must not fail every fetch.
+fn fetched_body_is_kept_on(conn: &Connection, message_id: &str) -> Result<bool, StoreError> {
+    let has_body: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bodies WHERE message_id = ?1)",
+        params![message_id],
+        |r| r.get(0),
+    )?;
+    if !has_body {
+        return Ok(false);
+    }
+    let edited: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 AND local_edit > 0)",
+        params![message_id],
+        |r| r.get(0),
+    )?;
+    if edited {
+        return Ok(true);
+    }
+    let mut stmt = conn.prepare("SELECT payload FROM outbox ORDER BY seq ASC")?;
+    let payloads = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for payload in payloads {
+        let id = match decode_outbox_payload(&payload) {
+            Ok(OutboxOp::SaveDraft { id } | OutboxOp::SendDraft { id }) => id,
+            _ => continue,
+        };
+        if current_id_on(conn, &id)? == message_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// All queued ops on `conn`, oldest first (`Store::pending_ops`).
 fn pending_ops_on(conn: &Connection) -> Result<Vec<OutboxRow>, StoreError> {
     let mut stmt = conn.prepare("SELECT seq, payload, attempts FROM outbox ORDER BY seq ASC")?;
@@ -5007,10 +5092,7 @@ fn pending_ops_on(conn: &Connection) -> Result<Vec<OutboxRow>, StoreError> {
         .collect::<Result<Vec<_>, _>>()?;
     rows.into_iter()
         .map(|(seq, payload, attempts)| {
-            let v = json::parse(&payload).map_err(|e| StoreError::Decode(e.to_string()))?;
-            let op = OutboxOp::from_json(&v).ok_or_else(|| {
-                StoreError::Decode(format!("unrecognized outbox payload: {payload}"))
-            })?;
+            let op = decode_outbox_payload(&payload)?;
             Ok(OutboxRow { seq, op, attempts })
         })
         .collect()
@@ -14490,6 +14572,238 @@ mod body_format_tests {
         );
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A draft's unpushed body kept against a fetched one (#2082).
+#[cfg(test)]
+mod kept_body_tests {
+    use super::*;
+
+    const AUTH_AS: &str = "X-MS-Exchange-Organization-AuthAs";
+
+    fn html(content: &str) -> Body {
+        Body {
+            content_type: "html".into(),
+            content: content.into(),
+        }
+    }
+
+    fn header(value: &str) -> Vec<MessageHeader> {
+        vec![MessageHeader {
+            name: AUTH_AS.into(),
+            value: value.into(),
+        }]
+    }
+
+    fn message(id: &str, is_draft: bool) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: String::new(),
+            subject: "S".into(),
+            from: Recipient::default(),
+            to: Vec::new(),
+            cc: Vec::new(),
+            received: String::new(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft,
+            is_meeting_request: false,
+            categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+        }
+    }
+
+    /// A store with the Drafts folder holding draft `D` and the Inbox
+    /// holding message `M`, neither with a body.
+    fn store() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        for (id, name, wk) in [("INBOX", "Inbox", "inbox"), ("DRAFTS", "Drafts", "drafts")] {
+            s.upsert_folder(&MailFolder {
+                id: id.into(),
+                display_name: name.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some(wk.into()),
+            })
+            .unwrap();
+        }
+        s.upsert_message("DRAFTS", &message("D", true)).unwrap();
+        s.upsert_message("INBOX", &message("M", false)).unwrap();
+        s
+    }
+
+    fn body(s: &Store, id: &str) -> Option<String> {
+        s.get_body(id).unwrap().map(|b| b.content)
+    }
+
+    /// Both fetched writers, each refused or each taking `server` (the
+    /// headers' writer last, so a taken fetch ends with its body).
+    fn fetch_both(s: &Store, id: &str, server: &str) -> (bool, bool) {
+        let plain = s
+            .put_fetched_body(id, &html(server), BodyFormat::Html)
+            .unwrap();
+        let with_headers = s
+            .put_fetched_body_with_headers(id, &html(server), BodyFormat::Html, &header("Server"))
+            .unwrap();
+        (plain, with_headers)
+    }
+
+    #[test]
+    fn a_fetched_body_keeps_a_locally_edited_drafts_body() {
+        let s = store();
+        assert!(
+            s.put_fetched_body_with_headers(
+                "D",
+                &html("<p>quote</p>"),
+                BodyFormat::Html,
+                &header("Internal"),
+            )
+            .unwrap()
+        );
+        s.update_draft_fields("D", "S", "bob@x", "", "", "<p>mine</p>")
+            .unwrap();
+
+        assert_eq!(fetch_both(&s, "D", "<p>quote</p>"), (false, false));
+        assert_eq!(body(&s, "D").as_deref(), Some("<p>mine</p>"));
+        assert_eq!(
+            s.message_header("D", AUTH_AS).unwrap().as_deref(),
+            Some("Internal"),
+            "a kept body keeps its headers too"
+        );
+
+        // Pushed: Graph has the user's body now, and a fetch writes again.
+        let generation = s.local_edit_generation("D").unwrap();
+        assert!(s.clear_local_edit("D", generation).unwrap());
+        assert_eq!(fetch_both(&s, "D", "<p>graph's</p>"), (true, true));
+        assert_eq!(body(&s, "D").as_deref(), Some("<p>graph's</p>"));
+        assert_eq!(
+            s.message_header("D", AUTH_AS).unwrap().as_deref(),
+            Some("Server")
+        );
+    }
+
+    #[test]
+    fn a_queued_send_or_save_keeps_the_body() {
+        for op in [
+            OutboxOp::SaveDraft { id: "D".into() },
+            OutboxOp::SendDraft { id: "D".into() },
+        ] {
+            let s = store();
+            s.put_body("D", &html("<p>mine</p>")).unwrap();
+            assert_eq!(s.local_edit_generation("D").unwrap(), 0);
+            let seq = s.enqueue_op(&op).unwrap();
+
+            assert_eq!(
+                fetch_both(&s, "D", "<p>quote</p>"),
+                (false, false),
+                "{op:?}"
+            );
+            assert_eq!(body(&s, "D").as_deref(), Some("<p>mine</p>"), "{op:?}");
+
+            s.drop_op(seq);
+            assert_eq!(
+                fetch_both(&s, "D", "<p>graph's</p>"),
+                (true, true),
+                "{op:?}"
+            );
+            assert_eq!(body(&s, "D").as_deref(), Some("<p>graph's</p>"), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn a_draft_op_under_the_local_id_protects_the_reconciled_row() {
+        let s = store();
+        let local = s
+            .create_local_draft("S", "bob@x", "", "<p>mine</p>")
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SendDraft { id: local.clone() })
+            .unwrap();
+        s.reconcile_id(&local, "G").unwrap();
+        assert_eq!(s.local_edit_generation("G").unwrap(), 0);
+
+        assert_eq!(fetch_both(&s, "G", "<p>quote</p>"), (false, false));
+        assert_eq!(body(&s, "G").as_deref(), Some("<p>mine</p>"));
+    }
+
+    #[test]
+    fn a_mark_read_op_does_not_keep_a_body() {
+        let s = store();
+        s.put_body("M", &html("<p>old</p>")).unwrap();
+        for op in [
+            OutboxOp::MarkRead {
+                id: "M".into(),
+                read: true,
+            },
+            OutboxOp::Delete { id: "M".into() },
+        ] {
+            s.enqueue_op(&op).unwrap();
+        }
+
+        assert_eq!(fetch_both(&s, "M", "<p>fetched</p>"), (true, true));
+        assert_eq!(body(&s, "M").as_deref(), Some("<p>fetched</p>"));
+    }
+
+    #[test]
+    fn a_protected_row_without_a_body_takes_the_fetch() {
+        let s = store();
+        s.enqueue_op(&OutboxOp::SendDraft { id: "D".into() })
+            .unwrap();
+        s.conn
+            .execute("UPDATE messages SET local_edit = 3 WHERE id = 'D'", [])
+            .unwrap();
+
+        assert!(
+            s.put_fetched_body_with_headers(
+                "D",
+                &html("<p>graph's</p>"),
+                BodyFormat::Html,
+                &header("Server"),
+            )
+            .unwrap()
+        );
+        assert_eq!(body(&s, "D").as_deref(), Some("<p>graph's</p>"));
+    }
+
+    #[test]
+    fn put_body_still_writes_over_a_protected_draft() {
+        let s = store();
+        s.update_draft_fields("D", "S", "bob@x", "", "", "<p>mine</p>")
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SendDraft { id: "D".into() })
+            .unwrap();
+
+        s.put_body("D", &html("<p>newer local</p>")).unwrap();
+        assert_eq!(body(&s, "D").as_deref(), Some("<p>newer local</p>"));
+    }
+
+    #[test]
+    fn an_undecodable_outbox_row_does_not_stop_a_fetched_write() {
+        let s = store();
+        s.put_body("M", &html("<p>old</p>")).unwrap();
+        s.put_body("D", &html("<p>mine</p>")).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO outbox (op, payload) VALUES ('futureOp', 'not json')",
+                [],
+            )
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SaveDraft { id: "D".into() })
+            .unwrap();
+
+        assert_eq!(fetch_both(&s, "M", "<p>fetched</p>"), (true, true));
+        assert_eq!(body(&s, "M").as_deref(), Some("<p>fetched</p>"));
+        // The draft op after the bad row still protects its draft.
+        assert_eq!(fetch_both(&s, "D", "<p>quote</p>"), (false, false));
+        assert_eq!(body(&s, "D").as_deref(), Some("<p>mine</p>"));
     }
 }
 
