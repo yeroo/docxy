@@ -2992,4 +2992,227 @@ mod tests {
         assert_eq!(slot(2), ("", ""), "absent");
         assert_eq!(slot(3), ("", ""), "half a slot is no proposal");
     }
+
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    /// A complete flagged message carrying `props` as its
+    /// `singleValueExtendedProperties` (raw JSON), or none when `None`.
+    fn flagged_with(props: Option<&str>) -> Value {
+        let props = props
+            .map(|p| format!(r#","singleValueExtendedProperties":{p}"#))
+            .unwrap_or_default();
+        parse(&format!(
+            r#"{{"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                "receivedDateTime":"2026-11-01T00:00:00Z",
+                "flag":{{"flagStatus":"flagged"}}{props}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn prop(id: &str, value: &str) -> String {
+        format!(r#"{{"id":"{id}","value":{value}}}"#)
+    }
+
+    fn three(set: &str, at: &str, signal: &str) -> String {
+        format!(
+            "[{},{},{}]",
+            prop(REMINDER_SET_PROP, set),
+            prop(REMINDER_TIME_PROP, at),
+            prop(REMINDER_SIGNAL_TIME_PROP, signal)
+        )
+    }
+
+    #[test]
+    fn message_reminder_parses_the_three_properties() {
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""2026-11-08T10:00:00Z""#,
+            r#""2026-11-08T10:15:00.0000000Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "2026-11-08T10:00:00Z");
+        assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
+        assert!(MessageFields::of(&v).reminder);
+
+        // Graph may lower-case the GUID; a JSON boolean and "TRUE" are on too.
+        let lower = |id: &str| id.to_ascii_lowercase();
+        let props = format!(
+            "[{},{}]",
+            prop(&lower(REMINDER_SET_PROP), "true"),
+            prop(
+                &lower(REMINDER_SIGNAL_TIME_PROP),
+                r#""2026-11-08T10:15:00Z""#
+            )
+        );
+        let m = Message::from_json(&flagged_with(Some(&props))).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "");
+        assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
+        let props = format!(
+            "[{},{}]",
+            prop(REMINDER_SET_PROP, r#""TRUE""#),
+            prop(REMINDER_TIME_PROP, r#""2026-11-08T10:00:00Z""#)
+        );
+        assert!(
+            Message::from_json(&flagged_with(Some(&props)))
+                .unwrap()
+                .is_reminder_on
+        );
+    }
+
+    #[test]
+    fn message_without_reminder_properties_has_none() {
+        for props in [
+            None,
+            Some("[]"),
+            Some("null"),
+            Some("{}"),
+            Some(r#"["x",3]"#),
+        ] {
+            let v = flagged_with(props);
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{props:?}");
+            assert_eq!(m.reminder_at, "", "{props:?}");
+            assert_eq!(m.reminder_signal_at, "", "{props:?}");
+        }
+        assert!(!MessageFields::of(&flagged_with(None)).reminder);
+        assert!(MessageFields::of(&flagged_with(Some("[]"))).reminder);
+        // Another extended property is not the reminder.
+        let other = format!(
+            "[{}]",
+            prop(
+                "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8504",
+                r#""true""#
+            )
+        );
+        assert!(
+            !Message::from_json(&flagged_with(Some(&other)))
+                .unwrap()
+                .is_reminder_on
+        );
+    }
+
+    #[test]
+    fn message_reminder_false_is_off() {
+        for set in [
+            r#""false""#,
+            "false",
+            r#""yes""#,
+            r#""1""#,
+            "1",
+            "null",
+            r#""""#,
+        ] {
+            let v = flagged_with(Some(&three(
+                set,
+                r#""2026-11-08T10:00:00Z""#,
+                r#""2026-11-08T10:15:00Z""#,
+            )));
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{set}");
+            // The times are still read: a client may show them.
+            assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z", "{set}");
+        }
+    }
+
+    #[test]
+    fn message_reminder_with_garbage_times_is_off() {
+        for t in [
+            r#""garbage""#,
+            r#""""#,
+            "null",
+            "12",
+            r#""2026-13-08T10:00:00Z""#,
+            r#""2026-02-30T10:00:00Z""#,
+            r#""2026-11-08""#,
+            r#""0000-00-00T00:00:00Z""#,
+        ] {
+            let v = flagged_with(Some(&three(r#""true""#, t, t)));
+            let m = Message::from_json(&v).expect("never None");
+            assert!(!m.is_reminder_on, "{t}");
+            assert_eq!(m.reminder_at, "", "{t}");
+            assert_eq!(m.reminder_signal_at, "", "{t}");
+        }
+        // One readable time is enough.
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""garbage""#,
+            r#""2026-11-08T10:15:00Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "");
+    }
+
+    #[test]
+    fn message_reminder_with_an_offset_time_is_unreadable() {
+        // `to_utc` would drop the offset without applying it: the wrong time.
+        for t in [
+            r#""2026-11-08T10:15:00+02:00""#,
+            r#""2026-11-08T10:15:00-05:00""#,
+        ] {
+            let v = flagged_with(Some(&three(r#""true""#, t, t)));
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{t}");
+            assert_eq!(m.reminder_signal_at, "", "{t}");
+        }
+        // No suffix reads as UTC; Outlook's "never" sentinel parses.
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""2026-11-08T10:00:00""#,
+            r#""4501-01-01T00:00:00Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert_eq!(m.reminder_at, "2026-11-08T10:00:00Z");
+        assert_eq!(m.reminder_signal_at, "4501-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn flag_due_date_time_is_normalised_utc() {
+        for zone in [r#""UTC""#, r#""utc""#, r#""Etc/UTC""#, r#""""#] {
+            let v = parse(&format!(
+                r#"{{"id":"M1","flag":{{"flagStatus":"flagged",
+                    "dueDateTime":{{"dateTime":"2026-11-09T17:00:00.0000000","timeZone":{zone}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                Message::from_json(&v).unwrap().flag_due_at,
+                "2026-11-09T17:00:00Z",
+                "{zone}"
+            );
+        }
+        let v = parse(r#"{"id":"M1","flag":{"flagStatus":"flagged"}}"#).unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+        let v = parse(r#"{"id":"M1","flag":{"dueDateTime":{"dateTime":"soon","timeZone":"UTC"}}}"#)
+            .unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+    }
+
+    #[test]
+    fn flag_due_in_a_named_zone_is_empty() {
+        let v = parse(
+            r#"{"id":"M1","flag":{"flagStatus":"flagged",
+                "dueDateTime":{"dateTime":"2026-11-09T17:00:00","timeZone":"Pacific Standard Time"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+    }
+
+    #[test]
+    fn message_fields_reminder_written_only_when_carried_or_complete() {
+        // A complete item without the key: written (no reminder).
+        assert!(MessageFields::of(&flagged_with(None)).writes_reminder());
+        // A partial item without it: kept.
+        let partial = parse(r#"{"id":"M1","isRead":true}"#).unwrap();
+        assert!(!MessageFields::of(&partial).writes_reminder());
+        // A partial item with it: written.
+        let partial = parse(&format!(
+            r#"{{"id":"M1","singleValueExtendedProperties":{}}}"#,
+            three(r#""false""#, "null", "null")
+        ))
+        .unwrap();
+        assert!(MessageFields::of(&partial).writes_reminder());
+        assert!(MessageFields::all().reminder);
+    }
 }
