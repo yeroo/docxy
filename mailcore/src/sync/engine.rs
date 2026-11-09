@@ -1294,6 +1294,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         shutting_down: false,
         body_skip: HashSet::new(),
         body_parked: false,
+        contact_rereads_paused: false,
     };
     engine.startup();
     engine.main_loop();
@@ -1408,6 +1409,10 @@ struct Engine {
     /// fetches (#1978) until the next sync pass, which clears it: one try a
     /// pass, never a loop, and a store or a service that recovered heals.
     body_parked: bool,
+    /// An owed contact re-read failed transiently in this drain (#2063):
+    /// `settle_contact_rereads` tries no more until the next drain, which
+    /// clears it.
+    contact_rereads_paused: bool,
 }
 
 impl Engine {
@@ -3440,6 +3445,7 @@ impl Engine {
     /// transport, or that sync stopping), so the caller stops too and keeps
     /// the back-off.
     fn drain_outbox(&mut self) -> Drain {
+        self.contact_rereads_paused = false;
         let ops = match self.store.pending_ops() {
             Ok(o) => o,
             // A row that won't deserialize can't be pinpointed through the
@@ -3698,11 +3704,18 @@ impl Engine {
     /// so a revert before it would make it send the server's own values and
     /// lose the user's edit. Graph's version is stored, a 404 deletes the
     /// row (`Store::revert_folder_contact`, which writes nothing and keeps
-    /// the id owed if an edit was queued during the GET), and any other
-    /// failure gives the re-read up, the row left for the next full pass.
+    /// the id owed if an edit was queued during the GET). A final refusal
+    /// (a 4xx other than 404, an answer that did not parse) gives the
+    /// re-read up, the row left for the next full pass; a transient failure
+    /// (a 5xx, a throttle, a transport error, a 401 a refresh did not cure)
+    /// keeps it owed and stops settling for the rest of this drain
+    /// (`contact_rereads_paused`), so a later drain retries.
     /// The owed set is in the store, so one a restart interrupted is settled
     /// by the startup pass's drain. Whether any row was re-read.
     fn settle_contact_rereads(&mut self) -> bool {
+        if self.contact_rereads_paused {
+            return false;
+        }
         let Ok(owed) = self.store.owed_contact_rereads() else {
             return false;
         };
@@ -3714,9 +3727,22 @@ impl Engine {
             let server = match self.with_auth(|c| c.contact(&id)) {
                 Ok(c) => Some(c),
                 Err(GraphError::NotFound) => None,
-                Err(_) => {
+                // A final answer: asking again changes nothing.
+                Err(GraphError::Http { status, .. }) if status < 500 => {
                     let _ = self.store.forget_contact_reread(&id);
                     continue;
+                }
+                Err(GraphError::Parse(_)) => {
+                    let _ = self.store.forget_contact_reread(&id);
+                    continue;
+                }
+                // Transient (a 5xx, a throttle, offline, a 401 a refresh did
+                // not cure): keep it owed and try no more in this drain.
+                // Best-effort: the next drain or pass meets the condition
+                // itself, so no back-off or sign-in is started from here.
+                Err(_) => {
+                    self.contact_rereads_paused = true;
+                    break;
                 }
             };
             if self
@@ -7320,6 +7346,69 @@ mod tests {
         // Nothing protects it now: the next full pass replaces it.
         handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert_eq!(
+            store.folder_contact("C-dave").unwrap(),
+            Some(dave_contact())
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owed_contact_reread_survives_a_transient_get_failure() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-reread-503",
+            vec![
+                (any_route("PATCH", "/me/contacts/C-dave", 403, DENIED), None),
+                (any_route("GET", "/me/contacts/C-dave", 503, "{}"), Some(1)),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, DAVE_JSON),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        let mut f = dave_contact().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        assert!(contact_failure(&seen).is_some(), "{seen:?}");
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(
+            store.owed_contact_rereads().unwrap(),
+            [("C-dave".to_string(), false)],
+            "a 503 keeps it owed"
+        );
+        assert_eq!(
+            store
+                .folder_contact("C-dave")
+                .unwrap()
+                .unwrap()
+                .fields
+                .job_title,
+            "Lead"
+        );
+
+        // A later drain (a command that only pushes the queue) re-reads it.
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteContact {
+                id: "C-none".into(),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 2);
+        assert!(store.owed_contact_rereads().unwrap().is_empty());
         assert_eq!(
             store.folder_contact("C-dave").unwrap(),
             Some(dave_contact())

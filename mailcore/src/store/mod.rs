@@ -4718,18 +4718,21 @@ impl Store {
     }
 
     /// The owed re-reads (`owe_contact_reread`), each with whether a queued
-    /// contact op still names it, read in one transaction.
+    /// contact op still names it. A plain read, no write lock: it runs on
+    /// every drain, and `revert_folder_contact` checks the queue again
+    /// inside its own write transaction.
     pub(crate) fn owed_contact_rereads(&self) -> Result<Vec<(String, bool)>, StoreError> {
-        let tx = self.write_tx()?;
         let ids: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM contact_reread_owed ORDER BY id")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM contact_reread_owed ORDER BY id")?;
             stmt.query_map([], |r| r.get(0))?
                 .collect::<Result<_, _>>()?
         };
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let queued = queued_contacts_on(&tx)?.any;
+        let queued = queued_contacts_on(&self.conn)?.any;
         Ok(ids
             .into_iter()
             .map(|id| {
@@ -4739,8 +4742,9 @@ impl Store {
             .collect())
     }
 
-    /// Gives up an owed re-read (#2063): Graph could not be asked, so the row
-    /// is left for the next full pass to replace.
+    /// Gives up an owed re-read (#2063): Graph refused it for good (a 4xx
+    /// other than 404, an answer that did not parse), so the row is left for
+    /// the next full pass to replace.
     pub(crate) fn forget_contact_reread(&self, id: &str) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM contact_reread_owed WHERE id = ?1", params![id])?;

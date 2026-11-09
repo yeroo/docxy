@@ -1282,10 +1282,16 @@ wider window fresh without downloading it again.
   startup drain settles one a restart interrupted (`settle_contact_rereads`).
   Every later edit is a queued op from the moment it is written, and
   `revert_folder_contact` checks the queue in its own transaction: an edit
-  written during the GET makes it write nothing and keep the id owed. If the
-  re-read fails (no read scope, offline), it is given up
+  written during the GET makes it write nothing and keep the id owed. A
+  final refusal of the GET (a 4xx other than 404, such as a 403 without read
+  scope, or an answer that did not parse) gives the re-read up
   (`forget_contact_reread`) and the row is left until the next full pass
-  replaces it. Then `SyncEvent::ContactWriteFailed { id, write, status, error,
+  replaces it. A transient one (a 5xx, a throttle, offline, a 401 a refresh
+  did not cure) keeps it owed and pauses re-reads for the rest of that drain
+  (`contact_rereads_paused`); a later drain retries it. Best-effort: no
+  back-off, offline state or sign-in is started from there.
+  `owed_contact_rereads` is a plain read (no write lock), as it runs on every
+  drain; the revert checks the queue again in its own write transaction. Then `SyncEvent::ContactWriteFailed { id, write, status, error,
   attempted }`, one `SyncEvent::Error("{create|update|delete} contact {id}:
   {error}")` (as the reminder ops report, so a host showing only `Error` lines
   sees it), and `ContactsUpdated`. `id` is the id stored at the failure (the
@@ -1346,6 +1352,7 @@ wider window fresh without downloading it again.
   `full_pass_keeps_a_delete_whose_command_is_still_in_the_channel` (the store
   written while a slow `/me/contacts`, `start_paced`, is in flight),
   `reread_after_refusal_waits_for_an_edit_written_but_not_commanded`,
+  `owed_contact_reread_survives_a_transient_get_failure`,
   `owed_contact_reread_survives_a_restart`,
   `full_pass_syncs_the_contacts_folder_apart_from_people_and_mined`,
   `contacts_403_keeps_the_stored_set_and_does_not_fail_the_pass`,
