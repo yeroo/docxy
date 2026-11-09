@@ -105,8 +105,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `docs/claude/docx-editing.md`'s "Web Layout fits tables"): the view's
   text width comes from a last in-flow `w_full` zero-height probe in
   `ext-doc-scroll` (`text_w`), and `ext-doc-scroll` scrolls on both axes
-  under a horizontal bar (`ext-doc-hscrollbar`, a 12 px strip along the
-  bottom). gpui's X11, Wayland and Windows clients turn a shifted wheel
+  under the suite's document scrollbars (#2080, `doc_scrollbar`: 12 px
+  strips over the right and bottom padding, shown while their axis
+  overflows; `ext-doc-vbar`, `ext-doc-hbar-thumb`, ... regions, and
+  `ext-doc-read`'s `vbar` / `hbar`, see `docs/claude/suite-document.md`).
+  A press on a bar stops there: it does not focus the view. gpui's X11, Wayland and Windows clients turn a shifted wheel
   into `delta.x` (macOS sends it), so the view has no shift handling;
   Ctrl+wheel's put-back restores both axes. `ext-doc-read` adds `scroll_x`
   / `max_scroll_x` (clamped as the next paint will), `text_width` and

@@ -298,3 +298,63 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   Print Layout's first page's first band, whose rect is 2 px narrower than
   the column its blocks draw in: the page's border; 2.5 px tolerance).
   `uiharness/cases/table-jc.uit`.
+
+## Document scrollbars (#2080)
+
+- `doc_scrollbar.rs` draws every document view's bars: Print Layout, Web
+  Layout / Draft and `ext::DocView`, instead of gpui-component's fading
+  bars. Each bar is a canvas that reads the `ScrollHandle` while it
+  prepaints. Laid out after its scroll area, it sees this frame's offset and
+  extent, so a wheel scroll moves the thumb without a render. It is 12 px
+  (`BAR_PX`): an arrow square at each end and the track between, coloured
+  from the theme's `scrollbar`, `scrollbar_thumb` / `_hover` and
+  `muted_foreground`.
+- The geometry is pure and unit-tested. `thumb`: the length is
+  `track * view / content`, at least `MIN_THUMB` (20); the start is
+  `(track - len) * offset / max`. `drag_offset` / `offset_for_thumb` invert
+  it, clamped. `track_press` steps one page (`view - LINE`, `LINE` 40)
+  toward the press, `None` on the thumb. `arrow_press` steps one line.
+  A held press repeats its step (400 ms, then every 50 ms: a
+  `window.spawn` task in `BarState`, dropped on any left mouse-up) until it
+  answers `None`. A thumb drag follows the pointer anywhere until the
+  button goes up. A press on a bar stops propagation: it neither selects
+  nor focuses.
+- Print Layout's bars take strips of their own beside the pages
+  (`Docxy::print_bars`), not over them, with a corner square when both
+  show. A strip is laid out while `BarState::shown`. The bar's prepaint
+  keeps that equal to "the axis overflows by more than half a pixel" and
+  requests a frame when it flips, so the strip appears a frame later. A
+  strip only ever shrinks the view, so this settles. The flow view and
+  DocView lay theirs over the padding (`overlay_bars`), which keeps the
+  text width. An unshown overlay paints nothing and takes no input.
+- Print Layout scrolls both axes. `ruler_scroll_view(.., true)` bounds the
+  view to the window, and the pages sit in a column (`min_w_full`,
+  `items_center`) inside the scroll area. A page narrower than the view is
+  centred, and a wider one starts at the left, so it overflows to the right
+  only. Auto margins (`mx_auto`) or centring in the scroll area itself
+  split the overflow and clip the page's left (taffy centres past both
+  edges). So the pages are not the scroll area's children:
+  `bounds_for_item` does not index them. The caret follow (see
+  `docs/claude/docx-editing.md`, #1895) and the page tip read each page's
+  painted rect instead (`page_follow_el`, `print_page_spans`).
+- The tip: while the vertical Print Layout thumb is dragged, a
+  `Page N of M` box (`page_tip`, the theme's `popover`) shows left of the
+  thumb. N is `page_at`, the first page whose bottom is below the view's
+  top (so a gap counts for the next page), and the last page at the end.
+  It goes on the mouse-up. Web Layout, Draft and DocView show none.
+- The harness: regions `doc-vbar`, `doc-vbar-thumb`, `doc-vbar-up` /
+  `-down`, `doc-hbar`, `doc-hbar-thumb`, `doc-hbar-left` / `-right`
+  (`Region::DocBar`, while that bar is shown), and `ext-doc-vbar...` for
+  the test extension's view. `doc {}`'s `scroll`: `scroll_y` /
+  `max_scroll_y`, `scroll_x` / `max_scroll_x`, `vbar` / `hbar` (`null`
+  while hidden, else `track`, `thumb_start`, `thumb_len`), `page_tip`, and
+  in Print Layout `page_count`, `top_page` (1-based) and
+  `page_left_in_view` / `page_right_in_view` (page 1's edges). It also has
+  `caret_in_view`: the painted piece the caret is in or after lies inside
+  the view. `ext-doc-read` adds `vbar` / `hbar`.
+  `uiharness/cases/print-layout-scrollbars.uit` runs a 14-page fixture
+  (`fourteen-pages.docx`, `RIGHTMARGIN` right-aligned on page 1) in a
+  narrow window.
+- Not done: the tip's heading text, Word's Previous/Next Page browse
+  buttons, a scrollbar context menu, the help view's and terminal
+  `docxy`'s bars.

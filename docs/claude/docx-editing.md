@@ -202,10 +202,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
 - A table's root is as wide as its widest row (`w`, not stretched): gpui's
   scroll extent is the union of the scroll area's direct children, so a
   stretched root would hide a wide table from it. Both flow scroll areas
-  scroll on both axes under a 12 px horizontal bar (`doc-hscrollbar`,
-  `ext-doc-hscrollbar`); the doc tab's `ruler_scroll_view(.., shrink:
-  true)` sets `min_w(0)`, else the flex item would widen to the table.
-  Print Layout passes false and still widens to a wide sheet.
+  scroll on both axes under the document scrollbars (#2080, was
+  gpui-component's `doc-hscrollbar` / `ext-doc-hscrollbar`); the doc tab's
+  `ruler_scroll_view(.., shrink: true)` sets `min_w(0)`, else the flex item
+  would widen to the table. Print Layout passes true too since #2080: it
+  scrolls a wide sheet sideways instead of widening to it.
 - The flow view's caret follow is y only (#1895 r1): gpui's
   `scroll_to_item` also moves x on a scroll area that scrolls sideways
   (back to a wide block's left on every key), so `scroll_to_caret` only
@@ -215,8 +216,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   y) and asks for one more frame when it moved: the follow shows a frame
   after the edit. The last layout's bounds are not used: after an Enter or
   a delete they can be another block's. A caret in a cell scrolled out of
-  view sideways does not scroll x. Print Layout keeps `scroll_to_item`
-  (its scroll area scrolls in y only).
+  view sideways does not scroll x. Print Layout follows the same way since
+  it scrolls sideways (#2080): `scroll_to_caret` sets its own
+  `Docxy::page_follow` (the Print Layout render clears `doc_follow`), and
+  the follow runs in the followed page's own probe (`page_follow_el`),
+  from the page's laid-out bounds (`follow_bounds_y`), as the pages are not
+  the scroll area's children. gpui's default strategy was FirstVisible
+  already, so only the x move went.
 - `fitted_grid` caps a pct at 10000% (`MAX_FIT_PCT`) and the target at
   `MAX_FIT_TW` (1,000,000 twips), so a mail body's `w:w="4000000000"` or
   `"1e30%"` overflows nothing; cell sums saturate.

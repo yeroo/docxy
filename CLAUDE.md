@@ -29,13 +29,15 @@ issue number to find its notes.
   Apply to Selected text (#1272), Layout settings.xml undo steps (#1273), Header & Footer
   leftovers: `w:ptab`, bound Company/Manager properties, Date & Time (#1433), live page
   fields (#1437), Web Layout and DocView fitting tables to the view width, horizontal
-  scroll (#1895), the flow view drawing an imported mail: exact spacing and line height,
-  list numbers in the mark's look, the layout dump (#1986).
+  scroll (#1895), Print Layout's y-only caret follow (#2080), the flow view drawing an
+  imported mail: exact spacing and line height, list numbers in the mark's look, the
+  layout dump (#1986).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
   (#1900), link colours (#1906), tables placed by `w:jc` (#1922), rounded
-  picture crops (#1926).
+  picture crops (#1926), the document views' scrollbars and Print Layout's
+  sideways scroll (#2080).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
@@ -56,8 +58,9 @@ issue number to find its notes.
 - `docs/claude/suite-extensions.md`: before changing the suite as a library
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),
-  page inset and page background (#2003), an extension's ribbon drawn by the suite
-  and the suite's theme (#1870), File backstage pages and CloseTab (#1923).
+  page inset and page background (#2003), its scrollbars (#2080), an extension's ribbon
+  drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab
+  (#1923).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
