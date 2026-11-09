@@ -783,9 +783,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `update_event_fields_follows_the_join_link_unless_online_meeting`,
   `events_without_1983_columns_migrate`); `engine.rs`
   `refresh_calendar_stores_calendar_client_fields`.
-- Not done: `calendarView` returns occurrences, never series masters; a synced
-  master is fetched only on demand (`FetchEventSeries`, #2022) and never stored,
-  so `EventRow::recurrence` is `Some` in production only for a local series.
+- Not done: plain `calendarView` returns occurrences, never series masters; a
+  synced master is stored when a calendar delta round returns or fetches it
+  (#2064), with its `recurrence`; the grid queries leave it out once a row of
+  its series is stored.
   `calendar_id` is the calendar a pass fetched the event from since #1984
   (`calendar.id` in the JSON loses to it). Safe Links-wrapped links
   (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
@@ -1117,7 +1118,9 @@ wider window fresh without downloading it again.
   next pass still runs initial rounds. `CreateEvent`'s `local:` row is
   never replaced either way.
 - Not done: no checkpoint between a round's pages (as before); series
-  masters are fetched only on demand and never stored (#2022); `FetchCalendarRange` stays plain
+  masters come with the rounds, or are fetched for their occurrences, and
+  are stored, off the grid once a row of their series is (#2064);
+  `FetchCalendarRange` stays plain
   `calendarView` (a range overlapping the window, when its record is
   stale, re-fetches that part, server truth either way). Two passes
   straddling 00:00 UTC make the second an initial round, so a test that
@@ -1470,8 +1473,8 @@ this occurrence or the whole series, as Outlook does.
   master and each instance take the calendar of a stored row of the series
   (`Store::series_calendar_id`), or `""` when none is stored.
 - `OutboxOp::UpdateEventSeries { id, body }` (`updateEventSeries`) stores the PATCH
-  body whole (`event_body_json` at command time), because the master is not
-  stored. `apply_op` sends it with `update_event_body`. An empty `input.fields`
+  body whole (`event_body_json` at command time), because the master was not
+  stored then (#2064 stores it, off the grid). `apply_op` sends it with `update_event_body`. An empty `input.fields`
   queues nothing. There is no optimistic local write, so the op is not an event op
   for the quarantine reset. Instead the calendars owe a reset once it went
   through (`calendar_reset_owed`, in memory; a refused `RespondEvent` owes it too, #2023): a pattern change mints new occurrence
@@ -1503,8 +1506,11 @@ this occurrence or the whole series, as Outlook does.
   `drain_queued` then leaves the state that failure set. A drain that quarantines
   or cancels around a series edit can refresh twice. A restart before the reset
   ran drops it, and the delta rounds carry on.
-- Masters are not stored: `calendarView` never returns one, so every window replace
-  would delete it, and `events_in_window` would show it on the series' first day.
+- Masters are stored since #2064 (the delta returns them, and a missing one is
+  fetched), off the grid: `events_in_window` / `events_in_range` leave a master out
+  once a row of its series is stored, or it would show on the series' first day, and
+  a `FetchCalendarRange`, whose plain `calendarView` never returns one, keeps it.
+  See "Occurrences take their series' fields (#2064)".
 - A series edit with `TIMES` names the master's zone and wall clocks
   (`EventInput::start_time_zone` / `start_local` and the end's, #2039, which closes
   #2030), so the series stays in its zone; with none named it is sent in UTC, and
@@ -2297,3 +2303,160 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `a_refused_backfill_keeps_reminders_and_leaves_an_accepted_head_unmarked` and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
   `message_reminder_commands_by_the_old_id_write_and_reach_the_new_id`,
   `a_dismiss_by_the_new_id_dedupes_against_one_queued_by_the_old_id`.
+
+## Occurrences take their series' fields (#2064)
+
+Graph's `calendarView/delta` (#2013) returns each recurring occurrence with only its
+`id`, `type`, `start`, `end` and `seriesMasterId`; the series' fields live on the
+`seriesMaster`, which the delta returns too. Stored as returned, every occurrence
+was a blank meeting, and the grid queries drew the masters as meetings on each
+series' first day.
+
+- **The fill, at write time.** `apply_calendar_sync` runs `fill_occurrences_on` for
+  each fetched calendar after its removals and upserts (`Window` and `Delta`, cascade
+  or not), in the pass's transaction. A non-`local:` `occurrence` of that calendar
+  whose master is stored there as a `seriesMaster` is filled when the round upserted
+  it, or upserted its master and the master changed, or it is blank (`BLANK_OCCURRENCE`: `subject`, `organizer_name`, `organizer_addr`,
+  `location` and `response_status` all `''`; every real event has an organizer).
+  The blank rule repairs a store from before #2064 on its next pass, with no
+  download. An occurrence that neither the round nor its master touched keeps its
+  own values: an optimistic local write (a `RespondEvent`'s status, an `UpdateEvent`
+  of this occurrence) waits for its op. A changed master is server truth and
+  overwrites, as a delta upsert does. "Changed" (`changed_masters_on`, read before
+  the round's writes; r3): not stored as a master of that calendar, or stored with
+  another `last_modified` (Graph's `lastModifiedDateTime`), or either one empty.
+  Every initial round lists or refetches the masters of its occurrences, so without
+  this an unchanged master would refill every occurrence of its series, of any date,
+  daily, overwriting a pending write on one outside the window (a range fetch's, or
+  history); the round's own occurrences are still filled, as touched ones.
+  Exceptions are full items and never filled.
+- What is copied: `SERIES_FIELDS` (subject, location, organizer, response status,
+  body preview, `is_all_day`, reminder, show-as, online meeting and join URL,
+  categories, sensitivity, importance, `is_cancelled`, `is_organizer`,
+  `response_requested`, `allow_new_time_proposals`, `has_attachments`, the original
+  zones), and the master's attendees replace the occurrence's. The fill runs after
+  `upsert_fetched_events_on`, which writes each minimal occurrence's own empty
+  attendee list. `is_all_day` matters: a minimal occurrence of an all-day series
+  reads `false`, and `days_with_events` would shift it by the offset. Not copied:
+  id, times, `series_master_id`, `event_type`, `calendar_id`, `web_link`,
+  `last_modified`, both recurrences, the body and the internal columns.
+- **The body is a reference.** `event_body_on` gives an `occurrence` with no body of
+  its own its stored master's (same calendar). Copying the master's body would have
+  duplicated the Teams HTML of each master into every occurrence. `Store::event_body`
+  uses it, and so
+  does `update_event_fields` for its `old` body, so it compares an occurrence edit's
+  body against what the host showed: a subject-only edit does not mark `BODY`, and
+  the master's HTML is not sent. `event_for_send` reads the row's own body (r4): a
+  `BODY` PATCH sends exactly what the row holds, so clearing an occurrence's shown
+  body sends it cleared. Known transient: until the next sync stores that occurrence
+  as an `exception` (which has no fallback), `event_body` still shows the master's
+  body; a marker would need a new column. An edit that leaves the body alone (no
+  `BODY`) writes the row's own body, not the shown one (r5): a subject-only edit of
+  a filled occurrence keeps `''`, so it still follows its master, and an edit during
+  the transient does not write the master's body back for the queued clear to send.
+  Its join link is still read from the shown body (the master's link, already
+  copied).
+- **A missing master is fetched** (`Engine::fetch_missing_masters`, after a round
+  and before the write). It fetches the masters of the round's occurrences and of
+  the calendar's stored blank ones (`Store::blank_occurrence_masters`) that are not
+  stored as a `seriesMaster` of that calendar (`Store::has_series_master`; in an
+  initial round, stored or not: see below), plus
+  every id the round lists as removed that is stored as one. A master starting
+  before the window that changed comes as `@removed` (#2013); the removal does not
+  delete it, since it does not overlap the window, so without the refetch its
+  occurrences would keep the old fields. The round's own masters are not fetched,
+  and each id is fetched once, in id order, with `get_event`. A `seriesMaster`
+  answer joins the round's events (under the round's calendar) with its attendees;
+  any other type is ignored. A 404 is no `Error`: the id goes into the engine's
+  `masters_not_found` (in memory, cleared by `enter_signin` and a restart), so a
+  needed master that `/me/events` cannot reach is asked once a session, not every
+  pass. A removed stored master that 404s goes through `CalendarRound::Delta`'s
+  `gone_masters`, which deletes only that calendar's `seriesMaster` row of that id,
+  of any date, before the upserts. A removed stored master skips the
+  `masters_not_found` check (r1): if its pass stops before the write, it is still
+  stored, and the replayed link lists it again, so the next pass's 404 deletes it.
+  A 401, throttle or transport error ends the pass as a failed round does (nothing
+  written, every link kept: `MasterFetch::StopPass`). An HTTP or parse error is
+  reported. For a needed master the round is written without it (its occurrences
+  stay blank and are named again next pass). For a removed stored master the
+  calendar is left out of the pass (`MasterFetch::SkipCalendar`), as a failed
+  round is: writing would advance the link past the `@removed` and keep the stale
+  master for good (r1). Only once per id a session (`masters_skipped`, cleared with
+  `masters_not_found`; a refetch that succeeds or 404s forgets it): a refetch that
+  fails again (a 403 on a delegate's private item, a repeated 500) writes the round
+  with the stale master, or one master would stop its calendar syncing until the
+  window moves at 00:00 UTC; the next initial round fetches it again (r2).
+- **An initial round refetches its stored masters** (r2). In a
+  `CalendarRound::Window` round a needed master that is not among the round's own is
+  fetched even when it is stored: Graph's initial round may not list a master that
+  starts before the window, the round re-sends minimal occurrences, and a stale
+  stored master (a series renamed before a reset, `UpdateEventSeries`' among them)
+  would refill them with its old fields, while the new baseline means no later
+  delta lists the change. One GET per series per initial round (daily, plus
+  resets). An HTTP or parse failure there writes the round with the stored copy
+  (no `@removed` to replay); a 404 joins `masters_not_found`, and the stored row
+  stays, since the round still names its occurrences. Delta rounds fetch only
+  masters that are not stored, or removed. A refetched master that has not changed
+  (the same `lastModifiedDateTime`) fills only the round's own occurrences (r3,
+  above). #2013's cascade is
+  unchanged: a master listed as removed with none of its occurrences in the round
+  still takes its in-window occurrences and the delta state, and the next initial
+  round brings them back, filled from the refetched master.
+- **Masters stay stored, off the grid.** `GRID_ROWS`, shared by `events_in_window`
+  and `events_in_range` (and so `days_with_events`), leaves out a `seriesMaster`
+  once a row of its series (an occurrence or exception, of any date, cancelled or
+  not) is stored, and a cancelled `occurrence` or `exception`. A master with none
+  stays: a new series is one `seriesMaster` row until its occurrences sync, as
+  `local:` (#2034) and after its `CreateEvent` reconciles to its Graph id alike,
+  since no refresh follows the drain (r1; a "synced master" rule hid it until the
+  next pass). `idx_events_series` (`series_master_id`, an original column) serves
+  the `EXISTS`. After #2013's cascade a refetched master is alone until the next
+  initial round, so it is drawn on its first day meanwhile, usually before the
+  window. A cancelled `singleInstance` stays too, for Remove from Calendar (#2024). The asymmetry is deliberate: an occurrence takes its master's
+  `is_cancelled`, so a whole series the organizer cancelled leaves an attendee's
+  grid, as the issue asked. `Store::event`, `series_calendar_id`,
+  `delete_event_series` and the fill still see masters. A `FetchCalendarRange`
+  (`apply_calendar_range`, plain `calendarView`, which never returns a master) keeps
+  the stored masters in its range (`replace_calendar_range_on`'s `keep_masters`);
+  a `Window` round replaces them, since the delta returns them. `FetchCalendarRange`
+  does not fill: its occurrences come full.
+- Not done (follow-ups): masters that no row refers to any more are not pruned:
+  with no row of its series stored, such a master is drawn on its own first day
+  (usually before the window) until something removes it (a window replace drops
+  in-window ones, a 404'd removed master goes, a deselected calendar goes). A shared calendar of another owner: `/me/events/{id}` may 404
+  there, so its occurrences stay blank (asked once a session).
+- Tests: `store` `calendar_tests` `apply_calendar_sync_fills_occurrences_from_their_master`,
+  `apply_calendar_sync_fill_leaves_exceptions_alone`,
+  `apply_calendar_sync_fill_keeps_an_untouched_occurrences_local_write`,
+  `apply_calendar_sync_delta_master_change_refreshes_its_occurrences`,
+  `apply_calendar_sync_repairs_blank_occurrences_from_a_stored_master`,
+  `apply_calendar_sync_fill_needs_the_master_in_the_same_calendar`,
+  `events_in_range_leaves_out_synced_series_masters_but_not_local_ones`,
+  `events_in_window_leaves_out_series_masters`,
+  `events_in_range_leaves_out_cancelled_series_members`,
+  `a_filled_all_day_occurrence_marks_its_utc_date`,
+  `event_body_of_an_occurrence_falls_back_to_its_master`,
+  `blank_occurrence_masters_lists_distinct_ids`,
+  `apply_calendar_range_keeps_a_stored_series_master`,
+  `update_event_fields_on_a_filled_occurrence_does_not_mark_the_masters_body`,
+  `apply_calendar_sync_gone_masters_deletes_only_that_calendars_master`,
+  `a_series_master_leaves_the_grid_once_its_series_has_a_row`,
+  `a_created_series_stays_on_the_grid_through_its_reconcile`,
+  `apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences`,
+  `update_event_fields_clearing_an_occurrences_body_sends_it_empty`,
+  `update_event_fields_leaving_an_occurrences_body_keeps_its_own`; `outbox.rs`
+  `update_event_clearing_an_occurrences_shown_body_sends_it_empty`; `engine.rs`
+  `calendar_delta_occurrences_take_their_masters_fields`,
+  `calendar_delta_repairs_blank_occurrences_in_one_pass`,
+  `calendar_delta_fetches_a_missing_master`,
+  `calendar_delta_missing_master_404_writes_the_rest_once_per_session`,
+  `calendar_delta_removed_master_beside_occurrences_is_refetched`,
+  `calendar_delta_master_only_removed_is_refetched_and_restored_next_pass`,
+  `calendar_delta_removed_master_404_deletes_the_stored_master`,
+  `calendar_delta_removed_master_http_error_keeps_the_link`,
+  `calendar_delta_removed_master_404_in_a_stopped_pass_is_retried`,
+  `calendar_delta_removed_master_failing_twice_writes_the_second_pass`,
+  `calendar_initial_round_refetches_a_stored_master_it_does_not_list`,
+  `calendar_initial_round_unchanged_master_keeps_a_far_occurrences_write`,
+  `calendar_delta_master_fetch_throttled_writes_nothing`. Tests that read a series
+  master's fields through `events_in_window` read it with `Store::event` now.

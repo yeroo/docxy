@@ -116,6 +116,7 @@ issue number to find its notes.
   every calendar, `SetCalendars`, events in a range and days with events (#1984),
   a calendar range on demand, fetched once while fresh (#2014),
   a 30/180-day window kept by calendarView delta per calendar (#2013),
+  occurrences filled from their series master, masters off the grid (#2064),
   the Contacts folder as records, `is_contact`, contacts created, updated and
   deleted through the outbox, a refused write reported and reverted (#1934, #2063),
   cancelling a meeting with a message and forwarding it (#1985),

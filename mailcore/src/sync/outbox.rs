@@ -217,7 +217,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             client.forward_event(id, to, comment.as_deref())
         }
         // A series edit (#2022) sends the body built at command time: the
-        // master is not stored. A `local:` series is edited through its row
+        // master was not stored when #2022 added this, and still may not be
+        // (a calendar pass stores it only when a round returns or fetches
+        // it, #2064). A `local:` series is edited through its row
         // (`UpdateEvent`, or its pending `CreateEvent`), so nothing goes.
         OutboxOp::UpdateEventSeries { id, body } => {
             if id.starts_with("local:") {
@@ -2672,6 +2674,80 @@ mod tests {
                 .get("subject")
                 .and_then(Value::as_str),
             Some("Sync v2")
+        );
+    }
+
+    /// Clearing a filled occurrence's body (#2064 r4): the host showed the
+    /// master's body (the occurrence has none of its own), the edit clears
+    /// it, and the PATCH sends it cleared, not the master's again.
+    #[test]
+    fn update_event_clearing_an_occurrences_shown_body_sends_it_empty() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/events/O1".into(),
+            status: 200,
+            headers: vec![],
+            body: event_json("O1", "Standup"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let common = crate::store::NewEvent {
+            subject: "Standup".into(),
+            start_utc: "2026-07-20T11:00:00Z".into(),
+            end_utc: "2026-07-20T11:15:00Z".into(),
+            ..Default::default()
+        };
+        store
+            .upsert_event(&crate::store::NewEvent {
+                id: "M".into(),
+                event_type: "seriesMaster".into(),
+                body_html: "<p>series</p>".into(),
+                ..common.clone()
+            })
+            .unwrap();
+        store
+            .upsert_event(&crate::store::NewEvent {
+                id: "O1".into(),
+                event_type: "occurrence".into(),
+                series_master_id: Some("M".into()),
+                ..common
+            })
+            .unwrap();
+        assert_eq!(
+            store.event_body("O1").unwrap().as_deref(),
+            Some("<p>series</p>")
+        );
+        let changed = store
+            .update_event_fields(
+                "O1",
+                &crate::store::LocalEventFields {
+                    subject: "Standup".into(),
+                    start_utc: "2026-07-20T11:00:00Z".into(),
+                    end_utc: "2026-07-20T11:15:00Z".into(),
+                    body_html: String::new(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::BODY);
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateEvent {
+                id: "O1".into(),
+                fields: changed,
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(sent_keys(&reqs[0].body), ["body"]);
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(Value::as_str),
+            Some("")
         );
     }
 
