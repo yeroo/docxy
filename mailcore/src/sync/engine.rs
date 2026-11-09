@@ -4862,12 +4862,13 @@ impl Engine {
                 round = self.calendar_delta_round(&id, &from, &to, None);
             }
             match round {
-                Ok(mut c) => {
-                    if !self.fetch_missing_masters(&mut c) {
-                        return;
-                    }
-                    fetched.push(c);
-                }
+                Ok(mut c) => match self.fetch_missing_masters(&mut c) {
+                    MasterFetch::Write => fetched.push(c),
+                    // Kept as a failed round is: its rows and link stay,
+                    // and the next pass replays the `@removed`.
+                    MasterFetch::SkipCalendar => {}
+                    MasterFetch::StopPass => return,
+                },
                 // Sign-in, throttle or offline: the whole pass waits, and
                 // every calendar keeps its stored link.
                 Err(e) => {
@@ -4894,18 +4895,25 @@ impl Engine {
     /// that changed comes as `@removed` (#2013), which the store does not
     /// delete (it does not overlap the window), so without a refetch its
     /// occurrences would keep the old fields. The round's own masters are
-    /// not fetched, nor one this session already found gone; the rest go
-    /// once each, in id order.
+    /// not fetched, nor a needed one this session already found gone (a
+    /// removed stored one always is: only a written pass deletes it, and
+    /// it comes again only when a replayed link lists it again); the rest
+    /// go once each, in id order.
     ///
     /// A fetched `seriesMaster` joins the round's events (under the
     /// round's calendar) with its attendees, so the store's fill takes it
     /// as one the round brought; any other type is ignored. A 404 is no
     /// `Error`: the id joins `masters_not_found`, and a removed stored
     /// master goes (`CalendarRound::Delta`'s `gone_masters`). Another
-    /// error goes through `react`: `false` (the pass stops, nothing
-    /// written) for sign-in, throttle or transport; an HTTP or parse error
-    /// is reported and the round is written without that master.
-    fn fetch_missing_masters(&mut self, round: &mut SyncedCalendar) -> bool {
+    /// error goes through `react`: sign-in, throttle or transport stop the
+    /// pass (`StopPass`, nothing written). An HTTP or parse error is
+    /// reported; for a needed master the round is written without it (its
+    /// occurrences stay blank, and `blank_occurrence_masters` names it
+    /// again next pass), but for a removed stored master the calendar is
+    /// left out of the pass (`SkipCalendar`), as a failed round is, since
+    /// writing would advance the link past the `@removed` and keep the
+    /// stale master for good.
+    fn fetch_missing_masters(&mut self, round: &mut SyncedCalendar) -> MasterFetch {
         let calendar = round.fetched.calendar_id.clone();
         let own: HashSet<String> = round
             .fetched
@@ -4936,7 +4944,10 @@ impl Engine {
             .map(|id| (id, false))
             .chain(removed.into_iter().map(|id| (id, true)));
         for (id, was_removed) in candidates {
-            if own.contains(&id) || self.masters_not_found.contains(&id) || wanted.contains(&id) {
+            if own.contains(&id)
+                || wanted.contains(&id)
+                || (!was_removed && self.masters_not_found.contains(&id))
+            {
                 continue;
             }
             let stored = match self.store.has_series_master(&calendar, &id) {
@@ -4975,12 +4986,15 @@ impl Engine {
                 }
                 Err(e) => {
                     if self.react(e) {
-                        return false;
+                        return MasterFetch::StopPass;
+                    }
+                    if removed_stored.contains(&id) {
+                        return MasterFetch::SkipCalendar;
                     }
                 }
             }
         }
-        true
+        MasterFetch::Write
     }
 
     /// One calendarView delta round of calendar `id` over `[from, to)`
@@ -5906,6 +5920,18 @@ fn fetched_calendar(id: String, events: &[crate::graph::model::Event]) -> Fetche
             .collect(),
         calendar_id: id,
     }
+}
+
+/// What `Engine::fetch_missing_masters` tells `refresh_calendar` to do with
+/// a calendar's round (#2064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MasterFetch {
+    /// Write the round, with the masters it fetched.
+    Write,
+    /// Leave the calendar out of this pass: its rows and link stay.
+    SkipCalendar,
+    /// End the pass with nothing written (`react` said so).
+    StopPass,
 }
 
 /// The `[from, to)` ISO-8601 UTC bounds a calendar pass keeps (#2013):
@@ -12346,7 +12372,9 @@ mod tests {
         {
             let store = Store::open(&store_path).unwrap();
             assert_eq!(store.event("SM").unwrap().unwrap().subject, "New");
-            assert!(ids_in(&store, "CAL-A").is_empty(), "the cascade");
+            // The cascade took the occurrences; the master, alone until
+            // the next round, is drawn on its own first day.
+            assert_eq!(ids_in(&store, "CAL-A"), ["SM"], "the cascade");
             assert_eq!(store.calendar_delta("CAL-A").unwrap(), None);
         }
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
@@ -12393,6 +12421,187 @@ mod tests {
         assert_eq!(store.event("SM").unwrap(), None);
         assert!(ids_in(&store, "CAL-A").is_empty());
         assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removed stored master whose refetch fails with an HTTP error
+    /// (#2064 r1): writing the round would advance the link past the
+    /// `@removed` and keep the stale master for good, so the calendar is
+    /// left out of the pass, and the next pass replays the link.
+    #[test]
+    fn calendar_delta_removed_master_http_error_keeps_the_link() {
+        let link = delta_link_of("CAL-A");
+        let failing = Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/SM".into(),
+            status: 500,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let routes = vec![
+            (
+                get_route(
+                    &link,
+                    200,
+                    &calendar_delta_page(
+                        &[
+                            minimal_occurrence_json("O1", "SM", 3600),
+                            removed_json("SM"),
+                        ],
+                        "/cal-delta/CAL-A?token=2",
+                    ),
+                ),
+                None,
+            ),
+            (failing, Some(1)),
+            (
+                get_route(
+                    "/me/events/SM",
+                    200,
+                    &graph_series_master_json("SM", -40 * DAY, "New"),
+                ),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "calendar-removed-master-500",
+            routes,
+            seed_series_before_window,
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert!(
+            seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "the 500 is reported: {seen:?}"
+        );
+        {
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(subjects(&store, &["SM", "O1", "O2"]), ["Old", "Old", "Old"]);
+            assert_eq!(
+                store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+                link
+            );
+        }
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(subjects(&store, &["SM", "O1", "O2"]), ["New", "New", "New"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            "/cal-delta/CAL-A?token=2"
+        );
+        assert_eq!(event_gets(&srv), ["/me/events/SM", "/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removed stored master that 404s in a pass that then stops (a later
+    /// master's fetch throttled) is not skipped by the next pass (#2064 r1):
+    /// nothing was written, so it is still stored, and the replayed link
+    /// lists it again; the next pass's 404 deletes it.
+    #[test]
+    fn calendar_delta_removed_master_404_in_a_stopped_pass_is_retried() {
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let throttled = Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/SM2".into(),
+            status: 429,
+            headers: vec![("Retry-After".into(), "30".into())],
+            body: "{}".into(),
+        };
+        let routes = vec![
+            (
+                get_route(
+                    &link,
+                    200,
+                    &calendar_delta_page(
+                        &[
+                            minimal_occurrence_json("O1", "SM1", 3600),
+                            minimal_occurrence_json("O2", "SM2", 7200),
+                            removed_json("SM1"),
+                            removed_json("SM2"),
+                        ],
+                        "/cal-delta/CAL-A?token=2",
+                    ),
+                ),
+                None,
+            ),
+            (throttled, Some(1)),
+            (
+                get_route(
+                    "/me/events/SM2",
+                    200,
+                    &graph_series_master_json("SM2", -40 * DAY, "New"),
+                ),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "calendar-removed-master-404-stopped",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![
+                        stored_master("SM1", "CAL-A", -40 * DAY, "Old"),
+                        stored_master("SM2", "CAL-A", -40 * DAY, "Old"),
+                        stored_minimal("O1", "SM1", "CAL-A", 3600),
+                        stored_minimal("O2", "SM2", "CAL-A", 7200),
+                    ],
+                    (&from, &to),
+                    &link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        // A bad range after it marks the end of the stopped pass.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        assert!(
+            Store::open(&store_path)
+                .unwrap()
+                .has_series_master("CAL-A", "SM1")
+                .unwrap()
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.event("SM1").unwrap(), None, "the 404'd master goes");
+        assert_eq!(subjects(&store, &["SM2", "O2"]), ["New", "New"]);
+        assert_eq!(
+            event_gets(&srv),
+            [
+                "/me/events/SM1",
+                "/me/events/SM2",
+                "/me/events/SM1",
+                "/me/events/SM2"
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -351,6 +351,11 @@ CREATE TABLE IF NOT EXISTS events (
 -- range filter, ordered by `start_utc`.
 CREATE INDEX IF NOT EXISTS idx_events_window ON events(start_utc, end_utc);
 
+-- A series' rows by their master (#2064): the grid queries' `GRID_ROWS`
+-- asks whether a master has any. `series_master_id` is an original
+-- column, never added by `ALTER TABLE`, so an older table has it here.
+CREATE INDEX IF NOT EXISTS idx_events_series ON events(series_master_id);
+
 -- The user's calendars as `GET /me/calendars` lists them (#1984), in
 -- Graph's order (`position`). Written whole by `Store::replace_calendars`.
 -- Which of them sync is `Store::synced_calendar_ids`: the selection in

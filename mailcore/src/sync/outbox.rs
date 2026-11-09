@@ -217,7 +217,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             client.forward_event(id, to, comment.as_deref())
         }
         // A series edit (#2022) sends the body built at command time: the
-        // master is not stored. A `local:` series is edited through its row
+        // master was not stored when #2022 added this, and still may not be
+        // (a calendar pass stores it only when a round returns or fetches
+        // it, #2064). A `local:` series is edited through its row
         // (`UpdateEvent`, or its pending `CreateEvent`), so nothing goes.
         OutboxOp::UpdateEventSeries { id, body } => {
             if id.starts_with("local:") {

@@ -329,8 +329,9 @@ pub enum OutboxOp {
     },
     /// A series edit (#2022): PATCH the series master `id` with `body`, the
     /// JSON `event_body_json` built at command time. The body is stored
-    /// whole because the master is not (`calendarView` only lists
-    /// occurrences), so nothing is read at send time. No local write goes
+    /// whole because the master was not stored when #2022 added this, and
+    /// still may not be (a calendar pass stores it only when a round
+    /// returns or fetches it, #2064), so nothing is read at send time. No local write goes
     /// with it. A `local:` id sends nothing.
     UpdateEventSeries {
         id: String,
@@ -3512,8 +3513,8 @@ impl Store {
     /// end_utc > from_utc`, so multi-day/ongoing events that started before
     /// the window (or end after it) still show, not just ones fully
     /// contained in it. Ordered `start_utc ASC`. Only what a grid draws
-    /// (`GRID_ROWS`, #2064): no synced series master, no cancelled
-    /// occurrence or exception.
+    /// (`GRID_ROWS`, #2064): no series master once a row of its series is
+    /// stored, no cancelled occurrence or exception.
     pub fn events_in_window(
         &self,
         from_utc: &str,
@@ -3568,9 +3569,10 @@ impl Store {
     /// days of its UTC dates `[start, end)`, without the offset: under
     /// `Prefer: outlook.timezone="UTC"` Graph gives an all-day event's
     /// dates at UTC midnight. The events are `events_in_range`'s, so a
-    /// series master marks no day, and neither does a cancelled occurrence
-    /// or exception (#2064), while a cancelled single event counts like
-    /// any other: it stays on the grid for Remove from Calendar (#2024).
+    /// series master marks no day once a row of its series is stored, and
+    /// a cancelled occurrence or exception marks none (#2064), while a
+    /// cancelled single event counts like any other: it stays on the grid
+    /// for Remove from Calendar (#2024).
     ///
     /// One fixed offset, not a time zone: in a month with a DST change, an
     /// event within the shifted hour of local midnight can mark the
@@ -5197,13 +5199,16 @@ const EVENT_ROW_COLUMNS: &str = "id, subject, start_utc, end_utc, is_all_day, lo
     original_start_tz, original_end_tz, calendar_id";
 
 /// The rows a calendar grid draws (#2064), for `events_in_window` and
-/// `events_in_range`: a synced series master is not an appointment (its
-/// occurrences are), and a cancelled occurrence or exception is gone from
-/// the series. A `local:` master stays: until its `CreateEvent`
-/// reconciles and its occurrences sync, it is the only row of a new
-/// series (#2034). A cancelled `singleInstance` stays too, for Remove from
-/// Calendar (#2024).
-const GRID_ROWS: &str = "NOT (event_type = 'seriesMaster' AND id NOT LIKE 'local:%')
+/// `events_in_range` (whose `FROM events` it names): a series master is
+/// not an appointment once a row of its series (an occurrence or an
+/// exception, of any date) is stored, since those are, and a cancelled
+/// occurrence or exception is gone from the series. A master with none
+/// stays: a new series is one `seriesMaster` row until its occurrences
+/// sync, `local:` (#2034) and after its `CreateEvent` reconciles to its
+/// Graph id alike. A cancelled `singleInstance` stays too, for Remove from
+/// Calendar (#2024). `idx_events_series` serves the `EXISTS`.
+const GRID_ROWS: &str = "NOT (event_type = 'seriesMaster'
+        AND EXISTS (SELECT 1 FROM events AS o WHERE o.series_master_id = events.id))
     AND NOT (is_cancelled = 1 AND event_type IN ('occurrence', 'exception'))";
 
 /// An `EventRow` from a row selected with `EVENT_ROW_COLUMNS`.
@@ -8963,13 +8968,12 @@ mod calendar_tests {
         let row = s.event("E1").unwrap().unwrap();
         assert_eq!(row.id, "E1");
         assert_client_fields(&row, &e);
-        // The row is the one the window read gives (E1 is a series master,
-        // which the window leaves out, #2064: compare the plain E2).
+        // The row is the one the window read gives (a series master with no
+        // occurrence stored is listed, #2064).
         let listed = s
             .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
             .unwrap();
-        assert_eq!(ids(&listed), ["E2"]);
-        assert_eq!(s.event("E2").unwrap().as_ref(), listed.first());
+        assert_eq!(Some(&row), listed.iter().find(|r| r.id == "E1"));
         assert!(!s.event("E2").unwrap().unwrap().is_organizer);
         assert_eq!(s.event("nope").unwrap(), None);
         // A local event is the user's own meeting.
@@ -11815,8 +11819,11 @@ mod calendar_tests {
         assert_eq!(s.days_with_events(2026, 7, 0, &a).unwrap(), [22]);
     }
 
+    /// A master alone is the series' only row (a new series before its
+    /// occurrences sync): it is drawn and marks its day. Once a row of its
+    /// series is stored, the occurrences are drawn instead.
     #[test]
-    fn days_with_events_ignores_a_series_master() {
+    fn a_series_master_leaves_the_grid_once_its_series_has_a_row() {
         let s = Store::open_in_memory().unwrap();
         s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
         s.apply_calendar_sync(
@@ -11827,7 +11834,8 @@ mod calendar_tests {
         )
         .unwrap();
         let a = ["A".to_string()];
-        assert!(s.days_with_events(2026, 7, 0, &a).unwrap().is_empty());
+        assert_eq!(ids(&s.events_in_range(FROM, TO, &a).unwrap()), ["M"]);
+        assert_eq!(s.days_with_events(2026, 7, 0, &a).unwrap(), [20]);
         s.apply_calendar_sync(
             FROM,
             TO,
@@ -11846,7 +11854,65 @@ mod calendar_tests {
             STAMP,
         )
         .unwrap();
+        assert_eq!(ids(&s.events_in_range(FROM, TO, &a).unwrap()), ["O2"]);
         assert_eq!(s.days_with_events(2026, 7, 0, &a).unwrap(), [21]);
+        // A cancelled exception of the series hides it too: the series has
+        // a row, even one the grid leaves out.
+        let s2 = Store::open_in_memory().unwrap();
+        s2.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let mut x = minimal(
+            "X",
+            "M",
+            "A",
+            "2026-07-22T09:00:00Z",
+            "2026-07-22T09:15:00Z",
+        );
+        x.event_type = "exception".into();
+        x.is_cancelled = true;
+        s2.apply_calendar_sync(
+            FROM,
+            TO,
+            &[window("A", vec![master("M", "A", M_START, M_END), x])],
+            STAMP,
+        )
+        .unwrap();
+        assert!(s2.events_in_range(FROM, TO, &a).unwrap().is_empty());
+    }
+
+    /// A new recurring series stays on the grid when its `CreateEvent`
+    /// reconciles: the row takes its Graph id, still a `seriesMaster`, and
+    /// no occurrence is stored until the next calendar pass.
+    #[test]
+    fn a_created_series_stays_on_the_grid_through_its_reconcile() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let mut f = in_calendar("A");
+        f.recurrence = Some(Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: None,
+        });
+        let local = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let a = ["A".to_string()];
+        assert_eq!(
+            ids(&s.events_in_range(FROM, TO, &a).unwrap()),
+            [local.as_str()]
+        );
+        let created = Event {
+            id: "G-SERIES".into(),
+            event_type: "seriesMaster".into(),
+            subject: f.subject.clone(),
+            start_utc: f.start_utc.clone(),
+            end_utc: f.end_utc.clone(),
+            ..Default::default()
+        };
+        s.reconcile_created_event(&local, &created).unwrap();
+        assert_eq!(row(&s, "G-SERIES").event_type, "seriesMaster");
+        assert_eq!(ids(&s.events_in_range(FROM, TO, &a).unwrap()), ["G-SERIES"]);
     }
 
     /// An all-day series' minimal occurrence reads `isAllDay` false; the
