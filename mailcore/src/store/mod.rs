@@ -5077,9 +5077,10 @@ fn sanitize_recipient_name(name: &str) -> String {
         .to_string()
 }
 
-/// The `messages` columns `map_message_row` reads, in its order. The queries
-/// that select exactly these (`messages_in_folder`, `message_row`,
-/// `message_rows`) use this list, so they cannot drift from the mapping.
+/// The `messages` columns `map_message_row` reads, in its order.
+/// `messages_in_folder`, `message_row` and `message_rows` select this list,
+/// so they cannot drift from the mapping; `search`, `draft` and
+/// `conversations_in_folder` still spell the columns out.
 const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from_name, from_addr,
     to_recipients, cc_recipients, received_at, sent_at,
     is_read, is_flagged, has_attachments, importance, preview, is_draft,
@@ -5097,10 +5098,11 @@ fn message_rows_sql() -> String {
 
 /// Maps one row of a `SELECT {MESSAGE_ROW_COLUMNS} FROM messages ...` query
 /// (that exact column order) to a `MessageRow`. Shared by
-/// `messages_in_folder`, `message_row`, `message_rows`, `search`, and
-/// `draft`, which all select those columns in that order from `messages`
-/// (`search` and `draft` spell the list out), so there's only one place
-/// mapping can drift out of sync with the column list.
+/// `messages_in_folder`, `message_row`, `message_rows`, `search`, `draft`
+/// and `conversations_in_folder`, which all select those columns in that
+/// order from `messages` (`search`, `draft` and `conversations_in_folder`
+/// spell the list out), so there's only one place mapping can drift out of
+/// sync with the column list.
 fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
@@ -5609,14 +5611,25 @@ mod tests {
         assert_eq!(s.message_folder("missing").unwrap(), None);
     }
 
-    /// A message whose row columns are not the defaults, so a mapping that
-    /// reads a wrong column shows (#2053).
-    fn rich_msg(id: &str) -> Message {
-        let mut m = msg(id, true);
-        m.is_flagged = true;
-        m.has_attachments = true;
+    /// A message whose text columns all differ from each other and from the
+    /// defaults, so a mapping that reads a wrong column shows (#2053). The
+    /// bools are `flags`' bits: is_read, is_flagged, has_attachments,
+    /// is_draft, is_meeting_request (bit 0 up). `Message` has no bcc, so a
+    /// test sets `bcc_recipients` itself (`set_bcc`).
+    fn rich_msg(id: &str, flags: u8) -> Message {
+        let bit = |i: u8| flags & (1 << i) != 0;
+        let mut m = msg(id, bit(0));
+        m.conversation_id = format!("conv{id}");
+        m.is_flagged = bit(1);
+        m.has_attachments = bit(2);
+        m.is_draft = bit(3);
+        m.is_meeting_request = bit(4);
         m.importance = "high".into();
         m.categories = vec!["Work".into(), "Red".into()];
+        m.to = vec![Recipient {
+            name: "T".into(),
+            address: "t@x".into(),
+        }];
         m.cc = vec![Recipient {
             name: "C".into(),
             address: "c@x".into(),
@@ -5625,12 +5638,59 @@ mod tests {
         m
     }
 
+    /// Bit patterns for three `rich_msg`s under which every pair of the five
+    /// bool columns differs in at least one message, so swapping any two
+    /// shows: is_read 100, is_flagged 010, has_attachments 001, is_draft
+    /// 110, is_meeting_request 011 (messages 1, 2, 3).
+    const RICH_FLAGS: [u8; 3] = [0b01001, 0b11010, 0b10100];
+
+    fn set_bcc(s: &Store, id: &str, bcc: &str) {
+        s.conn
+            .execute(
+                "UPDATE messages SET bcc_recipients = ?2 WHERE id = ?1",
+                params![id, bcc],
+            )
+            .unwrap();
+    }
+
+    /// Asserts every field of `row` against the message it was stored from.
+    fn assert_row_is(row: &MessageRow, m: &Message, folder_id: &str, bcc: &str) {
+        assert_eq!(row.id, m.id);
+        assert_eq!(row.folder_id, folder_id);
+        assert_eq!(row.conversation_id, m.conversation_id);
+        assert_eq!(row.subject, m.subject);
+        assert_eq!(row.from_name, m.from.name);
+        assert_eq!(row.from_addr, m.from.address);
+        assert!(row.to_recipients.contains("t@x"), "{}", row.to_recipients);
+        assert!(!row.to_recipients.contains("c@x"), "{}", row.to_recipients);
+        assert!(row.cc_recipients.contains("c@x"), "{}", row.cc_recipients);
+        assert!(!row.cc_recipients.contains("t@x"), "{}", row.cc_recipients);
+        assert_eq!(row.received_at, m.received);
+        assert_eq!(row.sent_at, m.sent);
+        assert_eq!(row.is_read, m.is_read);
+        assert_eq!(row.is_flagged, m.is_flagged);
+        assert_eq!(row.has_attachments, m.has_attachments);
+        assert_eq!(row.importance, m.importance);
+        assert_eq!(row.preview, m.preview);
+        assert_eq!(row.is_draft, m.is_draft);
+        assert_eq!(row.bcc_recipients, bcc);
+        assert_eq!(row.is_meeting_request, m.is_meeting_request);
+        assert_eq!(row.categories, m.categories);
+    }
+
     #[test]
     fn message_row_reads_a_bodiless_row_as_messages_in_folder_does() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1");
-        s.upsert_message("F1", &rich_msg("01")).unwrap();
-        s.upsert_message("F1", &rich_msg("02")).unwrap();
+        let stored: Vec<Message> = ["01", "02", "03"]
+            .iter()
+            .zip(RICH_FLAGS)
+            .map(|(id, flags)| rich_msg(id, flags))
+            .collect();
+        for m in &stored {
+            s.upsert_message("F1", m).unwrap();
+            set_bcc(&s, &m.id, "b@x");
+        }
         s.put_body(
             "02",
             &Body {
@@ -5640,26 +5700,15 @@ mod tests {
         )
         .unwrap();
         let listed = s.messages_in_folder("F1", 10, 0).unwrap();
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 3);
         for want in &listed {
             assert_eq!(s.message_row(&want.id).unwrap().as_ref(), Some(want));
         }
-        // The row's fields are the stored message's, not only the list's.
-        let row = s.message_row("01").unwrap().unwrap();
-        assert_eq!(row.folder_id, "F1");
-        assert_eq!(row.subject, "s01");
-        assert_eq!(
-            (row.from_name.as_str(), row.from_addr.as_str()),
-            ("A", "a@x")
-        );
-        assert!(row.cc_recipients.contains("c@x"), "{}", row.cc_recipients);
-        assert_eq!(row.received_at, "2026-07-01T00:00:00Z");
-        assert_eq!(row.sent_at, "2026-06-01T00:00:00Z");
-        assert!(row.is_read && row.is_flagged && row.has_attachments);
-        assert!(!row.is_draft && !row.is_meeting_request);
-        assert_eq!(row.importance, "high");
-        assert_eq!(row.preview, "p");
-        assert_eq!(row.categories, vec!["Work".to_string(), "Red".to_string()]);
+        // The rows' fields are the stored messages', not only the list's
+        // (the list selects the same `MESSAGE_ROW_COLUMNS`).
+        for m in &stored {
+            assert_row_is(&s.message_row(&m.id).unwrap().unwrap(), m, "F1", "b@x");
+        }
 
         assert_eq!(s.message_row("missing").unwrap(), None);
         // Exact current ids: a moved message's old id is not followed.
@@ -5673,9 +5722,11 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1");
         folder(&s, "F2");
-        s.upsert_message("F1", &rich_msg("01")).unwrap();
+        s.upsert_message("F1", &rich_msg("01", RICH_FLAGS[0]))
+            .unwrap();
         s.upsert_message("F1", &msg("02", false)).unwrap();
-        s.upsert_message("F2", &rich_msg("03")).unwrap();
+        let in_f2 = rich_msg("03", RICH_FLAGS[1]);
+        s.upsert_message("F2", &in_f2).unwrap();
         s.put_body(
             "03",
             &Body {
@@ -5697,11 +5748,7 @@ mod tests {
             .unwrap();
         got.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(got, want);
-        assert_eq!(got[1].folder_id, "F2");
-        assert_eq!(
-            got[1].categories,
-            vec!["Work".to_string(), "Red".to_string()]
-        );
+        assert_row_is(&got[1], &in_f2, "F2", "");
         assert!(s.message_rows(&[]).unwrap().is_empty());
         assert!(s.message_rows(&["nope"]).unwrap().is_empty());
     }
