@@ -4241,6 +4241,8 @@ impl Store {
         let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         for c in fetched {
+            // Read before the round's writes replace the masters.
+            let changed = changed_masters_on(&tx, &c.fetched)?;
             let cascaded = match &c.round {
                 CalendarRound::Window => {
                     replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp, false)?;
@@ -4259,7 +4261,7 @@ impl Store {
                     stamp,
                 )?,
             };
-            fill_occurrences_on(&tx, &c.fetched)?;
+            fill_occurrences_on(&tx, &c.fetched, &changed)?;
             if cascaded {
                 tx.execute(
                     "DELETE FROM calendar_deltas WHERE calendar_id = ?1",
@@ -5514,28 +5516,30 @@ const SERIES_FIELDS: &str = "subject, location, organizer_name, organizer_addr,
 ///
 /// An occurrence is filled when it is a non-`local:` `occurrence` of that
 /// calendar whose master is stored there as a `seriesMaster`, and either
-/// the round upserted it, or the round upserted its master (a changed
-/// series, or one the engine fetched), or it is blank
+/// the round upserted it, or the round upserted its master and the master
+/// changed (`changed`, from `changed_masters_on` before the round's
+/// writes), or it is blank
 /// (`BLANK_OCCURRENCE`: a store from before #2064, or a master that came
 /// later). An occurrence neither the round nor its master touched keeps
 /// its own values: an optimistic local write (a `RespondEvent`'s
-/// `response_status`) waits for its op. Exceptions are full items, and
-/// never filled.
+/// `response_status`) waits for its op. So does one whose master the round
+/// brought unchanged (r3): every initial round lists or refetches the
+/// masters of its occurrences, and filling every occurrence of the series,
+/// of any date, from an unchanged master would overwrite a pending write
+/// on one outside the window. Exceptions are full items, and never filled.
 ///
 /// The master's `SERIES_FIELDS` are copied and its attendees replace the
 /// occurrence's. This runs after `upsert_fetched_events_on`, which writes
 /// each minimal occurrence's own (empty) attendee list, so the copy wins.
-fn fill_occurrences_on(conn: &Connection, f: &FetchedCalendar) -> Result<(), StoreError> {
+fn fill_occurrences_on(
+    conn: &Connection,
+    f: &FetchedCalendar,
+    changed: &HashSet<String>,
+) -> Result<(), StoreError> {
     let touched_occurrences: HashSet<&str> = f
         .events
         .iter()
         .filter(|e| e.event_type == "occurrence")
-        .map(|e| e.id.as_str())
-        .collect();
-    let touched_masters: HashSet<&str> = f
-        .events
-        .iter()
-        .filter(|e| e.event_type == "seriesMaster")
         .map(|e| e.id.as_str())
         .collect();
     let candidates: Vec<(String, String, bool)> = conn
@@ -5553,10 +5557,7 @@ fn fill_occurrences_on(conn: &Connection, f: &FetchedCalendar) -> Result<(), Sto
         })?
         .collect::<Result<_, _>>()?;
     for (id, master, blank) in candidates {
-        if !(blank
-            || touched_occurrences.contains(id.as_str())
-            || touched_masters.contains(master.as_str()))
-        {
+        if !(blank || touched_occurrences.contains(id.as_str()) || changed.contains(&master)) {
             continue;
         }
         conn.prepare_cached(&format!(
@@ -5576,6 +5577,34 @@ fn fill_occurrences_on(conn: &Connection, f: &FetchedCalendar) -> Result<(), Sto
         .execute(params![id, master])?;
     }
     Ok(())
+}
+
+/// The `seriesMaster`s among `f`'s events that changed (#2064 r3): not
+/// stored as a master of `f.calendar_id`, or stored with another
+/// `last_modified` (Graph's `lastModifiedDateTime`), or with either one
+/// empty. Read before the round's writes, for `fill_occurrences_on`.
+fn changed_masters_on(
+    conn: &Connection,
+    f: &FetchedCalendar,
+) -> Result<HashSet<String>, StoreError> {
+    let mut changed = HashSet::new();
+    let mut stmt = conn.prepare_cached(
+        "SELECT last_modified FROM events
+         WHERE id = ?1 AND calendar_id = ?2 AND event_type = 'seriesMaster'",
+    )?;
+    for e in f.events.iter().filter(|e| e.event_type == "seriesMaster") {
+        let stored: Option<String> = stmt
+            .query_row(params![e.id, f.calendar_id], |r| r.get(0))
+            .optional()?;
+        let same = matches!(
+            stored.as_deref(),
+            Some(m) if !m.is_empty() && m == e.last_modified
+        );
+        if !same {
+            changed.insert(e.id.clone());
+        }
+    }
+    Ok(changed)
 }
 
 /// `Store::event_body` on `conn`: the row's own `body_html`, or for an
@@ -12104,6 +12133,72 @@ mod calendar_tests {
         }
         s2.apply_calendar_sync(FROM, TO, &[round], STAMP).unwrap();
         assert!(s2.event("O1").unwrap().is_some(), "not a master");
+    }
+    /// A master a round brings unchanged (the same `last_modified`) fills
+    /// only the round's own occurrences, not its others of any date, which
+    /// may hold a pending local write (#2064 r3); a changed one fills them
+    /// all. Here Graph's initial round lists the master itself.
+    #[test]
+    fn apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let m = |modified: &str, subject: &str| NewEvent {
+            last_modified: modified.into(),
+            subject: subject.into(),
+            ..master("M", "A", M_START, M_END)
+        };
+        let far = ("2026-12-07T09:00:00Z", "2026-12-07T09:15:00Z");
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[window(
+                "A",
+                vec![
+                    m("2026-07-01T00:00:00Z", "Standup"),
+                    minimal("O1", "M", "A", M_START, M_END),
+                ],
+            )],
+            STAMP,
+        )
+        .unwrap();
+        // An occurrence outside the window (a range fetch's), with an RSVP
+        // not yet sent.
+        s.upsert_event(&minimal("O-FAR", "M", "A", far.0, far.1))
+            .unwrap();
+        s.set_event_response("O-FAR", "tentative");
+        let next_day =
+            |master: NewEvent| window("A", vec![master, minimal("O1", "M", "A", M_START, M_END)]);
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[next_day(m("2026-07-01T00:00:00Z", "Standup"))],
+            STAMP,
+        )
+        .unwrap();
+        assert_eq!(row(&s, "O-FAR").response_status, "tentative");
+        assert_eq!(
+            row(&s, "O1").subject,
+            "Standup",
+            "the round's own is filled"
+        );
+        // A changed master is server truth for every occurrence.
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[next_day(m("2026-07-02T00:00:00Z", "Renamed"))],
+            STAMP,
+        )
+        .unwrap();
+        let o = row(&s, "O-FAR");
+        assert_eq!(
+            (o.subject.as_str(), o.response_status.as_str()),
+            ("Renamed", "accepted")
+        );
+        // A master with no `last_modified` counts as changed.
+        s.set_event_response("O-FAR", "tentative");
+        s.apply_calendar_sync(FROM, TO, &[next_day(m("", "Renamed"))], STAMP)
+            .unwrap();
+        assert_eq!(row(&s, "O-FAR").response_status, "accepted");
     }
 }
 

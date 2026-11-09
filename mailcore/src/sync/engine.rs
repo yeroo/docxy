@@ -12058,10 +12058,23 @@ mod tests {
         )
     }
 
+    /// `json` (a Graph event) with `lastModifiedDateTime` `at`.
+    fn modified_at(json: &str, at: &str) -> String {
+        json.replacen(
+            r#"{"id":"#,
+            &format!(r#"{{"lastModifiedDateTime":"{at}","id":"#),
+            1,
+        )
+    }
+
+    /// When `stored_master` says its master last changed.
+    const MASTER_MODIFIED: &str = "2026-07-01T00:00:00Z";
+
     /// A stored series master of `calendar` (`graph_series_master_json`'s fields
-    /// that matter here).
+    /// that matter here), last modified at `MASTER_MODIFIED`.
     fn stored_master(id: &str, calendar: &str, from_now: i64, subject: &str) -> NewEvent {
         NewEvent {
+            last_modified: MASTER_MODIFIED.into(),
             subject: subject.into(),
             location: "Room 7".into(),
             organizer_name: "Ann".into(),
@@ -12721,7 +12734,11 @@ mod tests {
             get_route(
                 "/me/events/SM",
                 200,
-                &graph_series_master_json("SM", -40 * DAY, "New"),
+                // Changed since the stored copy (`MASTER_MODIFIED`).
+                &modified_at(
+                    &graph_series_master_json("SM", -40 * DAY, "New"),
+                    "2026-08-01T00:00:00Z",
+                ),
             ),
             get_route(
                 "/me/calendars?",
@@ -12739,6 +12756,72 @@ mod tests {
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let store = Store::open(&store_path).unwrap();
         assert_eq!(subjects(&store, &["SM", "O1", "O2"]), ["New", "New", "New"]);
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An initial round's refetch of a master that has not changed (the
+    /// same `lastModifiedDateTime`) fills only the round's own occurrences
+    /// (#2064 r3): one outside the window keeps its pending local write.
+    #[test]
+    fn calendar_initial_round_unchanged_master_keeps_a_far_occurrences_write() {
+        let initial = events_body(&[
+            minimal_occurrence_json("O1", "SM", 3600),
+            minimal_occurrence_json("O2", "SM", DAY + 3600),
+        ]);
+        let routes = vec![
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &with_delta_link(&initial, "/cal-delta/CAL-A?token=2"),
+            ),
+            get_route(
+                "/me/events/SM",
+                200,
+                &modified_at(
+                    &graph_series_master_json("SM", -40 * DAY, "Old"),
+                    MASTER_MODIFIED,
+                ),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-initial-unchanged-master", routes, |s| {
+                seed_series_before_window(s);
+                // A range-fetched occurrence 200 days out (full, as plain
+                // calendarView gives it), with an RSVP whose op is not yet
+                // sent.
+                s.upsert_event(&NewEvent {
+                    subject: "Old".into(),
+                    organizer_name: "Ann".into(),
+                    organizer_addr: "ann@x".into(),
+                    response_status: "accepted".into(),
+                    ..stored_minimal("O-FAR", "SM", "CAL-A", 200 * DAY)
+                })
+                .unwrap();
+                s.set_event_response("O-FAR", "tentative");
+                s.clear_calendar_deltas().unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            store.event("O-FAR").unwrap().unwrap().response_status,
+            "tentative"
+        );
+        // The round's own occurrences are filled from the stored master.
+        for id in ["O1", "O2"] {
+            let o = store.event(id).unwrap().unwrap();
+            assert_eq!(
+                (o.subject.as_str(), o.response_status.as_str()),
+                ("Old", "accepted")
+            );
+        }
         assert_eq!(event_gets(&srv), ["/me/events/SM"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
