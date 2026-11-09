@@ -1,14 +1,19 @@
 //! The suite's build info (#1023): what `--version`, File > Account's About
 //! dialog and its Copy button, `app-info` and the crash log say about this
 //! binary. The commit, last merged PR and build kind come from the `buildinfo`
-//! crate; this module names the product and shapes the text.
+//! crate; this module names the product and shapes the text. About and its
+//! Copy also say which manual each editor's Help shows (#1857): its revision
+//! and whether it is built in or installed.
 
 use crate::dialog::catalog;
 use crate::dialog::{
     ButtonRole, Control as Field, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN, Value,
 };
+use crate::help_manual::{Bundle, Editor};
 use crate::{Context, Docxy};
 use buildinfo::BuildInfo;
+use ctlcore::json::Json;
+use std::sync::Arc;
 
 /// The product name `--version` and the About dialog print.
 pub(crate) const PRODUCT: &str = "docxy suite";
@@ -24,16 +29,91 @@ pub(crate) fn version_text(info: &BuildInfo) -> String {
     info.version_block(PRODUCT)
 }
 
+/// One editor's manual as About shows it (#1857): the row's name and label,
+/// and its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManualRow {
+    pub editor: Editor,
+    pub value: String,
+}
+
+impl ManualRow {
+    /// The control's name, for scripts (`word manual`).
+    pub(crate) fn name(&self) -> &'static str {
+        match self.editor {
+            Editor::Word => "word manual",
+            Editor::Excel => "excel manual",
+            Editor::Project => "project manual",
+        }
+    }
+
+    /// The label a person reads (`Word manual`).
+    pub(crate) fn label(&self) -> String {
+        format!("{} manual", self.editor.title())
+    }
+}
+
+/// The manual each editor's Help shows, as `load` (the app's
+/// `help_bundle`) gives it: `<revision> (built in)`, `<revision>
+/// (installed)`, `unknown revision (<source>)` without a REVISION, or `none`
+/// when the editor has no manual.
+pub(crate) fn manual_rows(load: impl Fn(Editor) -> Option<Arc<Bundle>>) -> Vec<ManualRow> {
+    Editor::ALL
+        .into_iter()
+        .map(|editor| ManualRow {
+            editor,
+            value: load(editor).map_or_else(
+                || "none".to_string(),
+                |b| {
+                    let rev = b.manual.revision.as_deref().unwrap_or("unknown revision");
+                    format!("{rev} ({})", b.source.words())
+                },
+            ),
+        })
+        .collect()
+}
+
+/// `app-info`'s `manuals` (#1857): per editor, as `load` gives it, its
+/// `revision` (null without one), `short` (`Manual::short_revision`) and
+/// `source` (`built-in` or `installed`), or null when it has no manual.
+pub(crate) fn manuals_json(load: impl Fn(Editor) -> Option<Arc<Bundle>>) -> Json {
+    let text = |t: Option<&str>| t.map_or(Json::Null, |t| Json::Str(t.to_string()));
+    Json::obj(
+        Editor::ALL
+            .into_iter()
+            .map(|e| {
+                let manual = load(e).map_or(Json::Null, |b| {
+                    Json::obj(vec![
+                        ("revision", text(b.manual.revision.as_deref())),
+                        ("short", text(b.manual.short_revision())),
+                        ("source", Json::Str(b.source.name().to_string())),
+                    ])
+                });
+                (e.name(), manual)
+            })
+            .collect(),
+    )
+}
+
 /// What the About dialog's Copy button puts on the clipboard: the `--version`
-/// block plus the one-line summary, ready to paste into a bug report.
-pub(crate) fn copy_text(info: &BuildInfo) -> String {
-    format!("{}summary:     {}\n", version_text(info), info.short_line())
+/// block plus the one-line summary, then the manuals, ready to paste into a
+/// bug report. The manual rows' labels are padded among themselves.
+pub(crate) fn copy_text(info: &BuildInfo, manuals: &[ManualRow]) -> String {
+    let mut s = format!("{}summary:     {}\n", version_text(info), info.short_line());
+    for row in manuals {
+        s.push_str(&format!(
+            "{:<16}{}\n",
+            format!("{}:", row.name()),
+            row.value
+        ));
+    }
+    s
 }
 
 /// The About docxy suite dialog: every field of the build as a labelled row,
-/// the "Manual build" marker when it is one, and Copy / Close. Enter and Escape
-/// press Close.
-pub(crate) fn dialog(info: &BuildInfo) -> Dialog {
+/// the "Manual build" marker when it is one, each editor's manual, and Copy /
+/// Close. Enter and Escape press Close.
+pub(crate) fn dialog(info: &BuildInfo, manuals: &[ManualRow]) -> Dialog {
     let mut d = Dialog::message(
         catalog::ABOUT,
         &format!("About {PRODUCT} {}", info.version),
@@ -59,6 +139,14 @@ pub(crate) fn dialog(info: &BuildInfo) -> Dialog {
             Value::Text(value),
         ));
     }
+    for row in manuals {
+        controls.push(Field::new(
+            row.name(),
+            &row.label(),
+            ControlKind::Label,
+            Value::Text(row.value.clone()),
+        ));
+    }
     d.controls = controls;
     for b in &mut d.buttons {
         b.default = b.label == "Close";
@@ -71,8 +159,9 @@ impl Docxy {
     /// About docxy suite, from the Account page or Help › About (#1021): the
     /// dialog on the active tab.
     pub(crate) fn open_about(&mut self) -> Result<(), String> {
+        let manuals = manual_rows(|e| self.help_bundle(e));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
-        tab.dialogs.push(dialog(info()));
+        tab.dialogs.push(dialog(info(), &manuals));
         Ok(())
     }
 
@@ -97,7 +186,8 @@ impl Docxy {
         let done = click(&mut tab.dialogs, button)?;
         Some(done.map(|copy| {
             if copy {
-                self.clipboard_write(copy_text(info()), cx);
+                let manuals = manual_rows(|e| self.help_bundle(e));
+                self.clipboard_write(copy_text(info(), &manuals), cx);
             }
         }))
     }
@@ -192,6 +282,7 @@ mod windows_console {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::help_manual::Source;
 
     #[test]
     fn the_suite_reports_its_own_version() {
@@ -209,12 +300,107 @@ mod tests {
         assert!(!stdout_usable(0x1c4, 0)); // FILE_TYPE_UNKNOWN
     }
 
+    /// A bundle of one page, read from `source`, with `revision` as its
+    /// REVISION file.
+    fn bundle(editor: Editor, source: Source, revision: Option<&str>) -> Arc<Bundle> {
+        let mut files = vec![
+            ("contents.txt".to_string(), b"p\n".to_vec()),
+            ("p.md".to_string(), b"# P\n".to_vec()),
+        ];
+        if let Some(r) = revision {
+            files.push(("REVISION".into(), r.as_bytes().to_vec()));
+        }
+        Arc::new(Bundle::from_files(editor, source, files).unwrap())
+    }
+
+    const SHA: &str = "0123abcdef0123abcdef0123abcdef0123abcdef";
+
+    /// Word built in with a commit, Excel installed without a REVISION,
+    /// Project none.
+    fn mixed() -> Vec<ManualRow> {
+        manual_rows(|e| match e {
+            Editor::Word => Some(bundle(e, Source::BuiltIn, Some(SHA))),
+            Editor::Excel => Some(bundle(e, Source::Installed, None)),
+            Editor::Project => None,
+        })
+    }
+
     #[test]
-    fn copy_text_is_the_version_block_plus_a_summary() {
+    fn manual_rows_say_each_editors_revision_and_source() {
+        let rows = mixed();
+        let got: Vec<(&str, String, &str)> = rows
+            .iter()
+            .map(|r| (r.name(), r.label(), r.value.as_str()))
+            .collect();
+        let built_in = format!("{SHA} (built in)");
+        assert_eq!(
+            got,
+            [
+                ("word manual", "Word manual".to_string(), built_in.as_str()),
+                (
+                    "excel manual",
+                    "Excel manual".to_string(),
+                    "unknown revision (installed)"
+                ),
+                ("project manual", "Project manual".to_string(), "none"),
+            ]
+        );
+        // Installed with a commit; a blank REVISION is no revision.
+        let rows = manual_rows(|e| match e {
+            Editor::Word => Some(bundle(e, Source::Installed, Some("v2026.11\n"))),
+            Editor::Excel => Some(bundle(e, Source::Installed, Some("\n"))),
+            Editor::Project => Some(bundle(e, Source::BuiltIn, Some(""))),
+        });
+        let values: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(
+            values,
+            [
+                "v2026.11 (installed)",
+                "unknown revision (installed)",
+                "unknown revision (built in)"
+            ]
+        );
+        // No manual at all: every row says none.
+        let rows = manual_rows(|_| None);
+        assert!(rows.iter().all(|r| r.value == "none"), "{rows:?}");
+    }
+
+    #[test]
+    fn manuals_json_gives_each_editors_revision_short_and_source() {
+        let mut word = bundle(Editor::Word, Source::BuiltIn, Some(SHA));
+        let j = manuals_json(|e| match e {
+            Editor::Word => Some(word.clone()),
+            Editor::Excel => Some(bundle(e, Source::Installed, None)),
+            Editor::Project => None,
+        });
+        let w = j.get("word").unwrap();
+        assert_eq!(w.get_str("revision"), Some(SHA));
+        assert_eq!(w.get_str("short"), Some("0123abc"));
+        assert_eq!(w.get_str("source"), Some("built-in"));
+        let x = j.get("excel").unwrap();
+        assert_eq!(x.get("revision"), Some(&Json::Null));
+        assert_eq!(x.get("short"), Some(&Json::Null));
+        assert_eq!(x.get_str("source"), Some("installed"));
+        assert_eq!(j.get("project"), Some(&Json::Null));
+        word = bundle(Editor::Word, Source::Installed, Some("v2026.11"));
+        let j = manuals_json(|e| (e == Editor::Word).then(|| word.clone()));
+        let w = j.get("word").unwrap();
+        assert_eq!(w.get_str("short"), Some("v2026.11"));
+        assert_eq!(w.get_str("source"), Some("installed"));
+    }
+
+    #[test]
+    fn copy_text_is_the_version_block_plus_a_summary_and_the_manuals() {
         let i = info();
-        let copy = copy_text(i);
+        let copy = copy_text(i, &mixed());
         assert!(copy.starts_with(&version_text(i)));
-        assert!(copy.contains(&i.short_line()));
+        let summary = format!("summary:     {}\n", i.short_line());
+        let manuals = format!(
+            "word manual:    {SHA} (built in)\n\
+             excel manual:   unknown revision (installed)\n\
+             project manual: none\n"
+        );
+        assert_eq!(copy, format!("{}{summary}{manuals}", version_text(i)));
     }
 
     /// `app-info` is the buildinfo JSON; the harness and normal control both parse it.
@@ -253,7 +439,7 @@ mod tests {
     #[test]
     fn the_dialog_lists_every_field_with_copy_and_close() {
         let i = info();
-        let d = dialog(i);
+        let d = dialog(i, &mixed());
         let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
         for want in [
             "commit",
@@ -271,6 +457,33 @@ mod tests {
         }
         // The marker is a row exactly when the build is manual.
         assert_eq!(names.contains(&"manual"), i.manual());
+        // The manuals come last, after the build's rows (#1857).
+        let last: Vec<(&str, &str, String)> = d.controls[d.controls.len() - 3..]
+            .iter()
+            .map(|c| {
+                let Value::Text(t) = &c.value else {
+                    panic!("{} is a label", c.name)
+                };
+                (c.name, c.label.as_str(), t.clone())
+            })
+            .collect();
+        assert_eq!(
+            last,
+            [
+                ("word manual", "Word manual", format!("{SHA} (built in)")),
+                (
+                    "excel manual",
+                    "Excel manual",
+                    "unknown revision (installed)".to_string()
+                ),
+                ("project manual", "Project manual", "none".to_string()),
+            ]
+        );
+        assert!(
+            d.controls[d.controls.len() - 3..]
+                .iter()
+                .all(|c| c.kind == ControlKind::Label)
+        );
         let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
         assert_eq!(labels, ["Copy", "Close"]);
         let mut stack = DialogStack::default();
