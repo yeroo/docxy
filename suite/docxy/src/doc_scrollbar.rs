@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, CursorStyle, Hitbox, HitboxBehavior, Hsla, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollHandle, SharedString, Task,
-    TextAlign, TextRun, Window, canvas, fill, point, px, size,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollWheelEvent,
+    SharedString, Task, TextAlign, TextRun, Window, canvas, fill, point, px, size,
 };
 
 /// A bar's thickness, px.
@@ -77,7 +77,9 @@ pub(crate) fn offset_for_thumb(axis: Axis, track: f32, start: f32) -> f32 {
     let (_, len) = thumb(axis, track);
     let room = track - len;
     if room <= 0. {
-        return 0.;
+        // The thumb fills the track: no travel maps to an offset, so it
+        // stays where it is.
+        return axis.clamp(axis.offset);
     }
     (start / room).clamp(0., 1.) * axis.max_offset()
 }
@@ -125,6 +127,76 @@ pub(crate) fn arrow_press(axis: Axis, forward: bool) -> Option<f32> {
 
 fn moved(axis: Axis, to: f32) -> Option<f32> {
     ((to - axis.offset).abs() > 0.01).then_some(to)
+}
+
+/// Which of Print Layout's bar strips to lay out (vertical, horizontal),
+/// decided together (#2080 r2) from the content's size and the view's
+/// without any strip (`bare`). The two strips shrink each other's room, so
+/// deciding each on its own from the other's last state could swap them
+/// forever (content just under the bare view on both axes). The vertical
+/// strip goes when the content is taller than the view, the horizontal one
+/// when it is wider than the view beside that strip, and the vertical one
+/// also when the content is taller than the view above that one. Half a
+/// pixel of slack.
+pub(crate) fn bars_needed(content: (f32, f32), bare: (f32, f32)) -> (bool, bool) {
+    let over = |c: f32, view: f32| c > view + 0.5;
+    let beside = |on: bool| if on { BAR_PX } else { 0. };
+    let v = over(content.1, bare.1);
+    let h = over(content.0, bare.0 - beside(v));
+    let v = v || over(content.1, bare.1 - beside(h));
+    (v, h)
+}
+
+/// The strips the next frame lays out, from what this frame measured: the
+/// strips `shown`, the scroll area's `view` with them and how far it can
+/// scroll (`max`). Content that overflows the view is known exactly (view
+/// plus max); content that fits is known only to fit, and counts as none,
+/// so a strip it might not need waits until a frame shows it is needed.
+pub(crate) fn strips_next(shown: (bool, bool), view: (f32, f32), max: (f32, f32)) -> (bool, bool) {
+    let with = |on: bool| if on { BAR_PX } else { 0. };
+    let bare = (view.0 + with(shown.0), view.1 + with(shown.1));
+    let known = |view: f32, max: f32| if max > 0.5 { view + max } else { 0. };
+    bars_needed((known(view.0, max.0), known(view.1, max.1)), bare)
+}
+
+/// Print Layout's strip decision (#2080 r2), drawn after its scroll area:
+/// its prepaint applies [`strips_next`] to both bars' `shown` and asks for
+/// a frame when that changed.
+pub(crate) fn strip_decider(handle: &ScrollHandle, vbar: &Bar, hbar: &Bar) -> gpui::AnyElement {
+    use gpui::{IntoElement, Styled};
+    let (handle, vbar, hbar) = (handle.clone(), vbar.clone(), hbar.clone());
+    canvas(
+        move |_b, window: &mut Window, _cx: &mut App| {
+            let (view, max) = (handle.bounds().size, handle.max_offset());
+            let now = (vbar.shown(), hbar.shown());
+            let next = strips_next(
+                now,
+                (f32::from(view.width), f32::from(view.height)),
+                (f32::from(max.x).max(0.), f32::from(max.y).max(0.)),
+            );
+            if next != now {
+                vbar.shown.set(next.0);
+                hbar.shown.set(next.1);
+                window.request_animation_frame();
+            }
+        },
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .size_0()
+    .into_any_element()
+}
+
+/// Where a bar is drawn.
+#[derive(Clone)]
+pub(crate) enum Place {
+    /// Over its scroll area's padding (the flow view, DocView): it decides
+    /// its own `shown` from its axis, as it never changes the layout.
+    Overlay,
+    /// In a strip of its own beside the scroll area (Print Layout), whose
+    /// `shown` [`strip_decider`] keeps: a wheel over the strip scrolls the
+    /// area, which is not under it. `pages`: the vertical bar's page tip.
+    Strip { pages: Option<Pages> },
 }
 
 /// The page at the top of the view at `offset`: `pages` are each page's
@@ -361,7 +433,13 @@ pub(crate) fn overlay_bars(
             .right_0()
             .bottom(end(h))
             .w(px(BAR_PX))
-            .child(doc_scrollbar(handle, Dir::Vertical, vbar, None, colors))
+            .child(doc_scrollbar(
+                handle,
+                Dir::Vertical,
+                vbar,
+                Place::Overlay,
+                colors,
+            ))
             .into_any_element(),
         div()
             .absolute()
@@ -369,7 +447,13 @@ pub(crate) fn overlay_bars(
             .bottom_0()
             .right(end(v))
             .h(px(BAR_PX))
-            .child(doc_scrollbar(handle, Dir::Horizontal, hbar, None, colors))
+            .child(doc_scrollbar(
+                handle,
+                Dir::Horizontal,
+                hbar,
+                Place::Overlay,
+                colors,
+            ))
             .into_any_element(),
     ]
 }
@@ -431,25 +515,24 @@ fn frame(dir: Dir, strip: Bounds<Pixels>, axis: Axis) -> Frame {
 }
 
 /// A bar for `handle`'s `dir` axis, filling its parent. It paints nothing
-/// and takes no input while that axis fits. `pages`: the vertical Print
-/// Layout bar, which shows the page tip while its thumb is dragged.
+/// and takes no input while that axis fits.
 pub(crate) fn doc_scrollbar(
     handle: &ScrollHandle,
     dir: Dir,
     state: &Bar,
-    pages: Option<Pages>,
+    place: Place,
     colors: BarColors,
 ) -> gpui::AnyElement {
     use gpui::{IntoElement, Styled};
-    let (prep_handle, prep_state) = (handle.clone(), state.clone());
+    let (prep_handle, prep_state, prep_place) = (handle.clone(), state.clone(), place.clone());
     let (handle, state) = (handle.clone(), state.clone());
     canvas(
         move |strip: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
             let axis = dir.axis(&prep_handle);
             let shows = axis.overflows();
-            // A strip that appears or goes changes the layout: draw it
-            // again (a strip only ever shrinks the view, so this settles).
-            if prep_state.shown.replace(shows) != shows {
+            // An overlay keeps its own `shown`, which only the harness and
+            // the other overlay's corner read: a frame shows the change.
+            if matches!(prep_place, Place::Overlay) && prep_state.shown.replace(shows) != shows {
                 window.request_animation_frame();
             }
             if !shows || strip.size.width <= px(0.) || strip.size.height <= px(0.) {
@@ -482,10 +565,14 @@ pub(crate) fn doc_scrollbar(
             let Some((f, hitbox)) = prep else { return };
             paint_bar(dir, &f, &state, colors, window);
             window.set_cursor_style(CursorStyle::Arrow, &hitbox);
-            if let Some(pages) = &pages {
+            if let Place::Strip {
+                pages: Some(pages), ..
+            } = &place
+            {
                 paint_tip(&f, &handle, &state, pages, colors, window, cx);
             }
-            listen(dir, f, hitbox, &handle, &state, window);
+            let wheel = matches!(place, Place::Strip { .. });
+            listen(dir, f, hitbox, &handle, &state, wheel, window);
         },
     )
     .size_full()
@@ -603,9 +690,32 @@ fn listen(
     hitbox: Hitbox,
     handle: &ScrollHandle,
     state: &Bar,
+    wheel: bool,
     window: &mut Window,
 ) {
     let view = window.current_view();
+    if wheel {
+        // A strip lies beside its scroll area, outside it: a wheel over it
+        // scrolls the area as a wheel over the pages does (an overlay sits
+        // on the area, which scrolls already).
+        let (handle, hitbox) = (handle.clone(), hitbox.clone());
+        window.on_mouse_event(move |ev: &ScrollWheelEvent, phase, window, cx| {
+            if !phase.bubble() || !hitbox.should_handle_scroll(window) {
+                return;
+            }
+            let delta = ev.delta.pixel_delta(window.line_height());
+            let (now, max) = (handle.offset(), handle.max_offset());
+            let to = point(
+                (now.x + delta.x).clamp(-max.x.max(px(0.)), px(0.)),
+                (now.y + delta.y).clamp(-max.y.max(px(0.)), px(0.)),
+            );
+            if to != now {
+                handle.set_offset(to);
+                cx.notify(view);
+            }
+            cx.stop_propagation();
+        });
+    }
     {
         let (handle, state, hitbox) = (handle.clone(), state.clone(), hitbox.clone());
         window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
@@ -746,6 +856,90 @@ mod tests {
         // Clamped at both ends.
         assert_eq!(drag_offset(a, 400., 0., -100.), 0.);
         assert_eq!(drag_offset(a, 400., 1400., 1000.), 1500.);
+    }
+
+    /// #2080 r2: a thumb that fills a track too short for it does not
+    /// jump to the start when dragged; it stays.
+    #[test]
+    fn a_thumb_with_no_room_keeps_the_offset() {
+        let a = axis(500., 2000., 750.);
+        // A 15 px track: the thumb is the whole track.
+        assert_eq!(thumb(a, 15.), (0., 15.));
+        assert_eq!(offset_for_thumb(a, 15., 0.), 750.);
+        assert_eq!(drag_offset(a, 15., 750., 5.), 750.);
+        assert_eq!(drag_offset(a, 15., 750., -5.), 750.);
+        // A wheel past the end, not yet clamped: clamped.
+        assert_eq!(offset_for_thumb(axis(500., 2000., 9000.), 15., 0.), 1500.);
+    }
+
+    /// #2080 r2: Print Layout's two strips are decided together from the
+    /// view without strips.
+    #[test]
+    fn strips_are_decided_together() {
+        let (w, h) = (600., 400.);
+        // Neither: the content fits the bare view.
+        assert_eq!(bars_needed((500., 300.), (w, h)), (false, false));
+        assert_eq!(bars_needed((w, h), (w, h)), (false, false));
+        // Just under the bare view on both axes (the swap r2 traced):
+        // neither strip, as neither axis overflows without them.
+        assert_eq!(bars_needed((w - 5., h - 5.), (w, h)), (false, false));
+        // Taller only, and narrow enough beside the vertical strip.
+        assert_eq!(bars_needed((500., 2000.), (w, h)), (true, false));
+        // Taller, and wider than the room beside the vertical strip: both.
+        assert_eq!(bars_needed((w - 5., 2000.), (w, h)), (true, true));
+        // Wider only, and short enough above the horizontal strip.
+        assert_eq!(bars_needed((900., 300.), (w, h)), (false, true));
+        // Wider, and taller than the room above the horizontal strip: both.
+        assert_eq!(bars_needed((900., h - 5.), (w, h)), (true, true));
+        assert_eq!(bars_needed((900., 2000.), (w, h)), (true, true));
+    }
+
+    /// #2080 r2: frame after frame, measuring the scroll area as the
+    /// strips leave it, the decision settles within three frames on
+    /// [`bars_needed`]'s answer and stays there, from every start and for
+    /// content around every edge (no endless swap).
+    #[test]
+    fn the_strips_settle_from_any_start() {
+        let (w, h) = (600., 400.);
+        let b = BAR_PX;
+        let sizes = |bare: f32| {
+            [
+                bare / 2.,
+                bare - b - 3.,
+                bare - b,
+                bare - b + 3.,
+                bare - 3.,
+                bare,
+                bare + 3.,
+                bare * 3.,
+            ]
+        };
+        let starts = [(false, false), (true, false), (false, true), (true, true)];
+        for cw in sizes(w) {
+            for ch in sizes(h) {
+                let want = bars_needed((cw, ch), (w, h));
+                for start in starts {
+                    let mut shown = start;
+                    let mut frames = 0;
+                    loop {
+                        let view = (
+                            w - if shown.0 { b } else { 0. },
+                            h - if shown.1 { b } else { 0. },
+                        );
+                        // The centring column is at least the view's width.
+                        let max = ((cw - view.0).max(0.), (ch - view.1).max(0.));
+                        let next = strips_next(shown, view, max);
+                        if next == shown {
+                            break;
+                        }
+                        shown = next;
+                        frames += 1;
+                        assert!(frames <= 3, "{cw}x{ch} from {start:?}: no settling");
+                    }
+                    assert_eq!(shown, want, "{cw}x{ch} from {start:?}");
+                }
+            }
+        }
     }
 
     #[test]

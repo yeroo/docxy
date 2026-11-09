@@ -26481,10 +26481,11 @@ impl Docxy {
 
     /// Scroll the document so the caret's top-level block is in view (keyboard
     /// navigation/typing in a long document shouldn't let the caret drift off).
-    /// Print Layout's scroll children are pages, not blocks, so the caret's
-    /// block maps to its page first; a page already in view isn't re-aligned
-    /// (following it would snap its top over the caret). Both views follow
-    /// in y only, from the next layout (#1895, #2080).
+    /// Print Layout draws pages (in one centring column), not blocks, so the
+    /// caret's block maps to its page first, and that page's own probe
+    /// (`page_follow_el`) follows it; a page already in view isn't
+    /// re-aligned (following it would snap its top over the caret). Both
+    /// views follow in y only, from the next layout (#1895, #2080).
     fn scroll_to_caret(&self) {
         if let Some(t) = self.tabs.get(self.active) {
             if let Surface::Doc(ed) = &t.surface {
@@ -27858,11 +27859,11 @@ impl Docxy {
 
     /// Print Layout's view with its scrollbars (#2080): each in a strip of
     /// its own beside the pages, not over them (a page scrolled to its right
-    /// edge would sit under an overlaid bar), shown while its axis
-    /// overflows, with a corner square when both are. `view` is the scroll
+    /// edge would sit under an overlaid bar), shown as `strip_decider`
+    /// decides both, with a corner square when both are. `view` is the scroll
     /// area under its viewport probe, so the strips are not viewport.
     fn print_bars(&self, view: AnyElement, cx: &App) -> AnyElement {
-        use doc_scrollbar::{BAR_PX, BarColors, Dir, doc_scrollbar};
+        use doc_scrollbar::{BAR_PX, BarColors, Dir, Place, doc_scrollbar, strip_decider};
         let colors = BarColors::of(cx);
         let (v, h) = (self.doc_vbar.shown(), self.doc_hbar.shown());
         let thick = |on: bool| px(if on { BAR_PX } else { 0. });
@@ -27883,7 +27884,7 @@ impl Docxy {
                         &self.doc_scroll,
                         Dir::Horizontal,
                         &self.doc_hbar,
-                        None,
+                        Place::Strip { pages: None },
                         colors,
                     ))),
             )
@@ -27896,7 +27897,9 @@ impl Docxy {
                         &self.doc_scroll,
                         Dir::Vertical,
                         &self.doc_vbar,
-                        Some(self.print_pages()),
+                        Place::Strip {
+                            pages: Some(self.print_pages()),
+                        },
                         colors,
                     )))
                     .child(
@@ -27907,6 +27910,13 @@ impl Docxy {
                             .bg(colors.track()),
                     ),
             )
+            // Decides both strips for the next frame, from this one's
+            // scroll area (prepainted before it).
+            .child(strip_decider(
+                &self.doc_scroll,
+                &self.doc_vbar,
+                &self.doc_hbar,
+            ))
             .into_any_element()
     }
 

@@ -321,12 +321,25 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   nor focuses.
 - Print Layout's bars take strips of their own beside the pages
   (`Docxy::print_bars`), not over them, with a corner square when both
-  show. A strip is laid out while `BarState::shown`. The bar's prepaint
-  keeps that equal to "the axis overflows by more than half a pixel" and
-  requests a frame when it flips, so the strip appears a frame later. A
-  strip only ever shrinks the view, so this settles. The flow view and
-  DocView lay theirs over the padding (`overlay_bars`), which keeps the
-  text width. An unshown overlay paints nothing and takes no input.
+  show. A strip is laid out while `BarState::shown`. `strip_decider`
+  decides both strips together (#2080 r2): it is drawn after the scroll
+  area, and its prepaint applies `strips_next`, then requests a frame when
+  the decision changed, so a strip appears a frame later.
+  - `strips_next` adds the shown strips back to get the bare view. Content
+    that overflows is measured as view + max; content that fits counts as
+    none.
+  - `bars_needed` then answers: vertical if taller than the bare view,
+    horizontal if wider than the room beside that, and vertical too if
+    taller than the room above the horizontal strip.
+  - Deciding each strip from the other's last state swapped them forever
+    for content just under the bare view on both axes.
+    `the_strips_settle_from_any_start` checks the decision settles within
+    three frames from every start.
+  - A wheel over a strip scrolls the area, since a strip is outside it.
+- The flow view and DocView lay their bars over the padding
+  (`overlay_bars`), which keeps the text width. An overlay decides its own
+  `shown` from its axis. An unshown overlay paints nothing and takes no
+  input, and the overlays take no wheel (the area under them scrolls).
 - Print Layout scrolls both axes. `ruler_scroll_view` bounds the view to
   the window, and the pages sit in a column (`min_w_full`,
   `items_center`) inside the scroll area. A page narrower than the view is

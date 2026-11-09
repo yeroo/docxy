@@ -54,6 +54,16 @@ test issue 2080 Print Layout shows both scrollbars, drags to the last page and s
   call doc {}
   assert reply.scroll.scroll_y is 0
   assert reply.scroll.top_page is 1
+  # The wheel over the bar's strip (beside the pages, outside the scroll
+  # area) scrolls the document too (#2080 r2).
+  call pointer-wheel {"region":"doc-vbar","dy":-120}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is not 0
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-up"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 0
   # Sideways to the end: page 1's right edge and the word at its right
   # margin are in view, its left edge is not.
   call pointer-drag {"from":"doc-hbar-thumb","to":"doc-hbar-right"}
