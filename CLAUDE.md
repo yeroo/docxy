@@ -105,7 +105,8 @@ issue number to find its notes.
   a failed send back to Drafts (#1874), the signed-in user's profile, photo and Sign
   out (#1920), granted scopes and a refused sign-in's `error_description` (#1875),
   `Content-Length` on bodiless POSTs and one-line HTTP error text (#1954), inline outbound
-  attachments (#1949), the whole mailbox newest first, backfilled in idle time (#1871),
+  attachments (#1949), attachment upload progress and resumed upload sessions (#1941),
+  the whole mailbox newest first, backfilled in idle time (#1871),
   new mail with its body, recent bodies prefetched, FetchBody served between folders (#1978),
   Exchange's AuthAs header and the `msip_labels` sensitivity label stored
   with a fetched body (#1933, #2015),

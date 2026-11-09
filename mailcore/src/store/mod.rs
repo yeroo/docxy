@@ -208,6 +208,14 @@ pub struct OutboundAttachment {
     pub content_type: Option<String>,
     /// The bytes are in the row, not in a file (#1949).
     pub from_bytes: bool,
+    /// The Graph upload session a send opened for this attachment and has
+    /// not finished (#1941): a pre-authenticated url, so it is kept like
+    /// the message bodies, not like the OAuth tokens. A later attempt
+    /// resumes it only while `upload_digest` matches what it would upload.
+    pub upload_url: Option<String>,
+    /// The fingerprint of what the `upload_url` session uploads (name,
+    /// content type, content id and bytes, see `sync::outbox`), set with it.
+    pub upload_digest: Option<String>,
 }
 
 /// A `contacts` row — one per normalized (lowercased) email address, the
@@ -1295,6 +1303,16 @@ impl Store {
             [],
         );
         let _ = conn.execute("ALTER TABLE outbound_attachments ADD COLUMN data BLOB", []);
+        // Same idempotent-migration pattern, for the upload session a send
+        // opened (#1941). Older rows have none, so their next send opens one.
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN upload_url TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN upload_digest TEXT",
+            [],
+        );
         // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
         // a `SendDraft` op's `/send` POST went out). On the open that adds
         // the column, every `SendDraft` an older engine left queued reads
@@ -1987,8 +2005,9 @@ impl Store {
 
     /// Records whether the first call of the walk whose link `folder_id`
     /// stores as `delta_link` found Graph refusing the reminder `$expand`
-    /// (#2054): the engine sets it with the head's or a small folder's
-    /// link, 1 or 0, and `complete_backfill` from the backfill's own
+    /// (#2054). The engine writes it with the link itself:
+    /// `set_head_link` and a small folder's `complete_backfill` take it,
+    /// and an ending backfill's `complete_backfill` moves the walk's own
     /// record. While it is set, a round on that link (which carries no
     /// expand) merges its items as `MessageFields::reminder_unasked`,
     /// keeping the stored reminders. `clear_delta_links` clears it.
@@ -2113,11 +2132,21 @@ impl Store {
     }
 
     /// Stores a folder's head delta link (#1871: its recent mail, run in
-    /// the sync pass), marking what it covers as [`SCOPE_HEAD`].
-    pub fn set_head_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
+    /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
+    /// whether its walk's first call was refused the reminder `$expand`
+    /// (#2054, `refused`): in the same statement, so no reader (and no
+    /// crash) ever sees the new link with the old link's mark.
+    pub fn set_head_link(
+        &self,
+        folder_id: &str,
+        link: &str,
+        refused: bool,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3 WHERE id = ?1",
-            params![folder_id, link, SCOPE_HEAD],
+            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                reminder_expand_refused = ?4
+             WHERE id = ?1",
+            params![folder_id, link, SCOPE_HEAD, refused],
         )?;
         Ok(())
     }
@@ -2147,25 +2176,27 @@ impl Store {
     /// Ends a folder's backfill (#1871), in one statement: the full
     /// delta's `deltaLink` becomes the folder's `delta_link` (replacing the
     /// head's), `scope` records what it covers, the backfill link is
-    /// cleared and `synced` is set to the final count. The walk's refused
-    /// reminder expand (#2054, `backfill_expand_refused`) becomes the
-    /// folder's mark, as its link is now `delta_link`; a small folder's
-    /// caller sets the mark after it (`set_reminder_expand_refused`).
+    /// cleared and `synced` is set to the final count. The folder's
+    /// refused-reminder-expand mark (#2054) goes with the link, in the same
+    /// statement: `refused` when the caller knows it (`Some`: a small
+    /// folder walked whole in the sync pass), else the walk's own record
+    /// (`None`: `backfill_expand_refused`, a backfill that ends).
     pub fn complete_backfill(
         &self,
         folder_id: &str,
         delta_link: &str,
         scope: &str,
         synced: i64,
+        refused: Option<bool>,
     ) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET delta_link = ?2, history_scope = ?3,
                                 backfill_link = NULL, backfill_synced = ?4,
                                 backfill_scope = NULL,
-                                reminder_expand_refused = backfill_expand_refused,
+                                reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
                                 backfill_expand_refused = 0
              WHERE id = ?1",
-            params![folder_id, delta_link, scope, synced],
+            params![folder_id, delta_link, scope, synced, refused],
         )?;
         Ok(())
     }
@@ -2781,7 +2812,8 @@ impl Store {
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
         let mut stmt = self.conn.prepare(concat!(
-            "SELECT path, name, size, uploaded, content_id, content_type, data IS NOT NULL
+            "SELECT path, name, size, uploaded, content_id, content_type, data IS NOT NULL,
+                    upload_url, upload_digest
              FROM outbound_attachments WHERE draft_id = ",
             current_id_sql!(),
             " ORDER BY rowid"
@@ -2796,6 +2828,8 @@ impl Store {
                     content_id: r.get(4)?,
                     content_type: r.get(5)?,
                     from_bytes: r.get(6)?,
+                    upload_url: r.get(7)?,
+                    upload_digest: r.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2817,7 +2851,8 @@ impl Store {
 
     /// Marks the file `path` of `draft_id` as already on the Graph draft
     /// (#1874), right after `SendDraft` uploaded it, so a resend after a
-    /// failed send does not upload it again. No-op if absent.
+    /// failed send does not upload it again. Its upload session (#1941) is
+    /// forgotten: it is done. No-op if absent.
     pub fn mark_outbound_attachment_uploaded(
         &self,
         draft_id: &str,
@@ -2825,11 +2860,35 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
-                "UPDATE outbound_attachments SET uploaded = 1 WHERE draft_id = ",
+                "UPDATE outbound_attachments
+                 SET uploaded = 1, upload_url = NULL, upload_digest = NULL
+                 WHERE draft_id = ",
                 current_id_sql!(),
                 " AND path = ?2"
             ),
             params![draft_id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Records the upload session a send opened for the attachment `path`
+    /// of `draft_id` (#1941): `Some((upload_url, upload_digest))`, or `None`
+    /// to forget it (Graph refused it). No-op if absent.
+    pub fn set_outbound_attachment_upload_session(
+        &self,
+        draft_id: &str,
+        path: &str,
+        session: Option<(&str, &str)>,
+    ) -> Result<(), StoreError> {
+        let (url, digest) = session.unzip();
+        self.conn.execute(
+            concat!(
+                "UPDATE outbound_attachments SET upload_url = ?3, upload_digest = ?4
+                 WHERE draft_id = ",
+                current_id_sql!(),
+                " AND path = ?2"
+            ),
+            params![draft_id, path, url, digest],
         )?;
         Ok(())
     }
@@ -11073,6 +11132,54 @@ mod draft_tests {
     }
 
     #[test]
+    fn upload_session_is_stored_and_cleared_on_upload() {
+        // #1941: a send's upload session is kept on the row with its digest,
+        // follows the draft to its Graph id, and is gone once uploaded.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/b.pdf", "b.pdf", 10)
+            .unwrap();
+        let session = |draft: &str, i: usize| {
+            let got = s.outbound_attachments(draft).unwrap();
+            (got[i].upload_url.clone(), got[i].upload_digest.clone())
+        };
+        assert_eq!(session(&id, 0), (None, None), "none before a send");
+
+        s.set_outbound_attachment_upload_session(&id, "/tmp/a.pdf", Some(("https://u/1", "10:ab")))
+            .unwrap();
+        s.set_outbound_attachment_upload_session(&id, "/tmp/b.pdf", Some(("https://u/2", "10:cd")))
+            .unwrap();
+        let want_a = (Some("https://u/1".to_string()), Some("10:ab".to_string()));
+        assert_eq!(session(&id, 0), want_a);
+
+        s.reconcile_id(&id, "GRAPH-1").unwrap();
+        assert_eq!(session("GRAPH-1", 0), want_a, "follows the Graph id");
+        assert_eq!(session(&id, 0), want_a, "the local id still reaches it");
+
+        // Forgotten (Graph refused it): both columns cleared.
+        s.set_outbound_attachment_upload_session(&id, "/tmp/b.pdf", None)
+            .unwrap();
+        assert_eq!(session("GRAPH-1", 1), (None, None));
+
+        // Uploaded: the session is done.
+        s.mark_outbound_attachment_uploaded("GRAPH-1", "/tmp/a.pdf")
+            .unwrap();
+        let got = s.outbound_attachments("GRAPH-1").unwrap();
+        assert!(got[0].uploaded);
+        assert_eq!(
+            (got[0].upload_url.clone(), got[0].upload_digest.clone()),
+            (None, None)
+        );
+
+        // An absent row is a no-op.
+        s.set_outbound_attachment_upload_session("GRAPH-1", "/tmp/z", Some(("u", "d")))
+            .unwrap();
+        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 2);
+    }
+
+    #[test]
     fn outbound_attachments_without_the_1949_columns_migrate() {
         let dir = std::env::temp_dir().join(format!(
             "mailcore-1949-migration-{}-{}",
@@ -11102,6 +11209,17 @@ mod draft_tests {
         assert_eq!(got[0].content_type, None);
         assert!(!got[0].from_bytes);
         assert!(got[0].uploaded, "the old flag is kept");
+        // #1941's columns are added too, and read as no session.
+        assert_eq!(got[0].upload_url, None);
+        assert_eq!(got[0].upload_digest, None);
+        s.set_outbound_attachment_upload_session("G", "/tmp/a.pdf", Some(("https://u", "1:ff")))
+            .unwrap();
+        assert_eq!(
+            s.outbound_attachments("G").unwrap()[0]
+                .upload_url
+                .as_deref(),
+            Some("https://u")
+        );
         // The new columns are usable on the migrated table.
         s.add_outbound_attachment_bytes("G", "p.png", "image/png", b"P", "pic1")
             .unwrap();
@@ -12401,7 +12519,7 @@ mod backfill_tests {
         let h = history(&s, "F1");
         assert_eq!((h.scope, h.has_delta_link), (None, false));
 
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
         assert_eq!(history(&s, "F1").scope.as_deref(), Some(SCOPE_HEAD));
 
@@ -12417,10 +12535,11 @@ mod backfill_tests {
     fn complete_backfill_sets_link_and_scope_and_clears_the_cursor() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
-        s.complete_backfill("F1", "FULL", SCOPE_ALL, 120).unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_ALL, 120, None)
+            .unwrap();
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("FULL"));
         assert_eq!(
             history(&s, "F1"),
@@ -12440,7 +12559,7 @@ mod backfill_tests {
     fn reset_backfill_keeps_the_head_and_restarts_the_count() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
         s.reset_backfill("F1").unwrap();
@@ -12455,10 +12574,11 @@ mod backfill_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         folder(&s, "F2", 10, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
-        s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10).unwrap();
+        s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10, None)
+            .unwrap();
         s.clear_delta_links().unwrap();
         for id in ["F1", "F2"] {
             let h = history(&s, id);
@@ -12474,7 +12594,7 @@ mod backfill_tests {
     fn upsert_folder_leaves_the_backfill_state_alone() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE2", 50, SCOPE_ALL)
             .unwrap();
         // The next listing renames it and changes its count.
@@ -12688,7 +12808,7 @@ mod backfill_tests {
     fn a_walk_is_window_once_any_page_ran_with_the_cutoff() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "P2", 1, SCOPE_ALL).unwrap();
         assert_eq!(history(&s, "F1").backfill_scope.as_deref(), Some(SCOPE_ALL));
         s.set_backfill_progress("F1", "P3", 2, SCOPE_WINDOW)
@@ -12702,7 +12822,8 @@ mod backfill_tests {
         assert_eq!(history(&s, "F1").backfill_scope, None);
         s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
             .unwrap();
-        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 1).unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 1, None)
+            .unwrap();
         assert_eq!(history(&s, "F1").backfill_scope, None);
         s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
             .unwrap();
@@ -13499,28 +13620,57 @@ mod message_reminder_tests {
     }
 
     #[test]
+    fn a_link_and_its_expand_refused_mark_are_written_together() {
+        // #2054 r2 (the Windows race): the head's and a small folder's link
+        // carry their mark in the same statement, so no reader sees one
+        // without the other.
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        s.set_head_link("F", "HEAD", true).unwrap();
+        assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("HEAD"));
+        assert!(s.reminder_expand_refused("F").unwrap());
+        // An accepted head over a refused one clears the mark.
+        s.set_head_link("F", "HEAD2", false).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+
+        // A small folder walked whole: the caller's mark wins over the
+        // (clear) backfill record, both ways.
+        s.complete_backfill("G", "FULL", SCOPE_ALL, 3, Some(true))
+            .unwrap();
+        assert_eq!(s.get_delta_link("G").unwrap().as_deref(), Some("FULL"));
+        assert!(s.reminder_expand_refused("G").unwrap());
+        s.set_backfill_expand_refused("G").unwrap();
+        s.complete_backfill("G", "FULL2", SCOPE_ALL, 3, Some(false))
+            .unwrap();
+        assert!(!s.reminder_expand_refused("G").unwrap());
+        assert!(!s.backfill_expand_refused("G").unwrap(), "cleared");
+    }
+
+    #[test]
     fn the_backfill_expand_refusal_moves_with_its_link() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F");
         assert!(!s.backfill_expand_refused("NOPE").unwrap());
         // A refused head, then a backfill whose first call was accepted:
         // its link replaces the head's, and so does its (clear) record.
-        s.set_head_link("F", "HEAD").unwrap();
-        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_head_link("F", "HEAD", true).unwrap();
         s.set_backfill_progress("F", "PAGE2", 10, SCOPE_ALL)
             .unwrap();
         assert!(
             s.reminder_expand_refused("F").unwrap(),
             "the head's link is still stored"
         );
-        s.complete_backfill("F", "FULL", SCOPE_ALL, 20).unwrap();
+        s.complete_backfill("F", "FULL", SCOPE_ALL, 20, None)
+            .unwrap();
         assert!(!s.reminder_expand_refused("F").unwrap());
         // The reverse: an accepted head, a refused backfill under way, then
         // its link stored.
         s.set_backfill_expand_refused("F").unwrap();
         assert!(!s.reminder_expand_refused("F").unwrap());
         assert!(s.backfill_expand_refused("F").unwrap());
-        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20).unwrap();
+        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20, None)
+            .unwrap();
         assert!(s.reminder_expand_refused("F").unwrap());
         assert!(!s.backfill_expand_refused("F").unwrap(), "moved");
         // `reset_backfill` drops the walk's record, and keeps the folder's.
@@ -13568,9 +13718,9 @@ mod message_reminder_tests {
                 &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
             )
             .unwrap();
-            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7)
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
                 .unwrap();
-            s.set_head_link("G", "https://graph/G?$deltatoken=2")
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
                 .unwrap();
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
@@ -13627,7 +13777,7 @@ mod message_reminder_tests {
             .unwrap();
         assert_eq!(indexed, 1);
         // A link stored after the migration survives the next open.
-        s.set_head_link("F", "https://graph/F?$deltatoken=new")
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();

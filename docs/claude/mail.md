@@ -381,6 +381,57 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   images into `cid:` attachments, checking that body references and content
   ids agree.
 
+## Attachment upload progress and resume (#1941)
+
+- `SyncEvent::AttachmentProgress { draft_id, path, name, sent, total }`
+  comes from the outbox drain while a `SendDraft` uploads: once for a small
+  (≤ `INLINE_MAX`, 3 MiB) attachment after its POST (`sent == total`), and
+  after each chunk of an upload session Graph accepted (`sent` = the
+  chunk's end). `draft_id` is the op's id, as `Sent { id }`; `path` is the
+  row key, so two attachments of one name differ. An uploaded (skipped) row
+  reports nothing. All of them follow the command's `Sending` (a retry from
+  a later drain emits no new one) and precede `Sent`/`SendFailed`. The
+  engine sends them from a clone of `evt_tx` inside `apply_op_with_retry`'s
+  closure (it must not borrow `self` across `try_refresh`). lookxy ignores
+  the event: its composer closes on Send.
+- `GraphClient::upload_attachment` (`pub(crate)`, as is `UploadObserver`)
+  reports to the observer: `session(Some(url))` when a session opens,
+  `session(None)` when it is no good any more, `progress(sent, total)`.
+  `add_attachment_with` is it with no resume and the `()` observer.
+- `outbound_attachments.upload_url` and `upload_digest` (nullable, in
+  `SCHEMA_SQL` and as idempotent ALTERs) hold the open session and the
+  fingerprint of what it uploads: `outbox::upload_digest`, `"{len}:{FNV-1a
+  64 hex}"` over the name, the effective content type (the row's or
+  `content_type_for(name)`), the content id and the bytes, with marker
+  bytes between fields. `apply_send` passes the url as `resume_url` only
+  while the digests match, so a file edited between attempts (a file row
+  is read at send time, and `add_outbound_attachment` is `INSERT OR
+  IGNORE`, so no re-add could clear it) goes up whole in a new session,
+  never spliced. `set_outbound_attachment_upload_session` writes or clears
+  both; `mark_outbound_attachment_uploaded` clears them. A store error on
+  either only loses the resume. The url is pre-authenticated (write access
+  to that one session, short-lived): it sits in SQLite with the bodies,
+  unlike the OAuth tokens (#1877).
+- A resume first GETs the url (no bearer) and goes on from the lowest
+  start in `nextExpectedRanges`, reported as `progress(start, total)`. Any
+  failed GET (any status, transport, a body with no usable range, a start
+  not below the size) opens a new session from byte 0. A 4xx other than
+  429 on a resumed PUT forgets the session and opens a new one in the same
+  attempt; on a new session's PUT it forgets the session and fails the
+  send (the drain's 4xx rule). A 5xx, a 429/503 or a transport failure
+  keeps the session for the next attempt. `sent` can go down after a
+  fallback, between attempts or within one.
+- `put_bytes` maps a 401 and a 404 from the session url to `Http`, not
+  `Unauthorized`/`NotFound`: they are the session's, so the engine neither
+  refreshes the token nor asks for a sign-in. For a not-yet-posted send a
+  404 ends in `fail_send` as before (only its text changes: `HTTP 404`). A
+  401 changes more: it used to be `Unauthorized`, so the engine refreshed
+  the token, retried, then called `enter_signin` with the op kept queued;
+  now `fail_send` returns the draft to Drafts with `SendFailed`.
+- Not done: a session whose last chunk Graph accepted but whose answer was
+  lost is gone at the next GET, so the file is uploaded again (the #1874
+  rule for any lost upload answer). No UI shows the progress yet.
+
 ## Whole mailbox, newest first (#1871)
 
 - `spawn`'s `backfill_days` keeps its type: `<= 0` (`engine::WHOLE_MAILBOX`)
@@ -1992,11 +2043,14 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   the expand too, so the refusal belongs to the walk, and the mark follows the first
   call of the link stored as `delta_link`:
   - a head or small-folder walk (`run_delta`) keeps its first page's refusal in memory
-    for its nextLink pages (`DeltaRun::expand_refused`), and stores it, 1 or 0, with
-    its link (`Store::set_reminder_expand_refused`, `folders.reminder_expand_refused`);
+    for its nextLink pages (`DeltaRun::expand_refused`), and stores it, 1 or 0, in
+    the same statement as its link (`folders.reminder_expand_refused`: a head's
+    `set_head_link(.., refused)`, a small folder's `complete_backfill(.., Some(refused))`).
+    Written apart, a reader between the two (a test on Windows, every run) or a crash
+    saw the new link with the old mark (#2054 r2, fixed in #1941);
   - a backfill walk spans idle steps, so its first page's refusal is kept next to
     `backfill_link` (`folders.backfill_expand_refused`) for its later pages, and
-    `complete_backfill` moves it to the folder's mark with its link; `reset_backfill`
+    `complete_backfill(.., None)` moves it to the folder's mark with its link; `reset_backfill`
     drops it;
   - a round on the stored link merges as that link's mark says.
   An accepted first page never clears the mark while the refused walk's link is still

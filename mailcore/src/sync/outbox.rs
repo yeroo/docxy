@@ -31,10 +31,10 @@
 
 use crate::graph::client::{
     EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
-    graph_error_message, one_line,
+    UploadObserver, graph_error_message, one_line,
 };
 use crate::graph::model::Recipient;
-use crate::store::{OutboxOp, Store};
+use crate::store::{OutboundAttachment, OutboxOp, Store};
 
 /// What an applied op left for the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +98,7 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             }
         }
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
-        OutboxOp::SendDraft { id } => apply_send(client, store, id, None),
+        OutboxOp::SendDraft { id } => apply_send(client, store, id, None, &mut |_, _, _| {}),
         OutboxOp::RespondEvent {
             id,
             kind,
@@ -257,18 +257,32 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
 /// never returns a posted op to Drafts.
 ///
 /// A file-read or upload error returns before the POST, so the drain's
-/// failure policy applies (a 5xx defers the op; a 401, a 429/503 throttle
-/// or a transport failure keeps it queued; any other failure returns the
-/// draft to Drafts) and the attachments are NOT cleared. Each upload Graph
+/// failure policy applies (a 5xx defers the op; Graph's own 401 for the
+/// bearer token, a 429/503 throttle or a transport failure keeps it queued;
+/// any other failure returns the draft to Drafts, an upload session url's
+/// 401 or 404 included, as they come back as `Http`, #1941) and the
+/// attachments are NOT cleared. Each upload Graph
 /// confirmed is marked `uploaded` at once, and one already marked is
 /// skipped, so a confirmed upload is never repeated. An upload whose answer
 /// was lost (a 5xx or a dropped connection after Graph stored it), or whose
 /// marker could not be written, is uploaded again by the next attempt.
+///
+/// `progress` hears each attachment's upload as it runs (#1941): the row,
+/// then the bytes Graph has and the total, once for a small attachment
+/// after its POST, and after each accepted chunk of an upload session (a
+/// resumed one first reports where it goes on from). A skipped (uploaded)
+/// row reports nothing. An upload session's url is stored on the row with
+/// the digest of what it uploads (`upload_digest`: name, content type,
+/// content id and bytes), and a later attempt resumes the session only
+/// while the digest matches: a file edited between attempts is uploaded
+/// from byte 0 in a new session, never spliced into the old one. A store
+/// error writing or clearing the session only loses the resume.
 pub(crate) fn apply_send(
     client: &GraphClient,
     store: &Store,
     id: &str,
     seq: Option<i64>,
+    progress: &mut dyn FnMut(&OutboundAttachment, u64, u64),
 ) -> Result<(), GraphError> {
     let store_err = |e: crate::store::StoreError| GraphError::Parse(e.to_string());
     if let Some(seq) = seq
@@ -308,12 +322,26 @@ pub(crate) fn apply_send(
             .content_type
             .clone()
             .unwrap_or_else(|| content_type_for(&att.name));
-        client.add_attachment_with(
+        let digest = upload_digest(&att.name, &content_type, att.content_id.as_deref(), &bytes);
+        let resume_url = match (&att.upload_url, &att.upload_digest) {
+            (Some(url), Some(stored)) if *stored == digest => Some(url.as_str()),
+            _ => None,
+        };
+        let mut obs = SendObserver {
+            store,
+            graph_id: &graph_id,
+            att: &att,
+            digest: &digest,
+            progress: &mut *progress,
+        };
+        client.upload_attachment(
             &graph_id,
             &att.name,
             &content_type,
             &bytes,
             att.content_id.as_deref(),
+            resume_url,
+            &mut obs,
         )?;
         store
             .mark_outbound_attachment_uploaded(&graph_id, &att.path)
@@ -342,6 +370,62 @@ pub(crate) fn apply_send(
     // leaves the attachment rows behind, which is harmless.
     let _ = store.clear_outbound_attachments(&graph_id);
     Ok(())
+}
+
+/// `apply_send`'s observer of one attachment's upload (#1941): stores the
+/// upload session on the row (with the digest of what it uploads), forgets
+/// one Graph refused, and passes progress on.
+struct SendObserver<'a> {
+    store: &'a Store,
+    graph_id: &'a str,
+    att: &'a OutboundAttachment,
+    digest: &'a str,
+    progress: &'a mut dyn FnMut(&OutboundAttachment, u64, u64),
+}
+
+impl UploadObserver for SendObserver<'_> {
+    fn session(&mut self, upload_url: Option<&str>) {
+        let session = upload_url.map(|url| (url, self.digest));
+        let _ = self.store.set_outbound_attachment_upload_session(
+            self.graph_id,
+            &self.att.path,
+            session,
+        );
+    }
+
+    fn progress(&mut self, sent: u64, total: u64) {
+        (self.progress)(self.att, sent, total);
+    }
+}
+
+/// The fingerprint of what an upload session uploads (#1941): what its
+/// `AttachmentItem` names (name, content type, content id) and the bytes, as
+/// `"{len}:{FNV-1a 64 hex}"`. Each text field is hashed with a byte before
+/// it saying whether it is there and one after it that no UTF-8 text holds,
+/// so no two field lists hash the same input. Not cryptographic: it tells
+/// an unchanged attachment from an edited one, which no attacker controls.
+fn upload_digest(name: &str, content_type: &str, content_id: Option<&str>, bytes: &[u8]) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    let mut feed = |data: &[u8]| {
+        for b in data {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(PRIME);
+        }
+    };
+    for field in [Some(name), Some(content_type), content_id] {
+        match field {
+            Some(text) => {
+                feed(&[1]);
+                feed(text.as_bytes());
+            }
+            None => feed(&[0]),
+        }
+        feed(&[0xff]);
+    }
+    feed(bytes);
+    format!("{}:{h:016x}", bytes.len())
 }
 
 /// The text a failed send reports in `SyncEvent::SendFailed` (#1874): Graph's
@@ -1512,6 +1596,255 @@ mod tests {
     }
 
     #[test]
+    fn upload_digest_tells_every_field_apart() {
+        // #1941: the digest changes with anything the session's
+        // AttachmentItem or bytes hold, and only then.
+        let d = |n: &str, t: &str, c: Option<&str>, b: &[u8]| upload_digest(n, t, c, b);
+        let base = d("a.bin", "application/pdf", None, b"abc");
+        assert_eq!(base, d("a.bin", "application/pdf", None, b"abc"));
+        assert!(base.starts_with("3:"), "{base}");
+        for other in [
+            d("b.bin", "application/pdf", None, b"abc"),
+            d("a.bin", "image/png", None, b"abc"),
+            d("a.bin", "application/pdf", Some("pic1"), b"abc"),
+            d("a.bin", "application/pdf", Some(""), b"abc"),
+            d("a.bin", "application/pdf", None, b"abd"),
+            d("a.bin", "application/pdf", None, b"abcd"),
+            // A field boundary moved: "a.bi" + "napplication/pdf".
+            d("a.bi", "napplication/pdf", None, b"abc"),
+        ] {
+            assert_ne!(base, other);
+        }
+    }
+
+    /// A temp dir for one outbox test's files.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn put_route(path: &str, status: u16) -> Route {
+        Route {
+            method: "PUT".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    /// A Graph server for a send of a local draft created as `GRAPH-8`
+    /// whose createUploadSession answers name `upload_urls` in turn.
+    fn session_send_server(upload_urls: &[String]) -> FakeServer {
+        let mut routes: Vec<(Route, Option<usize>)> = upload_urls
+            .iter()
+            .map(|url| {
+                (
+                    Route {
+                        method: "POST".into(),
+                        path_prefix: "/me/messages/GRAPH-8/attachments/createUploadSession".into(),
+                        status: 200,
+                        headers: vec![],
+                        body: format!(r#"{{"uploadUrl":"{url}"}}"#),
+                    },
+                    Some(1),
+                )
+            })
+            .collect();
+        for (path, status, body) in [
+            ("/me/messages/GRAPH-8/send", 202, String::new()),
+            ("/me/messages/GRAPH-8", 200, "{}".to_string()),
+            ("/me/messages", 201, draft_json("GRAPH-8", "Hi")),
+        ] {
+            let method = if path == "/me/messages/GRAPH-8" {
+                "PATCH"
+            } else {
+                "POST"
+            };
+            routes.push((
+                Route {
+                    method: method.into(),
+                    path_prefix: path.into(),
+                    status,
+                    headers: vec![],
+                    body,
+                },
+                None,
+            ));
+        }
+        FakeServer::start_limited(routes)
+    }
+
+    /// The `(path, Content-Range)` of each PUT `srv` received.
+    fn put_ranges(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| {
+                let range = r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                    .map(|(_, v)| v.clone())
+                    .expect("a Content-Range");
+                (r.path, range)
+            })
+            .collect()
+    }
+
+    /// Two full upload-session chunks and a short third one.
+    const BIG: usize = 2 * 3_932_160 + 500;
+
+    #[test]
+    fn a_changed_file_is_not_resumed_into_the_old_session() {
+        // #1941: the first attempt fails on chunk 2, the file is rewritten
+        // (same size, other bytes), and the retry must not splice the new
+        // file's rest onto the old file's first chunk.
+        let dir = temp_dir("1941-changed");
+        let file = dir.join("big.bin");
+        std::fs::write(&file, vec![b'a'; BIG]).unwrap();
+        let upload_srv = FakeServer::start_limited(vec![
+            (put_route("/upload/s1", 202), Some(1)),
+            (put_route("/upload/s1", 500), Some(1)),
+            (put_route("/upload/s2", 202), None),
+        ]);
+        let s1 = format!("{}/upload/s1", upload_srv.base_url);
+        let s2 = format!("{}/upload/s2", upload_srv.base_url);
+        let srv = session_send_server(&[s1.clone(), s2.clone()]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hi</p>")
+            .unwrap();
+        let path = file.to_str().unwrap();
+        store
+            .add_outbound_attachment(&local, path, "big.bin", BIG as i64)
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let err = apply_send(&c, &store, &local, None, &mut |a, sent, total| {
+            seen.push((a.path.clone(), sent, total))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, GraphError::Http { status: 500, .. }),
+            "{err:?}"
+        );
+        let row = &store.outbound_attachments("GRAPH-8").unwrap()[0];
+        assert_eq!(
+            row.upload_url.as_deref(),
+            Some(s1.as_str()),
+            "kept to resume"
+        );
+        assert_eq!(
+            row.upload_digest.as_deref(),
+            Some(
+                upload_digest(
+                    "big.bin",
+                    "application/octet-stream",
+                    None,
+                    &vec![b'a'; BIG]
+                )
+                .as_str()
+            )
+        );
+
+        std::fs::write(&file, vec![b'b'; BIG]).unwrap();
+        apply_send(&c, &store, &local, None, &mut |a, sent, total| {
+            seen.push((a.path.clone(), sent, total))
+        })
+        .unwrap();
+
+        assert!(
+            !upload_srv.requests().iter().any(|r| r.method == "GET"),
+            "the old session is not even asked"
+        );
+        assert_eq!(
+            bodies_to(
+                &srv,
+                "POST",
+                "/me/messages/GRAPH-8/attachments/createUploadSession"
+            )
+            .len(),
+            2,
+            "a new session"
+        );
+        let ranges = put_ranges(&upload_srv);
+        assert_eq!(ranges.len(), 5, "{ranges:?}");
+        assert!(ranges[2..].iter().all(|(p, _)| p == "/upload/s2"));
+        assert_eq!(ranges[2].1, format!("bytes 0-3932159/{BIG}"), "from byte 0");
+        let t = BIG as u64;
+        let sents: Vec<u64> = seen.iter().map(|(_, s, _)| *s).collect();
+        assert_eq!(sents, vec![3_932_160, 3_932_160, 7_864_320, t]);
+        assert!(seen.iter().all(|(p, _, total)| p == path && *total == t));
+        assert!(store.outbound_attachments("GRAPH-8").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_draft_after_a_refused_resume_uploads_from_a_new_session() {
+        // #1941: a live session (its GET answers) whose PUT Graph refuses is
+        // dropped in the same attempt, which sends from a new session.
+        let dir = temp_dir("1941-refused");
+        let file = dir.join("big.bin");
+        std::fs::write(&file, vec![b'a'; BIG]).unwrap();
+        let upload_srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/upload/old".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"nextExpectedRanges":["3932160-"]}"#.into(),
+            },
+            put_route("/upload/old", 416),
+            put_route("/upload/new", 202),
+        ]);
+        let old = format!("{}/upload/old", upload_srv.base_url);
+        let new = format!("{}/upload/new", upload_srv.base_url);
+        let srv = session_send_server(std::slice::from_ref(&new));
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hi</p>")
+            .unwrap();
+        let path = file.to_str().unwrap();
+        store
+            .add_outbound_attachment(&local, path, "big.bin", BIG as i64)
+            .unwrap();
+        let digest = upload_digest(
+            "big.bin",
+            "application/octet-stream",
+            None,
+            &vec![b'a'; BIG],
+        );
+        store
+            .set_outbound_attachment_upload_session(&local, path, Some((&old, &digest)))
+            .unwrap();
+
+        apply_send(&c, &store, &local, None, &mut |_, _, _| {}).unwrap();
+
+        let ranges = put_ranges(&upload_srv);
+        assert_eq!(ranges.len(), 4, "{ranges:?}");
+        assert_eq!(ranges[0].0, "/upload/old");
+        assert!(ranges[1..].iter().all(|(p, _)| p == "/upload/new"));
+        assert_eq!(ranges[1].1, format!("bytes 0-3932159/{BIG}"));
+        assert!(
+            srv.requests()
+                .iter()
+                .any(|r| r.path == "/me/messages/GRAPH-8/send")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn send_draft_uploads_a_large_inline_file_through_an_upload_session_with_its_content_id() {
         // #1949: an inline file over the small-upload limit goes through an
         // upload session whose AttachmentItem carries both fields. The
@@ -1763,7 +2096,7 @@ mod tests {
             .unwrap();
         store.set_send_posted(seq, true).unwrap();
 
-        apply_send(&c, &store, &local_id, Some(seq)).unwrap();
+        apply_send(&c, &store, &local_id, Some(seq), &mut |_, _, _| {}).unwrap();
 
         let reqs = srv.requests();
         assert!(reqs.iter().all(|r| r.method != "GET"), "no delivery check");

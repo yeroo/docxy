@@ -56,8 +56,8 @@ use crate::graph::model::{
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
-    NewEvent, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError,
-    SyncedCalendar,
+    NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store,
+    StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
 use crate::tokencache;
@@ -658,6 +658,30 @@ pub enum SyncEvent {
     /// `error.message` when the response has one, else the status or the
     /// failure's own text.
     SendFailed { id: String, error: String },
+    /// A queued send is uploading the attachment `path` of draft
+    /// `draft_id` (#1941): Graph has `sent` of its `total` bytes. Emitted
+    /// once for a small (≤ 3 MB) attachment after its POST (`sent ==
+    /// total`), and for a larger one after each chunk of its upload session
+    /// Graph accepted (`sent` is the chunk's end). An attempt that resumes
+    /// a session first reports where it goes on from; one that has to open
+    /// a new session (the old one expired, Graph refused it, or the file
+    /// changed) starts again from the first chunk, so `sent` can go down
+    /// between attempts, or within one when Graph refuses a resumed
+    /// session's PUT and the attempt falls back to a new session. An attachment an earlier attempt already uploaded
+    /// reports nothing. `draft_id` is the id the [`SyncCommand::SendDraft`]
+    /// carried, as for [`SyncEvent::Sent`]; `path` is the attachment's key
+    /// (`OutboundAttachment::path`: its file path, or `cid:<id>` for a
+    /// pasted picture), which tells two attachments of the same `name`
+    /// apart. Every one comes after that send's [`SyncEvent::Sending`] (a
+    /// retry from a later drain emits no new one) and before its
+    /// [`SyncEvent::Sent`] or [`SyncEvent::SendFailed`].
+    AttachmentProgress {
+        draft_id: String,
+        path: String,
+        name: String,
+        sent: u64,
+        total: u64,
+    },
     /// The events store changed (a `RefreshCalendar`/`RespondEvent` just
     /// landed); re-read `Store::events_in_window`/`Store::event_attendees`.
     CalendarUpdated,
@@ -2296,21 +2320,26 @@ impl Engine {
                 } else {
                     SCOPE_ALL
                 };
+                // The link's refused-expand mark (#2054) is written with
+                // it, in one statement: a reader between two would see the
+                // new link with the old mark.
                 if self
                     .store
-                    .complete_backfill(folder_id, &delta, scope, run.walked as i64)
+                    .complete_backfill(
+                        folder_id,
+                        &delta,
+                        scope,
+                        run.walked as i64,
+                        Some(run.expand_refused),
+                    )
                     .is_ok()
                 {
-                    let _ = self
-                        .store
-                        .set_reminder_expand_refused(folder_id, run.expand_refused);
                     self.emit_progress(folder_id, run.walked, true);
                 }
-            } else if self.store.set_head_link(folder_id, &delta).is_ok() {
-                // The mark follows the link now stored (#2054): 1 or 0.
+            } else {
                 let _ = self
                     .store
-                    .set_reminder_expand_refused(folder_id, run.expand_refused);
+                    .set_head_link(folder_id, &delta, run.expand_refused);
             }
         }
         self.emit(SyncEvent::MessagesUpdated {
@@ -2772,7 +2801,7 @@ impl Engine {
             };
         if let Err(e) = self
             .store
-            .complete_backfill(&id, &delta, scope, synced as i64)
+            .complete_backfill(&id, &delta, scope, synced as i64, None)
         {
             self.park_on_store_error(&id, e);
             return;
@@ -3484,9 +3513,10 @@ impl Engine {
     /// whatever the op's attempt count. The drain calls it only for an op
     /// whose `/send` POST never went out (`Store::send_posted` false; a
     /// refused POST clears it), so the message cannot have been delivered.
-    /// That is an `Http` 4xx (401 and 429 never get here), `NotFound` (the
-    /// Graph draft is gone; the Drafts delta may then remove the row this
-    /// returns to Drafts) and any `Parse`, which includes an attachment file
+    /// That is an `Http` 4xx (Graph's own 401 for the bearer token and a
+    /// 429 never get here; an upload session url's 401 or 404 does, as
+    /// `Http`, #1941), `NotFound` (the Graph draft is gone; the Drafts delta
+    /// may then remove the row this returns to Drafts) and any `Parse`, which includes an attachment file
     /// that cannot be read and a store error `apply_send` maps to `Parse`.
     /// A 404 after a POST whose answer was lost is not a failure:
     /// `apply_send`'s delivery check reads it as delivered. Drops the op, undoes the
@@ -3612,9 +3642,22 @@ impl Engine {
     /// `/send` POST is recorded and a later attempt checks delivery first
     /// (#1874).
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
+        // A `SendDraft`'s upload progress (#1941) goes out as it runs, from
+        // a clone: the closure must not borrow `self` across `try_refresh`.
+        let evt_tx = self.evt_tx.clone();
         let apply = |client: &GraphClient, store: &Store| match &row.op {
             OutboxOp::SendDraft { id } => {
-                apply_send(client, store, id.as_str(), Some(row.seq)).map(|()| Applied::Done)
+                let mut progress = |att: &OutboundAttachment, sent: u64, total: u64| {
+                    let _ = evt_tx.send(SyncEvent::AttachmentProgress {
+                        draft_id: id.clone(),
+                        path: att.path.clone(),
+                        name: att.name.clone(),
+                        sent,
+                        total,
+                    });
+                };
+                apply_send(client, store, id.as_str(), Some(row.seq), &mut progress)
+                    .map(|()| Applied::Done)
             }
             op => apply_op(client, store, op),
         };
@@ -16511,6 +16554,291 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A 10 MiB attachment (#1941): two full upload-session chunks and a
+    /// short third one.
+    const TEN_MIB: usize = 10 * 1024 * 1024;
+    const CHUNK: usize = 3_932_160;
+    const SESSION_PATH: &str = "/me/messages/GRAPH-42/attachments/createUploadSession";
+
+    fn put_route(path: &str, status: u16) -> Route {
+        Route {
+            method: "PUT".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    /// The `Content-Range` and body length of each PUT `srv` received.
+    fn upload_puts(srv: &FakeServer) -> Vec<(String, usize)> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| {
+                let range = r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                    .map(|(_, v)| v.clone())
+                    .expect("a Content-Range");
+                (range, r.body.len())
+            })
+            .collect()
+    }
+
+    /// The `(sent, total)` of each `AttachmentProgress` for `path` of
+    /// `draft`, in order.
+    fn progress_of(seen: &[SyncEvent], draft: &str, path: &str) -> Vec<(u64, u64)> {
+        seen.iter()
+            .filter_map(|e| match e {
+                SyncEvent::AttachmentProgress {
+                    draft_id,
+                    path: p,
+                    sent,
+                    total,
+                    ..
+                } if draft_id == draft && p == path => Some((*sent, *total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `send_routes` with a createUploadSession that names `upload_url`.
+    fn upload_send_routes(upload_url: &str) -> Vec<(Route, Option<usize>)> {
+        send_routes(vec![
+            (
+                post_route(
+                    SESSION_PATH,
+                    200,
+                    &format!(r#"{{"uploadUrl":"{upload_url}"}}"#),
+                ),
+                None,
+            ),
+            (post_route("/me/messages/GRAPH-42/send", 202, ""), None),
+        ])
+    }
+
+    /// Seeds a local draft with the files `atts` (`(path, name)`, in attach
+    /// order) and returns the local id through `local`.
+    fn seed_draft_with_files<'a>(
+        local: &'a mut String,
+        atts: Vec<(String, &'static str)>,
+    ) -> impl FnOnce(&Store) + 'a {
+        move |s: &Store| {
+            *local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+            for (path, name) in atts {
+                let size = std::fs::metadata(&path).unwrap().len() as i64;
+                s.add_outbound_attachment(local, &path, name, size).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn send_draft_uploads_a_10_mib_attachment_in_chunks_with_progress() {
+        let dir = unique_dir("send-10mib-files");
+        let big = dir.join("big.bin");
+        let small = dir.join("note.txt");
+        std::fs::write(&big, vec![b'a'; TEN_MIB]).unwrap();
+        std::fs::write(&small, b"hello").unwrap();
+        let (big, small) = (
+            big.to_str().unwrap().to_string(),
+            small.to_str().unwrap().to_string(),
+        );
+        let upload_srv = FakeServer::start_limited(vec![
+            (put_route("/upload/s1", 202), Some(2)),
+            (put_route("/upload/s1", 201), None),
+        ]);
+        let srv = FakeServer::start_limited(upload_send_routes(&format!(
+            "{}/upload/s1",
+            upload_srv.base_url
+        )));
+        let mut local = String::new();
+        let (handle, store_path, store_dir) = spawn_fast(
+            &srv,
+            "send-10mib",
+            HOUR,
+            None,
+            seed_draft_with_files(
+                &mut local,
+                vec![(big.clone(), "big.bin"), (small.clone(), "note.txt")],
+            ),
+        );
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+        }));
+
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        // One upload session, sized for the whole file.
+        let sessions: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == SESSION_PATH)
+            .collect();
+        assert_eq!(sessions.len(), 1);
+        let item = crate::json::parse(&sessions[0].body).unwrap();
+        assert_eq!(
+            item.get("AttachmentItem")
+                .and_then(|i| i.get("size"))
+                .and_then(crate::json::Value::as_i64),
+            Some(TEN_MIB as i64)
+        );
+        // Three chunk PUTs with their ranges and bodies.
+        assert_eq!(
+            upload_puts(&upload_srv),
+            vec![
+                (format!("bytes 0-{}/{TEN_MIB}", CHUNK - 1), CHUNK),
+                (format!("bytes {CHUNK}-{}/{TEN_MIB}", 2 * CHUNK - 1), CHUNK),
+                (
+                    format!("bytes {}-{}/{TEN_MIB}", 2 * CHUNK, TEN_MIB - 1),
+                    TEN_MIB - 2 * CHUNK
+                ),
+            ]
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/attachments"), 1);
+        // The send went out after the last chunk.
+        let last_put = upload_srv.requests().last().unwrap().at;
+        let send = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.path == "/me/messages/GRAPH-42/send")
+            .expect("a /send POST");
+        assert!(send.at >= last_put);
+        // Progress, per attachment, after `Sending` and before `Sent`.
+        let t = TEN_MIB as u64;
+        assert_eq!(
+            progress_of(&seen, &local, &big),
+            vec![(CHUNK as u64, t), (2 * CHUNK as u64, t), (t, t)]
+        );
+        assert_eq!(progress_of(&seen, &local, &small), vec![(5, 5)]);
+        let sending =
+            position(&seen, |e| e == &SyncEvent::Sending { id: local.clone() }).expect("Sending");
+        let sent = position(&seen, |e| matches!(e, SyncEvent::Sent { .. })).unwrap();
+        let first = position(&seen, |e| matches!(e, SyncEvent::AttachmentProgress { .. })).unwrap();
+        let last = seen
+            .iter()
+            .rposition(|e| matches!(e, SyncEvent::AttachmentProgress { .. }))
+            .unwrap();
+        assert!(sending < first && last < sent, "{seen:?}");
+        assert!(
+            seen.iter().any(|e| matches!(
+                e,
+                SyncEvent::AttachmentProgress { name, path, .. } if name == "big.bin" && path == &big
+            )),
+            "the event names the attachment"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.outbound_attachments("GRAPH-42").unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_chunk_resumes_the_upload_session_and_uploads_nothing_twice() {
+        let dir = unique_dir("send-resume-files");
+        let small = dir.join("note.txt");
+        let big = dir.join("big.bin");
+        std::fs::write(&small, b"hello").unwrap();
+        std::fs::write(&big, vec![b'a'; TEN_MIB]).unwrap();
+        let (small, big) = (
+            small.to_str().unwrap().to_string(),
+            big.to_str().unwrap().to_string(),
+        );
+        // The second chunk fails once; Graph then has the first.
+        let upload_srv = FakeServer::start_limited(vec![
+            (put_route("/upload/s1", 202), Some(1)),
+            (put_route("/upload/s1", 500), Some(1)),
+            (put_route("/upload/s1", 202), None),
+            (
+                get_route(
+                    "/upload/s1",
+                    200,
+                    &format!(r#"{{"nextExpectedRanges":["{CHUNK}-"]}}"#),
+                ),
+                None,
+            ),
+        ]);
+        let srv = FakeServer::start_limited(upload_send_routes(&format!(
+            "{}/upload/s1",
+            upload_srv.base_url
+        )));
+        let mut local = String::new();
+        let (handle, store_path, store_dir) = spawn_fast(
+            &srv,
+            "send-resume",
+            HOUR,
+            None,
+            seed_draft_with_files(
+                &mut local,
+                vec![(small.clone(), "note.txt"), (big.clone(), "big.bin")],
+            ),
+        );
+        let seen = send_failing_then_refresh(
+            &handle,
+            &local,
+            || {},
+            |e| matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. }),
+        );
+
+        assert!(
+            seen.contains(&SyncEvent::Sent { id: local.clone() }),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SendFailed { .. }))
+        );
+        // Attachment 1 reached the draft once: no duplicate.
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/attachments"), 1);
+        assert_eq!(progress_of(&seen, &local, &small), vec![(5, 5)]);
+        // Attachment 2: one session, asked where to go on, never restarted.
+        assert_eq!(hits(&srv, "POST", SESSION_PATH), 1);
+        assert_eq!(hits(&upload_srv, "GET", "/upload/s1"), 1);
+        let second = (format!("bytes {CHUNK}-{}/{TEN_MIB}", 2 * CHUNK - 1), CHUNK);
+        assert_eq!(
+            upload_puts(&upload_srv),
+            vec![
+                (format!("bytes 0-{}/{TEN_MIB}", CHUNK - 1), CHUNK),
+                second.clone(),
+                second,
+                (
+                    format!("bytes {}-{}/{TEN_MIB}", 2 * CHUNK, TEN_MIB - 1),
+                    TEN_MIB - 2 * CHUNK
+                ),
+            ],
+            "range 0 once, the failed chunk again, then the rest"
+        );
+        let (c1, c2, t) = (CHUNK as u64, 2 * CHUNK as u64, TEN_MIB as u64);
+        assert_eq!(
+            progress_of(&seen, &local, &big),
+            vec![(c1, t), (c1, t), (c2, t), (t, t)],
+            "attempt 1's chunk, then the resume's report and the rest"
+        );
+        assert_eq!(hits(&srv, "POST", "/me/messages/GRAPH-42/send"), 1);
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.outbound_attachments("GRAPH-42").unwrap().is_empty());
+        no_quarantine(&seen);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_5xx_send_graph_delivered_is_sent_not_returned_to_drafts() {
         // FIX r1 (a): Graph delivered it despite the 500 and moved it to
@@ -17699,10 +18027,14 @@ mod tests {
             let (handle, store_path, dir) =
                 spawn_fast(&srv, "msg-reminder-no-expand", TICK, None, seed_m1);
             let store = Store::open(&store_path).unwrap();
+            // The mark is in the wait too: it is written with the link
+            // (one statement), so it never lags it, and a regression that
+            // splits them again fails here rather than racing.
             assert!(wait_until(ENGINE_WAIT, || store
                 .message_exists("M9")
                 .unwrap()
-                && store.get_delta_link("F1").unwrap().is_some()));
+                && store.get_delta_link("F1").unwrap().is_some()
+                && store.reminder_expand_refused("F1").unwrap()));
             let firsts: Vec<String> = srv
                 .requests()
                 .into_iter()
@@ -19725,7 +20057,7 @@ mod tests {
         fn seed_at_page_2(dir: &std::path::Path) {
             seed_legacy(dir);
             let s = store_in(dir);
-            s.set_head_link("F1", &head_link("F1")).unwrap();
+            s.set_head_link("F1", &head_link("F1"), false).unwrap();
             s.set_backfill_progress("F1", &page_link("F1", 2), 50, SCOPE_ALL)
                 .unwrap();
         }

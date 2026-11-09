@@ -174,6 +174,9 @@ CREATE TABLE IF NOT EXISTS attachments (
 -- `content_id` set makes it inline (#1949: an html body's `cid:` picture);
 -- `content_type` NULL is derived from the name at send time; `data` set
 -- means the bytes live in the row (a pasted picture), keyed `cid:<content_id>`.
+-- `upload_url` is the Graph upload session a send opened for it (#1941), and
+-- `upload_digest` the fingerprint of what that session uploads: a later
+-- attempt resumes the session only while the digest still matches.
 CREATE TABLE IF NOT EXISTS outbound_attachments (
     draft_id      TEXT NOT NULL,
     path          TEXT NOT NULL,
@@ -183,6 +186,8 @@ CREATE TABLE IF NOT EXISTS outbound_attachments (
     content_id    TEXT,
     content_type  TEXT,
     data          BLOB,
+    upload_url    TEXT,
+    upload_digest TEXT,
     PRIMARY KEY (draft_id, path)
 );
 
