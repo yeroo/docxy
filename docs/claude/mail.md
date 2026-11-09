@@ -1505,10 +1505,10 @@ this occurrence or the whole series, as Outlook does.
   or cancels around a series edit can refresh twice. A restart before the reset
   ran drops it, and the delta rounds carry on.
 - Masters are stored since #2064 (the delta returns them, and a missing one is
-  fetched), off the grid: `events_in_window` / `events_in_range` leave a synced master
-  out, or it would show on the series' first day, and a `FetchCalendarRange`, whose
-  plain `calendarView` never returns one, keeps it. See "Occurrences take their
-  series' fields (#2064)".
+  fetched), off the grid: `events_in_window` / `events_in_range` leave a master out
+  once a row of its series is stored, or it would show on the series' first day, and
+  a `FetchCalendarRange`, whose plain `calendarView` never returns one, keeps it.
+  See "Occurrences take their series' fields (#2064)".
 - A series edit with `TIMES` names the master's zone and wall clocks
   (`EventInput::start_time_zone` / `start_local` and the end's, #2039, which closes
   #2030), so the series stays in its zone; with none named it is sent in UTC, and
@@ -2350,21 +2350,33 @@ series' first day.
   answer joins the round's events (under the round's calendar) with its attendees;
   any other type is ignored. A 404 is no `Error`: the id goes into the engine's
   `masters_not_found` (in memory, cleared by `enter_signin` and a restart), so a
-  master that `/me/events` cannot reach is asked once a session, not every pass.
-  A removed stored master that 404s goes through `CalendarRound::Delta`'s
+  needed master that `/me/events` cannot reach is asked once a session, not every
+  pass. A removed stored master that 404s goes through `CalendarRound::Delta`'s
   `gone_masters`, which deletes only that calendar's `seriesMaster` row of that id,
-  of any date, before the upserts. A 401, throttle or transport error ends the pass
-  as a failed round does (nothing written, every link kept); an HTTP or parse error
-  is reported, and the round is written without that master. #2013's cascade is
+  of any date, before the upserts. A removed stored master skips the
+  `masters_not_found` check (r1): if its pass stops before the write, it is still
+  stored, and the replayed link lists it again, so the next pass's 404 deletes it.
+  A 401, throttle or transport error ends the pass as a failed round does (nothing
+  written, every link kept: `MasterFetch::StopPass`). An HTTP or parse error is
+  reported. For a needed master the round is written without it (its occurrences
+  stay blank and are named again next pass). For a removed stored master the
+  calendar is left out of the pass (`MasterFetch::SkipCalendar`), as a failed
+  round is: writing would advance the link past the `@removed` and keep the stale
+  master for good (r1). #2013's cascade is
   unchanged: a master listed as removed with none of its occurrences in the round
   still takes its in-window occurrences and the delta state, and the next initial
   round brings them back, filled from the refetched master.
 - **Masters stay stored, off the grid.** `GRID_ROWS`, shared by `events_in_window`
-  and `events_in_range` (and so `days_with_events`), leaves out a non-`local:`
-  `seriesMaster` and a cancelled `occurrence` or `exception`. A `local:` master
-  stays: until its `CreateEvent` reconciles and its occurrences sync, it is a new
-  series' only row (#2034). A cancelled `singleInstance` stays too, for Remove from
-  Calendar (#2024). The asymmetry is deliberate: an occurrence takes its master's
+  and `events_in_range` (and so `days_with_events`), leaves out a `seriesMaster`
+  once a row of its series (an occurrence or exception, of any date, cancelled or
+  not) is stored, and a cancelled `occurrence` or `exception`. A master with none
+  stays: a new series is one `seriesMaster` row until its occurrences sync, as
+  `local:` (#2034) and after its `CreateEvent` reconciles to its Graph id alike,
+  since no refresh follows the drain (r1; a "synced master" rule hid it until the
+  next pass). `idx_events_series` (`series_master_id`, an original column) serves
+  the `EXISTS`. After #2013's cascade a refetched master is alone until the next
+  initial round, so it is drawn on its first day meanwhile, usually before the
+  window. A cancelled `singleInstance` stays too, for Remove from Calendar (#2024). The asymmetry is deliberate: an occurrence takes its master's
   `is_cancelled`, so a whole series the organizer cancelled leaves an attendee's
   grid, as the issue asked. `Store::event`, `series_calendar_id`,
   `delete_event_series` and the fill still see masters. A `FetchCalendarRange`
@@ -2385,13 +2397,14 @@ series' first day.
   `events_in_range_leaves_out_synced_series_masters_but_not_local_ones`,
   `events_in_window_leaves_out_series_masters`,
   `events_in_range_leaves_out_cancelled_series_members`,
-  `days_with_events_ignores_a_series_master`,
   `a_filled_all_day_occurrence_marks_its_utc_date`,
   `event_body_of_an_occurrence_falls_back_to_its_master`,
   `blank_occurrence_masters_lists_distinct_ids`,
   `apply_calendar_range_keeps_a_stored_series_master`,
   `update_event_fields_on_a_filled_occurrence_does_not_mark_the_masters_body`,
-  `apply_calendar_sync_gone_masters_deletes_only_that_calendars_master`; `engine.rs`
+  `apply_calendar_sync_gone_masters_deletes_only_that_calendars_master`,
+  `a_series_master_leaves_the_grid_once_its_series_has_a_row`,
+  `a_created_series_stays_on_the_grid_through_its_reconcile`; `engine.rs`
   `calendar_delta_occurrences_take_their_masters_fields`,
   `calendar_delta_repairs_blank_occurrences_in_one_pass`,
   `calendar_delta_fetches_a_missing_master`,
@@ -2399,5 +2412,7 @@ series' first day.
   `calendar_delta_removed_master_beside_occurrences_is_refetched`,
   `calendar_delta_master_only_removed_is_refetched_and_restored_next_pass`,
   `calendar_delta_removed_master_404_deletes_the_stored_master`,
+  `calendar_delta_removed_master_http_error_keeps_the_link`,
+  `calendar_delta_removed_master_404_in_a_stopped_pass_is_retried`,
   `calendar_delta_master_fetch_throttled_writes_nothing`. Tests that read a series
   master's fields through `events_in_window` read it with `Store::event` now.
