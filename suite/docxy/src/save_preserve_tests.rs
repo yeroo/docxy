@@ -169,3 +169,43 @@ fn an_edit_elsewhere_keeps_cell_level_content_controls_1102() {
     }
     assert_eq!(doc.matches("<w:sdt>").count(), 2, "{doc}");
 }
+
+/// Word's dark mode is display only (#2079): the dark-mode fixture, edited
+/// so its document is written by the serializer, saves its own colours: the
+/// explicit black, the light callout fill and the saturated title fill, none
+/// of them as a dark page draws them. A regression guard: the mapping lives
+/// in the view's palette, never in the model.
+#[test]
+fn the_dark_mode_fixture_saves_its_own_colours_2079() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../uiharness/fixtures/dark-mode.docx"
+    );
+    let dir = Scratch::new();
+    let path = dir.path("dark-mode.docx");
+    std::fs::copy(fixture, &path).unwrap();
+    let mut tab = tab_from_path(&path);
+    let ed = editor(&mut tab);
+    // The empty paragraph after the title table.
+    ed.caret.path = vec![1];
+    ed.caret.offset = 0;
+    ed.anchor = None;
+    ed.insert_str("x");
+    assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+    let doc = part(&path, "word/document.xml");
+    assert!(doc.contains(">x</w:t>"), "{doc}");
+    for kept in [
+        r#"w:color w:val="000000""#,
+        r#"w:color w:val="767676""#,
+        r#"w:fill="EEF3FF""#,
+        r#"w:fill="5B9BD5""#,
+    ] {
+        assert!(doc.contains(kept), "{kept} missing: {doc}");
+    }
+    for mapped in [
+        format!("{:06X}", crate::dark_page::fill(0xEEF3FF)),
+        format!("{:06X}", crate::dark_page::AUTO_DARK),
+    ] {
+        assert!(!doc.contains(&mapped), "{mapped} saved: {doc}");
+    }
+}
