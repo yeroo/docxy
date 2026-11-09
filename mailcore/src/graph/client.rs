@@ -5907,16 +5907,6 @@ mod tests {
         }
     }
 
-    fn get_url_route(path: &str, status: u16, body: &str) -> Route {
-        Route {
-            method: "GET".into(),
-            path_prefix: path.into(),
-            status,
-            headers: vec![],
-            body: body.into(),
-        }
-    }
-
     /// A Graph server whose createUploadSession names `upload_url`.
     fn session_server(upload_url: &str) -> FakeServer {
         FakeServer::start(vec![Route {
@@ -6010,7 +6000,7 @@ mod tests {
     fn upload_resumes_a_session_from_next_expected_ranges() {
         let start = CHUNK_SIZE;
         let upload_srv = FakeServer::start(vec![
-            get_url_route(
+            get_route(
                 "/upload/s1",
                 200,
                 &format!(
@@ -6065,7 +6055,7 @@ mod tests {
     #[test]
     fn upload_with_an_expired_session_opens_a_new_one_from_byte_zero() {
         let upload_srv = FakeServer::start(vec![
-            get_url_route("/upload/old", 404, ""),
+            get_route("/upload/old", 404, ""),
             put_route("/upload/new", 202),
         ]);
         let old = format!("{}/upload/old", upload_srv.base_url);
@@ -6096,7 +6086,7 @@ mod tests {
             "not json".to_string(),
         ] {
             let upload_srv = FakeServer::start(vec![
-                get_url_route("/upload/old", 200, &body),
+                get_route("/upload/old", 200, &body),
                 put_route("/upload/new", 202),
             ]);
             let old = format!("{}/upload/old", upload_srv.base_url);
@@ -6118,7 +6108,7 @@ mod tests {
     #[test]
     fn a_session_get_resumes_from_the_lowest_range_start() {
         let upload_srv = FakeServer::start(vec![
-            get_url_route(
+            get_route(
                 "/upload/s1",
                 200,
                 &format!(
@@ -6143,10 +6133,10 @@ mod tests {
     #[test]
     fn a_refused_resumed_put_falls_back_to_a_new_session() {
         let upload_srv = FakeServer::start(vec![
-            get_url_route(
+            get_route(
                 "/upload/old",
                 200,
-                &format!(r#"{{"nextExpectedRanges":["{CHUNK_SIZE}-"]}}"#),
+                &format!(r#"{{"nextExpectedRanges":["{}-"]}}"#, 2 * CHUNK_SIZE),
             ),
             put_route("/upload/old", 416),
             put_route("/upload/new", 202),
@@ -6169,12 +6159,12 @@ mod tests {
         assert_eq!(
             obs.progress,
             vec![
-                (CHUNK_SIZE as u64, t),
+                (2 * CHUNK_SIZE as u64, t),
                 (CHUNK_SIZE as u64, t),
                 (2 * CHUNK_SIZE as u64, t),
                 (t, t)
             ],
-            "the resume's report, then the new session's chunks"
+            "the resume's report, then the new session's chunks: `sent` goes down"
         );
     }
 

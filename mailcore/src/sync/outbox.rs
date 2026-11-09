@@ -257,9 +257,11 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
 /// never returns a posted op to Drafts.
 ///
 /// A file-read or upload error returns before the POST, so the drain's
-/// failure policy applies (a 5xx defers the op; a 401, a 429/503 throttle
-/// or a transport failure keeps it queued; any other failure returns the
-/// draft to Drafts) and the attachments are NOT cleared. Each upload Graph
+/// failure policy applies (a 5xx defers the op; Graph's own 401 for the
+/// bearer token, a 429/503 throttle or a transport failure keeps it queued;
+/// any other failure returns the draft to Drafts, an upload session url's
+/// 401 or 404 included, as they come back as `Http`, #1941) and the
+/// attachments are NOT cleared. Each upload Graph
 /// confirmed is marked `uploaded` at once, and one already marked is
 /// skipped, so a confirmed upload is never repeated. An upload whose answer
 /// was lost (a 5xx or a dropped connection after Graph stored it), or whose

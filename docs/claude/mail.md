@@ -420,11 +420,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   attempt; on a new session's PUT it forgets the session and fails the
   send (the drain's 4xx rule). A 5xx, a 429/503 or a transport failure
   keeps the session for the next attempt. `sent` can go down after a
-  fallback.
+  fallback, between attempts or within one.
 - `put_bytes` maps a 401 and a 404 from the session url to `Http`, not
   `Unauthorized`/`NotFound`: they are the session's, so the engine neither
-  refreshes the token nor asks for a sign-in. A not-yet-posted send ends in
-  `fail_send` either way; only its text changes (`HTTP 404`).
+  refreshes the token nor asks for a sign-in. For a not-yet-posted send a
+  404 ends in `fail_send` as before (only its text changes: `HTTP 404`). A
+  401 changes more: it used to be `Unauthorized`, so the engine refreshed
+  the token, retried, then called `enter_signin` with the op kept queued;
+  now `fail_send` returns the draft to Drafts with `SendFailed`.
 - Not done: a session whose last chunk Graph accepted but whose answer was
   lost is gone at the next GET, so the file is uploaded again (the #1874
   rule for any lost upload answer). No UI shows the progress yet.

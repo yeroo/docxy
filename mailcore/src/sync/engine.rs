@@ -666,7 +666,8 @@ pub enum SyncEvent {
     /// a session first reports where it goes on from; one that has to open
     /// a new session (the old one expired, Graph refused it, or the file
     /// changed) starts again from the first chunk, so `sent` can go down
-    /// between attempts. An attachment an earlier attempt already uploaded
+    /// between attempts, or within one when Graph refuses a resumed
+    /// session's PUT and the attempt falls back to a new session. An attachment an earlier attempt already uploaded
     /// reports nothing. `draft_id` is the id the [`SyncCommand::SendDraft`]
     /// carried, as for [`SyncEvent::Sent`]; `path` is the attachment's key
     /// (`OutboundAttachment::path`: its file path, or `cid:<id>` for a
@@ -3507,9 +3508,10 @@ impl Engine {
     /// whatever the op's attempt count. The drain calls it only for an op
     /// whose `/send` POST never went out (`Store::send_posted` false; a
     /// refused POST clears it), so the message cannot have been delivered.
-    /// That is an `Http` 4xx (401 and 429 never get here), `NotFound` (the
-    /// Graph draft is gone; the Drafts delta may then remove the row this
-    /// returns to Drafts) and any `Parse`, which includes an attachment file
+    /// That is an `Http` 4xx (Graph's own 401 for the bearer token and a
+    /// 429 never get here; an upload session url's 401 or 404 does, as
+    /// `Http`, #1941), `NotFound` (the Graph draft is gone; the Drafts delta
+    /// may then remove the row this returns to Drafts) and any `Parse`, which includes an attachment file
     /// that cannot be read and a store error `apply_send` maps to `Parse`.
     /// A 404 after a POST whose answer was lost is not a failure:
     /// `apply_send`'s delivery check reads it as delivered. Drops the op, undoes the
