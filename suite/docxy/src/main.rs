@@ -31,6 +31,7 @@ mod convert_child;
 mod convert_tests;
 mod cover_page;
 mod crashlog;
+mod dark_page;
 mod design_dialogs;
 mod design_tab;
 mod dialog;
