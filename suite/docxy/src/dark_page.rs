@@ -27,7 +27,7 @@ pub(crate) const CANVAS_DARK: u32 = 0x141414;
 pub(crate) const AUTO_DARK: u32 = 0xF2F2F2;
 /// Automatic text on a light ground (as `design_tab::page_ink` draws it).
 const AUTO_LIGHT: u32 = 0x202020;
-/// An automatic border or rule on a dark ground: 4.6:1 on [`PAGE_DARK`].
+/// An automatic border or rule on a dark ground: 4.5:1 on [`PAGE_DARK`].
 pub(crate) const BORDER_DARK: u32 = 0x8C8C8C;
 /// Dimmed text (the light grey `design_tab::page_ink` dims with on a dark
 /// page), floor-checked like any text.
@@ -160,9 +160,11 @@ pub(crate) fn page_sheet(page_colour: Option<u32>) -> u32 {
 /// The least lightness at or above `from` (hue `h`, saturation `s`) whose
 /// colour has at least `min` contrast against `ground`, lighter than it.
 fn lighten(h: f32, s: f32, from: f32, ground: u32, min: f32) -> Option<u32> {
+    let y = luminance(ground);
     let reads = |l: f32| {
         let c = from_hsl(h, s, l);
-        (luminance(c) >= luminance(ground) && contrast(c, ground) >= min).then_some(c)
+        let yc = luminance(c);
+        (yc >= y && (yc + 0.05) / (y + 0.05) >= min).then_some(c)
     };
     reads(1.0)?;
     if let Some(c) = reads(from) {
@@ -185,9 +187,11 @@ fn lighten(h: f32, s: f32, from: f32, ground: u32, min: f32) -> Option<u32> {
 /// The greatest lightness at or below `from` whose colour has at least
 /// `min` contrast against `ground`, darker than it.
 fn darken(h: f32, s: f32, from: f32, ground: u32, min: f32) -> Option<u32> {
+    let y = luminance(ground);
     let reads = |l: f32| {
         let c = from_hsl(h, s, l);
-        (luminance(c) <= luminance(ground) && contrast(c, ground) >= min).then_some(c)
+        let yc = luminance(c);
+        (yc <= y && (y + 0.05) / (yc + 0.05) >= min).then_some(c)
     };
     reads(0.0)?;
     if let Some(c) = reads(from) {
@@ -234,6 +238,40 @@ fn floored(rgb: u32, ground: u32, min: f32) -> u32 {
         down().or_else(up)
     };
     moved.unwrap_or(if light { 0xFFFFFF } else { 0x000000 })
+}
+
+/// `over` laid at opacity `a` on `base`, as one opaque colour.
+pub(crate) fn blend(base: u32, over: u32, a: f32) -> u32 {
+    let (b, o) = (channels(base), channels(over));
+    pack([0, 1, 2].map(|i| b[i] + (o[i] - b[i]) * a))
+}
+
+/// The wash a palette on `ground` draws its chips and hover in (a field's
+/// shading, a picture's stand-in): its colour and opacity. A faint light
+/// wash where the ink is light (a dark one would not show on a dark page),
+/// a faint dark one where the ink is dark, as Print Layout's light chips.
+/// Either way the washed ground ([`chip`]) lies between the ground and the
+/// ink, so ink chosen against the chip reads on the plain ground too.
+pub(crate) fn wash(ground: u32) -> (u32, f32) {
+    if takes_light(ground) {
+        (0xFFFFFF, 0.10)
+    } else {
+        (0x000000, 0.06)
+    }
+}
+
+/// `ground` under its [`wash`]: where a chip's text sits.
+pub(crate) fn chip(ground: u32) -> u32 {
+    let (c, a) = wash(ground);
+    blend(ground, c, a)
+}
+
+/// The ground of an open header or footer on a sheet of colour `sheet`:
+/// the sheet under a faint light-blue wash, opaque, so the area shows as
+/// being edited and its text is chosen against it (Print Layout tints a
+/// light sheet with `#EEF4FF` at half opacity instead).
+pub(crate) fn edit_tint(sheet: u32) -> u32 {
+    blend(sheet, 0xEEF4FF, 0.10)
 }
 
 /// The colour text of colour `rgb` draws in on the mapped ground `ground`
@@ -448,6 +486,35 @@ mod tests {
         assert_eq!(border(Some(0xBFBFBF), PAGE_DARK), 0xBFBFBF);
         // On a kept light fill the automatic border is dark and visible.
         assert!(contrast(border(None, 0xFFC000), 0xFFC000) >= BORDER_FLOOR);
+    }
+
+    #[test]
+    fn an_open_headers_tint_shows_and_keeps_its_text_readable() {
+        let t = edit_tint(PAGE_DARK);
+        // Lighter than the sheet, visibly, and still a dark ground.
+        assert!(luminance(t) > luminance(PAGE_DARK));
+        assert!(contrast(t, PAGE_DARK) > 1.2, "{t:06x}");
+        assert!(takes_light(t));
+        // Text chosen against the tint reads on it, and on the plain sheet
+        // the same live header draws on other pages.
+        for c in [0x000000, 0x595959, 0x0047FF, 0x0563C1, AUTO_DARK, 0xC00000] {
+            let ink = text(c, t);
+            assert!(contrast(ink, t) >= TEXT_FLOOR, "{c:06x} -> {ink:06x}");
+            assert!(
+                contrast(ink, PAGE_DARK) >= TEXT_FLOOR,
+                "{c:06x} -> {ink:06x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chip_lies_between_the_ground_and_its_ink() {
+        assert_eq!(blend(0x000000, 0xFFFFFF, 0.5), 0x808080);
+        // Dark ink on a red fill: a faint dark wash.
+        assert!(!takes_light(0xFF0000));
+        assert!(luminance(chip(0xFF0000)) < luminance(0xFF0000));
+        // On the page: a light wash that shows.
+        assert!(luminance(chip(PAGE_DARK)) > luminance(PAGE_DARK));
     }
 
     #[test]

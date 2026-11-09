@@ -7603,6 +7603,71 @@ mod link_colour_tests {
     }
 
     #[test]
+    fn an_open_header_on_a_dark_page_keeps_its_text_readable_2079() {
+        let sel = hsla_u(0x123456);
+        let dark = dark_page_pal(dark_page::PAGE_DARK, sel);
+        let (tint, hf) = hf_edit_look(dark);
+        // An opaque tint (not the light page's half-opacity #EEF4FF, which
+        // composites to about #8A8D92 on #262626) and a palette on it.
+        assert_eq!(tint.a, 1.0);
+        let ground = rgb_u(tint);
+        assert_eq!(hf.ground, ground);
+        assert!(hf.dark);
+        assert!(dark_page::luminance(ground) < 0.06, "{ground:06x}");
+        for ink in [hf.fg, hf.dim, hf.link] {
+            assert!(dark_page::contrast(rgb_u(ink), ground) >= dark_page::TEXT_FLOOR);
+        }
+        // An explicit accent and black, mapped against the tint, read on it
+        // and on the plain sheet the same live header draws on elsewhere.
+        for c in ["0047FF", "000000", "595959"] {
+            let ink = rgb_u(run_ink(&coloured(Some(c)), false, &hf));
+            for g in [ground, dark_page::PAGE_DARK] {
+                assert!(
+                    dark_page::contrast(ink, g) >= dark_page::TEXT_FLOOR,
+                    "{c} on {g:06x}"
+                );
+            }
+        }
+        // On a light page: as before.
+        let light = page_pal(0xffffff, sel);
+        let (tint, hf) = hf_edit_look(light);
+        assert_eq!(
+            tint,
+            Hsla {
+                a: 0.5,
+                ..hsla_u(0xeef4ff)
+            }
+        );
+        assert_eq!(hf.fg, light.fg);
+        assert_eq!(hf.ground, 0xffffff);
+    }
+
+    #[test]
+    fn a_vivid_cell_on_a_dark_page_reads_on_its_field_chips_2079() {
+        let dark = dark_page_pal(dark_page::PAGE_DARK, hsla_u(0x123456));
+        // A pure red fill: kept, dark ink, and a chip the same rule picks.
+        let cell = cell_pal(dark, Some(0xFF0000));
+        assert_eq!(cell.ground, 0xFF0000);
+        let chip = dark_page::blend(0xFF0000, rgb_u(cell.panel), cell.panel.a);
+        assert_eq!(chip, dark_page::chip(0xFF0000));
+        for ink in [cell.fg, cell.dim, cell.link] {
+            for g in [chip, 0xFF0000] {
+                let r = dark_page::contrast(rgb_u(ink), g);
+                assert!(
+                    r >= dark_page::TEXT_FLOOR,
+                    "{:06x} on {g:06x}: {r:.2}",
+                    rgb_u(ink)
+                );
+            }
+        }
+        // And on the page itself, under its light wash.
+        let chip = dark_page::blend(dark_page::PAGE_DARK, rgb_u(dark.panel), dark.panel.a);
+        for ink in [dark.fg, dark.dim, dark.link] {
+            assert!(dark_page::contrast(rgb_u(ink), chip) >= dark_page::TEXT_FLOOR);
+        }
+    }
+
+    #[test]
     fn painted_inks_report_the_least_readable_run_2079() {
         let ink = |text: &str, ink: u32, ground: u32| PaintedInk {
             text: text.into(),
@@ -10606,34 +10671,50 @@ fn page_pal(sheet: u32, sel: Hsla) -> Pal {
 }
 
 /// The palette a document draws in on a dark page of colour `ground`, as
-/// Word's dark mode draws it (#2079): automatic text and dimmed text that
-/// read on it, a visible mid-grey border, washes that show on it, the light
-/// link blue floor-checked against it, and [`Pal::dark`] on, so the
-/// document's own colours map through [`dark_page`] as they draw. `ground`
-/// is the mapped page ([`dark_page::page_sheet`]) or a cell's mapped fill.
+/// Word's dark mode draws it (#2079): a visible mid-grey border, the
+/// chips' and hover's wash ([`dark_page::wash`]), and automatic text,
+/// dimmed text and the light link blue chosen against the washed ground
+/// ([`dark_page::chip`], between the ground and the ink), so they read on
+/// a field's chip and on the plain ground alike; and [`Pal::dark`] on, so
+/// the document's own colours map through [`dark_page`] against `ground`
+/// as they draw. `ground` is the mapped page ([`dark_page::page_sheet`]),
+/// a cell's mapped fill or an open header's tint.
 fn dark_page_pal(ground: u32, sel: Hsla) -> Pal {
-    let wash = if dark_page::takes_light(ground) {
-        0xffffff
-    } else {
-        0x000000
-    };
+    let (wash, a) = dark_page::wash(ground);
+    let chip = dark_page::chip(ground);
+    let washed = Hsla { a, ..hsla_u(wash) };
     Pal {
-        fg: hsla_u(dark_page::auto_text(ground)),
-        dim: hsla_u(dark_page::dim_text(ground)),
+        fg: hsla_u(dark_page::auto_text(chip)),
+        dim: hsla_u(dark_page::dim_text(chip)),
         border: hsla_u(dark_page::border(None, ground)),
-        panel: Hsla {
-            a: 0.10,
-            ..hsla_u(wash)
-        },
-        hover: Hsla {
-            a: 0.12,
-            ..hsla_u(wash)
-        },
+        panel: washed,
+        hover: washed,
         sel,
-        link: hsla_u(dark_page::text(LINK_DARK, ground)),
+        link: hsla_u(dark_page::text(LINK_DARK, chip)),
         ground,
         dark: true,
     }
+}
+
+/// How an open header or footer draws on its edit page in Print Layout
+/// (#2079): the tint its area takes, and the palette its live text draws
+/// in. On a light page, `#EEF4FF` at half opacity over the sheet and the
+/// page's own palette, as before; on a dark one an opaque light-blue wash
+/// of the sheet ([`dark_page::edit_tint`]) and the dark palette chosen
+/// against it, which reads on the plain sheet too (the same live text draws
+/// on the part's other pages).
+fn hf_edit_look(doc_pal: Pal) -> (Hsla, Pal) {
+    if doc_pal.dark {
+        let tint = dark_page::edit_tint(doc_pal.ground);
+        return (hsla_u(tint), dark_page_pal(tint, doc_pal.sel));
+    }
+    (
+        Hsla {
+            a: 0.5,
+            ..hsla_u(0xeef4ff)
+        },
+        doc_pal,
+    )
 }
 
 const GANTT_CRIT: u32 = 0xD9642C;
@@ -35437,8 +35518,9 @@ fn emit_words(
     pal: Pal,
     zoom: f32,
 ) {
-    // Resolved once per run, not per word (#1900).
+    // Resolved once per run, not per word (#1900), as is its ink (#2079).
     let family = props.font.as_deref().and_then(font_subst::family);
+    let color = run_ink(props, is_link, &pal);
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
@@ -35459,7 +35541,6 @@ fn emit_words(
             }
             VertAlign::Baseline => None,
         };
-        let color = run_ink(props, is_link, &pal);
         // Render each word as a StyledText so its TextLayout gives pixel-exact
         // hit-testing (index_for_position), for a true click-anywhere caret.
         let word_str = word.to_string();
@@ -37276,22 +37357,11 @@ fn cell_pal(pal: Pal, fill: Option<u32>) -> Pal {
     // On a dark page (#2079) the fill is mapped and the cell's palette is the
     // dark one on it: its text is chosen against the fill as shown, with a
     // dim that keeps the floor too (not `cell_ink`'s fixed light grey).
+    // Its washes too: one light/dark rule (`dark_page::takes_light`) for
+    // the ink and the chips under it.
     if pal.dark {
         return match fill {
-            Some(f) => {
-                let shown = pal.shown_fill(f);
-                let ink = design_tab::cell_ink(Some(shown));
-                let chip = ink.map(|i| Hsla {
-                    a: i.chip.1,
-                    ..hsla_u(i.chip.0)
-                });
-                let cell = dark_page_pal(shown, pal.sel);
-                Pal {
-                    panel: chip.unwrap_or(cell.panel),
-                    hover: chip.unwrap_or(cell.hover),
-                    ..cell
-                }
-            }
+            Some(f) => dark_page_pal(pal.shown_fill(f), pal.sel),
             None => pal,
         };
     }
@@ -37804,7 +37874,9 @@ fn block_el_numbered(
                         .paras
                         .filter(|_| ctx.active && ctx.hf_width.is_none())
                         .zip(top.then(|| path[0])),
-                    inks: ctx.inks.filter(|_| ctx.hf_width.is_none()),
+                    // A body's runs, and an open header's or footer's
+                    // (its live context alone sets `inks` there).
+                    inks: ctx.inks,
                 },
             )
         }
@@ -43667,8 +43739,10 @@ impl Render for Docxy {
                     let doc_ent = cx.entity();
                     let ent = DocTarget::Suite(doc_ent.clone());
                     // In Print Layout the sheet is white, or the document's page
-                    // colour (#651), whatever the app theme, like Word's document
-                    // surface; its ink comes from `design_tab::page_ink`.
+                    // colour (#651), on a light theme or with Switch Modes, like
+                    // Word's document surface, its ink from
+                    // `design_tab::page_ink`; on a dark theme it is the dark sheet
+                    // (#2079).
                     // On a dark theme the document draws as Word's dark
                     // mode does (#2079): a dark page, its colours mapped
                     // (`dark_page`), unless View > Switch Modes shows the
@@ -43752,7 +43826,8 @@ impl Render for Docxy {
                         // Print Layout: split the body into discrete page sheets,
                         // each section with its own page size, margins and columns
                         // (#745), stacked on a grey canvas. A sheet is white, or the
-                        // document's page colour (#651).
+                        // document's page colour (#651), on a light theme or with
+                        // Switch Modes; the dark sheet otherwise (#2079).
                         // The palette's ground: the sheet as `doc_pal` maps
                         // it (#2079).
                         let sheet = hsla_u(doc_pal.ground);
@@ -44015,12 +44090,15 @@ impl Render for Docxy {
                                 // Header/footer text-area width, for the implicit
                                 // centre/right tab stops.
                                 let hf_w = zoom * (sb.w - sb.left - sb.right).max(0) as f32 / 15.0;
+                                // The open part's tint on its edit page and the
+                                // palette its live text draws in (#2079).
+                                let (tint, hf_pal) = hf_edit_look(doc_pal);
                                 let hf_ctx = hf.map(|h| RenderCtx {
                                     caret_path: &h.editor.caret.path,
                                     caret_off: h.editor.caret.offset,
                                     spans: &hf_spans,
                                     ent: &ent,
-                                    pal: doc_pal,
+                                    pal: hf_pal,
                                     marks: false,
                                     zoom: self.zoom,
                                     active: true,
@@ -44042,7 +44120,9 @@ impl Render for Docxy {
                                     flow: false,
                                     gap_below: false,
                                     paras: None,
-                                    inks: None,
+                                    // The open part's runs, against its tint
+                                    // (#2079).
+                                    inks: doc_view::harness().then_some(&painted_inks),
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -44152,10 +44232,6 @@ impl Render for Docxy {
                                     .border_1()
                                     .border_color(hsla_u(0xd0d0d0));
                                 // Tint the region actively being edited on this page.
-                                let tint = Hsla {
-                                    a: 0.5,
-                                    ..hsla_u(0xeef4ff)
-                                };
                                 let hdr_bg = if edit_hdr_here { tint } else { sheet };
                                 let ftr_bg = if edit_ftr_here { tint } else { sheet };
                                 // Header in the top margin, content in the middle, footer in

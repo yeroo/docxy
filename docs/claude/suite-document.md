@@ -407,14 +407,26 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   - `border`: an automatic border is `BORDER_DARK` `#8C8C8C`; an explicit
     one keeps 3:1 (non-text contrast) by the same moves.
 - `Pal` carries `ground` (what its text sits on) and `dark` (the mapping is
-  on). `dark_page_pal(ground, sel)` builds the dark palette: `auto_text`,
-  a floor-checked `dim_text`, light washes, the light link blue checked
-  against the ground. `run_ink` maps an explicit colour (links included);
+  on). `dark_page_pal(ground, sel)` builds the dark palette: the chips'
+  and hover's wash (`dark_page::wash`: white at 0.10 where the ink is
+  light, black at 0.06 where it is dark, by `takes_light`), and
+  `auto_text`, `dim_text` and the light link blue chosen against the
+  washed ground (`dark_page::chip`, which lies between the ground and the
+  ink, so they read on a field's chip and the plain ground alike).
+  `run_ink` maps an explicit colour (links included) against `ground`;
   `cell_pal` maps the fill (`Pal::shown_fill`, also the painted cell
-  background) and builds the cell's palette on it, not `cell_ink`'s (whose
-  `#B0B0B0` dim misses 4.5:1 on a darkened tint). Table borders and
-  diagonals go through `Pal::border_ink` against the cell's ground.
+  background) and the cell's palette is `dark_page_pal` on it, washes
+  included, not `cell_ink`'s (whose `#B0B0B0` dim misses 4.5:1 on a
+  darkened tint and whose chip follows the other cutoff). Table borders
+  and diagonals go through `Pal::border_ink` against the cell's ground.
   `page_pal` and `Pal::from_theme` are unchanged (`dark: false`).
+- An open header or footer (`hf_edit_look`): on a light page its area
+  takes `#EEF4FF` at half opacity and the page's palette, as before; on a
+  dark page an opaque tint (`dark_page::edit_tint`, the sheet under
+  `#EEF4FF` at 0.10, about `#3A3B3C`) and `dark_page_pal` on it. The
+  half-opacity light tint would composite to about `#8A8D92` on `#262626`,
+  where light text is under 3:1. Text chosen against the tint also reads
+  on the plain sheet, where the same live part draws on its other pages.
 - The paragraph rule (`has_border`, a bottom `w:pBdr`) carries no colour in
   the model: it draws `border(None, ground)` on a dark page, the ink as
   before on a light one. Paragraph and run shading (`w:shd` in `w:pPr` /
@@ -440,8 +452,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   (`rrggbb`) are the page the document last drew on
   (`Docxy::painted_page`), and `inks` (`painted_inks_json`) rates every
   body run and list number as painted, top-level and in table cells, in
-  both views (`Docxy::painted_inks`, `PaintedInk`, a harness instance
-  only; headers and footers and highlighted runs are left out): `runs`,
+  both views, and an open header's or footer's runs against its tint
+  (`Docxy::painted_inks`, `PaintedInk`, a harness instance only; closed
+  headers and footers and highlighted runs are left out). The ground is
+  the palette's, so it is true only while every painted ground has its own
+  palette, as the header tint now does: `runs`,
   `min_contrast`, `all_readable` (every run at 4.5:1 or more) and `worst`
   (`text`, `ink`, `ground`). It is separate from `PaintedRun`, which holds
   top-level paragraphs only. `uiharness/cases/doc-dark-mode.uit` runs

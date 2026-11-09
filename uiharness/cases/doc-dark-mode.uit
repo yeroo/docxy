@@ -43,6 +43,15 @@ test issue 2079 a dark theme draws the document as Word's dark mode does, every 
   assert reply.page_color is 262626
   assert reply.inks.runs is not 0
   assert reply.inks.all_readable is true
+  # An open header: its own tint, and its text reads on it (#2079 r1).
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert hf_edit is true
+  call real-type {"text":"Header text"}
+  shot window
+  call doc {}
+  assert reply.inks.all_readable is true
+  call ribbon-click {"tab":"Header & Footer","command":"Close Header and Footer"}
+  assert hf_edit is false
   # Switch Modes is on offer on a dark theme, off until clicked.
   call ribbon-read {}
   assert reply.tabs.7.name is View
