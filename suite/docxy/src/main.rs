@@ -37201,15 +37201,12 @@ fn paragraph_el(
         .pr(px(pad_r))
         .when(pbox.heading_mt, |d| d.mt_2())
         .when(flow.gap_below, |d| d.mb(px(4.)))
-        // The rule carries no colour of its own: the ink, or on a dark page
-        // the visible mid grey (#2079).
+        // The rule carries no colour of its own: an automatic border, the
+        // ink, or on a dark page the visible mid grey (#2079).
         .when(has_border, |d| {
-            let rule = if pal.dark {
-                pal.border_ink(None, pal.ground)
-            } else {
-                pal.fg
-            };
-            d.border_b_1().border_color(rule).pb_1()
+            d.border_b_1()
+                .border_color(pal.border_ink(None, pal.ground))
+                .pb_1()
         })
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
