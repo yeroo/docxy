@@ -1279,6 +1279,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         reconverge_pending,
         calendar_reset_owed: false,
         masters_not_found: HashSet::new(),
+        masters_skipped: HashSet::new(),
         parked: Vec::new(),
         expired: Vec::new(),
         next_tick: Instant::now(),
@@ -1359,6 +1360,12 @@ struct Engine {
     /// owner's) costs one request, not one a pass. Cleared on sign-out
     /// (`enter_signin`) and by a restart.
     masters_not_found: HashSet<String>,
+    /// Removed stored masters whose failed refetch (an HTTP or parse error)
+    /// already left their calendar out of a pass (#2064 r2,
+    /// `fetch_missing_masters`): the next failure writes the round. An id
+    /// goes once its refetch succeeds or 404s. Cleared on sign-out
+    /// (`enter_signin`) and by a restart.
+    masters_skipped: HashSet<String>,
     /// Folders whose backfill a failure stopped until the next sync pass
     /// (#1871): one request per park, never a hot loop.
     parked: Vec<String>,
@@ -4894,7 +4901,14 @@ impl Engine {
     /// removed that is stored as one. A master starting before the window
     /// that changed comes as `@removed` (#2013), which the store does not
     /// delete (it does not overlap the window), so without a refetch its
-    /// occurrences would keep the old fields. The round's own masters are
+    /// occurrences would keep the old fields. In an initial round
+    /// (`CalendarRound::Window`) a needed master is fetched even when it is
+    /// stored: Graph's initial round may not list a master that starts
+    /// before the window, the round re-sends the occurrences, and a stored
+    /// master that changed (a series renamed before a reset) would refill
+    /// them with its old fields, while the new baseline means no later
+    /// delta lists the change. One request per series per initial round,
+    /// which are daily, plus resets. The round's own masters are
     /// not fetched, nor a needed one this session already found gone (a
     /// removed stored one always is: only a written pass deletes it, and
     /// it comes again only when a replayed link lists it again); the rest
@@ -4909,10 +4923,15 @@ impl Engine {
     /// pass (`StopPass`, nothing written). An HTTP or parse error is
     /// reported; for a needed master the round is written without it (its
     /// occurrences stay blank, and `blank_occurrence_masters` names it
-    /// again next pass), but for a removed stored master the calendar is
-    /// left out of the pass (`SkipCalendar`), as a failed round is, since
-    /// writing would advance the link past the `@removed` and keep the
-    /// stale master for good.
+    /// again next pass, or keep the stored master's fields), but for a
+    /// removed stored master the calendar is left out of the pass
+    /// (`SkipCalendar`), as a failed round is, since writing would advance
+    /// the link past the `@removed` and keep the stale master for good.
+    /// Only once per id a session (`masters_skipped`): a refetch that fails
+    /// again writes the round with the stale master, so one master that
+    /// keeps failing (a 403, a repeated 500) cannot stop its calendar
+    /// syncing until the window moves; the next initial round fetches it
+    /// again. A refetch that succeeds or 404s forgets the skip.
     fn fetch_missing_masters(&mut self, round: &mut SyncedCalendar) -> MasterFetch {
         let calendar = round.fetched.calendar_id.clone();
         let own: HashSet<String> = round
@@ -4933,9 +4952,9 @@ impl Engine {
             Ok(ids) => needed.extend(ids),
             Err(e) => self.emit(SyncEvent::Error(e.to_string())),
         }
-        let removed: Vec<String> = match &round.round {
-            CalendarRound::Delta { removed, .. } => removed.clone(),
-            CalendarRound::Window => Vec::new(),
+        let (removed, initial): (Vec<String>, bool) = match &round.round {
+            CalendarRound::Delta { removed, .. } => (removed.clone(), false),
+            CalendarRound::Window => (Vec::new(), true),
         };
         let mut wanted = std::collections::BTreeSet::new();
         let mut removed_stored = HashSet::new();
@@ -4960,7 +4979,7 @@ impl Engine {
             if was_removed && stored {
                 removed_stored.insert(id.clone());
                 wanted.insert(id);
-            } else if !was_removed && !stored {
+            } else if !was_removed && (!stored || initial) {
                 wanted.insert(id);
             }
         }
@@ -4974,9 +4993,13 @@ impl Engine {
                         master.attendees.iter().map(NewAttendee::from).collect(),
                     ));
                     round.fetched.events.push(e);
+                    self.masters_skipped.remove(&id);
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    self.masters_skipped.remove(&id);
+                }
                 Err(GraphError::NotFound) => {
+                    self.masters_skipped.remove(&id);
                     self.masters_not_found.insert(id.clone());
                     if removed_stored.contains(&id)
                         && let CalendarRound::Delta { gone_masters, .. } = &mut round.round
@@ -4988,7 +5011,10 @@ impl Engine {
                     if self.react(e) {
                         return MasterFetch::StopPass;
                     }
-                    if removed_stored.contains(&id) {
+                    // Once per id a session: a refetch that keeps failing
+                    // writes the round the next time, keeping the stale
+                    // master, or the calendar would not sync all day.
+                    if removed_stored.contains(&id) && self.masters_skipped.insert(id.clone()) {
                         return MasterFetch::SkipCalendar;
                     }
                 }
@@ -5502,6 +5528,7 @@ impl Engine {
         self.token = None;
         self.announced_scopes = None;
         self.masters_not_found.clear();
+        self.masters_skipped.clear();
         self.emit(SyncEvent::SignInRequired);
         self.set_state(SyncState::SignInRequired);
     }
@@ -12126,7 +12153,9 @@ mod tests {
     }
 
     /// The issue's store: blank occurrences beside their stored master,
-    /// and a deltaLink with no change. One pass repairs them.
+    /// and a deltaLink with no change. One pass repairs them. Also pins
+    /// that a delta round fetches no stored master (only an initial round
+    /// refetches one, r2).
     #[test]
     fn calendar_delta_repairs_blank_occurrences_in_one_pass() {
         let (from, to) = today_window();
@@ -12384,8 +12413,9 @@ mod tests {
         let store = Store::open(&store_path).unwrap();
         assert_eq!(ids_in(&store, "CAL-A"), ["O1", "O2"]);
         assert_eq!(subjects(&store, &["O1", "O2"]), ["New", "New"]);
-        // The initial round had the master stored: one GET, in pass 1.
-        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        // Pass 1's refetch of the removed master, and the initial round's
+        // of a needed master it did not list (r2).
+        assert_eq!(event_gets(&srv), ["/me/events/SM", "/me/events/SM"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12602,6 +12632,114 @@ mod tests {
                 "/me/events/SM2"
             ]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removed stored master whose refetch keeps failing (#2064 r2): the
+    /// first pass leaves the calendar out, the second writes the round
+    /// with the stale master, so the calendar's other changes land.
+    #[test]
+    fn calendar_delta_removed_master_failing_twice_writes_the_second_pass() {
+        let link = delta_link_of("CAL-A");
+        let failing = Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/SM".into(),
+            status: 500,
+            headers: vec![],
+            body: "{}".into(),
+        };
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(
+                    &[event_from_now("E-NEW", 7200), removed_json("SM")],
+                    "/cal-delta/CAL-A?token=2",
+                ),
+            ),
+            failing,
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "calendar-removed-master-failing",
+            routes,
+            seed_series_before_window,
+        );
+        let errors = |seen: &[SyncEvent]| {
+            seen.iter()
+                .filter(|e| matches!(e, SyncEvent::Error(_)))
+                .count()
+        };
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        assert_eq!(errors(&seen), 1, "{seen:?}");
+        {
+            let store = Store::open(&store_path).unwrap();
+            assert!(store.event("E-NEW").unwrap().is_none(), "skipped");
+            assert_eq!(
+                store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+                link
+            );
+        }
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(errors(&seen), 1, "{seen:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.event("E-NEW").unwrap().is_some(), "written");
+        // Written past the `@removed`: the round re-sent none of SM's
+        // occurrences, so #2013's cascade took them and dropped the delta
+        // state, and the next pass's initial round refetches SM (r2).
+        assert_eq!(store.calendar_delta("CAL-A").unwrap(), None);
+        assert!(store.event("O1").unwrap().is_none());
+        // The stale master stays (it starts before the window).
+        assert_eq!(store.event("SM").unwrap().unwrap().subject, "Old");
+        assert_eq!(event_gets(&srv), ["/me/events/SM", "/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An initial round re-sends minimal occurrences without their master,
+    /// which starts before the window and is stored with old fields (a
+    /// series renamed before a reset): it is fetched again, so the
+    /// occurrences take the new fields (#2064 r2).
+    #[test]
+    fn calendar_initial_round_refetches_a_stored_master_it_does_not_list() {
+        let initial = events_body(&[
+            minimal_occurrence_json("O1", "SM", 3600),
+            minimal_occurrence_json("O2", "SM", DAY + 3600),
+        ]);
+        let routes = vec![
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &with_delta_link(&initial, "/cal-delta/CAL-A?token=2"),
+            ),
+            get_route(
+                "/me/events/SM",
+                200,
+                &graph_series_master_json("SM", -40 * DAY, "New"),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-initial-refetch", routes, |s| {
+                seed_series_before_window(s);
+                s.clear_calendar_deltas().unwrap();
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(subjects(&store, &["SM", "O1", "O2"]), ["New", "New", "New"]);
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15810,7 +15948,8 @@ mod tests {
 
     /// #1983: a calendar refresh stores every field a calendar client
     /// shows, read back through `Store::event` (a series master, which the
-    /// grid queries leave out, #2064) and `event_attendees`.
+    /// grid queries list only while no row of its series is stored, #2064)
+    /// and `event_attendees`.
     /// The join link here is found only in the body (no `onlineMeeting`).
     #[test]
     fn refresh_calendar_stores_calendar_client_fields() {

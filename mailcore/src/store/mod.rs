@@ -9104,7 +9104,8 @@ mod calendar_tests {
             &[("E1".into(), vec![attendee.clone()])],
         )
         .unwrap();
-        // A series master (`client_event`), so read by id (#2064).
+        // Read by id: `client_event` is a series master, which the grid
+        // queries list only while no row of its series is stored (#2064).
         assert_client_fields(&s.event("E1").unwrap().unwrap(), &e);
         let atts = s.event_attendees("E1").unwrap();
         assert_eq!(atts[0].r#type, "resource");
@@ -9168,7 +9169,8 @@ mod calendar_tests {
             &[],
         )
         .unwrap();
-        // A series master (`client_event`), so read by id (#2064).
+        // Read by id: `client_event` is a series master, which the grid
+        // queries list only while no row of its series is stored (#2064).
         assert_client_fields(&s.event("E1").unwrap().unwrap(), &moved);
 
         let again = NewEvent {
