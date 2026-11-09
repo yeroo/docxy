@@ -1,0 +1,120 @@
+# Word's dark mode for the document view (#2079). On a dark theme the
+# document draws on a dark-grey page (#262626; Print Layout's sheet on a
+# darker canvas), automatic and black text light, explicit dark colours
+# lightened keeping their hue, light fills darkened, vivid fills kept with
+# their text chosen against them, borders a visible grey: every run at
+# least 4.5:1 on what it sits on. View > Switch Modes shows the light page
+# while the app stays dark; a light theme has nothing to switch.
+#
+# The fixture (`fixtures/dark-mode.docx`) has the issue's shapes: a title
+# cell filled #5B9BD5 with dark (#1F1F1F) and automatic text; a cell
+# filled Word's Accent 1 #4472C4 with automatic and black text (light ink
+# only just reads there, and both take it); a
+# three-column figure table with thin #BFBFBF borders, grey (#767676) caps
+# labels, accent-blue (#0047FF) numbers and grey (#595959) body text;
+# headings with an accent number prefix and an automatic title; automatic
+# body text, explicit black text and a paragraph rule; a callout cell
+# filled #EEF3FF with a thick accent left border, a bold accent caps label,
+# automatic and black text; a numbered list in a two-column table; light
+# grey (#7F7F7F) text and a highlighted phrase.
+#
+# `doc`'s `page_mode` (`dark` / `light`) and `page_color` are the page the
+# document last drew on, and `inks` rates every body run (cells included,
+# highlighted runs left out) against the ground under it: `all_readable`
+# is every run at 4.5:1 or more. Each read follows a `shot`, which waits
+# for the frame after the change.
+
+test issue 2079 a dark theme draws the document as Word's dark mode does, every run readable
+  open copy:../fixtures/dark-mode.docx
+  assert view.layout is web
+  call window-size {"w":1100,"h":900}
+  call theme-set {"theme":"dark"}
+  # Web Layout: the dark-grey page, every run readable on what it sits on.
+  shot window
+  call doc {}
+  assert reply.page_mode is dark
+  assert reply.page_color is 262626
+  assert reply.inks.runs is not 0
+  assert reply.inks.all_readable is true
+  # Print Layout: the same, on the sheet.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.page_mode is dark
+  assert reply.page_color is 262626
+  assert reply.inks.runs is not 0
+  assert reply.inks.all_readable is true
+  # An open header: its runs read on the ground they were chosen for (the
+  # palette's own, so this cannot see a tint painted under the wrong
+  # palette: `an_open_header_on_a_dark_page_keeps_its_text_readable_2079`
+  # guards that).
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert hf_edit is true
+  call real-type {"text":"Header text"}
+  shot window
+  call doc {}
+  assert reply.inks.all_readable is true
+  call ribbon-click {"tab":"Header & Footer","command":"Close Header and Footer"}
+  assert hf_edit is false
+  # Switch Modes is on offer on a dark theme, off until clicked.
+  call ribbon-read {}
+  assert reply.tabs.7.name is View
+  assert reply.tabs.7.groups.2.commands.2.label is Switch Modes
+  assert reply.tabs.7.groups.2.commands.2.enabled is true
+  assert reply.tabs.7.groups.2.commands.2.checked is false
+  # The window keeps its view across tests: back to Web Layout.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  call theme-set {"theme":"auto"}
+
+test issue 2079 Switch Modes shows the light page on a dark theme, and a light theme has nothing to switch
+  open copy:../fixtures/dark-mode.docx
+  call window-size {"w":1100,"h":900}
+  call theme-set {"theme":"dark"}
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  call ribbon-click {"tab":"View","command":"Switch Modes"}
+  # Print Layout's white sheet, as before #2079.
+  shot window
+  call doc {}
+  assert reply.page_mode is light
+  assert reply.page_color is ffffff
+  call ribbon-read {}
+  assert reply.tabs.7.groups.2.commands.2.checked is true
+  # Web Layout shows the light page too.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  shot window
+  call doc {}
+  assert reply.page_mode is light
+  assert reply.page_color is ffffff
+  # Back to the dark page.
+  call ribbon-click {"tab":"View","command":"Switch Modes"}
+  shot window
+  call doc {}
+  assert reply.page_mode is dark
+  assert reply.page_color is 262626
+  assert reply.inks.all_readable is true
+  # A light theme: the light page, Switch Modes disabled and unchecked.
+  call theme-set {"theme":"light"}
+  shot window
+  call doc {}
+  assert reply.page_mode is light
+  call ribbon-read {}
+  assert reply.tabs.7.groups.2.commands.2.enabled is false
+  assert reply.tabs.7.groups.2.commands.2.checked is false
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.page_mode is light
+  assert reply.page_color is ffffff
+  # The light page is not mapped: the document's own light grey (4.0:1 on
+  # white) is its least readable run, as in Word.
+  assert reply.inks.all_readable is false
+  assert reply.inks.worst.ink is 7f7f7f
+  assert reply.inks.worst.ground is ffffff
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  call theme-set {"theme":"auto"}

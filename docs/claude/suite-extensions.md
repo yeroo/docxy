@@ -71,14 +71,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   update. The view never opens a link.
 - Colours: the chrome (scroll bar, selection) is the theme's; the document
   is a white page in Print Layout's palette (`content_look`, `page_pal`) unless
-  `set_content_dark(true)` on a dark theme, which draws the theme's own (on
-  the host's page colour if it set one, #2003).
+  `set_content_dark(true)` on a dark theme, which draws on the host's page
+  colour if it set one (#2003), else the theme's background, with the
+  document's colours mapped against it as Word's dark mode maps them
+  (`dark_page_pal`, #2079: `docs/claude/suite-document.md`).
   A link draws in its run's colour (#1906); only a link without one takes
   the palette's `Pal::link`: `LINK` `#2F6FDB` on the white page, `LINK_DARK`
   `#6CA0F0` on the dark one (7.5:1 on the stock `#0A0A0A`). HTML import
-  colours every link `0563C1` and Word's Hyperlink style does too, so with
-  dark mode for content and no adaptation by the embedder such a link draws
-  `0563C1`, about 3.4:1 on `#0A0A0A`, like any dark authored ink there.
+  colours every link `0563C1` and Word's Hyperlink style does too (about
+  3.4:1 on `#0A0A0A`), so with dark mode for content such a link is
+  lightened, hue kept, to 4.5:1 on the page (#2079), as any dark authored
+  ink is.
 - Pictures: the view's `pictures::Cache` is registered with
   `pictures::register_extra` and never reads `Docxy`: `set_document` and
   its release queue what it gave up (`queue_release`), the windows'
@@ -260,9 +263,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - `DocView::set_page_background(Option<Hsla>)` / `page_background()`: the
   dark page's colour (`content_look`'s `page_bg`, used only when content
   is dark on a dark theme); `None` is the theme's `background`. The light
-  page stays white and the palette is unchanged: a host recolours the
-  document's text in the document. The colour paints the view's root, so
-  the padding is that colour too.
+  page stays white. The palette maps the document's colours against the
+  host's page colour (`dark_page_pal`, #2079), so a host need not recolour
+  the document's text. The colour paints the view's root, so the padding
+  is that colour too.
 - Both setters notify only when the stored value changes (`set_if_changed`);
   the getters return what the host set, `None` included.
 - Harness: `ext-doc-set` takes `page_inset` (`null` or

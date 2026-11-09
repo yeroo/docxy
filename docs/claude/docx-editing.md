@@ -295,7 +295,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `flow.layout` (`null` in Print Layout; x from `draft_column`).
   `uiharness/cases/ext-doc-outlook-mail.uit` drives both: the view, and the
   same mail (`fixtures/outlook-mail.html`) opened in a document tab.
-- Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`), and
-  now its numbers, stay black on a dark page; Outlook lightens them. Style
+- Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`) and
+  its numbers stayed black on a dark page until #2079, which maps them as
+  Word's dark mode does (`docs/claude/suite-document.md`). Style
   spacing (docDefaults, Normal, the style chain) is still not resolved, so
   Word paragraphs keep the stand-ins. `ext::DocView`'s page margin is #1987.

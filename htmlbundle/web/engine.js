@@ -759,6 +759,9 @@
     // and Arrange All are the desktop run's multi-window commands.
     NewWindow: 'Not available in the browser — the browser shell has one window',
     ArrangeAll: 'Not available in the browser — the browser shell has one window',
+    // View › Switch Modes (#2079): the desktop document view's dark page;
+    // the browser draws the document on its own light page.
+    SwitchModes: NOT_YET,
   };
 
   root.DocxyEngine = {

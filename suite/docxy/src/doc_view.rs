@@ -1032,6 +1032,7 @@ impl Render for DocView {
             flow: true,
             gap_below: false,
             paras: harness().then_some(&self.paras),
+            inks: None,
         };
         let blocks: Vec<AnyElement> = body
             .iter()
@@ -1411,8 +1412,9 @@ fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, care
 
 /// The page the document draws on and its palette. A light page (white, in
 /// the ink Print Layout's sheet uses) unless dark mode for content is on and
-/// the theme is dark: then the theme's own colours on the host's page colour
-/// (`page_bg`, #2003), else on the theme's background. The selection is the
+/// the theme is dark: then the host's page colour (`page_bg`, #2003), else
+/// the theme's background, with the document's colours mapped against it as
+/// Word's dark mode maps them (`dark_page_pal`, #2079). The selection is the
 /// theme's either way.
 pub(crate) fn content_look(
     theme: Pal,
@@ -1422,7 +1424,8 @@ pub(crate) fn content_look(
     page_bg: Option<Hsla>,
 ) -> (Hsla, Pal) {
     if content_dark && theme_dark {
-        return (page_bg.unwrap_or(theme_bg), theme);
+        let bg = page_bg.unwrap_or(theme_bg);
+        return (bg, crate::dark_page_pal(crate::rgb_u(bg), theme.sel));
     }
     (hsla_u(0xffffff), page_pal(0xffffff, theme.sel))
 }
@@ -1733,6 +1736,8 @@ mod tests {
             hover: c,
             sel: hsla_u(0x123456),
             link: hsla_u(0x0000ff),
+            ground: 0x1e1e1e,
+            dark: false,
         }
     }
 
@@ -1747,10 +1752,14 @@ mod tests {
         assert_eq!(bg, hsla_u(0xffffff));
         assert_eq!(p.fg, ink);
         assert_eq!(p.sel, hsla_u(0x123456));
-        // Dark mode for content on a dark theme: the theme's own.
+        // Dark mode for content on a dark theme: the theme's background,
+        // the document's colours mapped against it (#2079).
         let (bg, p) = content_look(theme, theme_bg, true, true, None);
         assert_eq!(bg, theme_bg);
-        assert_eq!(p.fg, hsla_u(0xeeeeee));
+        assert!(p.dark);
+        assert_eq!(p.ground, 0x1e1e1e);
+        assert_eq!(p.fg, hsla_u(crate::dark_page::AUTO_DARK));
+        assert_eq!(p.sel, hsla_u(0x123456));
         // On a light theme it changes nothing.
         let (bg, p) = content_look(theme, theme_bg, false, true, None);
         assert_eq!(bg, hsla_u(0xffffff));
@@ -1758,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    fn the_host_paints_the_dark_page_only_and_keeps_the_palette_2003() {
+    fn the_host_paints_the_dark_page_and_the_palette_maps_against_it_2003_2079() {
         let theme = pal(0xeeeeee);
         let theme_bg = hsla_u(0x0a0a0a);
         let host = hsla_u(0x262626);
@@ -1766,13 +1775,20 @@ mod tests {
         // Unset: the theme's background, as before.
         let (bg, p) = content_look(theme, theme_bg, true, true, None);
         assert_eq!(bg, theme_bg);
-        assert_eq!(p.fg, hsla_u(0xeeeeee));
-        // Set: the host's colour, the theme's palette unchanged.
+        assert_eq!(p.ground, 0x0a0a0a);
+        // Set: the host's colour, and the dark mapping against it (#2079):
+        // automatic text and an uncoloured link that read on it.
         let (bg, p) = content_look(theme, theme_bg, true, true, Some(host));
         assert_eq!(bg, host);
-        assert_eq!(p.fg, hsla_u(0xeeeeee));
-        assert_eq!(p.link, hsla_u(0x0000ff));
+        assert!(p.dark);
+        assert_eq!(p.ground, 0x262626);
+        let inks = crate::dark_page::inks(0x262626);
+        assert_eq!(p.fg, hsla_u(inks.fg));
+        assert_eq!(p.link, hsla_u(inks.link));
         assert_eq!(p.sel, hsla_u(0x123456));
+        // A light host page under dark content takes dark ink.
+        let (_, p) = content_look(theme, theme_bg, true, true, Some(hsla_u(0xffffff)));
+        assert!(crate::dark_page::luminance(crate::rgb_u(p.fg)) < 0.05);
         // The light page stays white: light content, or a light theme.
         for (theme_dark, content_dark) in [(true, false), (false, true), (false, false)] {
             let (bg, p) = content_look(theme, theme_bg, theme_dark, content_dark, Some(host));

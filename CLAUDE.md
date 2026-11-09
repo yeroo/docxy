@@ -37,7 +37,8 @@ issue number to find its notes.
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
   (#1900), link colours (#1906), tables placed by `w:jc` (#1922), rounded
   picture crops (#1926), the document views' scrollbars and Print Layout's
-  sideways scroll (#2080).
+  sideways scroll (#2080), Word's dark mode for the document and View >
+  Switch Modes (#2079).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),

@@ -105,7 +105,10 @@ test issue 1986 an imported Outlook mail draws its lines, empty lines and list n
   assert reply.paragraphs.8.height is 18
   assert reply.paragraphs.9.top is 162
   assert reply.paragraphs.9.lines.0.text is Name
-  assert reply.paragraphs.2.marker.color is 000000
+  # Word's dark mode (#2079): the mail's explicit black draws light on
+  # the dark page, its numbers with it.
+  assert reply.paragraphs.2.lines.0.color is f2f2f2
+  assert reply.paragraphs.2.marker.color is f2f2f2
   call ext-doc-set {"content_dark":false}
   call theme-set {"theme":"auto"}
   call real-key {"key":"ctrl+w"}

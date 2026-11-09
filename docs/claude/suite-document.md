@@ -375,3 +375,110 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - Not done: the tip's heading text, Word's Previous/Next Page browse
   buttons, a scrollbar context menu, the help view's and terminal
   `docxy`'s bars.
+
+## Word's dark mode for the document (#2079)
+
+- On a dark theme the document draws as Word's dark mode does, in Print
+  Layout, Web Layout and `ext::DocView` with dark mode for content. It is
+  display only: the model, saving, printing and PDF keep the document's
+  colours (`save_preserve_tests::the_dark_mode_fixture_saves_its_own_colours_2079`
+  guards it). The rules are pure `0xRRGGBB` functions in
+  `suite/docxy/src/dark_page.rs`, unit-tested there:
+  - the page is `PAGE_DARK` `#262626`, Print Layout's canvas `CANVAS_DARK`
+    `#141414` (darker, so the page edge shows; the old dark canvas
+    `#2B2B2B` was lighter than the page). A document page colour is mapped
+    as a fill (`page_sheet`): gold stays gold, a pastel page is darkened.
+  - `fill`: a fill of HSL lightness at least `LIGHT_FILL` (0.8) is darkened,
+    hue kept, monotone in lightness (L' = L_page + (1 - L), plus `TINT_LIFT`
+    for a tinted one, saturation capped at `TINT_MAX_SAT`): white becomes
+    the page, `#F2F2F2` and `#D9D9D9` bands stay distinct and in order, and
+    `#EEF3FF` becomes a dark blue-grey. Every other fill is kept. The
+    threshold is a step: a fill at 0.79 is kept as it is.
+  - `text(rgb, ground)`: kept at 4.5:1 or more on the mapped ground (so
+    dark text on a kept `#5B9BD5` stays dark); otherwise, on a ground that
+    takes light ink (`takes_light`: white beats black on it, a contrast
+    test, not `design_tab::dark_ground`'s gamma cutoff), a dark colour's
+    lightness is inverted (capped at `AUTO_DARK` `#F2F2F2`'s) and then
+    raised, hue and saturation kept, to the floor; on a light ground it is
+    lowered. If that side cannot reach the floor, the other side, at worst
+    white or black (always 4.58:1 or more). So black becomes `#F2F2F2`,
+    `#0047FF` a lighter blue, and black on Word's Accent 1 `#4472C4` turns
+    light (black is only 4.45:1 there).
+  - `border`: an automatic border is `BORDER_DARK` `#8C8C8C`; an explicit
+    one keeps 3:1 (non-text contrast) by the same moves.
+- `Pal` carries `ground` (what its text sits on) and `dark` (the mapping is
+  on). `dark_page_pal(ground, sel)` builds the dark palette from
+  `dark_page::inks`: automatic text, dimmed text and the link blue on the
+  ground's side (`takes_light(ground)`, the side `text` moves a run to),
+  reading on the ground and on the
+  chips' and hover's wash alike. The wash is the one that shows (white at
+  0.10 on a ground that takes light ink, black at 0.06 on one that takes
+  dark) with the inks chosen against the washed ground (`dark_page::chip`),
+  unless no ink on that side reads there: near the crossover (Accent 1
+  `#4472C4`: white 4.73:1 on it, 3.93:1 on its light chip) the wash goes
+  away from the ink (black, or white, at 0.10), which only raises the
+  contrast, and the inks are chosen against the ground. A run whose own
+  colour already reads on the ground is kept on its side, so near the
+  crossover automatic text and explicit black can still part (`#757575`:
+  white 4.61:1, black 4.56:1, so black stays black beside light automatic
+  text); both read.
+  `run_ink` maps an explicit colour (links included) against `ground`;
+  `cell_pal` maps the fill (`Pal::shown_fill`, also the painted cell
+  background) and the cell's palette is `dark_page_pal` on it, washes
+  included, not `cell_ink`'s (whose `#B0B0B0` dim misses 4.5:1 on a
+  darkened tint and whose chip follows the other cutoff). Table borders
+  and diagonals go through `Pal::border_ink` against the cell's ground.
+  `page_pal` and `Pal::from_theme` are unchanged (`dark: false`).
+- An open header or footer (`hf_edit_look`): on a light page its area
+  takes `#EEF4FF` at half opacity and the page's palette, as before; on a
+  dark page an opaque tint (`dark_page::edit_tint`) and `dark_page_pal` on
+  it, for the live part on its edit page. The half-opacity light tint
+  would composite to about `#8A8D92` on `#262626`, where light text is
+  under 3:1. The tint lies between the sheet and its ink (`#EEF4FF` at
+  0.10 on a sheet that takes light ink, about `#3A3B3C` on `#262626`;
+  black at 0.06 on one that takes dark ink, a gold page), and none at all
+  (the sheet) where the far-side extreme (black where the ink is light,
+  white where it is dark) still reads on the tint. So every colour `text`
+  keeps or moves there is on the ink's side, beyond the tint, and also
+  reads on the plain sheet, where a frame of the part placed off its band
+  sits (`#676767`: black is 4.56:1 on its tint, 3.71:1 on the sheet, so
+  that sheet takes no tint). The
+  part's other pages draw it in `doc_pal`.
+- The paragraph rule (`has_border`, a bottom `w:pBdr`) carries no colour in
+  the model: it draws `border(None, ground)` on a dark page, the ink as
+  before on a light one. Paragraph and run shading (`w:shd` in `w:pPr` /
+  `w:rPr`) are not painted at all, so a palette's `ground` is everything
+  under a run; a later shading feature must set the ground it paints.
+- Not mapped: highlights (their colour and their own ink, as before),
+  pictures, shapes, text boxes, watermarks, View Gridlines' dashed
+  `#9FB8E0` on borderless edges (a view aid: the issue's "dotted" rules),
+  the header/footer editing chrome, the style and table-style galleries.
+- The views: `Docxy::page_is_dark` (applied theme dark and not
+  `light_page`). Print Layout's sheet is `doc_pal.ground`. Web Layout's
+  ground is `#262626` dark; with Switch Modes it is the white page
+  (`page_pal(0xFFFFFF)`, so in Web Layout Switch Modes shows the light
+  page rather than today's theme palette); on a light theme it is the
+  theme's, as before. `ext::DocView`: `content_look` maps against
+  `page_bg` or the theme background (#2003).
+- View > Appearance > Switch Modes (`Act::SwitchModes`, id `switchmodes`,
+  KeyTip `S`, the column's third row): toggles `Docxy::light_page`, per
+  window, not persisted. Enabled only when the applied theme is dark
+  (Auto resolving light counts as light); checked while the light page is
+  shown.
+- Harness: `doc {}`'s `page_mode` (`dark` / `light`) and `page_color`
+  (`rrggbb`) are the page the document last drew on
+  (`Docxy::painted_page`), and `inks` (`painted_inks_json`) rates every
+  body run and list number as painted, top-level and in table cells, in
+  both views, and an open header's or footer's runs against its tint
+  (`Docxy::painted_inks`, `PaintedInk`, a harness instance only; closed
+  headers and footers and highlighted runs are left out). The ground is
+  the palette's, so it is true only while every painted ground has its own
+  palette, as the header tint now does: `runs`,
+  `min_contrast`, `all_readable` (every run at 4.5:1 or more) and `worst`
+  (`text`, `ink`, `ground`). It is separate from `PaintedRun`, which holds
+  top-level paragraphs only. `uiharness/cases/doc-dark-mode.uit` runs
+  `fixtures/dark-mode.docx` (the issue's shapes) dark, with Switch Modes
+  and light.
+- Known limits: list numbers inside table cells are not drawn (the
+  fixture's numbered list in a two-column table shows none, dark or
+  light); `w:caps` is not drawn.
