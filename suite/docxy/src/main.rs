@@ -50,6 +50,7 @@ mod doc_paste;
 #[cfg(test)]
 mod doc_protected_tests;
 mod doc_recovery;
+mod doc_scrollbar;
 mod doc_templates;
 #[cfg(test)]
 mod doc_templates_tests;
@@ -5805,6 +5806,15 @@ struct Docxy {
     /// The flow view's block the caret moved into (#1895), followed in y by
     /// the scroll area's probe once the next layout has laid it out.
     doc_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    /// Print Layout's page the caret (or an open header or footer) moved
+    /// onto (#2080), followed in y by that page's own `page_follow_el` once
+    /// the next layout has laid it out: the flow view's `doc_follow`, for
+    /// pages.
+    page_follow: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    /// The document views' scrollbars (#2080): one pair for the tab, as
+    /// Print Layout and the flow view never draw at once.
+    doc_vbar: doc_scrollbar::Bar,
+    doc_hbar: doc_scrollbar::Bar,
     // The frame's line-number counting state and harness record, shared by
     // the numbered rows' canvases in paint order (#746; LineProbe).
     line_probe: std::rc::Rc<std::cell::RefCell<line_numbers::LineProbe>>,
@@ -7059,17 +7069,81 @@ fn follow_y(view: Bounds<Pixels>, child: Bounds<Pixels>, y: Pixels) -> Pixels {
 /// to its left on every key. Called from a child's prepaint, after the
 /// scroll area recorded this layout's children; the move shows next frame.
 /// Whether it moved; nothing happens for a child the layout did not record.
-fn follow_item_y(handle: &ScrollHandle, ix: usize) -> bool {
+/// `view`: the part of the scroll area the child must be in, the handle's
+/// bounds less what an overlaid horizontal bar covers
+/// (`doc_scrollbar::clear_of_hbar`, #2080).
+fn follow_item_y(handle: &ScrollHandle, ix: usize, view: Bounds<Pixels>) -> bool {
     let Some(child) = handle.bounds_for_item(ix) else {
         return false;
     };
+    follow_bounds_y(handle, view, child)
+}
+
+/// Scroll `handle` in y so `child` (its unscrolled layout bounds) is in
+/// `view`: [`follow_item_y`] for a child given by its bounds. Whether it
+/// moved.
+fn follow_bounds_y(handle: &ScrollHandle, view: Bounds<Pixels>, child: Bounds<Pixels>) -> bool {
     let offset = handle.offset();
-    let y = follow_y(handle.bounds(), child, offset.y);
+    let y = follow_y(view, child, offset.y);
     if y == offset.y {
         return false;
     }
     handle.set_offset(point(offset.x, y));
     true
+}
+
+/// Print Layout's caret follow (#2080), drawn over page `page`: when
+/// `follow` names that page, its prepaint (after the scroll area set this
+/// layout's offset and extent) follows the page in y from where it is now
+/// laid out, shown the next frame. x is never moved: the view may be
+/// scrolled to a wide page's right. The pages are not the scroll area's own
+/// children, so the page's bounds are its own, not `bounds_for_item`'s.
+fn page_follow_el(
+    follow: &std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    handle: &ScrollHandle,
+    page: usize,
+) -> AnyElement {
+    let (follow, handle) = (follow.clone(), handle.clone());
+    canvas(
+        move |b: Bounds<Pixels>, window: &mut Window, _a: &mut App| {
+            if follow.get() == Some(page) {
+                follow.set(None);
+                // Laid out at the current offset: unscrolled, as `follow_y`
+                // reads the bounds a scroll handle records.
+                let offset = handle.offset();
+                let child = Bounds::new(point(b.origin.x, b.origin.y - offset.y), b.size);
+                // Print Layout's bars are beside the view, not over it.
+                if follow_bounds_y(&handle, handle.bounds(), child) {
+                    window.request_animation_frame();
+                }
+            }
+        },
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .size_full()
+    .into_any_element()
+}
+
+/// Each Print Layout page's top and bottom in the scroll area's content
+/// coordinates (its unscrolled top is 0), from the page rects the last
+/// frame painted, in order, up to the first not painted (#2080): the page
+/// tip's and `doc`'s `top_page`.
+fn print_page_spans(probe: &RulerProbe, handle: &ScrollHandle) -> Vec<(f32, f32)> {
+    let top = f32::from(handle.bounds().top()) + f32::from(handle.offset().y);
+    page_spans_from(&probe.pages, top)
+}
+
+/// Painted page rects as spans below `top`, the content's painted top (the
+/// scroll area's top plus its offset), up to the first page not painted.
+fn page_spans_from(pages: &[Option<ScreenRect>], top: f32) -> Vec<(f32, f32)> {
+    pages
+        .iter()
+        .map_while(|p| *p)
+        .map(|p| (p.y - top, p.y + p.h - top))
+        .collect()
 }
 
 #[cfg(test)]
@@ -7095,6 +7169,41 @@ mod follow_tests {
         assert_eq!(follow_y(view, rect(150., 50.), px(-300.)), px(-50.));
         // Taller than the view: its top.
         assert_eq!(follow_y(view, rect(300., 900.), px(0.)), px(-200.));
+    }
+
+    /// #2080: Print Layout follows the caret's page in y and keeps a
+    /// sideways scroll (gpui's scroll_to_item would put x back).
+    #[test]
+    fn a_followed_page_keeps_the_sideways_scroll() {
+        let handle = ScrollHandle::new();
+        handle.set_offset(point(px(-228.), px(0.)));
+        // The handle's view is not laid out (a 0 px view at 0): a page
+        // below it is followed to its top.
+        assert!(follow_bounds_y(&handle, handle.bounds(), rect(300., 50.)));
+        assert_eq!(handle.offset(), point(px(-228.), px(-300.)));
+        // In place now: nothing moves.
+        assert!(!follow_bounds_y(&handle, handle.bounds(), rect(300., 50.)));
+    }
+
+    /// #2080: the page tip's spans come from the painted page rects, in
+    /// content coordinates, up to the first page not painted.
+    #[test]
+    fn page_spans_are_the_painted_pages_below_the_content_top() {
+        let r = |y: f32, h: f32| {
+            Some(ScreenRect {
+                x: 0.,
+                y,
+                w: 816.,
+                h,
+            })
+        };
+        // The content's painted top at 100 (scrolled 500 under a view at 600).
+        let pages = [r(124., 1056.), r(1198., 1056.), None, r(3000., 10.)];
+        assert_eq!(
+            page_spans_from(&pages, 100.),
+            vec![(24., 1080.), (1098., 2154.)]
+        );
+        assert!(page_spans_from(&[], 0.).is_empty());
     }
 }
 
@@ -7171,14 +7280,12 @@ impl Docxy {
 /// The document's scroll area under the probe of its viewport, which the
 /// ruler and the harness read.
 ///
-/// `shrink`: the view is no wider than the window, whatever it holds (the
-/// flow view, #1895: a table wider than the view scrolls inside it). Print
-/// Layout passes false, so its area still widens to a sheet wider than the
-/// window, as it always has.
+/// The view is no wider than the window, whatever it holds: a table wider
+/// than the flow view scrolls inside it (#1895), and so does a Print Layout
+/// sheet wider than the window (#2080), which the area once widened to.
 fn ruler_scroll_view(
     scroll: AnyElement,
     probe: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
-    shrink: bool,
 ) -> AnyElement {
     v_flex()
         .relative()
@@ -7187,7 +7294,7 @@ fn ruler_scroll_view(
         .min_h(px(0.))
         // A flex item is at least as wide as its content unless told
         // otherwise.
-        .when(shrink, |d| d.min_w(px(0.)))
+        .min_w(px(0.))
         .child(scroll)
         .child(ruler_probe_el(probe, |state, rect| {
             state.viewport = Some(rect)
@@ -9618,6 +9725,28 @@ fn doc_line_point(block: usize, row: usize, end: bool) -> Option<Bounds<Pixels>>
         origin: point(x, y),
         size: size(px(0.), px(0.)),
     })
+}
+
+/// The painted piece the caret of `path` at `offset` is in or at the end
+/// of, as the last frame drew it (#2080): the harness's `caret_in_view`.
+fn caret_piece_bounds(path: &[usize], offset: usize) -> Option<Bounds<Pixels>> {
+    let words = DOC_WORDS.with(|d| {
+        d.borrow()
+            .iter()
+            .find(|(p, _)| p.as_slice() == path)
+            .map(|(_, w)| w.clone())
+    })?;
+    let words = words.borrow();
+    let sized = |w: &&WordSpan| {
+        let b = w.bounds();
+        b.size.width > px(0.) && b.size.height > px(0.)
+    };
+    words
+        .iter()
+        .filter(sized)
+        .find(|w| w.off <= offset && offset < w.off + w.len)
+        .or_else(|| words.iter().filter(sized).find(|w| w.off + w.len == offset))
+        .map(WordSpan::bounds)
 }
 
 /// A paragraph's painted pieces that have a size.
@@ -16737,6 +16866,9 @@ impl Docxy {
             painted_paras: PaintedParas::default(),
             drawn_pictures: pictures::DrawnPictures::default(),
             doc_follow: std::rc::Rc::default(),
+            page_follow: std::rc::Rc::default(),
+            doc_vbar: doc_scrollbar::Bar::default(),
+            doc_hbar: doc_scrollbar::Bar::default(),
             line_probe: std::rc::Rc::new(std::cell::RefCell::new(
                 line_numbers::LineProbe::default(),
             )),
@@ -19467,6 +19599,15 @@ impl Docxy {
             .ok_or_else(|| "the File screen is not open".to_string()),
             Region::DocLine { block, row, end } => doc_line_point(block, row, end)
                 .ok_or_else(|| format!("body paragraph {block} row {row} is not on screen")),
+            // The document's scrollbars as last painted (#2080).
+            Region::DocBar(name) => {
+                if !self.active_is_doc() {
+                    return Err(format!("{name}: the active tab is not a document"));
+                }
+                let part = name.strip_prefix("doc-").unwrap_or(name);
+                doc_scrollbar::bar_region(&self.doc_vbar, &self.doc_hbar, part)
+                    .map_err(|e| format!("{name}: {e}"))
+            }
             Region::Qat(name) => lookup(&self.probes.borrow(), name).ok_or_else(|| {
                 if name == "qat-redo-arrow" {
                     format!("{name} is not drawn: only a sheet tab draws it")
@@ -26344,9 +26485,11 @@ impl Docxy {
 
     /// Scroll the document so the caret's top-level block is in view (keyboard
     /// navigation/typing in a long document shouldn't let the caret drift off).
-    /// Print Layout's scroll children are pages, not blocks, so the caret's
-    /// block maps to its page first; a page already in view isn't re-aligned
-    /// (scroll_to_item would snap its top over the caret).
+    /// Print Layout draws pages (in one centring column), not blocks, so the
+    /// caret's block maps to its page first, and that page's own probe
+    /// (`page_follow_el`) follows it; a page already in view isn't
+    /// re-aligned (following it would snap its top over the caret). Both
+    /// views follow in y only, from the next layout (#1895, #2080).
     fn scroll_to_caret(&self) {
         if let Some(t) = self.tabs.get(self.active) {
             if let Surface::Doc(ed) = &t.surface {
@@ -26363,7 +26506,12 @@ impl Docxy {
                             page_needs_scroll(&probe, page)
                         };
                         if needs_scroll {
-                            self.doc_scroll.scroll_to_item(page);
+                            // In y only (#2080): Print Layout scrolls
+                            // sideways too, and gpui's scroll_to_item would
+                            // snap x back on every key. Followed once the
+                            // next layout has laid the page out (a page an
+                            // edit just made has no bounds before).
+                            self.page_follow.set(Some(page));
                         }
                     } else {
                         // The flow view scrolls sideways too (#1895): gpui's
@@ -27701,6 +27849,78 @@ impl Docxy {
                     }
                 }),
             )
+            .into_any_element()
+    }
+
+    /// Print Layout's pages for its page tip and `doc`'s `top_page`
+    /// (#2080), from the page rects the last frame painted.
+    pub(crate) fn print_pages(&self) -> doc_scrollbar::Pages {
+        let probe = self.ruler_probe.clone();
+        doc_scrollbar::Pages {
+            spans: std::rc::Rc::new(move |handle| print_page_spans(&probe.borrow(), handle)),
+        }
+    }
+
+    /// Print Layout's view with its scrollbars (#2080): each in a strip of
+    /// its own beside the pages, not over them (a page scrolled to its right
+    /// edge would sit under an overlaid bar), shown as `strip_decider`
+    /// decides both, with a corner square when both are. `view` is the scroll
+    /// area under its viewport probe, so the strips are not viewport.
+    fn print_bars(&self, view: AnyElement, cx: &App) -> AnyElement {
+        use doc_scrollbar::{BAR_PX, BarColors, Dir, Place, doc_scrollbar, strip_decider};
+        let colors = BarColors::of(cx);
+        let (v, h) = (self.doc_vbar.shown(), self.doc_hbar.shown());
+        let thick = |on: bool| px(if on { BAR_PX } else { 0. });
+        h_flex()
+            .flex_1()
+            .h_full()
+            .min_h(px(0.))
+            .min_w(px(0.))
+            .items_stretch()
+            .child(
+                v_flex()
+                    .flex_1()
+                    .h_full()
+                    .min_h(px(0.))
+                    .min_w(px(0.))
+                    .child(view)
+                    .child(div().flex_none().w_full().h(thick(h)).child(doc_scrollbar(
+                        &self.doc_scroll,
+                        Dir::Horizontal,
+                        &self.doc_hbar,
+                        Place::Strip { pages: None },
+                        colors,
+                    ))),
+            )
+            .child(
+                v_flex()
+                    .flex_none()
+                    .h_full()
+                    .w(thick(v))
+                    .child(div().flex_1().min_h(px(0.)).w_full().child(doc_scrollbar(
+                        &self.doc_scroll,
+                        Dir::Vertical,
+                        &self.doc_vbar,
+                        Place::Strip {
+                            pages: Some(self.print_pages()),
+                        },
+                        colors,
+                    )))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_full()
+                            .h(thick(v && h))
+                            .bg(colors.track()),
+                    ),
+            )
+            // Decides both strips for the next frame, from this one's
+            // scroll area (prepainted before it).
+            .child(strip_decider(
+                &self.doc_scroll,
+                &self.doc_vbar,
+                &self.doc_hbar,
+            ))
             .into_any_element()
     }
 
@@ -43850,6 +44070,7 @@ impl Render for Docxy {
                                             *slot = Some(rect);
                                         }
                                     }))
+                                    .child(page_follow_el(&self.page_follow, &self.doc_scroll, pi))
                                     .into_any_element()
                             })
                             .collect();
@@ -43861,26 +44082,43 @@ impl Render for Docxy {
                             let n = probe.entries.len();
                             probe.rows.resize(n, 0);
                         }
+                        // Both axes (#2080): a page wider than the view
+                        // scrolls sideways. The pages sit in a column at
+                        // least as wide as the view that centres them, so
+                        // one narrower than the view is centred and a
+                        // wider one starts at the left, where it can be
+                        // reached (auto margins, or centring in the scroll
+                        // area itself, would split its overflow and clip
+                        // its left). The caret follow and the page tip read
+                        // each page's painted rect, not the area's children.
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
                             .h_full()
                             .min_h(px(0.))
-                            .overflow_y_scroll()
+                            .overflow_scroll()
                             .bg(canvas)
-                            .items_center()
-                            .gap(px(18.))
+                            .items_start()
                             .py(px(24.))
-                            .children(sheets)
+                            .child(
+                                v_flex()
+                                    .flex_none()
+                                    .min_w_full()
+                                    .items_center()
+                                    .gap(px(18.))
+                                    .children(sheets),
+                            )
                             .into_any_element();
-                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe, false);
+                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
+                        let scroll_view = self.print_bars(scroll_view, cx);
                         if self.show_ruler {
                             h_flex()
                                 .flex_1()
                                 .h_full()
                                 .items_stretch()
                                 .min_h(px(0.))
+                                .min_w(px(0.))
                                 .child(self.vruler(pal))
                                 .child(scroll_view)
                                 .into_any_element()
@@ -43900,6 +44138,8 @@ impl Render for Docxy {
                             probe.hf_open = false;
                             probe.draft_column = None;
                             probe.painted = None;
+                            // Print Layout's caret follow is for its pages.
+                            self.page_follow.set(None);
                         }
                         // Draft/Web draws no numbers; drop last Print Layout
                         // frame's probe too so `doc {}` reports none (#746).
@@ -43935,6 +44175,7 @@ impl Render for Docxy {
                             .collect();
                         let probe = self.ruler_probe.clone();
                         let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
+                        let hbar = self.doc_hbar.clone();
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .relative()
@@ -43965,38 +44206,36 @@ impl Render for Docxy {
                                     state.draft_column = Some(ScreenRect::from_bounds(b));
                                     state.draft_text_w = Some(f32::from(b.size.width));
                                     if let Some(ix) = follow.take() {
-                                        if follow_item_y(&handle, ix) {
+                                        // Clear of the horizontal bar
+                                        // laid over the view's bottom.
+                                        let view = doc_scrollbar::clear_of_hbar(
+                                            handle.bounds(),
+                                            hbar.shown(),
+                                        );
+                                        if follow_item_y(&handle, ix, view) {
                                             window.request_animation_frame();
                                         }
                                     }
                                 },
                             )))
                             .into_any_element();
+                        // The bars lie over the view's right and bottom
+                        // edges (#2080), which keeps the text width; the
+                        // caret follow stays clear of the horizontal one.
                         let scroll = v_flex()
                             .relative()
                             .flex_1()
                             .h_full()
                             .min_h(px(0.))
                             .child(scroll)
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left_0()
-                                    .right_0()
-                                    .bottom_0()
-                                    .h(px(12.))
-                                    .child(
-                                        gpui_component::scroll::Scrollbar::horizontal(
-                                            &self.doc_scroll,
-                                        )
-                                        .id("doc-hscrollbar")
-                                        .scrollbar_show(
-                                            gpui_component::scroll::ScrollbarShow::Scrolling,
-                                        ),
-                                    ),
-                            )
+                            .children(doc_scrollbar::overlay_bars(
+                                &self.doc_scroll,
+                                &self.doc_vbar,
+                                &self.doc_hbar,
+                                doc_scrollbar::BarColors::of(cx),
+                            ))
                             .into_any_element();
-                        ruler_scroll_view(scroll, &self.ruler_probe, true)
+                        ruler_scroll_view(scroll, &self.ruler_probe)
                     }
                 }
                 Surface::Sheet(v) => sheet_el(

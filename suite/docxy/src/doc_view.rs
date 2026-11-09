@@ -28,7 +28,6 @@ pub use edit::{CaretFormat, DocFormat};
 use super::*;
 use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::package::Package;
-use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +138,9 @@ pub struct DocView {
     /// A key or host command moved the caret or edited: the next frame
     /// scrolls the caret into view, once it is painted.
     reveal: bool,
+    /// The view's scrollbars (#2080), the suite's document bars.
+    vbar: crate::doc_scrollbar::Bar,
+    hbar: crate::doc_scrollbar::Bar,
 }
 
 impl DocView {
@@ -183,6 +185,8 @@ impl DocView {
             editable: false,
             on_change: None,
             reveal: false,
+            vbar: Default::default(),
+            hbar: Default::default(),
         }
     }
 
@@ -796,6 +800,9 @@ impl DocView {
                 "max_scroll_x",
                 Json::Num(f64::from(self.max_scroll_x().round())),
             ),
+            // The scrollbars as last painted (#2080), `null` while hidden.
+            ("vbar", crate::doc_scrollbar::bar_json(&self.vbar)),
+            ("hbar", crate::doc_scrollbar::bar_json(&self.hbar)),
             (
                 "text_width",
                 self.text_w
@@ -877,7 +884,13 @@ impl DocView {
                     caret_piece(&self.words, &self.editor.caret),
                     self.viewport.get(),
                 ) {
-                    (Some(piece), Some(view)) => Json::Bool(reveal_dy(view, piece) == px(0.)),
+                    // Clear of the horizontal bar, as the reveal is.
+                    (Some(piece), Some(view)) => Json::Bool(
+                        reveal_dy(
+                            crate::doc_scrollbar::clear_of_hbar(view, self.hbar.shown()),
+                            piece,
+                        ) == px(0.),
+                    ),
                     _ => Json::Null,
                 },
             ),
@@ -934,6 +947,12 @@ impl DocView {
                 Some((bounds, text_end))
             })
         })
+    }
+
+    /// A scrollbar region (#2080): `vbar`, `hbar-thumb`, `vbar-down`, ...
+    /// ([`crate::doc_scrollbar::bar_region`]).
+    pub(crate) fn bar_region(&self, part: &str) -> Result<Bounds<Pixels>, String> {
+        crate::doc_scrollbar::bar_region(&self.vbar, &self.hbar, part)
     }
 
     /// The scrolling area's bounds as last painted.
@@ -1027,6 +1046,7 @@ impl Render for DocView {
             .collect();
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
+        let hbar = self.hbar.clone();
         let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
         let (column, painted_gen, doc_gen) =
             (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
@@ -1103,7 +1123,10 @@ impl Render for DocView {
                     // made among them.
                     move |b, _s, window, _a| {
                         if let Some(caret) = reveal {
-                            if reveal_caret(&words, &scroll, b, &caret) {
+                            // Clear of the horizontal bar over the view's
+                            // bottom (#2080).
+                            let view = crate::doc_scrollbar::clear_of_hbar(b, hbar.shown());
+                            if reveal_caret(&words, &scroll, view, &caret) {
                                 window.request_animation_frame();
                             }
                         }
@@ -1114,32 +1137,14 @@ impl Render for DocView {
                 .left_0()
                 .size_full(),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .w(px(12.))
-                    .child(
-                        Scrollbar::vertical(&self.scroll)
-                            .id("ext-doc-scrollbar")
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(px(12.))
-                    .child(
-                        Scrollbar::horizontal(&self.scroll)
-                            .id("ext-doc-hscrollbar")
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
-            )
+            // The suite's document bars (#2080), over the host's padding
+            // along the right and bottom edges.
+            .children(crate::doc_scrollbar::overlay_bars(
+                &self.scroll,
+                &self.vbar,
+                &self.hbar,
+                crate::doc_scrollbar::BarColors::of(cx),
+            ))
     }
 }
 
@@ -1388,7 +1393,7 @@ fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, care
         return caret
             .path
             .first()
-            .is_some_and(|&b| follow_item_y(scroll, b));
+            .is_some_and(|&b| follow_item_y(scroll, b, view));
     };
     let dy = reveal_dy(view, piece);
     if dy == px(0.) {
@@ -1922,6 +1927,11 @@ mod tests {
         assert_eq!(reveal_dy(view, rows(900., 20.)), px(-520.));
         // Taller than the view: its top.
         assert_eq!(reveal_dy(view, rows(120., 400.)), px(-20.));
+        // #2080 r3: a line in the view's bottom 12 px, under the
+        // horizontal bar while it is shown, comes up clear of it.
+        let clear = crate::doc_scrollbar::clear_of_hbar(view, true);
+        assert_eq!(reveal_dy(view, rows(385., 10.)), px(0.));
+        assert_eq!(reveal_dy(clear, rows(385., 10.)), px(-7.));
     }
 
     #[test]

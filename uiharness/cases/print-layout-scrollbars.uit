@@ -1,0 +1,146 @@
+# Print Layout's scrollbars (#2080): in a window narrower and shorter than
+# a page, a vertical bar shows at the document's right and a horizontal
+# one at its bottom. Dragging the vertical thumb to the end lands on the
+# last page, and an arrow press scrolls one line (40 px). The view scrolls
+# sideways instead of clipping the page: dragging the horizontal thumb to
+# its end brings page 1's right edge, and the right-aligned word at its
+# right margin, into view. A key keeps the sideways scroll, since the
+# caret is followed in y only. In a wide window the horizontal bar goes
+# and the page is centred whole. `doc`'s `scroll` reports the offsets, the
+# bars, the page at the top and what of page 1 and the caret is in view.
+# The fixture's first paragraph is `RIGHTMARGIN`, right-aligned; 13 page
+# breaks follow.
+
+test issue 2080 Print Layout shows both scrollbars, drags to the last page and scrolls to the page's right edge
+  open copy:../fixtures/fourteen-pages.docx
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  call window-size {"w":600,"h":500}
+  # The caret at the end of the right-aligned word, at page 1's right
+  # margin.
+  call real-key {"key":"ctrl+home"}
+  call real-key {"key":"end"}
+  shot window
+  call doc {}
+  assert reply.scroll.page_count is 14
+  assert reply.scroll.vbar is not null
+  assert reply.scroll.hbar is not null
+  assert reply.scroll.max_scroll_x is not 0
+  assert reply.scroll.scroll_x is 0
+  assert reply.scroll.scroll_y is 0
+  assert reply.scroll.top_page is 1
+  # Not clipped equally on both sides: the left edge shows, the right
+  # one and the word at the right margin are past the view.
+  assert reply.scroll.page_left_in_view is true
+  assert reply.scroll.page_right_in_view is false
+  assert reply.scroll.caret_in_view is false
+  assert reply.scroll.page_tip is null
+  # An arrow press scrolls one line.
+  call pointer-click {"region":"doc-vbar-down"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 40
+  # The thumb dragged to the end: the last page is at the top.
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-down"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is {doc.scroll.max_scroll_y}
+  assert reply.scroll.top_page is 14
+  # The tip went with the drag.
+  assert reply.scroll.page_tip is null
+  # And back to the top.
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-up"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 0
+  assert reply.scroll.top_page is 1
+  # The wheel over the bar's strip (beside the pages, outside the scroll
+  # area) scrolls the document too (#2080 r2).
+  call pointer-wheel {"region":"doc-vbar","dy":-120}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is not 0
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-up"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 0
+  # Sideways to the end: page 1's right edge and the word at its right
+  # margin are in view, its left edge is not.
+  call pointer-drag {"from":"doc-hbar-thumb","to":"doc-hbar-right"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.page_right_in_view is true
+  assert reply.scroll.page_left_in_view is false
+  assert reply.scroll.caret_in_view is true
+  # Keys keep the sideways scroll: the caret is followed in y only.
+  call real-key {"key":"left"}
+  call real-key {"key":"end"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.caret_in_view is true
+  # Keys that move the caret to another page follow it in y only: the
+  # last page comes to the top, and the sideways scroll is kept (page 14's
+  # text at its left margin may be off to the left; the page is in view).
+  call real-key {"key":"ctrl+end"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.scroll_y is not 0
+  assert reply.scroll.top_page is 14
+  call real-key {"key":"ctrl+home"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.top_page is 1
+  # A wide window: the page fits, so no horizontal bar, and it is centred.
+  call window-size {"w":1400,"h":500}
+  shot window
+  call doc {}
+  assert reply.scroll.hbar is null
+  assert reply.scroll.max_scroll_x is 0
+  assert reply.scroll.vbar is not null
+  assert reply.scroll.page_left_in_view is true
+  assert reply.scroll.page_right_in_view is true
+  assert reply.scroll.caret_in_view is true
+  # Web Layout uses the same bars, laid over its padding: the text is
+  # taller than the view, and nothing is wider. No page tip, no pages.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  shot window
+  call doc {}
+  assert reply.scroll.vbar is not null
+  assert reply.scroll.hbar is null
+  assert reply.scroll.page_count is null
+  assert reply.scroll.top_page is null
+  # From the top, an arrow press scrolls one line.
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-up"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 0
+  call pointer-click {"region":"doc-vbar-down"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 40
+
+  # Back in a narrow Print Layout, scrolled to the end and sideways: Edit
+  # Header follows the header's page (page 1, its only section's first) in
+  # y only, keeping the sideways scroll (#2080 r1: gpui's scroll_to_item
+  # reset x and missed the pages).
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  call window-size {"w":600,"h":500}
+  shot window
+  call pointer-drag {"from":"doc-hbar-thumb","to":"doc-hbar-right"}
+  call pointer-drag {"from":"doc-vbar-thumb","to":"doc-vbar-down"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.top_page is 14
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert ribbon_tab is Header & Footer
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_x is {doc.scroll.max_scroll_x}
+  assert reply.scroll.top_page is 1

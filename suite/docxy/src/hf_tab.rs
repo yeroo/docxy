@@ -1251,7 +1251,10 @@ impl Docxy {
     }
 
     /// Bring the page on which the open header or footer is edited into view
-    /// (after Previous, Next, Go to and the like move to another page).
+    /// (after Previous, Next, Go to and the like move to another page), in y
+    /// only and once the next layout has laid it out, as the caret's page
+    /// is (#2080): Print Layout scrolls sideways, and its pages are not the
+    /// scroll area's children, so gpui's scroll_to_item would miss them.
     pub(crate) fn scroll_to_hf(&self) {
         if !self.page_view {
             return;
@@ -1263,8 +1266,8 @@ impl Docxy {
             return;
         };
         let slots = tab_page_slots(tab, self.markup);
-        self.doc_scroll
-            .scroll_to_item(crate::hf::edit_page(&slots, h.section, h.variant));
+        self.page_follow
+            .set(Some(crate::hf::edit_page(&slots, h.section, h.variant)));
     }
 }
 
