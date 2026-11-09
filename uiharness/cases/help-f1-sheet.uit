@@ -1,0 +1,44 @@
+# F1 on a hovered sheet ribbon command (#1869): the command's page in the
+# Excel manual, by its `SheetCmd` id, else its ribbon tab's area page, else
+# the root. The runner installs the helpdocs excel fixture as this instance's
+# Excel manual: `excel` (the root) and `home` (area home, keys bold). Apart
+# from help-docs.uit, which needs no Excel manual installed. Each step closes
+# the Help tab it opened (Ctrl+W on it).
+manual excel ../../helpdocs/tests/fixture/excel
+
+test F1 with focus on a sheet ribbon command opens that command's page
+  open ../fixtures/basic.xlsx
+  call ribbon-layout {"tab":"Home"}
+  call pointer-move {"to":"ribbon-cmd:bold"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is excel
+  assert reply.page is home
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A Large command no page keys, on a tab with no area page of its own:
+  # View > New Window, the root.
+  call ribbon-layout {"tab":"View"}
+  call pointer-move {"to":"ribbon-cmd:newwindow"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is excel
+  assert reply.via is root
+  call real-key {"key":"ctrl+w"}
+  # The pointer on the grid, on no command: Home's area page.
+  call ribbon-layout {"tab":"Home"}
+  call pointer-move {"to":"cell:B3"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # The pointer left the window over Bold: no command, the area page.
+  call pointer-move {"to":"ribbon-cmd:bold"}
+  call pointer-leave {}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}

@@ -276,6 +276,93 @@ test the pages draw lists, tables, code, key chords and pictures, light and dark
   call theme-set {"theme":"auto"}
   call real-key {"key":"ctrl+w"}
 
+test F1 with focus on a ribbon command opens that command's page
+  # F1 with the pointer resting on a ribbon command opens its page, as Word
+  # opens a command's help from its ScreenTip (#1869): the command's id
+  # (`ribbon-cmd:<id>`), else its ribbon tab's area page. No ScreenTip has
+  # to be up. A small button, Home > Bold (home-font keys bold):
+  open copy:../fixtures/basic.docx
+  call ribbon-layout {"tab":"Home"}
+  call pointer-move {"to":"ribbon-cmd:bold"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is word
+  assert reply.page is home-font
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # The pointer on the document, on no command: the area page, as before.
+  call pointer-move {"to":"doc-line-start:0"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # A drop-down, Insert > Table, which a page keys (tables).
+  call ribbon-layout {"tab":"Insert"}
+  call pointer-move {"to":"ribbon-cmd:table"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is tables
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A Large button no page keys, Insert > Symbol: its area's page, never an
+  # error.
+  call pointer-move {"to":"ribbon-cmd:symbol"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is insert
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # Help > Help, a Large button, and the disabled Show Training: a greyed
+  # command has its page too.
+  call ribbon-layout {"tab":"Help"}
+  call pointer-move {"to":"ribbon-cmd:help"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is help
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  call pointer-move {"to":"ribbon-cmd:showtraining"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is help
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A command in an open group flyout: the window narrowed until Font
+  # collapses (settled as doc-font-box.uit does), its flyout open, Bold in
+  # it. F1 closes the flyout, as it did before.
+  call window-size {"w":520,"h":800}
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is collapsed
+  call ribbon-flyout {"action":"open","group":"Font"}
+  assert reply.open is true
+  call pointer-move {"to":"ribbon-cmd:bold"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home-font
+  assert reply.via is exact
+  call ribbon-flyout {}
+  assert reply.open is false
+  call real-key {"key":"ctrl+w"}
+  call window-size {"w":1180,"h":800}
+  # The pointer left the window over Bold: gpui keeps its last position,
+  # but no command is under a pointer that is not in the window.
+  call ribbon-layout {"tab":"Home"}
+  call pointer-move {"to":"ribbon-cmd:bold"}
+  call pointer-leave {}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # A command that is not drawn (Symbol is on Insert) cannot be aimed at.
+  call-error pointer-move {"to":"ribbon-cmd:symbol"} => the ribbon command symbol is not drawn
+
 test without a manual for the editor, Help and F1 still say it is coming
   open ../fixtures/basic.xlsx
   call ribbon-click {"tab":"Help","command":"Help"}
