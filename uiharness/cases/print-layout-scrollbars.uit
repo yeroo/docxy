@@ -80,3 +80,17 @@ test issue 2080 Print Layout shows both scrollbars, drags to the last page and s
   assert reply.scroll.page_left_in_view is true
   assert reply.scroll.page_right_in_view is true
   assert reply.scroll.caret_in_view is true
+  # Web Layout uses the same bars, laid over its padding: the text is
+  # taller than the view, and nothing is wider. No page tip, no pages.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  shot window
+  call doc {}
+  assert reply.scroll.vbar is not null
+  assert reply.scroll.hbar is null
+  assert reply.scroll.page_count is null
+  assert reply.scroll.top_page is null
+  call pointer-click {"region":"doc-vbar-down"}
+  shot window
+  call doc {}
+  assert reply.scroll.scroll_y is 40
