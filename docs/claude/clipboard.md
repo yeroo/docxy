@@ -87,4 +87,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   manager's `SelectionNotify` was lost that way about one run in five
   (`at_quit_our_copy_goes_to_the_clipboard_manager`); it now ends on
   `send_event(…).check()`, as `uiharness`'s `request_close` does. `Peer`
-  ends on a `DestroyNotify` it waits for, and `Reader` on a reply.
+  ends on a `DestroyNotify` it waits for, and a `Reader` read that succeeds
+  on a reply; one it gives up on leaves only requests on its own window,
+  which nobody waits for.
