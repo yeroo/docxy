@@ -208,6 +208,14 @@ pub struct OutboundAttachment {
     pub content_type: Option<String>,
     /// The bytes are in the row, not in a file (#1949).
     pub from_bytes: bool,
+    /// The Graph upload session a send opened for this attachment and has
+    /// not finished (#1941): a pre-authenticated url, so it is kept like
+    /// the message bodies, not like the OAuth tokens. A later attempt
+    /// resumes it only while `upload_digest` matches what it would upload.
+    pub upload_url: Option<String>,
+    /// The fingerprint of what the `upload_url` session uploads (name,
+    /// content type, content id and bytes, see `sync::outbox`), set with it.
+    pub upload_digest: Option<String>,
 }
 
 /// A `contacts` row — one per normalized (lowercased) email address, the
@@ -1295,6 +1303,16 @@ impl Store {
             [],
         );
         let _ = conn.execute("ALTER TABLE outbound_attachments ADD COLUMN data BLOB", []);
+        // Same idempotent-migration pattern, for the upload session a send
+        // opened (#1941). Older rows have none, so their next send opens one.
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN upload_url TEXT",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE outbound_attachments ADD COLUMN upload_digest TEXT",
+            [],
+        );
         // Same idempotent-migration pattern, for `outbox.send_posted` (#1874:
         // a `SendDraft` op's `/send` POST went out). On the open that adds
         // the column, every `SendDraft` an older engine left queued reads
@@ -2781,7 +2799,8 @@ impl Store {
         draft_id: &str,
     ) -> Result<Vec<OutboundAttachment>, StoreError> {
         let mut stmt = self.conn.prepare(concat!(
-            "SELECT path, name, size, uploaded, content_id, content_type, data IS NOT NULL
+            "SELECT path, name, size, uploaded, content_id, content_type, data IS NOT NULL,
+                    upload_url, upload_digest
              FROM outbound_attachments WHERE draft_id = ",
             current_id_sql!(),
             " ORDER BY rowid"
@@ -2796,6 +2815,8 @@ impl Store {
                     content_id: r.get(4)?,
                     content_type: r.get(5)?,
                     from_bytes: r.get(6)?,
+                    upload_url: r.get(7)?,
+                    upload_digest: r.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2817,7 +2838,8 @@ impl Store {
 
     /// Marks the file `path` of `draft_id` as already on the Graph draft
     /// (#1874), right after `SendDraft` uploaded it, so a resend after a
-    /// failed send does not upload it again. No-op if absent.
+    /// failed send does not upload it again. Its upload session (#1941) is
+    /// forgotten: it is done. No-op if absent.
     pub fn mark_outbound_attachment_uploaded(
         &self,
         draft_id: &str,
@@ -2825,11 +2847,35 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
-                "UPDATE outbound_attachments SET uploaded = 1 WHERE draft_id = ",
+                "UPDATE outbound_attachments
+                 SET uploaded = 1, upload_url = NULL, upload_digest = NULL
+                 WHERE draft_id = ",
                 current_id_sql!(),
                 " AND path = ?2"
             ),
             params![draft_id, path],
+        )?;
+        Ok(())
+    }
+
+    /// Records the upload session a send opened for the attachment `path`
+    /// of `draft_id` (#1941): `Some((upload_url, upload_digest))`, or `None`
+    /// to forget it (Graph refused it). No-op if absent.
+    pub fn set_outbound_attachment_upload_session(
+        &self,
+        draft_id: &str,
+        path: &str,
+        session: Option<(&str, &str)>,
+    ) -> Result<(), StoreError> {
+        let (url, digest) = session.unzip();
+        self.conn.execute(
+            concat!(
+                "UPDATE outbound_attachments SET upload_url = ?3, upload_digest = ?4
+                 WHERE draft_id = ",
+                current_id_sql!(),
+                " AND path = ?2"
+            ),
+            params![draft_id, path, url, digest],
         )?;
         Ok(())
     }
@@ -11073,6 +11119,54 @@ mod draft_tests {
     }
 
     #[test]
+    fn upload_session_is_stored_and_cleared_on_upload() {
+        // #1941: a send's upload session is kept on the row with its digest,
+        // follows the draft to its Graph id, and is gone once uploaded.
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.add_outbound_attachment(&id, "/tmp/a.pdf", "a.pdf", 10)
+            .unwrap();
+        s.add_outbound_attachment(&id, "/tmp/b.pdf", "b.pdf", 10)
+            .unwrap();
+        let session = |draft: &str, i: usize| {
+            let got = s.outbound_attachments(draft).unwrap();
+            (got[i].upload_url.clone(), got[i].upload_digest.clone())
+        };
+        assert_eq!(session(&id, 0), (None, None), "none before a send");
+
+        s.set_outbound_attachment_upload_session(&id, "/tmp/a.pdf", Some(("https://u/1", "10:ab")))
+            .unwrap();
+        s.set_outbound_attachment_upload_session(&id, "/tmp/b.pdf", Some(("https://u/2", "10:cd")))
+            .unwrap();
+        let want_a = (Some("https://u/1".to_string()), Some("10:ab".to_string()));
+        assert_eq!(session(&id, 0), want_a);
+
+        s.reconcile_id(&id, "GRAPH-1").unwrap();
+        assert_eq!(session("GRAPH-1", 0), want_a, "follows the Graph id");
+        assert_eq!(session(&id, 0), want_a, "the local id still reaches it");
+
+        // Forgotten (Graph refused it): both columns cleared.
+        s.set_outbound_attachment_upload_session(&id, "/tmp/b.pdf", None)
+            .unwrap();
+        assert_eq!(session("GRAPH-1", 1), (None, None));
+
+        // Uploaded: the session is done.
+        s.mark_outbound_attachment_uploaded("GRAPH-1", "/tmp/a.pdf")
+            .unwrap();
+        let got = s.outbound_attachments("GRAPH-1").unwrap();
+        assert!(got[0].uploaded);
+        assert_eq!(
+            (got[0].upload_url.clone(), got[0].upload_digest.clone()),
+            (None, None)
+        );
+
+        // An absent row is a no-op.
+        s.set_outbound_attachment_upload_session("GRAPH-1", "/tmp/z", Some(("u", "d")))
+            .unwrap();
+        assert_eq!(s.outbound_attachments("GRAPH-1").unwrap().len(), 2);
+    }
+
+    #[test]
     fn outbound_attachments_without_the_1949_columns_migrate() {
         let dir = std::env::temp_dir().join(format!(
             "mailcore-1949-migration-{}-{}",
@@ -11102,6 +11196,17 @@ mod draft_tests {
         assert_eq!(got[0].content_type, None);
         assert!(!got[0].from_bytes);
         assert!(got[0].uploaded, "the old flag is kept");
+        // #1941's columns are added too, and read as no session.
+        assert_eq!(got[0].upload_url, None);
+        assert_eq!(got[0].upload_digest, None);
+        s.set_outbound_attachment_upload_session("G", "/tmp/a.pdf", Some(("https://u", "1:ff")))
+            .unwrap();
+        assert_eq!(
+            s.outbound_attachments("G").unwrap()[0]
+                .upload_url
+                .as_deref(),
+            Some("https://u")
+        );
         // The new columns are usable on the migrated table.
         s.add_outbound_attachment_bytes("G", "p.png", "image/png", b"P", "pic1")
             .unwrap();
