@@ -2460,3 +2460,46 @@ series' first day.
   `calendar_initial_round_unchanged_master_keeps_a_far_occurrences_write`,
   `calendar_delta_master_fetch_throttled_writes_nothing`. Tests that read a series
   master's fields through `events_in_window` read it with `Store::event` now.
+
+## An event's own response time and created time (#2068)
+
+- `Event`/`NewEvent`/`EventRow` `response_time` is Graph's `responseStatus.time`, when
+  the signed-in user answered the event (a client's "Accepted on <time>"); `created_utc`
+  is `createdDateTime`, the meeting's "Sent" date. Both are canonical UTC
+  `YYYY-MM-DDTHH:MM:SSZ` (`graph::model::graph_utc_or_empty`: `graph_date_or_empty`
+  turns Graph's year-1 "never" into `""` first, as that time is otherwise readable, then
+  `reminder_time` drops any fraction and reads `""` for a numeric offset or garbage) and
+  `""` when absent. `AttendeeRow::response_time` stays the attendees' `status.time`
+  (#1983).
+- Stored in `events.response_time` / `events.created_utc` (`TEXT NOT NULL DEFAULT ''`,
+  added to an older database by `Store::init`'s #1983 column loop), written by
+  `upsert_event_on` on insert and `ON CONFLICT`, read by `EVENT_ROW_COLUMNS`.
+- Status and time are written, and corrected, together. `Store::set_event_response`
+  takes the time (`at`), so the store stays clock-free: the engine's `RespondEvent`
+  passes now, as Graph stamps it, and a host such as lookxy, which writes its RSVP before
+  it sends `RespondEvent`, passes its own now (`ui::calendar::now_utc`). A refused
+  `RespondEvent` writes nothing in the engine; a host's own write keeps both until the
+  reset round (#2013) puts Graph's back, as for the status. A quarantined op is
+  corrected the same way.
+- Occurrences take both from their master (`SERIES_FIELDS`, #2064): Graph's occurrence
+  shares the series' answer and creation time (an occurrence answered on its own is an
+  exception, never filled). The fill gate holds for them as for the status: an
+  untouched occurrence keeps its own pending RSVP time.
+- `Store::reconcile_created_event` writes both from the event Graph returned to
+  `CreateEvent`, so a meeting the user just sent has its "Sent" date at once; a
+  `local:` row has `''`.
+- No `$select` change: no calendar event read sends `$select` (`calendar_view*`,
+  calendarView delta, which refuses it, `event_instances`, `get_event`), so Graph's
+  default representation carries `createdDateTime` and `responseStatus`.
+- Tests: `model.rs` `event_own_response_time_and_created_utc`,
+  `event_response_time_never_and_absent_are_empty`; `store` `calendar_tests`
+  `event_response_time_and_created_utc_round_trip`, `set_event_response_flips_status`,
+  `reconcile_created_event_repoints_event_and_attendees`, the #2064 fill tests
+  (`assert_filled_from`, `apply_calendar_sync_fill_keeps_an_untouched_occurrences_local_write`,
+  `apply_calendar_sync_delta_master_change_refreshes_its_occurrences`), and
+  `events_without_1983_columns_migrate` (an old row reads `''`); `engine.rs`
+  `calendar_delta_stores_own_response_time_and_created_utc`,
+  `calendar_delta_occurrences_take_their_masters_fields`,
+  `respond_event_optimistically_flips_status_and_drains_to_accept`; lookxy
+  `ui::calendar` `accept_key_opens_a_comment_prompt_and_enter_submits_it_with_the_comment`,
+  `tentative_key_sets_the_tentative_status`.

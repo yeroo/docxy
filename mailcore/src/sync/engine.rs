@@ -342,8 +342,8 @@ pub enum SyncCommand {
     /// calendar is an `Error`, and the others carry on.
     FetchCalendarRange { from_utc: String, to_utc: String },
     /// Respond to a calendar event's invite: optimistic local
-    /// `Store::set_event_response` (immediately reflected, before Graph is
-    /// even reached) plus [`SyncEvent::CalendarUpdated`], then enqueue
+    /// `Store::set_event_response` (the status, and now as its response
+    /// time, #2068; immediately reflected, before Graph is even reached) plus [`SyncEvent::CalendarUpdated`], then enqueue
     /// [`crate::store::OutboxOp::RespondEvent`] and drain. `kind` is the
     /// response_status vocabulary `Store::set_event_response` accepts
     /// (`"accepted"`/`"declined"`/`"tentativelyAccepted"`); `comment` is an
@@ -1964,7 +1964,9 @@ impl Engine {
                 // Optimistic local write, same pattern as MarkRead/SetFlag/
                 // Move/Delete: reflect the RSVP immediately, before the
                 // outbox drain even reaches Graph.
-                self.store.set_event_response(&id, &kind);
+                // The response time is now, as Graph will stamp it (#2068).
+                self.store
+                    .set_event_response(&id, &kind, &unix_to_iso8601(now_unix()));
                 self.emit(SyncEvent::CalendarUpdated);
                 self.enqueue_and_drain(OutboxOp::RespondEvent {
                     id,
@@ -12033,7 +12035,8 @@ mod tests {
             "end":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
             "isAllDay":false,"location":{{"displayName":"Room 7"}},
             "organizer":{{"emailAddress":{{"name":"Ann","address":"ann@x"}}}},
-            "responseStatus":{{"response":"accepted"}},"showAs":"busy",
+            "responseStatus":{{"response":"accepted","time":"2026-07-01T09:30:00.25Z"}},
+            "createdDateTime":"2026-06-30T16:00:00.5Z","showAs":"busy",
             "isOnlineMeeting":true,"onlineMeetingProvider":"teamsForBusiness",
             "onlineMeeting":{{"joinUrl":"https://teams.microsoft.com/l/meetup-join/7"}},
             "body":{{"contentType":"html","content":"<p>series body</p>"}},
@@ -12147,6 +12150,9 @@ mod tests {
             assert_eq!(o.show_as, "busy");
             assert_eq!(o.join_url, "https://teams.microsoft.com/l/meetup-join/7");
             assert_eq!(o.response_status, "accepted");
+            // The user's answer to the series and its creation time (#2068).
+            assert_eq!(o.response_time, "2026-07-01T09:30:00Z");
+            assert_eq!(o.created_utc, "2026-06-30T16:00:00Z");
             let atts: Vec<String> = store
                 .event_attendees(id)
                 .unwrap()
@@ -12162,6 +12168,54 @@ mod tests {
         assert_eq!(store.event("X").unwrap().unwrap().subject, "Moved");
         // The master came with the round: nothing fetched.
         assert!(event_gets(&srv).is_empty(), "{:?}", event_gets(&srv));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2068: a calendarView delta round's event keeps the user's own
+    /// response time and the event's creation time, canonical; Graph's
+    /// "never" response time is `""`.
+    #[test]
+    fn calendar_delta_stores_own_response_time_and_created_utc() {
+        let event = |id: &str, from_now: i64, status: &str| {
+            format!(
+                r#"{{"id":"{id}","type":"singleInstance","subject":"Review",
+                "start":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
+                "end":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
+                "organizer":{{"emailAddress":{{"name":"Ann","address":"ann@x"}}}},
+                {status}}}"#,
+                graph_time_from_now(from_now),
+                graph_time_from_now(from_now + 1800),
+            )
+        };
+        let page = events_body(&[
+            event(
+                "E1",
+                3600,
+                r#""responseStatus":{"response":"accepted","time":"2026-08-13T19:19:00.0000000Z"},
+                   "createdDateTime":"2026-08-01T08:00:05.1234567Z""#,
+            ),
+            event(
+                "E2",
+                7200,
+                r#""responseStatus":{"response":"notResponded","time":"0001-01-01T00:00:00Z"},
+                   "createdDateTime":"2026-08-02T10:11:12Z""#,
+            ),
+        ]);
+        let routes = calendar_routes(&[("CAL-A", true, "me@x")], vec![("CAL-A", 200, page)]);
+        let (_srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-own-response-time", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        let e1 = store.event("E1").unwrap().unwrap();
+        assert_eq!(e1.response_status, "accepted");
+        assert_eq!(e1.response_time, "2026-08-13T19:19:00Z");
+        assert_eq!(e1.created_utc, "2026-08-01T08:00:05Z");
+        let e2 = store.event("E2").unwrap().unwrap();
+        assert_eq!(e2.response_time, "", "Graph's year-1 time is never");
+        assert_eq!(e2.created_utc, "2026-08-02T10:11:12Z");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12803,7 +12857,7 @@ mod tests {
                     ..stored_minimal("O-FAR", "SM", "CAL-A", 200 * DAY)
                 })
                 .unwrap();
-                s.set_event_response("O-FAR", "tentative");
+                s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
                 s.clear_calendar_deltas().unwrap();
             });
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
@@ -16187,6 +16241,7 @@ mod tests {
             |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1"),
         );
 
+        let before = now_unix();
         handle
             .cmd_tx
             .send(SyncCommand::RespondEvent {
@@ -16207,6 +16262,15 @@ mod tests {
             .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
             .unwrap();
         assert_eq!(rows[0].response_status, "accepted");
+        // ...stamped with the time of the response, as Graph will (#2068).
+        let after = now_unix();
+        let at = crate::store::iso8601_to_unix_secs(&rows[0].response_time)
+            .unwrap_or_else(|| panic!("not canonical: {:?}", rows[0].response_time));
+        assert_eq!(rows[0].response_time, unix_to_iso8601(at as u64));
+        assert!(
+            (before as i64..=after as i64).contains(&at),
+            "{before} <= {at} <= {after}"
+        );
 
         // The drain reaches Graph too.
         if !wait_until(ENGINE_WAIT, || {

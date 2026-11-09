@@ -503,6 +503,12 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// Now as the store's canonical UTC string (`YYYY-MM-DDTHH:MM:SSZ`): the
+/// time an optimistic RSVP is stamped with (#2068), as Graph will.
+pub(crate) fn now_utc() -> String {
+    unix_to_iso8601(unix_now())
+}
+
 /// Parses one of the store's fixed-width `YYYY-MM-DDTHH:MM:SSZ` UTC strings
 /// into a Unix timestamp. Bounds/format-safe: any malformed or short input
 /// (never expected in practice — every `start_utc`/`end_utc` the store hands
@@ -1085,6 +1091,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         app.sync.cmd_tx = cmd_tx;
 
+        let before = unix_now();
         crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
         assert!(
             app.rsvp_prompt.is_some(),
@@ -1106,8 +1113,13 @@ mod tests {
             .find(|e| e.id == id)
             .unwrap();
         assert_eq!(row.response_status, "accepted");
+        // ...stamped with the time it was given (#2068), canonical UTC.
+        let at = parse_iso_utc(&row.response_time);
+        assert_eq!(row.response_time, unix_to_iso8601(at), "canonical");
+        assert!((before..=unix_now()).contains(&at), "{}", row.response_time);
         // The agenda (and therefore the rendered glyph) reflects it too.
         assert_eq!(app.agenda[0].response_status, "accepted");
+        assert_eq!(app.agenda[0].response_time, row.response_time);
 
         match cmd_rx.try_recv() {
             Ok(SyncCommand::RespondEvent {
@@ -1172,6 +1184,8 @@ mod tests {
         crate::ui::handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
 
         assert_eq!(app.agenda[0].response_status, "tentativelyAccepted");
+        let at = &app.agenda[0].response_time;
+        assert_eq!((at.len(), at.ends_with('Z')), (20, true), "{at}");
     }
 
     #[test]

@@ -734,6 +734,11 @@ pub struct EventRow {
     pub organizer_name: String,
     pub organizer_addr: String,
     pub response_status: String,
+    /// When the user answered (`responseStatus.time`) and when the event was
+    /// created (`createdDateTime`), canonical UTC or `""` (#2068); see
+    /// `graph::model::Event`.
+    pub response_time: String,
+    pub created_utc: String,
     pub series_master_id: Option<String>,
     pub reminder_minutes: i64,
     pub is_reminder_on: bool,
@@ -773,6 +778,8 @@ impl Default for EventRow {
             organizer_name: String::new(),
             organizer_addr: String::new(),
             response_status: String::new(),
+            response_time: String::new(),
+            created_utc: String::new(),
             series_master_id: None,
             reminder_minutes: 0,
             is_reminder_on: false,
@@ -909,6 +916,11 @@ pub struct NewEvent {
     pub organizer_name: String,
     pub organizer_addr: String,
     pub response_status: String,
+    /// When the user answered (`responseStatus.time`) and when the event was
+    /// created (`createdDateTime`), canonical UTC or `""` (#2068); see
+    /// `graph::model::Event`.
+    pub response_time: String,
+    pub created_utc: String,
     pub series_master_id: Option<String>,
     pub body_preview: String,
     pub web_link: String,
@@ -952,6 +964,8 @@ impl Default for NewEvent {
             organizer_name: String::new(),
             organizer_addr: String::new(),
             response_status: String::new(),
+            response_time: String::new(),
+            created_utc: String::new(),
             series_master_id: None,
             body_preview: String::new(),
             web_link: String::new(),
@@ -1009,6 +1023,8 @@ impl From<&Event> for NewEvent {
             organizer_name: e.organizer_name.clone(),
             organizer_addr: e.organizer_addr.clone(),
             response_status: e.response_status.clone(),
+            response_time: e.response_time.clone(),
+            created_utc: e.created_utc.clone(),
             series_master_id: e.series_master_id.clone(),
             body_preview: e.body_preview.clone(),
             web_link: e.web_link.clone(),
@@ -1263,6 +1279,9 @@ impl Store {
             "send_start_local TEXT NOT NULL DEFAULT ''",
             "send_end_tz TEXT NOT NULL DEFAULT ''",
             "send_end_local TEXT NOT NULL DEFAULT ''",
+            // The user's own response time and the creation time (#2068).
+            "response_time TEXT NOT NULL DEFAULT ''",
+            "created_utc TEXT NOT NULL DEFAULT ''",
         ] {
             let _ = conn.execute(&format!("ALTER TABLE events ADD COLUMN {column}"), []);
         }
@@ -4050,8 +4069,9 @@ impl Store {
     /// (mirrors `reconcile_id` for drafts) and writes back what only Graph
     /// decides on a create (#1994), in one transaction: the reminder (the
     /// host's, or the mailbox default when it set none), and an online
-    /// meeting's join link and provider when Graph returned them. Clears
-    /// `reminder_unset`, so a Graph-id row never keeps it.
+    /// meeting's join link and provider when Graph returned them, and its
+    /// creation and response times (#2068). Clears `reminder_unset`, so a
+    /// Graph-id row never keeps it.
     pub fn reconcile_created_event(
         &self,
         local_id: &str,
@@ -4072,6 +4092,13 @@ impl Store {
             "UPDATE events SET is_reminder_on = ?2, reminder_minutes = ?3, reminder_unset = 0
              WHERE id = ?1",
             params![graph_id, created.is_reminder_on, created.reminder_minutes],
+        )?;
+        // Graph's creation time (#2068): a just-sent meeting shows its
+        // "Sent" date at once, not after a delta round names it. An
+        // organizer's response time is Graph's "never", `''`.
+        tx.execute(
+            "UPDATE events SET created_utc = ?2, response_time = ?3 WHERE id = ?1",
+            params![graph_id, created.created_utc, created.response_time],
         )?;
         set_event_online_meeting_on(
             &tx,
@@ -4096,13 +4123,17 @@ impl Store {
     }
 
     /// Locally sets an event's RSVP response status (`"accepted"`,
-    /// `"declined"`, `"tentativelyAccepted"`, ...) — the optimistic half of
-    /// an RSVP a later task's outbox will push to Graph. See `set_read` for
-    /// why this doesn't return a `Result`.
-    pub fn set_event_response(&self, id: &str, status: &str) {
+    /// `"declined"`, `"tentativelyAccepted"`, ...) and when it was given
+    /// (`at`, canonical UTC, #2068: Graph's `responseStatus.time` is the time
+    /// of the response) — the optimistic half of an RSVP the outbox pushes to
+    /// Graph. Status and time are written together, so the row never shows an
+    /// answer with another answer's time. The caller passes the time, which
+    /// keeps the store clock-free. See `set_read` for why this doesn't return
+    /// a `Result`.
+    pub fn set_event_response(&self, id: &str, status: &str, at: &str) {
         let _ = self.conn.execute(
-            "UPDATE events SET response_status = ?1 WHERE id = ?2",
-            params![status, id],
+            "UPDATE events SET response_status = ?1, response_time = ?3 WHERE id = ?2",
+            params![status, id, at],
         );
     }
 
@@ -5218,7 +5249,7 @@ const EVENT_ROW_COLUMNS: &str = "id, subject, start_utc, end_utc, is_all_day, lo
     online_meeting_provider, join_url, categories, sensitivity, importance,
     event_type, graph_recurrence, is_cancelled, is_organizer,
     response_requested, allow_new_time_proposals, has_attachments,
-    original_start_tz, original_end_tz, calendar_id";
+    original_start_tz, original_end_tz, calendar_id, response_time, created_utc";
 
 /// The rows a calendar grid draws (#2064), for `events_in_window` and
 /// `events_in_range` (whose `FROM events` it names): a series master is
@@ -5265,6 +5296,8 @@ fn event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
         original_start_time_zone: row.get(26)?,
         original_end_time_zone: row.get(27)?,
         calendar_id: row.get(28)?,
+        response_time: row.get(29)?,
+        created_utc: row.get(30)?,
     })
 }
 
@@ -5526,7 +5559,7 @@ const BLANK_OCCURRENCE: &str = "subject = '' AND organizer_name = '' AND organiz
 /// its own identity, times, links and body (`event_body_on` refers to the
 /// master's instead of copying it).
 const SERIES_FIELDS: &str = "subject, location, organizer_name, organizer_addr,
-    response_status, body_preview, is_all_day, reminder_minutes, is_reminder_on, show_as,
+    response_status, response_time, created_utc, body_preview, is_all_day, reminder_minutes, is_reminder_on, show_as,
     is_online_meeting, online_meeting_provider, join_url, categories, sensitivity,
     importance, is_cancelled, is_organizer, response_requested, allow_new_time_proposals,
     has_attachments, original_start_tz, original_end_tz";
@@ -6248,10 +6281,10 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
              categories, sensitivity, importance, event_type, graph_recurrence,
              is_cancelled, is_organizer, response_requested,
              allow_new_time_proposals, has_attachments, original_start_tz,
-             original_end_tz, calendar_id
+             original_end_tz, calendar_id, response_time, created_utc
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                    ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
-                   ?31, ?32, ?33)
+                   ?31, ?32, ?33, ?34, ?35)
          ON CONFLICT(id) DO UPDATE SET
              subject = excluded.subject,
              start_utc = excluded.start_utc,
@@ -6284,7 +6317,9 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
              has_attachments = excluded.has_attachments,
              original_start_tz = excluded.original_start_tz,
              original_end_tz = excluded.original_end_tz,
-             calendar_id = excluded.calendar_id",
+             calendar_id = excluded.calendar_id,
+             response_time = excluded.response_time,
+             created_utc = excluded.created_utc",
         params![
             e.id,
             e.subject,
@@ -6322,6 +6357,8 @@ fn upsert_event_on(conn: &Connection, e: &NewEvent) -> Result<(), StoreError> {
             e.original_start_time_zone,
             e.original_end_time_zone,
             e.calendar_id,
+            e.response_time,
+            e.created_utc,
         ],
     )?;
     Ok(())
@@ -8524,11 +8561,47 @@ mod calendar_tests {
         let s = Store::open_in_memory().unwrap();
         s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
             .unwrap();
-        s.set_event_response("1", "accepted");
+        s.set_event_response("1", "accepted", "2026-08-13T19:19:00Z");
         let rows = s
             .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
             .unwrap();
         assert_eq!(rows[0].response_status, "accepted");
+        // ...with the time it was given (#2068).
+        assert_eq!(rows[0].response_time, "2026-08-13T19:19:00Z");
+        s.set_event_response("1", "declined", "2026-08-14T07:00:00Z");
+        let row = s.event("1").unwrap().unwrap();
+        assert_eq!(row.response_status, "declined");
+        assert_eq!(row.response_time, "2026-08-14T07:00:00Z");
+    }
+
+    #[test]
+    fn event_response_time_and_created_utc_round_trip() {
+        // #2068: both columns are written on insert, read back by `event`
+        // and `events_in_window`, and replaced by a later upsert.
+        let s = Store::open_in_memory().unwrap();
+        let mut e = ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z");
+        e.response_time = "2026-07-10T08:30:00Z".into();
+        e.created_utc = "2026-07-01T12:00:05Z".into();
+        s.upsert_event(&e).unwrap();
+        let row = s.event("1").unwrap().unwrap();
+        assert_eq!(row.response_time, "2026-07-10T08:30:00Z");
+        assert_eq!(row.created_utc, "2026-07-01T12:00:05Z");
+        let rows = s
+            .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows[0].response_time, "2026-07-10T08:30:00Z");
+        assert_eq!(rows[0].created_utc, "2026-07-01T12:00:05Z");
+        // The `ON CONFLICT` update path.
+        e.response_time = "2026-07-11T09:00:00Z".into();
+        e.created_utc = "2026-07-02T00:00:00Z".into();
+        s.upsert_event(&e).unwrap();
+        let row = s.event("1").unwrap().unwrap();
+        assert_eq!(row.response_time, "2026-07-11T09:00:00Z");
+        assert_eq!(row.created_utc, "2026-07-02T00:00:00Z");
+        // Graph's "never" arrives as `""` and clears a stored time.
+        e.response_time = String::new();
+        s.upsert_event(&e).unwrap();
+        assert_eq!(s.event("1").unwrap().unwrap().response_time, "");
     }
 
     #[test]
@@ -8989,14 +9062,21 @@ mod calendar_tests {
         let id = s
             .create_local_event(&sample_fields(), "Me", "me@x")
             .unwrap();
+        let local = s.event(&id).unwrap().unwrap();
+        assert_eq!(local.created_utc, "", "a local event has no Graph time");
         let created = Event {
             id: "EV1".into(),
+            created_utc: "2026-08-01T08:00:05Z".into(),
             ..Event::default()
         };
         s.reconcile_created_event(&id, &created).unwrap();
         assert!(s.event_for_send(&id).unwrap().is_none()); // old id gone
         let send = s.event_for_send("EV1").unwrap().unwrap(); // under graph id
         assert_eq!(send.attendees.len(), 1); // attendees moved too
+        // Graph's creation time is kept at once (#2068): the "Sent" date.
+        let row = s.event("EV1").unwrap().unwrap();
+        assert_eq!(row.created_utc, "2026-08-01T08:00:05Z");
+        assert_eq!(row.response_time, "");
     }
 
     #[test]
@@ -11505,6 +11585,8 @@ mod calendar_tests {
             organizer_name: "Ann".into(),
             organizer_addr: "ann@x".into(),
             response_status: "accepted".into(),
+            response_time: "2026-07-01T09:30:00Z".into(),
+            created_utc: "2026-06-30T16:00:00Z".into(),
             body_preview: "Daily".into(),
             body_html: "<p>Join the standup</p>".into(),
             reminder_minutes: 10,
@@ -11616,6 +11698,9 @@ mod calendar_tests {
         assert_eq!(o.organizer_name, m.organizer_name);
         assert_eq!(o.organizer_addr, m.organizer_addr);
         assert_eq!(o.response_status, m.response_status);
+        // The user's answer to the series and its creation time (#2068).
+        assert_eq!(o.response_time, m.response_time);
+        assert_eq!(o.created_utc, m.created_utc);
         assert_eq!(o.is_all_day, m.is_all_day);
         assert_eq!(o.reminder_minutes, m.reminder_minutes);
         assert_eq!(o.is_reminder_on, m.is_reminder_on);
@@ -11639,6 +11724,8 @@ mod calendar_tests {
     fn apply_calendar_sync_fills_occurrences_from_their_master() {
         let s = series_store();
         let m = row(&s, "M");
+        assert_eq!(m.response_time, "2026-07-01T09:30:00Z");
+        assert_eq!(m.created_utc, "2026-06-30T16:00:00Z");
         for id in ["O1", "O2"] {
             let o = row(&s, id);
             assert_filled_from(&o, &m);
@@ -11688,7 +11775,7 @@ mod calendar_tests {
     fn apply_calendar_sync_fill_keeps_an_untouched_occurrences_local_write() {
         let s = series_store();
         // An optimistic RSVP on O1, its op not yet sent.
-        s.set_event_response("O1", "declined");
+        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z");
         // A round that touches neither O1 nor M keeps it; O2, re-sent
         // minimal, is filled again.
         s.apply_calendar_sync(
@@ -11710,18 +11797,21 @@ mod calendar_tests {
         )
         .unwrap();
         assert_eq!(row(&s, "O1").response_status, "declined");
+        // ...with its own response time (#2068), not the master's.
+        assert_eq!(row(&s, "O1").response_time, "2026-08-13T19:19:00Z");
         assert_filled_from(&row(&s, "O2"), &row(&s, "M"));
         assert_eq!(addrs(&s, "O2"), ["ann@x", "bob@x"]);
         // An empty round too.
         s.apply_calendar_sync(FROM, TO, &[delta("A", vec![], &[], "L3")], STAMP)
             .unwrap();
         assert_eq!(row(&s, "O1").response_status, "declined");
+        assert_eq!(row(&s, "O1").response_time, "2026-08-13T19:19:00Z");
     }
 
     #[test]
     fn apply_calendar_sync_delta_master_change_refreshes_its_occurrences() {
         let s = series_store();
-        s.set_event_response("O1", "declined");
+        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z");
         let changed = NewEvent {
             subject: "Renamed".into(),
             location: "Room 2".into(),
@@ -11738,8 +11828,10 @@ mod calendar_tests {
             );
             assert_eq!(addrs(&s, id), ["cid@x"]);
         }
-        // Server truth for the series wins over the pending write.
+        // Server truth for the series wins over the pending write, its
+        // response time with it (#2068).
         assert_eq!(row(&s, "O1").response_status, "accepted");
+        assert_eq!(row(&s, "O1").response_time, "2026-07-01T09:30:00Z");
     }
 
     /// The issue's store: occurrences stored blank before #2064, beside
@@ -12283,7 +12375,7 @@ mod calendar_tests {
         // not yet sent.
         s.upsert_event(&minimal("O-FAR", "M", "A", far.0, far.1))
             .unwrap();
-        s.set_event_response("O-FAR", "tentative");
+        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
         let next_day =
             |master: NewEvent| window("A", vec![master, minimal("O1", "M", "A", M_START, M_END)]);
         s.apply_calendar_sync(
@@ -12313,7 +12405,7 @@ mod calendar_tests {
             ("Renamed", "accepted")
         );
         // A master with no `last_modified` counts as changed.
-        s.set_event_response("O-FAR", "tentative");
+        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
         s.apply_calendar_sync(FROM, TO, &[next_day(m("", "Renamed"))], STAMP)
             .unwrap();
         assert_eq!(row(&s, "O-FAR").response_status, "accepted");

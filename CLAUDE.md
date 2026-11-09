@@ -130,6 +130,7 @@ issue number to find its notes.
   server message search and opening a hit not in the store (#2006),
   a message's list row by id, batched, without its body (#2053),
   a flagged message's reminder, read, stored, snoozed and dismissed (#2054),
+  an event's own response time and created time (#2068),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 
