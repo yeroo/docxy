@@ -52,7 +52,7 @@ use crate::graph::client::{
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
-    MeetingMessageType, Message, Recipient, ScheduleEntry, SearchHit,
+    MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry, SearchHit,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -451,6 +451,27 @@ pub enum SyncCommand {
         id: String,
         new_reminder_utc: String,
     },
+    /// Dismiss a flagged message's Outlook reminder (#2054): turn it off in
+    /// the store at once (`Store::dismiss_message_reminder`), then queue
+    /// [`crate::store::OutboxOp::DismissMessageReminder`] (a PATCH of
+    /// `PidLidReminderSet` to false) and drain. `id` may be one the message
+    /// had before a move (#1896): it is resolved first, and again when the
+    /// op drains. A `local:` id is a [`SyncEvent::Error`] and nothing is
+    /// written or queued. Dedupe and refusals are `DismissReminder`'s, with
+    /// one difference, as this op wrote the store: after a refusal other
+    /// than a 404 or a 5xx the message is read again from Graph, so the row
+    /// shows the reminder Graph kept.
+    DismissMessageReminder { id: String },
+    /// Snooze a flagged message's Outlook reminder until `new_reminder_utc`
+    /// (#2054): move its next signal in the store at once
+    /// (`Store::snooze_message_reminder`), then queue
+    /// [`crate::store::OutboxOp::SnoozeMessageReminder`] (a PATCH of
+    /// `PidLidReminderSignalTime`) and drain, as `DismissMessageReminder`
+    /// does. The time is checked and normalised as `SnoozeReminder`'s.
+    SnoozeMessageReminder {
+        id: String,
+        new_reminder_utc: String,
+    },
     /// Open "the series" (#2022): GET the series master
     /// (`GraphClient::get_event`, with its `recurrence`), which
     /// `calendarView` never lists, and emit [`SyncEvent::EventSeriesFetched`].
@@ -791,6 +812,10 @@ struct DeltaRun {
     walked: u64,
     new_ids: Vec<String>,
     stopped: bool,
+    /// The walk's pages were read without the reminder `$expand` (#2054):
+    /// its first call's was refused, or it ran on a stored link whose walk
+    /// was (`Store::reminder_expand_refused`). Stored with its link.
+    expand_refused: bool,
 }
 
 /// What `Engine::background_body` did with one id.
@@ -837,6 +862,27 @@ fn reminder_op_event(op: &OutboxOp) -> Option<&str> {
         OutboxOp::DismissReminder { id } | OutboxOp::SnoozeReminder { id, .. } => Some(id),
         _ => None,
     }
+}
+
+/// The message a message reminder op (#2054) names, as it was queued;
+/// `None` for every other op.
+fn message_reminder_op_id(op: &OutboxOp) -> Option<&str> {
+    match op {
+        OutboxOp::DismissMessageReminder { id } | OutboxOp::SnoozeMessageReminder { id, .. } => {
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
+/// What a reminder op is deduped against (#2025, #2054): the event an
+/// event reminder op names, or the message a message reminder op names,
+/// as it is stored now (`current_id`, so an op queued before a move still
+/// matches). An event and a message never match.
+#[derive(Debug, PartialEq, Eq)]
+enum ReminderTarget {
+    Event(String),
+    Message(String),
 }
 
 /// An event op whose command wrote the store first (an RSVP, edited
@@ -1034,9 +1080,14 @@ pub(crate) fn spawn_with_bases(
     )
 }
 
-/// [`spawn_with_bases`] with the engine's [`EngineOptions`].
+/// [`spawn_with_bases`] with the engine's [`EngineOptions`]. Public but
+/// hidden from the docs (#2054): the test seam for
+/// [`crate::testserver`], so a crate built on mailcore can point the whole
+/// engine (Graph and auth) at a `FakeServer`'s `base_url` in its own tests.
+/// Hosts use [`spawn`] or [`spawn_with_options`].
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_with_bases_and_options(
+pub fn spawn_with_bases_and_options(
     store_path: PathBuf,
     token_path: PathBuf,
     cfg: AuthConfig,
@@ -1795,6 +1846,11 @@ impl Engine {
                 id,
                 new_reminder_utc,
             } => self.snooze_reminder(id, new_reminder_utc),
+            SyncCommand::DismissMessageReminder { id } => self.dismiss_message_reminder(id),
+            SyncCommand::SnoozeMessageReminder {
+                id,
+                new_reminder_utc,
+            } => self.snooze_message_reminder(id, new_reminder_utc),
             SyncCommand::FetchEventSeries { id } => self.fetch_event_series(id),
             SyncCommand::FetchEventInstances {
                 id,
@@ -2245,10 +2301,16 @@ impl Engine {
                     .complete_backfill(folder_id, &delta, scope, run.walked as i64)
                     .is_ok()
                 {
+                    let _ = self
+                        .store
+                        .set_reminder_expand_refused(folder_id, run.expand_refused);
                     self.emit_progress(folder_id, run.walked, true);
                 }
-            } else {
-                let _ = self.store.set_head_link(folder_id, &delta);
+            } else if self.store.set_head_link(folder_id, &delta).is_ok() {
+                // The mark follows the link now stored (#2054): 1 or 0.
+                let _ = self
+                    .store
+                    .set_reminder_expand_refused(folder_id, run.expand_refused);
             }
         }
         self.emit(SyncEvent::MessagesUpdated {
@@ -2281,9 +2343,27 @@ impl Engine {
     ) -> Result<DeltaRun, GraphError> {
         let mut walked = 0;
         let mut new_ids = Vec::new();
+        // A round on a stored link follows the walk that minted it; a first
+        // call's walk follows its own first page (#2054). A store error
+        // reads as refused, which only keeps reminders.
+        let mut expand_refused = match &cursor {
+            DeltaCursor::Link(_) => self
+                .store
+                .reminder_expand_refused(folder_id)
+                .unwrap_or(true),
+            _ => false,
+        };
         loop {
             let page = self.with_auth(|c| c.delta(cursor.clone()))?;
-            walked += self.merge_delta_items(folder_id, &page.items, cutoff, protect, &mut new_ids);
+            expand_refused |= page.expand_refused;
+            walked += self.merge_delta_items(
+                folder_id,
+                &page.items,
+                cutoff,
+                protect,
+                expand_refused,
+                &mut new_ids,
+            );
             match page.next_link {
                 Some(next) => {
                     if !self.checkpoint() {
@@ -2292,6 +2372,7 @@ impl Engine {
                             walked,
                             new_ids,
                             stopped: true,
+                            expand_refused,
                         });
                     }
                     cursor = DeltaCursor::Link(next);
@@ -2302,6 +2383,7 @@ impl Engine {
                         walked,
                         new_ids,
                         stopped: false,
+                        expand_refused,
                     });
                 }
             }
@@ -2332,12 +2414,18 @@ impl Engine {
     /// of upserts that were not stored before go to `new_ids` (#1978): the
     /// new mail, whose bodies the round fetches. This thread is the only
     /// writer of delta rows, so the check right before the write holds.
+    ///
+    /// With `unasked` (#2054) the page's walk was read without the
+    /// reminder `$expand` (its first call's refused, or a link minted from
+    /// such a call): every upsert is merged `MessageFields::reminder_unasked`,
+    /// so its lack of the reminder keeps the stored one.
     fn merge_delta_items(
         &self,
         folder_id: &str,
         items: &[DeltaItem],
         cutoff: Option<&str>,
         protect: Option<&[String]>,
+        unasked: bool,
         new_ids: &mut Vec<String>,
     ) -> u64 {
         let note_new = self.config.options.prefetch_body_days > 0;
@@ -2345,6 +2433,16 @@ impl Engine {
         for item in items {
             match item {
                 DeltaItem::Upsert(m, fields) => {
+                    let marked;
+                    let fields = if unasked {
+                        marked = MessageFields {
+                            reminder_unasked: true,
+                            ..*fields
+                        };
+                        &marked
+                    } else {
+                        fields
+                    };
                     if let Some(cut) = cutoff {
                         if !m.received.is_empty() && m.received.as_str() < cut {
                             continue;
@@ -2569,6 +2667,18 @@ impl Engine {
                 return;
             }
         };
+        // The walk's first call decides how all its pages merge (#2054):
+        // a refusal is kept next to its `backfill_link`, across idle steps,
+        // and becomes the folder's mark with its link (`complete_backfill`).
+        // A store error reads as refused, which only keeps reminders.
+        if page.expand_refused {
+            if let Err(e) = self.store.set_backfill_expand_refused(&id) {
+                self.park_on_store_error(&id, e);
+                return;
+            }
+        }
+        let unasked =
+            page.expand_refused || self.store.backfill_expand_refused(&id).unwrap_or(true);
         let cutoff = self.backfill_cutoff();
         let page_scope = if cutoff.is_some() {
             SCOPE_WINDOW
@@ -2587,6 +2697,7 @@ impl Engine {
             &page.items,
             cutoff.as_deref(),
             Some(&pending),
+            unasked,
             &mut Vec::new(),
         );
         let synced = u64::try_from(h.synced).unwrap_or(0) + walked;
@@ -2854,19 +2965,87 @@ impl Engine {
         });
     }
 
-    /// Queues a reminder op (#2025) unless it equals the last reminder op
-    /// queued for the same event (a second Dismiss while the first waits
-    /// offline), then drains either way. Only the last one counts: with
-    /// `[Dismiss, Snooze]` queued, a new Dismiss is queued, or the snooze
-    /// would land last. A queue that cannot be read is queued to.
+    /// [`SyncCommand::DismissMessageReminder`].
+    fn dismiss_message_reminder(&mut self, id: String) {
+        let id = self.store.current_id(&id).unwrap_or(id);
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "dismiss message reminder {id}: the message is not on the server yet"
+            )));
+            return;
+        }
+        self.store.dismiss_message_reminder(&id);
+        self.enqueue_reminder_op(OutboxOp::DismissMessageReminder { id });
+    }
+
+    /// [`SyncCommand::SnoozeMessageReminder`].
+    fn snooze_message_reminder(&mut self, id: String, new_reminder_utc: String) {
+        let id = self.store.current_id(&id).unwrap_or(id);
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "snooze message reminder {id}: the message is not on the server yet"
+            )));
+            return;
+        }
+        // Read as Graph's reminder times are (`reminder_time`): a time with
+        // a numeric offset is refused, as `to_utc` would drop the offset
+        // without applying it.
+        let utc = crate::graph::model::reminder_time(&new_reminder_utc);
+        if utc.is_empty() {
+            self.emit(SyncEvent::Error(format!(
+                "snooze message reminder {id}: not a UTC time: {new_reminder_utc:?}"
+            )));
+            return;
+        }
+        self.store.snooze_message_reminder(&id, &utc);
+        self.enqueue_reminder_op(OutboxOp::SnoozeMessageReminder {
+            id,
+            new_reminder_utc: utc,
+        });
+    }
+
+    /// What `op` is deduped against ([`ReminderTarget`]); `None` for an op
+    /// that is no reminder op.
+    fn reminder_target(&self, op: &OutboxOp) -> Option<ReminderTarget> {
+        if let Some(event) = reminder_op_event(op) {
+            return Some(ReminderTarget::Event(event.to_string()));
+        }
+        message_reminder_op_id(op).map(|id| {
+            ReminderTarget::Message(self.store.current_id(id).unwrap_or_else(|_| id.to_string()))
+        })
+    }
+
+    /// Queues a reminder op (#2025, #2054) unless it equals the last
+    /// reminder op queued for the same event or message (a second Dismiss
+    /// while the first waits offline), then drains either way. Only the
+    /// last one counts: with `[Dismiss, Snooze]` queued, a new Dismiss is
+    /// queued, or the snooze would land last. A message op's id is compared
+    /// as the message is stored now, so one queued before a move still
+    /// matches. A queue that cannot be read is queued to.
     fn enqueue_reminder_op(&mut self, op: OutboxOp) {
-        let event = reminder_op_event(&op);
+        let target = self.reminder_target(&op);
         let last = self.store.pending_ops().ok().and_then(|rows| {
             rows.into_iter()
                 .rev()
-                .find(|r| event.is_some() && reminder_op_event(&r.op) == event)
+                .find(|r| target.is_some() && self.reminder_target(&r.op) == target)
         });
-        if last.is_some_and(|r| r.op == op) {
+        let same = |queued: &OutboxOp| match (queued, &op) {
+            (OutboxOp::DismissMessageReminder { .. }, OutboxOp::DismissMessageReminder { .. }) => {
+                true
+            }
+            (
+                OutboxOp::SnoozeMessageReminder {
+                    new_reminder_utc: a,
+                    ..
+                },
+                OutboxOp::SnoozeMessageReminder {
+                    new_reminder_utc: b,
+                    ..
+                },
+            ) => a == b,
+            (queued, op) => queued == op,
+        };
+        if last.is_some_and(|r| same(&r.op)) {
             self.drain_queued();
             return;
         }
@@ -3189,6 +3368,25 @@ impl Engine {
                     // (its mail reconverge would re-enumerate the whole
                     // mailbox for nothing). A 404 is no error: the event is
                     // gone, and so is its reminder.
+                    // A message reminder op (#2054) is dropped the same
+                    // way, but it wrote the store first: after a refusal
+                    // other than a 404 the message is read again, as no
+                    // delta re-reports a message Graph never changed.
+                    if let Some(id) = message_reminder_op_id(&row.op) {
+                        self.store.drop_op(row.seq);
+                        if !matches!(other, GraphError::NotFound) {
+                            let action = match row.op {
+                                OutboxOp::DismissMessageReminder { .. } => {
+                                    "dismiss message reminder"
+                                }
+                                _ => "snooze message reminder",
+                            };
+                            self.emit(SyncEvent::Error(format!("{action} {id}: {other}")));
+                            let id = id.to_string();
+                            self.reread_message(&id);
+                        }
+                        continue;
+                    }
                     if let Some(event) = reminder_op_event(&row.op) {
                         self.store.drop_op(row.seq);
                         if !matches!(other, GraphError::NotFound) {
@@ -4631,6 +4829,35 @@ impl Engine {
         }
     }
 
+    /// Reads the message `id` names (as it is stored now) again from Graph
+    /// and merges it into the folder its row is in (#2054: after a refused
+    /// message reminder op, whose optimistic write Graph never made), with
+    /// `merge_message_unless_edited`, so a draft's unsaved edit is never
+    /// overwritten. A row another queued op names (`protected_ids`) is left
+    /// alone, as is a row that is gone; any failure is ignored
+    /// (the refusal's `Error` is already out, and a later delta corrects
+    /// what changes).
+    fn reread_message(&mut self, id: &str) {
+        let Ok(current) = self.store.current_id(id) else {
+            return;
+        };
+        // Another queued op still owns the row (a `SetFlag` behind the
+        // refused op, say): its optimistic write must stand until it
+        // drains, as a fresh delta leaves it (`protected_ids`).
+        match self.protected_ids() {
+            Ok(ids) if ids.binary_search(&current).is_err() => {}
+            _ => return,
+        }
+        let Ok(Some(row)) = self.store.message_row(&current) else {
+            return;
+        };
+        if let Ok((m, fields)) = self.with_auth(|c| c.get_message(&current)) {
+            let _ = self
+                .store
+                .merge_message_unless_edited(&row.folder_id, &m, &fields);
+        }
+    }
+
     // --- Auth ------------------------------------------------------------
 
     /// Runs a Graph call with the current token; on a 401, refreshes the token
@@ -5702,6 +5929,10 @@ mod tests {
                             is_draft: false,
                             is_meeting_request: false,
                             categories: vec![],
+                            is_reminder_on: false,
+                            reminder_at: String::new(),
+                            reminder_signal_at: String::new(),
+                            flag_due_at: String::new(),
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -17268,6 +17499,697 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    mod message_reminders {
+        use super::*;
+
+        const SET: &str = "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503";
+        const AT: &str = "SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8502";
+        const SIGNAL: &str = "SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560";
+
+        /// `message_json` (flagged) with the three reminder properties.
+        fn reminded_json(id: &str, set: bool, signal: &str) -> String {
+            let plain = message_json(id, false, true, &[]);
+            format!(
+                r#"{},"singleValueExtendedProperties":[{{"id":"{SET}","value":"{set}"}},{{"id":"{AT}","value":"2026-11-08T10:00:00Z"}},{{"id":"{SIGNAL}","value":"{signal}"}}]}}"#,
+                plain.strip_suffix('}').unwrap()
+            )
+        }
+
+        /// A flagged `M1` in `F1` whose reminder is on, signalling at 10:15.
+        fn seed_m1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            s.upsert_message(
+                "F1",
+                &Message {
+                    id: "M1".into(),
+                    conversation_id: "C".into(),
+                    subject: "Hello".into(),
+                    from: Default::default(),
+                    to: vec![],
+                    cc: vec![],
+                    received: "2026-07-16T10:00:00Z".into(),
+                    sent: String::new(),
+                    is_read: false,
+                    is_flagged: true,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: String::new(),
+                    is_draft: false,
+                    is_meeting_request: false,
+                    categories: vec![],
+                    is_reminder_on: true,
+                    reminder_at: "2026-11-08T10:00:00Z".into(),
+                    reminder_signal_at: "2026-11-08T10:15:00Z".into(),
+                    flag_due_at: String::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        const INBOX: &[(&str, &str, Option<&str>)] = &[("F1", "Inbox", Some("inbox"))];
+
+        fn route(method: &str, path: &str, status: u16, body: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: method.into(),
+                    path_prefix: path.into(),
+                    status,
+                    headers: vec![],
+                    body: body.into(),
+                },
+                None,
+            )
+        }
+
+        /// An engine on `extra` (matched first) and an Inbox, with `M1`
+        /// seeded and its folder synced (a delta link stored) before it
+        /// returns.
+        fn spawn_m1(
+            tag: &str,
+            extra: Vec<(Route, Option<usize>)>,
+        ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+            let mut routes = extra;
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            (srv, handle, store, dir)
+        }
+
+        fn m1(store: &Store) -> crate::store::MessageRow {
+            store.message_row("M1").unwrap().unwrap()
+        }
+
+        fn patches(srv: &FakeServer) -> Vec<(String, String)> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == "PATCH")
+                .map(|r| (r.path, r.body))
+                .collect()
+        }
+
+        fn errors(seen: &[SyncEvent]) -> Vec<String> {
+            seen.iter()
+                .filter_map(|e| match e {
+                    SyncEvent::Error(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        const DISMISS_BODY: &str = r#"{"singleValueExtendedProperties":[{"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"false"}]}"#;
+
+        fn snooze_body(t: &str) -> String {
+            format!(
+                r#"{{"singleValueExtendedProperties":[{{"id":"SystemTime {{00062008-0000-0000-C000-000000000046}} Id 0x8560","value":"{t}"}}]}}"#
+            )
+        }
+
+        #[test]
+        fn delta_with_reminder_properties_stores_them_and_a_later_round_clears_them() {
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas(
+                "F1",
+                &[reminded_json("M1", true, "2026-11-08T10:15:00Z")],
+                &[message_json("M1", false, true, &[])],
+            ));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (1, 1), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (1, 1), 0)]),
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "msg-reminder-delta", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(TICK_WAIT, || store
+                .message_row("M1")
+                .unwrap()
+                .is_some_and(|r| r.is_reminder_on)));
+            let r = m1(&store);
+            assert_eq!(r.reminder_at, "2026-11-08T10:00:00Z");
+            assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z");
+            // The first call asked for them.
+            let first = srv
+                .requests()
+                .into_iter()
+                .find(|r| r.path.starts_with("/me/mailFolders/F1/messages/delta?$"))
+                .unwrap();
+            assert!(
+                first
+                    .path
+                    .contains("&$expand=singleValueExtendedProperties($filter="),
+                "{}",
+                first.path
+            );
+            // The next round's complete item carries none: cleared.
+            assert!(wait_until(TICK_WAIT, || {
+                let r = m1(&store);
+                !r.is_reminder_on && r.reminder_at.is_empty() && r.reminder_signal_at.is_empty()
+            }));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn refused_expand_still_syncs_the_folder_and_keeps_its_reminders() {
+            // F1's first call (with the expand) answers 400 once; its retry
+            // without the expand gets a page whose M1 carries no reminder,
+            // and so does the next round on the link minted from it.
+            let link = "/me/mailFolders/F1/messages/delta?token=D-F1";
+            let plain_m1 = message_json("M1", false, true, &[]);
+            let mut routes = vec![
+                (
+                    route(
+                        "GET",
+                        "/me/mailFolders/F1/messages/delta?$",
+                        400,
+                        r#"{"error":{"code":"BadRequest","message":"no expand"}}"#,
+                    )
+                    .0,
+                    Some(1),
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/messages/delta?$",
+                    200,
+                    &delta_page(
+                        &[plain_m1.clone(), message_json("M9", false, false, &[])],
+                        link,
+                    ),
+                ),
+                route("GET", link, 200, &delta_page(&[plain_m1], link)),
+            ];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "msg-reminder-no-expand", TICK, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .message_exists("M9")
+                .unwrap()
+                && store.get_delta_link("F1").unwrap().is_some()));
+            let firsts: Vec<String> = srv
+                .requests()
+                .into_iter()
+                .map(|r| r.path)
+                .filter(|p| p.starts_with("/me/mailFolders/F1/messages/delta?$"))
+                .collect();
+            assert_eq!(firsts.len(), 2, "{firsts:?}");
+            assert!(firsts[0].contains("&$expand="));
+            assert!(!firsts[1].contains("$expand"));
+            // The folder is marked, and the stored reminder survived the
+            // fallback's page and then a round on its link.
+            assert!(store.reminder_expand_refused("F1").unwrap());
+            assert!(wait_until(TICK_WAIT, || srv
+                .requests()
+                .iter()
+                .any(|r| r.path == link)));
+            reminder_barrier(&handle);
+            let r = m1(&store);
+            assert!(
+                r.is_reminder_on,
+                "kept through the fallback and the link round"
+            );
+            assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z");
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            // Clearing the links clears the mark: the next first call asks
+            // for the reminder again.
+            store.clear_delta_links().unwrap();
+            assert!(!store.reminder_expand_refused("F1").unwrap());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_refused_reminder_op_does_not_re_read_a_row_another_op_owns() {
+            // Queued offline: dismiss M1, then unflag it. Graph refuses the
+            // dismiss (400) and answers the unflag with a 500, so the unflag
+            // still waits: the re-read must not put Graph's flagged M1, its
+            // reminder on, back over it.
+            let extra = vec![
+                (
+                    route(
+                        "PATCH",
+                        "/me/messages/M1",
+                        400,
+                        r#"{"error":{"code":"ErrorInvalidProperty","message":"Bad property"}}"#,
+                    )
+                    .0,
+                    Some(1),
+                ),
+                route("PATCH", "/me/messages/M1", 500, ""),
+                route(
+                    "GET",
+                    "/me/messages/M1?$select=",
+                    200,
+                    &reminded_json("M1", true, "2026-11-08T10:15:00Z"),
+                ),
+            ];
+            let mut routes = extra;
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "msg-reminder-reread-owned", HOUR, None, |s| {
+                    seed_m1(s);
+                    s.dismiss_message_reminder("M1");
+                    s.set_flag("M1", false);
+                    s.enqueue_op(&OutboxOp::DismissMessageReminder { id: "M1".into() })
+                        .unwrap();
+                    s.enqueue_op(&OutboxOp::SetFlag {
+                        id: "M1".into(),
+                        flagged: false,
+                    })
+                    .unwrap();
+                });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || patches(&srv).len() == 2));
+            reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert_eq!(
+                queued_ops(&store),
+                [OutboxOp::SetFlag {
+                    id: "M1".into(),
+                    flagged: false,
+                }],
+                "the dismiss dropped, the unflag waiting"
+            );
+            let r = m1(&store);
+            assert!(!r.is_flagged && !r.is_reminder_on, "{r:?}");
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select=")),
+                "no re-read: {:?}",
+                srv.requests()
+            );
+            assert!(
+                store
+                    .due_message_reminders("2026-11-08T12:00:00Z")
+                    .unwrap()
+                    .is_empty()
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn delta_link_reset_after_migration_refetches_no_body() {
+            // A store from before #2054: M1 synced with its body, F1 on a
+            // link Graph minted without the expand.
+            let old_link = "/me/mailFolders/F1/messages/delta?token=OLD";
+            let link = "/me/mailFolders/F1/messages/delta?token=D-F1";
+            let mut routes = vec![
+                route("GET", old_link, 200, &delta_page(&[], link)),
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/messages/delta?$",
+                    200,
+                    &delta_page(&[reminded_json("M1", true, "2026-11-08T10:15:00Z")], link),
+                ),
+            ];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let dir = unique_dir("msg-reminder-migrate");
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            {
+                let s = Store::open(&store_path).unwrap();
+                s.upsert_folder(&crate::graph::model::MailFolder {
+                    id: "F1".into(),
+                    display_name: "Inbox".into(),
+                    parent_id: None,
+                    total_count: 1,
+                    unread_count: 0,
+                    well_known_name: Some("inbox".into()),
+                })
+                .unwrap();
+                let v = crate::json::parse(&message_json("M1", false, true, &[])).unwrap();
+                let mut m = Message::from_json(&v).unwrap();
+                // An hour old, so the prefetch window covers it.
+                m.received = unix_to_iso8601(now_unix() - 3600);
+                s.upsert_message("F1", &m).unwrap();
+                s.put_body(
+                    "M1",
+                    &crate::graph::model::Body {
+                        content_type: "html".into(),
+                        content: "<p>kept</p>".into(),
+                    },
+                )
+                .unwrap();
+                s.set_delta_link("F1", old_link).unwrap();
+                drop(s);
+                rusqlite::Connection::open(&store_path)
+                    .unwrap()
+                    .execute_batch(
+                        "DROP INDEX idx_messages_reminder;
+                         ALTER TABLE messages DROP COLUMN is_reminder_on;
+                         ALTER TABLE messages DROP COLUMN reminder_at;
+                         ALTER TABLE messages DROP COLUMN reminder_signal_at;
+                         ALTER TABLE messages DROP COLUMN flag_due_at;
+                         ALTER TABLE folders DROP COLUMN reminder_expand_refused;
+                         ALTER TABLE folders DROP COLUMN backfill_expand_refused;",
+                    )
+                    .unwrap();
+            }
+            let handle = spawn_with_bases_and_options(
+                store_path.clone(),
+                token_path,
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+                EngineOptions {
+                    prefetch_body_days: 30,
+                    ..EngineOptions::without_prefetch()
+                },
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .message_row("M1")
+                .unwrap()
+                .is_some_and(|r| r.is_reminder_on)));
+            reminder_barrier(&handle);
+            let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            assert!(!paths.iter().any(|p| p == old_link), "{paths:?}");
+            assert!(
+                !paths.iter().any(|p| p.starts_with(&body_get_path("M1"))),
+                "the re-enumeration fetched no stored body again: {paths:?}"
+            );
+            assert_eq!(
+                store.get_body("M1").unwrap().unwrap().content,
+                "<p>kept</p>"
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn dismiss_message_reminder_patches_and_writes_the_store() {
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-dismiss",
+                vec![route("PATCH", "/me/messages/M1", 200, "{}")],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "M1".into() })
+                .unwrap();
+            let seen = reminder_barrier(&handle);
+            assert!(errors(&seen).is_empty(), "{seen:?}");
+            assert_eq!(
+                patches(&srv),
+                [("/me/messages/M1".to_string(), DISMISS_BODY.to_string())]
+            );
+            assert!(!m1(&store).is_reminder_on);
+            assert!(m1(&store).is_flagged, "the flag stays");
+            assert!(store.pending_ops().unwrap().is_empty());
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn snooze_message_reminder_patches_a_normalised_time_and_writes_the_store() {
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-snooze",
+                vec![route("PATCH", "/me/messages/M1", 200, "{}")],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::SnoozeMessageReminder {
+                    id: "M1".into(),
+                    new_reminder_utc: "2026-11-08T11:45:00.0000000".into(),
+                })
+                .unwrap();
+            let seen = reminder_barrier(&handle);
+            assert!(errors(&seen).is_empty(), "{seen:?}");
+            assert_eq!(
+                patches(&srv),
+                [(
+                    "/me/messages/M1".to_string(),
+                    snooze_body("2026-11-08T11:45:00Z")
+                )]
+            );
+            let r = m1(&store);
+            assert!(r.is_reminder_on);
+            assert_eq!(r.reminder_signal_at, "2026-11-08T11:45:00Z");
+            assert_eq!(r.reminder_at, "2026-11-08T10:00:00Z", "left alone");
+            assert!(store.pending_ops().unwrap().is_empty());
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn message_reminder_commands_refuse_local_id_and_a_bad_time() {
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-refused",
+                vec![route("PATCH", "/me/messages/", 200, "{}")],
+            );
+            let snooze = |id: &str, t: &str| SyncCommand::SnoozeMessageReminder {
+                id: id.into(),
+                new_reminder_utc: t.into(),
+            };
+            for (cmd, error) in [
+                (
+                    SyncCommand::DismissMessageReminder {
+                        id: "local:d1".into(),
+                    },
+                    "dismiss message reminder local:d1: the message is not on the server yet",
+                ),
+                (
+                    snooze("local:d1", "2026-11-08T10:15:00Z"),
+                    "snooze message reminder local:d1: the message is not on the server yet",
+                ),
+                (
+                    snooze("M1", ""),
+                    r#"snooze message reminder M1: not a UTC time: """#,
+                ),
+                (
+                    snooze("M1", "not a time"),
+                    r#"snooze message reminder M1: not a UTC time: "not a time""#,
+                ),
+                (
+                    snooze("M1", "10:15"),
+                    r#"snooze message reminder M1: not a UTC time: "10:15""#,
+                ),
+                // An offset would be dropped without being applied.
+                (
+                    snooze("M1", "2026-11-08T10:15:00+02:00"),
+                    r#"snooze message reminder M1: not a UTC time: "2026-11-08T10:15:00+02:00""#,
+                ),
+            ] {
+                handle.cmd_tx.send(cmd).unwrap();
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                assert_eq!(seen.last(), Some(&SyncEvent::Error(error.into())));
+            }
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
+            assert!(patches(&srv).is_empty(), "{:?}", srv.requests());
+            assert_eq!(
+                m1(&store).reminder_signal_at,
+                "2026-11-08T10:15:00Z",
+                "nothing written"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn message_reminder_op_404_is_dropped_without_error() {
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-404",
+                vec![route(
+                    "PATCH",
+                    "/me/messages/M1",
+                    404,
+                    r#"{"error":{"code":"ErrorItemNotFound"}}"#,
+                )],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "M1".into() })
+                .unwrap();
+            handle
+                .cmd_tx
+                .send(SyncCommand::SnoozeMessageReminder {
+                    id: "M1".into(),
+                    new_reminder_utc: "2026-11-08T11:00:00Z".into(),
+                })
+                .unwrap();
+            let seen = reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert!(errors(&seen).is_empty(), "{seen:?}");
+            assert!(
+                store.pending_ops().unwrap().is_empty(),
+                "dropped, not retried"
+            );
+            assert_eq!(patches(&srv).len(), 2);
+            // No re-read: the message is gone on Graph.
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1")),
+                "{:?}",
+                srv.requests()
+            );
+            assert!(
+                store.get_delta_link("F1").unwrap().is_some(),
+                "no quarantine"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn message_reminder_op_400_is_dropped_with_one_error_and_the_row_re_read() {
+            // Graph refuses the PATCH and still has the reminder, signalling
+            // at 10:15: the row shows it again.
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-400",
+                vec![
+                    route(
+                        "PATCH",
+                        "/me/messages/M1",
+                        400,
+                        r#"{"error":{"code":"ErrorInvalidProperty","message":"Bad property"}}"#,
+                    ),
+                    route(
+                        "GET",
+                        "/me/messages/M1?$select=",
+                        200,
+                        &reminded_json("M1", true, "2026-11-08T10:15:00Z"),
+                    ),
+                ],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "M1".into() })
+                .unwrap();
+            let seen = reminder_barrier(&handle);
+            assert_eq!(
+                errors(&seen),
+                ["dismiss message reminder M1: HTTP 400: Bad property"]
+            );
+            assert!(store.pending_ops().unwrap().is_empty(), "dropped at once");
+            assert_eq!(patches(&srv).len(), 1);
+            let r = m1(&store);
+            assert!(r.is_reminder_on, "re-read from Graph");
+            assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z");
+            let reread = srv
+                .requests()
+                .into_iter()
+                .find(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select="))
+                .unwrap();
+            assert!(reread.path.contains("&$expand="), "{}", reread.path);
+
+            // A refused snooze is re-read the same way.
+            handle
+                .cmd_tx
+                .send(SyncCommand::SnoozeMessageReminder {
+                    id: "M1".into(),
+                    new_reminder_utc: "2026-11-08T12:00:00Z".into(),
+                })
+                .unwrap();
+            let seen = reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert_eq!(
+                errors(&seen),
+                ["snooze message reminder M1: HTTP 400: Bad property"]
+            );
+            assert_eq!(m1(&store).reminder_signal_at, "2026-11-08T10:15:00Z");
+            assert!(
+                store.get_delta_link("F1").unwrap().is_some(),
+                "no quarantine"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn dismiss_message_reminder_twice_while_queued_queues_one() {
+            // A 500 defers the queue under the outbox's back-off, so the
+            // first op is still queued when the next ones run.
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-twice",
+                vec![route("PATCH", "/me/messages/M1", 500, "")],
+            );
+            let dismiss = || SyncCommand::DismissMessageReminder { id: "M1".into() };
+            let snooze = || SyncCommand::SnoozeMessageReminder {
+                id: "M1".into(),
+                new_reminder_utc: "2026-11-08T11:00:00Z".into(),
+            };
+            for cmd in [dismiss(), dismiss()] {
+                handle.cmd_tx.send(cmd).unwrap();
+            }
+            reminder_barrier(&handle);
+            let dismissed = OutboxOp::DismissMessageReminder { id: "M1".into() };
+            assert_eq!(queued_ops(&store), std::slice::from_ref(&dismissed));
+            // The store was written at once, before Graph took it.
+            assert!(!m1(&store).is_reminder_on);
+            for cmd in [snooze(), snooze()] {
+                handle.cmd_tx.send(cmd).unwrap();
+            }
+            reminder_barrier(&handle);
+            assert_eq!(m1(&store).reminder_signal_at, "2026-11-08T11:00:00Z");
+            // An event's reminder op of the same id is another target.
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissReminder { id: "M1".into() })
+                .unwrap();
+            reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert_eq!(
+                queued_ops(&store),
+                [
+                    dismissed,
+                    OutboxOp::SnoozeMessageReminder {
+                        id: "M1".into(),
+                        new_reminder_utc: "2026-11-08T11:00:00Z".into(),
+                    },
+                    OutboxOp::DismissReminder { id: "M1".into() },
+                ]
+            );
+            assert_eq!(patches(&srv).len(), 1, "the back-off holds the rest");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn unflag_clears_the_stored_reminder() {
+            let (srv, handle, store, dir) = spawn_m1(
+                "msg-reminder-unflag",
+                vec![route("PATCH", "/me/messages/M1", 200, "{}")],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::SetFlag {
+                    id: "M1".into(),
+                    flagged: false,
+                })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !patches(&srv).is_empty()));
+            let r = m1(&store);
+            assert!(!r.is_flagged && !r.is_reminder_on);
+            assert!(
+                store
+                    .due_message_reminders("2026-11-08T12:00:00Z")
+                    .unwrap()
+                    .is_empty()
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     // --- A moved message follows its new id (#1896) ----------------------
 
     /// Engine tests for `follow_move`: Graph answers each move with a new
@@ -17341,6 +18263,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: vec![],
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();
@@ -17747,6 +18673,123 @@ mod tests {
             no_quarantine(&seen);
 
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The message reminder PATCHes (#2054) sent so far, path and body.
+        fn reminder_patches(srv: &FakeServer) -> Vec<(String, String)> {
+            requests(srv, "PATCH")
+                .into_iter()
+                .filter(|(_, b)| b.contains("singleValueExtendedProperties"))
+                .collect()
+        }
+
+        #[test]
+        fn message_reminder_ops_queued_behind_a_move_reach_the_new_id() {
+            // Dismiss and snooze queued by `OLD1` behind its move: they drain
+            // after it, by the id Graph minted.
+            let mut routes = move_routes();
+            routes.push(ok_route("PATCH", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-msg-reminder", |s| {
+                for op in [
+                    OutboxOp::Move {
+                        id: "OLD1".into(),
+                        dest: "F2".into(),
+                    },
+                    OutboxOp::DismissMessageReminder { id: "OLD1".into() },
+                    OutboxOp::SnoozeMessageReminder {
+                        id: "OLD1".into(),
+                        new_reminder_utc: "2026-11-08T11:00:00Z".into(),
+                    },
+                ] {
+                    s.enqueue_op(&op).unwrap();
+                }
+            });
+            let store = Store::open(&store_path).unwrap();
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            assert!(wait_until(ENGINE_WAIT, || reminder_patches(&srv).len() == 2));
+            assert!(drained(&store));
+            let paths: Vec<String> = reminder_patches(&srv).into_iter().map(|(p, _)| p).collect();
+            assert_eq!(paths, ["/me/messages/NEW1", "/me/messages/NEW1"]);
+            assert!(reminder_patches(&srv)[0].1.contains("0x8503"));
+            assert!(reminder_patches(&srv)[1].1.contains("0x8560"));
+            no_quarantine(&seen);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn message_reminder_commands_by_the_old_id_write_and_reach_the_new_id() {
+            let mut routes = move_routes();
+            routes.push(ok_route("PATCH", "/me/messages/NEW1"));
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-msg-reminder-cmd", |_| {});
+            let store = Store::open(&store_path).unwrap();
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "OLD1".into(),
+                    dest: "F2".into(),
+                })
+                .unwrap();
+            let seen = wait_moved(&handle.evt_rx, "OLD1", "NEW1");
+            handle
+                .cmd_tx
+                .send(SyncCommand::SnoozeMessageReminder {
+                    id: "OLD1".into(),
+                    new_reminder_utc: "2026-11-08T11:00:00Z".into(),
+                })
+                .unwrap();
+            assert!(wait_until(ENGINE_WAIT, || reminder_patches(&srv).len() == 1));
+            assert!(drained(&store));
+            assert_eq!(reminder_patches(&srv)[0].0, "/me/messages/NEW1");
+            assert_eq!(
+                row(&store, "NEW1").reminder_signal_at,
+                "2026-11-08T11:00:00Z"
+            );
+            no_quarantine(&seen);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_dismiss_by_the_new_id_dedupes_against_one_queued_by_the_old_id() {
+            // The PATCH meets a 500, so the queued dismiss (by `OLD1`, from
+            // before the move) waits; the same dismiss by `NEW1` is not
+            // queued again.
+            let routes = vec![(
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/NEW1".into(),
+                    status: 500,
+                    headers: vec![],
+                    body: String::new(),
+                },
+                None,
+            )];
+            let mut routes = routes;
+            routes.extend(folder_routes(F1_F2, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn(&srv, "moved-msg-reminder-dedupe", |s| {
+                assert!(s.follow_move("OLD1", "NEW1").unwrap());
+                s.enqueue_op(&OutboxOp::DismissMessageReminder { id: "OLD1".into() })
+                    .unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || reminder_patches(&srv).len() == 1));
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "NEW1".into() })
+                .unwrap();
+            reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert_eq!(
+                queued_ops(&store),
+                [OutboxOp::DismissMessageReminder { id: "OLD1".into() }]
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -18297,6 +19340,137 @@ mod tests {
                     .any(|e| matches!(e, SyncEvent::State(_))),
                 "no state change during the backfill: {events:?}"
             );
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A flagged message whose reminder is on, as Graph sends it with
+        /// the expand (#2054), or complete without the properties.
+        fn reminded(id: &str, with_props: bool) -> String {
+            let plain = message_json(id, false, true, &[]);
+            if !with_props {
+                return plain;
+            }
+            format!(
+                r#"{},"singleValueExtendedProperties":[{{"id":"Boolean {{00062008-0000-0000-C000-000000000046}} Id 0x8503","value":"true"}},{{"id":"SystemTime {{00062008-0000-0000-C000-000000000046}} Id 0x8560","value":"2026-11-08T10:15:00Z"}}]}}"#,
+                plain.strip_suffix('}').unwrap()
+            )
+        }
+
+        /// Stores `ids` in `F1`, flagged with their reminder on.
+        fn seed_reminded(dir: &std::path::Path, ids: &[&str]) {
+            let s = store_in(dir);
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: BIG,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            for id in ids {
+                let v = crate::json::parse(&reminded(id, true)).unwrap();
+                s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                    .unwrap();
+                assert!(s.message_row(id).unwrap().unwrap().is_reminder_on);
+            }
+        }
+
+        fn reminder_on(dir: &std::path::Path, id: &str) -> bool {
+            store_in(dir)
+                .message_row(id)
+                .unwrap()
+                .unwrap()
+                .is_reminder_on
+        }
+
+        #[test]
+        fn an_accepted_backfill_link_unmarks_a_refused_head() {
+            // F1's head refuses the reminder expand (its retry stores M1
+            // without it: kept); the backfill's first call accepts it. Once
+            // its link is the folder's, a round on it clears a reminder
+            // Graph no longer has.
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let extra = vec![
+                (route(&format!("{delta}?$filter"), 400, "{}"), Some(1)),
+                (
+                    route(
+                        &full_link("F1"),
+                        200,
+                        &page(&[reminded("M1", false)], None, Some(&full_link("F1"))),
+                    ),
+                    None,
+                ),
+            ];
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![reminded("M1", false)],
+                    pages: vec![vec![msg("X1", "2025-06-01T00:00:00Z")]],
+                    ..inbox()
+                }],
+                extra,
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reminder-unmark");
+            seed_reminded(&dir, &["M1"]);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, TICK, None);
+            until_complete(&handle, "F1");
+            let store = store_in(&dir);
+            assert!(
+                !store.reminder_expand_refused("F1").unwrap(),
+                "the stored link is the accepted backfill's"
+            );
+            assert!(wait_until(TICK_WAIT, || !reminder_on(&dir, "M1")));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_refused_backfill_keeps_reminders_and_leaves_an_accepted_head_unmarked() {
+            // F1's head accepts the expand; its backfill's first call is
+            // refused. The walk's pages (M2 on page 2) keep stored
+            // reminders, while the round on the head's link before the walk
+            // completes (M1, no reminder) clears one: that link was asked.
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let extra = vec![
+                (route(&format!("{delta}?$orderby"), 400, "{}"), Some(1)),
+                (
+                    route(
+                        &head_link("F1"),
+                        200,
+                        &page(&[reminded("M1", false)], None, Some(&head_link("F1"))),
+                    ),
+                    Some(1),
+                ),
+            ];
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: vec![
+                        vec![msg("X1", "2025-06-01T00:00:00Z")],
+                        vec![reminded("M2", false)],
+                    ],
+                    ..inbox()
+                }],
+                extra,
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-reminder-refused-walk");
+            seed_reminded(&dir, &["M1", "M2"]);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            assert!(
+                paths_from(&srv, 0).iter().any(|p| p == &head_link("F1")),
+                "a round on the head's link ran"
+            );
+            assert!(!reminder_on(&dir, "M1"), "the accepted head's round clears");
+            assert!(reminder_on(&dir, "M2"), "the refused walk's page keeps");
+            let store = store_in(&dir);
+            assert!(
+                store.reminder_expand_refused("F1").unwrap(),
+                "the refused walk's link is the folder's now"
+            );
+            assert!(!store.backfill_expand_refused("F1").unwrap());
             stop(handle);
             let _ = std::fs::remove_dir_all(&dir);
         }

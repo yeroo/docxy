@@ -875,6 +875,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed second message");
@@ -934,6 +938,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed message in second folder");
@@ -1004,6 +1012,10 @@ mod tests {
                     is_draft: true,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();
@@ -1261,6 +1273,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("update message to has_attachments=true");

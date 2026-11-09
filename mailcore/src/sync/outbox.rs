@@ -21,9 +21,11 @@
 //! `SaveDraft`/`SendDraft` do for drafts.
 //!
 //! The message ops (`MarkRead`, `SetFlag`, `SetCategories`, `Move`,
-//! `Delete`) read the store only to resolve their id (`Store::current_id`)
-//! at apply time, so an op queued with an id an earlier op moved reaches
-//! the message (#1896). `Move` hands the id Graph minted back to the
+//! `Delete`, and #2054's `DismissMessageReminder` / `SnoozeMessageReminder`)
+//! read the store only to resolve their id (`Store::current_id`) at apply
+//! time, so an op queued with an id an earlier op moved reaches the
+//! message (#1896). `Delete` and the two reminder ops send nothing for an
+//! id that still resolves to `local:` (never on Graph). `Move` hands the id Graph minted back to the
 //! caller ([`Applied::Moved`]), which re-keys the store: a store failure
 //! there must not turn into a retry of a move Graph already made.
 
@@ -210,6 +212,27 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
                 return Ok(());
             }
             client.snooze_reminder(id, new_reminder_utc)
+        }
+        // A flagged message's reminder (#2054), under the id the message is
+        // stored as now (a move before the drain, #1896). The engine refuses
+        // a `local:` id; one that still resolves to `local:` was never on
+        // Graph and sends nothing.
+        OutboxOp::DismissMessageReminder { id } => {
+            let target = resolve(store, id)?;
+            if target.starts_with("local:") {
+                return Ok(());
+            }
+            client.dismiss_message_reminder(&target)
+        }
+        OutboxOp::SnoozeMessageReminder {
+            id,
+            new_reminder_utc,
+        } => {
+            let target = resolve(store, id)?;
+            if target.starts_with("local:") {
+                return Ok(());
+            }
+            client.snooze_message_reminder(&target, new_reminder_utc)
         }
     }
 }
@@ -665,6 +688,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: vec![],
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();
@@ -3012,6 +3039,10 @@ mod tests {
             is_draft: true,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -3114,6 +3145,10 @@ mod tests {
             is_draft: true,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -3274,6 +3309,80 @@ mod tests {
         )
         .unwrap();
 
+        assert!(srv.requests().is_empty());
+    }
+
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    fn patch_route(path: &str) -> Route {
+        Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn dismiss_message_reminder_patches_the_resolved_id() {
+        let srv = FakeServer::start(vec![patch_route("/me/messages/NEW1")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::DismissMessageReminder { id: "OLD1".into() },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/NEW1");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"false"}]}"#
+        );
+    }
+
+    #[test]
+    fn snooze_message_reminder_patches_the_resolved_id() {
+        let srv = FakeServer::start(vec![patch_route("/me/messages/NEW1")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SnoozeMessageReminder {
+                id: "OLD1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].path, "/me/messages/NEW1");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560","value":"2026-11-08T10:15:00Z"}]}"#
+        );
+    }
+
+    #[test]
+    fn message_reminder_op_of_a_local_id_makes_no_request() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        for op in [
+            OutboxOp::DismissMessageReminder {
+                id: "local:never".into(),
+            },
+            OutboxOp::SnoozeMessageReminder {
+                id: "local:never".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        ] {
+            assert_eq!(apply_op(&c, &store, &op), Ok(Applied::Done));
+        }
         assert!(srv.requests().is_empty());
     }
 }

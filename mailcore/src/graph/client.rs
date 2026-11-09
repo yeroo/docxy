@@ -11,8 +11,9 @@
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
     EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
-    MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person, Recipient,
-    Recurrence, ScheduleEntry, SearchHit, plain_to_html, to_utc,
+    MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person, REMINDER_SET_PROP,
+    REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit, plain_to_html,
+    to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -514,6 +515,21 @@ pub struct EventInput {
 const MESSAGE_SELECT: &str = "id,conversationId,subject,from,toRecipients,ccRecipients,\
 receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories";
 
+/// The `$expand` that brings a message's Outlook reminder (#2054): the
+/// three PSETID_Common named properties `Message::from_json` reads
+/// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
+/// the `REMINDER_*_PROP` ids), filtered so nothing else comes. Quotes and
+/// braces are percent-encoded, so the URL goes out as written here.
+const MESSAGE_EXPAND: &str = "singleValueExtendedProperties($filter=\
+id%20eq%20%27Boolean%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8503%27%20or%20\
+id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8502%27%20or%20\
+id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8560%27)";
+
+/// `target` with the reminder `$expand` (#2054) appended.
+fn with_expand(target: &str) -> String {
+    format!("{target}&$expand={MESSAGE_EXPAND}")
+}
+
 enum Method {
     Get,
     Patch,
@@ -719,47 +735,68 @@ impl GraphClient {
     /// or `DeltaCursor::Full`) or a stored `nextLink`/`deltaLink`
     /// (`DeltaCursor::Link`), requesting pages of 50 via
     /// `Prefer: odata.maxpagesize=50`.
+    ///
+    /// A first call asks for the reminder too (`MESSAGE_EXPAND`, #2054),
+    /// and Graph keeps that in every link it mints from it. Should Graph
+    /// refuse the expand there (a 400), the same call is sent once more
+    /// without it, so the folder still syncs, and the page says so
+    /// (`DeltaPage::expand_refused`, its upserts `reminder_unasked`): the
+    /// engine then reads no reminders for that folder until its links
+    /// reset, and keeps the reminders already stored. A 400 with another
+    /// cause costs that one extra request, and the second answer is
+    /// returned as it is.
     pub fn delta(&self, cursor: DeltaCursor) -> Result<DeltaPage, GraphError> {
-        let target = match cursor {
+        let (target, first) = match cursor {
             DeltaCursor::Head { folder_id, since } => {
                 let folder_id = encode_path_segment(&folder_id);
-                format!(
+                let target = format!(
                     "/me/mailFolders/{folder_id}/messages/delta\
                      ?$filter=receivedDateTime%20ge%20{since}\
                      &$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
-                )
+                );
+                (target, true)
             }
             DeltaCursor::Full(folder_id) => {
                 let folder_id = encode_path_segment(&folder_id);
-                format!(
+                let target = format!(
                     "/me/mailFolders/{folder_id}/messages/delta\
                      ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
-                )
+                );
+                (target, true)
             }
-            DeltaCursor::Link(url) => url,
+            DeltaCursor::Link(url) => (url, false),
         };
-        let resp = self.send(
-            Method::Get,
-            &target,
-            None,
-            &[("Prefer", "odata.maxpagesize=50")],
-        )?;
+        let prefer = [("Prefer", "odata.maxpagesize=50")];
+        let (resp, expanded) = if first {
+            self.get_with_expand(&target, &prefer)?
+        } else {
+            (self.send(Method::Get, &target, None, &prefer)?, true)
+        };
         let v = parse_body(resp)?;
-        DeltaPage::from_json(&v)
-            .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))
+        let mut page = DeltaPage::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))?;
+        if !expanded {
+            page.expand_refused = true;
+            page.mark_reminder_unasked();
+        }
+        Ok(page)
     }
 
-    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT`: one message's
-    /// stored properties, with which of them the response carried. The
+    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT&$expand=MESSAGE_EXPAND`:
+    /// one message's stored properties and reminder (#2054; without the
+    /// expand should Graph refuse it, as `delta`), with which of them the
+    /// response carried. The
     /// sync engine completes a header-less row with it (#1899).
     pub fn get_message(&self, message_id: &str) -> Result<(Message, MessageFields), GraphError> {
         let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT}");
-        let resp = self.send(Method::Get, &path, None, &[])?;
+        let (resp, expanded) = self.get_with_expand(&path, &[])?;
         let v = parse_body(resp)?;
         let m = Message::from_json(&v)
             .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
-        Ok((m, MessageFields::of(&v)))
+        let mut fields = MessageFields::of(&v);
+        fields.reminder_unasked = !expanded;
+        Ok((m, fields))
     }
 
     /// Searches messages on the server (#2006): GET
@@ -810,16 +847,20 @@ impl GraphClient {
         Ok(hits)
     }
 
-    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT,parentFolderId`: one
-    /// message as a [`SearchHit`], with the folder it is filed in, for the
+    /// GET `/me/messages/{id}?$select=MESSAGE_SELECT,parentFolderId&$expand=
+    /// MESSAGE_EXPAND` (without the expand should Graph refuse it, as
+    /// `delta`): one message as a [`SearchHit`], with the folder it is filed in, for the
     /// engine to store a search hit the store does not have (#2006). A body
     /// without an id is a `Parse` error.
     pub fn get_message_hit(&self, message_id: &str) -> Result<SearchHit, GraphError> {
         let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT},parentFolderId");
-        let resp = self.send(Method::Get, &path, None, &[])?;
+        let (resp, expanded) = self.get_with_expand(&path, &[])?;
         let v = parse_body(resp)?;
-        SearchHit::from_json(&v).ok_or_else(|| GraphError::Parse("malformed message".to_string()))
+        let mut hit = SearchHit::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
+        hit.fields.reminder_unasked = !expanded;
+        Ok(hit)
     }
 
     /// [`GraphClient::get_body_with_headers`] with the headers dropped: the
@@ -931,6 +972,60 @@ impl GraphClient {
                 "flagStatus".to_string(),
                 Value::Str(status.to_string()),
             )]),
+        )])
+        .to_string();
+        self.send(Method::Patch, &path, Some(body), &[])?;
+        Ok(())
+    }
+
+    /// GETs `target` with the reminder `$expand` (#2054) appended; on a 400,
+    /// sends it once more as it is (`delta`'s doc says why). The `bool` is
+    /// whether the answer is to the call with the expand: when it is not,
+    /// the caller marks what it parses `MessageFields::reminder_unasked`,
+    /// so its lack of the reminder keeps a stored one.
+    fn get_with_expand(
+        &self,
+        target: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<(ureq::Response, bool), GraphError> {
+        match self.send(Method::Get, &with_expand(target), None, headers) {
+            Err(GraphError::Http { status: 400, .. }) => self
+                .send(Method::Get, target, None, headers)
+                .map(|r| (r, false)),
+            other => other.map(|r| (r, true)),
+        }
+    }
+
+    /// PATCH `/me/messages/{id}` with `PidLidReminderSet` false (#2054):
+    /// dismisses a flagged message's reminder on the server, so the user's
+    /// other devices stop showing it.
+    pub fn dismiss_message_reminder(&self, id: &str) -> Result<(), GraphError> {
+        self.patch_message_property(id, REMINDER_SET_PROP, "false")
+    }
+
+    /// PATCH `/me/messages/{id}` with `PidLidReminderSignalTime` set to
+    /// `new_reminder_utc`, a store-shaped UTC time sent as is (#2054): the
+    /// reminder fires again then. `PidLidReminderTime` is left alone, as
+    /// Outlook's Snooze does.
+    pub fn snooze_message_reminder(
+        &self,
+        id: &str,
+        new_reminder_utc: &str,
+    ) -> Result<(), GraphError> {
+        self.patch_message_property(id, REMINDER_SIGNAL_TIME_PROP, new_reminder_utc)
+    }
+
+    /// PATCH `/me/messages/{id}` with one `singleValueExtendedProperties`
+    /// entry.
+    fn patch_message_property(&self, id: &str, prop: &str, value: &str) -> Result<(), GraphError> {
+        let id = encode_path_segment(id);
+        let path = format!("/me/messages/{id}");
+        let body = Value::Object(vec![(
+            "singleValueExtendedProperties".to_string(),
+            Value::Array(vec![Value::Object(vec![
+                ("id".to_string(), Value::Str(prop.to_string())),
+                ("value".to_string(), Value::Str(value.to_string())),
+            ])]),
         )])
         .to_string();
         self.send(Method::Patch, &path, Some(body), &[])?;
@@ -2637,7 +2732,10 @@ mod tests {
         assert_eq!(hit.message.subject, "Hi");
         assert_eq!(
             srv.requests()[0].path,
-            format!("/me/messages/A%2FB%2BC%3D?$select={MESSAGE_SELECT},parentFolderId")
+            format!(
+                "/me/messages/A%2FB%2BC%3D?$select={MESSAGE_SELECT},parentFolderId\
+                 &$expand={MESSAGE_EXPAND}"
+            )
         );
     }
 
@@ -3004,7 +3102,8 @@ mod tests {
             format!(
                 "/me/mailFolders/F1/messages/delta\
                  ?$filter=receivedDateTime%20ge%202026-10-23T00:00:00Z\
-                 &$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+                 &$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}\
+                 &$expand={MESSAGE_EXPAND}"
             )
         );
         assert!(sends_maxpagesize(&reqs[0]));
@@ -3021,10 +3120,12 @@ mod tests {
             reqs[0].path,
             format!(
                 "/me/mailFolders/F1/messages/delta\
-                 ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+                 ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}\
+                 &$expand={MESSAGE_EXPAND}"
             )
         );
-        assert!(!reqs[0].path.contains("$filter"));
+        // No `$filter` of its own: the only one is the expand's.
+        assert!(!reqs[0].path.contains("&$filter") && !reqs[0].path.contains("?$filter"));
         assert!(sends_maxpagesize(&reqs[0]));
     }
 
@@ -6523,5 +6624,251 @@ mod tests {
         c.update_event_body("MASTER", event_body_json(&input))
             .unwrap();
         assert_eq!(srv.requests()[1].body, reqs[0].body);
+    }
+
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    fn get_route(prefix: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: prefix.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn message_expand_names_the_three_reminder_properties() {
+        // The `$filter` inside the expand, decoded, is exactly the three
+        // property ids the model reads.
+        let decoded = MESSAGE_EXPAND
+            .replace("%20", " ")
+            .replace("%27", "'")
+            .replace("%7B", "{")
+            .replace("%7D", "}");
+        assert_eq!(
+            decoded,
+            format!(
+                "singleValueExtendedProperties($filter=id eq '{REMINDER_SET_PROP}' or \
+                 id eq '{}' or id eq '{REMINDER_SIGNAL_TIME_PROP}')",
+                crate::graph::model::REMINDER_TIME_PROP
+            )
+        );
+        assert!(!MESSAGE_EXPAND.contains(' '));
+    }
+
+    #[test]
+    fn get_message_expands_the_reminder() {
+        let srv = FakeServer::start(vec![get_route(
+            "/me/messages/",
+            200,
+            r#"{"id":"A/B","subject":"Hi"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.get_message("A/B").unwrap();
+        assert_eq!(
+            srv.requests()[0].path,
+            format!("/me/messages/A%2FB?$select={MESSAGE_SELECT}&$expand={MESSAGE_EXPAND}")
+        );
+    }
+
+    #[test]
+    fn delta_link_is_sent_as_it_is() {
+        // A link Graph minted carries the expand it accepted: nothing is
+        // added to it.
+        let srv = FakeServer::start(vec![delta_route()]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let link = format!(
+            "{}/me/mailFolders/F1/messages/delta?$deltatoken=t",
+            srv.base_url
+        );
+        let page = c.delta(DeltaCursor::Link(link)).unwrap();
+        assert!(!page.expand_refused, "a link is no first call");
+        assert_eq!(
+            srv.requests()[0].path,
+            "/me/mailFolders/F1/messages/delta?$deltatoken=t"
+        );
+    }
+
+    #[test]
+    fn delta_head_retries_without_expand_on_400() {
+        let plain = "/me/mailFolders/F1/messages/delta\
+                     ?$filter=receivedDateTime%20ge%202026-10-23T00:00:00Z\
+                     &$orderby=receivedDateTime%20desc&$select=";
+        let plain = format!("{plain}{MESSAGE_SELECT}");
+        let srv = FakeServer::start(vec![
+            get_route(
+                &format!("{plain}&$expand="),
+                400,
+                r#"{"error":{"code":"BadRequest","message":"expand not supported"}}"#,
+            ),
+            get_route(
+                &plain,
+                200,
+                r#"{"value":[{"id":"M1","subject":"s"}],"@odata.deltaLink":"http://x/d"}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c
+            .delta(DeltaCursor::Head {
+                folder_id: "F1".to_string(),
+                since: "2026-10-23T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.delta_link.as_deref(), Some("http://x/d"));
+        // The page says it was read without the reminder, item by item.
+        assert!(page.expand_refused);
+        assert!(matches!(
+            &page.items[0],
+            crate::graph::model::DeltaItem::Upsert(_, f) if f.reminder_unasked && !f.writes_reminder()
+        ));
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, format!("{plain}&$expand={MESSAGE_EXPAND}"));
+        assert_eq!(reqs[1].path, plain);
+        assert!(sends_maxpagesize(&reqs[1]));
+    }
+
+    #[test]
+    fn delta_full_retries_without_expand_on_400_only() {
+        let plain = format!(
+            "/me/mailFolders/F1/messages/delta\
+             ?$orderby=receivedDateTime%20desc&$select={MESSAGE_SELECT}"
+        );
+        // A 400 on the expand: the retry without it answers.
+        let srv = FakeServer::start(vec![
+            get_route(&format!("{plain}&$expand="), 400, "{}"),
+            get_route(
+                &plain,
+                200,
+                r#"{"value":[],"@odata.deltaLink":"http://x/d"}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        assert_eq!(srv.requests().len(), 2);
+        // Another refusal (a 403) is no reason to retry.
+        let srv = FakeServer::start(vec![get_route(&plain, 403, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.delta(DeltaCursor::Full("F1".to_string())),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[test]
+    fn get_message_retries_without_expand_on_400() {
+        let plain = format!("/me/messages/M1?$select={MESSAGE_SELECT}");
+        let body = r#"{"id":"M1","subject":"Hi","from":{"emailAddress":{"address":"a@x"}},"receivedDateTime":"2026-01-01T00:00:00Z"}"#;
+        let srv = FakeServer::start(vec![
+            get_route(&format!("{plain}&$expand="), 400, "{}"),
+            get_route(&plain, 200, body),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (m, f) = c.get_message("M1").unwrap();
+        assert_eq!(m.subject, "Hi");
+        assert!(!f.reminder, "no reminder came");
+        assert!(
+            f.reminder_unasked && !f.writes_reminder(),
+            "and it was not asked for"
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].path, plain);
+        // A 400 the retry answers too is returned as it is.
+        let srv = FakeServer::start(vec![get_route("/me/messages/", 400, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.get_message("M1"),
+            Err(GraphError::Http { status: 400, .. })
+        ));
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn get_message_hit_retries_without_expand_on_400() {
+        let plain = format!("/me/messages/M1?$select={MESSAGE_SELECT},parentFolderId");
+        let srv = FakeServer::start(vec![
+            get_route(&format!("{plain}&$expand="), 400, "{}"),
+            get_route(&plain, 200, r#"{"id":"M1","parentFolderId":"F2"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hit = c.get_message_hit("M1").unwrap();
+        assert_eq!(hit.folder_id, "F2");
+        assert!(hit.fields.reminder_unasked);
+        assert_eq!(srv.requests()[1].path, plain);
+    }
+
+    #[test]
+    fn get_message_reads_the_reminder() {
+        let body = r#"{"id":"M1","subject":"Hi","flag":{"flagStatus":"flagged"},
+            "singleValueExtendedProperties":[
+              {"id":"Boolean {00062008-0000-0000-c000-000000000046} Id 0x8503","value":"true"},
+              {"id":"SystemTime {00062008-0000-0000-c000-000000000046} Id 0x8560","value":"2026-11-08T10:15:00Z"}]}"#;
+        let srv = FakeServer::start(vec![get_route("/me/messages/M1", 200, body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (m, f) = c.get_message("M1").unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
+        assert!(f.reminder && !f.reminder_unasked);
+    }
+
+    fn ok_patch(path: &str) -> Route {
+        Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn dismiss_message_reminder_patches_reminder_set_false() {
+        let srv = FakeServer::start(vec![ok_patch("/me/messages/")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.dismiss_message_reminder("A/B+C=").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/A%2FB%2BC%3D");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"false"}]}"#
+        );
+    }
+
+    #[test]
+    fn snooze_message_reminder_patches_signal_time() {
+        let srv = FakeServer::start(vec![ok_patch("/me/messages/")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.snooze_message_reminder("A/B", "2026-11-08T10:15:00Z")
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/A%2FB");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560","value":"2026-11-08T10:15:00Z"}]}"#
+        );
+    }
+
+    #[test]
+    fn message_reminder_refused_is_an_error() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 400,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.dismiss_message_reminder("M1"),
+            Err(GraphError::Http { status: 400, .. })
+        ));
     }
 }

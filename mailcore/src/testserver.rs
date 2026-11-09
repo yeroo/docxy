@@ -1,9 +1,15 @@
-//! In-process fake HTTP server for tests. Not part of the shipped binary.
+//! In-process fake HTTP server for tests: test support for mailcore and for
+//! crates built on it (#2054), public but hidden from the docs. Nothing in
+//! mailcore's own code calls it, so a binary that does not either carries
+//! none of it.
 //!
 //! Binds an ephemeral loopback port, speaks just enough HTTP/1.1 to serve
 //! canned [`Route`] responses and record the requests it received. One
 //! request per connection, no keep-alive — this is test infrastructure for
-//! `auth`, `graph`, and `sync` tests, not a general-purpose server.
+//! `auth`, `graph`, and `sync` tests (mailcore's or a client's: pass
+//! `base_url` to `GraphClient::new`, or as the Graph and auth bases of the
+//! hidden `sync::engine::spawn_with_bases_and_options`), not a general-purpose
+//! server.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -23,11 +29,7 @@ pub struct Route {
 }
 
 /// A request the fake server received, captured for test assertions.
-///
-/// `method`, `headers`, and `body` are unused by this module's own test but
-/// are part of the public surface later `auth`/`graph`/`sync` tests rely on.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RecordedRequest {
     pub method: String,
     pub path: String,

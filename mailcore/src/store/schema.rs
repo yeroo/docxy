@@ -30,7 +30,14 @@ CREATE TABLE IF NOT EXISTS folders (
     backfill_link   TEXT,
     backfill_synced INTEGER NOT NULL DEFAULT 0,
     history_scope   TEXT,
-    backfill_scope  TEXT
+    backfill_scope  TEXT,
+    -- The first call of the walk whose link is `delta_link` found Graph
+    -- refusing the reminder `$expand` (#2054), so the link carries none: a
+    -- round on it never clears a stored reminder. `backfill_expand_refused`
+    -- is the same for the backfill walk under way, moved to
+    -- `reminder_expand_refused` when its link becomes `delta_link`.
+    reminder_expand_refused INTEGER NOT NULL DEFAULT 0,
+    backfill_expand_refused INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -63,7 +70,16 @@ CREATE TABLE IF NOT EXISTS messages (
     -- bumps it, a successful push clears it back to 0 if no edit came
     -- since. Non-zero: the row holds fields Graph has not seen, which a
     -- fresh delta must not overwrite.
-    local_edit      INTEGER NOT NULL DEFAULT 0
+    local_edit      INTEGER NOT NULL DEFAULT 0,
+    -- A flagged message's Outlook reminder (#2054): on (never on an
+    -- unflagged row), the time it was set for and when it fires next, and
+    -- the flag's due time, all `YYYY-MM-DDTHH:MM:SSZ` or ''. An old file
+    -- gets them, and its delta links reset, in `Store::init`, which also
+    -- creates their index.
+    is_reminder_on     INTEGER NOT NULL DEFAULT 0,
+    reminder_at        TEXT NOT NULL DEFAULT '',
+    reminder_signal_at TEXT NOT NULL DEFAULT '',
+    flag_due_at        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

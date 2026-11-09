@@ -57,6 +57,8 @@ pub enum StoreError {
     /// recognized `OutboxOp` shape. This should only happen if the row was
     /// written by something other than `enqueue_op`.
     Decode(String),
+    /// An argument the store cannot use (#2054: a time that is not one).
+    Invalid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -64,6 +66,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Sql(msg) => write!(f, "sqlite error: {msg}"),
             StoreError::Decode(msg) => write!(f, "outbox decode error: {msg}"),
+            StoreError::Invalid(msg) => f.write_str(msg),
         }
     }
 }
@@ -164,6 +167,18 @@ pub struct MessageRow {
     pub is_meeting_request: bool,
     /// Assigned category names (color labels). Empty when none.
     pub categories: Vec<String>,
+    /// The flagged message's Outlook reminder is on (#2054,
+    /// `Message::is_reminder_on`). Never true on an unflagged row: a merge
+    /// or `set_flag` that leaves it unflagged turns it off.
+    pub is_reminder_on: bool,
+    /// The time the reminder was set for (`PidLidReminderTime`), UTC
+    /// `YYYY-MM-DDTHH:MM:SSZ`, or `""`.
+    pub reminder_at: String,
+    /// When the reminder fires next (`PidLidReminderSignalTime`, moved by a
+    /// snooze), UTC `YYYY-MM-DDTHH:MM:SSZ`, or `""`.
+    pub reminder_signal_at: String,
+    /// The flag's due time (`flag.dueDateTime`), UTC, or `""`.
+    pub flag_due_at: String,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -327,6 +342,21 @@ pub enum OutboxOp {
         id: String,
         new_reminder_utc: String,
     },
+    /// Dismiss a flagged message's reminder on the server (#2054): a PATCH
+    /// of `PidLidReminderSet` to false. A message op (it follows a move,
+    /// #1896); the command wrote the store first
+    /// (`Store::dismiss_message_reminder`). A `local:` id sends nothing.
+    DismissMessageReminder {
+        id: String,
+    },
+    /// Snooze a flagged message's reminder until `new_reminder_utc`, the
+    /// store's `YYYY-MM-DDTHH:MM:SSZ` (#2054): a PATCH of
+    /// `PidLidReminderSignalTime`. A message op, written to the store first
+    /// (`Store::snooze_message_reminder`). A `local:` id sends nothing.
+    SnoozeMessageReminder {
+        id: String,
+        new_reminder_utc: String,
+    },
 }
 
 impl OutboxOp {
@@ -351,6 +381,8 @@ impl OutboxOp {
             OutboxOp::UpdateEventSeries { .. } => "updateEventSeries",
             OutboxOp::DismissReminder { .. } => "dismissReminder",
             OutboxOp::SnoozeReminder { .. } => "snoozeReminder",
+            OutboxOp::DismissMessageReminder { .. } => "dismissMessageReminder",
+            OutboxOp::SnoozeMessageReminder { .. } => "snoozeMessageReminder",
         }
     }
 
@@ -443,7 +475,8 @@ impl OutboxOp {
             ]),
             OutboxOp::CreateEvent { id }
             | OutboxOp::DeleteEvent { id }
-            | OutboxOp::DismissReminder { id } => Value::Object(vec![
+            | OutboxOp::DismissReminder { id }
+            | OutboxOp::DismissMessageReminder { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
@@ -458,6 +491,10 @@ impl OutboxOp {
                 ("body".to_string(), Value::Str(body.clone())),
             ]),
             OutboxOp::SnoozeReminder {
+                id,
+                new_reminder_utc,
+            }
+            | OutboxOp::SnoozeMessageReminder {
                 id,
                 new_reminder_utc,
             } => Value::Object(vec![
@@ -585,6 +622,11 @@ impl OutboxOp {
             }),
             "dismissReminder" => Some(OutboxOp::DismissReminder { id: id()? }),
             "snoozeReminder" => Some(OutboxOp::SnoozeReminder {
+                id: id()?,
+                new_reminder_utc: v.get("newReminderUtc")?.as_str()?.to_string(),
+            }),
+            "dismissMessageReminder" => Some(OutboxOp::DismissMessageReminder { id: id()? }),
+            "snoozeMessageReminder" => Some(OutboxOp::SnoozeMessageReminder {
                 id: id()?,
                 new_reminder_utc: v.get("newReminderUtc")?.as_str()?.to_string(),
             }),
@@ -1276,6 +1318,12 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_local_id ON messages(local_id)",
             [],
         )?;
+        migrate_message_reminders(&conn)?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_reminder
+                 ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
+            [],
+        )?;
         Ok(Store { conn })
     }
 
@@ -1402,7 +1450,12 @@ impl Store {
     /// row is inserted with what the item carried (empty otherwise). With
     /// every property carried it writes every column (`upsert_message`).
     /// `is_meeting_request` and `is_draft` follow
-    /// `MessageFields::writes_meeting_request` / `writes_is_draft`.
+    /// `MessageFields::writes_meeting_request` / `writes_is_draft`, the
+    /// reminder columns `writes_reminder` and `flag_due_at` the flag
+    /// (#2054). The reminder is on only while the row is flagged (the
+    /// stored flag when the item carries none), so an unflag or a completed
+    /// flag Graph reports leaves it off even if Exchange kept
+    /// `PidLidReminderSet`.
     ///
     /// One static statement, so the FTS update trigger fires once.
     pub fn merge_message(
@@ -1444,8 +1497,10 @@ impl Store {
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
                  is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                 is_meeting_request, categories
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                 is_meeting_request, categories,
+                 is_reminder_on, reminder_at, reminder_signal_at, flag_due_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                       ?35 AND ?12, ?36, ?37, ?38)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -1463,7 +1518,14 @@ impl Store {
                  preview = CASE WHEN ?30 THEN excluded.preview ELSE messages.preview END,
                  is_draft = CASE WHEN ?31 THEN excluded.is_draft ELSE messages.is_draft END,
                  is_meeting_request = CASE WHEN ?32 THEN excluded.is_meeting_request ELSE messages.is_meeting_request END,
-                 categories = CASE WHEN ?33 THEN excluded.categories ELSE messages.categories END
+                 categories = CASE WHEN ?33 THEN excluded.categories ELSE messages.categories END,
+                 is_reminder_on =
+                     (CASE WHEN ?39 THEN ?35 ELSE messages.is_reminder_on END)
+                     AND (CASE WHEN ?27 THEN excluded.is_flagged ELSE messages.is_flagged END),
+                 reminder_at = CASE WHEN ?39 THEN excluded.reminder_at ELSE messages.reminder_at END,
+                 reminder_signal_at = CASE WHEN ?39 THEN excluded.reminder_signal_at
+                                           ELSE messages.reminder_signal_at END,
+                 flag_due_at = CASE WHEN ?27 THEN excluded.flag_due_at ELSE messages.flag_due_at END
              WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
@@ -1500,6 +1562,11 @@ impl Store {
                 fields.writes_meeting_request(),
                 fields.categories,
                 guard,
+                m.is_reminder_on,
+                m.reminder_at,
+                m.reminder_signal_at,
+                m.flag_due_at,
+                fields.writes_reminder(),
             ],
         )?;
         Ok(n > 0)
@@ -1577,7 +1644,9 @@ impl Store {
                 | OutboxOp::Move { id, .. }
                 | OutboxOp::Delete { id }
                 | OutboxOp::SaveDraft { id }
-                | OutboxOp::SendDraft { id } => Some(id),
+                | OutboxOp::SendDraft { id }
+                | OutboxOp::DismissMessageReminder { id }
+                | OutboxOp::SnoozeMessageReminder { id, .. } => Some(id),
                 OutboxOp::RespondEvent { .. }
                 | OutboxOp::CreateEvent { .. }
                 | OutboxOp::UpdateEvent { .. }
@@ -1702,6 +1771,7 @@ impl Store {
                         to_recipients, cc_recipients, received_at, sent_at,
                         is_read, is_flagged, has_attachments, importance, preview, is_draft,
                         bcc_recipients, is_meeting_request, categories,
+                        is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -1717,7 +1787,8 @@ impl Store {
              SELECT k.id, k.folder_id, k.conversation_id, k.subject, k.from_name, k.from_addr,
                     k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
                     k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft,
-                    k.bcc_recipients, k.is_meeting_request, k.categories
+                    k.bcc_recipients, k.is_meeting_request, k.categories,
+                    k.is_reminder_on, k.reminder_at, k.reminder_signal_at, k.flag_due_at
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -1742,11 +1813,62 @@ impl Store {
 
     /// Locally sets/clears the flagged state of a message. See `set_read`
     /// for why this doesn't return a `Result`.
+    ///
+    /// Clearing the flag turns its reminder off too, as Outlook does
+    /// (#2054); its times are kept. Setting it leaves the reminder as it
+    /// is (off, until Graph reports one).
     pub fn set_flag(&self, id: &str, flagged: bool) {
         let _ = self.conn.execute(
-            "UPDATE messages SET is_flagged = ?1 WHERE id = ?2",
+            "UPDATE messages SET is_flagged = ?1, is_reminder_on = is_reminder_on AND ?1
+             WHERE id = ?2",
             params![flagged, id],
         );
+    }
+
+    /// Locally turns a message's reminder off (the optimistic half of
+    /// `SyncCommand::DismissMessageReminder`, #2054), under exactly `id`
+    /// (the engine resolves a moved id first). See `set_read` for why this
+    /// doesn't return a `Result`.
+    pub fn dismiss_message_reminder(&self, id: &str) {
+        let _ = self.conn.execute(
+            "UPDATE messages SET is_reminder_on = 0 WHERE id = ?1",
+            params![id],
+        );
+    }
+
+    /// Locally moves a message reminder's next signal to `utc` (the
+    /// optimistic half of `SyncCommand::SnoozeMessageReminder`, #2054), a
+    /// store-shaped UTC time, under exactly `id`. The reminder stays as it
+    /// is otherwise: snoozing one that is off does not turn it on. See
+    /// `set_read` for why this doesn't return a `Result`.
+    pub fn snooze_message_reminder(&self, id: &str, utc: &str) {
+        let _ = self.conn.execute(
+            "UPDATE messages SET reminder_signal_at = ?2 WHERE id = ?1",
+            params![id, utc],
+        );
+    }
+
+    /// The flagged messages, in any folder, whose reminder is on and due at
+    /// or before `now_utc` (#2054): their next signal time
+    /// (`reminder_signal_at`, else `reminder_at` when Graph sent no signal
+    /// time) is not after it. Soonest first, then by id. `now_utc` is read
+    /// as a reminder time is (`model::reminder_time`: UTC, `Z` or no
+    /// suffix, a fraction allowed) and normalised like every stored time,
+    /// as they compare as text; one it cannot read (an offset, not a time)
+    /// is a `StoreError::Invalid`, so a caller's bug shows. A client polls
+    /// it, as it reads events for their reminders.
+    pub fn due_message_reminders(&self, now_utc: &str) -> Result<Vec<MessageRow>, StoreError> {
+        let now = crate::graph::model::reminder_time(now_utc);
+        if now.is_empty() {
+            return Err(StoreError::Invalid(format!(
+                "due message reminders: not a UTC time: {now_utc:?}"
+            )));
+        }
+        let mut stmt = self.conn.prepare(&due_message_reminders_sql())?;
+        let rows = stmt
+            .query_map(params![now], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Locally sets a message's category names (the optimistic half of
@@ -1863,6 +1985,72 @@ impl Store {
         Ok(link)
     }
 
+    /// Records whether the first call of the walk whose link `folder_id`
+    /// stores as `delta_link` found Graph refusing the reminder `$expand`
+    /// (#2054): the engine sets it with the head's or a small folder's
+    /// link, 1 or 0, and `complete_backfill` from the backfill's own
+    /// record. While it is set, a round on that link (which carries no
+    /// expand) merges its items as `MessageFields::reminder_unasked`,
+    /// keeping the stored reminders. `clear_delta_links` clears it.
+    pub fn set_reminder_expand_refused(
+        &self,
+        folder_id: &str,
+        refused: bool,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET reminder_expand_refused = ?2 WHERE id = ?1",
+            params![folder_id, refused],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `folder_id`'s `delta_link` came from a walk whose reminder
+    /// `$expand` was refused ([`Store::set_reminder_expand_refused`]);
+    /// false for an unknown folder.
+    pub fn reminder_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
+        self.folder_flag(folder_id, "reminder_expand_refused")
+    }
+
+    /// Records that the backfill walk under way for `folder_id` had its
+    /// first call's reminder `$expand` refused (#2054), so its later pages,
+    /// on links that carry none, keep stored reminders too. Moved to the
+    /// folder's mark by `complete_backfill`; cleared by `reset_backfill`
+    /// and `clear_delta_links`.
+    pub fn set_backfill_expand_refused(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET backfill_expand_refused = 1 WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether the backfill walk under way for `folder_id` was refused the
+    /// expand ([`Store::set_backfill_expand_refused`]); false for an
+    /// unknown folder.
+    pub fn backfill_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
+        self.folder_flag(folder_id, "backfill_expand_refused")
+    }
+
+    /// One boolean `folders` column of `folder_id`, false for an unknown
+    /// folder. `column` is one of this file's literals, never input.
+    fn folder_flag(&self, folder_id: &str, column: &str) -> Result<bool, StoreError> {
+        let flag = self
+            .conn
+            .query_row(
+                &format!("SELECT {column} FROM folders WHERE id = ?1"),
+                params![folder_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(flag)
+    }
+
     /// Stores the delta link for a folder (used to resume delta sync).
     pub fn set_delta_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
         self.conn.execute(
@@ -1880,6 +2068,9 @@ impl Store {
     ///
     /// It also clears every folder's backfill (#1871): its link, count and
     /// scope, so each folder runs its head and then its full delta again.
+    /// It clears every folder's refused-expand marks (#2054,
+    /// [`Store::set_reminder_expand_refused`]) with them.
+    ///
     /// And it marks a reconverge pending (`meta.reconverge_pending`, read by
     /// [`Store::reconverge_pending`]), in the same transaction, so an engine
     /// restarted before the reconverge ends still runs it without the
@@ -1889,7 +2080,8 @@ impl Store {
         tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
-                                backfill_scope = NULL",
+                                backfill_scope = NULL, reminder_expand_refused = 0,
+                                backfill_expand_refused = 0",
             [],
         )?;
         tx.execute(
@@ -1955,7 +2147,10 @@ impl Store {
     /// Ends a folder's backfill (#1871), in one statement: the full
     /// delta's `deltaLink` becomes the folder's `delta_link` (replacing the
     /// head's), `scope` records what it covers, the backfill link is
-    /// cleared and `synced` is set to the final count.
+    /// cleared and `synced` is set to the final count. The walk's refused
+    /// reminder expand (#2054, `backfill_expand_refused`) becomes the
+    /// folder's mark, as its link is now `delta_link`; a small folder's
+    /// caller sets the mark after it (`set_reminder_expand_refused`).
     pub fn complete_backfill(
         &self,
         folder_id: &str,
@@ -1966,7 +2161,9 @@ impl Store {
         self.conn.execute(
             "UPDATE folders SET delta_link = ?2, history_scope = ?3,
                                 backfill_link = NULL, backfill_synced = ?4,
-                                backfill_scope = NULL
+                                backfill_scope = NULL,
+                                reminder_expand_refused = backfill_expand_refused,
+                                backfill_expand_refused = 0
              WHERE id = ?1",
             params![folder_id, delta_link, scope, synced],
         )?;
@@ -1975,12 +2172,12 @@ impl Store {
 
     /// Restarts a folder's backfill from a fresh full delta (#1871: its
     /// page link expired, or a window walk resumed in whole-mailbox mode):
-    /// clears the link, the count and the walk's scope, and keeps the
-    /// head's `delta_link`.
+    /// clears the link, the count, the walk's scope and its refused
+    /// reminder expand (#2054), and keeps the head's `delta_link`.
     pub fn reset_backfill(&self, folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET backfill_link = NULL, backfill_synced = 0,
-                                backfill_scope = NULL
+                                backfill_scope = NULL, backfill_expand_refused = 0
              WHERE id = ?1",
             params![folder_id],
         )?;
@@ -2719,6 +2916,7 @@ impl Store {
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
                     bcc_recipients, is_meeting_request, categories,
+                    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                     bodies.content_type, bodies.content
              FROM messages JOIN bodies ON bodies.message_id = messages.id
              WHERE ",
@@ -2729,8 +2927,8 @@ impl Store {
                 Ok((
                     map_message_row(r)?,
                     Body {
-                        content_type: r.get(19)?,
-                        content: r.get(20)?,
+                        content_type: r.get(23)?,
+                        content: r.get(24)?,
                     },
                 ))
             })?
@@ -3006,7 +3204,8 @@ impl Store {
             "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
                     to_recipients, cc_recipients, received_at, sent_at,
                     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request, categories
+                    bcc_recipients, is_meeting_request, categories,
+                    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
@@ -4737,6 +4936,40 @@ pub(crate) fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
     Some(days_from_civil(i64::from(y), m, d) * 86400 + i64::from(h * 3600 + mi * 60 + sec))
 }
 
+/// Brings a store from before #2054 up to date: adds the message reminder
+/// columns and resets every folder's delta and backfill state (what
+/// [`Store::clear_delta_links`] clears, without a reconverge: nothing was
+/// quarantined), as a link Graph minted before then never returns the
+/// reminder's `$expand`. One IMMEDIATE transaction that probes for the
+/// column first, so a crash cannot leave the columns without the reset,
+/// and a second connection opening the same file at once waits and then
+/// finds the columns there. A store that has them (every fresh one, from
+/// `SCHEMA_SQL`) is left alone. Returns whether it migrated.
+fn migrate_message_reminders(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'is_reminder_on'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN is_reminder_on INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE messages ADD COLUMN reminder_at TEXT NOT NULL DEFAULT '';
+         ALTER TABLE messages ADD COLUMN reminder_signal_at TEXT NOT NULL DEFAULT '';
+         ALTER TABLE messages ADD COLUMN flag_due_at TEXT NOT NULL DEFAULT '';
+         ALTER TABLE folders ADD COLUMN reminder_expand_refused INTEGER NOT NULL DEFAULT 0;
+         ALTER TABLE folders ADD COLUMN backfill_expand_refused INTEGER NOT NULL DEFAULT 0;
+         UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                            backfill_synced = 0, history_scope = NULL,
+                            backfill_scope = NULL;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
 /// OS-entropy source the PKCE verifier uses, rather than pulling in a
@@ -5084,7 +5317,25 @@ fn sanitize_recipient_name(name: &str) -> String {
 const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from_name, from_addr,
     to_recipients, cc_recipients, received_at, sent_at,
     is_read, is_flagged, has_attachments, importance, preview, is_draft,
-    bcc_recipients, is_meeting_request, categories";
+    bcc_recipients, is_meeting_request, categories,
+    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at";
+
+/// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
+/// reminder is on and whose next signal (`reminder_signal_at`, else
+/// `reminder_at`), bound once as `due`, is set and not after `?1`. The
+/// `is_reminder_on = 1` term lets SQLite use the partial
+/// `idx_messages_reminder`; a test checks the plan.
+fn due_message_reminders_sql() -> String {
+    format!(
+        "SELECT {MESSAGE_ROW_COLUMNS} FROM (
+             SELECT *, COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) AS due
+             FROM messages
+             WHERE is_flagged = 1 AND is_reminder_on = 1
+         )
+         WHERE due <> '' AND due <= ?1
+         ORDER BY due, id"
+    )
+}
 
 /// `Store::message_rows`'s statement (#2053): the rows whose id is in the
 /// JSON array `?1`. SQLite plans the `IN` subquery as one primary-key
@@ -5124,6 +5375,10 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         bcc_recipients: row.get(16)?,
         is_meeting_request: row.get(17)?,
         categories: decode_categories(&row.get::<_, String>(18)?),
+        is_reminder_on: row.get(19)?,
+        reminder_at: row.get(20)?,
+        reminder_signal_at: row.get(21)?,
+        flag_due_at: row.get(22)?,
     })
 }
 
@@ -5299,6 +5554,10 @@ mod tests {
             is_draft: false,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         }
     }
 
@@ -5853,6 +6112,10 @@ mod tests {
             is_draft: false,
             is_meeting_request: false,
             categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         s.merge_message("G", &partial, &read_only_fields()).unwrap();
         let after = raw_row(&s, "11");
@@ -5927,6 +6190,10 @@ mod tests {
         m.is_draft = true;
         m.is_meeting_request = true;
         m.categories = vec!["X".into(), "Y".into()];
+        m.is_reminder_on = true;
+        m.reminder_at = "2026-07-13T08:00:00Z".into();
+        m.reminder_signal_at = "2026-07-13T09:00:00Z".into();
+        m.flag_due_at = "2026-07-14T00:00:00Z".into();
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -5959,6 +6226,10 @@ mod tests {
             ("categories", t(&encode_categories(&m.categories))),
             ("local_id", V::Null),
             ("local_edit", V::Integer(0)),
+            ("is_reminder_on", V::Integer(1)),
+            ("reminder_at", t("2026-07-13T08:00:00Z")),
+            ("reminder_signal_at", t("2026-07-13T09:00:00Z")),
+            ("flag_due_at", t("2026-07-14T00:00:00Z")),
         ];
         expect(&s, "13", &first);
 
@@ -5987,6 +6258,10 @@ mod tests {
             is_draft: false,
             is_meeting_request: false,
             categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         s.upsert_message("G", &m2).unwrap();
         expect(
@@ -6014,6 +6289,10 @@ mod tests {
                 ("categories", t(&encode_categories(&[]))),
                 ("local_id", V::Null),
                 ("local_edit", V::Integer(0)),
+                ("is_reminder_on", V::Integer(0)),
+                ("reminder_at", t("")),
+                ("reminder_signal_at", t("")),
+                ("flag_due_at", t("")),
             ],
         );
     }
@@ -10269,6 +10548,10 @@ mod search_tests {
             is_draft: false,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(
@@ -11073,6 +11356,10 @@ mod local_id_tests {
             is_draft: true,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         s.upsert_message(&folder, &m).unwrap();
         assert_eq!(s.current_id(&local).unwrap(), "G");
@@ -11175,6 +11462,10 @@ mod body_format_tests {
             is_draft,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         }
     }
 
@@ -11863,6 +12154,10 @@ mod folder_retain_tests {
             is_draft: false,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         }
     }
 
@@ -12281,6 +12576,10 @@ mod backfill_tests {
             is_draft: false,
             is_meeting_request: false,
             categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         };
         let all = MessageFields::all();
         assert!(
@@ -12447,6 +12746,10 @@ mod moved_id_tests {
             is_draft: false,
             is_meeting_request: false,
             categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
         }
     }
 
@@ -12765,5 +13068,640 @@ mod moved_id_tests {
         })
         .unwrap();
         assert_eq!(s.pending_message_ids().unwrap(), ["NEW1", "OTHER"]);
+    }
+}
+
+#[cfg(test)]
+mod message_reminder_tests {
+    //! A flagged message's reminder (#2054): its columns, the migration,
+    //! the flag invariant, the due query and the outbox ops.
+    use super::*;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    /// A flagged message with a reminder, set for `at` and signalling at
+    /// `signal`.
+    fn reminded(id: &str, at: &str, signal: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("subject {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-11-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: true,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+            is_reminder_on: true,
+            reminder_at: at.into(),
+            reminder_signal_at: signal.into(),
+            flag_due_at: "2026-11-09T17:00:00Z".into(),
+        }
+    }
+
+    fn row(s: &Store, id: &str) -> MessageRow {
+        s.message_row(id).unwrap().unwrap()
+    }
+
+    /// The reminder columns of `r`.
+    fn reminder(r: &MessageRow) -> (bool, &str, &str, &str) {
+        (
+            r.is_reminder_on,
+            r.reminder_at.as_str(),
+            r.reminder_signal_at.as_str(),
+            r.flag_due_at.as_str(),
+        )
+    }
+
+    const ON: (bool, &str, &str, &str) = (
+        true,
+        "2026-11-08T10:00:00Z",
+        "2026-11-08T10:15:00Z",
+        "2026-11-09T17:00:00Z",
+    );
+
+    #[test]
+    fn message_reminder_columns_round_trip() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let mut m = reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z");
+        m.is_draft = true;
+        s.upsert_message("F", &m).unwrap();
+        s.put_body(
+            "M1",
+            &Body {
+                content_type: "text".into(),
+                content: "b".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(reminder(&row(&s, "M1")), ON, "message_row");
+        let in_folder = s.messages_in_folder("F", 50, 0).unwrap();
+        assert_eq!(reminder(&in_folder[0]), ON, "messages_in_folder");
+        let rows = s.message_rows(&["M1"]).unwrap();
+        assert_eq!(reminder(&rows[0]), ON, "message_rows");
+        let hits = s.search("subject", 10).unwrap();
+        assert_eq!(reminder(&hits[0]), ON, "search");
+        let conv = s.conversations_in_folder("F", 50, 0).unwrap();
+        assert_eq!(reminder(&conv[0]), ON, "conversations_in_folder");
+        let (draft, body) = s.draft("M1").unwrap().unwrap();
+        assert_eq!(reminder(&draft), ON, "draft");
+        assert_eq!(
+            body.content, "b",
+            "the body columns moved past the new ones"
+        );
+    }
+
+    #[test]
+    fn partial_merge_keeps_the_reminder_complete_merge_clears_it() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message(
+            "F",
+            &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+        )
+        .unwrap();
+        // A partial item (`{id, isRead}`) carries no reminder: kept.
+        let partial = crate::json::parse(r#"{"id":"M1","isRead":true}"#).unwrap();
+        let m = Message::from_json(&partial).unwrap();
+        s.merge_message("F", &m, &MessageFields::of(&partial))
+            .unwrap();
+        assert_eq!(reminder(&row(&s, "M1")), ON);
+        // A partial item carrying the properties writes them.
+        let partial = crate::json::parse(
+            r#"{"id":"M1","singleValueExtendedProperties":[
+                {"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"true"},
+                {"id":"SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560","value":"2026-11-08T11:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let m = Message::from_json(&partial).unwrap();
+        s.merge_message("F", &m, &MessageFields::of(&partial))
+            .unwrap();
+        let r = row(&s, "M1");
+        assert_eq!(
+            reminder(&r),
+            (true, "", "2026-11-08T11:00:00Z", "2026-11-09T17:00:00Z"),
+            "the flag (and its due time) was not carried: kept"
+        );
+        // A complete item without the properties: no reminder.
+        let complete = crate::json::parse(
+            r#"{"id":"M1","subject":"s","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"flagged"}}"#,
+        )
+        .unwrap();
+        let m = Message::from_json(&complete).unwrap();
+        s.merge_message("F", &m, &MessageFields::of(&complete))
+            .unwrap();
+        assert_eq!(reminder(&row(&s, "M1")), (false, "", "", ""));
+    }
+
+    #[test]
+    fn unflagged_delta_item_with_reminder_set_stays_off() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        // Exchange may keep `PidLidReminderSet` on a message it unflagged
+        // (or completed): the row's reminder stays off.
+        for status in ["notFlagged", "complete"] {
+            let v = crate::json::parse(&format!(
+                r#"{{"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                    "receivedDateTime":"2026-11-01T00:00:00Z","flag":{{"flagStatus":"{status}"}},
+                    "singleValueExtendedProperties":[
+                    {{"id":"Boolean {{00062008-0000-0000-C000-000000000046}} Id 0x8503","value":"true"}},
+                    {{"id":"SystemTime {{00062008-0000-0000-C000-000000000046}} Id 0x8560","value":"2026-11-08T10:15:00Z"}}]}}"#
+            ))
+            .unwrap();
+            let m = Message::from_json(&v).unwrap();
+            assert!(m.is_reminder_on, "the model reads what Graph sent");
+            // Inserted, and over a flagged row with a reminder.
+            s.merge_message("F", &m, &MessageFields::of(&v)).unwrap();
+            let r = row(&s, "M1");
+            assert!(!r.is_flagged && !r.is_reminder_on, "{status}");
+            assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z", "times kept");
+            s.upsert_message(
+                "F",
+                &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+            )
+            .unwrap();
+            assert!(row(&s, "M1").is_reminder_on);
+            s.merge_message("F", &m, &MessageFields::of(&v)).unwrap();
+            assert!(!row(&s, "M1").is_reminder_on, "{status} over a flagged row");
+        }
+    }
+
+    #[test]
+    fn partial_reminder_props_on_an_unflagged_row_stay_off() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let mut m = reminded("M1", "", "");
+        m.is_flagged = false;
+        m.is_reminder_on = false;
+        s.upsert_message("F", &m).unwrap();
+        // A partial item carrying only the reminder (no flag): the stored
+        // flag, off, decides.
+        let partial = crate::json::parse(
+            r#"{"id":"M1","singleValueExtendedProperties":[
+                {"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"true"},
+                {"id":"SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560","value":"2026-11-08T10:15:00Z"}]}"#,
+        )
+        .unwrap();
+        let pm = Message::from_json(&partial).unwrap();
+        s.merge_message("F", &pm, &MessageFields::of(&partial))
+            .unwrap();
+        let r = row(&s, "M1");
+        assert!(!r.is_reminder_on);
+        assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z");
+        // Once flagged (a partial item carrying the flag alone), the stored
+        // reminder decides: its time is there, but `is_reminder_on` was
+        // stored off, so it stays off until Graph says it is on.
+        let flag = crate::json::parse(r#"{"id":"M1","flag":{"flagStatus":"flagged"}}"#).unwrap();
+        let fm = Message::from_json(&flag).unwrap();
+        s.merge_message("F", &fm, &MessageFields::of(&flag))
+            .unwrap();
+        let r = row(&s, "M1");
+        assert!(r.is_flagged && !r.is_reminder_on);
+    }
+
+    #[test]
+    fn set_flag_false_clears_the_reminder() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message(
+            "F",
+            &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+        )
+        .unwrap();
+        s.set_flag("M1", true);
+        assert_eq!(
+            reminder(&row(&s, "M1")),
+            ON,
+            "flagging again changes nothing"
+        );
+        s.set_flag("M1", false);
+        let r = row(&s, "M1");
+        assert!(!r.is_flagged);
+        assert_eq!(
+            reminder(&r),
+            (
+                false,
+                "2026-11-08T10:00:00Z",
+                "2026-11-08T10:15:00Z",
+                "2026-11-09T17:00:00Z"
+            ),
+            "off, its times kept"
+        );
+        s.set_flag("M1", true);
+        assert!(
+            !row(&s, "M1").is_reminder_on,
+            "a re-flag does not turn it on"
+        );
+    }
+
+    #[test]
+    fn dismiss_and_snooze_write_the_row() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message(
+            "F",
+            &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+        )
+        .unwrap();
+        s.snooze_message_reminder("M1", "2026-11-08T11:00:00Z");
+        let r = row(&s, "M1");
+        assert_eq!(
+            (
+                r.is_reminder_on,
+                r.reminder_at.as_str(),
+                r.reminder_signal_at.as_str()
+            ),
+            (true, "2026-11-08T10:00:00Z", "2026-11-08T11:00:00Z"),
+            "the snooze moves the signal only"
+        );
+        s.dismiss_message_reminder("M1");
+        assert!(!row(&s, "M1").is_reminder_on);
+        // An unknown id is no error.
+        s.dismiss_message_reminder("NOPE");
+        s.snooze_message_reminder("NOPE", "2026-11-08T11:00:00Z");
+    }
+
+    #[test]
+    fn due_message_reminders_returns_only_flagged_due_reminders_across_folders() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        let now = "2026-11-08T12:00:00Z";
+        // Due: a signal in the past, in two folders; a signal exactly now;
+        // no signal time but a due reminder time.
+        s.upsert_message(
+            "F",
+            &reminded("A", "2026-11-08T09:00:00Z", "2026-11-08T11:00:00Z"),
+        )
+        .unwrap();
+        s.upsert_message(
+            "G",
+            &reminded("B", "2026-11-08T08:00:00Z", "2026-11-08T10:00:00Z"),
+        )
+        .unwrap();
+        s.upsert_message("F", &reminded("C", "2026-11-08T07:00:00Z", now))
+            .unwrap();
+        s.upsert_message("G", &reminded("D", "2026-11-08T11:30:00Z", ""))
+            .unwrap();
+        // Not due: a snooze past now (the reminder time alone is past), and
+        // Outlook's "never" sentinel.
+        s.upsert_message(
+            "F",
+            &reminded("E", "2026-11-08T09:00:00Z", "2026-11-08T12:00:01Z"),
+        )
+        .unwrap();
+        s.upsert_message(
+            "F",
+            &reminded("N", "2026-11-08T09:00:00Z", "4501-01-01T00:00:00Z"),
+        )
+        .unwrap();
+        // Not due: the reminder off, no time at all, unflagged with a
+        // reminder set (stored directly, as an old row might be).
+        let mut off = reminded("O", "2026-11-08T09:00:00Z", "2026-11-08T09:00:00Z");
+        off.is_reminder_on = false;
+        s.upsert_message("F", &off).unwrap();
+        s.upsert_message("F", &reminded("T", "", "")).unwrap();
+        s.upsert_message(
+            "G",
+            &reminded("U", "2026-11-08T09:00:00Z", "2026-11-08T09:00:00Z"),
+        )
+        .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET is_flagged = 0, is_reminder_on = 1 WHERE id = 'U'",
+                [],
+            )
+            .unwrap();
+        let due: Vec<String> = s
+            .due_message_reminders(now)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(due, ["B", "A", "D", "C"], "soonest first, across folders");
+        // `now` is normalised like the stored times.
+        let due = s
+            .due_message_reminders("2026-11-08T12:00:00.0000000")
+            .unwrap();
+        assert_eq!(due.len(), 4);
+        assert!(
+            s.due_message_reminders("2026-11-08T09:59:59Z")
+                .unwrap()
+                .is_empty()
+        );
+        // A `now` that is not a UTC time is the caller's bug: an error, not
+        // an empty list (an offset would be dropped without being applied).
+        for bad in ["2026-11-08T12:00:00+02:00", "garbage", ""] {
+            assert!(
+                matches!(s.due_message_reminders(bad), Err(StoreError::Invalid(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_read_without_the_reminder_keeps_it() {
+        // `reminder_unasked` (#2054: Graph refused the expand): a complete
+        // item without the key keeps the stored reminder; one with it writes.
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message(
+            "F",
+            &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+        )
+        .unwrap();
+        let complete = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"flagged"}}"#,
+        )
+        .unwrap();
+        let m = Message::from_json(&complete).unwrap();
+        let mut fields = MessageFields::of(&complete);
+        fields.reminder_unasked = true;
+        s.merge_message("F", &m, &fields).unwrap();
+        let r = row(&s, "M1");
+        assert_eq!(r.subject, "new");
+        assert_eq!(
+            (
+                r.is_reminder_on,
+                r.reminder_at.as_str(),
+                r.reminder_signal_at.as_str()
+            ),
+            (true, "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z")
+        );
+        assert_eq!(r.flag_due_at, "", "the due time still follows the flag");
+        // An unasked item that carries the key writes it.
+        let carried = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"flagged"},
+                "singleValueExtendedProperties":[]}"#,
+        )
+        .unwrap();
+        let mut fields = MessageFields::of(&carried);
+        fields.reminder_unasked = true;
+        assert!(fields.writes_reminder());
+        // The flag still rules: unflagged, the kept reminder is off.
+        let unflagged = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"notFlagged"}}"#,
+        )
+        .unwrap();
+        let mut fields = MessageFields::of(&unflagged);
+        fields.reminder_unasked = true;
+        s.merge_message("F", &Message::from_json(&unflagged).unwrap(), &fields)
+            .unwrap();
+        assert!(!row(&s, "M1").is_reminder_on);
+    }
+
+    #[test]
+    fn the_expand_refused_mark_goes_with_the_links() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(!s.reminder_expand_refused("NOPE").unwrap());
+        s.set_reminder_expand_refused("F", true).unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        assert!(!s.reminder_expand_refused("G").unwrap());
+        // A round's new link (minted from the same walk) keeps it.
+        s.set_delta_link("F", "LINK").unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        s.set_reminder_expand_refused("F", false).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        // Clearing the links clears both marks.
+        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_backfill_expand_refused("F").unwrap();
+        s.clear_delta_links().unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(!s.backfill_expand_refused("F").unwrap());
+    }
+
+    #[test]
+    fn the_backfill_expand_refusal_moves_with_its_link() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        assert!(!s.backfill_expand_refused("NOPE").unwrap());
+        // A refused head, then a backfill whose first call was accepted:
+        // its link replaces the head's, and so does its (clear) record.
+        s.set_head_link("F", "HEAD").unwrap();
+        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_backfill_progress("F", "PAGE2", 10, SCOPE_ALL)
+            .unwrap();
+        assert!(
+            s.reminder_expand_refused("F").unwrap(),
+            "the head's link is still stored"
+        );
+        s.complete_backfill("F", "FULL", SCOPE_ALL, 20).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        // The reverse: an accepted head, a refused backfill under way, then
+        // its link stored.
+        s.set_backfill_expand_refused("F").unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(s.backfill_expand_refused("F").unwrap());
+        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20).unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        assert!(!s.backfill_expand_refused("F").unwrap(), "moved");
+        // `reset_backfill` drops the walk's record, and keeps the folder's.
+        s.set_backfill_expand_refused("F").unwrap();
+        s.reset_backfill("F").unwrap();
+        assert!(!s.backfill_expand_refused("F").unwrap());
+        assert!(s.reminder_expand_refused("F").unwrap());
+    }
+
+    #[test]
+    fn due_message_reminders_uses_the_partial_index() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                due_message_reminders_sql()
+            ))
+            .unwrap()
+            .query_map(["2026-11-08T12:00:00Z"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|p| p.contains("idx_messages_reminder")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn messages_without_2054_columns_migrate_and_reset_delta_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-reminder-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            s.upsert_message(
+                "F",
+                &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+            )
+            .unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2")
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            // Back to a store from before #2054.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_reminder;
+                     ALTER TABLE messages DROP COLUMN is_reminder_on;
+                     ALTER TABLE messages DROP COLUMN reminder_at;
+                     ALTER TABLE messages DROP COLUMN reminder_signal_at;
+                     ALTER TABLE messages DROP COLUMN flag_due_at;
+                     ALTER TABLE folders DROP COLUMN reminder_expand_refused;
+                     ALTER TABLE folders DROP COLUMN backfill_expand_refused;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // The columns are there, empty, and no folder is marked.
+        assert_eq!(reminder(&row(&s, "M1")), (false, "", "", ""));
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        // Every folder's delta and backfill state is reset, with no
+        // reconverge (nothing was quarantined).
+        for f in ["F", "G"] {
+            assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
+            let (backfill, synced, history, scope): (
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = s
+                .conn
+                .query_row(
+                    "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = ?1",
+                    [f],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (backfill, synced, history, scope),
+                (None, 0, None, None),
+                "{f}"
+            );
+        }
+        assert!(!s.reconverge_pending().unwrap());
+        // The index came with them.
+        let indexed: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_messages_reminder'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+        // A link stored after the migration survives the next open.
+        s.set_head_link("F", "https://graph/F?$deltatoken=new")
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=new")
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_is_not_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        assert!(!migrate_message_reminders(&conn).unwrap());
+    }
+
+    #[test]
+    fn outbox_op_message_reminder_round_trip() {
+        let dismiss = OutboxOp::DismissMessageReminder { id: "M1".into() };
+        assert_eq!(
+            dismiss.to_json().to_string(),
+            r#"{"kind":"dismissMessageReminder","id":"M1"}"#
+        );
+        let snooze = OutboxOp::SnoozeMessageReminder {
+            id: "M1".into(),
+            new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+        };
+        assert_eq!(
+            snooze.to_json().to_string(),
+            r#"{"kind":"snoozeMessageReminder","id":"M1","newReminderUtc":"2026-11-08T10:15:00Z"}"#
+        );
+        for op in [dismiss, snooze] {
+            let back = OutboxOp::from_json(&crate::json::parse(&op.to_json().to_string()).unwrap());
+            assert_eq!(back, Some(op));
+        }
+        for raw in [
+            r#"{"kind":"dismissMessageReminder"}"#,
+            r#"{"kind":"snoozeMessageReminder","id":"M1"}"#,
+            r#"{"kind":"snoozeMessageReminder","newReminderUtc":"2026-11-08T10:15:00Z"}"#,
+        ] {
+            assert_eq!(
+                OutboxOp::from_json(&crate::json::parse(raw).unwrap()),
+                None,
+                "{raw}"
+            );
+        }
+        // Through the queue too.
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue_op(&OutboxOp::DismissMessageReminder { id: "M1".into() })
+            .unwrap();
+        assert_eq!(
+            s.pending_ops().unwrap()[0].op,
+            OutboxOp::DismissMessageReminder { id: "M1".into() }
+        );
+    }
+
+    #[test]
+    fn pending_message_ids_include_message_reminder_ops() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &reminded("NEW", "", "")).unwrap();
+        s.follow_move("OLD", "NEW").unwrap();
+        for op in [
+            OutboxOp::DismissMessageReminder { id: "OLD".into() },
+            OutboxOp::SnoozeMessageReminder {
+                id: "M2".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+            OutboxOp::DismissReminder { id: "EV".into() },
+        ] {
+            s.enqueue_op(&op).unwrap();
+        }
+        assert_eq!(s.pending_message_ids().unwrap(), ["M2", "NEW"]);
     }
 }

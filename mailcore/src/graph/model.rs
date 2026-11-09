@@ -110,10 +110,24 @@ pub struct Message {
     /// Graph `categories`: the message's assigned category names (color labels).
     /// Colors live separately in the master category list (`MasterCategory`).
     pub categories: Vec<String>,
+    /// Outlook's reminder on a flagged message is on (#2054):
+    /// `PidLidReminderSet` true and at least one of its times readable. A
+    /// reminder with no time cannot fire, so it reads as off.
+    pub is_reminder_on: bool,
+    /// `PidLidReminderTime`, the time the reminder was set for, as
+    /// `YYYY-MM-DDTHH:MM:SSZ`; `""` when absent or unreadable.
+    pub reminder_at: String,
+    /// `PidLidReminderSignalTime`, when it fires next (Outlook moves it on
+    /// Snooze), as `YYYY-MM-DDTHH:MM:SSZ`; `""` when absent or unreadable.
+    pub reminder_signal_at: String,
+    /// `flag.dueDateTime` in UTC (`YYYY-MM-DDTHH:MM:SSZ`); `""` when the
+    /// flag has none, or a zone other than UTC (no zone database here).
+    pub flag_due_at: String,
 }
 
 impl Message {
     pub fn from_json(v: &Value) -> Option<Self> {
+        let (is_reminder_on, reminder_at, reminder_signal_at) = parse_message_reminder(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -138,8 +152,106 @@ impl Message {
             is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
                 == Some("#microsoft.graph.eventMessageRequest"),
             categories: string_list(v, "categories"),
+            is_reminder_on,
+            reminder_at,
+            reminder_signal_at,
+            flag_due_at: parse_flag_due(v),
         })
     }
+}
+
+/// `PidLidReminderSet` (PSETID_Common LID `0x8503`, PT_BOOLEAN) as a Graph
+/// extended property id (#2054): a message's reminder is on.
+pub const REMINDER_SET_PROP: &str = "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503";
+/// `PidLidReminderTime` (PSETID_Common LID `0x8502`, PT_SYSTIME): the time
+/// the reminder was set for.
+pub const REMINDER_TIME_PROP: &str = "SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8502";
+/// `PidLidReminderSignalTime` (PSETID_Common LID `0x8560`, PT_SYSTIME): when
+/// the reminder fires next.
+pub const REMINDER_SIGNAL_TIME_PROP: &str =
+    "SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560";
+
+/// Reads a message's reminder from its `singleValueExtendedProperties`
+/// (#2054): `(on, reminder time, signal time)`. Lenient, never an error:
+/// anything that is not an array of `{id, value}` objects is no property, a
+/// property id is matched ASCII-case-insensitively (Graph may lower-case
+/// the GUID), the boolean is on only for `"true"` (any case) or JSON `true`,
+/// and a time is kept only when [`reminder_time`] reads it. On means set and
+/// at least one readable time.
+pub fn parse_message_reminder(v: &Value) -> (bool, String, String) {
+    let mut set = false;
+    let mut at = String::new();
+    let mut signal = String::new();
+    let props = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    for p in props {
+        let Some(id) = p.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = p.get("value");
+        if id.eq_ignore_ascii_case(REMINDER_SET_PROP) {
+            set = match value {
+                Some(Value::Bool(b)) => *b,
+                Some(Value::Str(s)) => s.eq_ignore_ascii_case("true"),
+                _ => false,
+            };
+        } else if id.eq_ignore_ascii_case(REMINDER_TIME_PROP) {
+            at = value
+                .and_then(Value::as_str)
+                .map(reminder_time)
+                .unwrap_or_default();
+        } else if id.eq_ignore_ascii_case(REMINDER_SIGNAL_TIME_PROP) {
+            signal = value
+                .and_then(Value::as_str)
+                .map(reminder_time)
+                .unwrap_or_default();
+        }
+    }
+    let on = set && !(at.is_empty() && signal.is_empty());
+    (on, at, signal)
+}
+
+/// A UTC time Graph sent (an extended property's SystemTime, a followup
+/// flag's `dateTime`) as `YYYY-MM-DDTHH:MM:SSZ`, or `""` when it cannot be
+/// read (#2054). Only a time ending in `Z` or with nothing after its
+/// seconds (a fraction allowed) is read: `to_utc` drops a numeric offset
+/// without applying it, which would give the wrong time.
+pub(crate) fn reminder_time(s: &str) -> String {
+    let s = s.trim();
+    let bare = s.strip_suffix('Z').unwrap_or(s);
+    let Some((_, time)) = bare.split_once('T') else {
+        return String::new();
+    };
+    if !time
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ':' || c == '.')
+    {
+        return String::new();
+    }
+    let utc = to_utc(bare, "UTC");
+    if crate::store::iso8601_to_unix_secs(&utc).is_some() {
+        utc
+    } else {
+        String::new()
+    }
+}
+
+/// `flag.dueDateTime` in UTC (#2054), `""` when absent, unreadable or in a
+/// zone other than UTC (an empty zone is read as UTC).
+fn parse_flag_due(v: &Value) -> String {
+    let Some(due) = v.get("flag").and_then(|f| f.get("dueDateTime")) else {
+        return String::new();
+    };
+    let zone = due.get("timeZone").and_then(Value::as_str).unwrap_or("");
+    if !zone.is_empty() && !is_utc_zone(zone) {
+        return String::new();
+    }
+    due.get("dateTime")
+        .and_then(Value::as_str)
+        .map(reminder_time)
+        .unwrap_or_default()
 }
 
 /// Graph `eventMessage.meetingMessageType` (#2024): what a meeting message
@@ -246,6 +358,14 @@ pub struct MessageFields {
     /// `@odata.type`, from which `is_meeting_request` is read.
     pub odata_type: bool,
     pub categories: bool,
+    /// `singleValueExtendedProperties`, from which the reminder is read
+    /// (#2054).
+    pub reminder: bool,
+    /// Not a key: the item came from a request that did not ask for the
+    /// reminder (#2054: Graph refused the `$expand`, or a delta link minted
+    /// from such a call), so its lack of `singleValueExtendedProperties`
+    /// says nothing. Never set by `of` or `all`.
+    pub reminder_unasked: bool,
 }
 
 impl MessageFields {
@@ -268,6 +388,8 @@ impl MessageFields {
             is_draft: has("isDraft"),
             odata_type: has("@odata.type"),
             categories: has("categories"),
+            reminder: has("singleValueExtendedProperties"),
+            reminder_unasked: false,
         }
     }
 
@@ -290,6 +412,8 @@ impl MessageFields {
             is_draft: true,
             odata_type: true,
             categories: true,
+            reminder: true,
+            reminder_unasked: false,
         }
     }
 
@@ -316,6 +440,16 @@ impl MessageFields {
     /// the stored value unless it carries the key.
     pub fn writes_is_draft(&self) -> bool {
         self.is_draft || !self.is_partial()
+    }
+
+    /// Whether the reminder columns are to be written (#2054). Graph
+    /// leaves `singleValueExtendedProperties` out when the expand's filter
+    /// matches nothing, so a complete item without it means "no
+    /// reminder"; on a partial item, or one read without asking for the
+    /// reminder (`reminder_unasked`), its absence says nothing, and the
+    /// stored reminder is kept. An item carrying the key always writes.
+    pub fn writes_reminder(&self) -> bool {
+        self.reminder || (!self.is_partial() && !self.reminder_unasked)
     }
 }
 
@@ -789,6 +923,13 @@ pub struct DeltaPage {
     pub items: Vec<DeltaItem>,
     pub next_link: Option<String>,
     pub delta_link: Option<String>,
+    /// The first call asked for the reminder `$expand` and Graph refused it
+    /// (#2054): the page came from the call sent again without it, and
+    /// every upsert's `MessageFields::reminder_unasked` is set. The engine
+    /// keeps the refusal with the walk and stores it with the walk's link
+    /// (`Store::set_reminder_expand_refused`), as the links Graph mints
+    /// from this call carry no expand either.
+    pub expand_refused: bool,
 }
 
 impl DeltaPage {
@@ -810,7 +951,18 @@ impl DeltaPage {
             items,
             next_link: opt_str_field(v, "@odata.nextLink"),
             delta_link: opt_str_field(v, "@odata.deltaLink"),
+            expand_refused: false,
         })
+    }
+
+    /// Marks every upsert as read without the reminder `$expand`
+    /// (`MessageFields::reminder_unasked`, #2054).
+    pub fn mark_reminder_unasked(&mut self) {
+        for item in &mut self.items {
+            if let DeltaItem::Upsert(_, fields) = item {
+                fields.reminder_unasked = true;
+            }
+        }
     }
 }
 
@@ -2866,5 +3018,238 @@ mod tests {
         assert_eq!(slot(1), ("", ""), "null");
         assert_eq!(slot(2), ("", ""), "absent");
         assert_eq!(slot(3), ("", ""), "half a slot is no proposal");
+    }
+
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    /// A complete flagged message carrying `props` as its
+    /// `singleValueExtendedProperties` (raw JSON), or none when `None`.
+    fn flagged_with(props: Option<&str>) -> Value {
+        let props = props
+            .map(|p| format!(r#","singleValueExtendedProperties":{p}"#))
+            .unwrap_or_default();
+        parse(&format!(
+            r#"{{"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                "receivedDateTime":"2026-11-01T00:00:00Z",
+                "flag":{{"flagStatus":"flagged"}}{props}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn prop(id: &str, value: &str) -> String {
+        format!(r#"{{"id":"{id}","value":{value}}}"#)
+    }
+
+    fn three(set: &str, at: &str, signal: &str) -> String {
+        format!(
+            "[{},{},{}]",
+            prop(REMINDER_SET_PROP, set),
+            prop(REMINDER_TIME_PROP, at),
+            prop(REMINDER_SIGNAL_TIME_PROP, signal)
+        )
+    }
+
+    #[test]
+    fn message_reminder_parses_the_three_properties() {
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""2026-11-08T10:00:00Z""#,
+            r#""2026-11-08T10:15:00.0000000Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "2026-11-08T10:00:00Z");
+        assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
+        assert!(MessageFields::of(&v).reminder);
+
+        // Graph may lower-case the GUID; a JSON boolean and "TRUE" are on too.
+        let lower = |id: &str| id.to_ascii_lowercase();
+        let props = format!(
+            "[{},{}]",
+            prop(&lower(REMINDER_SET_PROP), "true"),
+            prop(
+                &lower(REMINDER_SIGNAL_TIME_PROP),
+                r#""2026-11-08T10:15:00Z""#
+            )
+        );
+        let m = Message::from_json(&flagged_with(Some(&props))).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "");
+        assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
+        let props = format!(
+            "[{},{}]",
+            prop(REMINDER_SET_PROP, r#""TRUE""#),
+            prop(REMINDER_TIME_PROP, r#""2026-11-08T10:00:00Z""#)
+        );
+        assert!(
+            Message::from_json(&flagged_with(Some(&props)))
+                .unwrap()
+                .is_reminder_on
+        );
+    }
+
+    #[test]
+    fn message_without_reminder_properties_has_none() {
+        for props in [
+            None,
+            Some("[]"),
+            Some("null"),
+            Some("{}"),
+            Some(r#"["x",3]"#),
+        ] {
+            let v = flagged_with(props);
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{props:?}");
+            assert_eq!(m.reminder_at, "", "{props:?}");
+            assert_eq!(m.reminder_signal_at, "", "{props:?}");
+        }
+        assert!(!MessageFields::of(&flagged_with(None)).reminder);
+        assert!(MessageFields::of(&flagged_with(Some("[]"))).reminder);
+        // Another extended property is not the reminder.
+        let other = format!(
+            "[{}]",
+            prop(
+                "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8504",
+                r#""true""#
+            )
+        );
+        assert!(
+            !Message::from_json(&flagged_with(Some(&other)))
+                .unwrap()
+                .is_reminder_on
+        );
+    }
+
+    #[test]
+    fn message_reminder_false_is_off() {
+        for set in [
+            r#""false""#,
+            "false",
+            r#""yes""#,
+            r#""1""#,
+            "1",
+            "null",
+            r#""""#,
+        ] {
+            let v = flagged_with(Some(&three(
+                set,
+                r#""2026-11-08T10:00:00Z""#,
+                r#""2026-11-08T10:15:00Z""#,
+            )));
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{set}");
+            // The times are still read: a client may show them.
+            assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z", "{set}");
+        }
+    }
+
+    #[test]
+    fn message_reminder_with_garbage_times_is_off() {
+        for t in [
+            r#""garbage""#,
+            r#""""#,
+            "null",
+            "12",
+            r#""2026-13-08T10:00:00Z""#,
+            r#""2026-02-30T10:00:00Z""#,
+            r#""2026-11-08""#,
+            r#""0000-00-00T00:00:00Z""#,
+        ] {
+            let v = flagged_with(Some(&three(r#""true""#, t, t)));
+            let m = Message::from_json(&v).expect("never None");
+            assert!(!m.is_reminder_on, "{t}");
+            assert_eq!(m.reminder_at, "", "{t}");
+            assert_eq!(m.reminder_signal_at, "", "{t}");
+        }
+        // One readable time is enough.
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""garbage""#,
+            r#""2026-11-08T10:15:00Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert!(m.is_reminder_on);
+        assert_eq!(m.reminder_at, "");
+    }
+
+    #[test]
+    fn message_reminder_with_an_offset_time_is_unreadable() {
+        // `to_utc` would drop the offset without applying it: the wrong time.
+        for t in [
+            r#""2026-11-08T10:15:00+02:00""#,
+            r#""2026-11-08T10:15:00-05:00""#,
+        ] {
+            let v = flagged_with(Some(&three(r#""true""#, t, t)));
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.is_reminder_on, "{t}");
+            assert_eq!(m.reminder_signal_at, "", "{t}");
+        }
+        // No suffix reads as UTC; Outlook's "never" sentinel parses.
+        let v = flagged_with(Some(&three(
+            r#""true""#,
+            r#""2026-11-08T10:00:00""#,
+            r#""4501-01-01T00:00:00Z""#,
+        )));
+        let m = Message::from_json(&v).unwrap();
+        assert_eq!(m.reminder_at, "2026-11-08T10:00:00Z");
+        assert_eq!(m.reminder_signal_at, "4501-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn flag_due_date_time_is_normalised_utc() {
+        for zone in [r#""UTC""#, r#""utc""#, r#""Etc/UTC""#, r#""""#] {
+            let v = parse(&format!(
+                r#"{{"id":"M1","flag":{{"flagStatus":"flagged",
+                    "dueDateTime":{{"dateTime":"2026-11-09T17:00:00.0000000","timeZone":{zone}}}}}}}"#
+            ))
+            .unwrap();
+            assert_eq!(
+                Message::from_json(&v).unwrap().flag_due_at,
+                "2026-11-09T17:00:00Z",
+                "{zone}"
+            );
+        }
+        let v = parse(r#"{"id":"M1","flag":{"flagStatus":"flagged"}}"#).unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+        let v = parse(r#"{"id":"M1","flag":{"dueDateTime":{"dateTime":"soon","timeZone":"UTC"}}}"#)
+            .unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+    }
+
+    #[test]
+    fn flag_due_in_a_named_zone_is_empty() {
+        let v = parse(
+            r#"{"id":"M1","flag":{"flagStatus":"flagged",
+                "dueDateTime":{"dateTime":"2026-11-09T17:00:00","timeZone":"Pacific Standard Time"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(Message::from_json(&v).unwrap().flag_due_at, "");
+    }
+
+    #[test]
+    fn message_fields_reminder_written_only_when_carried_or_complete() {
+        // A complete item without the key: written (no reminder).
+        assert!(MessageFields::of(&flagged_with(None)).writes_reminder());
+        // A partial item without it: kept.
+        let partial = parse(r#"{"id":"M1","isRead":true}"#).unwrap();
+        assert!(!MessageFields::of(&partial).writes_reminder());
+        // A partial item with it: written.
+        let partial = parse(&format!(
+            r#"{{"id":"M1","singleValueExtendedProperties":{}}}"#,
+            three(r#""false""#, "null", "null")
+        ))
+        .unwrap();
+        assert!(MessageFields::of(&partial).writes_reminder());
+        assert!(MessageFields::all().reminder);
+        // Read without asking (#2054: the expand refused): a complete item
+        // without the key keeps the stored reminder; one with it writes.
+        let mut unasked = MessageFields::of(&flagged_with(None));
+        unasked.reminder_unasked = true;
+        assert!(!unasked.writes_reminder());
+        let mut unasked = MessageFields::of(&flagged_with(Some("[]")));
+        unasked.reminder_unasked = true;
+        assert!(unasked.writes_reminder());
+        assert!(!MessageFields::of(&flagged_with(None)).reminder_unasked);
+        assert!(!MessageFields::all().reminder_unasked);
     }
 }
