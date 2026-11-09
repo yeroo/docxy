@@ -1233,11 +1233,19 @@ wider window fresh without downloading it again.
   fetch succeeds. Full passes only (startup, `Refresh`, sign-in, a pass
   `needs_full_pass` asks for): in a long-running session a removal made
   elsewhere can take days to count; the `is_contact` doc says so.
-- Writes, through the outbox as event writes. The host writes the store
-  first, then sends the command; each queues its op, drains, and emits
-  `ContactsUpdated`:
-  - `Store::create_local_contact(&fields)` → `local:` id, then
-    `SyncCommand::CreateContact { id }`. The op POSTs the row as stored at
+- Writes, through the outbox. Unlike event writes, the store write queues
+  the op **in the same transaction** as the local row (#2063 r1): a command
+  waiting in the channel, or deferred by a full pass's `checkpoint`, would
+  otherwise leave the row unprotected while `replace_contacts` or a refused
+  write's re-read runs, and the later op would send the server's own values.
+  The commands only drain (`drain_queued`) and emit `ContactsUpdated`; they
+  queue nothing. A host that never sends one still has the op sent by the
+  next drain (any tick). `revert_folder_contact`, `discard_contact_row` and
+  `replace_contacts` queue nothing. Blank phone and category entries are
+  dropped before a contact is stored or compared (`tidy_contact_fields`):
+  `encode_categories` stores `[""]` as `""`, which reads back as `[]`.
+  - `Store::create_local_contact(&fields)` → `local:` id, `CreateContact`
+    queued; `SyncCommand::CreateContact { id }` pushes it. The op POSTs the row as stored at
     send time; `Store::reconcile_created_contact` re-keys it to Graph's id,
     sets `change_key`, fills `display_name`/`file_as` from Graph only where
     the stored ones are empty (Graph computes them), overwrites nothing else
@@ -1249,12 +1257,13 @@ wider window fresh without downloading it again.
     the drain, or an id that already resolves (a retry after the re-key),
     sends nothing.
   - `Store::update_contact_fields(id, &fields)` → the changed
-    `ContactFieldSet`, then `SyncCommand::UpdateContact { id, fields }`. The
+    `ContactFieldSet`, `UpdateContact` queued under the id the contact is
+    stored as; `SyncCommand::UpdateContact { id, fields }` pushes it. The
     PATCH sends those properties with their values at send time. An empty set
-    queues nothing. An id still `local:` after resolving, or a row gone, sends
+    writes and queues nothing, and its command does nothing. An id still `local:` after resolving, or a row gone, sends
     nothing.
-  - `Store::delete_contact(id)`, then `SyncCommand::DeleteContact { id }`.
-    A 404 is success. A `local:` id never re-keyed sends nothing.
+  - `Store::delete_contact(id)` → `DeleteContact` queued when a row went;
+    `SyncCommand::DeleteContact { id }` pushes it. A 404 is success. A `local:` id never re-keyed sends nothing.
 - Refused writes: 401, throttle, transport and 5xx are unchanged (stop or
   defer; a 5xx keeps the op queued, and the pending-op rule above keeps a full
   pass from undoing it). Any other failure is final at the first refusal, not
@@ -1262,15 +1271,20 @@ wider window fresh without downloading it again.
   retrying, and the quarantine's mail reconverge has nothing to do with
   contacts. The engine (`refuse_contact_write`) reads the row as the user left
   it, drops the op, and reverts to the server: a refused create deletes its
-  `local:` row; a refused update or delete owes a re-read
-  (`contact_reread_owed`): `GET /me/contacts/{id}` upserts Graph's version, a
-  404 deletes the row. The re-read waits while another queued contact op
-  names the same contact, as that op reads the row at send time and would
-  otherwise PATCH the server's own value, losing the user's later edit
-  silently; it runs when the last such op is applied or refused, and at the
-  end of every drain (`settle_contact_rereads`). In memory only: a restart
-  drops it and the startup full pass replaces the row. If the re-read fails
-  too (no read scope, offline), the row is left until the next full pass
+  `local:` row (`discard_contact_row`); a refused update or delete owes a
+  re-read (`Store::owe_contact_reread`, the `contact_reread_owed` table, so a
+  restart keeps it): `GET /me/contacts/{id}` and `revert_folder_contact`
+  store Graph's version, a 404 deletes the row. The re-read waits while
+  another queued contact op names the same contact, as that op reads the row
+  at send time and would otherwise PATCH the server's own value, losing the
+  user's later edit silently; it runs when the last such op is applied or
+  refused, and at the end of every drain, an empty one included, so the
+  startup drain settles one a restart interrupted (`settle_contact_rereads`).
+  Every later edit is a queued op from the moment it is written, and
+  `revert_folder_contact` checks the queue in its own transaction: an edit
+  written during the GET makes it write nothing and keep the id owed. If the
+  re-read fails (no read scope, offline), it is given up
+  (`forget_contact_reread`) and the row is left until the next full pass
   replaces it. Then `SyncEvent::ContactWriteFailed { id, write, status, error,
   attempted }`, one `SyncEvent::Error("{create|update|delete} contact {id}:
   {error}")` (as the reminder ops report, so a host showing only `Error` lines
@@ -1309,7 +1323,11 @@ wider window fresh without downloading it again.
   `update_contact_fields_returns_only_changed`,
   `reconcile_created_contact_rekeys_and_keeps_local_edits`,
   `reconcile_created_contact_of_a_deleted_row_still_aliases`,
-  `replace_contacts_keeps_rows_with_pending_ops`, `contact_ops_round_trip_json`;
+  `replace_contacts_keeps_rows_with_pending_ops`, `contact_ops_round_trip_json`,
+  `contact_writes_queue_their_op_in_the_same_transaction`,
+  `blank_phone_and_category_entries_are_not_stored_or_compared`,
+  `revert_folder_contact_waits_while_an_op_names_it`,
+  `owed_contact_reread_survives_reopening_the_store`;
   `outbox.rs` `create_contact_reconciles_the_local_id`,
   `create_contact_retry_after_reconcile_sends_nothing`,
   `create_contact_of_a_deleted_row_sends_nothing`,
@@ -1324,6 +1342,11 @@ wider window fresh without downloading it again.
   `refused_contact_edit_keeps_a_later_queued_edit`,
   `is_contact_follows_created_and_deleted_contacts`,
   `full_pass_keeps_a_contact_edit_waiting_behind_a_5xx`,
+  `full_pass_keeps_an_edit_whose_command_is_still_in_the_channel` and
+  `full_pass_keeps_a_delete_whose_command_is_still_in_the_channel` (the store
+  written while a slow `/me/contacts`, `start_paced`, is in flight),
+  `reread_after_refusal_waits_for_an_edit_written_but_not_commanded`,
+  `owed_contact_reread_survives_a_restart`,
   `full_pass_syncs_the_contacts_folder_apart_from_people_and_mined`,
   `contacts_403_keeps_the_stored_set_and_does_not_fail_the_pass`,
   `contact_removed_from_the_folder_stops_counting_after_the_next_full_pass`,
