@@ -333,6 +333,7 @@ pub(crate) fn inks(ground: u32) -> Inks {
 }
 
 /// `ground` under its palette's wash ([`inks`]): where a chip's text sits.
+#[cfg(test)]
 pub(crate) fn chip(ground: u32) -> u32 {
     let (c, a) = inks(ground).wash;
     blend(ground, c, a)
@@ -367,31 +368,6 @@ pub(crate) fn edit_tint(sheet: u32) -> u32 {
 /// blue; dark text on a kept `#5B9BD5` fill already reads and is kept.
 pub(crate) fn text(rgb: u32, ground: u32) -> u32 {
     floored(rgb, ground, TEXT_FLOOR)
-}
-
-/// Automatic text on `ground`: [`AUTO_DARK`] where light ink reads better,
-/// else a near-black, floor-checked.
-pub(crate) fn auto_text(ground: u32) -> u32 {
-    text(
-        if takes_light(ground) {
-            AUTO_DARK
-        } else {
-            AUTO_LIGHT
-        },
-        ground,
-    )
-}
-
-/// Dimmed text on `ground` (the palette's `dim`), floor-checked.
-pub(crate) fn dim_text(ground: u32) -> u32 {
-    text(
-        if takes_light(ground) {
-            DIM_DARK
-        } else {
-            DIM_LIGHT
-        },
-        ground,
-    )
 }
 
 /// A border or rule of colour `rgb` (`None`: automatic) on `ground`: an
@@ -444,10 +420,10 @@ mod tests {
 
     #[test]
     fn automatic_text_is_light_on_the_page() {
-        assert_eq!(auto_text(PAGE_DARK), AUTO_DARK);
-        assert!(contrast(auto_text(PAGE_DARK), PAGE_DARK) >= TEXT_FLOOR);
+        assert_eq!(inks(PAGE_DARK).fg, AUTO_DARK);
+        assert!(contrast(inks(PAGE_DARK).fg, PAGE_DARK) >= TEXT_FLOOR);
         // On a light ground (a host's light page) it is dark.
-        assert_eq!(auto_text(0xFFFFFF), AUTO_LIGHT);
+        assert_eq!(inks(0xFFFFFF).fg, AUTO_LIGHT);
     }
 
     #[test]
@@ -494,7 +470,7 @@ mod tests {
         assert_eq!(text(0x1F1F1F, 0x5B9BD5), 0x1F1F1F);
         assert!(!takes_light(0x5B9BD5));
         // Automatic text on it is dark too.
-        assert!(luminance(auto_text(0x5B9BD5)) < 0.05);
+        assert!(luminance(inks(0x5B9BD5).fg) < 0.05);
     }
 
     #[test]
@@ -524,12 +500,12 @@ mod tests {
         // Its own area: distinguishable from the page.
         assert!(contrast(f, PAGE_DARK) > 1.15, "{f:06x}");
         // Automatic text on it is light and reads.
-        let t = auto_text(f);
+        let t = inks(f).fg;
         assert!(luminance(t) > 0.8, "{t:06x}");
         assert!(contrast(t, f) >= TEXT_FLOOR);
         // So does black text and the dim grey.
         assert!(contrast(text(0x000000, f), f) >= TEXT_FLOOR);
-        assert!(contrast(dim_text(f), f) >= TEXT_FLOOR);
+        assert!(contrast(inks(f).dim, f) >= TEXT_FLOOR);
     }
 
     #[test]
@@ -689,8 +665,8 @@ mod tests {
                     }
                 }
             }
-            assert!(contrast(auto_text(g), g) >= TEXT_FLOOR, "auto on {g:06x}");
-            assert!(contrast(dim_text(g), g) >= TEXT_FLOOR, "dim on {g:06x}");
+            assert!(contrast(inks(g).fg, g) >= TEXT_FLOOR, "auto on {g:06x}");
+            assert!(contrast(inks(g).dim, g) >= TEXT_FLOOR, "dim on {g:06x}");
             assert!(
                 contrast(border(None, g), g) >= BORDER_FLOOR,
                 "border on {g:06x}"
