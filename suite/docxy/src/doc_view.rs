@@ -1782,12 +1782,9 @@ mod tests {
         assert_eq!(bg, host);
         assert!(p.dark);
         assert_eq!(p.ground, 0x262626);
-        let chip = crate::dark_page::chip(0x262626);
-        assert_eq!(p.fg, hsla_u(crate::dark_page::auto_text(chip)));
-        assert_eq!(
-            p.link,
-            hsla_u(crate::dark_page::text(crate::LINK_DARK, chip))
-        );
+        let inks = crate::dark_page::inks(0x262626);
+        assert_eq!(p.fg, hsla_u(inks.fg));
+        assert_eq!(p.link, hsla_u(inks.link));
         assert_eq!(p.sel, hsla_u(0x123456));
         // A light host page under dark content takes dark ink.
         let (_, p) = content_look(theme, theme_bg, true, true, Some(hsla_u(0xffffff)));

@@ -33,6 +33,10 @@ pub(crate) const BORDER_DARK: u32 = 0x8C8C8C;
 /// page), floor-checked like any text.
 const DIM_DARK: u32 = 0xB0B0B0;
 const DIM_LIGHT: u32 = 0x6E6E6E;
+/// An uncoloured link on a light ground (the suite's `LINK`).
+const LINK_LIGHT: u32 = 0x2F6FDB;
+/// An uncoloured link on a dark ground (the suite's `LINK_DARK`).
+const LINK_DARK: u32 = 0x6CA0F0;
 /// The contrast every run keeps against what it sits on (WCAG AA).
 pub(crate) const TEXT_FLOOR: f32 = 4.5;
 /// The contrast a border keeps (WCAG non-text contrast).
@@ -246,32 +250,114 @@ pub(crate) fn blend(base: u32, over: u32, a: f32) -> u32 {
     pack([0, 1, 2].map(|i| b[i] + (o[i] - b[i]) * a))
 }
 
-/// The wash a palette on `ground` draws its chips and hover in (a field's
-/// shading, a picture's stand-in): its colour and opacity. A faint light
-/// wash where the ink is light (a dark one would not show on a dark page),
-/// a faint dark one where the ink is dark, as Print Layout's light chips.
-/// Either way the washed ground ([`chip`]) lies between the ground and the
-/// ink, so ink chosen against the chip reads on the plain ground too.
-pub(crate) fn wash(ground: u32) -> (u32, f32) {
-    if takes_light(ground) {
-        (0xFFFFFF, 0.10)
+/// The inks and the chip wash of a palette on `ground`: automatic text,
+/// dimmed text and an uncoloured link, and the wash its chips and hover
+/// draw in (a field's shading, a picture's stand-in), as (colour, opacity).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Inks {
+    pub fg: u32,
+    pub dim: u32,
+    pub link: u32,
+    pub wash: (u32, f32),
+}
+
+/// `rgb` moved, on the side `light` (lighter than the ground, else darker),
+/// to `min` contrast against `ground`, hue kept: as [`floored`] does, but
+/// never to the other side; `None` where that side cannot reach it.
+fn on_side(rgb: u32, ground: u32, min: f32, light: bool) -> Option<u32> {
+    let (y, yg) = (luminance(rgb), luminance(ground));
+    if (if light { y >= yg } else { y <= yg }) && contrast(rgb, ground) >= min {
+        return Some(rgb);
+    }
+    let (h, s, l) = hsl(rgb);
+    if light {
+        let from = if l < 0.5 {
+            (1.0 - l).min(hsl(AUTO_DARK).2).max(l)
+        } else {
+            l
+        };
+        lighten(h, s, from, ground, min)
     } else {
-        (0x000000, 0.06)
+        darken(h, s, l, ground, min)
     }
 }
 
-/// `ground` under its [`wash`]: where a chip's text sits.
+/// The [`Inks`] of a palette on `ground`. The inks' side is the ground's
+/// ([`takes_light`]), as [`text`] maps a run's colour. The wash is the one
+/// that shows (light on a ground that takes light ink, dark on one that
+/// takes dark), which moves the chip toward the ink: the inks are chosen
+/// against the chip, the harder ground, so they read on it and on the
+/// plain ground. Near the crossover no ink on that side may read on such a
+/// chip (`#4472C4`: white is 4.73:1 on it but 3.93:1 on its light chip);
+/// then the wash goes away from the ink, which only raises the contrast,
+/// and the inks are chosen against the ground, where that side always
+/// reaches the floor.
+pub(crate) fn inks(ground: u32) -> Inks {
+    let light = takes_light(ground);
+    let bases = if light {
+        [AUTO_DARK, DIM_DARK, LINK_DARK]
+    } else {
+        [AUTO_LIGHT, DIM_LIGHT, LINK_LIGHT]
+    };
+    let toward = if light {
+        (0xFFFFFF, 0.10)
+    } else {
+        (0x000000, 0.06)
+    };
+    let chip = blend(ground, toward.0, toward.1);
+    let picked = bases.map(|b| {
+        on_side(b, chip, TEXT_FLOOR, light).filter(|&i| contrast(i, ground) >= TEXT_FLOOR)
+    });
+    if let [Some(fg), Some(dim), Some(link)] = picked {
+        return Inks {
+            fg,
+            dim,
+            link,
+            wash: toward,
+        };
+    }
+    let away = if light {
+        (0x000000, 0.10)
+    } else {
+        (0xFFFFFF, 0.10)
+    };
+    let [fg, dim, link] = bases.map(|b| {
+        on_side(b, ground, TEXT_FLOOR, light).unwrap_or(if light { 0xFFFFFF } else { 0x000000 })
+    });
+    Inks {
+        fg,
+        dim,
+        link,
+        wash: away,
+    }
+}
+
+/// `ground` under its palette's wash ([`inks`]): where a chip's text sits.
 pub(crate) fn chip(ground: u32) -> u32 {
-    let (c, a) = wash(ground);
+    let (c, a) = inks(ground).wash;
     blend(ground, c, a)
 }
 
 /// The ground of an open header or footer on a sheet of colour `sheet`:
-/// the sheet under a faint light-blue wash, opaque, so the area shows as
-/// being edited and its text is chosen against it (Print Layout tints a
-/// light sheet with `#EEF4FF` at half opacity instead).
+/// opaque, so the area shows as being edited, and between the sheet and
+/// its ink, so ink chosen against the tint also reads on the plain sheet
+/// (a frame of the part placed off its band sits there): a faint
+/// light-blue wash on a sheet that takes light ink, a faint darkening on
+/// one that takes dark ink. A wash that would move the tint to the other
+/// side of the crossover is not drawn: the sheet itself. (Print Layout
+/// tints a light page with `#EEF4FF` at half opacity instead.)
 pub(crate) fn edit_tint(sheet: u32) -> u32 {
-    blend(sheet, 0xEEF4FF, 0.10)
+    let light = takes_light(sheet);
+    let tint = if light {
+        blend(sheet, 0xEEF4FF, 0.10)
+    } else {
+        blend(sheet, 0x000000, 0.06)
+    };
+    if takes_light(tint) == light {
+        tint
+    } else {
+        sheet
+    }
 }
 
 /// The colour text of colour `rgb` draws in on the mapped ground `ground`
@@ -508,13 +594,76 @@ mod tests {
     }
 
     #[test]
-    fn the_chip_lies_between_the_ground_and_its_ink() {
+    fn the_chip_shows_where_it_can_and_moves_away_from_the_ink_where_not() {
         assert_eq!(blend(0x000000, 0xFFFFFF, 0.5), 0x808080);
-        // Dark ink on a red fill: a faint dark wash.
+        // Dark ink on a red fill: a faint dark wash that shows.
         assert!(!takes_light(0xFF0000));
         assert!(luminance(chip(0xFF0000)) < luminance(0xFF0000));
         // On the page: a light wash that shows.
         assert!(luminance(chip(PAGE_DARK)) > luminance(PAGE_DARK));
+        // Word's Accent 1 takes light ink, which a light chip would leave
+        // under the floor (white 3.93:1 on #5780CA): a dark chip instead.
+        assert!(takes_light(0x4472C4));
+        assert!(luminance(chip(0x4472C4)) < luminance(0x4472C4));
+    }
+
+    #[test]
+    fn automatic_text_and_black_take_the_same_side_on_accent_one() {
+        let i = inks(0x4472C4);
+        let black = text(0x000000, 0x4472C4);
+        assert!(luminance(i.fg) > luminance(0x4472C4), "{:06x}", i.fg);
+        assert!(luminance(black) > luminance(0x4472C4), "{black:06x}");
+        assert!(contrast(i.fg, 0x4472C4) >= TEXT_FLOOR);
+    }
+
+    #[test]
+    fn a_palettes_inks_read_on_its_ground_and_its_chip_on_the_grounds_side() {
+        let grounds = [
+            PAGE_DARK, 0x4472C4, 0x0070C0, 0x2E74B5, 0x6E6E6E, 0x767676, 0x7C7C7C, 0x5B9BD5,
+            0xFF0000, 0xFFC000, 0x808080, 0x0047FF, 0x1F3864, 0x70AD47, 0x00B0F0, 0x0A0A0A,
+            0xFFFFFF, 0x262626, 0x3A3B3C, 0xC00000, 0x7030A0, 0x00B050,
+        ];
+        // And a grey ramp across the crossover.
+        let ramp = (0x50..=0x90).step_by(2).map(|v: u32| v * 0x010101);
+        for g in grounds.into_iter().chain(ramp).chain(grounds.map(fill)) {
+            let i = inks(g);
+            let c = blend(g, i.wash.0, i.wash.1);
+            for (name, ink) in [("fg", i.fg), ("dim", i.dim), ("link", i.link)] {
+                for on in [g, c] {
+                    let r = contrast(ink, on);
+                    assert!(
+                        r >= TEXT_FLOOR,
+                        "{name} {ink:06x} on {on:06x} (ground {g:06x}): {r:.2}"
+                    );
+                }
+                assert_eq!(
+                    luminance(ink) > luminance(g),
+                    takes_light(g),
+                    "{name} {ink:06x} on {g:06x} is on the other side"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_headers_tint_on_a_gold_page_keeps_its_runs_readable_on_the_sheet() {
+        let sheet = page_sheet(Some(0xFFC000));
+        let t = edit_tint(sheet);
+        assert_ne!(t, sheet);
+        assert!(luminance(t) < luminance(sheet));
+        for c in [0xC00000, 0x6E6E6E, 0x000000, 0x0047FF] {
+            let ink = text(c, t);
+            for on in [t, sheet] {
+                assert!(
+                    contrast(ink, on) >= TEXT_FLOOR,
+                    "{c:06x} -> {ink:06x} on {on:06x}"
+                );
+            }
+        }
+        // A sheet at the crossover keeps no tint that would flip its side.
+        for v in (0x60..=0x80).map(|v: u32| v * 0x010101) {
+            assert_eq!(takes_light(edit_tint(v)), takes_light(v), "{v:06x}");
+        }
     }
 
     #[test]

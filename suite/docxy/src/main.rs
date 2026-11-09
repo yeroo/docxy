@@ -7618,7 +7618,7 @@ mod link_colour_tests {
             assert!(dark_page::contrast(rgb_u(ink), ground) >= dark_page::TEXT_FLOOR);
         }
         // An explicit accent and black, mapped against the tint, read on it
-        // and on the plain sheet the same live header draws on elsewhere.
+        // and on the plain sheet, where a frame placed off the band sits.
         for c in ["0047FF", "000000", "595959"] {
             let ink = rgb_u(run_ink(&coloured(Some(c)), false, &hf));
             for g in [ground, dark_page::PAGE_DARK] {
@@ -7664,6 +7664,24 @@ mod link_colour_tests {
         let chip = dark_page::blend(dark_page::PAGE_DARK, rgb_u(dark.panel), dark.panel.a);
         for ink in [dark.fg, dark.dim, dark.link] {
             assert!(dark_page::contrast(rgb_u(ink), chip) >= dark_page::TEXT_FLOOR);
+        }
+    }
+
+    #[test]
+    fn automatic_text_and_black_share_a_side_in_an_accent_one_cell_2079() {
+        let dark = dark_page_pal(dark_page::PAGE_DARK, hsla_u(0x123456));
+        let cell = cell_pal(dark, Some(0x4472C4));
+        let black = rgb_u(run_ink(&coloured(Some("000000")), false, &cell));
+        let auto = rgb_u(run_ink(&coloured(None), false, &cell));
+        let y = dark_page::luminance(0x4472C4);
+        assert!(dark_page::luminance(auto) > y, "{auto:06x}");
+        assert!(dark_page::luminance(black) > y, "{black:06x}");
+        let chip = dark_page::blend(0x4472C4, rgb_u(cell.panel), cell.panel.a);
+        for on in [0x4472C4, chip] {
+            assert!(
+                dark_page::contrast(auto, on) >= dark_page::TEXT_FLOOR,
+                "{on:06x}"
+            );
         }
     }
 
@@ -10671,26 +10689,27 @@ fn page_pal(sheet: u32, sel: Hsla) -> Pal {
 }
 
 /// The palette a document draws in on a dark page of colour `ground`, as
-/// Word's dark mode draws it (#2079): a visible mid-grey border, the
-/// chips' and hover's wash ([`dark_page::wash`]), and automatic text,
-/// dimmed text and the light link blue chosen against the washed ground
-/// ([`dark_page::chip`], between the ground and the ink), so they read on
-/// a field's chip and on the plain ground alike; and [`Pal::dark`] on, so
-/// the document's own colours map through [`dark_page`] against `ground`
-/// as they draw. `ground` is the mapped page ([`dark_page::page_sheet`]),
-/// a cell's mapped fill or an open header's tint.
+/// Word's dark mode draws it (#2079): a visible mid-grey border, and the
+/// inks and chip wash of [`dark_page::inks`]: automatic text, dimmed text
+/// and the link blue on the ground's side, reading on the ground and on a
+/// field's chip alike; and [`Pal::dark`] on, so the document's own colours
+/// map through [`dark_page`] against `ground` as they draw. `ground` is the
+/// mapped page ([`dark_page::page_sheet`]), a cell's mapped fill or an
+/// open header's tint.
 fn dark_page_pal(ground: u32, sel: Hsla) -> Pal {
-    let (wash, a) = dark_page::wash(ground);
-    let chip = dark_page::chip(ground);
-    let washed = Hsla { a, ..hsla_u(wash) };
+    let inks = dark_page::inks(ground);
+    let washed = Hsla {
+        a: inks.wash.1,
+        ..hsla_u(inks.wash.0)
+    };
     Pal {
-        fg: hsla_u(dark_page::auto_text(chip)),
-        dim: hsla_u(dark_page::dim_text(chip)),
+        fg: hsla_u(inks.fg),
+        dim: hsla_u(inks.dim),
         border: hsla_u(dark_page::border(None, ground)),
         panel: washed,
         hover: washed,
         sel,
-        link: hsla_u(dark_page::text(LINK_DARK, chip)),
+        link: hsla_u(inks.link),
         ground,
         dark: true,
     }
@@ -10698,11 +10717,12 @@ fn dark_page_pal(ground: u32, sel: Hsla) -> Pal {
 
 /// How an open header or footer draws on its edit page in Print Layout
 /// (#2079): the tint its area takes, and the palette its live text draws
-/// in. On a light page, `#EEF4FF` at half opacity over the sheet and the
-/// page's own palette, as before; on a dark one an opaque light-blue wash
-/// of the sheet ([`dark_page::edit_tint`]) and the dark palette chosen
-/// against it, which reads on the plain sheet too (the same live text draws
-/// on the part's other pages).
+/// in there. On a light page, `#EEF4FF` at half opacity over the sheet and
+/// the page's own palette, as before; on a dark one an opaque tint
+/// ([`dark_page::edit_tint`]) and the dark palette chosen against it. The
+/// tint lies between the sheet and its ink, so that text also reads on the
+/// plain sheet, where a frame of the part placed off its band sits (the
+/// part's other pages draw it in `doc_pal`).
 fn hf_edit_look(doc_pal: Pal) -> (Hsla, Pal) {
     if doc_pal.dark {
         let tint = dark_page::edit_tint(doc_pal.ground);

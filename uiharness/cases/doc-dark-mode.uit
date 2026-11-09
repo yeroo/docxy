@@ -7,7 +7,9 @@
 # while the app stays dark; a light theme has nothing to switch.
 #
 # The fixture (`fixtures/dark-mode.docx`) has the issue's shapes: a title
-# cell filled #5B9BD5 with dark (#1F1F1F) and automatic text; a
+# cell filled #5B9BD5 with dark (#1F1F1F) and automatic text; a cell
+# filled Word's Accent 1 #4472C4 with automatic and black text (light ink
+# only just reads there, and both take it); a
 # three-column figure table with thin #BFBFBF borders, grey (#767676) caps
 # labels, accent-blue (#0047FF) numbers and grey (#595959) body text;
 # headings with an accent number prefix and an automatic title; automatic
