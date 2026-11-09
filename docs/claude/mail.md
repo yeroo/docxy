@@ -2316,14 +2316,20 @@ series' first day.
   each fetched calendar after its removals and upserts (`Window` and `Delta`, cascade
   or not), in the pass's transaction. A non-`local:` `occurrence` of that calendar
   whose master is stored there as a `seriesMaster` is filled when the round upserted
-  it, or upserted its master (a changed series, or one the engine fetched), or it is
-  blank (`BLANK_OCCURRENCE`: `subject`, `organizer_name`, `organizer_addr`,
+  it, or upserted its master and the master changed, or it is blank (`BLANK_OCCURRENCE`: `subject`, `organizer_name`, `organizer_addr`,
   `location` and `response_status` all `''`; every real event has an organizer).
   The blank rule repairs a store from before #2064 on its next pass, with no
   download. An occurrence that neither the round nor its master touched keeps its
   own values: an optimistic local write (a `RespondEvent`'s status, an `UpdateEvent`
   of this occurrence) waits for its op. A changed master is server truth and
-  overwrites, as a delta upsert does. Exceptions are full items and never filled.
+  overwrites, as a delta upsert does. "Changed" (`changed_masters_on`, read before
+  the round's writes; r3): not stored as a master of that calendar, or stored with
+  another `last_modified` (Graph's `lastModifiedDateTime`), or either one empty.
+  Every initial round lists or refetches the masters of its occurrences, so without
+  this an unchanged master would refill every occurrence of its series, of any date,
+  daily, overwriting a pending write on one outside the window (a range fetch's, or
+  history); the round's own occurrences are still filled, as touched ones.
+  Exceptions are full items and never filled.
 - What is copied: `SERIES_FIELDS` (subject, location, organizer, response status,
   body preview, `is_all_day`, reminder, show-as, online meeting and join URL,
   categories, sensitivity, importance, `is_cancelled`, `is_organizer`,
@@ -2380,7 +2386,9 @@ series' first day.
   resets). An HTTP or parse failure there writes the round with the stored copy
   (no `@removed` to replay); a 404 joins `masters_not_found`, and the stored row
   stays, since the round still names its occurrences. Delta rounds fetch only
-  masters that are not stored, or removed. #2013's cascade is
+  masters that are not stored, or removed. A refetched master that has not changed
+  (the same `lastModifiedDateTime`) fills only the round's own occurrences (r3,
+  above). #2013's cascade is
   unchanged: a master listed as removed with none of its occurrences in the round
   still takes its in-window occurrences and the delta state, and the next initial
   round brings them back, filled from the refetched master.
@@ -2423,7 +2431,8 @@ series' first day.
   `update_event_fields_on_a_filled_occurrence_does_not_mark_the_masters_body`,
   `apply_calendar_sync_gone_masters_deletes_only_that_calendars_master`,
   `a_series_master_leaves_the_grid_once_its_series_has_a_row`,
-  `a_created_series_stays_on_the_grid_through_its_reconcile`; `engine.rs`
+  `a_created_series_stays_on_the_grid_through_its_reconcile`,
+  `apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences`; `engine.rs`
   `calendar_delta_occurrences_take_their_masters_fields`,
   `calendar_delta_repairs_blank_occurrences_in_one_pass`,
   `calendar_delta_fetches_a_missing_master`,
@@ -2435,5 +2444,6 @@ series' first day.
   `calendar_delta_removed_master_404_in_a_stopped_pass_is_retried`,
   `calendar_delta_removed_master_failing_twice_writes_the_second_pass`,
   `calendar_initial_round_refetches_a_stored_master_it_does_not_list`,
+  `calendar_initial_round_unchanged_master_keeps_a_far_occurrences_write`,
   `calendar_delta_master_fetch_throttled_writes_nothing`. Tests that read a series
   master's fields through `events_in_window` read it with `Store::event` now.
