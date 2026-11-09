@@ -116,8 +116,10 @@ issue number to find its notes.
   every calendar, `SetCalendars`, events in a range and days with events (#1984),
   a calendar range on demand, fetched once while fresh (#2014),
   a 30/180-day window kept by calendarView delta per calendar (#2013),
-  the Contacts folder and `is_contact` (#1934), cancelling a meeting with a message and
-  forwarding it (#1985), a series' occurrences, its master and editing either (#2022),
+  the Contacts folder as records, `is_contact`, contacts created, updated and
+  deleted through the outbox, a refused write reported and reverted (#1934, #2063),
+  cancelling a meeting with a message and forwarding it (#1985),
+  a series' occurrences, its master and editing either (#2022),
   a series created with any Graph recurrence (#2034),
   event times in a named time zone, zone-preserving series edits (#2039, #2030),
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),

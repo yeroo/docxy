@@ -780,6 +780,10 @@ impl App {
             // (#1877); lookxy does not.
             | SyncEvent::TokenStoredUnencrypted
             | SyncEvent::ContactsUpdated
+            // lookxy has no contact form, so it never writes a contact
+            // (#2063) and has nothing to re-key or report.
+            | SyncEvent::ContactCreated { .. }
+            | SyncEvent::ContactWriteFailed { .. }
             | SyncEvent::FolderProgress { .. }
             // lookxy has no meeting banner yet, so it never asks for a
             // message's meeting type or a Remove from Calendar (#2024).

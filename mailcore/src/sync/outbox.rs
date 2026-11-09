@@ -45,6 +45,9 @@ pub enum Applied {
     /// id, resolved) is `new_id` now. The caller re-keys the store
     /// (`Store::follow_move`) and reports it (#1896).
     Moved { old_id: String, new_id: String },
+    /// A `CreateContact` reached Graph and the store re-keyed the contact
+    /// created as `local_id` to `id` (#2063). The caller reports it.
+    ContactCreated { local_id: String, id: String },
 }
 
 /// The id the message `id` names is stored under now (#1884, #1896).
@@ -66,8 +69,35 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
             let new_id = client.move_message(&old_id, dest)?;
             Ok(Applied::Moved { old_id, new_id })
         }
+        OutboxOp::CreateContact { id } => create_contact(client, store, id),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
+}
+
+/// A store error while applying a contact op, as the drain's `Parse`.
+fn store_err(e: crate::store::StoreError) -> GraphError {
+    GraphError::Parse(e.to_string())
+}
+
+/// `CreateContact` (#2063): POST the `local:` row as stored now, then re-key
+/// it. A row deleted before the drain sends nothing, nor does an id that
+/// already resolves to a Graph id (the re-key committed and the op was not
+/// dropped: a crash, or a retry).
+fn create_contact(client: &GraphClient, store: &Store, id: &str) -> Result<Applied, GraphError> {
+    if store.resolve_contact_id(id).map_err(store_err)? != id {
+        return Ok(Applied::Done);
+    }
+    let Some(row) = store.folder_contact(id).map_err(store_err)? else {
+        return Ok(Applied::Done);
+    };
+    let created = client.create_contact(&row.fields)?;
+    store
+        .reconcile_created_contact(id, &created)
+        .map_err(store_err)?;
+    Ok(Applied::ContactCreated {
+        local_id: id.to_string(),
+        id: created.id,
+    })
 }
 
 /// `apply_op` for every op but `Move`.
@@ -233,6 +263,36 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
                 return Ok(());
             }
             client.snooze_message_reminder(&target, new_reminder_utc)
+        }
+        OutboxOp::CreateContact { .. } => unreachable!("apply_op handles CreateContact"),
+        // Only the properties the edit changed (#2063), each with its value
+        // at send time. An id still `local:` after resolving has no Graph
+        // contact (its create was refused, and the row went with it); a row
+        // gone (deleted since) has nothing to send: its `DeleteContact`
+        // follows.
+        OutboxOp::UpdateContact { id, fields } => {
+            if fields.is_empty() {
+                return Ok(());
+            }
+            let target = store.resolve_contact_id(id).map_err(store_err)?;
+            if target.starts_with("local:") {
+                return Ok(());
+            }
+            let Some(row) = store.folder_contact(&target).map_err(store_err)? else {
+                return Ok(());
+            };
+            client.update_contact(&target, &row.fields, *fields)
+        }
+        // A 404 is done: the contact is already gone (#2063).
+        OutboxOp::DeleteContact { id } => {
+            let target = store.resolve_contact_id(id).map_err(store_err)?;
+            if target.starts_with("local:") {
+                return Ok(());
+            }
+            match client.delete_contact(&target) {
+                Err(GraphError::NotFound) => Ok(()),
+                r => r,
+            }
         }
     }
 }
@@ -630,6 +690,7 @@ fn parse_recipient_part(part: &str) -> Vec<Recipient> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::client::ContactFieldSet;
     use crate::graph::model::{Body, MailFolder, Message};
     use crate::json::{self, Value};
     use crate::testserver::{FakeServer, Route};
@@ -3717,5 +3778,160 @@ mod tests {
             assert_eq!(apply_op(&c, &store, &op), Ok(Applied::Done));
         }
         assert!(srv.requests().is_empty());
+    }
+
+    // --- Contacts (#2063) ---------------------------------------------
+
+    fn contact_route(method: &str, prefix: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: method.into(),
+            path_prefix: prefix.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    fn ann_fields() -> crate::graph::model::ContactFields {
+        crate::graph::model::ContactFields {
+            given_name: "Ann".into(),
+            surname: "Cole".into(),
+            email_addresses: vec![Recipient {
+                name: "Ann".into(),
+                address: "ann@x.com".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn create_contact_reconciles_the_local_id() {
+        let srv = FakeServer::start(vec![contact_route(
+            "POST",
+            "/me/contacts",
+            201,
+            r#"{"id":"G1","changeKey":"ck1","displayName":"Ann Cole"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        let applied = apply_op(&c, &store, &OutboxOp::CreateContact { id: local.clone() }).unwrap();
+        assert_eq!(
+            applied,
+            Applied::ContactCreated {
+                local_id: local.clone(),
+                id: "G1".into()
+            }
+        );
+        let row = store.folder_contact("G1").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck1");
+        assert_eq!(row.fields.display_name, "Ann Cole");
+        assert_eq!(store.resolve_contact_id(&local).unwrap(), "G1");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("givenName").and_then(Value::as_str), Some("Ann"));
+        assert!(
+            sent.get("displayName").is_none(),
+            "an empty property is not sent"
+        );
+    }
+
+    #[test]
+    fn create_contact_retry_after_reconcile_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        let created = crate::graph::model::FolderContact {
+            id: "G1".into(),
+            ..Default::default()
+        };
+        store.reconcile_created_contact(&local, &created).unwrap();
+        let applied = apply_op(&c, &store, &OutboxOp::CreateContact { id: local }).unwrap();
+        assert_eq!(applied, Applied::Done);
+        assert!(srv.requests().is_empty(), "no second POST");
+    }
+
+    #[test]
+    fn create_contact_of_a_deleted_row_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        store.delete_contact(&local).unwrap();
+        let applied = apply_op(&c, &store, &OutboxOp::CreateContact { id: local }).unwrap();
+        assert_eq!(applied, Applied::Done);
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn update_contact_of_a_local_id_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        let op = OutboxOp::UpdateContact {
+            id: local.clone(),
+            fields: ContactFieldSet::SURNAME,
+        };
+        apply_op(&c, &store, &op).unwrap();
+        // Nor does a delete of one, nor an update of a row gone.
+        apply_op(&c, &store, &OutboxOp::DeleteContact { id: local }).unwrap();
+        let gone = OutboxOp::UpdateContact {
+            id: "G9".into(),
+            fields: ContactFieldSet::SURNAME,
+        };
+        apply_op(&c, &store, &gone).unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn update_contact_after_create_patches_the_graph_id() {
+        let srv = FakeServer::start(vec![contact_route(
+            "PATCH",
+            "/me/contacts/G1",
+            200,
+            r#"{"id":"G1"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        let created = crate::graph::model::FolderContact {
+            id: "G1".into(),
+            ..Default::default()
+        };
+        store.reconcile_created_contact(&local, &created).unwrap();
+        let mut f = ann_fields();
+        f.surname = "Cole-Smith".into();
+        f.job_title = "Lead".into();
+        let changed = store.update_contact_fields(&local, &f).unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::UpdateContact {
+                id: local,
+                fields: changed,
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/contacts/G1");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"surname":"Cole-Smith","jobTitle":"Lead"}"#
+        );
+    }
+
+    #[test]
+    fn delete_contact_404_is_success() {
+        let srv = FakeServer::start(vec![contact_route("DELETE", "/me/contacts/G1", 404, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let applied = apply_op(&c, &store, &OutboxOp::DeleteContact { id: "G1".into() }).unwrap();
+        assert_eq!(applied, Applied::Done);
+        assert_eq!(srv.requests()[0].method, "DELETE");
     }
 }

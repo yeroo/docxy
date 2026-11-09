@@ -1154,70 +1154,223 @@ wider window fresh without downloading it again.
   view prefix ends in `?`, so none answers another. #2014's "outside the
   window" events are now 200 days out.
 
-## Contacts folder and is_contact (#1934)
+## Contacts folder as records, is_contact and contact writes (#1934, #2063)
 
+- Records: `/me/contacts` (the default Contacts folder) is stored one row per
+  contact in `contact_records`, keyed by Graph `id` (or a `local:` id until its
+  create reaches Graph), with `changeKey` and the fields Outlook's contact
+  form edits (`graph::model::ContactFields`): given, middle, surname, display
+  name, file-as, `emailAddresses` (name and address each, in
+  `contact_emails`), business and home phones, mobile, company, job title,
+  department, business and home `physicalAddress` (Graph's `countryOrRegion`),
+  birthday, personal notes, categories. Phone and category lists are
+  `\u{1f}`-joined (`encode_categories`), as `messages.categories`. The type is
+  `FolderContact { id, change_key, fields }`, not `Contact`:
+  `store::Contact` is the autocomplete row (lookxy uses it).
+- `birthday` is `YYYY-MM-DD` (`""` for none): the date part of Graph's
+  DateTimeOffset when it starts with one. A write sends noon UTC of the day
+  (`T12:00:00Z`), so no client's zone shows the day before; `""` sends `null`.
+- Reads: `Store::folder_contacts()` (ordered by `file_as`, or `display_name`
+  where it is empty, `COLLATE NOCASE`, then id) and `Store::folder_contact(id)`
+  (a Graph id, or the `local:` id a contact was created under, followed
+  through `contact_aliases`).
 - `Store::is_contact(address)` answers whether an address is in the user's
   own Contacts folder, for a "Trust email from my contacts" setting. It
-  reads `folder_contacts` only. It never reads `contacts`, which holds
-  `/me/people` (anyone the user corresponded with) and mined senders and
-  recipients for autocomplete: a trust decision on those would trust anyone
-  who ever mailed the user. The match is exact (`=`, never `LIKE`), ignoring
-  ASCII case and surrounding whitespace (`folder_contact_key`:
-  `to_ascii_lowercase`, both when stored and when asked). Not Unicode
-  `to_lowercase`, which `contacts` keeps for autocomplete: it folds U+212A
-  KELVIN SIGN onto `k`, so `\u{212A}ate@x.com` would match `kate@x.com`, a
-  false positive on trust. The cost is on the safe side: a stored
-  `Ärger@x.com` does not match `ärger@x.com`. A blank address is `false`.
-- A table of its own, not a `source` value in `contacts`: there any two
-  sources merge into `both`, which loses which ones, and removing a contact
-  would have to strip one source off a merged row. `upsert_contact`,
-  `refresh_local_contacts` and `search_contacts` never touch
-  `folder_contacts`. It is `CREATE TABLE IF NOT EXISTS` in `SCHEMA_SQL`, so
-  an older database gets it empty at `open`.
-- `GraphClient::contacts()` GETs
-  `/me/contacts?$top=200&$select=displayName,emailAddresses` (Graph's
-  default page is 10) and follows `@odata.nextLink`. It returns one
-  `FolderContact` per non-blank address (a contact holds up to three), each
-  with the contact's `displayName`. Any page's error is an `Err`, never a
-  partial list.
-- `Store::replace_folder_contacts` replaces the whole set in one
-  transaction (as `replace_master_categories`), so a contact removed from
-  the folder stops counting. Blank addresses and addresses without an `@`
-  are dropped; duplicates collapse, the first non-empty name winning.
-- The engine's full pass runs `sync_people`, then `sync_folder_contacts`,
-  then `refresh_master_categories`. A successful fetch replaces the set and
-  sends `SyncEvent::ContactsUpdated`, changed or not. Any error (403 without
-  `Contacts.Read`, Conditional Access, offline, parse) is swallowed: no
-  `Error`, no event, the pass carries on, and the stored set is kept, as a
-  failed fetch says nothing about the folder. A revoked scope therefore
-  leaves the last set trusted until a fetch succeeds.
-- Full passes only (startup, `Refresh`, sign-in, a pass `needs_full_pass`
-  asks for). Periodic and fast ticks never fetch it, so in a long-running
-  session a removal can take days to count: the `is_contact` doc says so.
-- Scope: `AuthConfig::default()` does not ask for `Contacts.Read`. Adding it
-  would make every existing refresh ask for an unconsented scope. A host
-  that wants `is_contact` adds it to its `AuthConfig::scope`, and #1875's
-  `Scopes { missing }` tells it when the grant lacks it. lookxy ignores
-  `ContactsUpdated`.
-- Tests: `client.rs` `contacts_follows_next_links_and_keeps_every_address`,
-  `contacts_propagates_a_403`, `contacts_later_page_error_is_an_error`,
-  `contacts_page_without_value_is_an_error`; `store`
-  `is_contact_matches_only_folder_contacts`, `is_contact_folds_ascii_case_only`,
-  `replace_folder_contacts_drops_absent_and_blank`,
-  `is_contact_on_a_database_from_before_the_table`; `engine.rs`
+  reads `contact_emails.address_key` only (and the legacy table below). It
+  never reads `contacts`, which holds `/me/people` (anyone the user
+  corresponded with) and mined senders and recipients for autocomplete: a
+  trust decision on those would trust anyone who ever mailed the user. The
+  match is exact (`=`, never `LIKE`), ignoring ASCII case and surrounding
+  whitespace (`folder_contact_key`: `to_ascii_lowercase`, both when stored and
+  when asked). Not Unicode `to_lowercase`, which `contacts` keeps for
+  autocomplete: it folds U+212A KELVIN SIGN onto `k`, so `\u{212A}ate@x.com`
+  would match `kate@x.com`, a false positive on trust. The cost is on the
+  safe side: a stored `Ärger@x.com` does not match `ärger@x.com`. A blank
+  address is `false`. A blank address or one without an `@` (a directory
+  contact's X500 DN) is stored for display with `address_key = ''`, so it
+  never matches. A contact created or deleted locally counts at once.
+- Legacy: #1934's `folder_contacts` (one row per address) stays in
+  `SCHEMA_SQL`. Nothing writes it; `is_contact` still reads it and
+  `replace_contacts` empties it, so a database from before the records keeps
+  its trust answers until their first fetch, never a window of `false`.
+  Before that fetch `folder_contacts()` lists nothing, so no contact only the
+  legacy table knows can be edited or deleted.
+- Tables of their own, not a `source` value in `contacts`: there any two
+  sources merge into `both`. `upsert_contact`, `refresh_local_contacts` and
+  `search_contacts` never touch them. All `CREATE TABLE IF NOT EXISTS`, so an
+  older database gets them empty at `open`. `contact_emails` follows a
+  re-keyed row by `ON UPDATE CASCADE` (`foreign_keys` is on).
+- `GraphClient`: `contacts()` GETs
+  `/me/contacts?$top=200&$select=id,changeKey,…` (`CONTACT_SELECT`, every
+  property `ContactFieldSet` names; Graph's default page is 10) and follows
+  `@odata.nextLink`; an item without an `id` is skipped, any page's error is
+  an `Err`, never a partial list. `contact(id)` GETs one with the same
+  `$select`. `create_contact(&ContactFields)` POSTs the non-empty properties
+  (`ContactFieldSet::non_empty`) and parses Graph's answer.
+  `update_contact(id, &fields, set)` PATCHes only `set`'s properties (an empty
+  set sends nothing). `delete_contact(id)`. Path ids are percent-encoded
+  (`encode_path_segment`). Errors are the usual `GraphError`: a 404 is
+  `NotFound`, a 403 `Http { status: 403, .. }`. The body
+  (`contact_body_json`): strings as given (`""` clears), lists whole, an
+  address as its full five-key object, `emailAddresses` as `[{name, address}]`
+  without blank addresses.
+- `ContactFieldSet`: one bit per Graph property; its JSON names are the Graph
+  property names, which a queued `updateContact` stores, so they never change
+  (an unknown name is dropped on read; a row without `fields` is corrupt).
+  `ContactFieldSet::changed(a, b)` is what `Store::update_contact_fields`
+  returns.
+- Full pass: `sync_people`, then `sync_folder_contacts` (`contacts()` +
+  `Store::replace_contacts`), then `refresh_master_categories`. A successful
+  fetch replaces the records in one transaction and sends
+  `SyncEvent::ContactsUpdated`, changed or not: every row Graph no longer
+  lists goes, every listed one is written, **except** a `local:` row is never
+  removed, a contact a queued `UpdateContact` names (resolved through
+  `contact_aliases`) keeps its stored row, and one a queued `DeleteContact`
+  names is not written back. The outbox is read inside the same transaction.
+  Any error (403 without `Contacts.Read`, Conditional Access, offline, parse)
+  is swallowed: no `Error`, no event, the pass carries on, and the stored set
+  is kept. A revoked scope therefore leaves the last set trusted until a
+  fetch succeeds. Full passes only (startup, `Refresh`, sign-in, a pass
+  `needs_full_pass` asks for): in a long-running session a removal made
+  elsewhere can take days to count; the `is_contact` doc says so.
+- Writes, through the outbox. Unlike event writes, the store write queues
+  the op **in the same transaction** as the local row (#2063 r1): a command
+  waiting in the channel, or deferred by a full pass's `checkpoint`, would
+  otherwise leave the row unprotected while `replace_contacts` or a refused
+  write's re-read runs, and the later op would send the server's own values.
+  The commands only drain (`drain_queued`) and emit `ContactsUpdated`; they
+  queue nothing. A host that never sends one still has the op sent by the
+  next drain (any tick). `revert_folder_contact`, `discard_contact_row` and
+  `replace_contacts` queue nothing. Blank phone and category entries are
+  dropped before a contact is stored or compared (`tidy_contact_fields`):
+  `encode_categories` stores `[""]` as `""`, which reads back as `[]`.
+  - `Store::create_local_contact(&fields)` → `local:` id, `CreateContact`
+    queued; `SyncCommand::CreateContact { id }` pushes it. The op POSTs the row as stored at
+    send time; `Store::reconcile_created_contact` re-keys it to Graph's id,
+    sets `change_key`, fills `display_name`/`file_as` from Graph only where
+    the stored ones are empty (Graph computes them), overwrites nothing else
+    (an edit made while the POST was in flight is kept; its queued
+    `UpdateContact` sends it), and records `contact_aliases(local → id)`,
+    also when the row was deleted before Graph answered (so the queued
+    `DeleteContact` reaches the Graph contact).
+    `SyncEvent::ContactCreated { local_id, id }` follows. A row gone before
+    the drain, or an id that already resolves (a retry after the re-key),
+    sends nothing.
+  - `Store::update_contact_fields(id, &fields)` → the changed
+    `ContactFieldSet`, `UpdateContact` queued under the id the contact is
+    stored as; `SyncCommand::UpdateContact { id, fields }` pushes it. The
+    PATCH sends those properties with their values at send time. An empty set
+    writes and queues nothing, and its command does nothing. An id still `local:` after resolving, or a row gone, sends
+    nothing.
+  - `Store::delete_contact(id)` → `DeleteContact` queued when a row went;
+    `SyncCommand::DeleteContact { id }` pushes it. A 404 is success. A `local:` id never re-keyed sends nothing.
+- Refused writes: 401, throttle, transport and 5xx are unchanged (stop or
+  defer; a 5xx keeps the op queued, and the pending-op rule above keeps a full
+  pass from undoing it). Any other failure is final at the first refusal, not
+  the event ops' five attempts and quarantine: a 403 or 400 never heals by
+  retrying, and the quarantine's mail reconverge has nothing to do with
+  contacts. The engine (`refuse_contact_write`) reads the row as the user left
+  it, drops the op, and reverts to the server: a refused create deletes its
+  `local:` row (`discard_contact_row`); a refused update or delete owes a
+  re-read (`Store::owe_contact_reread`, the `contact_reread_owed` table, so a
+  restart keeps it): `GET /me/contacts/{id}` and `revert_folder_contact`
+  store Graph's version, a 404 deletes the row. The re-read waits while
+  another queued contact op names the same contact, as that op reads the row
+  at send time and would otherwise PATCH the server's own value, losing the
+  user's later edit silently; it runs when the last such op is applied or
+  refused, and at the end of every drain, an empty one included, so the
+  startup drain settles one a restart interrupted (`settle_contact_rereads`).
+  Every later edit is a queued op from the moment it is written, and
+  `revert_folder_contact` checks the queue in its own transaction: an edit
+  written during the GET makes it write nothing and keep the id owed. A
+  final refusal of the GET (a 4xx other than 404, such as a 403 without read
+  scope, or an answer that did not parse) gives the re-read up
+  (`forget_contact_reread`) and the row is left until the next full pass
+  replaces it. A transient one (a 5xx, a throttle, offline, a 401 a refresh
+  did not cure) keeps it owed and pauses re-reads for the rest of that drain
+  (`contact_rereads_paused`); a later drain retries it. Best-effort: no
+  back-off, offline state or sign-in is started from there.
+  `owed_contact_rereads` is a plain read (no write lock), as it runs on every
+  drain; the revert checks the queue again in its own write transaction. Then `SyncEvent::ContactWriteFailed { id, write, status, error,
+  attempted }`, one `SyncEvent::Error("{create|update|delete} contact {id}:
+  {error}")` (as the reminder ops report, so a host showing only `Error` lines
+  sees it), and `ContactsUpdated`. `id` is the id stored at the failure (the
+  Graph id once re-keyed); `status` is the HTTP status (`NotFound` →
+  `Some(404)`), `None` for a parse or store failure; `attempted` is the row as
+  the user left it (`None` for a delete).
+- A refused create is not proof Graph lacks the contact: a POST that worked
+  but whose answer did not parse, or whose re-key failed in the store, lands
+  there with `status: None`. Deleting the `local:` row is still right: the
+  next full pass brings Graph's copy back.
+- No `If-Match`: the stored `changeKey` is not used for optimistic
+  concurrency, the last writer wins.
+- Scope: `AuthConfig::default()` asks for neither. Reading needs
+  `Contacts.Read`; writing needs `Contacts.ReadWrite`, which a host adds to
+  its `AuthConfig::scope` (#1875's `Scopes { missing }` tells it when the
+  grant lacks it). With only `Contacts.Read` every write is refused 403:
+  `ContactWriteFailed { status: Some(403), attempted: Some(..) }`, the edit
+  kept in `attempted`, the store back to the server's record. lookxy ignores
+  `ContactsUpdated`, `ContactCreated` and `ContactWriteFailed`.
+- Tests: `client.rs` `contacts_follows_next_links_and_keeps_every_contact`,
+  `contacts_parses_every_record_field`, `contact_gets_one_record_and_404_is_not_found`,
+  `create_contact_posts_the_nonempty_fields_and_parses_the_answer`,
+  `update_contact_patches_only_the_given_fields`, `delete_contact_404_is_not_found`,
+  `contact_403_on_write_is_http_403`, `contact_field_set_names_round_trip`,
+  `contact_field_set_changed_and_non_empty`, `contacts_propagates_a_403`,
+  `contacts_later_page_error_is_an_error`, `contacts_page_without_value_is_an_error`;
+  `store` `is_contact_matches_only_folder_contacts`,
+  `is_contact_folds_ascii_case_only`,
+  `replace_contacts_drops_absent_and_never_matches_blank`,
+  `is_contact_on_a_database_from_before_the_table`,
+  `is_contact_reads_legacy_folder_contacts_until_the_first_replace`,
+  `replace_contacts_stores_records_and_drops_absent`,
+  `folder_contacts_orders_by_file_as_then_display_name`,
+  `folder_contact_by_id_and_by_local_alias`,
+  `update_contact_fields_returns_only_changed`,
+  `reconcile_created_contact_rekeys_and_keeps_local_edits`,
+  `reconcile_created_contact_of_a_deleted_row_still_aliases`,
+  `replace_contacts_keeps_rows_with_pending_ops`, `contact_ops_round_trip_json`,
+  `contact_writes_queue_their_op_in_the_same_transaction`,
+  `blank_phone_and_category_entries_are_not_stored_or_compared`,
+  `revert_folder_contact_waits_while_an_op_names_it`,
+  `owed_contact_reread_survives_reopening_the_store`;
+  `outbox.rs` `create_contact_reconciles_the_local_id`,
+  `create_contact_retry_after_reconcile_sends_nothing`,
+  `create_contact_of_a_deleted_row_sends_nothing`,
+  `update_contact_of_a_local_id_sends_nothing`,
+  `update_contact_after_create_patches_the_graph_id`,
+  `delete_contact_404_is_success`; `engine.rs`
+  `created_contact_round_trips_through_a_full_pass`,
+  `contact_edit_patches_only_the_changed_fields`, `contact_delete_sends_delete`,
+  `contact_delete_404_is_success`, `contact_write_403_reports_and_reverts`,
+  `contact_delete_403_restores_the_row`,
+  `refused_contact_write_with_failed_reread_leaves_the_row`,
+  `refused_contact_edit_keeps_a_later_queued_edit`,
+  `is_contact_follows_created_and_deleted_contacts`,
+  `full_pass_keeps_a_contact_edit_waiting_behind_a_5xx`,
+  `full_pass_keeps_an_edit_whose_command_is_still_in_the_channel` and
+  `full_pass_keeps_a_delete_whose_command_is_still_in_the_channel` (the store
+  written while a slow `/me/contacts`, `start_paced`, is in flight),
+  `reread_after_refusal_waits_for_an_edit_written_but_not_commanded`,
+  `owed_contact_reread_survives_a_transient_get_failure`,
+  `owed_contact_reread_survives_a_restart`,
   `full_pass_syncs_the_contacts_folder_apart_from_people_and_mined`,
   `contacts_403_keeps_the_stored_set_and_does_not_fail_the_pass`,
   `contact_removed_from_the_folder_stops_counting_after_the_next_full_pass`,
   `only_a_full_pass_fetches_the_contacts_folder`, and the request order in
   `normal_tick_without_fast_option_is_unchanged` and
-  `fast_tick_syncs_only_the_fast_folders`.
-- Not done: a periodic refresh of the set (a normal tick, or
-  `/me/contacts/delta`). Contacts in other contact folders
-  (`/me/contactFolders/{id}/contacts`). A contact saved from the directory
-  (GAL) whose address Graph returns as an Exchange X500 DN
-  (`/o=ExchangeLabs/...`) is not matched: resolving it needs `/users`.
+  `fast_tick_syncs_only_the_fast_folders`. A refused write's engine test waits
+  for the refusal's `ContactsUpdated` and then the command's own
+  (`wait_refused`), a create for `ContactCreated` and then the command's
+  (`wait_created`): a wait for a single `ContactsUpdated` would catch the
+  leftover one.
+- Not done: the contact photo (#2065). A periodic refresh of the set (a
+  normal tick, or `/me/contacts/delta`). Contacts in other contact folders
+  (`/me/contactFolders/{id}/contacts`), contact groups. A directory (GAL)
+  contact's X500 DN address is not matched: resolving it needs `/users`.
   Feeding the folder into autocomplete. Clearing the set on sign-out (the
-  store is kept across sign-out, #1920).
+  store is kept across sign-out, #1920). Dedup of a create retried after a
+  lost POST answer (as events: Graph has nothing to ask). `If-Match`.
 
 ## Cancel and forward a meeting (#1985)
 

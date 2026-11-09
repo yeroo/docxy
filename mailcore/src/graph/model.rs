@@ -71,14 +71,142 @@ pub struct Person {
     pub rank: i64,
 }
 
-/// One address of one contact in the user's Contacts folder (`/me/contacts`,
-/// #1934): a contact with several `emailAddresses` gives one of these per
-/// address, each with the contact's `displayName`. What `Store::is_contact`
-/// answers from, apart from `/me/people` and mined correspondents.
-#[derive(Debug, Clone, PartialEq)]
+/// A postal address of a contact, as Graph's `physicalAddress` (#2063).
+/// Every field is `""` when absent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PhysicalAddress {
+    pub street: String,
+    pub city: String,
+    pub state: String,
+    pub postal_code: String,
+    /// Graph's `countryOrRegion`.
+    pub country_or_region: String,
+}
+
+impl PhysicalAddress {
+    fn from_json(v: Option<&Value>) -> Self {
+        let Some(v) = v else {
+            return PhysicalAddress::default();
+        };
+        PhysicalAddress {
+            street: str_field(v, "street"),
+            city: str_field(v, "city"),
+            state: str_field(v, "state"),
+            postal_code: str_field(v, "postalCode"),
+            country_or_region: str_field(v, "countryOrRegion"),
+        }
+    }
+
+    /// Every field empty: Graph has no such address.
+    pub fn is_empty(&self) -> bool {
+        *self == PhysicalAddress::default()
+    }
+}
+
+/// The fields of a contact Outlook's contact form edits (#2063), as the
+/// store keeps them and the create / update calls send them. A string is
+/// `""` and a list empty when Graph has none.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ContactFields {
+    pub given_name: String,
+    pub middle_name: String,
+    pub surname: String,
+    pub display_name: String,
+    pub file_as: String,
+    /// Graph's `emailAddresses` (up to three), each `{name, address}`.
+    pub email_addresses: Vec<Recipient>,
+    pub business_phones: Vec<String>,
+    pub home_phones: Vec<String>,
+    pub mobile_phone: String,
+    pub company_name: String,
+    pub job_title: String,
+    pub department: String,
+    pub business_address: PhysicalAddress,
+    pub home_address: PhysicalAddress,
+    /// `YYYY-MM-DD`, `""` for none. Graph's `birthday` is a DateTimeOffset:
+    /// its date part is kept, and a write sends noon UTC of the day.
+    pub birthday: String,
+    pub personal_notes: String,
+    pub categories: Vec<String>,
+}
+
+/// One contact of the user's default Contacts folder (`/me/contacts`,
+/// #1934, #2063), keyed by Graph `id` (or a `local:` id before its create
+/// reached Graph). What `Store::is_contact` answers from, apart from
+/// `/me/people` and mined correspondents (`store::Contact`, the
+/// autocomplete row, is a different thing).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FolderContact {
-    pub name: String,
-    pub address: String,
+    pub id: String,
+    /// Graph's `changeKey`. Stored, not used for concurrency: a write sends
+    /// no `If-Match`, so the last writer wins.
+    pub change_key: String,
+    pub fields: ContactFields,
+}
+
+impl FolderContact {
+    /// A contact as `/me/contacts` returns it; `None` without an `id`.
+    /// Missing and null fields read as empty.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let id = str_field(v, "id");
+        if id.is_empty() {
+            return None;
+        }
+        let email_addresses = v
+            .get("emailAddresses")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|e| Recipient {
+                        name: str_field(e, "name"),
+                        address: str_field(e, "address"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(FolderContact {
+            id,
+            change_key: str_field(v, "changeKey"),
+            fields: ContactFields {
+                given_name: str_field(v, "givenName"),
+                middle_name: str_field(v, "middleName"),
+                surname: str_field(v, "surname"),
+                display_name: str_field(v, "displayName"),
+                file_as: str_field(v, "fileAs"),
+                email_addresses,
+                business_phones: string_list(v, "businessPhones"),
+                home_phones: string_list(v, "homePhones"),
+                mobile_phone: str_field(v, "mobilePhone"),
+                company_name: str_field(v, "companyName"),
+                job_title: str_field(v, "jobTitle"),
+                department: str_field(v, "department"),
+                business_address: PhysicalAddress::from_json(v.get("businessAddress")),
+                home_address: PhysicalAddress::from_json(v.get("homeAddress")),
+                birthday: birthday_date(&str_field(v, "birthday")),
+                personal_notes: str_field(v, "personalNotes"),
+                categories: string_list(v, "categories"),
+            },
+        })
+    }
+}
+
+/// The `YYYY-MM-DD` date part of Graph's `birthday` DateTimeOffset
+/// (`1980-05-17T11:59:00Z`), `""` when it does not start with one.
+fn birthday_date(s: &str) -> String {
+    let d = s.get(..10).unwrap_or("");
+    let b = d.as_bytes();
+    let is_date = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if is_date && !d.starts_with("0001-01-01") {
+        d.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// A mail message, as returned by Graph's `/messages` endpoints.
