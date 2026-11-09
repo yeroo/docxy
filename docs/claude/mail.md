@@ -1983,8 +1983,17 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `Full`), `get_message` and `get_message_hit`, not on search hits (not stored, #2006).
   Graph keeps a first call's options in every link it mints, so a `Link` is sent as is.
   Nothing showed delta accepts this exact expand, so a 400 on it (`get_with_expand`)
-  sends the call once more without it: the folder still syncs, without reminders until
-  its links reset. A 400 with another cause costs that one extra request.
+  sends the call once more without it, and the folder still syncs. A 400 with another
+  cause costs that one extra request.
+- A refused expand reads no reminders and keeps the stored ones: what the fallback
+  returns is `MessageFields::reminder_unasked` (`writes_reminder` is false unless the
+  item carries the key; `flag_due_at` still follows the flag). A delta first call that
+  fell back sets `DeltaPage::expand_refused`, and the engine marks the folder
+  (`folders.reminder_expand_refused`, `Store::mark_reminder_expand_refused`), as every
+  link Graph mints from that call lacks the expand too: while marked, every item of the
+  folder's pages and rounds is merged `reminder_unasked`. The mark goes when the links
+  do (`clear_delta_links`; the migration adds it at 0), the only paths that NULL
+  `delta_link`; the next first call then asks again, with no retry loop of its own.
 - Parse (`model::parse_message_reminder`), lenient and never an error: property ids
   match ASCII-case-insensitively (Graph may lower-case the GUID); on is only `"true"`
   (any case) or JSON `true`; a time is read only when it ends in `Z` or has nothing
@@ -2010,10 +2019,13 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   again. `idx_messages_reminder` (partial, `WHERE is_reminder_on = 1`) comes after.
 - `Store::due_message_reminders(now_utc)`: flagged rows, any folder, reminder on, whose
   `COALESCE(NULLIF(reminder_signal_at, ''), reminder_at)` is not empty and not after
-  `now_utc` (normalised with `to_utc`), soonest first then by id. A client polls it.
+  `now_utc`, soonest first then by id (`due_message_reminders_sql`, which the plan test
+  shares). `now_utc` is read by `reminder_time` too; one it cannot read is a
+  `StoreError::Invalid`, not an empty list. A client polls it.
 - Commands: `SyncCommand::DismissMessageReminder { id }` and `SnoozeMessageReminder {
   id, new_reminder_utc }` resolve `id` (`current_id`), refuse a `local:` id and a snooze
-  time `iso8601_to_unix_secs` cannot read (`Error("dismiss message reminder {id}: the
+  time `model::reminder_time` cannot read (as Graph's are: an offset is refused, not
+  dropped) (`Error("dismiss message reminder {id}: the
   message is not on the server yet")`, `"snooze message reminder {id}: not a UTC time:
   …"`), write the store (`Store::dismiss_message_reminder`, `snooze_message_reminder`)
   and queue `OutboxOp::DismissMessageReminder` / `SnoozeMessageReminder` (kinds
@@ -2029,11 +2041,15 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   quarantine), with one difference, as these ops wrote the store: after such a refusal
   other than a 404 `reread_message` GETs the message and merges it
   (`merge_message_unless_edited`) into its row's folder, as no delta re-reports a
-  message Graph never changed. A failed re-read is ignored.
+  message Graph never changed. A row another queued op still names (`protected_ids`: a
+  `SetFlag` behind the refused op, say) is not re-read, so that op's optimistic write
+  stands until it drains. A failed re-read is ignored.
 - `testserver` is a `#[doc(hidden)] pub mod`, so a crate built on mailcore can drive the
   whole path in its tests: `FakeServer::start` with routes for the delta and the
-  `PATCH /me/messages/`, a `GraphClient::new(&srv.base_url, …)` or the engine's Graph
-  base URL pointed at `srv.base_url`, then `srv.requests()` for the recorded PATCH.
+  `PATCH /me/messages/`, then `GraphClient::new(&srv.base_url, …)`, or the engine through
+  `sync::engine::spawn_with_bases_and_options` (`#[doc(hidden)] pub`, the test seam;
+  hosts use `spawn` / `spawn_with_options`, which hard-code Graph) with `srv.base_url`
+  as both bases, then `srv.requests()` for the recorded PATCH.
 - Not done: setting a new reminder, task (To Do) reminders, host UI, and
   `GET /me/reminderView`.
 - Tests: `model.rs` `message_reminder_parses_the_three_properties`,
@@ -2051,14 +2067,16 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `dismiss_message_reminder_patches_reminder_set_false`,
   `snooze_message_reminder_patches_signal_time`, `message_reminder_refused_is_an_error`;
   `store` `message_reminder_tests` (round trip through every reader, partial and
-  complete merges, the flag invariant, `set_flag`, the due query and its index, the
-  migration, the op round trip, `pending_message_ids`) and
+  complete merges, a merge read without the reminder, the flag invariant, `set_flag`,
+  the due query, its index and a bad `now`, the refused-expand mark, the migration, the
+  op round trip, `pending_message_ids`) and
   `upsert_writes_every_column`; `outbox.rs`
   `dismiss_message_reminder_patches_the_resolved_id`,
   `snooze_message_reminder_patches_the_resolved_id`,
   `message_reminder_op_of_a_local_id_makes_no_request`; `engine.rs`
-  `tests::message_reminders` (delta store and clear, refused expand, the migrated
-  store's re-enumeration, dismiss, snooze, refusals, 404, 400 with the re-read, dedupe,
-  unflag) and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
+  `tests::message_reminders` (delta store and clear, a refused expand keeping reminders
+  through a link round, the migrated store's re-enumeration, dismiss, snooze, refusals
+  with an offset time, 404, 400 with the re-read, no re-read of a row a queued op owns,
+  dedupe, unflag) and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
   `message_reminder_commands_by_the_old_id_write_and_reach_the_new_id`,
   `a_dismiss_by_the_new_id_dedupes_against_one_queued_by_the_old_id`.
