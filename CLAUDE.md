@@ -61,7 +61,8 @@ issue number to find its notes.
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
-  a help target (`every_ribbon_command_has_a_help_target`: `docs/claude/help.md`).
+  a help target (`every_ribbon_command_has_a_help_target`: `docs/claude/help.md`), and
+  a new command draw path its F1 probe, `ribbon-cmd:<id>` (#1869, same file).
 - `docs/claude/help.md`: before changing the help manuals or the Documentation tab:
   manual bundles (#1022), the Help tab and F1 (#1855), the manual revision in
   About and the Help footer (#1857), F1 on a hovered ribbon command (#1869).
