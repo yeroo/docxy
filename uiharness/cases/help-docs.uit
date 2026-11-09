@@ -2,7 +2,7 @@
 # suite. The runner installs the helpdocs word fixture as this instance's
 # Word manual (a harness instance reads a manual from its sandbox only, never
 # the one built into the binary), so the pages, keys and links here are the
-# fixture's: welcome, home, home-font (keys bold, dialog:font), insert,
+# fixture's: welcome, home, home-font (keys bold, b, dialog:font), insert,
 # tables (keys table, dialog:insert-table), images, keyboard, help. No Excel
 # or Project manual is installed. Each test closes the Help tab it opened
 # (Ctrl+W on it), so the next one starts without it.
@@ -280,10 +280,11 @@ test F1 with focus on a ribbon command opens that command's page
   # F1 with the pointer resting on a ribbon command opens its page, as Word
   # opens a command's help from its ScreenTip (#1869): the command's id
   # (`ribbon-cmd:<id>`), else its ribbon tab's area page. No ScreenTip has
-  # to be up. A small button, Home > Bold (home-font keys bold):
+  # to be up. A small button, Home > Bold, whose id is `b` (home-font keys
+  # it):
   open copy:../fixtures/basic.docx
   call ribbon-layout {"tab":"Home"}
-  call pointer-move {"to":"ribbon-cmd:bold"}
+  call pointer-move {"to":"ribbon-cmd:b"}
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.open is true
@@ -291,8 +292,9 @@ test F1 with focus on a ribbon command opens that command's page
   assert reply.page is home-font
   assert reply.via is exact
   call real-key {"key":"ctrl+w"}
-  # The pointer on the document, on no command: the area page, as before.
-  call pointer-move {"to":"doc-line-start:0"}
+  # The pointer on the document (the window's centre), on no command: the
+  # area page, as before.
+  call pointer-move {"to":"window"}
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.page is home
@@ -341,7 +343,7 @@ test F1 with focus on a ribbon command opens that command's page
   assert reply.groups.1.state is collapsed
   call ribbon-flyout {"action":"open","group":"Font"}
   assert reply.open is true
-  call pointer-move {"to":"ribbon-cmd:bold"}
+  call pointer-move {"to":"ribbon-cmd:b"}
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.page is home-font
@@ -353,7 +355,7 @@ test F1 with focus on a ribbon command opens that command's page
   # The pointer left the window over Bold: gpui keeps its last position,
   # but no command is under a pointer that is not in the window.
   call ribbon-layout {"tab":"Home"}
-  call pointer-move {"to":"ribbon-cmd:bold"}
+  call pointer-move {"to":"ribbon-cmd:b"}
   call pointer-leave {}
   call real-key {"key":"f1"}
   call help-read {}

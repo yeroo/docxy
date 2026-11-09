@@ -327,7 +327,8 @@ fn ribbon_cmd_at_finds_the_command_under_the_pointer() {
 fn f1_on_a_hovered_command_opens_its_page() {
     use helpdocs::Via;
     let m = word();
-    let ask = f1_command_ask(Some(Kind::Docx), "bold", "Home");
+    // The document ribbon's Bold is `b` (the sheet's is `bold`).
+    let ask = f1_command_ask(Some(Kind::Docx), "b", "Home");
     assert_eq!(ask.editor, HelpEditor::Word);
     assert_eq!(page_of(&ask, &m), ("home-font".into(), Via::Exact));
     let ask = f1_command_ask(Some(Kind::Docx), "table", "Insert");

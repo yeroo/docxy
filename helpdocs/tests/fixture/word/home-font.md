@@ -1,7 +1,7 @@
 ---
 title: Font group
 area: home
-keys: bold, italic, underline, dialog:font
+keys: bold, italic, underline, b, i, u, dialog:font  # b, i, u: the document ribbon's ids (#1869)
 ---
 # Font group
 

@@ -172,3 +172,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   `uiharness/cases/help-docs.uit` (word fixture), and
   `uiharness/cases/help-f1-sheet.uit` (excel fixture: help-docs.uit asserts
   no Excel manual is installed).
+- The document ribbon's ids are not the sheet's: its Bold is `b` (Italic
+  `i`, Underline `u`), the sheet's `bold`. The word fixture's `home-font`
+  keys both, so a hovered document Bold is an exact hit; a real Word manual
+  keys the document ribbon's ids (`every_ribbon_command_has_a_help_target`
+  lists them).
