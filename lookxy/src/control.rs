@@ -802,6 +802,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();

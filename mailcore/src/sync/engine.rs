@@ -451,6 +451,27 @@ pub enum SyncCommand {
         id: String,
         new_reminder_utc: String,
     },
+    /// Dismiss a flagged message's Outlook reminder (#2054): turn it off in
+    /// the store at once (`Store::dismiss_message_reminder`), then queue
+    /// [`crate::store::OutboxOp::DismissMessageReminder`] (a PATCH of
+    /// `PidLidReminderSet` to false) and drain. `id` may be one the message
+    /// had before a move (#1896): it is resolved first, and again when the
+    /// op drains. A `local:` id is a [`SyncEvent::Error`] and nothing is
+    /// written or queued. Dedupe and refusals are `DismissReminder`'s, with
+    /// one difference, as this op wrote the store: after a refusal other
+    /// than a 404 or a 5xx the message is read again from Graph, so the row
+    /// shows the reminder Graph kept.
+    DismissMessageReminder { id: String },
+    /// Snooze a flagged message's Outlook reminder until `new_reminder_utc`
+    /// (#2054): move its next signal in the store at once
+    /// (`Store::snooze_message_reminder`), then queue
+    /// [`crate::store::OutboxOp::SnoozeMessageReminder`] (a PATCH of
+    /// `PidLidReminderSignalTime`) and drain, as `DismissMessageReminder`
+    /// does. The time is checked and normalised as `SnoozeReminder`'s.
+    SnoozeMessageReminder {
+        id: String,
+        new_reminder_utc: String,
+    },
     /// Open "the series" (#2022): GET the series master
     /// (`GraphClient::get_event`, with its `recurrence`), which
     /// `calendarView` never lists, and emit [`SyncEvent::EventSeriesFetched`].
@@ -837,6 +858,27 @@ fn reminder_op_event(op: &OutboxOp) -> Option<&str> {
         OutboxOp::DismissReminder { id } | OutboxOp::SnoozeReminder { id, .. } => Some(id),
         _ => None,
     }
+}
+
+/// The message a message reminder op (#2054) names, as it was queued;
+/// `None` for every other op.
+fn message_reminder_op_id(op: &OutboxOp) -> Option<&str> {
+    match op {
+        OutboxOp::DismissMessageReminder { id } | OutboxOp::SnoozeMessageReminder { id, .. } => {
+            Some(id)
+        }
+        _ => None,
+    }
+}
+
+/// What a reminder op is deduped against (#2025, #2054): the event an
+/// event reminder op names, or the message a message reminder op names,
+/// as it is stored now (`current_id`, so an op queued before a move still
+/// matches). An event and a message never match.
+#[derive(Debug, PartialEq, Eq)]
+enum ReminderTarget {
+    Event(String),
+    Message(String),
 }
 
 /// An event op whose command wrote the store first (an RSVP, edited
@@ -1795,6 +1837,11 @@ impl Engine {
                 id,
                 new_reminder_utc,
             } => self.snooze_reminder(id, new_reminder_utc),
+            SyncCommand::DismissMessageReminder { id } => self.dismiss_message_reminder(id),
+            SyncCommand::SnoozeMessageReminder {
+                id,
+                new_reminder_utc,
+            } => self.snooze_message_reminder(id, new_reminder_utc),
             SyncCommand::FetchEventSeries { id } => self.fetch_event_series(id),
             SyncCommand::FetchEventInstances {
                 id,
@@ -2854,19 +2901,86 @@ impl Engine {
         });
     }
 
-    /// Queues a reminder op (#2025) unless it equals the last reminder op
-    /// queued for the same event (a second Dismiss while the first waits
-    /// offline), then drains either way. Only the last one counts: with
-    /// `[Dismiss, Snooze]` queued, a new Dismiss is queued, or the snooze
-    /// would land last. A queue that cannot be read is queued to.
+    /// [`SyncCommand::DismissMessageReminder`].
+    fn dismiss_message_reminder(&mut self, id: String) {
+        let id = self.store.current_id(&id).unwrap_or(id);
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "dismiss message reminder {id}: the message is not on the server yet"
+            )));
+            return;
+        }
+        self.store.dismiss_message_reminder(&id);
+        self.enqueue_reminder_op(OutboxOp::DismissMessageReminder { id });
+    }
+
+    /// [`SyncCommand::SnoozeMessageReminder`].
+    fn snooze_message_reminder(&mut self, id: String, new_reminder_utc: String) {
+        let id = self.store.current_id(&id).unwrap_or(id);
+        if id.starts_with("local:") {
+            self.emit(SyncEvent::Error(format!(
+                "snooze message reminder {id}: the message is not on the server yet"
+            )));
+            return;
+        }
+        // As `snooze_reminder`: `to_utc` never fails, so the result must
+        // read as a time.
+        let utc = crate::graph::model::to_utc(&new_reminder_utc, "UTC");
+        if crate::store::iso8601_to_unix_secs(&utc).is_none() {
+            self.emit(SyncEvent::Error(format!(
+                "snooze message reminder {id}: not a UTC time: {new_reminder_utc:?}"
+            )));
+            return;
+        }
+        self.store.snooze_message_reminder(&id, &utc);
+        self.enqueue_reminder_op(OutboxOp::SnoozeMessageReminder {
+            id,
+            new_reminder_utc: utc,
+        });
+    }
+
+    /// What `op` is deduped against ([`ReminderTarget`]); `None` for an op
+    /// that is no reminder op.
+    fn reminder_target(&self, op: &OutboxOp) -> Option<ReminderTarget> {
+        if let Some(event) = reminder_op_event(op) {
+            return Some(ReminderTarget::Event(event.to_string()));
+        }
+        message_reminder_op_id(op).map(|id| {
+            ReminderTarget::Message(self.store.current_id(id).unwrap_or_else(|_| id.to_string()))
+        })
+    }
+
+    /// Queues a reminder op (#2025, #2054) unless it equals the last
+    /// reminder op queued for the same event or message (a second Dismiss
+    /// while the first waits offline), then drains either way. Only the
+    /// last one counts: with `[Dismiss, Snooze]` queued, a new Dismiss is
+    /// queued, or the snooze would land last. A message op's id is compared
+    /// as the message is stored now, so one queued before a move still
+    /// matches. A queue that cannot be read is queued to.
     fn enqueue_reminder_op(&mut self, op: OutboxOp) {
-        let event = reminder_op_event(&op);
+        let target = self.reminder_target(&op);
         let last = self.store.pending_ops().ok().and_then(|rows| {
             rows.into_iter()
                 .rev()
-                .find(|r| event.is_some() && reminder_op_event(&r.op) == event)
+                .find(|r| target.is_some() && self.reminder_target(&r.op) == target)
         });
-        if last.is_some_and(|r| r.op == op) {
+        let same = |queued: &OutboxOp| match (queued, &op) {
+            (OutboxOp::DismissMessageReminder { .. }, OutboxOp::DismissMessageReminder { .. }) => {
+                true
+            }
+            (
+                OutboxOp::SnoozeMessageReminder {
+                    new_reminder_utc: a,
+                    ..
+                },
+                OutboxOp::SnoozeMessageReminder {
+                    new_reminder_utc: b,
+                    ..
+                },
+            ) => a == b,
+            (queued, op) => queued == op,
+        };
+        if last.is_some_and(|r| same(&r.op)) {
             self.drain_queued();
             return;
         }
@@ -3189,6 +3303,25 @@ impl Engine {
                     // (its mail reconverge would re-enumerate the whole
                     // mailbox for nothing). A 404 is no error: the event is
                     // gone, and so is its reminder.
+                    // A message reminder op (#2054) is dropped the same
+                    // way, but it wrote the store first: after a refusal
+                    // other than a 404 the message is read again, as no
+                    // delta re-reports a message Graph never changed.
+                    if let Some(id) = message_reminder_op_id(&row.op) {
+                        self.store.drop_op(row.seq);
+                        if !matches!(other, GraphError::NotFound) {
+                            let action = match row.op {
+                                OutboxOp::DismissMessageReminder { .. } => {
+                                    "dismiss message reminder"
+                                }
+                                _ => "snooze message reminder",
+                            };
+                            self.emit(SyncEvent::Error(format!("{action} {id}: {other}")));
+                            let id = id.to_string();
+                            self.reread_message(&id);
+                        }
+                        continue;
+                    }
                     if let Some(event) = reminder_op_event(&row.op) {
                         self.store.drop_op(row.seq);
                         if !matches!(other, GraphError::NotFound) {
@@ -4631,6 +4764,27 @@ impl Engine {
         }
     }
 
+    /// Reads the message `id` names (as it is stored now) again from Graph
+    /// and merges it into the folder its row is in (#2054: after a refused
+    /// message reminder op, whose optimistic write Graph never made), with
+    /// `merge_message_unless_edited`, so a draft's unsaved edit is never
+    /// overwritten. A row that is gone is left gone; any failure is ignored
+    /// (the refusal's `Error` is already out, and a later delta corrects
+    /// what changes).
+    fn reread_message(&mut self, id: &str) {
+        let Ok(current) = self.store.current_id(id) else {
+            return;
+        };
+        let Ok(Some(row)) = self.store.message_row(&current) else {
+            return;
+        };
+        if let Ok((m, fields)) = self.with_auth(|c| c.get_message(&current)) {
+            let _ = self
+                .store
+                .merge_message_unless_edited(&row.folder_id, &m, &fields);
+        }
+    }
+
     // --- Auth ------------------------------------------------------------
 
     /// Runs a Graph call with the current token; on a 401, refreshes the token
@@ -5702,6 +5856,10 @@ mod tests {
                             is_draft: false,
                             is_meeting_request: false,
                             categories: vec![],
+                            is_reminder_on: false,
+                            reminder_at: String::new(),
+                            reminder_signal_at: String::new(),
+                            flag_due_at: String::new(),
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -17341,6 +17499,10 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: vec![],
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();

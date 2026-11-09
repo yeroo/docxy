@@ -3818,6 +3818,10 @@ impl App {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed message");
@@ -4153,6 +4157,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: true,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed invite");
@@ -4571,6 +4579,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: vec!["Work".into()],
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .unwrap();
@@ -4804,6 +4816,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed m2");
@@ -4835,6 +4851,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed m3");
@@ -5521,6 +5541,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("update message to has_attachments=true");
@@ -5557,6 +5581,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("seed message");
@@ -6611,6 +6639,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("mark m1 has_attachments");
@@ -6637,6 +6669,10 @@ pub(crate) mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
                 },
             )
             .expect("mark m2 has_attachments");

@@ -14,5 +14,7 @@ pub mod sync;
 pub mod thread;
 pub mod tokencache;
 
-#[cfg(test)]
-mod testserver;
+/// In-process fake Graph server: test support for mailcore and for crates
+/// built on it (#2054), so a client's own tests can drive the whole path.
+#[doc(hidden)]
+pub mod testserver;

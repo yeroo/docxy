@@ -63,7 +63,16 @@ CREATE TABLE IF NOT EXISTS messages (
     -- bumps it, a successful push clears it back to 0 if no edit came
     -- since. Non-zero: the row holds fields Graph has not seen, which a
     -- fresh delta must not overwrite.
-    local_edit      INTEGER NOT NULL DEFAULT 0
+    local_edit      INTEGER NOT NULL DEFAULT 0,
+    -- A flagged message's Outlook reminder (#2054): on (never on an
+    -- unflagged row), the time it was set for and when it fires next, and
+    -- the flag's due time, all `YYYY-MM-DDTHH:MM:SSZ` or ''. An old file
+    -- gets them, and its delta links reset, in `Store::init`, which also
+    -- creates their index.
+    is_reminder_on     INTEGER NOT NULL DEFAULT 0,
+    reminder_at        TEXT NOT NULL DEFAULT '',
+    reminder_signal_at TEXT NOT NULL DEFAULT '',
+    flag_due_at        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
