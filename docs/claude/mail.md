@@ -2527,6 +2527,12 @@ series' first day.
   `Ok(true)`, so `FetchBody` is answered, `FetchMessage` does not fail with "could not
   store the body", and the background fetcher does not park. `get_body_for` (#1901)
   still decides whether an embedder asks; this is the store-side backstop.
+- `fetch_and_store_body` returns `BodyStored` (`Written`, `Kept`, `Failed`). A kept body
+  leaves the row unchanged, so it still reads as needing a body (`needs_body`,
+  `body_candidates`: a row `mark_sent` filed outside Drafts, with a text body under
+  `BodyFormat::Html`); `background_body` puts a `Kept` id in `body_skip`, or the
+  prefetch, whose wait is zero while it has candidates, would fetch it on every loop turn
+  for as long as the op waits (r1).
 - Embedders' tests: the platform secret store is skipped only under mailcore's own
   `cfg(test)`, so a client's tests that reach the token store set
   `MAILCORE_TOKEN_STORE=file` (`tokencache` and `testserver` module docs).
@@ -2535,3 +2541,5 @@ series' first day.
   `put_body` still writes, an undecodable outbox row); `engine.rs`
   `a_deferred_send_keeps_the_users_body_over_a_fetch` (the 500 PATCH, then `FetchBody`
   before the back-off, then `Refresh`: the PATCH before `/send` carries the user's body).
+  `engine.rs` `a_kept_draft_body_is_prefetched_once_not_in_a_loop` (one body GET for the
+  protected row in a run).

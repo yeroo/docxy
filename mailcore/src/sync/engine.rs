@@ -924,6 +924,19 @@ struct DeltaRun {
     expand_refused: bool,
 }
 
+/// What `Engine::fetch_and_store_body` did with the body Graph returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyStored {
+    /// Stored, and `BodyReady` sent.
+    Written,
+    /// The store kept a draft's unpushed body over it (#2082), and
+    /// `BodyReady` sent: the stored body is the one to show. The row is
+    /// unchanged, so it still needs a body by `Store::needs_body`'s rule.
+    Kept,
+    /// The store failed; no `BodyReady` sent.
+    Failed,
+}
+
 /// What `Engine::background_body` did with one id.
 enum BackgroundBody {
     /// It needs no body (any more), or it is skipped: no request was made.
@@ -3974,7 +3987,7 @@ impl Engine {
                 // As before #1978, `BodyReady` answers a `FetchBody` even
                 // when the store failed to write the body (a draft's body
                 // it keeps, #2082, is answered by `fetch_and_store_body`).
-                if !stored {
+                if stored == BodyStored::Failed {
                     self.emit(SyncEvent::BodyReady { id: id.to_string() });
                 }
                 false
@@ -3989,21 +4002,23 @@ impl Engine {
     /// format asked for in `fetched_as`, and the Exchange headers that came
     /// with the body, #1933), then `BodyReady`. A draft's unpushed body the
     /// store keeps over the fetch (#2082) is an answer too: the stored body
-    /// is the one to show, so `BodyReady` and `Ok(true)`, and the fetched one
-    /// is dropped. `Ok(false)`: the store failed (no `BodyReady` sent).
-    fn fetch_and_store_body(&mut self, id: &str) -> Result<bool, GraphError> {
+    /// is the one to show, so `BodyReady` and `BodyStored::Kept`, and the
+    /// fetched one is dropped. `BodyStored::Failed`: the store failed (no
+    /// `BodyReady` sent).
+    fn fetch_and_store_body(&mut self, id: &str) -> Result<BodyStored, GraphError> {
         let format = self.config.options.body_format;
         let (body, headers) =
             self.with_auth(|c| c.get_body_with_headers(id, format == BodyFormat::Text))?;
-        if self
+        let stored = match self
             .store
             .put_fetched_body_with_headers(id, &body, format, &headers)
-            .is_err()
         {
-            return Ok(false);
-        }
+            Ok(true) => BodyStored::Written,
+            Ok(false) => BodyStored::Kept,
+            Err(_) => return Ok(BodyStored::Failed),
+        };
         self.emit(SyncEvent::BodyReady { id: id.to_string() });
-        Ok(true)
+        Ok(stored)
     }
 
     // --- Server search (#2006) -------------------------------------------
@@ -4192,8 +4207,8 @@ impl Engine {
             }
         }
         match self.fetch_and_store_body(id) {
-            Ok(true) => false,
-            Ok(false) => {
+            Ok(BodyStored::Written | BodyStored::Kept) => false,
+            Ok(BodyStored::Failed) => {
                 self.fetch_message_failed(id, "could not store the body");
                 false
             }
@@ -4298,6 +4313,8 @@ impl Engine {
     /// caller. A 404 (moved or deleted since), another 4xx or a parse error
     /// is not reported, as the user asked for nothing, and puts the id in
     /// `body_skip`, so it is not asked for again in this run: never a loop.
+    /// So does a body the store kept over the fetch (#2082), as the row
+    /// still reads as needing one.
     /// A 5xx (other than a throttle's 503) or a store failure parks these
     /// fetches until the next pass (`body_parked`), the id not skipped: one
     /// request a pass while Graph or the store is failing, and the id is
@@ -4321,11 +4338,20 @@ impl Engine {
             }
         }
         match self.fetch_and_store_body(id) {
-            Ok(true) => BackgroundBody::Fetched,
+            Ok(BodyStored::Written) => BackgroundBody::Fetched,
+            // A draft's unpushed body kept (#2082) leaves the row as it
+            // was, still a candidate: skipped for this run, or the prefetch
+            // would fetch it again on every turn while its op waits.
+            Ok(BodyStored::Kept) => {
+                self.body_skip.insert(id.to_string());
+                BackgroundBody::Fetched
+            }
             // A row deleted since (the UI deletes on its own connection)
             // fails the body's foreign key: nothing is wrong with the store.
-            Ok(false) if !self.store.message_exists(id).unwrap_or(true) => BackgroundBody::Fetched,
-            Ok(false) => {
+            Ok(BodyStored::Failed) if !self.store.message_exists(id).unwrap_or(true) => {
+                BackgroundBody::Fetched
+            }
+            Ok(BodyStored::Failed) => {
                 self.body_parked = true;
                 BackgroundBody::Parked
             }
@@ -23727,6 +23753,85 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(500));
                 assert_eq!(body_get_ids(&srv), ["A", "B", "C", "OK"]);
                 stop(handle);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+
+            #[test]
+            fn a_kept_draft_body_is_prefetched_once_not_in_a_loop() {
+                // #2082 r1: P's queued `SendDraft` waits (every PATCH is a
+                // 500), so the store keeps its body over a fetch. Its stored
+                // body (a `createReply` text body, no fetch format) does not
+                // satisfy Html, and `mark_sent` filed it outside Drafts, so
+                // it stays a candidate: without `body_skip` the prefetch
+                // would fetch it on every turn of the loop.
+                let mut extra = vec![(
+                    Route {
+                        method: "PATCH".into(),
+                        path_prefix: "/me/messages/P".into(),
+                        status: 500,
+                        headers: vec![],
+                        body: "{}".into(),
+                    },
+                    None,
+                )];
+                extra.extend(bodies(&["P", "OK"]));
+                let srv = FakeServer::start_paced(mailbox(
+                    &[small(Fold {
+                        pages: vec![vec![msg("P", &ago(3600)), msg("OK", &ago(7200))]],
+                        ..inbox()
+                    })],
+                    extra,
+                    Duration::ZERO,
+                ));
+                let dir = new_dir("bodies-kept");
+                {
+                    let s = store_in(&dir);
+                    s.upsert_folder(&MailFolder {
+                        id: "F1".into(),
+                        display_name: "Inbox".into(),
+                        parent_id: None,
+                        total_count: 5,
+                        unread_count: 0,
+                        well_known_name: Some("inbox".into()),
+                    })
+                    .unwrap();
+                    seed_row(&s, "F1", &msg("P", &ago(3600)));
+                    s.put_body(
+                        "P",
+                        &crate::graph::model::Body {
+                            content_type: "text".into(),
+                            content: "the user's reply".into(),
+                        },
+                    )
+                    .unwrap();
+                    s.enqueue_op(&OutboxOp::SendDraft { id: "P".into() })
+                        .unwrap();
+                }
+                let handle = spawn_with(
+                    &srv,
+                    &dir,
+                    EngineOptions {
+                        body_format: BodyFormat::Html,
+                        ..Default::default()
+                    },
+                );
+                wait_ready(&handle, &["P", "OK"], None);
+                // Another pass, and idle steps after it. With the send
+                // queued, a pass settles at `PendingOps`, not `Idle`.
+                handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::State(SyncState::PendingOps(_)))
+                });
+                std::thread::sleep(Duration::from_millis(500));
+                let p_gets = body_get_ids(&srv).iter().filter(|id| *id == "P").count();
+                assert_eq!(p_gets, 1, "P's body is fetched once in this run");
+                stop(handle);
+                let s = store_in(&dir);
+                assert_eq!(
+                    s.get_body("P").unwrap().unwrap().content,
+                    "the user's reply"
+                );
+                assert_eq!(s.pending_ops().unwrap().len(), 1, "the send still waits");
                 let _ = std::fs::remove_dir_all(&dir);
             }
 
