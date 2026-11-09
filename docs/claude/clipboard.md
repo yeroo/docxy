@@ -77,3 +77,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   (no `'` the TSV gives a text cell like `007`). Lists are not kept: a `Clip`
   has no paragraph properties (#1967). The harness reports the caret's
   hyperlink target as `run.link`.
+
+## A test X client's last request (#2008)
+
+- An X client in a test that sends a request (above all a `SendEvent`) and
+  then drops its connection makes a checked request (or one with a reply)
+  first: the server may close a client that hung up before it reads what
+  that client last sent, so a flush alone is not enough. The test clipboard
+  manager's `SelectionNotify` was lost that way about one run in five
+  (`at_quit_our_copy_goes_to_the_clipboard_manager`); it now ends on
+  `send_event(…).check()`, as `uiharness`'s `request_close` does. `Peer`
+  ends on a `DestroyNotify` it waits for, and a `Reader` read that succeeds
+  on a reply; one it gives up on leaves only requests on its own window,
+  which nobody waits for.

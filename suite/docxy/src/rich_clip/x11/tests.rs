@@ -421,8 +421,9 @@ fn latin1_replaces_what_it_cannot_say() {
 }
 
 /// A clipboard manager: owns `CLIPBOARD_MANAGER`, and on `SAVE_TARGETS`
-/// reads the app's text and RTF, as a manager does, then says it is done.
-/// What it saved comes back through the join handle.
+/// reads the app's text and RTF, as a manager does, then says it is done
+/// and waits until the server has taken that answer before it lets go of
+/// its connection. What it saved comes back through the join handle.
 fn manager(display: &str) -> JoinHandle<Vec<(String, Vec<u8>)>> {
     let (conn, screen) = x11rb::connect(Some(display)).unwrap();
     let root = conn.setup().roots[screen].root;
@@ -467,8 +468,13 @@ fn manager(display: &str) -> JoinHandle<Vec<(String, Vec<u8>)>> {
                     property: e.property,
                 },
             )
+            .unwrap()
+            // Checked: a round trip before the connection drops. The
+            // server can close a client that hung up before it reads that
+            // client's last requests, and this answer was lost about one
+            // run in five (#2008).
+            .check()
             .unwrap();
-            conn.flush().unwrap();
             return saved;
         }
     })
@@ -486,8 +492,8 @@ fn at_quit_our_copy_goes_to_the_clipboard_manager() {
     drop(gpui);
     assert!(!clip.hand_over(), "no manager runs");
     let saved = manager(&x.display);
-    // The manager reads on its own connection: under a loaded test run it
-    // may take longer than the app's 100 ms bound.
+    // Not the app's 100 ms: the manager reads on its own connection, and
+    // this bound only makes a lost answer fail instead of hang.
     assert!(clip.hand_over_within(Duration::from_secs(10)));
     let saved = saved.join().unwrap();
     assert_eq!(
