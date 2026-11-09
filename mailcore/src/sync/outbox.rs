@@ -264,8 +264,7 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             }
             client.snooze_message_reminder(&target, new_reminder_utc)
         }
-        // `apply_op` handles it.
-        OutboxOp::CreateContact { .. } => Ok(()),
+        OutboxOp::CreateContact { .. } => unreachable!("apply_op handles CreateContact"),
         // Only the properties the edit changed (#2063), each with its value
         // at send time. An id still `local:` after resolving has no Graph
         // contact (its create was refused, and the row went with it); a row

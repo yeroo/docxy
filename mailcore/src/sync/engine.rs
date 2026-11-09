@@ -520,28 +520,35 @@ pub enum SyncCommand {
     /// `graph::client::event_zone_error` refuses is an `Error`, before the
     /// master is resolved, and nothing is queued.
     UpdateEventSeries { id: String, input: EventInput },
-    /// Push a contact the host created locally (`Store::create_local_contact`,
-    /// already applied) to Graph (#2063): queue
-    /// [`crate::store::OutboxOp::CreateContact`] and drain, then emit
-    /// [`SyncEvent::ContactsUpdated`]. When `POST /me/contacts` answers, the
+    /// Push a contact the host created locally to Graph now (#2063):
+    /// `Store::create_local_contact` wrote the row and queued
+    /// [`crate::store::OutboxOp::CreateContact`] in one transaction; this
+    /// command only drains the outbox, then emits
+    /// [`SyncEvent::ContactsUpdated`]. It queues nothing itself, and a host
+    /// that never sends it still has the op sent by the next drain (any
+    /// tick). When `POST /me/contacts` answers, the
     /// row is re-keyed to Graph's id and [`SyncEvent::ContactCreated`] names
     /// both ids; the `local:` id keeps resolving (`Store::folder_contact`).
     /// Writing needs `Contacts.ReadWrite`, which `AuthConfig::default()` does
     /// not ask for: with only `Contacts.Read` Graph refuses it with a 403,
     /// reported as [`SyncEvent::ContactWriteFailed`].
     CreateContact { id: String },
-    /// Push an edit of a contact (`Store::update_contact_fields`, already
-    /// applied) to Graph (#2063): queue
-    /// [`crate::store::OutboxOp::UpdateContact`] and drain, then emit
+    /// Push an edit of a contact to Graph now (#2063):
+    /// `Store::update_contact_fields` wrote it and queued
+    /// [`crate::store::OutboxOp::UpdateContact`] with the changed set in one
+    /// transaction; this command only drains, then emits
     /// [`SyncEvent::ContactsUpdated`]. `fields` is the set
     /// `update_contact_fields` returned: the PATCH sends only those, each
-    /// with its value when the op is sent. An empty set queues nothing.
+    /// with its value when the op is sent. An empty set (nothing changed,
+    /// nothing queued) does nothing. As `CreateContact`, the next drain
+    /// sends the op without the command.
     /// Needs `Contacts.ReadWrite`, as `CreateContact`.
     UpdateContact { id: String, fields: ContactFieldSet },
-    /// Delete a contact (`Store::delete_contact`, already applied) on Graph
-    /// (#2063): queue [`crate::store::OutboxOp::DeleteContact`] and drain,
-    /// then emit [`SyncEvent::ContactsUpdated`]. A 404 is success (already
-    /// gone). Needs `Contacts.ReadWrite`, as `CreateContact`.
+    /// Delete a contact on Graph now (#2063): `Store::delete_contact`
+    /// removed the row and queued [`crate::store::OutboxOp::DeleteContact`]
+    /// in one transaction; this command only drains, then emits
+    /// [`SyncEvent::ContactsUpdated`]. A 404 is success (already gone). As
+    /// `CreateContact`, the next drain sends the op without the command. Needs `Contacts.ReadWrite`, as `CreateContact`.
     DeleteContact { id: String },
     /// Exit the sync thread cleanly.
     Shutdown,
@@ -651,8 +658,9 @@ pub enum SyncEvent {
     /// update's or delete's contact is read again from Graph
     /// (`GET /me/contacts/{id}`, after any later queued op for it has gone),
     /// or deleted when Graph answers 404. If that read fails too, the row is
-    /// left until the next full pass replaces it. A [`SyncEvent::Error`] with
-    /// the same text follows, then [`SyncEvent::ContactsUpdated`].
+    /// left until the next full pass replaces it. A [`SyncEvent::Error`]
+    /// follows, `"{create|update|delete} contact {id}: {error}"`, then
+    /// [`SyncEvent::ContactsUpdated`].
     ContactWriteFailed {
         /// The contact's id as stored when it failed: the Graph id once a
         /// create re-keyed it, the `local:` id for a refused create.
@@ -1286,7 +1294,6 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         shutting_down: false,
         body_skip: HashSet::new(),
         body_parked: false,
-        contact_reread_owed: Vec::new(),
     };
     engine.startup();
     engine.main_loop();
@@ -1401,14 +1408,6 @@ struct Engine {
     /// fetches (#1978) until the next sync pass, which clears it: one try a
     /// pass, never a loop, and a store or a service that recovered heals.
     body_parked: bool,
-    /// Contacts a refused update or delete must read again from Graph
-    /// (#2063), waiting while another queued contact op names them: that
-    /// op reads the row at send time, so a revert before it would make it
-    /// send the server's own values and lose the user's edit. Each id is
-    /// the one stored now. Re-read once no queued op names it
-    /// (`settle_contact_rereads`). In memory only: a restart drops it, and
-    /// the startup full pass replaces the row.
-    contact_reread_owed: Vec<String>,
 }
 
 impl Engine {
@@ -1988,21 +1987,19 @@ impl Engine {
                 to_utc,
             } => self.fetch_event_instances(id, from_utc, to_utc),
             SyncCommand::UpdateEventSeries { id, input } => self.update_event_series(id, input),
-            // Handled in `main_loop` so the thread can actually return.
-            SyncCommand::CreateContact { id } => {
-                self.enqueue_and_drain(OutboxOp::CreateContact { id });
+            // The store write queued the op (#2063): the command only
+            // pushes it now.
+            SyncCommand::CreateContact { .. } | SyncCommand::DeleteContact { .. } => {
+                self.drain_queued();
                 self.emit(SyncEvent::ContactsUpdated);
             }
-            SyncCommand::UpdateContact { id, fields } => {
+            SyncCommand::UpdateContact { fields, .. } => {
                 if !fields.is_empty() {
-                    self.enqueue_and_drain(OutboxOp::UpdateContact { id, fields });
+                    self.drain_queued();
                     self.emit(SyncEvent::ContactsUpdated);
                 }
             }
-            SyncCommand::DeleteContact { id } => {
-                self.enqueue_and_drain(OutboxOp::DeleteContact { id });
-                self.emit(SyncEvent::ContactsUpdated);
-            }
+            // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
     }
@@ -3423,10 +3420,14 @@ impl Engine {
     /// [`MAX_OP_ATTEMPTS`], quarantines the op (drops it + emits `Error`) so
     /// the rest of the queue proceeds, except a `SendDraft`, whose first
     /// such failure returns the message to Drafts (`fail_send`, #1874), a
-    /// `CancelEvent` answered 404 (dropped, calendars reset, #1985) and a
+    /// `CancelEvent` answered 404 (dropped, calendars reset, #1985), a
     /// reminder op (#2025), which its first such failure drops (with one
-    /// `Error`, none for a 404) and never quarantines; the queue proceeds
-    /// after each of them too. A 5xx keeps the op and stops the
+    /// `Error`, none for a 404) and never quarantines, and a contact op
+    /// (#2063), which its first such failure drops and reverts
+    /// (`refuse_contact_write`); the queue proceeds after each of them too.
+    /// After each applied contact op and at the end of every drain (also an
+    /// empty one) the owed contact re-reads whose last op has gone are
+    /// settled (`settle_contact_rereads`). A 5xx keeps the op and stops the
     /// drain there ([`Drain::Deferred`]): a 5xx op is never quarantined, so
     /// it must not stop the caller's sync either. It arms the outbox's own
     /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
@@ -3653,8 +3654,8 @@ impl Engine {
     /// ([`SyncEvent::ContactWriteFailed`], an `Error` line,
     /// `ContactsUpdated`). A refused create deletes its `local:` row; a
     /// refused update or delete owes a re-read from Graph
-    /// (`contact_reread_owed`), done now unless another queued op names the
-    /// contact.
+    /// (`Store::owe_contact_reread`, persisted), done now unless another
+    /// queued op names the contact.
     fn refuse_contact_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = contact_op(&row.op) else {
             return;
@@ -3670,12 +3671,10 @@ impl Engine {
         self.store.drop_op(row.seq);
         match write {
             ContactWrite::Create => {
-                let _ = self.store.delete_contact(&id);
+                let _ = self.store.discard_contact_row(&id);
             }
             ContactWrite::Update | ContactWrite::Delete => {
-                if !self.contact_reread_owed.contains(&id) {
-                    self.contact_reread_owed.push(id.clone());
-                }
+                let _ = self.store.owe_contact_reread(&id);
                 self.settle_contact_rereads();
             }
         }
@@ -3694,38 +3693,41 @@ impl Engine {
         self.emit(SyncEvent::ContactsUpdated);
     }
 
-    /// Re-reads every owed contact (`contact_reread_owed`) that no queued
-    /// contact op names any more (#2063): Graph's version is stored, a 404
-    /// deletes the row, and any other failure leaves the row for the next
-    /// full pass. Whether any contact was re-read.
+    /// Re-reads every owed contact (`Store::owe_contact_reread`, #2063)
+    /// that no queued contact op names: that op reads the row at send time,
+    /// so a revert before it would make it send the server's own values and
+    /// lose the user's edit. Graph's version is stored, a 404 deletes the
+    /// row (`Store::revert_folder_contact`, which writes nothing and keeps
+    /// the id owed if an edit was queued during the GET), and any other
+    /// failure gives the re-read up, the row left for the next full pass.
+    /// The owed set is in the store, so one a restart interrupted is settled
+    /// by the startup pass's drain. Whether any row was re-read.
     fn settle_contact_rereads(&mut self) -> bool {
-        if self.contact_reread_owed.is_empty() {
-            return false;
-        }
-        let Ok(ops) = self.store.pending_ops() else {
+        let Ok(owed) = self.store.owed_contact_rereads() else {
             return false;
         };
-        let queued: HashSet<String> = ops
-            .iter()
-            .filter_map(|r| contact_op(&r.op))
-            .filter_map(|(_, id)| self.store.resolve_contact_id(id).ok())
-            .collect();
-        let (due, owed): (Vec<String>, Vec<String>) = std::mem::take(&mut self.contact_reread_owed)
-            .into_iter()
-            .partition(|id| !queued.contains(id));
-        self.contact_reread_owed = owed;
-        for id in &due {
-            match self.with_auth(|c| c.contact(id)) {
-                Ok(c) => {
-                    let _ = self.store.put_folder_contact(&c);
+        let mut reread = false;
+        for (id, queued) in owed {
+            if queued {
+                continue;
+            }
+            let server = match self.with_auth(|c| c.contact(&id)) {
+                Ok(c) => Some(c),
+                Err(GraphError::NotFound) => None,
+                Err(_) => {
+                    let _ = self.store.forget_contact_reread(&id);
+                    continue;
                 }
-                Err(GraphError::NotFound) => {
-                    let _ = self.store.delete_contact(id);
-                }
-                Err(_) => {}
+            };
+            if self
+                .store
+                .revert_folder_contact(&id, server.as_ref())
+                .unwrap_or(false)
+            {
+                reread = true;
             }
         }
-        !due.is_empty()
+        reread
     }
 
     /// A send failed for good (#1874): every failure reaching it is final,
@@ -7356,25 +7358,33 @@ mod tests {
             ],
             &[("/me/contacts", 200, &list, None)],
             |s| {
-                // Two edits queued before the engine drains: A, then B.
+                // Two edits queued before the engine drains: A, then B. Each
+                // store write queues its own op.
                 s.replace_contacts(&[dave_contact()]).unwrap();
                 let mut f = dave_contact().fields;
                 f.job_title = "Bad title".into();
-                let a = s.update_contact_fields("C-dave", &f).unwrap();
-                s.enqueue_op(&OutboxOp::UpdateContact {
-                    id: "C-dave".into(),
-                    fields: a,
-                })
-                .unwrap();
+                s.update_contact_fields("C-dave", &f).unwrap();
                 f.mobile_phone = "+1 555 0300".into();
-                let b = s.update_contact_fields("C-dave", &f).unwrap();
-                s.enqueue_op(&OutboxOp::UpdateContact {
-                    id: "C-dave".into(),
-                    fields: b,
-                })
-                .unwrap();
+                s.update_contact_fields("C-dave", &f).unwrap();
+                assert_eq!(s.pending_ops().unwrap().len(), 2);
             },
         );
+        // The first `ContactsUpdated` is the refusal's, mid-drain: wait for
+        // the re-read and its write to land.
+        assert!(
+            wait_until(ENGINE_WAIT, || !requests_of(
+                &srv,
+                "GET",
+                "/me/contacts/C-dave"
+            )
+            .is_empty()),
+            "{:?}",
+            paths_from(&srv, 0)
+        );
+        assert!(wait_until(ENGINE_WAIT, || store
+            .folder_contact("C-dave")
+            .unwrap()
+            .is_some_and(|c| c.change_key == "ck-2")));
         let patches = requests_of(&srv, "PATCH", "/me/contacts/C-dave");
         assert_eq!(patches.len(), 2);
         assert_eq!(patches[0].body, r#"{"jobTitle":"Bad title"}"#);
@@ -7392,6 +7402,246 @@ mod tests {
         assert_eq!(row.fields.mobile_phone, "+1 555 0300");
         assert_eq!(row.fields.job_title, "", "the refused edit is reverted");
         assert_eq!(row.change_key, "ck-2");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `contact_engine` whose later `/me/contacts` lists (after the startup
+    /// pass's `first_list`) each take `slow` to answer, so a test can write
+    /// the store while a full pass's fetch is in flight.
+    fn contact_engine_with_a_slow_list(
+        tag: &str,
+        writes: Vec<(Route, Option<usize>)>,
+        first_list: &str,
+        later_list: &str,
+        slow: Duration,
+    ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = writes
+            .into_iter()
+            .chain(folder_contacts_routes(
+                CAROL_PERSON,
+                &[("/me/contacts", 200, first_list, Some(1))],
+            ))
+            .map(|(r, n)| (r, n, Duration::ZERO))
+            .collect();
+        routes.push((get_route("/me/contacts", 200, later_list), None, slow));
+        let srv = FakeServer::start_paced(routes);
+        let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, |_| {});
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        let store = Store::open(&store_path).unwrap();
+        (srv, handle, store, dir)
+    }
+
+    /// Sends `Refresh` and returns once its `/me/contacts` fetch is in
+    /// flight (the slow list has been asked for).
+    fn refresh_until_the_list_is_in_flight(srv: &FakeServer, handle: &SyncHandle) {
+        let before = requests_of(srv, "GET", "/me/contacts?").len();
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || requests_of(srv, "GET", "/me/contacts?")
+                .len()
+                > before),
+            "{:?}",
+            paths_from(srv, 0)
+        );
+    }
+
+    #[test]
+    fn full_pass_keeps_an_edit_whose_command_is_still_in_the_channel() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine_with_a_slow_list(
+            "contact-edit-in-channel",
+            vec![(
+                any_route("PATCH", "/me/contacts/C-dave", 200, DAVE_JSON),
+                None,
+            )],
+            &list,
+            &list,
+            Duration::from_millis(1500),
+        );
+        refresh_until_the_list_is_in_flight(&srv, &handle);
+        // The host edits while the pass waits on Graph's (unedited) list, and
+        // its command waits behind the pass.
+        let mut f = dave_contact().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        // The pass's `ContactsUpdated`, then the command's.
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        let patches = requests_of(&srv, "PATCH", "/me/contacts/C-dave");
+        assert_eq!(patches.len(), 1, "{:?}", paths_from(&srv, 0));
+        assert_eq!(
+            patches[0].body, r#"{"jobTitle":"Lead"}"#,
+            "the user's value, not the listed one"
+        );
+        assert_eq!(
+            store
+                .folder_contact("C-dave")
+                .unwrap()
+                .unwrap()
+                .fields
+                .job_title,
+            "Lead"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_pass_keeps_a_delete_whose_command_is_still_in_the_channel() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine_with_a_slow_list(
+            "contact-delete-in-channel",
+            vec![(any_route("DELETE", "/me/contacts/C-dave", 204, ""), None)],
+            &list,
+            &list,
+            Duration::from_millis(1500),
+        );
+        refresh_until_the_list_is_in_flight(&srv, &handle);
+        assert!(store.delete_contact("C-dave").unwrap());
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteContact {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert_eq!(requests_of(&srv, "DELETE", "/me/contacts/C-dave").len(), 1);
+        assert!(
+            store.folder_contact("C-dave").unwrap().is_none(),
+            "not written back by the pass"
+        );
+        assert!(!store.is_contact("dave@x.com").unwrap());
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_after_refusal_waits_for_an_edit_written_but_not_commanded() {
+        let list = list_of(&[DAVE_JSON]);
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+            (
+                any_route("PATCH", "/me/contacts/C-dave", 403, DENIED),
+                None,
+                Duration::ZERO,
+            ),
+            (
+                any_route("GET", "/me/contacts/C-dave", 200, DAVE_JSON),
+                None,
+                Duration::from_millis(1500),
+            ),
+        ];
+        routes.extend(
+            folder_contacts_routes(CAROL_PERSON, &[("/me/contacts", 200, &list, None)])
+                .into_iter()
+                .map(|(r, n)| (r, n, Duration::ZERO)),
+        );
+        let srv = FakeServer::start_paced(routes);
+        let (handle, store_path, dir) =
+            spawn_fast(&srv, "contact-reread-waits", HOUR, None, |_| {});
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        let store = Store::open(&store_path).unwrap();
+
+        let mut f = dave_contact().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        // While the refusal's re-read waits on Graph, the host writes a
+        // second edit and sends no command.
+        assert!(wait_until(ENGINE_WAIT, || !requests_of(
+            &srv,
+            "GET",
+            "/me/contacts/C-dave"
+        )
+        .is_empty()));
+        f.mobile_phone = "+1 555 0300".into();
+        assert_eq!(
+            store.update_contact_fields("C-dave", &f).unwrap(),
+            ContactFieldSet::MOBILE_PHONE
+        );
+        let seen = wait_refused(&handle.evt_rx);
+        assert!(contact_failure(&seen).is_some(), "{seen:?}");
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(
+            row.fields.mobile_phone, "+1 555 0300",
+            "the re-read did not write over the queued edit"
+        );
+        assert_eq!(
+            store.owed_contact_rereads().unwrap(),
+            [("C-dave".to_string(), true)],
+            "still owed, behind the queued edit"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owed_contact_reread_survives_a_restart() {
+        // The server after the queued edit: the refused job title was never
+        // applied, the mobile phone was.
+        let server_after = r#"{"id":"C-dave","changeKey":"ck-2","displayName":"Dave","mobilePhone":"+1 555 0300","emailAddresses":[{"name":"Dave","address":"dave@x.com"}]}"#;
+        let list = list_of(&[server_after]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-owed-restart",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 200, server_after),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, server_after),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |s| {
+                // What a run stopped mid-way left: a refused edit's values
+                // and its owed re-read, behind a later queued edit.
+                s.replace_contacts(&[dave_contact()]).unwrap();
+                let mut f = dave_contact().fields;
+                f.job_title = "Refused".into();
+                s.update_contact_fields("C-dave", &f).unwrap();
+                // Its op was refused and dropped.
+                for row in s.pending_ops().unwrap() {
+                    s.drop_op(row.seq);
+                }
+                s.owe_contact_reread("C-dave").unwrap();
+                f.mobile_phone = "+1 555 0300".into();
+                s.update_contact_fields("C-dave", &f).unwrap();
+            },
+        );
+        assert!(wait_until(ENGINE_WAIT, || store
+            .folder_contact("C-dave")
+            .unwrap()
+            .is_some_and(|c| c.change_key == "ck-2")));
+        let patches = requests_of(&srv, "PATCH", "/me/contacts/C-dave");
+        let rereads = requests_of(&srv, "GET", "/me/contacts/C-dave");
+        assert_eq!((patches.len(), rereads.len()), (1, 1));
+        assert_eq!(patches[0].body, r#"{"mobilePhone":"+1 555 0300"}"#);
+        assert!(rereads[0].index > patches[0].index, "after its last op");
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.fields.job_title, "", "the refused value is gone");
+        assert_eq!(row.fields.mobile_phone, "+1 555 0300");
+        assert!(store.owed_contact_rereads().unwrap().is_empty());
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

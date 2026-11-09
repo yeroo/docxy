@@ -3338,12 +3338,7 @@ impl Store {
     /// returning its `seq` (the `outbox.seq` autoincrement rowid) so a
     /// caller could reference this exact queued op later if needed.
     pub fn enqueue_op(&self, op: &OutboxOp) -> Result<i64, StoreError> {
-        let payload = op.to_json().to_string();
-        self.conn.execute(
-            "INSERT INTO outbox (op, payload) VALUES (?1, ?2)",
-            params![op.kind(), payload],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+        enqueue_op_on(&self.conn, op)
     }
 
     /// All queued ops, oldest (lowest `seq`) first — the order the sync
@@ -4546,19 +4541,9 @@ impl Store {
     /// `contacts` (people and mined correspondents).
     pub fn replace_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
-        let mut edited = HashSet::new();
-        let mut deleted = HashSet::new();
-        for row in pending_ops_on(&tx)? {
-            match row.op {
-                OutboxOp::UpdateContact { id, .. } => {
-                    edited.insert(resolve_contact_id_on(&tx, &id)?);
-                }
-                OutboxOp::DeleteContact { id } => {
-                    deleted.insert(resolve_contact_id_on(&tx, &id)?);
-                }
-                _ => {}
-            }
-        }
+        let QueuedContacts {
+            edited, deleted, ..
+        } = queued_contacts_on(&tx)?;
         let mut seen = HashSet::new();
         let listed: Vec<&FolderContact> = contacts
             .iter()
@@ -4618,56 +4603,147 @@ impl Store {
     }
 
     /// Writes a new contact locally (#2063) under a fresh `local:` id, which
-    /// it returns: the optimistic half of `SyncCommand::CreateContact`.
+    /// it returns, and queues its `OutboxOp::CreateContact` in the same
+    /// transaction, so no full pass or re-read can see the row without the
+    /// op that protects it. `SyncCommand::CreateContact` then pushes it now;
+    /// without the command the next drain (any tick) sends it. Blank phone
+    /// and category entries are dropped.
     pub fn create_local_contact(&self, fields: &ContactFields) -> Result<String, StoreError> {
         let id = local_draft_id();
         let tx = self.write_tx()?;
         write_contact_on(&tx, &id, "", fields)?;
+        enqueue_op_on(&tx, &OutboxOp::CreateContact { id: id.clone() })?;
         tx.commit()?;
         Ok(id)
     }
 
-    /// Writes an edit of a stored contact (#2063, the optimistic half of
-    /// `SyncCommand::UpdateContact`) and returns the properties it changed:
-    /// what the PATCH sends. Empty when nothing changed or no such contact is
-    /// stored (then nothing is written). `id` may be the `local:` id the
-    /// contact was created under. The stored `change_key` is kept.
+    /// Writes an edit of a stored contact (#2063) and returns the properties
+    /// it changed: what the PATCH sends. When the set is not empty it queues
+    /// `OutboxOp::UpdateContact` with it in the same transaction (under the
+    /// id the contact is stored as), so the edit is protected from a full
+    /// pass and a refused write's re-read from the moment it is written;
+    /// `SyncCommand::UpdateContact` then pushes it now, and without the
+    /// command the next drain sends it. Empty when nothing changed or no such
+    /// contact is stored: then nothing is written or queued. `id` may be the
+    /// `local:` id the contact was created under. The stored `change_key` is
+    /// kept. Blank phone and category entries are dropped before the
+    /// comparison, so what is compared is what is stored.
     pub fn update_contact_fields(
         &self,
         id: &str,
         fields: &ContactFields,
     ) -> Result<ContactFieldSet, StoreError> {
+        let fields = tidy_contact_fields(fields);
         let tx = self.write_tx()?;
         let id = resolve_contact_id_on(&tx, id)?;
         let Some(old) = read_contact_on(&tx, &id)? else {
             return Ok(ContactFieldSet::default());
         };
-        let changed = ContactFieldSet::changed(&old.fields, fields);
+        let changed = ContactFieldSet::changed(&old.fields, &fields);
         if !changed.is_empty() {
-            write_contact_on(&tx, &id, &old.change_key, fields)?;
+            write_contact_on(&tx, &id, &old.change_key, &fields)?;
+            enqueue_op_on(
+                &tx,
+                &OutboxOp::UpdateContact {
+                    id: id.clone(),
+                    fields: changed,
+                },
+            )?;
             tx.commit()?;
         }
         Ok(changed)
     }
 
-    /// Removes a stored contact (#2063, the optimistic half of
-    /// `SyncCommand::DeleteContact`; its email rows go with it). `id` may be
-    /// the `local:` id it was created under. Whether a row was removed.
+    /// Removes a stored contact (#2063; its email rows go with it) and, when
+    /// a row was removed, queues `OutboxOp::DeleteContact` for it in the same
+    /// transaction; `SyncCommand::DeleteContact` then pushes it now, and
+    /// without the command the next drain sends it. `id` may be the `local:`
+    /// id it was created under. Whether a row was removed.
     pub fn delete_contact(&self, id: &str) -> Result<bool, StoreError> {
-        let id = resolve_contact_id_on(&self.conn, id)?;
-        let n = self
-            .conn
-            .execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+        let tx = self.write_tx()?;
+        let id = resolve_contact_id_on(&tx, id)?;
+        let n = tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+        if n > 0 {
+            enqueue_op_on(&tx, &OutboxOp::DeleteContact { id })?;
+            tx.commit()?;
+        }
         Ok(n > 0)
     }
 
-    /// Writes one contact as Graph has it (#2063): the record a refused
-    /// write's re-read brought back, replacing the stored row (or adding it
-    /// back after a refused delete).
-    pub fn put_folder_contact(&self, contact: &FolderContact) -> Result<(), StoreError> {
+    /// Deletes the row of a contact whose create Graph refused (#2063), and
+    /// queues nothing: Graph has no such contact to delete.
+    pub(crate) fn discard_contact_row(&self, id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Brings a contact back to Graph's version after a refused write
+    /// (#2063): `server` is the record `GET /me/contacts/{id}` returned
+    /// (written over the row, or added back after a refused delete), `None`
+    /// when Graph answered 404 (the row is deleted). Queues nothing. In one
+    /// transaction it first checks the queue: while any contact op names the
+    /// contact (an edit written since the re-read began), nothing is written
+    /// and `false` is returned, the re-read still owed; otherwise the owed
+    /// re-read (`owe_contact_reread`) is cleared and `true` returned.
+    pub(crate) fn revert_folder_contact(
+        &self,
+        id: &str,
+        server: Option<&FolderContact>,
+    ) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
-        write_contact_on(&tx, &contact.id, &contact.change_key, &contact.fields)?;
+        if queued_contacts_on(&tx)?.any.contains(id) {
+            return Ok(false);
+        }
+        match server {
+            Some(c) => write_contact_on(&tx, id, &c.change_key, &c.fields)?,
+            None => {
+                tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+            }
+        }
+        tx.execute("DELETE FROM contact_reread_owed WHERE id = ?1", params![id])?;
         tx.commit()?;
+        Ok(true)
+    }
+
+    /// Records that the contact `id` (as stored now) must be read again from
+    /// Graph after a refused write (#2063), once no queued op names it.
+    /// Persisted, so a restart before then keeps it.
+    pub(crate) fn owe_contact_reread(&self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO contact_reread_owed (id) VALUES (?1)",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// The owed re-reads (`owe_contact_reread`), each with whether a queued
+    /// contact op still names it, read in one transaction.
+    pub(crate) fn owed_contact_rereads(&self) -> Result<Vec<(String, bool)>, StoreError> {
+        let tx = self.write_tx()?;
+        let ids: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM contact_reread_owed ORDER BY id")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let queued = queued_contacts_on(&tx)?.any;
+        Ok(ids
+            .into_iter()
+            .map(|id| {
+                let q = queued.contains(&id);
+                (id, q)
+            })
+            .collect())
+    }
+
+    /// Gives up an owed re-read (#2063): Graph could not be asked, so the row
+    /// is left for the next full pass to replace.
+    pub(crate) fn forget_contact_reread(&self, id: &str) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM contact_reread_owed WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -4759,6 +4835,62 @@ impl Store {
     }
 }
 
+/// `Store::enqueue_op` on `conn` (the store's connection or a transaction).
+fn enqueue_op_on(conn: &Connection, op: &OutboxOp) -> Result<i64, StoreError> {
+    let payload = op.to_json().to_string();
+    conn.execute(
+        "INSERT INTO outbox (op, payload) VALUES (?1, ?2)",
+        params![op.kind(), payload],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// The contacts queued contact ops name (#2063), each id resolved through
+/// `contact_aliases`.
+#[derive(Default)]
+struct QueuedContacts {
+    /// Named by an `UpdateContact`.
+    edited: HashSet<String>,
+    /// Named by a `DeleteContact`.
+    deleted: HashSet<String>,
+    /// Named by any contact op.
+    any: HashSet<String>,
+}
+
+/// `QueuedContacts` as the outbox on `conn` holds them now.
+fn queued_contacts_on(conn: &Connection) -> Result<QueuedContacts, StoreError> {
+    let mut q = QueuedContacts::default();
+    for row in pending_ops_on(conn)? {
+        let (id, set) = match row.op {
+            OutboxOp::UpdateContact { id, .. } => (id, Some(&mut q.edited)),
+            OutboxOp::DeleteContact { id } => (id, Some(&mut q.deleted)),
+            OutboxOp::CreateContact { id } => (id, None),
+            _ => continue,
+        };
+        let id = resolve_contact_id_on(conn, &id)?;
+        if let Some(set) = set {
+            set.insert(id.clone());
+        }
+        q.any.insert(id);
+    }
+    Ok(q)
+}
+
+/// `f` with blank (whitespace-only) phone and category entries dropped
+/// (#2063): `encode_categories` would store `[""]` as `""`, which reads back
+/// as `[]`, so an edit carrying one would compare as changed on every save.
+fn tidy_contact_fields(f: &ContactFields) -> ContactFields {
+    let keep = |l: &[String]| -> Vec<String> {
+        l.iter().filter(|s| !s.trim().is_empty()).cloned().collect()
+    };
+    ContactFields {
+        business_phones: keep(&f.business_phones),
+        home_phones: keep(&f.home_phones),
+        categories: keep(&f.categories),
+        ..f.clone()
+    }
+}
+
 /// All queued ops on `conn`, oldest first (`Store::pending_ops`).
 fn pending_ops_on(conn: &Connection) -> Result<Vec<OutboxRow>, StoreError> {
     let mut stmt = conn.prepare("SELECT seq, payload, attempts FROM outbox ORDER BY seq ASC")?;
@@ -4803,6 +4935,7 @@ fn write_contact_on(
     change_key: &str,
     f: &ContactFields,
 ) -> Result<(), StoreError> {
+    let f = &tidy_contact_fields(f);
     let b = &f.business_address;
     let h = &f.home_address;
     conn.execute(
@@ -7714,31 +7847,30 @@ mod tests {
             contact_record("P1", "Plain", &["p@x.com"]),
         ])
         .unwrap();
-        // A create not sent yet, an edit queued by a local id since
-        // re-keyed, and a delete.
+        // A create not sent yet, an edit of a contact created by a local id
+        // since re-keyed, and a delete: each store write queues its op.
         let local = s.create_local_contact(&full_fields()).unwrap();
-        s.enqueue_op(&OutboxOp::CreateContact { id: local.clone() })
-            .unwrap();
         let edited_local = s.create_local_contact(&ContactFields::default()).unwrap();
         s.reconcile_created_contact(&edited_local, &contact_record("G2", "", &[]))
             .unwrap();
+        // Its create went through.
+        let create_seq = s
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|r| {
+                r.op == OutboxOp::CreateContact {
+                    id: edited_local.clone(),
+                }
+            })
+            .unwrap()
+            .seq;
+        s.drop_op(create_seq);
         let mut e = contact_record("E1", "Edited here", &["e@x.com"]).fields;
-        let changed = s.update_contact_fields("E1", &e).unwrap();
-        s.enqueue_op(&OutboxOp::UpdateContact {
-            id: "E1".into(),
-            fields: changed,
-        })
-        .unwrap();
+        s.update_contact_fields("E1", &e).unwrap();
         e.job_title = "Lead".into();
-        let changed = s.update_contact_fields(&edited_local, &e).unwrap();
-        s.enqueue_op(&OutboxOp::UpdateContact {
-            id: edited_local.clone(),
-            fields: changed,
-        })
-        .unwrap();
+        s.update_contact_fields(&edited_local, &e).unwrap();
         s.delete_contact("D1").unwrap();
-        s.enqueue_op(&OutboxOp::DeleteContact { id: "D1".into() })
-            .unwrap();
 
         // Graph's answer: none of the local writes yet, and R1 gone.
         s.replace_contacts(&[
@@ -7788,6 +7920,154 @@ mod tests {
             s.folder_contact("E1").unwrap().unwrap().fields.display_name,
             "Edited"
         );
+    }
+
+    #[test]
+    fn contact_writes_queue_their_op_in_the_same_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        let ops = |s: &Store| -> Vec<OutboxOp> {
+            s.pending_ops().unwrap().into_iter().map(|r| r.op).collect()
+        };
+        s.replace_contacts(&[fc("Ann", "ann@x.com")]).unwrap();
+        assert!(ops(&s).is_empty(), "a fetch queues nothing");
+
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        assert_eq!(ops(&s), [OutboxOp::CreateContact { id: local.clone() }]);
+
+        let mut f = s.folder_contact("C-ann@x.com").unwrap().unwrap().fields;
+        assert!(
+            s.update_contact_fields("C-ann@x.com", &f)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(ops(&s).len(), 1, "a no-change edit queues nothing");
+        f.surname = "Cole".into();
+        let changed = s.update_contact_fields("C-ann@x.com", &f).unwrap();
+        assert_eq!(changed, ContactFieldSet::SURNAME);
+        assert_eq!(
+            ops(&s)[1],
+            OutboxOp::UpdateContact {
+                id: "C-ann@x.com".into(),
+                fields: ContactFieldSet::SURNAME
+            }
+        );
+        // An edit by the `local:` id after the re-key queues the Graph id.
+        s.reconcile_created_contact(&local, &contact_record("G1", "", &[]))
+            .unwrap();
+        let mut g = full_fields();
+        g.department = "Ops".into();
+        s.update_contact_fields(&local, &g).unwrap();
+        assert_eq!(
+            ops(&s)[2],
+            OutboxOp::UpdateContact {
+                id: "G1".into(),
+                fields: ContactFieldSet::DEPARTMENT
+            }
+        );
+        assert!(s.update_contact_fields("C9", &g).unwrap().is_empty());
+        assert_eq!(ops(&s).len(), 3, "no row, nothing queued");
+
+        assert!(s.delete_contact("C-ann@x.com").unwrap());
+        assert_eq!(
+            ops(&s)[3],
+            OutboxOp::DeleteContact {
+                id: "C-ann@x.com".into()
+            }
+        );
+        assert!(!s.delete_contact("C-ann@x.com").unwrap());
+        assert_eq!(ops(&s).len(), 4, "nothing removed, nothing queued");
+
+        // The engine's reverts queue nothing.
+        let before = ops(&s).len();
+        assert!(
+            s.revert_folder_contact("C-bob", Some(&fc("Bob", "bob@x.com")))
+                .unwrap()
+        );
+        s.discard_contact_row("G1").unwrap();
+        assert!(s.revert_folder_contact("C-bob", None).unwrap());
+        assert_eq!(ops(&s).len(), before);
+    }
+
+    #[test]
+    fn blank_phone_and_category_entries_are_not_stored_or_compared() {
+        let s = Store::open_in_memory().unwrap();
+        let mut f = full_fields();
+        f.business_phones = vec!["".into(), "+1 555 0100".into(), "  ".into()];
+        f.categories = vec![" ".into()];
+        let id = s.create_local_contact(&f).unwrap();
+        let stored = s.folder_contact(&id).unwrap().unwrap().fields;
+        assert_eq!(stored.business_phones, ["+1 555 0100"]);
+        assert!(stored.categories.is_empty());
+        // Saving the same form again changes nothing and queues nothing.
+        let queued = s.pending_ops().unwrap().len();
+        assert!(s.update_contact_fields(&id, &f).unwrap().is_empty());
+        f.home_phones.push(" ".into());
+        assert!(s.update_contact_fields(&id, &f).unwrap().is_empty());
+        assert_eq!(s.pending_ops().unwrap().len(), queued);
+    }
+
+    #[test]
+    fn revert_folder_contact_waits_while_an_op_names_it() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("C1", "Ann", &["ann@x.com"])])
+            .unwrap();
+        s.owe_contact_reread("C1").unwrap();
+        s.owe_contact_reread("C1").unwrap();
+        assert_eq!(
+            s.owed_contact_rereads().unwrap(),
+            [("C1".to_string(), false)]
+        );
+        let mut f = s.folder_contact("C1").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        s.update_contact_fields("C1", &f).unwrap();
+        assert_eq!(
+            s.owed_contact_rereads().unwrap(),
+            [("C1".to_string(), true)]
+        );
+        let server = contact_record("C1", "Ann (server)", &["ann@x.com"]);
+        assert!(!s.revert_folder_contact("C1", Some(&server)).unwrap());
+        assert_eq!(
+            s.folder_contact("C1").unwrap().unwrap().fields.job_title,
+            "Lead",
+            "the queued edit stands"
+        );
+        assert_eq!(s.owed_contact_rereads().unwrap().len(), 1, "still owed");
+        for row in s.pending_ops().unwrap() {
+            s.drop_op(row.seq);
+        }
+        assert!(s.revert_folder_contact("C1", Some(&server)).unwrap());
+        assert_eq!(s.folder_contact("C1").unwrap(), Some(server));
+        assert!(s.owed_contact_rereads().unwrap().is_empty());
+        // A 404 deletes the row; a given-up re-read is forgotten.
+        s.owe_contact_reread("C1").unwrap();
+        assert!(s.revert_folder_contact("C1", None).unwrap());
+        assert!(s.folder_contact("C1").unwrap().is_none());
+        s.owe_contact_reread("C2").unwrap();
+        s.forget_contact_reread("C2").unwrap();
+        assert!(s.owed_contact_rereads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn owed_contact_reread_survives_reopening_the_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-contact-owed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        Store::open(&path)
+            .unwrap()
+            .owe_contact_reread("C1")
+            .unwrap();
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.owed_contact_rereads().unwrap(),
+            [("C1".to_string(), false)]
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

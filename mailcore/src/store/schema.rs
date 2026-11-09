@@ -174,6 +174,13 @@ CREATE TABLE IF NOT EXISTS contact_aliases (
     id       TEXT NOT NULL
 );
 
+-- Contacts a refused write must read again from Graph (#2063), once no
+-- queued contact op names them (`Store::owe_contact_reread`). Persisted, so a
+-- restart before the last such op drains still re-reads.
+CREATE TABLE IF NOT EXISTS contact_reread_owed (
+    id TEXT PRIMARY KEY
+);
+
 -- `fetched_as` is the format `FetchBody` asked Graph for (`text`/`html`,
 -- #1901); NULL for a body written locally (drafts, createReply), which
 -- `Store::get_body_for` never offers for a refetch, or by an engine from
