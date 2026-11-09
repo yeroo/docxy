@@ -785,7 +785,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `refresh_calendar_stores_calendar_client_fields`.
 - Not done: plain `calendarView` returns occurrences, never series masters; a
   synced master is stored when a calendar delta round returns or fetches it
-  (#2064), with its `recurrence`, but the grid queries leave it out.
+  (#2064), with its `recurrence`; the grid queries leave it out once a row of
+  its series is stored.
   `calendar_id` is the calendar a pass fetched the event from since #1984
   (`calendar.id` in the JSON loses to it). Safe Links-wrapped links
   (`*.safelinks.protection.outlook.com/?url=...`) are not unwrapped.
@@ -1118,7 +1119,8 @@ wider window fresh without downloading it again.
   never replaced either way.
 - Not done: no checkpoint between a round's pages (as before); series
   masters come with the rounds, or are fetched for their occurrences, and
-  are stored off the grid (#2064); `FetchCalendarRange` stays plain
+  are stored, off the grid once a row of their series is (#2064);
+  `FetchCalendarRange` stays plain
   `calendarView` (a range overlapping the window, when its record is
   stale, re-fetches that part, server truth either way). Two passes
   straddling 00:00 UTC make the second an initial round, so a test that
@@ -2341,7 +2343,8 @@ series' first day.
 - **A missing master is fetched** (`Engine::fetch_missing_masters`, after a round
   and before the write). It fetches the masters of the round's occurrences and of
   the calendar's stored blank ones (`Store::blank_occurrence_masters`) that are not
-  stored as a `seriesMaster` of that calendar (`Store::has_series_master`), plus
+  stored as a `seriesMaster` of that calendar (`Store::has_series_master`; in an
+  initial round, stored or not: see below), plus
   every id the round lists as removed that is stored as one. A master starting
   before the window that changed comes as `@removed` (#2013); the removal does not
   delete it, since it does not overlap the window, so without the refetch its
@@ -2362,7 +2365,22 @@ series' first day.
   stay blank and are named again next pass). For a removed stored master the
   calendar is left out of the pass (`MasterFetch::SkipCalendar`), as a failed
   round is: writing would advance the link past the `@removed` and keep the stale
-  master for good (r1). #2013's cascade is
+  master for good (r1). Only once per id a session (`masters_skipped`, cleared with
+  `masters_not_found`; a refetch that succeeds or 404s forgets it): a refetch that
+  fails again (a 403 on a delegate's private item, a repeated 500) writes the round
+  with the stale master, or one master would stop its calendar syncing until the
+  window moves at 00:00 UTC; the next initial round fetches it again (r2).
+- **An initial round refetches its stored masters** (r2). In a
+  `CalendarRound::Window` round a needed master that is not among the round's own is
+  fetched even when it is stored: Graph's initial round may not list a master that
+  starts before the window, the round re-sends minimal occurrences, and a stale
+  stored master (a series renamed before a reset, `UpdateEventSeries`' among them)
+  would refill them with its old fields, while the new baseline means no later
+  delta lists the change. One GET per series per initial round (daily, plus
+  resets). An HTTP or parse failure there writes the round with the stored copy
+  (no `@removed` to replay); a 404 joins `masters_not_found`, and the stored row
+  stays, since the round still names its occurrences. Delta rounds fetch only
+  masters that are not stored, or removed. #2013's cascade is
   unchanged: a master listed as removed with none of its occurrences in the round
   still takes its in-window occurrences and the delta state, and the next initial
   round brings them back, filled from the refetched master.
@@ -2384,9 +2402,10 @@ series' first day.
   the stored masters in its range (`replace_calendar_range_on`'s `keep_masters`);
   a `Window` round replaces them, since the delta returns them. `FetchCalendarRange`
   does not fill: its occurrences come full.
-- Not done (follow-ups): masters that no row refers to any more are not pruned
-  (invisible to the grids; a window replace drops in-window ones, a 404'd removed
-  master goes). A shared calendar of another owner: `/me/events/{id}` may 404
+- Not done (follow-ups): masters that no row refers to any more are not pruned:
+  with no row of its series stored, such a master is drawn on its own first day
+  (usually before the window) until something removes it (a window replace drops
+  in-window ones, a 404'd removed master goes, a deselected calendar goes). A shared calendar of another owner: `/me/events/{id}` may 404
   there, so its occurrences stay blank (asked once a session).
 - Tests: `store` `calendar_tests` `apply_calendar_sync_fills_occurrences_from_their_master`,
   `apply_calendar_sync_fill_leaves_exceptions_alone`,
@@ -2414,5 +2433,7 @@ series' first day.
   `calendar_delta_removed_master_404_deletes_the_stored_master`,
   `calendar_delta_removed_master_http_error_keeps_the_link`,
   `calendar_delta_removed_master_404_in_a_stopped_pass_is_retried`,
+  `calendar_delta_removed_master_failing_twice_writes_the_second_pass`,
+  `calendar_initial_round_refetches_a_stored_master_it_does_not_list`,
   `calendar_delta_master_fetch_throttled_writes_nothing`. Tests that read a series
   master's fields through `events_in_window` read it with `Store::event` now.
