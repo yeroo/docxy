@@ -24,6 +24,7 @@ mod backstage;
 mod control;
 mod datacmd;
 mod dataform;
+mod help;
 mod mcp;
 mod outlinedlg;
 mod ribbon;
@@ -2788,6 +2789,13 @@ struct App {
     // The welcome screen shown when launched with no file.
     start_screen: bool,
     start: backstage::Start,
+    /// F1 help (#1856): the manual's reader, drawn over everything and
+    /// owning every key while open.
+    help: Option<helpdocs::reader::Reader>,
+    /// The manual a unit test gave F1 (none by default); the real one comes
+    /// from `help::manual`.
+    #[cfg(test)]
+    help_manual: Option<std::sync::Arc<helpdocs::Manual>>,
     // The formatting popup (number format / font & fill color).
     format_picker: Option<FormatPicker>,
     format_dialog: Option<FormatDialog>,
@@ -2968,6 +2976,9 @@ impl App {
             counts: Default::default(),
             drawn_fields: Vec::new(),
             start_screen: false,
+            help: None,
+            #[cfg(test)]
+            help_manual: None,
             start: backstage::Start::new(
                 "xlsxy",
                 vec![
@@ -7489,6 +7500,49 @@ impl App {
         text
     }
 
+    /// The manual F1 shows: a unit test's, else the installed or built-in one.
+    fn help_manual(&self) -> Option<std::sync::Arc<helpdocs::Manual>> {
+        #[cfg(test)]
+        return self.help_manual.clone();
+        #[cfg(not(test))]
+        help::manual()
+    }
+
+    /// The area F1 asks the manual for: the active ribbon tab's name, `File`
+    /// in the backstage, none on the start screen (the manual's root).
+    fn help_area(&self) -> Option<&'static str> {
+        if self.start_screen {
+            None
+        } else if self.backstage.is_some() {
+            Some("File")
+        } else {
+            self.ribbon.tab_label(self.ribbon.active_tab())
+        }
+    }
+
+    /// F1 (#1856): help on the current area's page.
+    fn open_help_area(&mut self) {
+        let area = self.help_area();
+        self.show_help(|m| backstagecore::help::open_area(m, area));
+    }
+
+    /// Help › Help (#1856): help on the manual's Help page.
+    fn open_help_page(&mut self) {
+        self.show_help(backstagecore::help::open_help);
+    }
+
+    /// Open help with `open`, which picks the page in the manual. Without a
+    /// manual it says the documentation is coming, as before.
+    fn show_help(
+        &mut self,
+        open: impl FnOnce(std::sync::Arc<helpdocs::Manual>) -> Option<helpdocs::reader::Reader>,
+    ) {
+        match self.help_manual().and_then(open) {
+            Some(r) => self.help = Some(r),
+            None => self.status = Some(HELP_COMING.to_string()),
+        }
+    }
+
     /// Dispatch a ribbon command to the matching editor operation.
     fn ribbon_act(&mut self, act: ribbon::Act) {
         if self.protected_view.is_some() && !ribbon::allowed_in_protected_view(act) {
@@ -7613,7 +7667,7 @@ impl App {
                     .to_string(),
                 );
             }
-            Help => self.status = Some(HELP_COMING.to_string()),
+            Help => self.open_help_page(),
             ContactSupport | Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -11162,6 +11216,12 @@ fn draw(app: &mut App, f: &mut Frame) {
 }
 
 fn draw_screen(app: &mut App, f: &mut Frame) {
+    // F1 help takes the whole screen, at any size; nothing under it is drawn
+    // (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        backstagecore::help::draw(f, reader, Color::Green);
+        return;
+    }
     let area = f.area();
     if area.height < 8 || area.width < 12 {
         return;
@@ -11825,7 +11885,7 @@ fn draw_screen(app: &mut App, f: &mut Frame) {
         }
     } else {
         format!(
-            "{}{}  F9 ribbon  ^S save  ^Q quit  ^Z undo  ^F find  ^D/^R fill  ^T sheet",
+            "{}{}  F1 help  F9 ribbon  ^S save  ^Q quit  ^Z undo  ^F find  ^D/^R fill  ^T sheet",
             app.path,
             if app.modified { " *" } else { "" }
         )
@@ -12893,6 +12953,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.kind == KeyEventKind::Release {
         return false;
     }
+    // F1 help owns every key while open, over every other surface (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        if backstagecore::help::key(reader, key) == helpdocs::reader::Outcome::Close {
+            app.help = None;
+        }
+        return false;
+    }
+    if backstagecore::help::is_f1(&key) {
+        app.status = None;
+        app.open_help_area();
+        return false;
+    }
     app.status = None;
     app.last_click = None;
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -13515,6 +13587,11 @@ fn char_index(s: &str, char_pos: usize) -> usize {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> bool {
+    // F1 help swallows the mouse; its wheel scrolls (#1856).
+    if let Some(reader) = app.help.as_mut() {
+        backstagecore::help::mouse(reader, &m);
+        return false;
+    }
     // A data-validation alert is answered from the keyboard.
     if app.dv_alert.is_some() {
         return false;
@@ -16466,6 +16543,140 @@ mod tests {
         app.pkg.workbook.sheets[0].set_cell(0, 0, gridcore::sheet::Cell::number(7.0));
         app.modified = true;
         (app, bytes)
+    }
+
+    /// `app` with the helpdocs `editor` fixture as its manual (#1856).
+    fn with_manual(mut app: App, editor: &str) -> App {
+        app.help_manual = Some(help::tests::fixture(editor));
+        app
+    }
+
+    fn help_page(app: &App) -> Option<&str> {
+        app.help.as_ref().and_then(|r| r.page_id())
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn screen_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(app, f)).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn f1_opens_help_on_the_ribbon_tabs_page() {
+        let mut app = with_manual(app_with_numbers(&[]), "excel");
+        app.ribbon.set_active(1);
+        assert_eq!(app.ribbon.tab_label(1), Some("Home"));
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("home"));
+        handle_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.help.is_none());
+        // A held F1 (a repeat) opens nothing.
+        let mut held = plain(KeyCode::F(1));
+        held.kind = KeyEventKind::Repeat;
+        handle_key(&mut app, held);
+        assert!(app.help.is_none());
+        // Data has no page: the root.
+        app.ribbon.set_active(3);
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("excel"));
+        app.help = None;
+        // The backstage is File; the start screen has no area.
+        app.open_backstage();
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("excel"));
+        handle_key(&mut app, plain(KeyCode::Char('q')));
+        assert!(
+            app.backstage.is_some(),
+            "the backstage is still open under it"
+        );
+        app.backstage = None;
+        app.start_screen = true;
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("excel"));
+        handle_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.start_screen);
+    }
+
+    #[test]
+    fn help_help_opens_the_help_page_and_without_a_manual_says_it_is_coming() {
+        let mut app = with_manual(app_with_numbers(&[]), "word");
+        app.ribbon_act(ribbon::Act::Help);
+        assert_eq!(help_page(&app), Some("help"));
+        let mut app = app_with_numbers(&[]);
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert!(app.help.is_none());
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+        app.status = None;
+        app.ribbon_act(ribbon::Act::Help);
+        assert!(app.help.is_none());
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+    }
+
+    #[test]
+    fn help_owns_every_key_and_the_mouse_while_open() {
+        let mut app = with_manual(app_with_numbers(&[]), "excel");
+        app.open_prompt(PromptKind::Find);
+        handle_key(&mut app, plain(KeyCode::Char('b')));
+        let before = app.prompt.as_ref().unwrap().text.clone();
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("home"));
+        for k in [
+            plain(KeyCode::Char('x')),
+            plain(KeyCode::Delete),
+            ctrl('v'),
+            ctrl('s'),
+            ctrl('q'),
+            plain(KeyCode::F(9)),
+        ] {
+            assert!(!handle_key(&mut app, k), "{k:?} quits nothing");
+        }
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        handle_key(&mut app, plain(KeyCode::Tab));
+        handle_key(&mut app, plain(KeyCode::Enter));
+        assert!(app.help.is_some());
+        handle_key(&mut app, plain(KeyCode::Esc));
+        assert!(app.help.is_none());
+        let p = app.prompt.as_ref().expect("the Find prompt is still open");
+        assert_eq!(p.text, before);
+        assert!(!app.modified);
+        assert_eq!(value_at(&app, 0, 0), CellValue::Number(1.0));
+        assert_eq!(app.ribbon_focus, ribbon::Focus::None);
+    }
+
+    #[test]
+    fn help_draws_over_the_whole_screen() {
+        let mut app = with_manual(app_with_numbers(&[]), "excel");
+        app.ribbon.set_active(1);
+        handle_key(&mut app, plain(KeyCode::F(1)));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("Help: Home tab"), "{screen}");
+        assert!(screen.contains("Format cells."), "{screen}");
+        assert!(screen.contains("Esc close"), "{screen}");
+        assert!(!screen.contains("Sheet1"), "{screen}");
+        // Smaller than the grid's 12x8 minimum, help still draws, and never panics.
+        for (w, h) in [(3, 2), (1, 1), (11, 7)] {
+            screen_of(&mut app, w, h);
+        }
+        let small = screen_of(&mut app, 11, 7);
+        assert!(small.contains("Help"), "{small}");
+        handle_key(&mut app, plain(KeyCode::Esc));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("Sheet1"), "{screen}");
     }
 
     fn prompts_save_as(app: &App) -> bool {

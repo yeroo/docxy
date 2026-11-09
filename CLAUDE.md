@@ -98,7 +98,7 @@ issue number to find its notes.
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
-  Ctrl+A (#1376).
+  Ctrl+A (#1376), the F1 help reader (#1856).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),

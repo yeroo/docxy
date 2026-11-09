@@ -122,3 +122,39 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the terminal edi
   yppxy-prompt` reports it. Ctrl+A selects the buffer (#1376; typing and the
   edit keys replace or collapse it). Copy/paste is there (#1378, above);
   click-to-place is not; Backstage Save As's name field is separate.
+
+## Terminal editors: the F1 help reader (#1856)
+
+- F1 (a Press, no modifiers) in `docxy`, `xlsxy` and `yppxy` opens the
+  editor's manual (word, excel, project) on `helpdocs::resolve_area` of the
+  active ribbon tab's label (`File` in the backstage, none on the start
+  screen, so the root); Help › Help opens `resolve("help", "Help")`. Without
+  a manual both set `HELP_COMING` as before. `backstagecore::help` is the
+  shared glue: `is_f1`, `open_area`, `open_help`, the key and mouse mapping
+  and `draw(f, reader, accent)` (`backstagecore` now depends on `helpdocs`,
+  which is dependency-free). Each editor's `help.rs` only says where its
+  manual comes from (`EDITOR`, the built-in list, `manual()`), and its
+  `main.rs` holds the hooks, `help_area`, `open_help_area`, `open_help_page`
+  and `show_help`. The layout and the reader's state (scroll, links,
+  Back/Forward, Contents) are `helpdocs::text` and `helpdocs::reader`.
+- `App.help` is checked first in the key handler (docxy `on_key`, xlsxy
+  `handle_key` after its Release check, yppxy `on_key`), in the mouse
+  handler and in `draw_screen`, ahead of confirm, the start screen and the
+  backstage. While it is open it owns every key and mouse event, and the
+  editor under it is not drawn: no ratatui-image escapes, and xlsxy draws
+  help below its 12×8 minimum. Keys: arrows, PgUp/PgDn, Space, Home/End
+  scroll; Tab/Shift+Tab select a link; Enter follows it (an external link
+  only shows its address in the footer); Backspace or Alt+Left is Back,
+  Alt+Right Forward; `c` Contents; F1 the root; Esc or `q` closes. The wheel
+  scrolls three lines.
+- The manual comes from `helpdocs::locate::load`: `<config root>/docxy/manual/<editor>/`
+  (`DOCXY_CONFIG_DIR`, else the suite's config dir read from the environment:
+  `%APPDATA%`, `~/Library/Application Support`, an absolute `$XDG_CONFIG_HOME`
+  or `~/.config`, not the known-folder API, so a terminal harness case reads
+  its own home), else the one each `build.rs` built in from
+  `docs/manual/<editor>/` through `helpdocs::embed`. It is read once per
+  process. Unit tests read neither: they set `App.help_manual` to a
+  `helpdocs/tests/fixture/<editor>` manual (`help::tests::fixture`).
+- The terminal harness has no `manual` line, `help-read` or `help-open` for
+  these editors yet, and an editor cannot tell it runs under the harness, so
+  once a manual is published a terminal case would see the built-in one.

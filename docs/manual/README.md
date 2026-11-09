@@ -93,6 +93,17 @@ script's `manual <editor> <dir>` line copies a bundle; the built-in manuals
 never reach a `.uit` case. Images are drawn when they are PNG, JPEG, GIF or
 BMP; any other file is a box with its alt text.
 
+## Where the terminal editors read a manual (#1856)
+
+Terminal `docxy`, `xlsxy` and `yppxy` show the same manuals (word, excel,
+project) as text when F1 is pressed. They read the installed bundle in the
+suite's place, `<config root>/docxy/manual/<editor>/`, so one install serves
+both. The config root is `DOCXY_CONFIG_DIR`, else the OS's config directory
+(`%APPDATA%`, `~/Library/Application Support`, `$XDG_CONFIG_HOME` or
+`~/.config`). Without one they use the bundle built in from
+`docs/manual/<editor>/` when the binary was built. Images are shown as
+`[image: alt]`.
+
 ## Context help
 
 F1 resolves a context id to a page:

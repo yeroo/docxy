@@ -7,5 +7,8 @@ edition = "2024"
 # `Field`, what `field-read` reports of Save As's file name (#1204).
 # Dependency-free.
 ctlcore = { version = "0.5.0", path = "../ctlcore" }
+# The F1 help reader (`help`, #1856): a manual's layout and reader state.
+# Dependency-free.
+helpdocs = { version = "0.5.0", path = "../helpdocs" }
 ratatui = "0.29"
 unicode-width = "0.2"

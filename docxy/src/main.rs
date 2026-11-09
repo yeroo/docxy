@@ -16,6 +16,7 @@
 mod backstage;
 mod bidi;
 mod control;
+mod help;
 mod html;
 mod layout_tab;
 mod line_edit;
@@ -798,6 +799,7 @@ fn print_usage() {
            Ctrl-F find   Ctrl-H replace   Ctrl-Shift-8 show marks\n  \
            Ctrl-S save   Ctrl-Z undo   Ctrl-Y redo   Ctrl-Q quit\n  \
            F9 ribbon (←→ tabs · ↓ enter · arrows move · Enter apply · Esc leave)\n  \
+           F1 help: the manual (Tab links · Enter follow · Backspace back · Esc close)\n  \
            F2 page view   F3 show marks   F4 table borders\n  \
            F6 edit header   F7 edit footer   (Esc returns)   F8 section break\n  \
            mouse: click to move · click ribbon buttons · click a link · wheel to scroll"
@@ -1555,6 +1557,13 @@ struct App {
     /// When launched with no file, a welcome/start screen overlays everything
     /// until the user picks New/Open/Quit.
     start_screen: bool,
+    /// F1 help (#1856): the manual's reader, drawn over everything and
+    /// owning every key while open.
+    help: Option<helpdocs::reader::Reader>,
+    /// The manual a unit test gave F1 (none by default); the real one comes
+    /// from `help::manual`.
+    #[cfg(test)]
+    help_manual: Option<std::sync::Arc<helpdocs::Manual>>,
     /// The shared centered start card (item list, selection, click rects).
     start: backstage::Start,
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
@@ -1810,6 +1819,9 @@ impl App {
             md_source: false,
             modified: false,
             start_screen: false,
+            help: None,
+            #[cfg(test)]
+            help_manual: None,
             start: backstage::Start::new(
                 "docxy",
                 vec![
@@ -2509,10 +2521,7 @@ impl App {
                 self.status = Some(format!("Applied style: {id}"));
             }
             StylesDialog => self.open_styles_dialog(),
-            Help => {
-                self.status = Some(HELP_COMING.to_string());
-                self.dirty = true;
-            }
+            Help => self.open_help_page(),
             ContactSupport | Feedback => {
                 // A test never starts a browser.
                 #[cfg(not(test))]
@@ -5848,7 +5857,57 @@ impl App {
         }
     }
 
+    /// The manual F1 shows: a unit test's, else the installed or built-in one.
+    fn help_manual(&self) -> Option<std::sync::Arc<helpdocs::Manual>> {
+        #[cfg(test)]
+        return self.help_manual.clone();
+        #[cfg(not(test))]
+        help::manual()
+    }
+
+    /// The area F1 asks the manual for: the active ribbon tab's name, `File`
+    /// in the backstage, none on the start screen (the manual's root).
+    fn help_area(&self) -> Option<&'static str> {
+        if self.start_screen {
+            None
+        } else if self.backstage.is_some() {
+            Some("File")
+        } else {
+            self.ribbon.tab_label(self.ribbon.active_tab())
+        }
+    }
+
+    /// F1 (#1856): help on the current area's page.
+    fn open_help_area(&mut self) {
+        let area = self.help_area();
+        self.show_help(|m| backstagecore::help::open_area(m, area));
+    }
+
+    /// Help › Help (#1856): help on the manual's Help page.
+    fn open_help_page(&mut self) {
+        self.show_help(backstagecore::help::open_help);
+    }
+
+    /// Open help with `open`, which picks the page in the manual. Without a
+    /// manual it says the documentation is coming, as before.
+    fn show_help(
+        &mut self,
+        open: impl FnOnce(std::sync::Arc<helpdocs::Manual>) -> Option<helpdocs::reader::Reader>,
+    ) {
+        self.dirty = true;
+        match self.help_manual().and_then(open) {
+            Some(r) => self.help = Some(r),
+            None => self.status = Some(HELP_COMING.to_string()),
+        }
+    }
+
     fn on_mouse(&mut self, m: MouseEvent) {
+        // F1 help swallows the mouse; its wheel scrolls (#1856).
+        if let Some(reader) = self.help.as_mut() {
+            backstagecore::help::mouse(reader, &m);
+            self.dirty = true;
+            return;
+        }
         // The welcome screen owns the whole terminal; handle its clicks here so
         // nothing leaks to the hidden document behind it. Hovering highlights an
         // item, clicking activates it.
@@ -6842,6 +6901,18 @@ impl App {
 
     /// Returns true if the app should quit.
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        // F1 help owns every key while open, over every other surface (#1856).
+        if let Some(reader) = self.help.as_mut() {
+            if backstagecore::help::key(reader, key) == helpdocs::reader::Outcome::Close {
+                self.help = None;
+            }
+            self.dirty = true;
+            return false;
+        }
+        if backstagecore::help::is_f1(&key) {
+            self.open_help_area();
+            return false;
+        }
         // Keyboard actions should keep the caret on screen; wheel/drag don't.
         self.follow_caret = true;
         // The welcome screen (no file given) owns all keys until dismissed.
@@ -7249,6 +7320,11 @@ impl App {
     }
 
     fn draw_screen(&mut self, f: &mut Frame) {
+        // F1 help takes the whole screen; nothing under it is drawn (#1856).
+        if let Some(reader) = self.help.as_mut() {
+            backstagecore::help::draw(f, reader, Color::LightBlue);
+            return;
+        }
         // The welcome screen overlays everything when launched with no file.
         if self.start_screen {
             f.render_widget(Clear, f.area());
@@ -10507,6 +10583,160 @@ mod tests {
         assert!(n.contains("Protected: read-only"), "{n}");
         assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
         assert!(n.contains("Page border"), "{n}");
+    }
+
+    /// `app` with the helpdocs `editor` fixture as its manual (#1856).
+    fn with_manual(mut app: App, editor: &str) -> App {
+        app.help_manual = Some(help::tests::fixture(editor));
+        app
+    }
+
+    fn help_page(app: &App) -> Option<&str> {
+        app.help.as_ref().and_then(|r| r.page_id())
+    }
+
+    fn screen_of(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect()
+    }
+
+    #[test]
+    fn f1_opens_help_on_the_ribbon_tabs_page() {
+        let mut app = with_manual(app_with(&["A"]), "word");
+        assert_eq!(app.ribbon.tab_label(app.ribbon.active_tab()), Some("Home"));
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("home"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.help.is_none());
+        // Insert's page; a held F1 (a repeat) opens nothing.
+        let insert = (0..20)
+            .find(|&i| app.ribbon.tab_label(i) == Some("Insert"))
+            .unwrap();
+        app.ribbon.set_active(insert);
+        let mut held = key(KeyCode::F(1));
+        held.kind = KeyEventKind::Repeat;
+        app.on_key(held);
+        assert!(app.help.is_none());
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("insert"));
+        app.help = None;
+        // The backstage is the File area (no page: the root); so is the start screen.
+        app.open_backstage();
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("welcome"));
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(app.help.is_none());
+        assert!(
+            app.backstage.is_some(),
+            "the backstage is still open under it"
+        );
+        app.backstage = None;
+        app.start_screen = true;
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("welcome"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.start_screen, "the start screen is still up");
+    }
+
+    #[test]
+    fn help_help_opens_the_help_page_and_without_a_manual_says_it_is_coming() {
+        let mut app = with_manual(app_with(&["A"]), "word");
+        app.run_act(ribbon::Act::Help);
+        assert_eq!(help_page(&app), Some("help"));
+        assert_eq!(app.status, None);
+        let mut app = app_with(&["A"]);
+        app.on_key(key(KeyCode::F(1)));
+        assert!(app.help.is_none());
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+        app.status = None;
+        app.run_act(ribbon::Act::Help);
+        assert!(app.help.is_none());
+        assert_eq!(app.status.as_deref(), Some(HELP_COMING));
+    }
+
+    #[test]
+    fn help_owns_every_key_and_the_mouse_while_open() {
+        let mut app = with_manual(app_with(&["alpha"]), "word");
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("home"));
+        for k in [
+            key(KeyCode::Char('x')),
+            ctrl(KeyCode::Char('v')),
+            key(KeyCode::Delete),
+            ctrl(KeyCode::Char('s')),
+            key(KeyCode::Left),
+            key(KeyCode::F(9)),
+        ] {
+            assert!(!app.on_key(k), "{k:?} quits nothing");
+        }
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(help_page(&app), Some("home"));
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.help.is_none());
+        let find = app.find.as_ref().expect("the Find bar is still open");
+        assert_eq!(find.query.as_str(), "b");
+        assert_eq!(para_text(&app, 0), "alpha");
+        assert!(!app.modified);
+        assert_eq!(app.ribbon_focus, ribbon::Focus::None);
+    }
+
+    #[test]
+    fn help_keys_follow_links_and_walk_back() {
+        let mut app = with_manual(app_with(&["A"]), "word");
+        app.on_key(key(KeyCode::F(1)));
+        screen_of(&mut app, 60, 20);
+        // Home's first link is Font.
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(help_page(&app), Some("home-font"));
+        app.on_key(alt(KeyCode::Left));
+        assert_eq!(help_page(&app), Some("home"));
+        app.on_key(alt(KeyCode::Right));
+        assert_eq!(help_page(&app), Some("home-font"));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(help_page(&app), Some("home"));
+        app.on_key(key(KeyCode::Char('c')));
+        assert_eq!(app.help.as_ref().unwrap().title(), "Contents");
+        app.on_key(key(KeyCode::F(1)));
+        assert_eq!(help_page(&app), Some("welcome"));
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+    }
+
+    #[test]
+    fn help_draws_over_the_whole_screen() {
+        let mut app = with_manual(app_with(&["the document text"]), "word");
+        app.on_key(key(KeyCode::F(1)));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("Help: Home tab"), "{screen}");
+        assert!(
+            screen.contains("The Home tab holds the commands"),
+            "{screen}"
+        );
+        assert!(screen.contains("Esc close"), "{screen}");
+        assert!(!screen.contains("the document text"), "{screen}");
+        // A tiny frame draws what fits and never panics.
+        for (w, h) in [(3, 2), (1, 1), (2, 5)] {
+            screen_of(&mut app, w, h);
+        }
+        app.on_key(key(KeyCode::Esc));
+        let screen = screen_of(&mut app, 100, 20);
+        assert!(screen.contains("the document text"), "{screen}");
     }
 
     #[test]

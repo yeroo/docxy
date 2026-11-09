@@ -40,3 +40,9 @@ ratatui = "0.29"
 unicode-width = "0.2"
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
 backstagecore = { version = "0.1.0", path = "../backstagecore" }
+# The Project manual F1 shows (#1856): its layout, reader and locator.
+helpdocs = { version = "0.5.0", path = "../helpdocs" }
+
+[build-dependencies]
+# Builds docs/manual/project/ into the binary (#1856).
+helpdocs = { version = "0.5.0", path = "../helpdocs" }
