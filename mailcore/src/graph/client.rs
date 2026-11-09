@@ -543,6 +543,27 @@ const INLINE_MAX: usize = 3 * 1024 * 1024;
 /// Upload-session chunk size — a multiple of 320 KiB per Graph's requirement.
 const CHUNK_SIZE: usize = 12 * 320 * 1024; // 3,932,160 bytes
 
+/// What an attachment upload reports while it runs (#1941), to
+/// `GraphClient::upload_attachment`'s caller. Both methods default to
+/// nothing; `()` is the observer that wants neither.
+pub(crate) trait UploadObserver {
+    /// An upload session was opened (`Some(url)`; the url resumes it), or
+    /// the one the upload was given or opened is no good any more (`None`):
+    /// forget it.
+    fn session(&mut self, _upload_url: Option<&str>) {}
+    /// Graph has `sent` of the attachment's `total` bytes.
+    fn progress(&mut self, _sent: u64, _total: u64) {}
+}
+
+impl UploadObserver for () {}
+
+/// A session PUT Graph refused for good (#1941): a 4xx other than a 429
+/// throttle (`put_bytes` maps a 401 and a 404 to `Http` too). Retrying the
+/// same session cannot help, unlike a 5xx, a throttle or a lost connection.
+fn session_refused(e: &GraphError) -> bool {
+    matches!(e, GraphError::Http { status, .. } if *status < 500)
+}
+
 impl GraphClient {
     /// `base` has no trailing slash requirement — one is stripped if
     /// present, since every path built below starts with `/`.
@@ -1783,16 +1804,72 @@ impl GraphClient {
         bytes: &[u8],
         content_id: Option<&str>,
     ) -> Result<(), GraphError> {
+        self.upload_attachment(
+            message_id,
+            name,
+            content_type,
+            bytes,
+            content_id,
+            None,
+            &mut (),
+        )
+    }
+
+    /// `add_attachment_with`, reporting to `obs` as it runs (#1941): one
+    /// `progress(total, total)` once a small (≤ `INLINE_MAX`) attachment's
+    /// POST succeeded, and for a larger one `session` when an upload session
+    /// opens or the stored one is no good any more, and `progress` after
+    /// each chunk Graph accepted. `resume_url` (only a larger attachment's)
+    /// is an upload session of these same bytes, name, type and content id
+    /// opened by an earlier attempt: the caller checks that, so the upload
+    /// asks it where to go on from rather than starting a new session (see
+    /// `upload_large_attachment`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn upload_attachment(
+        &self,
+        message_id: &str,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+        content_id: Option<&str>,
+        resume_url: Option<&str>,
+        obs: &mut dyn UploadObserver,
+    ) -> Result<(), GraphError> {
         if bytes.len() <= INLINE_MAX {
-            self.post_file_attachment(message_id, name, content_type, bytes, content_id)
+            self.post_file_attachment(message_id, name, content_type, bytes, content_id)?;
+            let total = bytes.len() as u64;
+            obs.progress(total, total);
+            Ok(())
         } else {
-            self.upload_large_attachment(message_id, name, content_type, bytes, content_id)
+            self.upload_large_attachment(
+                message_id,
+                name,
+                content_type,
+                bytes,
+                content_id,
+                resume_url,
+                obs,
+            )
         }
     }
 
-    /// POST `.../attachments/createUploadSession`, then PUT the bytes to the
-    /// returned pre-authenticated `uploadUrl` in `CHUNK_SIZE` chunks, each with
-    /// a `Content-Range` header, until the last chunk completes.
+    /// Uploads `bytes` through an upload session: POST
+    /// `.../attachments/createUploadSession`, then PUT the bytes to the
+    /// returned pre-authenticated `uploadUrl` in `CHUNK_SIZE` chunks, each
+    /// with a `Content-Range` header, until the last chunk completes.
+    ///
+    /// With a `resume_url` (#1941) it first GETs that session
+    /// (`upload_session_next`): a live one says where Graph is, which is
+    /// reported as `progress(start, total)`, and the PUTs go on from there
+    /// with no new session. A GET that fails in any way opens a new session
+    /// from byte 0. So does a refusal (a 4xx other than 429) of a resumed
+    /// PUT, in the same attempt; the same refusal of a new session's PUT is
+    /// returned. Either refusal also tells `obs` to forget the session
+    /// (`session(None)`), so no later attempt resumes it. A 5xx, a 429/503
+    /// throttle or a transport failure is returned with the session kept:
+    /// the next attempt resumes it. A new session's url goes to
+    /// `obs.session(Some(url))` before its first PUT.
+    #[allow(clippy::too_many_arguments)]
     fn upload_large_attachment(
         &self,
         message_id: &str,
@@ -1800,7 +1877,18 @@ impl GraphClient {
         content_type: &str,
         bytes: &[u8],
         content_id: Option<&str>,
+        resume_url: Option<&str>,
+        obs: &mut dyn UploadObserver,
     ) -> Result<(), GraphError> {
+        if let Some(url) = resume_url
+            && let Some(start) = self.upload_session_next(url, bytes.len())
+        {
+            obs.progress(start as u64, bytes.len() as u64);
+            match self.put_chunks(url, bytes, start, obs) {
+                Err(e) if session_refused(&e) => obs.session(None),
+                done => return done,
+            }
+        }
         let id = encode_path_segment(message_id);
         let path = format!("/me/messages/{id}/attachments/createUploadSession");
         let mut item = vec![
@@ -1824,19 +1912,69 @@ impl GraphClient {
                 GraphError::Parse("createUploadSession response has no uploadUrl".to_string())
             })?
             .to_string();
+        obs.session(Some(&upload_url));
+        match self.put_chunks(&upload_url, bytes, 0, obs) {
+            Err(e) if session_refused(&e) => {
+                obs.session(None);
+                Err(e)
+            }
+            done => done,
+        }
+    }
 
+    /// PUTs `bytes[start..]` to the session `upload_url` in `CHUNK_SIZE`
+    /// chunks, reporting `progress(end, total)` after each one Graph
+    /// accepted.
+    fn put_chunks(
+        &self,
+        upload_url: &str,
+        bytes: &[u8],
+        start: usize,
+        obs: &mut dyn UploadObserver,
+    ) -> Result<(), GraphError> {
         let total = bytes.len();
-        for (start, end) in chunk_ranges(total, CHUNK_SIZE) {
+        for (start, end) in chunk_ranges(start, total, CHUNK_SIZE) {
             let range = format!("bytes {}-{}/{}", start, end - 1, total);
-            self.put_bytes(&upload_url, &range, &bytes[start..end])?;
+            self.put_bytes(upload_url, &range, &bytes[start..end])?;
+            obs.progress(end as u64, total as u64);
         }
         Ok(())
+    }
+
+    /// Where the upload session `upload_url` of a `total`-byte attachment
+    /// goes on from (#1941): a raw `GET` with NO bearer, as `put_bytes`, and
+    /// the lowest start in its `nextExpectedRanges` (`"start-"` or
+    /// `"start-end"`). `None` for any failure, any status, a body that does
+    /// not parse, no ranges, or a start that is not below `total`: the
+    /// caller then opens a new session.
+    fn upload_session_next(&self, upload_url: &str, total: usize) -> Option<usize> {
+        let resp = ureq::get(upload_url)
+            .set("Accept", "application/json")
+            .call()
+            .ok()?;
+        let v = parse_body(resp).ok()?;
+        let start = v
+            .get("nextExpectedRanges")?
+            .as_array()?
+            .iter()
+            .map(|r| {
+                let r = r.as_str()?;
+                r.split('-').next()?.trim().parse::<usize>().ok()
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()?;
+        (start < total).then_some(start)
     }
 
     /// Raw `PUT` of one `chunk` to a Graph upload-session `upload_url` with a
     /// `Content-Range` header and NO bearer (the session URL is already
     /// authorized). A 2xx (202 for an accepted intermediate chunk, 200/201 for
-    /// the final one) is Ok; anything else maps to a `GraphError`.
+    /// the final one) is Ok; anything else maps to a `GraphError`, a 401 or
+    /// a 404 as `Http` (#1941): they are the session's (its own
+    /// authorization lapsed, or it is gone), not the signed-in user's, so
+    /// the engine neither refreshes the token nor asks for a sign-in, and
+    /// `session_refused` sees them.
     fn put_bytes(
         &self,
         upload_url: &str,
@@ -1848,6 +1986,10 @@ impl GraphClient {
             .send_bytes(chunk)
         {
             Ok(_) => Ok(()),
+            Err(ureq::Error::Status(status @ (401 | 404), resp)) => Err(GraphError::Http {
+                status,
+                body: resp.into_string().unwrap_or_default(),
+            }),
             Err(ureq::Error::Status(status, resp)) => Err(classify_status(status, resp)),
             Err(ureq::Error::Transport(t)) => Err(GraphError::Transport(t.to_string())),
         }
@@ -2274,13 +2416,14 @@ fn recipients_json(recipients: &[Recipient]) -> Value {
     )
 }
 
-/// Splits `total` bytes into consecutive `(start, end)` half-open ranges of at
-/// most `chunk` bytes each — `end` exclusive, so `bytes[start..end]` is the
-/// slice to send and the last range's `end` always equals `total`. Empty
-/// (`total == 0`) yields no ranges.
-fn chunk_ranges(total: usize, chunk: usize) -> Vec<(usize, usize)> {
+/// Splits the bytes `start..total` into consecutive `(start, end)` half-open
+/// ranges of at most `chunk` bytes each — `end` exclusive, so
+/// `bytes[start..end]` is the slice to send and the last range's `end` always
+/// equals `total`. `start` is 0 for a new upload session, or where a resumed
+/// one goes on from (#1941). Empty (`start >= total`) yields no ranges.
+fn chunk_ranges(start: usize, total: usize, chunk: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
-    let mut start = 0;
+    let mut start = start;
     while start < total {
         let end = (start + chunk).min(total);
         v.push((start, end));
@@ -5508,20 +5651,20 @@ mod tests {
 
     #[test]
     fn chunk_ranges_covers_total_in_chunk_sized_pieces() {
-        assert_eq!(chunk_ranges(0, 100), Vec::<(usize, usize)>::new());
-        assert_eq!(chunk_ranges(100, 100), vec![(0, 100)]);
+        assert_eq!(chunk_ranges(0, 0, 100), Vec::<(usize, usize)>::new());
+        assert_eq!(chunk_ranges(0, 100, 100), vec![(0, 100)]);
         assert_eq!(
-            chunk_ranges(250, 100),
+            chunk_ranges(0, 250, 100),
             vec![(0, 100), (100, 200), (200, 250)]
         );
         // A payload just over INLINE_MAX still fits inside one CHUNK_SIZE chunk
         // (CHUNK_SIZE is much bigger than INLINE_MAX), matching the "big"
         // payload used in `add_attachment_routes_small_inline_and_large_to_upload_session`.
         let total = INLINE_MAX + 100;
-        assert_eq!(chunk_ranges(total, CHUNK_SIZE), vec![(0, total)]);
+        assert_eq!(chunk_ranges(0, total, CHUNK_SIZE), vec![(0, total)]);
         // Multiple full CHUNK_SIZE-sized chunks plus a smaller remainder.
         let total2 = CHUNK_SIZE * 2 + 500;
-        let ranges = chunk_ranges(total2, CHUNK_SIZE);
+        let ranges = chunk_ranges(0, total2, CHUNK_SIZE);
         assert_eq!(
             ranges,
             vec![
@@ -5736,6 +5879,364 @@ mod tests {
         assert!(plain.get("isInline").is_none());
         assert!(plain.get("contentId").is_none());
         assert!(!upload_srv.requests().is_empty(), "the bytes were PUT");
+    }
+
+    /// What an upload told its observer (#1941).
+    #[derive(Default)]
+    struct Recorder {
+        sessions: Vec<Option<String>>,
+        progress: Vec<(u64, u64)>,
+    }
+
+    impl UploadObserver for Recorder {
+        fn session(&mut self, upload_url: Option<&str>) {
+            self.sessions.push(upload_url.map(str::to_string));
+        }
+        fn progress(&mut self, sent: u64, total: u64) {
+            self.progress.push((sent, total));
+        }
+    }
+
+    fn put_route(path: &str, status: u16) -> Route {
+        Route {
+            method: "PUT".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: "".into(),
+        }
+    }
+
+    fn get_url_route(path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    /// A Graph server whose createUploadSession names `upload_url`.
+    fn session_server(upload_url: &str) -> FakeServer {
+        FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments/createUploadSession".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"uploadUrl":"{upload_url}"}}"#),
+        }])
+    }
+
+    /// The `(path, Content-Range)` of each PUT `srv` received.
+    fn put_ranges(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .map(|r| {
+                let range = r
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                    .map(|(_, v)| v.clone())
+                    .expect("a Content-Range");
+                (r.path.clone(), range)
+            })
+            .collect()
+    }
+
+    /// Two full chunks and a short one.
+    const BIG: usize = CHUNK_SIZE * 2 + 500;
+
+    fn upload_big(
+        c: &GraphClient,
+        resume_url: Option<&str>,
+        obs: &mut Recorder,
+    ) -> Result<(), GraphError> {
+        let big = vec![b'x'; BIG];
+        c.upload_attachment(
+            "M1",
+            "big.bin",
+            "application/octet-stream",
+            &big,
+            None,
+            resume_url,
+            obs,
+        )
+    }
+
+    #[test]
+    fn upload_attachment_reports_progress_after_each_chunk() {
+        let upload_srv = FakeServer::start(vec![put_route("/upload/s1", 202)]);
+        let url = format!("{}/upload/s1", upload_srv.base_url);
+        let session_srv = session_server(&url);
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let mut obs = Recorder::default();
+        upload_big(&c, None, &mut obs).unwrap();
+
+        assert_eq!(obs.sessions, vec![Some(url)]);
+        let (c1, c2, t) = (CHUNK_SIZE as u64, 2 * CHUNK_SIZE as u64, BIG as u64);
+        assert_eq!(obs.progress, vec![(c1, t), (c2, t), (t, t)]);
+        assert_eq!(upload_srv.requests().len(), 3, "no GET of a new session");
+    }
+
+    #[test]
+    fn a_small_attachment_reports_one_progress_event() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages/M1/attachments".into(),
+            status: 201,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "T");
+        let mut obs = Recorder::default();
+        c.upload_attachment(
+            "M1",
+            "a.txt",
+            "text/plain",
+            b"hello",
+            None,
+            Some("http://127.0.0.1:1/never"),
+            &mut obs,
+        )
+        .unwrap();
+        assert_eq!(obs.progress, vec![(5, 5)]);
+        assert!(obs.sessions.is_empty());
+        assert_eq!(srv.requests().len(), 1, "one POST, no session");
+    }
+
+    #[test]
+    fn upload_resumes_a_session_from_next_expected_ranges() {
+        let start = CHUNK_SIZE;
+        let upload_srv = FakeServer::start(vec![
+            get_url_route(
+                "/upload/s1",
+                200,
+                &format!(
+                    r#"{{"expirationDateTime":"2026-11-10T00:00:00Z","nextExpectedRanges":["{start}-"]}}"#
+                ),
+            ),
+            put_route("/upload/s1", 202),
+        ]);
+        let url = format!("{}/upload/s1", upload_srv.base_url);
+        let session_srv = session_server("http://127.0.0.1:1/unused");
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let mut obs = Recorder::default();
+        upload_big(&c, Some(&url), &mut obs).unwrap();
+
+        assert!(session_srv.requests().is_empty(), "no new session");
+        assert!(obs.sessions.is_empty(), "the stored session stays");
+        let gets: Vec<_> = upload_srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "GET")
+            .collect();
+        assert_eq!(gets.len(), 1);
+        assert!(
+            !gets[0]
+                .headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
+            "the session GET carries no bearer"
+        );
+        let t = BIG as u64;
+        assert_eq!(
+            put_ranges(&upload_srv),
+            vec![
+                (
+                    "/upload/s1".to_string(),
+                    format!("bytes {}-{}/{BIG}", CHUNK_SIZE, 2 * CHUNK_SIZE - 1)
+                ),
+                (
+                    "/upload/s1".to_string(),
+                    format!("bytes {}-{}/{BIG}", 2 * CHUNK_SIZE, BIG - 1)
+                ),
+            ]
+        );
+        let (c1, c2) = (CHUNK_SIZE as u64, 2 * CHUNK_SIZE as u64);
+        assert_eq!(
+            obs.progress,
+            vec![(c1, t), (c2, t), (t, t)],
+            "the resume reports where it goes on from first"
+        );
+    }
+
+    #[test]
+    fn upload_with_an_expired_session_opens_a_new_one_from_byte_zero() {
+        let upload_srv = FakeServer::start(vec![
+            get_url_route("/upload/old", 404, ""),
+            put_route("/upload/new", 202),
+        ]);
+        let old = format!("{}/upload/old", upload_srv.base_url);
+        let new = format!("{}/upload/new", upload_srv.base_url);
+        let session_srv = session_server(&new);
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let mut obs = Recorder::default();
+        upload_big(&c, Some(&old), &mut obs).unwrap();
+
+        assert_eq!(session_srv.requests().len(), 1, "one new session");
+        assert_eq!(obs.sessions, vec![Some(new)]);
+        let ranges = put_ranges(&upload_srv);
+        assert_eq!(ranges.len(), 3);
+        assert!(ranges.iter().all(|(p, _)| p == "/upload/new"));
+        assert_eq!(ranges[0].1, format!("bytes 0-{}/{BIG}", CHUNK_SIZE - 1));
+        assert_eq!(obs.progress[0], (CHUNK_SIZE as u64, BIG as u64));
+    }
+
+    #[test]
+    fn a_session_get_with_no_usable_range_opens_a_new_session() {
+        // Each answer is no place to go on from: no ranges, a start past the
+        // end, a range that is not a number, a body that is not JSON.
+        for body in [
+            r#"{"nextExpectedRanges":[]}"#.to_string(),
+            format!(r#"{{"nextExpectedRanges":["{BIG}-"]}}"#),
+            r#"{"nextExpectedRanges":["abc-"]}"#.to_string(),
+            r#"{}"#.to_string(),
+            "not json".to_string(),
+        ] {
+            let upload_srv = FakeServer::start(vec![
+                get_url_route("/upload/old", 200, &body),
+                put_route("/upload/new", 202),
+            ]);
+            let old = format!("{}/upload/old", upload_srv.base_url);
+            let new = format!("{}/upload/new", upload_srv.base_url);
+            let session_srv = session_server(&new);
+            let c = GraphClient::new(&session_srv.base_url, "T");
+            let mut obs = Recorder::default();
+            upload_big(&c, Some(&old), &mut obs).unwrap();
+            assert_eq!(session_srv.requests().len(), 1, "{body}");
+            assert_eq!(obs.sessions, vec![Some(new)], "{body}");
+            assert_eq!(
+                put_ranges(&upload_srv)[0].1,
+                format!("bytes 0-{}/{BIG}", CHUNK_SIZE - 1),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_get_resumes_from_the_lowest_range_start() {
+        let upload_srv = FakeServer::start(vec![
+            get_url_route(
+                "/upload/s1",
+                200,
+                &format!(
+                    r#"{{"nextExpectedRanges":["{}-{}","{}-"]}}"#,
+                    2 * CHUNK_SIZE,
+                    BIG - 1,
+                    CHUNK_SIZE
+                ),
+            ),
+            put_route("/upload/s1", 202),
+        ]);
+        let url = format!("{}/upload/s1", upload_srv.base_url);
+        let c = GraphClient::new("http://127.0.0.1:1", "T");
+        let mut obs = Recorder::default();
+        upload_big(&c, Some(&url), &mut obs).unwrap();
+        assert_eq!(
+            put_ranges(&upload_srv)[0].1,
+            format!("bytes {}-{}/{BIG}", CHUNK_SIZE, 2 * CHUNK_SIZE - 1)
+        );
+    }
+
+    #[test]
+    fn a_refused_resumed_put_falls_back_to_a_new_session() {
+        let upload_srv = FakeServer::start(vec![
+            get_url_route(
+                "/upload/old",
+                200,
+                &format!(r#"{{"nextExpectedRanges":["{CHUNK_SIZE}-"]}}"#),
+            ),
+            put_route("/upload/old", 416),
+            put_route("/upload/new", 202),
+        ]);
+        let old = format!("{}/upload/old", upload_srv.base_url);
+        let new = format!("{}/upload/new", upload_srv.base_url);
+        let session_srv = session_server(&new);
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let mut obs = Recorder::default();
+        upload_big(&c, Some(&old), &mut obs).unwrap();
+
+        assert_eq!(obs.sessions, vec![None, Some(new)], "forgotten, replaced");
+        assert_eq!(session_srv.requests().len(), 1);
+        let ranges = put_ranges(&upload_srv);
+        assert_eq!(ranges.len(), 4, "one refused, then three from byte 0");
+        assert_eq!(ranges[0].0, "/upload/old");
+        assert_eq!(ranges[1].0, "/upload/new");
+        assert_eq!(ranges[1].1, format!("bytes 0-{}/{BIG}", CHUNK_SIZE - 1));
+        let t = BIG as u64;
+        assert_eq!(
+            obs.progress,
+            vec![
+                (CHUNK_SIZE as u64, t),
+                (CHUNK_SIZE as u64, t),
+                (2 * CHUNK_SIZE as u64, t),
+                (t, t)
+            ],
+            "the resume's report, then the new session's chunks"
+        );
+    }
+
+    #[test]
+    fn a_refused_put_of_a_new_session_forgets_it_and_fails() {
+        let upload_srv = FakeServer::start(vec![put_route("/upload/s1", 400)]);
+        let url = format!("{}/upload/s1", upload_srv.base_url);
+        let session_srv = session_server(&url);
+        let c = GraphClient::new(&session_srv.base_url, "T");
+        let mut obs = Recorder::default();
+        let err = upload_big(&c, None, &mut obs).unwrap_err();
+        assert!(
+            matches!(err, GraphError::Http { status: 400, .. }),
+            "{err:?}"
+        );
+        assert_eq!(obs.sessions, vec![Some(url), None]);
+        assert_eq!(session_srv.requests().len(), 1, "no second session");
+    }
+
+    #[test]
+    fn a_401_or_404_from_an_upload_session_put_is_not_unauthorized() {
+        for status in [401u16, 404] {
+            let upload_srv = FakeServer::start(vec![put_route("/upload/s1", status)]);
+            let url = format!("{}/upload/s1", upload_srv.base_url);
+            let session_srv = session_server(&url);
+            let c = GraphClient::new(&session_srv.base_url, "T");
+            let mut obs = Recorder::default();
+            let err = upload_big(&c, None, &mut obs).unwrap_err();
+            assert!(
+                matches!(&err, GraphError::Http { status: s, .. } if *s == status),
+                "{status}: {err:?}"
+            );
+            assert_eq!(obs.sessions, vec![Some(url), None], "{status}");
+        }
+    }
+
+    #[test]
+    fn a_5xx_or_throttled_put_keeps_the_session() {
+        for status in [500u16, 503, 429] {
+            let upload_srv = FakeServer::start_limited(vec![
+                (put_route("/upload/s1", 202), Some(1)),
+                (put_route("/upload/s1", status), None),
+            ]);
+            let url = format!("{}/upload/s1", upload_srv.base_url);
+            let session_srv = session_server(&url);
+            let c = GraphClient::new(&session_srv.base_url, "T");
+            let mut obs = Recorder::default();
+            let err = upload_big(&c, None, &mut obs).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    GraphError::Http { status: 500, .. } | GraphError::Throttled { .. }
+                ),
+                "{status}: {err:?}"
+            );
+            assert_eq!(obs.sessions, vec![Some(url)], "{status}: kept");
+            assert_eq!(
+                obs.progress,
+                vec![(CHUNK_SIZE as u64, BIG as u64)],
+                "{status}"
+            );
+        }
     }
 
     fn sample_input() -> EventInput {
