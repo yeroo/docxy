@@ -352,9 +352,16 @@ test F1 with focus on a ribbon command opens that command's page
   assert reply.open is false
   call real-key {"key":"ctrl+w"}
   call window-size {"w":1180,"h":800}
+  # Settle the regrown window (the X server applies a resize later): Font
+  # is drawn in place again before the pointer aims at Bold.
+  call ribbon-layout {"tab":"Home"}
+  shot window
+  call ribbon-layout {"tab":"Home"}
+  assert reply.settled is true
+  assert reply.groups.1.title is Font
+  assert reply.groups.1.state is full
   # The pointer left the window over Bold: gpui keeps its last position,
   # but no command is under a pointer that is not in the window.
-  call ribbon-layout {"tab":"Home"}
   call pointer-move {"to":"ribbon-cmd:b"}
   call pointer-leave {}
   call real-key {"key":"f1"}
