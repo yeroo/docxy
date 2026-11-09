@@ -884,7 +884,13 @@ impl DocView {
                     caret_piece(&self.words, &self.editor.caret),
                     self.viewport.get(),
                 ) {
-                    (Some(piece), Some(view)) => Json::Bool(reveal_dy(view, piece) == px(0.)),
+                    // Clear of the horizontal bar, as the reveal is.
+                    (Some(piece), Some(view)) => Json::Bool(
+                        reveal_dy(
+                            crate::doc_scrollbar::clear_of_hbar(view, self.hbar.shown()),
+                            piece,
+                        ) == px(0.),
+                    ),
                     _ => Json::Null,
                 },
             ),
@@ -1040,6 +1046,7 @@ impl Render for DocView {
             .collect();
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
+        let hbar = self.hbar.clone();
         let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
         let (column, painted_gen, doc_gen) =
             (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
@@ -1116,7 +1123,10 @@ impl Render for DocView {
                     // made among them.
                     move |b, _s, window, _a| {
                         if let Some(caret) = reveal {
-                            if reveal_caret(&words, &scroll, b, &caret) {
+                            // Clear of the horizontal bar over the view's
+                            // bottom (#2080).
+                            let view = crate::doc_scrollbar::clear_of_hbar(b, hbar.shown());
+                            if reveal_caret(&words, &scroll, view, &caret) {
                                 window.request_animation_frame();
                             }
                         }
@@ -1383,7 +1393,7 @@ fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, care
         return caret
             .path
             .first()
-            .is_some_and(|&b| follow_item_y(scroll, b));
+            .is_some_and(|&b| follow_item_y(scroll, b, view));
     };
     let dy = reveal_dy(view, piece);
     if dy == px(0.) {
@@ -1917,6 +1927,11 @@ mod tests {
         assert_eq!(reveal_dy(view, rows(900., 20.)), px(-520.));
         // Taller than the view: its top.
         assert_eq!(reveal_dy(view, rows(120., 400.)), px(-20.));
+        // #2080 r3: a line in the view's bottom 12 px, under the
+        // horizontal bar while it is shown, comes up clear of it.
+        let clear = crate::doc_scrollbar::clear_of_hbar(view, true);
+        assert_eq!(reveal_dy(view, rows(385., 10.)), px(0.));
+        assert_eq!(reveal_dy(clear, rows(385., 10.)), px(-7.));
     }
 
     #[test]

@@ -159,6 +159,17 @@ pub(crate) fn strips_next(shown: (bool, bool), view: (f32, f32), max: (f32, f32)
     bars_needed((known(view.0, max.0), known(view.1, max.1)), bare)
 }
 
+/// The part of a scroll area's `view` a caret follow keeps a line in: all
+/// of it, less the overlaid horizontal bar along its bottom while that bar
+/// is shown (#2080 r3). Print Layout's bars are beside its view.
+pub(crate) fn clear_of_hbar(view: Bounds<Pixels>, hbar_shown: bool) -> Bounds<Pixels> {
+    if !hbar_shown {
+        return view;
+    }
+    let h = (view.size.height - px(BAR_PX)).max(px(0.));
+    Bounds::new(view.origin, size(view.size.width, h))
+}
+
 /// Print Layout's strip decision (#2080 r2), drawn after its scroll area:
 /// its prepaint applies [`strips_next`] to both bars' `shown` and asks for
 /// a frame when that changed.
@@ -291,8 +302,10 @@ pub(crate) struct Painted {
 /// embedded view on its `DocView`.
 #[derive(Default)]
 pub(crate) struct BarState {
-    /// Whether the last frame found the content overflowing: Print
-    /// Layout lays out the bar's strip only then.
+    /// Whether the bar is shown. An overlay bar sets it each frame from
+    /// its own axis; in Print Layout [`strip_decider`] sets both bars'
+    /// together for the next frame, and the strip is laid out only while
+    /// it is set.
     shown: Cell<bool>,
     /// A thumb drag: the offset and the pointer (along the bar) at the press.
     drag: Cell<Option<(f32, f32)>>,
@@ -414,8 +427,10 @@ impl BarColors {
 }
 
 /// A flow view's bars (#2080): laid over the right and bottom edges of the
-/// scroll area's parent, which must be `relative`, where its padding is, so
-/// they take no text width. Each paints only while its axis overflows; the
+/// scroll area's parent, which must be `relative`, so they take no text
+/// width. They cover the view's edges, which are padding only at the ends
+/// of the scroll: a caret follow keeps clear of the horizontal one
+/// ([`clear_of_hbar`]). Each paints only while its axis overflows; the
 /// vertical one stops above the horizontal one while both show.
 pub(crate) fn overlay_bars(
     handle: &ScrollHandle,
@@ -530,8 +545,12 @@ pub(crate) fn doc_scrollbar(
         move |strip: Bounds<Pixels>, window: &mut Window, _cx: &mut App| {
             let axis = dir.axis(&prep_handle);
             let shows = axis.overflows();
-            // An overlay keeps its own `shown`, which only the harness and
-            // the other overlay's corner read: a frame shows the change.
+            // An overlay keeps its own `shown`. `overlay_bars` reads it to
+            // stop the other bar short of the corner, the caret follow to
+            // keep clear of the horizontal bar, and `print_bars` as its
+            // starting point after a view switch (the pair is shared). The
+            // harness reads `painted` / `regions`, not `shown`. A frame
+            // shows the change.
             if matches!(prep_place, Place::Overlay) && prep_state.shown.replace(shows) != shows {
                 window.request_animation_frame();
             }
@@ -856,6 +875,21 @@ mod tests {
         // Clamped at both ends.
         assert_eq!(drag_offset(a, 400., 0., -100.), 0.);
         assert_eq!(drag_offset(a, 400., 1400., 1000.), 1500.);
+    }
+
+    /// #2080 r3: a caret follow keeps a line clear of the horizontal
+    /// overlay bar while it is shown, and uses the whole view otherwise.
+    #[test]
+    fn a_follow_keeps_clear_of_the_horizontal_bar() {
+        let view = Bounds::new(point(px(10.), px(100.)), size(px(600.), px(400.)));
+        assert_eq!(clear_of_hbar(view, false), view);
+        let clear = clear_of_hbar(view, true);
+        assert_eq!(clear.origin, view.origin);
+        assert_eq!(clear.size, size(px(600.), px(400. - BAR_PX)));
+        assert_eq!(clear.bottom(), px(500. - BAR_PX));
+        // A view shorter than the bar: nothing left, never negative.
+        let tiny = Bounds::new(point(px(0.), px(0.)), size(px(600.), px(5.)));
+        assert_eq!(clear_of_hbar(tiny, true).size.height, px(0.));
     }
 
     /// #2080 r2: a thumb that fills a track too short for it does not

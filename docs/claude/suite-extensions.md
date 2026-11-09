@@ -106,8 +106,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   text width comes from a last in-flow `w_full` zero-height probe in
   `ext-doc-scroll` (`text_w`), and `ext-doc-scroll` scrolls on both axes
   under the suite's document scrollbars (#2080, `doc_scrollbar`: 12 px
-  strips over the right and bottom padding, shown while their axis
-  overflows; `ext-doc-vbar`, `ext-doc-hbar-thumb`, ... regions, and
+  strips over the view's right and bottom edges, shown while their axis
+  overflows, the caret reveal keeping clear of the horizontal one; `ext-doc-vbar`, `ext-doc-hbar-thumb`, ... regions, and
   `ext-doc-read`'s `vbar` / `hbar`, see `docs/claude/suite-document.md`).
   A press on a bar stops there: it does not focus the view. gpui's X11, Wayland and Windows clients turn a shifted wheel
   into `delta.x` (macOS sends it), so the view has no shift handling;

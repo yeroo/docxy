@@ -7069,19 +7069,22 @@ fn follow_y(view: Bounds<Pixels>, child: Bounds<Pixels>, y: Pixels) -> Pixels {
 /// to its left on every key. Called from a child's prepaint, after the
 /// scroll area recorded this layout's children; the move shows next frame.
 /// Whether it moved; nothing happens for a child the layout did not record.
-fn follow_item_y(handle: &ScrollHandle, ix: usize) -> bool {
+/// `view`: the part of the scroll area the child must be in, the handle's
+/// bounds less what an overlaid horizontal bar covers
+/// (`doc_scrollbar::clear_of_hbar`, #2080).
+fn follow_item_y(handle: &ScrollHandle, ix: usize, view: Bounds<Pixels>) -> bool {
     let Some(child) = handle.bounds_for_item(ix) else {
         return false;
     };
-    follow_bounds_y(handle, child)
+    follow_bounds_y(handle, view, child)
 }
 
 /// Scroll `handle` in y so `child` (its unscrolled layout bounds) is in
-/// view: [`follow_item_y`] for a child given by its bounds. Whether it
+/// `view`: [`follow_item_y`] for a child given by its bounds. Whether it
 /// moved.
-fn follow_bounds_y(handle: &ScrollHandle, child: Bounds<Pixels>) -> bool {
+fn follow_bounds_y(handle: &ScrollHandle, view: Bounds<Pixels>, child: Bounds<Pixels>) -> bool {
     let offset = handle.offset();
-    let y = follow_y(handle.bounds(), child, offset.y);
+    let y = follow_y(view, child, offset.y);
     if y == offset.y {
         return false;
     }
@@ -7109,7 +7112,8 @@ fn page_follow_el(
                 // reads the bounds a scroll handle records.
                 let offset = handle.offset();
                 let child = Bounds::new(point(b.origin.x, b.origin.y - offset.y), b.size);
-                if follow_bounds_y(&handle, child) {
+                // Print Layout's bars are beside the view, not over it.
+                if follow_bounds_y(&handle, handle.bounds(), child) {
                     window.request_animation_frame();
                 }
             }
@@ -7175,10 +7179,10 @@ mod follow_tests {
         handle.set_offset(point(px(-228.), px(0.)));
         // The handle's view is not laid out (a 0 px view at 0): a page
         // below it is followed to its top.
-        assert!(follow_bounds_y(&handle, rect(300., 50.)));
+        assert!(follow_bounds_y(&handle, handle.bounds(), rect(300., 50.)));
         assert_eq!(handle.offset(), point(px(-228.), px(-300.)));
         // In place now: nothing moves.
-        assert!(!follow_bounds_y(&handle, rect(300., 50.)));
+        assert!(!follow_bounds_y(&handle, handle.bounds(), rect(300., 50.)));
     }
 
     /// #2080: the page tip's spans come from the painted page rects, in
@@ -44171,6 +44175,7 @@ impl Render for Docxy {
                             .collect();
                         let probe = self.ruler_probe.clone();
                         let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
+                        let hbar = self.doc_hbar.clone();
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .relative()
@@ -44201,15 +44206,22 @@ impl Render for Docxy {
                                     state.draft_column = Some(ScreenRect::from_bounds(b));
                                     state.draft_text_w = Some(f32::from(b.size.width));
                                     if let Some(ix) = follow.take() {
-                                        if follow_item_y(&handle, ix) {
+                                        // Clear of the horizontal bar
+                                        // laid over the view's bottom.
+                                        let view = doc_scrollbar::clear_of_hbar(
+                                            handle.bounds(),
+                                            hbar.shown(),
+                                        );
+                                        if follow_item_y(&handle, ix, view) {
                                             window.request_animation_frame();
                                         }
                                     }
                                 },
                             )))
                             .into_any_element();
-                        // The bars lie over the padding, which keeps the
-                        // text width (#2080).
+                        // The bars lie over the view's right and bottom
+                        // edges (#2080), which keeps the text width; the
+                        // caret follow stays clear of the horizontal one.
                         let scroll = v_flex()
                             .relative()
                             .flex_1()

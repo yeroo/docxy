@@ -336,9 +336,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
     `the_strips_settle_from_any_start` checks the decision settles within
     three frames from every start.
   - A wheel over a strip scrolls the area, since a strip is outside it.
-- The flow view and DocView lay their bars over the padding
-  (`overlay_bars`), which keeps the text width. An overlay decides its own
-  `shown` from its axis. An unshown overlay paints nothing and takes no
+- The flow view and DocView lay their bars over the view's right and
+  bottom edges (`overlay_bars`), which keeps the text width. Those edges
+  are padding only at the ends of the scroll, so while the horizontal bar
+  shows, the caret follow (`follow_item_y`, DocView's `reveal_caret`)
+  keeps a line clear of it (`clear_of_hbar`, #2080 r3). The theme's track
+  colour is transparent, but the thumb and arrows are not. An overlay
+  decides its own `shown` from its axis. An unshown overlay paints nothing and takes no
   input, and the overlays take no wheel (the area under them scrolls).
 - Print Layout scrolls both axes. `ruler_scroll_view` bounds the view to
   the window, and the pages sit in a column (`min_w_full`,
