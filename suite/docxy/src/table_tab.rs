@@ -1322,7 +1322,10 @@ impl Docxy {
             .collect();
         let geom = crate::ribbon_fit::gallery_geom(gal);
         let (_, well_w) = crate::ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
+        // Relative for its F1 probe (#1869); nothing in it is absolute
+        // against it (a cell's border lines sit in the cell's own relative box).
         h_flex()
+            .relative()
             .flex_none()
             .flex_wrap()
             .w(px(well_w))
@@ -1333,6 +1336,10 @@ impl Docxy {
             .border_color(pal.border)
             .bg(hsla_u(0xFAFAFA))
             .children(tiles)
+            .child(crate::probe(
+                &self.probes,
+                crate::help_tab::ribbon_cmd_probe(gal.id),
+            ))
             .into_any_element()
     }
 }

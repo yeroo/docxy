@@ -94,7 +94,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   the search box is the registered input `help-search` (`inputs.rs`).
   `tab-list` reports `count`. `uiharness/cases/help-docs.uit` drives it;
   `qa/help-docs.md` is the offline manual case. F1 on a hovered ribbon
-  command and on panes is #1869.
+  command is #1869 (below); on panes, #2077.
 
 ## Build-pinned manual revision (#1857)
 
@@ -127,3 +127,53 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
 - The terminal editors' F1 reader and File › Info do not show it yet:
   `helpdocs::locate` returns a bare `Manual` with no source, and the
   reader's footer row holds hints and link notes (a follow-up issue).
+
+## F1 on a hovered ribbon command (#1869)
+
+- F1 with the pointer resting on a ribbon command opens that command's page
+  (`help_tab::f1_command_ask`: its id, the ribbon tab shown as the area, so
+  `helpdocs::resolve` falls back to the area page, then the root). No
+  ScreenTip has to be up, unlike Word. Off every command, and on a Help tab,
+  F1 is as before (`f1_ask`). F1 under a dialog, with an entry owning the
+  keys, in the backstage or with a menu open (`menu_key` spends it, so an
+  open split menu's items have no F1) is unchanged.
+- No hover state: every ribbon command element draws a `ribbon-cmd:<id>`
+  probe (`help_tab::ribbon_cmd_probe`), and `help_f1` hit-tests the pointer
+  against the probes of the frame on screen (`ribbon_cmd_at`: the last drawn
+  wins). F1 clears `ribbon_flyout` first, so `help_f1` must read the probes,
+  never the flyout state: a command in an open flyout is still on screen.
+  Hover listeners would re-render the whole root on every move and go stale
+  under a still pointer. gpui's hitbox hover is false after a key, so it
+  cannot answer for F1.
+- The probes: `cmd_probe_els` (with an extension's `ext-ribbon-cmd:<id>`) in
+  `icon_btn`, `large_btn` and `dropdown_btn`; the whole split (both halves)
+  in `split_btn`; `combo_box`; a gallery by its id on its container, in
+  place and in a flyout, and on a swatch gallery's More button
+  (`swatch_gallery`, `style_gallery`, `table_style_gallery`); the sheet's
+  every shape (`sheet_cmd_probe`: `sheet_ib`, `sheet_gb`, `sheet_rb`,
+  `sheet_check`, `sheet_lb`, `sheet_combo`, `sheet_numfmt_combo`,
+  `sheet_dropdown_btn`, a `Shape::Split` whole). A probe fills its nearest
+  positioned ancestor, so each of these is `relative`. A disabled command
+  keeps its probe: F1 opens its page, as in Word. Group launchers carry no
+  id and draw none.
+- gpui keeps `mouse_position` after the pointer leaves the window.
+  `pointer_in_window` is set by a window-level `MouseMoveEvent` listener and
+  cleared by a `MouseExitEvent` one (the root's `gesture_listeners` canvas,
+  first, in the capture phase; they never stop the event and never notify).
+  gpui on Windows sends no `MouseExited` (`WM_MOUSELEAVE` only clears the
+  window's hovered flag), so `help_pointer` there, outside the harness, also
+  needs `window.is_window_hovered()`. It is read nowhere else: on macOS it
+  means the window is active, and the harness's dispatched events never set
+  it.
+- Harness: the region `ribbon-cmd:<id>` (a command drawn twice, a swatch
+  gallery with its More flyout open, is the first on screen) and the verb
+  `pointer-leave` (a dispatched `MouseExited`). Cases: the test "F1 with
+  focus on a ribbon command opens that command's page" in
+  `uiharness/cases/help-docs.uit` (word fixture), and
+  `uiharness/cases/help-f1-sheet.uit` (excel fixture: help-docs.uit asserts
+  no Excel manual is installed).
+- The document ribbon's ids are not the sheet's: its Bold is `b` (Italic
+  `i`, Underline `u`), the sheet's `bold`. The word fixture's `home-font`
+  keys both, so a hovered document Bold is an exact hit; a real Word manual
+  keys the document ribbon's ids (`every_ribbon_command_has_a_help_target`
+  lists them).

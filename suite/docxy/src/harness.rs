@@ -1007,6 +1007,12 @@ pub enum Region {
     /// upper half or a drop-down, in place or in an open group flyout, or a
     /// gallery tile drawn in place.
     ExtRibbonCmd(&'static str),
+    /// Any ribbon command, by its id (#1869): `rs::Cmd::id` on the document
+    /// and Project ribbons, `SheetCmd::id` on the sheet's, a gallery's id;
+    /// a whole split, in place or in an open flyout. A command drawn twice
+    /// (a swatch gallery in place and in its More flyout) is the first one
+    /// on screen.
+    RibbonCmd(&'static str),
     /// An extension page's File rail entry, by the page's id (#1923).
     BackstageExt(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
@@ -1121,6 +1127,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .filter(|a| !a.is_empty())
                 .ok_or("'ext-ribbon-cmd' needs a command id, e.g. ext-ribbon-cmd:fx.reply")?;
             Ok(Region::ExtRibbonCmd(crate::plugin_ui::intern(a)))
+        }
+        "ribbon-cmd" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'ribbon-cmd' needs a command id, e.g. ribbon-cmd:bold")?;
+            Ok(Region::RibbonCmd(crate::plugin_ui::intern(a)))
         }
         "bs-ext" => {
             let a = arg
@@ -1281,6 +1293,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonLaunch(title) => format!("ribbon-launch:{title}"),
         Region::GalleryMore(id) => format!("gallery-more:{id}"),
         Region::ExtRibbonCmd(id) => format!("ext-ribbon-cmd:{id}"),
+        Region::RibbonCmd(id) => crate::help_tab::ribbon_cmd_probe(id),
         Region::BackstageExt(id) => format!("bs-ext:{id}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
@@ -7021,6 +7034,20 @@ fn dispatch_verb(
             Ok(done)
         }
 
+        // The pointer leaves the window (#1869): a `MouseExited`, as a
+        // platform sends when the pointer crosses the window's edge. gpui
+        // keeps its last position; the suite's F1 then finds no ribbon
+        // command under it. It aims at nothing, so it hit-tests no frame.
+        "pointer-leave" => {
+            let mut done = Done::ok(Json::obj(vec![]))?;
+            done.input = vec![PlatformInput::MouseExited(gpui::MouseExitEvent {
+                position: window.mouse_position(),
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            })];
+            Ok(done)
+        }
+
         // Mailings ▸ Select Recipients ▸ Use an Existing List… without the
         // native file dialog (#628): the path goes to the same attach the
         // dialog's answer feeds. A relative path resolves against the tab's
@@ -9375,6 +9402,7 @@ mod tests {
         assert!(!closes_menu("pointer-click", &no_args));
         assert!(!closes_menu("pointer-drag", &no_args));
         assert!(!closes_menu("pointer-wheel", &no_args));
+        assert!(!closes_menu("pointer-leave", &no_args));
     }
 
     /// #1121: the verbs that queue pointer input from region geometry draw
@@ -9392,6 +9420,7 @@ mod tests {
             assert!(hit_tests_rendered_frame(verb), "{verb}");
         }
         for verb in [
+            "pointer-leave",
             "click-cell",
             "drag",
             "key",
@@ -10994,6 +11023,7 @@ mod tests {
             Region::RibbonLaunch("Page Setup"),
             Region::GalleryMore("fixture.wide"),
             Region::ExtRibbonCmd("fx.reply"),
+            Region::RibbonCmd("bold"),
             Region::BackstageExt("fx.account"),
             Region::BackstageContent,
             Region::BackstageRail,

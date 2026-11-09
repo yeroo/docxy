@@ -5891,6 +5891,11 @@ struct Docxy {
     // The flyout a press outside it last closed, and where, so the press on
     // its own collapsed button does not open it straight back.
     flyout_closed_at: Option<(FlyoutTarget, Point<Pixels>)>,
+    // Whether the pointer is in the window, as its last mouse event said
+    // (#1869): a move sets it, a `MouseExited` clears it (the window-level
+    // listeners in `render`). F1 asks for the ribbon command under the
+    // pointer only while it is set (`help_tab::help_pointer`).
+    pointer_in_window: bool,
     // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
     // `RepeatRecord` for when it is still valid.
     repeat: Option<RepeatRecord>,
@@ -6473,6 +6478,19 @@ fn ext_cmd_probe_el(
         Act::Ext(id) => Some(probe(cell, ext_cmd_probe(id))),
         _ => None,
     }
+}
+
+/// The probes a ribbon command's element draws: `ribbon-cmd:<id>`, which F1
+/// hit-tests (#1869) and the harness aims at, and an extension command's own
+/// `ext-ribbon-cmd:<id>` ([`ext_cmd_probe_el`]). The element must be
+/// `relative`, as a probe fills its nearest positioned ancestor. A disabled
+/// command draws them too: F1 on it opens its page, as in Word.
+fn cmd_probe_els(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    id: &str,
+    act: Act,
+) -> impl IntoIterator<Item = AnyElement> {
+    std::iter::once(probe(cell, help_tab::ribbon_cmd_probe(id))).chain(ext_cmd_probe_el(cell, act))
 }
 
 /// Record fresh bounds during prepaint and request one more frame if the
@@ -16753,6 +16771,7 @@ impl Docxy {
             menu_closed_at: None,
             ribbon_flyout: None,
             flyout_closed_at: None,
+            pointer_in_window: false,
             repeat: None,
             mini_bar: None,
             zoom: 1.0,
@@ -19485,6 +19504,10 @@ impl Docxy {
                 .ok_or_else(|| format!("the gallery {id} draws no More button in place")),
             Region::ExtRibbonCmd(id) => lookup(&self.probes.borrow(), &ext_cmd_probe(id))
                 .ok_or_else(|| format!("the extension's command {id} is not drawn in place")),
+            Region::RibbonCmd(id) => lookup(&self.probes.borrow(), &help_tab::ribbon_cmd_probe(id))
+                .ok_or_else(|| {
+                    format!("the ribbon command {id} is not drawn (another tab, a collapsed group or a closed flyout)")
+                }),
             Region::BackstageExt(id) => lookup(&self.probes.borrow(), &backstage_ext_probe(id))
                 .ok_or_else(|| {
                     format!("the File rail draws no extension page {id} (backstage open on its tab)")
@@ -39174,6 +39197,7 @@ impl Docxy {
     /// A small icon-only Home button (the two-row Font/Alignment buttons).
     fn sheet_ib(
         &self,
+        id: &'static str,
         icon: &'static str,
         act: SheetAct,
         on: bool,
@@ -39182,6 +39206,8 @@ impl Docxy {
     ) -> AnyElement {
         div()
             .id(ElementId::Name(format!("sib-{icon}").into()))
+            .relative()
+            .child(self.sheet_cmd_probe(id))
             .flex()
             .items_center()
             .justify_center()
@@ -39204,6 +39230,7 @@ impl Docxy {
     /// A small glyph/text Home button (number formats, wrap, merge, …).
     fn sheet_gb(
         &self,
+        id: &'static str,
         glyph: &'static str,
         act: SheetAct,
         pal: Pal,
@@ -39211,6 +39238,8 @@ impl Docxy {
     ) -> AnyElement {
         div()
             .id(ElementId::Name(format!("sgb-{glyph}").into()))
+            .relative()
+            .child(self.sheet_cmd_probe(id))
             .flex()
             .items_center()
             .justify_center()
@@ -39232,6 +39261,7 @@ impl Docxy {
     /// `icon_only` draws the icon alone, the label as its tooltip (#1020).
     fn sheet_rb(
         &self,
+        id: &'static str,
         icon: Option<&'static str>,
         label: &'static str,
         act: SheetAct,
@@ -39247,6 +39277,9 @@ impl Docxy {
         let pressed = matches!(act, SheetAct::ShowFormulas) && self.sheet_act_checked(act);
         div()
             .id(ElementId::Name(format!("srb-{label}").into()))
+            // A disabled placeholder keeps its probe: F1 opens its page.
+            .relative()
+            .child(self.sheet_cmd_probe(id))
             .when(pressed, |d| {
                 d.bg(Hsla {
                     a: 0.20,
@@ -39279,6 +39312,7 @@ impl Docxy {
     /// checked from the sheet's state; a click runs `act`, which toggles it.
     fn sheet_check(
         &self,
+        id: &'static str,
         label: &'static str,
         act: SheetAct,
         pal: Pal,
@@ -39287,6 +39321,8 @@ impl Docxy {
         let on = self.sheet_act_checked(act);
         div()
             .id(ElementId::Name(format!("scb-{label}").into()))
+            .relative()
+            .child(self.sheet_cmd_probe(id))
             .flex()
             .items_center()
             .gap_1()
@@ -39307,8 +39343,11 @@ impl Docxy {
 
     /// A large icon-over-label Home button (Paste, Styles, Cells, Editing). The
     /// label wraps at a word boundary (never mid-word) and the button sizes to it.
+    /// `id` names its F1 probe (#1869); a split's upper half has none, as the
+    /// whole split draws it.
     fn sheet_lb(
         &self,
+        id: Option<&'static str>,
         icon: Option<&'static str>,
         label: &'static str,
         act: SheetAct,
@@ -39326,6 +39365,8 @@ impl Docxy {
         }
         div()
             .id(ElementId::Name(format!("slb-{label}").into()))
+            .relative()
+            .children(id.map(|id| self.sheet_cmd_probe(id)))
             .flex()
             .flex_col()
             .items_center()
@@ -39377,6 +39418,7 @@ impl Docxy {
             .relative()
             // Where `pointer-click {"input":…}` finds it (#1200).
             .child(probe(&self.probes, format!("sheet-combo:{id}")))
+            .child(self.sheet_cmd_probe(id))
             .px_1p5()
             .rounded(px(3.))
             .border_1()
@@ -39429,10 +39471,12 @@ impl Docxy {
 
     /// The Number-group format combo: shows the selection's current format name
     /// and toggles the format-picker strip.
-    fn sheet_numfmt_combo(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+    fn sheet_numfmt_combo(&self, id: &'static str, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let name = self.active_numfmt_name();
         div()
             .id("numfmt-combo")
+            .relative()
+            .child(self.sheet_cmd_probe(id))
             .flex()
             .items_center()
             .justify_between()
@@ -40274,6 +40318,12 @@ impl Docxy {
             .into_any_element()
     }
 
+    /// The F1 probe of the sheet command `id` (#1869,
+    /// [`help_tab::ribbon_cmd_probe`]); its element must be `relative`.
+    fn sheet_cmd_probe(&self, id: &'static str) -> AnyElement {
+        probe(&self.probes, help_tab::ribbon_cmd_probe(id))
+    }
+
     /// A Large sheet ribbon button that opens a drop-down (Sort & Filter): a
     /// press anywhere on it opens its menu, or shuts it when it is the one
     /// open, as the document ribbon's drop-downs do.
@@ -40303,6 +40353,7 @@ impl Docxy {
             .hover(|d| d.bg(pal.hover))
             .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
+            .child(self.sheet_cmd_probe(id))
             .when_some(icon, |d, ic| d.child(icon_svg(ic, 22., pal.fg)))
             .child(menu_button_label(c.label, 11., pal.fg))
             .on_mouse_down(MouseButton::Left, menu_toggle(id, cx))
@@ -40323,8 +40374,9 @@ impl Docxy {
         let text = c.text(self.sheet_act_toggled(c.act));
         match c.shape {
             Shape::Menu(_) => self.sheet_dropdown_btn(c, pal, cx),
-            Shape::Large(icon) => self.sheet_lb(icon, text, c.act, pal, cx),
+            Shape::Large(icon) => self.sheet_lb(Some(c.id), icon, text, c.act, pal, cx),
             Shape::Row(icon) => self.sheet_rb(
+                c.id,
                 icon,
                 text,
                 c.act,
@@ -40332,20 +40384,23 @@ impl Docxy {
                 pal,
                 cx,
             ),
-            Shape::Check => self.sheet_check(text, c.act, pal, cx),
+            Shape::Check => self.sheet_check(c.id, text, c.act, pal, cx),
             Shape::Icon(icon) => {
-                self.sheet_ib(icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
+                self.sheet_ib(c.id, icon, c.act, sheet_ribbon::act_on(c.act, xf), pal, cx)
             }
-            Shape::Glyph(glyph) => self.sheet_gb(glyph, c.act, pal, cx),
+            Shape::Glyph(glyph) => self.sheet_gb(c.id, glyph, c.act, pal, cx),
             Shape::Combo { wide, .. } => self.sheet_combo(c.id, wide, c.act, pal, cx),
-            Shape::NumFmt => self.sheet_numfmt_combo(pal, cx),
+            Shape::NumFmt => self.sheet_numfmt_combo(c.id, pal, cx),
+            // The whole split, both halves, is the command's (#1869).
             Shape::Split { icon, menu } => v_flex()
+                .relative()
+                .child(self.sheet_cmd_probe(c.id))
                 .h_full()
                 .items_center()
                 .child(
                     div()
                         .flex_1()
-                        .child(self.sheet_lb(icon, text, c.act, pal, cx)),
+                        .child(self.sheet_lb(None, icon, text, c.act, pal, cx)),
                 )
                 .child(
                     div()
@@ -40723,6 +40778,9 @@ impl Docxy {
             .when(max_w.is_none(), |d| {
                 d.child(probe(&self.probes, format!("gallery-{}", gal.id)))
             })
+            // The gallery's own id, in place and in a flyout (#1869): its
+            // tiles carry no id of their own.
+            .child(probe(&self.probes, help_tab::ribbon_cmd_probe(gal.id)))
             .children(rows)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .into_any_element();
@@ -40749,6 +40807,8 @@ impl Docxy {
             .hover(move |d| d.bg(pal.hover))
             .child("▾")
             .child(probe(&self.probes, format!("gallery-more-{id}")))
+            // F1 on More is F1 on its gallery (#1869).
+            .child(probe(&self.probes, help_tab::ribbon_cmd_probe(id)))
             .tooltip(|w, cx| Tooltip::new("More").build(w, cx))
             // A press opens the gallery's flyout or shuts it, as a collapsed
             // group's button does (the backdrop may close it first).
@@ -40874,6 +40934,7 @@ impl Docxy {
             .flex_none()
             .child(well)
             .child(probe(&self.probes, "gallery"))
+            .child(probe(&self.probes, help_tab::ribbon_cmd_probe(gal.id)))
             .into_any_element()
     }
 
@@ -40938,6 +40999,7 @@ impl Docxy {
             .when(probed, |d| {
                 d.child(probe(&self.probes, format!("doc-combo:{}", cmd.id)))
             })
+            .child(probe(&self.probes, help_tab::ribbon_cmd_probe(cmd.id)))
             .flex()
             .items_center()
             .justify_between()
@@ -41040,7 +41102,7 @@ impl Docxy {
                 d.child(icon_svg(cmd.icon.0, 26., pal.fg))
             })
             .child(label)
-            .children(ext_cmd_probe_el(&self.probes, act))
+            .children(cmd_probe_els(&self.probes, cmd.id, act))
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .when(enabled, |d| {
@@ -41099,6 +41161,9 @@ impl Docxy {
             .px_1()
             .h_full()
             .child(probe(&self.probes, format!("ribbon-split:{}", cmd.id)))
+            // The whole split, both halves (#1869); an extension's own
+            // probe stays on the upper half.
+            .child(probe(&self.probes, help_tab::ribbon_cmd_probe(cmd.id)))
             .child(top)
             .child(arrow)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
@@ -41130,7 +41195,7 @@ impl Docxy {
             .cursor_pointer()
             .hover(|d| d.bg(pal.hover))
             .child(probe(&self.probes, format!("ribbon-split:{id}")))
-            .children(ext_cmd_probe_el(&self.probes, cmd.act))
+            .children(cmd_probe_els(&self.probes, id, cmd.act))
             .when(!cmd.icon.0.is_empty(), |d| {
                 d.child(icon_svg(cmd.icon.0, 26., fg))
             })
@@ -41300,7 +41365,7 @@ impl Docxy {
                         .child(SharedString::from(cmd.label)),
                 )
             })
-            .children(ext_cmd_probe_el(&self.probes, act))
+            .children(cmd_probe_els(&self.probes, cmd.id, act))
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
             .when(enabled, |d| {
@@ -44199,9 +44264,25 @@ impl Render for Docxy {
         let pressed = cx.entity();
         let pen = cx.entity();
         let tear = cx.entity();
+        let pointer = cx.entity();
         let gesture_listeners = canvas(
             |_b, _w, _a| {},
             move |_b, _s, window: &mut Window, _cx: &mut App| {
+                // Whether the pointer is in the window, for F1 on a hovered
+                // ribbon command (#1869). First, so no capture listener
+                // below can stop the event before it; it never stops one
+                // itself, and sets a plain field (no re-render).
+                let (entered, left) = (pointer.clone(), pointer.clone());
+                window.on_mouse_event(move |_ev: &MouseMoveEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        entered.update(cx, |this, _cx| this.pointer_in_window = true);
+                    }
+                });
+                window.on_mouse_event(move |_ev: &MouseExitEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        left.update(cx, |this, _cx| this.pointer_in_window = false);
+                    }
+                });
                 // A tab dragged off the strip (or out of the window) and let
                 // go there tears off into a window of its own, as a browser
                 // tab does. The release is the window's: there is no drop
