@@ -1017,6 +1017,9 @@ pub enum Region {
     BackstageExt(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
+    /// A part of the document tab's scrollbars (#2080), by name:
+    /// [`DOC_BAR_REGIONS`].
+    DocBar(&'static str),
     /// The File screen's scrolling content pane (#1028).
     BackstageContent,
     /// The File screen's left rail (#1028).
@@ -1041,6 +1044,19 @@ pub enum Region {
 /// The Quick Access Toolbar's probed parts [`Region::Qat`] names.
 const QAT_REGIONS: [&str; 4] = ["qat-undo", "qat-redo", "qat-undo-arrow", "qat-redo-arrow"];
 
+/// The document tab's scrollbar parts [`Region::DocBar`] names (#2080): each
+/// bar, its thumb and its arrows, while that bar is shown.
+const DOC_BAR_REGIONS: [&str; 8] = [
+    "doc-vbar",
+    "doc-vbar-thumb",
+    "doc-vbar-up",
+    "doc-vbar-down",
+    "doc-hbar",
+    "doc-hbar-thumb",
+    "doc-hbar-left",
+    "doc-hbar-right",
+];
+
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-heading:Duration`,
 /// `project-hbar-table`,
@@ -1064,6 +1080,15 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         return match arg {
             None => Ok(Region::Qat(qat)),
             Some(_) => Err(format!("'{qat}' does not take an argument; use '{qat}'")),
+        };
+    }
+    if let Some(bar) = DOC_BAR_REGIONS
+        .into_iter()
+        .find(|b| b.eq_ignore_ascii_case(head))
+    {
+        return match arg {
+            None => Ok(Region::DocBar(bar)),
+            Some(_) => Err(format!("'{bar}' does not take an argument; use '{bar}'")),
         };
     }
     match head.to_ascii_lowercase().as_str() {
@@ -1303,6 +1328,7 @@ pub fn region_name(region: Region) -> String {
             if end { "end" } else { "start" }
         ),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
+        Region::DocBar(name) => name.into(),
     }
 }
 
@@ -1949,6 +1975,10 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             .viewport()
             .map(|b| b.center())
             .ok_or_else(|| "the view is not drawn yet".to_string());
+    }
+    if part.starts_with("vbar") || part.starts_with("hbar") {
+        // The view's scrollbars (#2080).
+        return view.bar_region(part).map(|b| b.center());
     }
     if part == "header" {
         // The fixture's header line, just above the view (#2003).
@@ -2742,11 +2772,95 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
         fields.push(("ruler".into(), ruler_state(app)));
         fields.push(("line_numbers".into(), line_numbers_state(app)));
         fields.push(("flow".into(), flow_state(app)));
+        fields.push(("scroll".into(), scroll_state(app)));
         if let Some(tab) = app.tabs.get(app.active) {
             fields.push(("mail".into(), mail_state(tab)));
         }
     }
     Ok(doc)
+}
+
+/// The document view's scroll and scrollbars (#2080): `scroll_y` /
+/// `max_scroll_y` and `scroll_x` / `max_scroll_x` (px, within what the last
+/// frame allowed), `vbar` / `hbar` (`null` while that bar is not shown, else
+/// its `track` and the thumb on it, `thumb_start` / `thumb_len`, px:
+/// `crate::doc_scrollbar::bar_json`), `page_tip` (the `Page N of M` tip a
+/// dragged Print Layout thumb shows, else `null`), and in Print Layout
+/// (`null` in the flow view) `page_count`, `top_page` (1-based: the page
+/// at the view's top, the last at the end) and `page_left_in_view` /
+/// `page_right_in_view` (page 1's painted left / right edge inside the
+/// view, half a pixel of slack), and `caret_in_view`: the painted piece the
+/// caret is in or after lies inside the view (`null` when it is not
+/// painted).
+fn scroll_state(app: &crate::Docxy) -> Json {
+    let probe = app.ruler_probe.borrow();
+    let num = |v: f32| Json::Num(f64::from(v.round()));
+    let handle = &app.doc_scroll;
+    let max = handle.max_offset();
+    let (max_x, max_y) = (f32::from(max.x).max(0.), f32::from(max.y).max(0.));
+    let (x, y) = (
+        (-f32::from(handle.offset().x)).clamp(0., max_x),
+        (-f32::from(handle.offset().y)).clamp(0., max_y),
+    );
+    let view = probe.viewport;
+    let print = !probe.draft;
+    let page1 = probe.pages.first().copied().flatten();
+    let edge_in = |at: f32| {
+        view.map_or(Json::Null, |v| {
+            Json::Bool(at >= v.x - 0.5 && at <= v.x + v.w + 0.5)
+        })
+    };
+    let (left, right) = match (print, page1) {
+        (true, Some(p)) => (edge_in(p.x), edge_in(p.x + p.w)),
+        _ => (Json::Null, Json::Null),
+    };
+    let caret = active_doc(app)
+        .ok()
+        .and_then(|ed| crate::caret_piece_bounds(&ed.caret.path, ed.caret.offset));
+    let caret_in_view = match (caret, view) {
+        (Some(c), Some(v)) => {
+            let (cx0, cy0) = (f32::from(c.left()), f32::from(c.top()));
+            let (cx1, cy1) = (f32::from(c.right()), f32::from(c.bottom()));
+            Json::Bool(
+                cx0 >= v.x - 0.5
+                    && cx1 <= v.x + v.w + 0.5
+                    && cy0 >= v.y - 0.5
+                    && cy1 <= v.y + v.h + 0.5,
+            )
+        }
+        _ => Json::Null,
+    };
+    let pages = probe.pages.len();
+    Json::obj(vec![
+        ("scroll_y", num(y)),
+        ("max_scroll_y", num(max_y)),
+        ("scroll_x", num(x)),
+        ("max_scroll_x", num(max_x)),
+        ("vbar", crate::doc_scrollbar::bar_json(&app.doc_vbar)),
+        ("hbar", crate::doc_scrollbar::bar_json(&app.doc_hbar)),
+        ("page_tip", app.doc_vbar.tip().map_or(Json::Null, Json::Str)),
+        (
+            "page_count",
+            if print {
+                Json::Num(pages as f64)
+            } else {
+                Json::Null
+            },
+        ),
+        (
+            "top_page",
+            if print {
+                app.print_pages()
+                    .top(handle)
+                    .map_or(Json::Null, |(n, _)| Json::Num((n + 1) as f64))
+            } else {
+                Json::Null
+            },
+        ),
+        ("page_left_in_view", left),
+        ("page_right_in_view", right),
+        ("caret_in_view", caret_in_view),
+    ])
 }
 
 /// The document view's horizontal scroll and painted tables (#1895):
@@ -11028,6 +11142,8 @@ mod tests {
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
+            Region::DocBar("doc-vbar"),
+            Region::DocBar("doc-hbar-right"),
             Region::Qat("qat-undo"),
             Region::Qat("qat-redo"),
             Region::Qat("qat-undo-arrow"),

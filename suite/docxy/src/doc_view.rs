@@ -28,7 +28,6 @@ pub use edit::{CaretFormat, DocFormat};
 use super::*;
 use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::package::Package;
-use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +138,9 @@ pub struct DocView {
     /// A key or host command moved the caret or edited: the next frame
     /// scrolls the caret into view, once it is painted.
     reveal: bool,
+    /// The view's scrollbars (#2080), the suite's document bars.
+    vbar: crate::doc_scrollbar::Bar,
+    hbar: crate::doc_scrollbar::Bar,
 }
 
 impl DocView {
@@ -183,6 +185,8 @@ impl DocView {
             editable: false,
             on_change: None,
             reveal: false,
+            vbar: Default::default(),
+            hbar: Default::default(),
         }
     }
 
@@ -796,6 +800,9 @@ impl DocView {
                 "max_scroll_x",
                 Json::Num(f64::from(self.max_scroll_x().round())),
             ),
+            // The scrollbars as last painted (#2080), `null` while hidden.
+            ("vbar", crate::doc_scrollbar::bar_json(&self.vbar)),
+            ("hbar", crate::doc_scrollbar::bar_json(&self.hbar)),
             (
                 "text_width",
                 self.text_w
@@ -937,6 +944,12 @@ impl DocView {
     }
 
     /// The scrolling area's bounds as last painted.
+    /// A scrollbar region (#2080): `vbar`, `hbar-thumb`, `vbar-down`, ...
+    /// ([`crate::doc_scrollbar::bar_region`]).
+    pub(crate) fn bar_region(&self, part: &str) -> Result<Bounds<Pixels>, String> {
+        crate::doc_scrollbar::bar_region(&self.vbar, &self.hbar, part)
+    }
+
     pub(crate) fn viewport(&self) -> Option<Bounds<Pixels>> {
         self.viewport.get()
     }
@@ -1114,32 +1127,14 @@ impl Render for DocView {
                 .left_0()
                 .size_full(),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .w(px(12.))
-                    .child(
-                        Scrollbar::vertical(&self.scroll)
-                            .id("ext-doc-scrollbar")
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .h(px(12.))
-                    .child(
-                        Scrollbar::horizontal(&self.scroll)
-                            .id("ext-doc-hscrollbar")
-                            .scrollbar_show(ScrollbarShow::Scrolling),
-                    ),
-            )
+            // The suite's document bars (#2080), over the host's padding
+            // along the right and bottom edges.
+            .children(crate::doc_scrollbar::overlay_bars(
+                &self.scroll,
+                &self.vbar,
+                &self.hbar,
+                crate::doc_scrollbar::BarColors::of(cx),
+            ))
     }
 }
 
