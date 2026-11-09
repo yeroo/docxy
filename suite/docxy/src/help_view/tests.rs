@@ -1,6 +1,7 @@
 use super::lay::{self, Row, Run};
 use super::*;
 use crate::field_edit::Op;
+use crate::help_manual::Source;
 use crate::help_manual::tests::fixture_bundle;
 use helpdocs::md::{Align, parse};
 
@@ -24,6 +25,7 @@ fn page_bundle(body: &str) -> Bundle {
     .unwrap();
     Bundle::from_files(
         Editor::Word,
+        Source::BuiltIn,
         vec![
             ("contents.txt".into(), b"p\n".to_vec()),
             ("p.md".into(), body.as_bytes().to_vec()),
@@ -268,6 +270,15 @@ fn help_read_reports_the_page() {
     assert_eq!(contents[2].get_str("title"), Some("Font group"));
     assert_eq!(j.get_str("top_heading"), Some("font-group"));
     assert_eq!(j.get_usize("problems"), Some(0));
+    // The manual's revision, where it was read from and the footer (#1857):
+    // the fixture is read from a directory, as an installed manual is.
+    let fixture = "0000000000000000000000000000000000fixture";
+    assert_eq!(j.get_str("revision"), Some(fixture));
+    assert_eq!(j.get_str("source"), Some("installed"));
+    assert_eq!(
+        j.get_str("footer"),
+        Some(format!("Word manual · revision {fixture} · installed").as_str())
+    );
 
     let v = view("welcome");
     let j = v.read_json(0);
@@ -324,6 +335,7 @@ fn help_read_reports_the_heading_at_the_top() {
 fn help_read_answers_on_a_page_without_blocks() {
     let b = Bundle::from_files(
         Editor::Word,
+        Source::BuiltIn,
         vec![
             ("contents.txt".into(), b"empty\n".to_vec()),
             ("empty.md".into(), b"---\ntitle: Empty\n---\n".to_vec()),
@@ -588,5 +600,51 @@ fn code_keeps_its_lines() {
             lang: "rust".into(),
             lines: vec!["fn a() {}".into(), "  b".into()]
         }
+    );
+}
+
+/// The footer names the manual, its revision (a commit cut to 7) and where
+/// it was read from; a bundle without a REVISION says so (#1857).
+#[test]
+fn the_footer_names_the_manual_its_revision_and_source() {
+    let bundle = |editor: Editor, source: Source, revision: Option<&str>| {
+        let mut files = vec![
+            ("contents.txt".to_string(), b"p\n".to_vec()),
+            ("p.md".to_string(), b"# P\n".to_vec()),
+        ];
+        if let Some(r) = revision {
+            files.push(("REVISION".into(), r.as_bytes().to_vec()));
+        }
+        Bundle::from_files(editor, source, files).unwrap()
+    };
+    let sha = "0123abcdef0123abcdef0123abcdef0123abcdef\n";
+    assert_eq!(
+        footer_text(&bundle(Editor::Word, Source::BuiltIn, Some(sha))),
+        "Word manual · revision 0123abc · built in"
+    );
+    assert_eq!(
+        footer_text(&bundle(Editor::Excel, Source::Installed, Some("v2026.11"))),
+        "Excel manual · revision v2026.11 · installed"
+    );
+    assert_eq!(
+        footer_text(&bundle(Editor::Project, Source::BuiltIn, None)),
+        "Project manual · revision unknown · built in"
+    );
+    assert_eq!(
+        footer_text(&bundle(Editor::Word, Source::Installed, Some("\n"))),
+        "Word manual · revision unknown · installed"
+    );
+    // help-read reports what the footer draws, and no revision as null.
+    let v = HelpView::new(
+        Arc::new(bundle(Editor::Word, Source::BuiltIn, None)),
+        Loc::page("p"),
+        None,
+    );
+    let j = v.read_json(0);
+    assert_eq!(j.get("revision"), Some(&Json::Null));
+    assert_eq!(j.get_str("source"), Some("built-in"));
+    assert_eq!(
+        j.get_str("footer"),
+        Some("Word manual · revision unknown · built in")
     );
 }

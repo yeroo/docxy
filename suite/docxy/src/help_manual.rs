@@ -37,8 +37,45 @@ impl Editor {
         }
     }
 
+    /// The editor as About and the Help footer name it (`Word manual`).
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Editor::Word => "Word",
+            Editor::Excel => "Excel",
+            Editor::Project => "Project",
+        }
+    }
+
     pub(crate) fn from_name(name: &str) -> Option<Editor> {
         Editor::ALL.into_iter().find(|e| e.name() == name)
+    }
+}
+
+/// Where a manual was read from (#1857): About and the Help footer say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// From a directory: `<config root>/docxy/manual/<editor>/`, which
+    /// overrides the built-in one (a harness instance's sandbox manual too).
+    Installed,
+    /// Built into the binary from `docs/manual/<editor>/`.
+    BuiltIn,
+}
+
+impl Source {
+    /// The harness's word (`app-info`, `help-read`).
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Source::Installed => "installed",
+            Source::BuiltIn => "built-in",
+        }
+    }
+
+    /// The words About and the Help footer show.
+    pub(crate) fn words(self) -> &'static str {
+        match self {
+            Source::Installed => "installed",
+            Source::BuiltIn => "built in",
+        }
     }
 }
 
@@ -47,6 +84,7 @@ impl Editor {
 #[derive(Debug)]
 pub(crate) struct Bundle {
     pub editor: Editor,
+    pub source: Source,
     pub manual: helpdocs::Manual,
     pub files: HashMap<String, Arc<[u8]>>,
 }
@@ -54,7 +92,11 @@ pub(crate) struct Bundle {
 impl Bundle {
     /// A bundle from `(path, bytes)` pairs relative to the editor's
     /// directory; `None` when it has no page.
-    pub(crate) fn from_files(editor: Editor, files: Vec<(String, Vec<u8>)>) -> Option<Bundle> {
+    pub(crate) fn from_files(
+        editor: Editor,
+        source: Source,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Option<Bundle> {
         let images = files
             .iter()
             .map(|(p, b)| (p.replace('\\', "/"), b))
@@ -64,6 +106,7 @@ impl Bundle {
         let manual = helpdocs::Manual::from_files(files);
         (!manual.pages.is_empty()).then_some(Bundle {
             editor,
+            source,
             manual,
             files: images,
         })
@@ -74,7 +117,11 @@ impl Bundle {
     /// link is never followed, so it cannot take the walk out of the bundle
     /// or round in a loop.
     pub(crate) fn read_dir(editor: Editor, dir: &Path) -> Option<Bundle> {
-        Bundle::from_files(editor, helpdocs::bundle::files(dir).ok()?)
+        Bundle::from_files(
+            editor,
+            Source::Installed,
+            helpdocs::bundle::files(dir).ok()?,
+        )
     }
 
     /// The image `src` names (a bundle path such as `images/x.png`).
@@ -119,7 +166,7 @@ pub(crate) fn find(
     if harness {
         return None;
     }
-    Bundle::from_files(editor, embedded())
+    Bundle::from_files(editor, Source::BuiltIn, embedded())
 }
 
 /// `editor`'s manual, read once per process; `None` when none is installed
@@ -228,11 +275,13 @@ pub(crate) mod tests {
         for harness in [false, true] {
             let b = find(Editor::Word, &root, harness, embedded_one).unwrap();
             assert_eq!(b.manual.pages[0].id, "installed");
+            assert_eq!(b.source, Source::Installed);
             assert_eq!(b.image("images/a.png").map(|b| &b[..]), Some(&b"png"[..]));
         }
         // Another editor's directory is not this one's.
         let b = find(Editor::Excel, &root, false, embedded_one).unwrap();
         assert_eq!(b.manual.pages[0].id, "built-in");
+        assert_eq!(b.source, Source::BuiltIn);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -242,6 +291,15 @@ pub(crate) mod tests {
         assert!(find(Editor::Word, &root, true, embedded_one).is_none());
         let b = find(Editor::Word, &root, false, embedded_one).unwrap();
         assert_eq!(b.manual.pages[0].id, "built-in");
+        assert_eq!(b.source, Source::BuiltIn);
+        assert_eq!(
+            [Source::Installed.name(), Source::BuiltIn.name()],
+            ["installed", "built-in"]
+        );
+        assert_eq!(
+            [Source::Installed.words(), Source::BuiltIn.words()],
+            ["installed", "built in"]
+        );
     }
 
     #[test]

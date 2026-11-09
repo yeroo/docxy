@@ -337,6 +337,8 @@ impl HelpView {
             ("open", Json::Bool(true)),
             ("editor", s(self.editor().name())),
             ("revision", m.revision.as_deref().map_or(Json::Null, s)),
+            ("source", s(self.bundle.source.name())),
+            ("footer", s(&footer_text(&self.bundle))),
             ("page", s(&page.id)),
             ("title", s(&page.title)),
             ("tab_title", s(&self.title())),
@@ -365,6 +367,21 @@ impl HelpView {
             ("top_heading", top_heading),
         ])
     }
+}
+
+/// The line under the Help tab's page (#1857): the manual, its revision
+/// (a commit cut to 7, `Manual::short_revision`) and where it was read from,
+/// as in `Word manual · revision 0123abc · built in`.
+pub(crate) fn footer_text(bundle: &Bundle) -> String {
+    let revision = bundle.manual.short_revision().map_or_else(
+        || "revision unknown".to_string(),
+        |r| format!("revision {r}"),
+    );
+    format!(
+        "{} manual · {revision} · {}",
+        bundle.editor.title(),
+        bundle.source.words()
+    )
 }
 
 /// The top-level block of the heading `slug` (headings are only top-level

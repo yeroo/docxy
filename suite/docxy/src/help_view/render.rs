@@ -269,24 +269,41 @@ impl Docxy {
         // Room below the last row, so every heading can reach the top.
         let room = f32::from(v.scroll.bounds().size.height).max(200.);
         body = body.child(div().h(px(room)));
+        // The body and its scrollbar end where the footer starts.
+        let scrolled = div().relative().flex_1().min_h(px(0.)).child(body).child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .w(px(12.))
+                .child(
+                    gpui_component::scroll::Scrollbar::vertical(&v.scroll)
+                        .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                ),
+        );
+        // The manual, its revision and where it was read from (#1857).
+        let footer = div()
+            .flex_none()
+            .px(px(28.))
+            .py(px(4.))
+            .border_t_1()
+            .border_color(pal.border)
+            .text_size(px(12.))
+            .text_color(pal.dim)
+            .child(super::footer_text(&v.bundle));
         div()
             .relative()
             .flex_1()
             .h_full()
             .min_h(px(0.))
             .child(probe(&self.probes, "help-page"))
-            .child(body)
             .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .w(px(12.))
-                    .child(
-                        gpui_component::scroll::Scrollbar::vertical(&v.scroll)
-                            .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
-                    ),
+                v_flex()
+                    .size_full()
+                    .min_h(px(0.))
+                    .child(scrolled)
+                    .child(footer),
             )
             .on_mouse_down(
                 MouseButton::Left,
