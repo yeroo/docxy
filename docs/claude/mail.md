@@ -2341,10 +2341,14 @@ series' first day.
   id, times, `series_master_id`, `event_type`, `calendar_id`, `web_link`,
   `last_modified`, both recurrences, the body and the internal columns.
 - **The body is a reference.** `event_body_on` gives an `occurrence` with no body of
-  its own its stored master's (same calendar). `Store::event_body` and
-  `event_for_send_on` both use it, so `update_event_fields` compares an occurrence
-  edit's body against what the host showed: a subject-only edit does not mark
-  `BODY`, and the master's HTML is not sent. Copying it would have duplicated the
+  its own its stored master's (same calendar). `Store::event_body` uses it, and so
+  does `update_event_fields` for its `old` body, so it compares an occurrence edit's
+  body against what the host showed: a subject-only edit does not mark `BODY`, and
+  the master's HTML is not sent. `event_for_send` reads the row's own body (r4): a
+  `BODY` PATCH sends exactly what the row holds, so clearing an occurrence's shown
+  body sends it cleared. Known transient: until the next sync stores that occurrence
+  as an `exception` (which has no fallback), `event_body` still shows the master's
+  body; a marker would need a new column. Copying it would have duplicated the
   Teams HTML of each master into every occurrence.
 - **A missing master is fetched** (`Engine::fetch_missing_masters`, after a round
   and before the write). It fetches the masters of the round's occurrences and of
@@ -2432,7 +2436,9 @@ series' first day.
   `apply_calendar_sync_gone_masters_deletes_only_that_calendars_master`,
   `a_series_master_leaves_the_grid_once_its_series_has_a_row`,
   `a_created_series_stays_on_the_grid_through_its_reconcile`,
-  `apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences`; `engine.rs`
+  `apply_calendar_sync_unchanged_master_fills_only_the_rounds_occurrences`,
+  `update_event_fields_clearing_an_occurrences_body_sends_it_empty`; `outbox.rs`
+  `update_event_clearing_an_occurrences_shown_body_sends_it_empty`; `engine.rs`
   `calendar_delta_occurrences_take_their_masters_fields`,
   `calendar_delta_repairs_blank_occurrences_in_one_pass`,
   `calendar_delta_fetches_a_missing_master`,
