@@ -2551,9 +2551,10 @@ series' first day.
   `kind` (`DraftKind::Reply`, `ReplyAll`, `Forward`) the answer asked for. A host that
   stopped waiting for a request (a timeout, the form closed) compares them with the
   request it waits for now and drops a late draft of an earlier one: a failed request
-  emits no `DraftReady` (a transport error emits nothing at all), so "late" and "failed"
-  cannot be told apart otherwise, and two answers in one conversation share
-  `conversation_id`.
+  emits no `DraftReady`, and no failure event names the request (a transport error emits
+  only `State(Offline)`, when the engine was not offline already; others an `Error` or
+  the sign-in events), so "late" and "failed" cannot be told apart otherwise, and two
+  answers in one conversation share `conversation_id`.
 - `original` is never rewritten. Graph is addressed by `current_id` (an id from before a
   move, #1896), as every other message command is, but `compose_reply` /
   `compose_forward` pass the command's own id to `store_composed_draft` for the event.
