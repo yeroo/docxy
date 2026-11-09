@@ -9,6 +9,8 @@ repos publish to. `helpdocs/tests/fixture/` holds a small example of each.
 `docs/manual/<editor>/`, where `<editor>` is `word`, `excel` or `project`:
 
 - `REVISION`: one line, the spec-repo commit the bundle was published from.
+  The suite shows it in About docxy suite and under every Help page (cut to
+  7 characters when it is a commit); a blank line counts as no revision.
 - `contents.txt`: the contents tree, one page id per line, nested by two
   spaces of indent per level. A line starting `#` is a comment. The first
   entry is the manual's root page. Every page is listed exactly once.

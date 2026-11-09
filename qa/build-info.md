@@ -33,11 +33,15 @@ regression each one is meant to catch.
   `commit:` equal to `git rev-parse HEAD`.
 - File › Account shows `v… · <short sha> · after #<PR> · local · manual build` and
   a visible **Manual build** badge. The About dialog lists every field, also with the
-  badge, and the pasted text is the `--version` block plus a `summary:` line.
+  badge, then a Word, Excel and Project manual row (its revision and built in or
+  installed, or `none`). The pasted text is the `--version` block, a `summary:`
+  line, then one `<editor> manual:` line per editor (`word manual:`, `excel
+  manual:`, `project manual:`) with the same values.
 - Untracked scratch files (a new `notes.txt`) do not set `dirty`: only tracked changes do.
 
 **Fails when:** the badge is missing on a dirty or local build, the SHA is not
-`git rev-parse HEAD`, or Copy pastes something other than the `--version` text.
+`git rev-parse HEAD`, or Copy pastes something other than the `--version` block, the `summary:` line and
+the three `<editor> manual:` lines.
 
 ## A commit and a rebuild update the SHA
 

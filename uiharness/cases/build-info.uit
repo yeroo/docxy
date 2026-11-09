@@ -9,6 +9,11 @@ test About shows the build info and app-info matches it
   assert reply.commit_hex is true
   assert reply.kind is local
   assert reply.manual is true
+  # A harness instance reads manuals from its sandbox only, and this case
+  # installs none, so About's manual rows say none (#1857).
+  assert reply.manuals.word is null
+  assert reply.manuals.excel is null
+  assert reply.manuals.project is null
   call backstage {"action":"open"}
   assert reply.open is true
   call account {"action":"open"}

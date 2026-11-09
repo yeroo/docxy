@@ -20,6 +20,18 @@ test F1 on Home opens the Home page in a Help tab, and F1 there its root
   assert reply.title is Home tab
   assert reply.via is area
   assert reply.problems is 0
+  # The footer under the page names the manual, its revision (the fixture's
+  # is not a commit, so it is shown whole) and where it was read from: this
+  # instance's sandbox, an installed manual (#1857).
+  assert reply.revision is 0000000000000000000000000000000000fixture
+  assert reply.source is installed
+  assert reply.footer is Word manual · revision 0000000000000000000000000000000000fixture · installed
+  call app-info {}
+  assert reply.manuals.word.revision is 0000000000000000000000000000000000fixture
+  assert reply.manuals.word.short is 0000000000000000000000000000000000fixture
+  assert reply.manuals.word.source is installed
+  assert reply.manuals.excel is null
+  assert reply.manuals.project is null
   call tab-list {}
   # The sample document, basic.docx, then the Help tab right after it.
   assert reply.active is 2
@@ -271,4 +283,21 @@ test without a manual for the editor, Help and F1 still say it is coming
   assert reply.items.1.text is Help: the documentation is coming soon
   call real-key {"key":"f1"}
   call help-read {}
+  assert reply.open is false
+
+test About names each editor's manual, its revision and where it came from
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Help","command":"About docxy suite"}
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is about
+  # The rows' indices shift with the build's optional issue row, so the
+  # values are read through app-info; the shot shows the longest row,
+  # "<41-character revision> (installed)", fits the dialog (#1857).
+  shot window
+  call app-info {}
+  assert reply.manuals.word.source is installed
+  assert reply.manuals.excel is null
+  key escape
+  call dialog-read {}
   assert reply.open is false

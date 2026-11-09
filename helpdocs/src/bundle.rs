@@ -69,7 +69,9 @@ pub enum Problem {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Manual {
-    /// The spec-repo commit the bundle was published from.
+    /// The spec-repo commit the bundle was published from: `REVISION`'s
+    /// first line, trimmed; `None` when the file is missing or that line is
+    /// blank.
     pub revision: Option<String>,
     /// The contents tree in order, listed pages that exist only.
     pub contents: Vec<Entry>,
@@ -107,7 +109,11 @@ impl Manual {
                 t.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(t)
             };
             if path == "REVISION" {
-                m.revision = text().lines().next().map(|l| l.trim().to_string());
+                m.revision = text()
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+                    .filter(|r| !r.is_empty());
             } else if path == "contents.txt" {
                 contents_txt = Some(text());
             } else if path.starts_with("images/") {
@@ -156,6 +162,15 @@ impl Manual {
         }
         m.check();
         m
+    }
+
+    /// The revision as the Help footer shows it (#1857): a commit (all
+    /// ASCII hex, longer than 7) cut to its first 7 characters, as
+    /// `buildinfo`'s `short_commit` cuts the binary's; anything else whole.
+    pub fn short_revision(&self) -> Option<&str> {
+        let r = self.revision.as_deref()?;
+        let commit = r.len() > 7 && r.bytes().all(|b| b.is_ascii_hexdigit());
+        Some(if commit { &r[..7] } else { r })
     }
 
     pub fn page(&self, id: &str) -> Option<&Page> {
@@ -711,5 +726,33 @@ pub(crate) mod tests {
         assert_eq!(m.revision.as_deref(), Some("abc123"));
         assert_eq!(m.strict, vec!["home"]);
         assert_eq!(m.problems, vec![]);
+    }
+
+    #[test]
+    fn a_blank_revision_is_none() {
+        for rev in ["", "\n", "  \nabc\n", "\u{feff}\n"] {
+            let m = Manual::from_files([("REVISION", rev), ("x.md", "")]);
+            assert_eq!(m.revision, None, "{rev:?}");
+            assert_eq!(m.short_revision(), None, "{rev:?}");
+        }
+        let m = Manual::from_files([("x.md", "")]);
+        assert_eq!(m.revision, None);
+        assert_eq!(m.short_revision(), None);
+    }
+
+    #[test]
+    fn a_commit_revision_is_cut_to_seven() {
+        let short = |rev: &str| {
+            let m = Manual::from_files([("REVISION", rev), ("x.md", "")]);
+            m.short_revision().map(str::to_string)
+        };
+        let sha = "0123abcdef0123abcdef0123abcdef0123abcdef";
+        assert_eq!(short(sha).as_deref(), Some("0123abc"));
+        assert_eq!(short("0123ABC").as_deref(), Some("0123ABC"));
+        assert_eq!(short("0123abcd").as_deref(), Some("0123abc"));
+        // Not all hex: kept whole (the fixtures' revision, a tag).
+        let fixture = "0000000000000000000000000000000000fixture";
+        assert_eq!(short(fixture).as_deref(), Some(fixture));
+        assert_eq!(short("v2026.11").as_deref(), Some("v2026.11"));
     }
 }

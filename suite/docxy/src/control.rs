@@ -572,6 +572,11 @@ impl Docxy {
                         "plugins".into(),
                         crate::project_formats::plugins_json(crate::project_formats::global()),
                     ));
+                    // The manual each editor's Help shows (#1857).
+                    fields.push((
+                        "manuals".into(),
+                        crate::about::manuals_json(|e| self.help_bundle(e)),
+                    ));
                 }
                 info
             }));
