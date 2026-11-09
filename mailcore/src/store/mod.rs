@@ -11444,6 +11444,599 @@ mod calendar_tests {
         );
         assert_eq!(calendar_of(&s, "G1"), "CAL1");
     }
+    // --- Occurrences take their series' fields (#2064) ---
+
+    /// A synced series master of `cal`, with every field a series gives
+    /// its occurrences set.
+    fn master(id: &str, cal: &str, start: &str, end: &str) -> NewEvent {
+        NewEvent {
+            subject: "Standup".into(),
+            location: "Room 1".into(),
+            organizer_name: "Ann".into(),
+            organizer_addr: "ann@x".into(),
+            response_status: "accepted".into(),
+            body_preview: "Daily".into(),
+            body_html: "<p>Join the standup</p>".into(),
+            reminder_minutes: 10,
+            is_reminder_on: true,
+            show_as: "busy".into(),
+            is_online_meeting: true,
+            online_meeting_provider: "teamsForBusiness".into(),
+            join_url: "https://teams.microsoft.com/l/meetup-join/9".into(),
+            categories: vec!["Blue category".into()],
+            sensitivity: "private".into(),
+            importance: "high".into(),
+            event_type: "seriesMaster".into(),
+            is_organizer: false,
+            response_requested: false,
+            allow_new_time_proposals: false,
+            has_attachments: true,
+            original_start_time_zone: "W. Europe Standard Time".into(),
+            original_end_time_zone: "W. Europe Standard Time".into(),
+            ..in_cal(id, cal, start, end)
+        }
+    }
+
+    /// An occurrence of `master` as calendarView delta returns it: id,
+    /// type, times and `seriesMasterId`, nothing else.
+    fn minimal(id: &str, master: &str, cal: &str, start: &str, end: &str) -> NewEvent {
+        NewEvent {
+            id: id.into(),
+            start_utc: start.into(),
+            end_utc: end.into(),
+            series_master_id: Some(master.into()),
+            event_type: "occurrence".into(),
+            calendar_id: cal.into(),
+            ..Default::default()
+        }
+    }
+
+    fn attendee(addr: &str) -> NewAttendee {
+        NewAttendee {
+            name: format!("n-{addr}"),
+            addr: addr.into(),
+            r#type: "required".into(),
+            response: "accepted".into(),
+            ..Default::default()
+        }
+    }
+
+    const M_START: &str = "2026-07-20T09:00:00Z";
+    const M_END: &str = "2026-07-20T09:15:00Z";
+
+    /// Master `M` with attendees, occurrences `O1`/`O2` (O1 on the
+    /// master's own start) and exception `X` of calendar `A`: a window
+    /// round's events.
+    fn series_round() -> SyncedCalendar {
+        let mut x = minimal(
+            "X",
+            "M",
+            "A",
+            "2026-07-22T10:00:00Z",
+            "2026-07-22T10:15:00Z",
+        );
+        x.event_type = "exception".into();
+        x.subject = "Moved standup".into();
+        x.organizer_name = "Ann".into();
+        x.organizer_addr = "ann@x".into();
+        let mut round = window(
+            "A",
+            vec![
+                master("M", "A", M_START, M_END),
+                minimal("O1", "M", "A", M_START, M_END),
+                minimal(
+                    "O2",
+                    "M",
+                    "A",
+                    "2026-07-21T09:00:00Z",
+                    "2026-07-21T09:15:00Z",
+                ),
+                x,
+            ],
+        );
+        round.fetched.attendees[0].1 = vec![attendee("ann@x"), attendee("bob@x")];
+        round
+    }
+
+    fn series_store() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        s.apply_calendar_sync(FROM, TO, &[series_round()], STAMP)
+            .unwrap();
+        s
+    }
+
+    fn row(s: &Store, id: &str) -> EventRow {
+        s.event(id).unwrap().unwrap()
+    }
+
+    fn addrs(s: &Store, id: &str) -> Vec<String> {
+        s.event_attendees(id)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.addr)
+            .collect()
+    }
+
+    /// Every field an occurrence takes from its master, as the master has it.
+    fn assert_filled_from(o: &EventRow, m: &EventRow) {
+        assert_eq!(o.subject, m.subject);
+        assert_eq!(o.location, m.location);
+        assert_eq!(o.organizer_name, m.organizer_name);
+        assert_eq!(o.organizer_addr, m.organizer_addr);
+        assert_eq!(o.response_status, m.response_status);
+        assert_eq!(o.is_all_day, m.is_all_day);
+        assert_eq!(o.reminder_minutes, m.reminder_minutes);
+        assert_eq!(o.is_reminder_on, m.is_reminder_on);
+        assert_eq!(o.show_as, m.show_as);
+        assert_eq!(o.is_online_meeting, m.is_online_meeting);
+        assert_eq!(o.online_meeting_provider, m.online_meeting_provider);
+        assert_eq!(o.join_url, m.join_url);
+        assert_eq!(o.categories, m.categories);
+        assert_eq!(o.sensitivity, m.sensitivity);
+        assert_eq!(o.importance, m.importance);
+        assert_eq!(o.is_cancelled, m.is_cancelled);
+        assert_eq!(o.is_organizer, m.is_organizer);
+        assert_eq!(o.response_requested, m.response_requested);
+        assert_eq!(o.allow_new_time_proposals, m.allow_new_time_proposals);
+        assert_eq!(o.has_attachments, m.has_attachments);
+        assert_eq!(o.original_start_time_zone, m.original_start_time_zone);
+        assert_eq!(o.original_end_time_zone, m.original_end_time_zone);
+    }
+
+    #[test]
+    fn apply_calendar_sync_fills_occurrences_from_their_master() {
+        let s = series_store();
+        let m = row(&s, "M");
+        for id in ["O1", "O2"] {
+            let o = row(&s, id);
+            assert_filled_from(&o, &m);
+            // Its own identity, times and type stay.
+            assert_eq!(o.event_type, "occurrence");
+            assert_eq!(o.series_master_id.as_deref(), Some("M"));
+            assert_eq!(o.recurrence, None, "the series' recurrence is the master's");
+            assert_eq!(addrs(&s, id), ["ann@x", "bob@x"]);
+        }
+        assert_eq!(row(&s, "O2").start_utc, "2026-07-21T09:00:00Z");
+        let body_preview: String = s
+            .conn
+            .query_row("SELECT body_preview FROM events WHERE id = 'O1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(body_preview, "Daily");
+        // The body is referred to, not copied.
+        let own_body: String = s
+            .conn
+            .query_row("SELECT body_html FROM events WHERE id = 'O1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(own_body, "");
+    }
+
+    #[test]
+    fn apply_calendar_sync_fill_leaves_exceptions_alone() {
+        let s = series_store();
+        let x = row(&s, "X");
+        assert_eq!(x.subject, "Moved standup");
+        assert_eq!(x.location, "");
+        assert!(addrs(&s, "X").is_empty());
+        // A changed master leaves it alone too.
+        let changed = NewEvent {
+            subject: "Renamed".into(),
+            ..master("M", "A", M_START, M_END)
+        };
+        s.apply_calendar_sync(FROM, TO, &[delta("A", vec![changed], &[], "L2")], STAMP)
+            .unwrap();
+        assert_eq!(row(&s, "X").subject, "Moved standup");
+        assert_eq!(row(&s, "O1").subject, "Renamed");
+    }
+
+    #[test]
+    fn apply_calendar_sync_fill_keeps_an_untouched_occurrences_local_write() {
+        let s = series_store();
+        // An optimistic RSVP on O1, its op not yet sent.
+        s.set_event_response("O1", "declined");
+        // A round that touches neither O1 nor M keeps it; O2, re-sent
+        // minimal, is filled again.
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[delta(
+                "A",
+                vec![minimal(
+                    "O2",
+                    "M",
+                    "A",
+                    "2026-07-21T09:00:00Z",
+                    "2026-07-21T09:15:00Z",
+                )],
+                &[],
+                "L2",
+            )],
+            STAMP,
+        )
+        .unwrap();
+        assert_eq!(row(&s, "O1").response_status, "declined");
+        assert_filled_from(&row(&s, "O2"), &row(&s, "M"));
+        assert_eq!(addrs(&s, "O2"), ["ann@x", "bob@x"]);
+        // An empty round too.
+        s.apply_calendar_sync(FROM, TO, &[delta("A", vec![], &[], "L3")], STAMP)
+            .unwrap();
+        assert_eq!(row(&s, "O1").response_status, "declined");
+    }
+
+    #[test]
+    fn apply_calendar_sync_delta_master_change_refreshes_its_occurrences() {
+        let s = series_store();
+        s.set_event_response("O1", "declined");
+        let changed = NewEvent {
+            subject: "Renamed".into(),
+            location: "Room 2".into(),
+            ..master("M", "A", M_START, M_END)
+        };
+        let mut round = delta("A", vec![changed], &[], "L2");
+        round.fetched.attendees[0].1 = vec![attendee("cid@x")];
+        s.apply_calendar_sync(FROM, TO, &[round], STAMP).unwrap();
+        for id in ["O1", "O2"] {
+            let o = row(&s, id);
+            assert_eq!(
+                (o.subject.as_str(), o.location.as_str()),
+                ("Renamed", "Room 2")
+            );
+            assert_eq!(addrs(&s, id), ["cid@x"]);
+        }
+        // Server truth for the series wins over the pending write.
+        assert_eq!(row(&s, "O1").response_status, "accepted");
+    }
+
+    /// The issue's store: occurrences stored blank before #2064, beside
+    /// their stored master; a round that changes nothing repairs them.
+    #[test]
+    fn apply_calendar_sync_repairs_blank_occurrences_from_a_stored_master() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.upsert_event(&master("M", "A", M_START, M_END)).unwrap();
+        s.put_event_attendees("M", &[attendee("ann@x")]).unwrap();
+        s.upsert_event(&minimal("O1", "M", "A", M_START, M_END))
+            .unwrap();
+        s.upsert_event(&minimal(
+            "O2",
+            "M",
+            "A",
+            "2026-07-21T09:00:00Z",
+            "2026-07-21T09:15:00Z",
+        ))
+        .unwrap();
+        assert_eq!(s.blank_occurrence_masters("A").unwrap(), ["M"]);
+        s.apply_calendar_sync(FROM, TO, &[delta("A", vec![], &[], "L2")], STAMP)
+            .unwrap();
+        for id in ["O1", "O2"] {
+            assert_filled_from(&row(&s, id), &row(&s, "M"));
+            assert_eq!(addrs(&s, id), ["ann@x"]);
+        }
+        assert!(s.blank_occurrence_masters("A").unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_calendar_sync_fill_needs_the_master_in_the_same_calendar() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[
+                window("B", vec![master("M", "B", M_START, M_END)]),
+                window("A", vec![minimal("O1", "M", "A", M_START, M_END)]),
+            ],
+            STAMP,
+        )
+        .unwrap();
+        assert_eq!(row(&s, "O1").subject, "");
+        assert!(!s.has_series_master("A", "M").unwrap());
+        assert!(s.has_series_master("B", "M").unwrap());
+        assert!(!s.has_series_master("B", "O1").unwrap(), "not a master");
+        assert_eq!(s.blank_occurrence_masters("A").unwrap(), ["M"]);
+    }
+
+    #[test]
+    fn events_in_range_leaves_out_synced_series_masters_but_not_local_ones() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = series_store();
+        // O1 starts with M: the range over that start gives O1, not M.
+        let rows = s
+            .events_in_range(M_START, M_END, &["A".to_string()])
+            .unwrap();
+        assert_eq!(ids(&rows), ["O1"]);
+        assert!(s.event("M").unwrap().is_some(), "the master stays stored");
+        // A local series (#2034) is its own row until its occurrences sync.
+        let mut f = in_calendar("A");
+        f.recurrence = Some(Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: None,
+        });
+        let local = s.create_local_event(&f, "Me", "me@x").unwrap();
+        assert_eq!(row(&s, &local).event_type, "seriesMaster");
+        let rows = s.events_in_range(FROM, TO, &["A".to_string()]).unwrap();
+        assert!(ids(&rows).contains(&local.as_str()));
+        assert!(!ids(&rows).contains(&"M"));
+    }
+
+    #[test]
+    fn events_in_window_leaves_out_series_masters() {
+        let s = series_store();
+        assert_eq!(ids(&all_events(&s)), ["O1", "O2", "X"]);
+    }
+
+    #[test]
+    fn events_in_range_leaves_out_cancelled_series_members() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let day = |d: u32| {
+            (
+                format!("2026-07-{d:02}T09:00:00Z"),
+                format!("2026-07-{d:02}T10:00:00Z"),
+            )
+        };
+        let cancelled = |id: &str, ty: &str, d: u32| {
+            let (a, b) = day(d);
+            NewEvent {
+                event_type: ty.into(),
+                is_cancelled: true,
+                series_master_id: (ty != "singleInstance").then(|| "M".to_string()),
+                ..in_cal(id, "A", &a, &b)
+            }
+        };
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[window(
+                "A",
+                vec![
+                    cancelled("CO", "occurrence", 20),
+                    cancelled("CX", "exception", 21),
+                    cancelled("CS", "singleInstance", 22),
+                ],
+            )],
+            STAMP,
+        )
+        .unwrap();
+        let a = ["A".to_string()];
+        let rows = s.events_in_range(FROM, TO, &a).unwrap();
+        assert_eq!(ids(&rows), ["CS"]);
+        assert_eq!(ids(&all_events(&s)), ["CS"]);
+        assert_eq!(s.days_with_events(2026, 7, 0, &a).unwrap(), [22]);
+    }
+
+    #[test]
+    fn days_with_events_ignores_a_series_master() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[window("A", vec![master("M", "A", M_START, M_END)])],
+            STAMP,
+        )
+        .unwrap();
+        let a = ["A".to_string()];
+        assert!(s.days_with_events(2026, 7, 0, &a).unwrap().is_empty());
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[delta(
+                "A",
+                vec![minimal(
+                    "O2",
+                    "M",
+                    "A",
+                    "2026-07-21T09:00:00Z",
+                    "2026-07-21T09:15:00Z",
+                )],
+                &[],
+                "L2",
+            )],
+            STAMP,
+        )
+        .unwrap();
+        assert_eq!(s.days_with_events(2026, 7, 0, &a).unwrap(), [21]);
+    }
+
+    /// An all-day series' minimal occurrence reads `isAllDay` false; the
+    /// fill takes the master's, so its day is not shifted by the offset.
+    #[test]
+    fn a_filled_all_day_occurrence_marks_its_utc_date() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        let all_day = NewEvent {
+            is_all_day: true,
+            ..master("M", "A", "2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
+        };
+        s.apply_calendar_sync(
+            FROM,
+            TO,
+            &[window(
+                "A",
+                vec![
+                    all_day,
+                    minimal(
+                        "O1",
+                        "M",
+                        "A",
+                        "2026-07-22T00:00:00Z",
+                        "2026-07-23T00:00:00Z",
+                    ),
+                ],
+            )],
+            STAMP,
+        )
+        .unwrap();
+        assert!(row(&s, "O1").is_all_day);
+        let a = ["A".to_string()];
+        assert_eq!(s.days_with_events(2026, 7, -300, &a).unwrap(), [22]);
+    }
+
+    #[test]
+    fn event_body_of_an_occurrence_falls_back_to_its_master() {
+        let s = series_store();
+        assert_eq!(
+            s.event_body("O1").unwrap().as_deref(),
+            Some("<p>Join the standup</p>")
+        );
+        // An exception is a full item: its own (empty) body.
+        assert_eq!(s.event_body("X").unwrap().as_deref(), Some(""));
+        // An occurrence with a body of its own reads that.
+        s.conn
+            .execute(
+                "UPDATE events SET body_html = '<p>own</p>' WHERE id = 'O2'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.event_body("O2").unwrap().as_deref(), Some("<p>own</p>"));
+        assert_eq!(s.event_body("nope").unwrap(), None);
+        // Its master gone, an occurrence reads its own empty body.
+        s.delete_event("M").unwrap();
+        assert_eq!(s.event_body("O1").unwrap().as_deref(), Some(""));
+        // `event_for_send` reads the same body.
+        s.conn
+            .execute("UPDATE events SET body_html = '' WHERE id = 'O2'", [])
+            .unwrap();
+        assert_eq!(s.event_for_send("O2").unwrap().unwrap().body_html, "");
+    }
+
+    #[test]
+    fn blank_occurrence_masters_lists_distinct_ids() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        for e in [
+            minimal("O1", "M2", "A", M_START, M_END),
+            minimal(
+                "O2",
+                "M2",
+                "A",
+                "2026-07-21T09:00:00Z",
+                "2026-07-21T09:15:00Z",
+            ),
+            minimal(
+                "O3",
+                "M1",
+                "A",
+                "2026-07-22T09:00:00Z",
+                "2026-07-22T09:15:00Z",
+            ),
+            // Another calendar's, a filled one and an exception: not listed.
+            minimal("B1", "MB", "B", M_START, M_END),
+            NewEvent {
+                subject: "filled".into(),
+                ..minimal("O4", "M3", "A", M_START, M_END)
+            },
+            NewEvent {
+                event_type: "exception".into(),
+                ..minimal("X1", "M4", "A", M_START, M_END)
+            },
+        ] {
+            s.upsert_event(&e).unwrap();
+        }
+        assert_eq!(s.blank_occurrence_masters("A").unwrap(), ["M1", "M2"]);
+        assert_eq!(s.blank_occurrence_masters("B").unwrap(), ["MB"]);
+        assert!(s.blank_occurrence_masters("C").unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_calendar_range_keeps_a_stored_series_master() {
+        let s = series_store();
+        // A plain calendarView range over the master's start: full
+        // occurrences, never the master.
+        let full = NewEvent {
+            subject: "Standup".into(),
+            organizer_name: "Ann".into(),
+            ..minimal("O1", "M", "A", M_START, M_END)
+        };
+        s.apply_calendar_range(
+            "2026-07-20T00:00:00Z",
+            "2026-07-21T00:00:00Z",
+            &fetched("A", vec![full]),
+            STAMP,
+        )
+        .unwrap();
+        assert!(s.has_series_master("A", "M").unwrap());
+        // A window round that does not return it still removes it.
+        s.apply_calendar_sync(FROM, TO, &[window("A", vec![])], STAMP)
+            .unwrap();
+        assert!(!s.has_series_master("A", "M").unwrap());
+    }
+
+    #[test]
+    fn update_event_fields_on_a_filled_occurrence_does_not_mark_the_masters_body() {
+        let s = series_store();
+        let o = row(&s, "O1");
+        let edit = LocalEventFields {
+            subject: "Just this one".into(),
+            start_utc: o.start_utc.clone(),
+            end_utc: o.end_utc.clone(),
+            location: o.location.clone(),
+            // What a host shows: `event_body`, the master's.
+            body_html: s.event_body("O1").unwrap().unwrap(),
+            attendees: s
+                .event_attendees("O1")
+                .unwrap()
+                .into_iter()
+                .map(|a| AttendeeInput {
+                    name: a.name,
+                    addr: a.addr,
+                    r#type: a.r#type,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.update_event_fields("O1", &edit).unwrap(),
+            EventFieldSet::SUBJECT
+        );
+    }
+
+    #[test]
+    fn apply_calendar_sync_gone_masters_deletes_only_that_calendars_master() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        // A master starting before the window, another calendar's copy of
+        // its id, and an occurrence named by mistake.
+        let before = ("2026-05-04T09:00:00Z", "2026-05-04T09:15:00Z");
+        s.upsert_event(&master("M", "A", before.0, before.1))
+            .unwrap();
+        s.upsert_event(&master("MB", "B", before.0, before.1))
+            .unwrap();
+        s.upsert_event(&minimal("O1", "M", "A", M_START, M_END))
+            .unwrap();
+        let mut round = delta("A", vec![], &["M"], "L2");
+        if let CalendarRound::Delta { gone_masters, .. } = &mut round.round {
+            *gone_masters = vec!["M".into(), "MB".into(), "O1".into()];
+        }
+        s.apply_calendar_sync(FROM, TO, &[round], STAMP).unwrap();
+        assert!(s.event("M").unwrap().is_none());
+        assert!(s.event("MB").unwrap().is_some(), "another calendar's");
+        // O1 went with the cascade of the removed M, not as a gone master.
+        assert!(s.event("O1").unwrap().is_none());
+        let s2 = Store::open_in_memory().unwrap();
+        s2.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s2.upsert_event(&minimal("O1", "M", "A", M_START, M_END))
+            .unwrap();
+        let mut round = delta("A", vec![], &[], "L2");
+        if let CalendarRound::Delta { gone_masters, .. } = &mut round.round {
+            *gone_masters = vec!["O1".into()];
+        }
+        s2.apply_calendar_sync(FROM, TO, &[round], STAMP).unwrap();
+        assert!(s2.event("O1").unwrap().is_some(), "not a master");
+    }
 }
 
 #[cfg(test)]

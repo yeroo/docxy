@@ -11962,6 +11962,506 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Occurrences take their series' fields (#2064) ---
+
+    /// `now + secs` as a Graph `dateTime` (no `Z`).
+    fn graph_time_from_now(secs: i64) -> String {
+        unix_to_iso8601((now_unix() as i64 + secs) as u64)
+            .trim_end_matches('Z')
+            .to_string()
+    }
+
+    /// A series master as Graph returns it, starting `from_now` seconds
+    /// from now for a quarter of an hour.
+    fn graph_series_master_json(id: &str, from_now: i64, subject: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","type":"seriesMaster","subject":"{subject}",
+            "start":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
+            "isAllDay":false,"location":{{"displayName":"Room 7"}},
+            "organizer":{{"emailAddress":{{"name":"Ann","address":"ann@x"}}}},
+            "responseStatus":{{"response":"accepted"}},"showAs":"busy",
+            "isOnlineMeeting":true,"onlineMeetingProvider":"teamsForBusiness",
+            "onlineMeeting":{{"joinUrl":"https://teams.microsoft.com/l/meetup-join/7"}},
+            "body":{{"contentType":"html","content":"<p>series body</p>"}},
+            "attendees":[
+              {{"type":"required","status":{{"response":"accepted"}},"emailAddress":{{"name":"Ann","address":"ann@x"}}}},
+              {{"type":"optional","status":{{"response":"none"}},"emailAddress":{{"name":"Bob","address":"bob@x"}}}}]
+            }}"#,
+            graph_time_from_now(from_now),
+            graph_time_from_now(from_now + 900),
+        )
+    }
+
+    /// An occurrence as calendarView delta returns it: id, type, times and
+    /// `seriesMasterId` only.
+    fn minimal_occurrence_json(id: &str, master: &str, from_now: i64) -> String {
+        format!(
+            r#"{{"id":"{id}","type":"occurrence","seriesMasterId":"{master}",
+            "start":{{"dateTime":"{}.0000000","timeZone":"UTC"}},
+            "end":{{"dateTime":"{}.0000000","timeZone":"UTC"}}}}"#,
+            graph_time_from_now(from_now),
+            graph_time_from_now(from_now + 900),
+        )
+    }
+
+    /// A stored series master of `calendar` (`graph_series_master_json`'s fields
+    /// that matter here).
+    fn stored_master(id: &str, calendar: &str, from_now: i64, subject: &str) -> NewEvent {
+        NewEvent {
+            subject: subject.into(),
+            location: "Room 7".into(),
+            organizer_name: "Ann".into(),
+            organizer_addr: "ann@x".into(),
+            response_status: "accepted".into(),
+            event_type: "seriesMaster".into(),
+            end_utc: unix_to_iso8601((now_unix() as i64 + from_now + 900) as u64),
+            ..stored_event(id, calendar, from_now)
+        }
+    }
+
+    /// A stored occurrence of `master` as calendarView delta gave it.
+    fn stored_minimal(id: &str, master: &str, calendar: &str, from_now: i64) -> NewEvent {
+        NewEvent {
+            subject: String::new(),
+            series_master_id: Some(master.into()),
+            event_type: "occurrence".into(),
+            end_utc: unix_to_iso8601((now_unix() as i64 + from_now + 900) as u64),
+            ..stored_event(id, calendar, from_now)
+        }
+    }
+
+    /// How many `GET /me/events/{id}` a server answered.
+    fn event_gets(srv: &FakeServer) -> Vec<String> {
+        paths_from(srv, 0)
+            .into_iter()
+            .filter(|p| p.starts_with("/me/events/"))
+            .collect()
+    }
+
+    fn subjects(store: &Store, ids: &[&str]) -> Vec<String> {
+        ids.iter()
+            .map(|id| store.event(id).unwrap().unwrap().subject)
+            .collect()
+    }
+
+    const DAY: i64 = 86400;
+
+    #[test]
+    fn calendar_delta_occurrences_take_their_masters_fields() {
+        let exception = minimal_occurrence_json("X", "SM", 3 * DAY + 7200).replacen(
+            r#""type":"occurrence""#,
+            r#""type":"exception","subject":"Moved""#,
+            1,
+        );
+        let page = events_body(&[
+            graph_series_master_json("SM", 3600, "Weekly sync"),
+            minimal_occurrence_json("O1", "SM", 3600),
+            minimal_occurrence_json("O2", "SM", DAY + 3600),
+            minimal_occurrence_json("O3", "SM", 2 * DAY + 3600),
+            exception,
+        ]);
+        let routes = calendar_routes(&[("CAL-A", true, "me@x")], vec![("CAL-A", 200, page)]);
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-occurrences-filled", routes, |_| {});
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["O1", "O2", "O3", "X"]);
+        for id in ["O1", "O2", "O3"] {
+            let o = store.event(id).unwrap().unwrap();
+            assert_eq!(o.subject, "Weekly sync");
+            assert_eq!(
+                (o.organizer_name.as_str(), o.organizer_addr.as_str()),
+                ("Ann", "ann@x")
+            );
+            assert_eq!(o.location, "Room 7");
+            assert_eq!(o.show_as, "busy");
+            assert_eq!(o.join_url, "https://teams.microsoft.com/l/meetup-join/7");
+            assert_eq!(o.response_status, "accepted");
+            let atts: Vec<String> = store
+                .event_attendees(id)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.addr)
+                .collect();
+            assert_eq!(atts, ["ann@x", "bob@x"]);
+            assert_eq!(
+                store.event_body(id).unwrap().as_deref(),
+                Some("<p>series body</p>")
+            );
+        }
+        assert_eq!(store.event("X").unwrap().unwrap().subject, "Moved");
+        // The master came with the round: nothing fetched.
+        assert!(event_gets(&srv).is_empty(), "{:?}", event_gets(&srv));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The issue's store: blank occurrences beside their stored master,
+    /// and a deltaLink with no change. One pass repairs them.
+    #[test]
+    fn calendar_delta_repairs_blank_occurrences_in_one_pass() {
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-occurrences-repaired", routes, |s| {
+                seed_synced_calendar(s, "CAL-A", vec![], (&from, &to), &link);
+                s.upsert_event(&stored_master("SM", "CAL-A", -40 * DAY, "Weekly sync"))
+                    .unwrap();
+                for (id, at) in [("O1", 3600), ("O2", DAY + 3600)] {
+                    s.upsert_event(&stored_minimal(id, "SM", "CAL-A", at))
+                        .unwrap();
+                }
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(
+            subjects(&store, &["O1", "O2"]),
+            ["Weekly sync", "Weekly sync"]
+        );
+        assert_eq!(store.event("O1").unwrap().unwrap().organizer_addr, "ann@x");
+        // The pass replayed the link: no initial round, no master fetch.
+        assert_eq!(view_paths(&srv, "CAL-A"), std::slice::from_ref(&link));
+        assert!(event_gets(&srv).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_fetches_a_missing_master() {
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let mut routes = vec![get_route(
+            "/me/events/SM",
+            200,
+            &graph_series_master_json("SM", -40 * DAY, "Weekly sync"),
+        )];
+        routes.extend(calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[]))],
+        ));
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-master-fetched", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![
+                        stored_minimal("O1", "SM", "CAL-A", 3600),
+                        stored_minimal("O2", "SM", "CAL-A", DAY + 3600),
+                    ],
+                    (&from, &to),
+                    &link,
+                );
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        {
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(
+                subjects(&store, &["O1", "O2"]),
+                ["Weekly sync", "Weekly sync"]
+            );
+            assert!(store.has_series_master("CAL-A", "SM").unwrap());
+            assert_eq!(
+                ids_in(&store, "CAL-A"),
+                ["O1", "O2"],
+                "the master is not drawn"
+            );
+        }
+        // The next pass has it stored: no second GET.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A master that 404s (gone, or in a calendar `/me/events` cannot
+    /// reach): the rest of the pass is written, with no `Error`, and the
+    /// next pass of the session does not ask again.
+    #[test]
+    fn calendar_delta_missing_master_404_writes_the_rest_once_per_session() {
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(&[event_from_now("E-NEW", 7200)], &link),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("calendar-master-404", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_minimal("O1", "SM", "CAL-A", 3600)],
+                    (&from, &to),
+                    &link,
+                );
+            });
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let mut seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        seen.extend(wait_for_calendar_updates(&handle.evt_rx, 1));
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["O1", "E-NEW"]);
+        assert_eq!(
+            store.event("O1").unwrap().unwrap().subject,
+            "",
+            "left blank"
+        );
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seeds CAL-A synced over today's window with master `SM`, starting
+    /// before the window, subject `Old`, and its occurrences O1 and O2
+    /// (filled by the seeding round), ending with the calendar's link.
+    fn seed_series_before_window(s: &Store) {
+        let (from, to) = today_window();
+        seed_synced_calendar(
+            s,
+            "CAL-A",
+            vec![
+                stored_master("SM", "CAL-A", -40 * DAY, "Old"),
+                stored_minimal("O1", "SM", "CAL-A", 3600),
+                stored_minimal("O2", "SM", "CAL-A", DAY + 3600),
+            ],
+            (&from, &to),
+            &delta_link_of("CAL-A"),
+        );
+        assert_eq!(subjects(s, &["O1", "O2"]), ["Old", "Old"]);
+    }
+
+    /// A series edited whose master starts before the window: Graph lists
+    /// the master as `@removed` beside a re-sent occurrence. The master is
+    /// refetched and every occurrence takes its new fields.
+    #[test]
+    fn calendar_delta_removed_master_beside_occurrences_is_refetched() {
+        let link = delta_link_of("CAL-A");
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(
+                    &[
+                        minimal_occurrence_json("O1", "SM", 3600),
+                        removed_json("SM"),
+                    ],
+                    "/cal-delta/CAL-A?token=2",
+                ),
+            ),
+            get_route(
+                "/me/events/SM",
+                200,
+                &graph_series_master_json("SM", -40 * DAY, "New"),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "calendar-removed-master-refetched",
+            routes,
+            seed_series_before_window,
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(subjects(&store, &["SM", "O1", "O2"]), ["New", "New", "New"]);
+        assert_eq!(store.event("O2").unwrap().unwrap().location, "Room 7");
+        // No cascade: the round's link is kept.
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            "/cal-delta/CAL-A?token=2"
+        );
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master alone listed as `@removed`: it is refetched and stored
+    /// fresh; #2013's cascade still drops the in-window occurrences and
+    /// the delta state, and the next pass's initial round brings them
+    /// back, filled from the refetched master.
+    #[test]
+    fn calendar_delta_master_only_removed_is_refetched_and_restored_next_pass() {
+        let link = delta_link_of("CAL-A");
+        let initial = events_body(&[
+            minimal_occurrence_json("O1", "SM", 3600),
+            minimal_occurrence_json("O2", "SM", DAY + 3600),
+        ]);
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(&[removed_json("SM")], "/cal-delta/CAL-A?token=2"),
+            ),
+            get_route(
+                "/me/calendars/CAL-A/calendarView/delta?",
+                200,
+                &with_delta_link(&initial, "/cal-delta/CAL-A?token=3"),
+            ),
+            get_route(
+                "/me/events/SM",
+                200,
+                &graph_series_master_json("SM", -40 * DAY, "New"),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "calendar-master-only-removed",
+            routes,
+            seed_series_before_window,
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        {
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(store.event("SM").unwrap().unwrap().subject, "New");
+            assert!(ids_in(&store, "CAL-A").is_empty(), "the cascade");
+            assert_eq!(store.calendar_delta("CAL-A").unwrap(), None);
+        }
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["O1", "O2"]);
+        assert_eq!(subjects(&store, &["O1", "O2"]), ["New", "New"]);
+        // The initial round had the master stored: one GET, in pass 1.
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_removed_master_404_deletes_the_stored_master() {
+        let link = delta_link_of("CAL-A");
+        let routes = vec![
+            get_route(
+                &link,
+                200,
+                &calendar_delta_page(&[removed_json("SM")], "/cal-delta/CAL-A?token=2"),
+            ),
+            get_route(
+                "/me/calendars?",
+                200,
+                &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "calendar-removed-master-404",
+            routes,
+            seed_series_before_window,
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        let seen = wait_for_calendar_updates(&handle.evt_rx, 1);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.event("SM").unwrap(), None);
+        assert!(ids_in(&store, "CAL-A").is_empty());
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_delta_master_fetch_throttled_writes_nothing() {
+        let (from, to) = today_window();
+        let link = delta_link_of("CAL-A");
+        let throttled = Route {
+            method: "GET".into(),
+            path_prefix: "/me/events/SM".into(),
+            status: 429,
+            headers: vec![("Retry-After".into(), "30".into())],
+            body: "{}".into(),
+        };
+        let routes = vec![
+            (throttled, None),
+            (
+                get_route(
+                    &link,
+                    200,
+                    &calendar_delta_page(
+                        &[event_from_now("E-NEW", 7200)],
+                        "/cal-delta/CAL-A?token=2",
+                    ),
+                ),
+                None,
+            ),
+            (
+                get_route(
+                    "/me/calendars?",
+                    200,
+                    &events_body(&[calendar_json("CAL-A", true, "me@x")]),
+                ),
+                None,
+            ),
+        ];
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_limited(
+            "calendar-master-throttled",
+            routes,
+            |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_minimal("O1", "SM", "CAL-A", 3600)],
+                    (&from, &to),
+                    &link,
+                );
+            },
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        // A bad range after it marks the end of the throttled pass.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["O1"]);
+        assert_eq!(
+            store.calendar_delta("CAL-A").unwrap().unwrap().delta_link,
+            link
+        );
+        assert_eq!(event_gets(&srv), ["/me/events/SM"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn calendar_delta_throttled_keeps_the_link_and_writes_nothing() {
         let (from, to) = today_window();
