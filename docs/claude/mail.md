@@ -2503,3 +2503,35 @@ series' first day.
   `respond_event_optimistically_flips_status_and_drains_to_accept`; lookxy
   `ui::calendar` `accept_key_opens_a_comment_prompt_and_enter_submits_it_with_the_comment`,
   `tentative_key_sets_the_tentative_status`.
+
+## A draft's unpushed body is kept against a fetch (#2082)
+
+- `Store::put_fetched_body_with_headers` (and the `cfg(test)` `put_fetched_body`) write
+  nothing and return `Ok(false)` when a body is already stored for the id and either
+  the row has an unsaved compose edit (`local_edit > 0`) or a queued `SaveDraft` /
+  `SendDraft` names it by the id it is stored under now (`current_id_on`: an op queued
+  under the `local:` id since reconciled, or before a move, #1896). Neither the body
+  nor the headers change. Such an op PATCHes `Store::draft`'s body at drain time
+  (`ensure_draft_on_graph`), so a fetched body written over the user's would be sent as
+  the draft's: a `SendDraft` deferred by a 5xx, then a `FetchBody`, sent Graph's
+  quote-only reply.
+- Other ops (`MarkRead`, `Delete`, ...) push no body and keep nothing; a row with no
+  stored body takes the fetch, as it holds no user text. The check
+  (`fetched_body_is_kept_on`) and the write share one `write_tx`. It reads the outbox
+  only after the cheaper tests (a stored body, then `local_edit`), and skips an outbox
+  payload it cannot decode, so one bad row does not fail every fetch.
+- `put_body` is not guarded: it is the local writer (`createReply`'s body in
+  `store_composed_draft`, an embedder's own write), and refusing it would lose the newer
+  text.
+- The engine's `fetch_and_store_body` takes a kept body as an answer: `BodyReady`, and
+  `Ok(true)`, so `FetchBody` is answered, `FetchMessage` does not fail with "could not
+  store the body", and the background fetcher does not park. `get_body_for` (#1901)
+  still decides whether an embedder asks; this is the store-side backstop.
+- Embedders' tests: the platform secret store is skipped only under mailcore's own
+  `cfg(test)`, so a client's tests that reach the token store set
+  `MAILCORE_TOKEN_STORE=file` (`tokencache` and `testserver` module docs).
+- Tests: `store` `kept_body_tests` (a local edit, a queued `SaveDraft` / `SendDraft`, an op
+  under the reconciled `local:` id, `MarkRead` and `Delete` keep nothing, no body yet,
+  `put_body` still writes, an undecodable outbox row); `engine.rs`
+  `a_deferred_send_keeps_the_users_body_over_a_fetch` (the 500 PATCH, then `FetchBody`
+  before the back-off, then `Refresh`: the PATCH before `/send` carries the user's body).
