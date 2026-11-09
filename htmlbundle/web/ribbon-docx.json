@@ -3523,6 +3523,18 @@
                     "body": "",
                     "shortcut": "Ctrl+F1"
                   }
+                },
+                {
+                  "id": "switchmodes",
+                  "label": "Switch Modes",
+                  "icon": "page-color",
+                  "act": "SwitchModes",
+                  "keyTip": "S",
+                  "tip": {
+                    "title": "Switch Modes",
+                    "body": "",
+                    "shortcut": ""
+                  }
                 }
               ]
             }
