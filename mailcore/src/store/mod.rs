@@ -840,8 +840,14 @@ pub enum CalendarRound {
     /// A round from the stored deltaLink: `fetched`'s events (and their
     /// attendees) are added or changed, and each `removed` id goes, within
     /// the window, with its occurrences when the round upserts none of
-    /// them (`apply_calendar_delta_on` has the rule).
-    Delta { removed: Vec<String> },
+    /// them (`apply_calendar_delta_on` has the rule). Each `gone_masters`
+    /// id (#2064) is a stored series master a refetch found gone (a 404):
+    /// its `seriesMaster` row of that calendar goes, whatever its dates,
+    /// as a master before the window is outside the removal's bound.
+    Delta {
+        removed: Vec<String>,
+        gone_masters: Vec<String>,
+    },
 }
 
 /// One calendar of a sync pass (`Store::apply_calendar_sync`, #2013): what
@@ -3505,7 +3511,9 @@ impl Store {
     /// Events overlapping `[from_utc, to_utc)`: `start_utc < to_utc AND
     /// end_utc > from_utc`, so multi-day/ongoing events that started before
     /// the window (or end after it) still show, not just ones fully
-    /// contained in it. Ordered `start_utc ASC`.
+    /// contained in it. Ordered `start_utc ASC`. Only what a grid draws
+    /// (`GRID_ROWS`, #2064): no synced series master, no cancelled
+    /// occurrence or exception.
     pub fn events_in_window(
         &self,
         from_utc: &str,
@@ -3513,7 +3521,7 @@ impl Store {
     ) -> Result<Vec<EventRow>, StoreError> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {EVENT_ROW_COLUMNS} FROM events
-             WHERE start_utc < ?2 AND end_utc > ?1
+             WHERE start_utc < ?2 AND end_utc > ?1 AND {GRID_ROWS}
              ORDER BY start_utc ASC"
         ))?;
         let rows = stmt
@@ -3522,8 +3530,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// `events_in_window`'s overlap rule and order, restricted to events of
-    /// the calendars in `calendar_ids` (#1984). An empty slice returns no
+    /// `events_in_window`'s overlap rule, order and `GRID_ROWS`, restricted
+    /// to events of the calendars in `calendar_ids` (#1984). An empty slice returns no
     /// events (not every calendar's).
     pub fn events_in_range(
         &self,
@@ -3538,6 +3546,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {EVENT_ROW_COLUMNS} FROM events
              WHERE start_utc < ?2 AND end_utc > ?1 AND calendar_id IN ({marks})
+                   AND {GRID_ROWS}
              ORDER BY start_utc ASC"
         ))?;
         let args = [from_utc, to_utc]
@@ -3558,7 +3567,10 @@ impl Store {
     /// a zero-length one marks its start day. An all-day event marks the
     /// days of its UTC dates `[start, end)`, without the offset: under
     /// `Prefer: outlook.timezone="UTC"` Graph gives an all-day event's
-    /// dates at UTC midnight. Cancelled events count like any other.
+    /// dates at UTC midnight. The events are `events_in_range`'s, so a
+    /// series master marks no day, and neither does a cancelled occurrence
+    /// or exception (#2064), while a cancelled single event counts like
+    /// any other: it stays on the grid for Remove from Calendar (#2024).
     ///
     /// One fixed offset, not a time zone: in a month with a DST change, an
     /// event within the shifted hour of local midnight can mark the
@@ -3625,23 +3637,44 @@ impl Store {
     /// `get_body`'s `None`-means-"nothing stored" convention, adapted to a
     /// column that's always present (`NOT NULL DEFAULT ''`) rather than a
     /// row that may or may not exist in a separate table.
+    ///
+    /// An occurrence with no body of its own reads its stored series
+    /// master's (#2064): the fill refers to the master's body rather than
+    /// copying it into every occurrence.
     pub fn event_body(&self, id: &str) -> Result<Option<String>, StoreError> {
-        let body = self
+        event_body_on(&self.conn, id)
+    }
+
+    /// The series masters of `calendar_id`'s blank occurrences (#2064,
+    /// `BLANK_OCCURRENCE`), distinct and sorted: what a sync pass fetches
+    /// when the master is not stored (`Engine::refresh_calendar`).
+    pub fn blank_occurrence_masters(&self, calendar_id: &str) -> Result<Vec<String>, StoreError> {
+        let ids = self
+            .conn
+            .prepare(&format!(
+                "SELECT DISTINCT series_master_id FROM events
+                 WHERE calendar_id = ?1 AND event_type = 'occurrence'
+                       AND series_master_id IS NOT NULL AND id NOT LIKE 'local:%'
+                       AND {BLANK_OCCURRENCE}
+                 ORDER BY series_master_id"
+            ))?
+            .query_map(params![calendar_id], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(ids)
+    }
+
+    /// Whether `id` is stored as a `seriesMaster` of `calendar_id` (#2064).
+    pub fn has_series_master(&self, calendar_id: &str, id: &str) -> Result<bool, StoreError> {
+        let found = self
             .conn
             .query_row(
-                "SELECT body_html FROM events WHERE id = ?1",
-                params![id],
-                |row| row.get::<_, String>(0),
+                "SELECT 1 FROM events
+                 WHERE id = ?2 AND calendar_id = ?1 AND event_type = 'seriesMaster'",
+                params![calendar_id, id],
+                |_| Ok(()),
             )
-            .map(Some)
-            .or_else(|e| {
-                if e == rusqlite::Error::QueryReturnedNoRows {
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            })?;
-        Ok(body)
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Inserts a locally-created event with a fresh `local:` id and the given
@@ -3923,7 +3956,8 @@ impl Store {
     }
 
     /// Removes a series locally (#2022): the row `master_id` (a local
-    /// series is its own row; a synced master is not stored) and every row
+    /// series is its own row; a synced master is stored when a sync round
+    /// returned or fetched it, #2064) and every row
     /// whose `series_master_id` it is, in any calendar, with their
     /// attendees, in one transaction. Returns how many events went. The
     /// host calls it before `SyncCommand::DeleteEvent { id: master_id }`,
@@ -4207,13 +4241,23 @@ impl Store {
         for c in fetched {
             let cascaded = match &c.round {
                 CalendarRound::Window => {
-                    replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp)?;
+                    replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp, false)?;
                     false
                 }
-                CalendarRound::Delta { removed } => {
-                    apply_calendar_delta_on(&tx, from_utc, to_utc, &c.fetched, removed, stamp)?
-                }
+                CalendarRound::Delta {
+                    removed,
+                    gone_masters,
+                } => apply_calendar_delta_on(
+                    &tx,
+                    from_utc,
+                    to_utc,
+                    &c.fetched,
+                    removed,
+                    gone_masters,
+                    stamp,
+                )?,
             };
+            fill_occurrences_on(&tx, &c.fetched)?;
             if cascaded {
                 tx.execute(
                     "DELETE FROM calendar_deltas WHERE calendar_id = ?1",
@@ -4269,7 +4313,7 @@ impl Store {
     ) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
-        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp)?;
+        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp, true)?;
         tx.commit()?;
         Ok(())
     }
@@ -5152,6 +5196,16 @@ const EVENT_ROW_COLUMNS: &str = "id, subject, start_utc, end_utc, is_all_day, lo
     response_requested, allow_new_time_proposals, has_attachments,
     original_start_tz, original_end_tz, calendar_id";
 
+/// The rows a calendar grid draws (#2064), for `events_in_window` and
+/// `events_in_range`: a synced series master is not an appointment (its
+/// occurrences are), and a cancelled occurrence or exception is gone from
+/// the series. A `local:` master stays: until its `CreateEvent`
+/// reconciles and its occurrences sync, it is the only row of a new
+/// series (#2034). A cancelled `singleInstance` stays too, for Remove from
+/// Calendar (#2024).
+const GRID_ROWS: &str = "NOT (event_type = 'seriesMaster' AND id NOT LIKE 'local:%')
+    AND NOT (is_cancelled = 1 AND event_type IN ('occurrence', 'exception'))";
+
 /// An `EventRow` from a row selected with `EVENT_ROW_COLUMNS`.
 fn event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
     Ok(EventRow {
@@ -5315,18 +5369,26 @@ fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
 /// Replaces `f.calendar_id`'s synced (non-`local:`) events overlapping
 /// `[from_utc, to_utc)` with `f`'s, each stored under that id, with their
 /// attendees, and records the range as fetched at `stamp`.
+///
+/// With `keep_masters` (#2064) its stored `seriesMaster` rows stay: a
+/// `FetchCalendarRange`'s plain `calendarView` never returns a master, so
+/// replacing the range holding a series' first occurrence (the master's
+/// own times) would drop the master its occurrences are filled from. A
+/// delta round's initial window returns them, so it replaces them too.
 fn replace_calendar_range_on(
     conn: &Connection,
     from_utc: &str,
     to_utc: &str,
     f: &FetchedCalendar,
     stamp: RangeStamp,
+    keep_masters: bool,
 ) -> Result<(), StoreError> {
     conn.execute(
         "DELETE FROM events
          WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
-               AND id NOT LIKE 'local:%'",
-        params![from_utc, to_utc, f.calendar_id],
+               AND id NOT LIKE 'local:%'
+               AND NOT (?4 AND event_type = 'seriesMaster')",
+        params![from_utc, to_utc, f.calendar_id, keep_masters],
     )?;
     upsert_fetched_events_on(conn, f)?;
     record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)
@@ -5369,6 +5431,9 @@ fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<()
 /// before the window is "outside the range" when it is edited, and its
 /// occurrences stay; only the row with that id goes.
 ///
+/// Each `gone_masters` id's `seriesMaster` row of the calendar goes too,
+/// of any date (#2064, `CalendarRound::Delta`), before the upserts.
+///
 /// Returns whether a series cascade deleted any row other than the removed
 /// id's own. Then the window is not recorded as fetched, and the caller
 /// drops the calendar's delta state: a master Graph lists as removed may
@@ -5381,6 +5446,7 @@ fn apply_calendar_delta_on(
     to_utc: &str,
     f: &FetchedCalendar,
     removed: &[String],
+    gone_masters: &[String],
     stamp: RangeStamp,
 ) -> Result<bool, StoreError> {
     let named_masters: HashSet<&str> = f
@@ -5406,11 +5472,125 @@ fn apply_calendar_delta_on(
             cascaded |= occurrences > 0;
         }
     }
+    for id in gone_masters {
+        conn.execute(
+            "DELETE FROM events
+             WHERE calendar_id = ?1 AND id = ?2 AND event_type = 'seriesMaster'
+                   AND id NOT LIKE 'local:%'",
+            params![f.calendar_id, id],
+        )?;
+    }
     upsert_fetched_events_on(conn, f)?;
     if !cascaded {
         record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)?;
     }
     Ok(cascaded)
+}
+
+/// What makes a stored occurrence blank (#2064): none of the text a series
+/// gives it. Graph's calendarView delta returns an occurrence with only its
+/// id, type, times and `seriesMasterId`, and every real event has an
+/// organizer, so an occurrence with none of these was never filled.
+const BLANK_OCCURRENCE: &str = "subject = '' AND organizer_name = '' AND organizer_addr = ''
+    AND location = '' AND response_status = ''";
+
+/// The columns an occurrence takes from its series master (#2064,
+/// `fill_occurrences_on`): everything a calendar client shows of it except
+/// its own identity, times, links and body (`event_body_on` refers to the
+/// master's instead of copying it).
+const SERIES_FIELDS: &str = "subject, location, organizer_name, organizer_addr,
+    response_status, body_preview, is_all_day, reminder_minutes, is_reminder_on, show_as,
+    is_online_meeting, online_meeting_provider, join_url, categories, sensitivity,
+    importance, is_cancelled, is_organizer, response_requested, allow_new_time_proposals,
+    has_attachments, original_start_tz, original_end_tz";
+
+/// Fills `f.calendar_id`'s occurrences from their series masters (#2064),
+/// after a sync round's removals and upserts (`apply_calendar_sync`).
+///
+/// An occurrence is filled when it is a non-`local:` `occurrence` of that
+/// calendar whose master is stored there as a `seriesMaster`, and either
+/// the round upserted it, or the round upserted its master (a changed
+/// series, or one the engine fetched), or it is blank
+/// (`BLANK_OCCURRENCE`: a store from before #2064, or a master that came
+/// later). An occurrence neither the round nor its master touched keeps
+/// its own values: an optimistic local write (a `RespondEvent`'s
+/// `response_status`) waits for its op. Exceptions are full items, and
+/// never filled.
+///
+/// The master's `SERIES_FIELDS` are copied and its attendees replace the
+/// occurrence's. This runs after `upsert_fetched_events_on`, which writes
+/// each minimal occurrence's own (empty) attendee list, so the copy wins.
+fn fill_occurrences_on(conn: &Connection, f: &FetchedCalendar) -> Result<(), StoreError> {
+    let touched_occurrences: HashSet<&str> = f
+        .events
+        .iter()
+        .filter(|e| e.event_type == "occurrence")
+        .map(|e| e.id.as_str())
+        .collect();
+    let touched_masters: HashSet<&str> = f
+        .events
+        .iter()
+        .filter(|e| e.event_type == "seriesMaster")
+        .map(|e| e.id.as_str())
+        .collect();
+    let candidates: Vec<(String, String, bool)> = conn
+        .prepare(&format!(
+            "SELECT id, series_master_id, ({BLANK_OCCURRENCE}) FROM events AS o
+             WHERE calendar_id = ?1 AND event_type = 'occurrence' AND id NOT LIKE 'local:%'
+                   AND EXISTS (SELECT 1 FROM events AS m
+                               WHERE m.id = o.series_master_id
+                                     AND m.event_type = 'seriesMaster'
+                                     AND m.calendar_id = o.calendar_id)
+             ORDER BY id"
+        ))?
+        .query_map(params![f.calendar_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (id, master, blank) in candidates {
+        if !(blank
+            || touched_occurrences.contains(id.as_str())
+            || touched_masters.contains(master.as_str()))
+        {
+            continue;
+        }
+        conn.prepare_cached(&format!(
+            "UPDATE events SET ({SERIES_FIELDS}) = (SELECT {SERIES_FIELDS} FROM events WHERE id = ?2)
+             WHERE id = ?1"
+        ))?
+        .execute(params![id, master])?;
+        conn.prepare_cached("DELETE FROM event_attendees WHERE event_id = ?1")?
+            .execute(params![id])?;
+        conn.prepare_cached(
+            "INSERT INTO event_attendees (event_id, name, addr, type, response, response_time,
+                                          proposed_start_utc, proposed_end_utc)
+             SELECT ?1, name, addr, type, response, response_time, proposed_start_utc,
+                    proposed_end_utc
+             FROM event_attendees WHERE event_id = ?2 ORDER BY rowid",
+        )?
+        .execute(params![id, master])?;
+    }
+    Ok(())
+}
+
+/// `Store::event_body` on `conn`: the row's own `body_html`, or for an
+/// `occurrence` with none its stored master's (same calendar,
+/// `seriesMaster`), which an occurrence refers to rather than copies
+/// (#2064). `None` for no such row.
+fn event_body_on(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+    let body = conn
+        .query_row(
+            "SELECT CASE WHEN o.body_html = '' AND o.event_type = 'occurrence'
+                         THEN coalesce(m.body_html, '') ELSE o.body_html END
+             FROM events AS o
+             LEFT JOIN events AS m ON m.id = o.series_master_id
+                  AND m.event_type = 'seriesMaster' AND m.calendar_id = o.calendar_id
+             WHERE o.id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(body)
 }
 
 /// Records `[from_utc, to_utc)` of `calendar_id` as fetched at `stamp.at`,
@@ -5649,6 +5829,11 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
     let Some(mut data) = row else {
         return Ok(None);
     };
+    // An occurrence's body is its master's (#2064), as `Store::event_body`
+    // shows it, so an edit that leaves it alone does not mark `BODY`.
+    if data.body_html.is_empty() {
+        data.body_html = event_body_on(conn, id)?.unwrap_or_default();
+    }
     data.attendees = event_attendees_on(conn, id)?
         .into_iter()
         .map(|a| AttendeeInput {
@@ -8778,11 +8963,13 @@ mod calendar_tests {
         let row = s.event("E1").unwrap().unwrap();
         assert_eq!(row.id, "E1");
         assert_client_fields(&row, &e);
-        // The row is the one the window read gives.
+        // The row is the one the window read gives (E1 is a series master,
+        // which the window leaves out, #2064: compare the plain E2).
         let listed = s
             .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
             .unwrap();
-        assert_eq!(Some(&row), listed.iter().find(|r| r.id == "E1"));
+        assert_eq!(ids(&listed), ["E2"]);
+        assert_eq!(s.event("E2").unwrap().as_ref(), listed.first());
         assert!(!s.event("E2").unwrap().unwrap().is_organizer);
         assert_eq!(s.event("nope").unwrap(), None);
         // A local event is the user's own meeting.
@@ -8913,9 +9100,8 @@ mod calendar_tests {
             &[("E1".into(), vec![attendee.clone()])],
         )
         .unwrap();
-        let rows = s.events_in_window(from, to).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_client_fields(&rows[0], &e);
+        // A series master (`client_event`), so read by id (#2064).
+        assert_client_fields(&s.event("E1").unwrap().unwrap(), &e);
         let atts = s.event_attendees("E1").unwrap();
         assert_eq!(atts[0].r#type, "resource");
         assert_eq!(atts[0].response, "accepted");
@@ -8978,10 +9164,8 @@ mod calendar_tests {
             &[],
         )
         .unwrap();
-        let all = ("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z");
-        let rows = s.events_in_window(all.0, all.1).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_client_fields(&rows[0], &moved);
+        // A series master (`client_event`), so read by id (#2064).
+        assert_client_fields(&s.event("E1").unwrap().unwrap(), &moved);
 
         let again = NewEvent {
             show_as: "free".into(),
@@ -8992,8 +9176,7 @@ mod calendar_tests {
             ..moved
         };
         s.upsert_event(&again).unwrap();
-        let rows = s.events_in_window(all.0, all.1).unwrap();
-        assert_client_fields(&rows[0], &again);
+        assert_client_fields(&s.event("E1").unwrap().unwrap(), &again);
     }
 
     #[test]
@@ -9007,11 +9190,9 @@ mod calendar_tests {
                 [],
             )
             .unwrap();
-        let rows = s
-            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
-            .unwrap();
-        assert_eq!(rows[0].recurrence, None);
-        assert_eq!(rows[0].show_as, "oof", "the rest of the row still reads");
+        let row = s.event("E1").unwrap().unwrap();
+        assert_eq!(row.recurrence, None);
+        assert_eq!(row.show_as, "oof", "the rest of the row still reads");
     }
 
     #[test]
@@ -9907,10 +10088,7 @@ mod calendar_tests {
         let s = Store::open(&path).unwrap();
         let e = client_event("E1", "2026-07-20T09:00:00Z", "2026-07-20T10:00:00Z");
         s.upsert_event(&e).unwrap();
-        let rows = s
-            .events_in_window("2026-07-20T00:00:00Z", "2026-07-21T00:00:00Z")
-            .unwrap();
-        assert_client_fields(&rows[0], &e);
+        assert_client_fields(&s.event("E1").unwrap().unwrap(), &e);
         // ...and `event_attendees` takes an attendee's proposal (#2023).
         let proposing = NewAttendee {
             name: "Bob".into(),
@@ -10535,6 +10713,7 @@ mod calendar_tests {
             fetched: fetched(cal, events),
             round: CalendarRound::Delta {
                 removed: removed.iter().map(|r| r.to_string()).collect(),
+                gone_masters: Vec::new(),
             },
             delta_link: link.into(),
         }
