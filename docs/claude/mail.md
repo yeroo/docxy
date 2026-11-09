@@ -2043,11 +2043,14 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   the expand too, so the refusal belongs to the walk, and the mark follows the first
   call of the link stored as `delta_link`:
   - a head or small-folder walk (`run_delta`) keeps its first page's refusal in memory
-    for its nextLink pages (`DeltaRun::expand_refused`), and stores it, 1 or 0, with
-    its link (`Store::set_reminder_expand_refused`, `folders.reminder_expand_refused`);
+    for its nextLink pages (`DeltaRun::expand_refused`), and stores it, 1 or 0, in
+    the same statement as its link (`folders.reminder_expand_refused`: a head's
+    `set_head_link(.., refused)`, a small folder's `complete_backfill(.., Some(refused))`).
+    Written apart, a reader between the two (a test on Windows, every run) or a crash
+    saw the new link with the old mark (#2054 r2, fixed in #1941);
   - a backfill walk spans idle steps, so its first page's refusal is kept next to
     `backfill_link` (`folders.backfill_expand_refused`) for its later pages, and
-    `complete_backfill` moves it to the folder's mark with its link; `reset_backfill`
+    `complete_backfill(.., None)` moves it to the folder's mark with its link; `reset_backfill`
     drops it;
   - a round on the stored link merges as that link's mark says.
   An accepted first page never clears the mark while the refused walk's link is still

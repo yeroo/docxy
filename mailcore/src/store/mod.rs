@@ -2005,8 +2005,9 @@ impl Store {
 
     /// Records whether the first call of the walk whose link `folder_id`
     /// stores as `delta_link` found Graph refusing the reminder `$expand`
-    /// (#2054): the engine sets it with the head's or a small folder's
-    /// link, 1 or 0, and `complete_backfill` from the backfill's own
+    /// (#2054). The engine writes it with the link itself:
+    /// `set_head_link` and a small folder's `complete_backfill` take it,
+    /// and an ending backfill's `complete_backfill` moves the walk's own
     /// record. While it is set, a round on that link (which carries no
     /// expand) merges its items as `MessageFields::reminder_unasked`,
     /// keeping the stored reminders. `clear_delta_links` clears it.
@@ -2131,11 +2132,21 @@ impl Store {
     }
 
     /// Stores a folder's head delta link (#1871: its recent mail, run in
-    /// the sync pass), marking what it covers as [`SCOPE_HEAD`].
-    pub fn set_head_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
+    /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
+    /// whether its walk's first call was refused the reminder `$expand`
+    /// (#2054, `refused`): in the same statement, so no reader (and no
+    /// crash) ever sees the new link with the old link's mark.
+    pub fn set_head_link(
+        &self,
+        folder_id: &str,
+        link: &str,
+        refused: bool,
+    ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3 WHERE id = ?1",
-            params![folder_id, link, SCOPE_HEAD],
+            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                reminder_expand_refused = ?4
+             WHERE id = ?1",
+            params![folder_id, link, SCOPE_HEAD, refused],
         )?;
         Ok(())
     }
@@ -2165,25 +2176,27 @@ impl Store {
     /// Ends a folder's backfill (#1871), in one statement: the full
     /// delta's `deltaLink` becomes the folder's `delta_link` (replacing the
     /// head's), `scope` records what it covers, the backfill link is
-    /// cleared and `synced` is set to the final count. The walk's refused
-    /// reminder expand (#2054, `backfill_expand_refused`) becomes the
-    /// folder's mark, as its link is now `delta_link`; a small folder's
-    /// caller sets the mark after it (`set_reminder_expand_refused`).
+    /// cleared and `synced` is set to the final count. The folder's
+    /// refused-reminder-expand mark (#2054) goes with the link, in the same
+    /// statement: `refused` when the caller knows it (`Some`: a small
+    /// folder walked whole in the sync pass), else the walk's own record
+    /// (`None`: `backfill_expand_refused`, a backfill that ends).
     pub fn complete_backfill(
         &self,
         folder_id: &str,
         delta_link: &str,
         scope: &str,
         synced: i64,
+        refused: Option<bool>,
     ) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE folders SET delta_link = ?2, history_scope = ?3,
                                 backfill_link = NULL, backfill_synced = ?4,
                                 backfill_scope = NULL,
-                                reminder_expand_refused = backfill_expand_refused,
+                                reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
                                 backfill_expand_refused = 0
              WHERE id = ?1",
-            params![folder_id, delta_link, scope, synced],
+            params![folder_id, delta_link, scope, synced, refused],
         )?;
         Ok(())
     }
@@ -12506,7 +12519,7 @@ mod backfill_tests {
         let h = history(&s, "F1");
         assert_eq!((h.scope, h.has_delta_link), (None, false));
 
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("HEAD"));
         assert_eq!(history(&s, "F1").scope.as_deref(), Some(SCOPE_HEAD));
 
@@ -12522,10 +12535,11 @@ mod backfill_tests {
     fn complete_backfill_sets_link_and_scope_and_clears_the_cursor() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
-        s.complete_backfill("F1", "FULL", SCOPE_ALL, 120).unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_ALL, 120, None)
+            .unwrap();
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("FULL"));
         assert_eq!(
             history(&s, "F1"),
@@ -12545,7 +12559,7 @@ mod backfill_tests {
     fn reset_backfill_keeps_the_head_and_restarts_the_count() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
         s.reset_backfill("F1").unwrap();
@@ -12560,10 +12574,11 @@ mod backfill_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
         folder(&s, "F2", 10, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE3", 100, SCOPE_ALL)
             .unwrap();
-        s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10).unwrap();
+        s.complete_backfill("F2", "FULL", SCOPE_WINDOW, 10, None)
+            .unwrap();
         s.clear_delta_links().unwrap();
         for id in ["F1", "F2"] {
             let h = history(&s, id);
@@ -12579,7 +12594,7 @@ mod backfill_tests {
     fn upsert_folder_leaves_the_backfill_state_alone() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "PAGE2", 50, SCOPE_ALL)
             .unwrap();
         // The next listing renames it and changes its count.
@@ -12793,7 +12808,7 @@ mod backfill_tests {
     fn a_walk_is_window_once_any_page_ran_with_the_cutoff() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1", 120, None);
-        s.set_head_link("F1", "HEAD").unwrap();
+        s.set_head_link("F1", "HEAD", false).unwrap();
         s.set_backfill_progress("F1", "P2", 1, SCOPE_ALL).unwrap();
         assert_eq!(history(&s, "F1").backfill_scope.as_deref(), Some(SCOPE_ALL));
         s.set_backfill_progress("F1", "P3", 2, SCOPE_WINDOW)
@@ -12807,7 +12822,8 @@ mod backfill_tests {
         assert_eq!(history(&s, "F1").backfill_scope, None);
         s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
             .unwrap();
-        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 1).unwrap();
+        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 1, None)
+            .unwrap();
         assert_eq!(history(&s, "F1").backfill_scope, None);
         s.set_backfill_progress("F1", "P2", 1, SCOPE_WINDOW)
             .unwrap();
@@ -13604,28 +13620,57 @@ mod message_reminder_tests {
     }
 
     #[test]
+    fn a_link_and_its_expand_refused_mark_are_written_together() {
+        // #2054 r2 (the Windows race): the head's and a small folder's link
+        // carry their mark in the same statement, so no reader sees one
+        // without the other.
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        s.set_head_link("F", "HEAD", true).unwrap();
+        assert_eq!(s.get_delta_link("F").unwrap().as_deref(), Some("HEAD"));
+        assert!(s.reminder_expand_refused("F").unwrap());
+        // An accepted head over a refused one clears the mark.
+        s.set_head_link("F", "HEAD2", false).unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
+
+        // A small folder walked whole: the caller's mark wins over the
+        // (clear) backfill record, both ways.
+        s.complete_backfill("G", "FULL", SCOPE_ALL, 3, Some(true))
+            .unwrap();
+        assert_eq!(s.get_delta_link("G").unwrap().as_deref(), Some("FULL"));
+        assert!(s.reminder_expand_refused("G").unwrap());
+        s.set_backfill_expand_refused("G").unwrap();
+        s.complete_backfill("G", "FULL2", SCOPE_ALL, 3, Some(false))
+            .unwrap();
+        assert!(!s.reminder_expand_refused("G").unwrap());
+        assert!(!s.backfill_expand_refused("G").unwrap(), "cleared");
+    }
+
+    #[test]
     fn the_backfill_expand_refusal_moves_with_its_link() {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F");
         assert!(!s.backfill_expand_refused("NOPE").unwrap());
         // A refused head, then a backfill whose first call was accepted:
         // its link replaces the head's, and so does its (clear) record.
-        s.set_head_link("F", "HEAD").unwrap();
-        s.set_reminder_expand_refused("F", true).unwrap();
+        s.set_head_link("F", "HEAD", true).unwrap();
         s.set_backfill_progress("F", "PAGE2", 10, SCOPE_ALL)
             .unwrap();
         assert!(
             s.reminder_expand_refused("F").unwrap(),
             "the head's link is still stored"
         );
-        s.complete_backfill("F", "FULL", SCOPE_ALL, 20).unwrap();
+        s.complete_backfill("F", "FULL", SCOPE_ALL, 20, None)
+            .unwrap();
         assert!(!s.reminder_expand_refused("F").unwrap());
         // The reverse: an accepted head, a refused backfill under way, then
         // its link stored.
         s.set_backfill_expand_refused("F").unwrap();
         assert!(!s.reminder_expand_refused("F").unwrap());
         assert!(s.backfill_expand_refused("F").unwrap());
-        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20).unwrap();
+        s.complete_backfill("F", "FULL2", SCOPE_ALL, 20, None)
+            .unwrap();
         assert!(s.reminder_expand_refused("F").unwrap());
         assert!(!s.backfill_expand_refused("F").unwrap(), "moved");
         // `reset_backfill` drops the walk's record, and keeps the folder's.
@@ -13673,9 +13718,9 @@ mod message_reminder_tests {
                 &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
             )
             .unwrap();
-            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7)
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
                 .unwrap();
-            s.set_head_link("G", "https://graph/G?$deltatoken=2")
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
                 .unwrap();
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
@@ -13732,7 +13777,7 @@ mod message_reminder_tests {
             .unwrap();
         assert_eq!(indexed, 1);
         // A link stored after the migration survives the next open.
-        s.set_head_link("F", "https://graph/F?$deltatoken=new")
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
         let s = Store::open(&path).unwrap();

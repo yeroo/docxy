@@ -2320,21 +2320,26 @@ impl Engine {
                 } else {
                     SCOPE_ALL
                 };
+                // The link's refused-expand mark (#2054) is written with
+                // it, in one statement: a reader between two would see the
+                // new link with the old mark.
                 if self
                     .store
-                    .complete_backfill(folder_id, &delta, scope, run.walked as i64)
+                    .complete_backfill(
+                        folder_id,
+                        &delta,
+                        scope,
+                        run.walked as i64,
+                        Some(run.expand_refused),
+                    )
                     .is_ok()
                 {
-                    let _ = self
-                        .store
-                        .set_reminder_expand_refused(folder_id, run.expand_refused);
                     self.emit_progress(folder_id, run.walked, true);
                 }
-            } else if self.store.set_head_link(folder_id, &delta).is_ok() {
-                // The mark follows the link now stored (#2054): 1 or 0.
+            } else {
                 let _ = self
                     .store
-                    .set_reminder_expand_refused(folder_id, run.expand_refused);
+                    .set_head_link(folder_id, &delta, run.expand_refused);
             }
         }
         self.emit(SyncEvent::MessagesUpdated {
@@ -2796,7 +2801,7 @@ impl Engine {
             };
         if let Err(e) = self
             .store
-            .complete_backfill(&id, &delta, scope, synced as i64)
+            .complete_backfill(&id, &delta, scope, synced as i64, None)
         {
             self.park_on_store_error(&id, e);
             return;
@@ -18022,10 +18027,14 @@ mod tests {
             let (handle, store_path, dir) =
                 spawn_fast(&srv, "msg-reminder-no-expand", TICK, None, seed_m1);
             let store = Store::open(&store_path).unwrap();
+            // The mark is in the wait too: it is written with the link
+            // (one statement), so it never lags it, and a regression that
+            // splits them again fails here rather than racing.
             assert!(wait_until(ENGINE_WAIT, || store
                 .message_exists("M9")
                 .unwrap()
-                && store.get_delta_link("F1").unwrap().is_some()));
+                && store.get_delta_link("F1").unwrap().is_some()
+                && store.reminder_expand_refused("F1").unwrap()));
             let firsts: Vec<String> = srv
                 .requests()
                 .into_iter()
@@ -20048,7 +20057,7 @@ mod tests {
         fn seed_at_page_2(dir: &std::path::Path) {
             seed_legacy(dir);
             let s = store_in(dir);
-            s.set_head_link("F1", &head_link("F1")).unwrap();
+            s.set_head_link("F1", &head_link("F1"), false).unwrap();
             s.set_backfill_progress("F1", &page_link("F1", 2), 50, SCOPE_ALL)
                 .unwrap();
         }
