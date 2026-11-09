@@ -263,9 +263,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - `DocView::set_page_background(Option<Hsla>)` / `page_background()`: the
   dark page's colour (`content_look`'s `page_bg`, used only when content
   is dark on a dark theme); `None` is the theme's `background`. The light
-  page stays white and the palette is unchanged: a host recolours the
-  document's text in the document. The colour paints the view's root, so
-  the padding is that colour too.
+  page stays white. The palette maps the document's colours against the
+  host's page colour (`dark_page_pal`, #2079), so a host need not recolour
+  the document's text. The colour paints the view's root, so the padding
+  is that colour too.
 - Both setters notify only when the stored value changes (`set_if_changed`);
   the getters return what the host set, `None` included.
 - Harness: `ext-doc-set` takes `page_inset` (`null` or

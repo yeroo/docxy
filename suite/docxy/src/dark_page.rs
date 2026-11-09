@@ -33,10 +33,6 @@ pub(crate) const BORDER_DARK: u32 = 0x8C8C8C;
 /// page), floor-checked like any text.
 const DIM_DARK: u32 = 0xB0B0B0;
 const DIM_LIGHT: u32 = 0x6E6E6E;
-/// An uncoloured link on a light ground (the suite's `LINK`).
-const LINK_LIGHT: u32 = 0x2F6FDB;
-/// An uncoloured link on a dark ground (the suite's `LINK_DARK`).
-const LINK_DARK: u32 = 0x6CA0F0;
 /// The contrast every run keeps against what it sits on (WCAG AA).
 pub(crate) const TEXT_FLOOR: f32 = 4.5;
 /// The contrast a border keeps (WCAG non-text contrast).
@@ -224,24 +220,10 @@ fn floored(rgb: u32, ground: u32, min: f32) -> u32 {
     if contrast(rgb, ground) >= min {
         return rgb;
     }
-    let (h, s, l) = hsl(rgb);
     let light = takes_light(ground);
-    let up = || {
-        let cap = hsl(AUTO_DARK).2;
-        let from = if l < 0.5 {
-            (1.0 - l).min(cap).max(l)
-        } else {
-            l
-        };
-        lighten(h, s, from, ground, min)
-    };
-    let down = || darken(h, s, l, ground, min);
-    let moved = if light {
-        up().or_else(down)
-    } else {
-        down().or_else(up)
-    };
-    moved.unwrap_or(if light { 0xFFFFFF } else { 0x000000 })
+    on_side(rgb, ground, min, light)
+        .or_else(|| on_side(rgb, ground, min, !light))
+        .unwrap_or(if light { 0xFFFFFF } else { 0x000000 })
 }
 
 /// `over` laid at opacity `a` on `base`, as one opaque colour.
@@ -295,9 +277,9 @@ fn on_side(rgb: u32, ground: u32, min: f32, light: bool) -> Option<u32> {
 pub(crate) fn inks(ground: u32) -> Inks {
     let light = takes_light(ground);
     let bases = if light {
-        [AUTO_DARK, DIM_DARK, LINK_DARK]
+        [AUTO_DARK, DIM_DARK, crate::LINK_DARK]
     } else {
-        [AUTO_LIGHT, DIM_LIGHT, LINK_LIGHT]
+        [AUTO_LIGHT, DIM_LIGHT, crate::LINK]
     };
     let toward = if light {
         (0xFFFFFF, 0.10)
@@ -344,9 +326,11 @@ pub(crate) fn chip(ground: u32) -> u32 {
 /// its ink, so ink chosen against the tint also reads on the plain sheet
 /// (a frame of the part placed off its band sits there): a faint
 /// light-blue wash on a sheet that takes light ink, a faint darkening on
-/// one that takes dark ink. A wash that would move the tint to the other
-/// side of the crossover is not drawn: the sheet itself. (Print Layout
-/// tints a light page with `#EEF4FF` at half opacity instead.)
+/// one that takes dark ink. Where the far side's extreme (black for light
+/// ink) still reads on that tint, no tint (the sheet): there [`text`]
+/// could keep a far-side colour that reads on the tint but not on the
+/// sheet (`#676767`: black is 4.56:1 on its tint, 3.71:1 on it). (Print
+/// Layout tints a light page with `#EEF4FF` at half opacity instead.)
 pub(crate) fn edit_tint(sheet: u32) -> u32 {
     let light = takes_light(sheet);
     let tint = if light {
@@ -354,10 +338,13 @@ pub(crate) fn edit_tint(sheet: u32) -> u32 {
     } else {
         blend(sheet, 0x000000, 0.06)
     };
-    if takes_light(tint) == light {
-        tint
-    } else {
+    // The far side's extreme reads on it: a colour kept there could sit
+    // on the far side of the tint, and miss the floor on the sheet.
+    let far = if light { 0x000000 } else { 0xFFFFFF };
+    if contrast(far, tint) >= TEXT_FLOOR {
         sheet
+    } else {
+        tint
     }
 }
 
@@ -557,8 +544,8 @@ mod tests {
         assert!(luminance(t) > luminance(PAGE_DARK));
         assert!(contrast(t, PAGE_DARK) > 1.2, "{t:06x}");
         assert!(takes_light(t));
-        // Text chosen against the tint reads on it, and on the plain sheet
-        // the same live header draws on other pages.
+        // Text chosen against the tint reads on it, and on the plain sheet,
+        // where a frame of the part placed off its band sits.
         for c in [0x000000, 0x595959, 0x0047FF, 0x0563C1, AUTO_DARK, 0xC00000] {
             let ink = text(c, t);
             assert!(contrast(ink, t) >= TEXT_FLOOR, "{c:06x} -> {ink:06x}");
@@ -639,6 +626,41 @@ mod tests {
         // A sheet at the crossover keeps no tint that would flip its side.
         for v in (0x60..=0x80).map(|v: u32| v * 0x010101) {
             assert_eq!(takes_light(edit_tint(v)), takes_light(v), "{v:06x}");
+        }
+        // Where a far-side colour would read on the tint but not the sheet:
+        // no tint.
+        for (sheet, c) in [(0x676767, 0x000000), (0x7D7D7D, 0xFFFFFF)] {
+            let t = edit_tint(sheet);
+            let ink = text(c, t);
+            for on in [t, sheet] {
+                assert!(contrast(ink, on) >= TEXT_FLOOR, "{c:06x} on {on:06x}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_chosen_for_a_headers_tint_reads_on_its_sheet() {
+        let sheets = (0x10..=0xF0).step_by(4).map(|v: u32| v * 0x010101).chain([
+            0x1166CC, 0x426B8A, 0x5475E9, 0x2B9123, PAGE_DARK, 0xFFC000, 0x4472C4, 0x5B9BD5,
+            0xC00000, 0x7030A0, 0xFFFFFF, 0x000000,
+        ]);
+        let colours = [
+            0x000000, 0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0x00FFFF, 0xFF00FF,
+            0x404040, 0x595959, 0x676767, 0x757575, 0x808080, 0x7F7F7F, 0xA6A6A6, 0xC0C0C0,
+            0x0047FF, 0xC00000, 0x0563C1,
+        ];
+        for s in sheets {
+            let t = edit_tint(s);
+            for c in colours {
+                let ink = text(c, t);
+                for on in [t, s] {
+                    let r = contrast(ink, on);
+                    assert!(
+                        r >= TEXT_FLOOR,
+                        "{c:06x} -> {ink:06x} on {on:06x} (sheet {s:06x}, tint {t:06x}): {r:.2}"
+                    );
+                }
+            }
         }
     }
 

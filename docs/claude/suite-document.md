@@ -409,15 +409,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - `Pal` carries `ground` (what its text sits on) and `dark` (the mapping is
   on). `dark_page_pal(ground, sel)` builds the dark palette from
   `dark_page::inks`: automatic text, dimmed text and the link blue on the
-  ground's side (`takes_light(ground)`, as `text` maps a run, so automatic
-  text and explicit black never part), reading on the ground and on the
+  ground's side (`takes_light(ground)`, the side `text` moves a run to),
+  reading on the ground and on the
   chips' and hover's wash alike. The wash is the one that shows (white at
   0.10 on a ground that takes light ink, black at 0.06 on one that takes
   dark) with the inks chosen against the washed ground (`dark_page::chip`),
   unless no ink on that side reads there: near the crossover (Accent 1
   `#4472C4`: white 4.73:1 on it, 3.93:1 on its light chip) the wash goes
   away from the ink (black, or white, at 0.10), which only raises the
-  contrast, and the inks are chosen against the ground.
+  contrast, and the inks are chosen against the ground. A run whose own
+  colour already reads on the ground is kept on its side, so near the
+  crossover automatic text and explicit black can still part (`#757575`:
+  white 4.61:1, black 4.56:1, so black stays black beside light automatic
+  text); both read.
   `run_ink` maps an explicit colour (links included) against `ground`;
   `cell_pal` maps the fill (`Pal::shown_fill`, also the painted cell
   background) and the cell's palette is `dark_page_pal` on it, washes
@@ -432,9 +436,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   would composite to about `#8A8D92` on `#262626`, where light text is
   under 3:1. The tint lies between the sheet and its ink (`#EEF4FF` at
   0.10 on a sheet that takes light ink, about `#3A3B3C` on `#262626`;
-  black at 0.06 on one that takes dark ink, a gold page; none where it
-  would cross to the other side), so text chosen against it also reads on
-  the plain sheet, where a frame of the part placed off its band sits. The
+  black at 0.06 on one that takes dark ink, a gold page), and none at all
+  (the sheet) where the far-side extreme (black where the ink is light,
+  white where it is dark) still reads on the tint. So every colour `text`
+  keeps or moves there is on the ink's side, beyond the tint, and also
+  reads on the plain sheet, where a frame of the part placed off its band
+  sits (`#676767`: black is 4.56:1 on its tint, 3.71:1 on the sheet, so
+  that sheet takes no tint). The
   part's other pages draw it in `doc_pal`.
 - The paragraph rule (`has_border`, a bottom `w:pBdr`) carries no colour in
   the model: it draws `border(None, ground)` on a dark page, the ink as
