@@ -1323,7 +1323,7 @@ impl Docxy {
         let geom = crate::ribbon_fit::gallery_geom(gal);
         let (_, well_w) = crate::ribbon_fit::gallery_row(geom, gal.items.len(), max_w);
         // Relative for its F1 probe (#1869); nothing in it is absolute
-        // against it (a tile's lines sit in the tile's own relative box).
+        // against it (a cell's border lines sit in the cell's own relative box).
         h_flex()
             .relative()
             .flex_none()

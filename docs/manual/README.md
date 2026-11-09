@@ -23,7 +23,7 @@ A page starts with front matter:
 ---
 title: Home tab
 area: home                        # optional
-keys: bold, italic, dialog:font   # optional
+keys: b, i, dialog:font           # optional
 ---
 ```
 
@@ -109,7 +109,10 @@ both. The config root is `DOCXY_CONFIG_DIR`, else the OS's config directory
 ## Context help
 
 F1 resolves a context id to a page:
-- A ribbon command id is used bare (`bold`). F1 asks for it while the
+- A ribbon command id is used bare: the ribbon's own command id, which
+  differs per editor (the document's Bold is `b`, the sheet's `bold`). The
+  ids each ribbon draws are the ones `every_ribbon_command_has_a_help_target`
+  walks (`suite/docxy/src/help_tab/tests.rs`). F1 asks for it while the
   pointer rests on the command (its ScreenTip need not be up), with the
   ribbon tab shown as the area.
 - A dialog id is `dialog:<id>` (`dialog:font`).
