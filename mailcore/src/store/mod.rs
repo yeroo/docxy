@@ -1670,16 +1670,13 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<MessageRow>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
-                    to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request, categories
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS}
              FROM messages
              WHERE folder_id = ?1
              ORDER BY received_at DESC
-             LIMIT ?2 OFFSET ?3",
-        )?;
+             LIMIT ?2 OFFSET ?3"
+        ))?;
         let rows = stmt
             .query_map(params![folder_id, limit, offset], map_message_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2198,6 +2195,43 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// A stored message's list row by its exact current id (#2053), as
+    /// `messages_in_folder` maps it (`MESSAGE_ROW_COLUMNS`,
+    /// `map_message_row`), whether or not a body is stored. `None` when no
+    /// row has that id. Like `message_exists`, no `local:` or moved-id
+    /// resolution: pass the id through `current_id` first for that.
+    pub fn message_row(&self, message_id: &str) -> Result<Option<MessageRow>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {MESSAGE_ROW_COLUMNS} FROM messages WHERE id = ?1"),
+                params![message_id],
+                map_message_row,
+            )
+            .optional()?)
+    }
+
+    /// The list rows of the stored messages among `ids` (#2053), in no
+    /// particular order: an id the store does not have is skipped, and an
+    /// id given twice gives its row once. Each row is `message_row`'s (exact
+    /// current ids). One statement whose one parameter is the ids as a JSON
+    /// array read through `json_each` (as `retain_folders` passes a list),
+    /// so it has no SQLite variable limit and a concurrent writer cannot
+    /// shift what it sees part-way; `messages` is read through its primary
+    /// key index (`message_rows_sql`). An empty `ids` runs no statement.
+    pub fn message_rows(&self, ids: &[&str]) -> Result<Vec<MessageRow>, StoreError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json =
+            Value::Array(ids.iter().map(|id| Value::Str((*id).to_string())).collect()).to_string();
+        let mut stmt = self.conn.prepare(&message_rows_sql())?;
+        let rows = stmt
+            .query_map(params![ids_json], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Up to `limit` ids of the messages the engine fetches a body for on
@@ -5043,11 +5077,30 @@ fn sanitize_recipient_name(name: &str) -> String {
         .to_string()
 }
 
-/// Maps one row of a `SELECT id, folder_id, ..., preview, is_draft FROM
-/// messages ...` query (that exact column order) to a `MessageRow`. Shared
-/// by `messages_in_folder`, `search`, and `draft`, which all select those
-/// columns in that order from `messages`, so there's only one place mapping
-/// can drift out of sync with the column list.
+/// The `messages` columns `map_message_row` reads, in its order. The queries
+/// that select exactly these (`messages_in_folder`, `message_row`,
+/// `message_rows`) use this list, so they cannot drift from the mapping.
+const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from_name, from_addr,
+    to_recipients, cc_recipients, received_at, sent_at,
+    is_read, is_flagged, has_attachments, importance, preview, is_draft,
+    bcc_recipients, is_meeting_request, categories";
+
+/// `Store::message_rows`'s statement (#2053): the rows whose id is in the
+/// JSON array `?1`. SQLite plans the `IN` subquery as one primary-key
+/// lookup per listed id, not a scan of `messages`; a test checks the plan.
+fn message_rows_sql() -> String {
+    format!(
+        "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
+         WHERE id IN (SELECT value FROM json_each(?1))"
+    )
+}
+
+/// Maps one row of a `SELECT {MESSAGE_ROW_COLUMNS} FROM messages ...` query
+/// (that exact column order) to a `MessageRow`. Shared by
+/// `messages_in_folder`, `message_row`, `message_rows`, `search`, and
+/// `draft`, which all select those columns in that order from `messages`
+/// (`search` and `draft` spell the list out), so there's only one place
+/// mapping can drift out of sync with the column list.
 fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
@@ -5554,6 +5607,146 @@ mod tests {
         s.move_message("01", "F2").unwrap();
         assert_eq!(s.message_folder("01").unwrap().as_deref(), Some("F2"));
         assert_eq!(s.message_folder("missing").unwrap(), None);
+    }
+
+    /// A message whose row columns are not the defaults, so a mapping that
+    /// reads a wrong column shows (#2053).
+    fn rich_msg(id: &str) -> Message {
+        let mut m = msg(id, true);
+        m.is_flagged = true;
+        m.has_attachments = true;
+        m.importance = "high".into();
+        m.categories = vec!["Work".into(), "Red".into()];
+        m.cc = vec![Recipient {
+            name: "C".into(),
+            address: "c@x".into(),
+        }];
+        m.sent = format!("2026-06-{id}T00:00:00Z");
+        m
+    }
+
+    #[test]
+    fn message_row_reads_a_bodiless_row_as_messages_in_folder_does() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        s.upsert_message("F1", &rich_msg("01")).unwrap();
+        s.upsert_message("F1", &rich_msg("02")).unwrap();
+        s.put_body(
+            "02",
+            &Body {
+                content_type: "text".into(),
+                content: "hi".into(),
+            },
+        )
+        .unwrap();
+        let listed = s.messages_in_folder("F1", 10, 0).unwrap();
+        assert_eq!(listed.len(), 2);
+        for want in &listed {
+            assert_eq!(s.message_row(&want.id).unwrap().as_ref(), Some(want));
+        }
+        // The row's fields are the stored message's, not only the list's.
+        let row = s.message_row("01").unwrap().unwrap();
+        assert_eq!(row.folder_id, "F1");
+        assert_eq!(row.subject, "s01");
+        assert_eq!(
+            (row.from_name.as_str(), row.from_addr.as_str()),
+            ("A", "a@x")
+        );
+        assert!(row.cc_recipients.contains("c@x"), "{}", row.cc_recipients);
+        assert_eq!(row.received_at, "2026-07-01T00:00:00Z");
+        assert_eq!(row.sent_at, "2026-06-01T00:00:00Z");
+        assert!(row.is_read && row.is_flagged && row.has_attachments);
+        assert!(!row.is_draft && !row.is_meeting_request);
+        assert_eq!(row.importance, "high");
+        assert_eq!(row.preview, "p");
+        assert_eq!(row.categories, vec!["Work".to_string(), "Red".to_string()]);
+
+        assert_eq!(s.message_row("missing").unwrap(), None);
+        // Exact current ids: a moved message's old id is not followed.
+        assert!(s.follow_move("01", "01m").unwrap());
+        assert_eq!(s.message_row("01").unwrap(), None);
+        assert_eq!(s.message_row("01m").unwrap().unwrap().subject, "s01");
+    }
+
+    #[test]
+    fn message_rows_returns_only_stored_ids_once() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "F2");
+        s.upsert_message("F1", &rich_msg("01")).unwrap();
+        s.upsert_message("F1", &msg("02", false)).unwrap();
+        s.upsert_message("F2", &rich_msg("03")).unwrap();
+        s.put_body(
+            "03",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>x</p>".into(),
+            },
+        )
+        .unwrap();
+        let mut want: Vec<MessageRow> = s
+            .messages_in_folder("F1", 10, 0)
+            .unwrap()
+            .into_iter()
+            .chain(s.messages_in_folder("F2", 10, 0).unwrap())
+            .filter(|r| r.id != "02")
+            .collect();
+        want.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut got = s
+            .message_rows(&["03", "nope", "01", "03", "", "01"])
+            .unwrap();
+        got.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(got, want);
+        assert_eq!(got[1].folder_id, "F2");
+        assert_eq!(
+            got[1].categories,
+            vec!["Work".to_string(), "Red".to_string()]
+        );
+        assert!(s.message_rows(&[]).unwrap().is_empty());
+        assert!(s.message_rows(&["nope"]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_rows_takes_more_ids_than_the_variable_limit() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        for id in ["05", "17", "28"] {
+            s.upsert_message("F1", &msg(id, false)).unwrap();
+        }
+        // More than SQLite's default SQLITE_MAX_VARIABLE_NUMBER (32766).
+        let ids: Vec<String> = (0..40_000).map(|i| format!("{i:02}")).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut got: Vec<String> = s
+            .message_rows(&refs)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        got.sort();
+        assert_eq!(got, ["05", "17", "28"]);
+    }
+
+    #[test]
+    fn message_rows_reads_messages_by_its_primary_key() {
+        let s = Store::open_in_memory().unwrap();
+        let mut stmt = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", message_rows_sql()))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["[]"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("SEARCH messages") && d.contains("(id=?)")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|d| d.contains("SCAN messages")),
+            "{plan:?}"
+        );
     }
 
     /// Every column of a message row, as SQLite holds it.
