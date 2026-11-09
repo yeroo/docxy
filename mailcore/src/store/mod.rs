@@ -12,11 +12,11 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::graph::client::{AttendeeInput, EventFieldSet, event_zone_error};
+use crate::graph::client::{AttendeeInput, ContactFieldSet, EventFieldSet, event_zone_error};
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, Event, EventRecurrence,
-    FolderContact, MailFolder, MasterCategory, Message, MessageFields, MessageHeader, Recipient,
-    Recurrence, is_stored_header, meeting_link_in,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields, Event,
+    EventRecurrence, FolderContact, MailFolder, MasterCategory, Message, MessageFields,
+    MessageHeader, PhysicalAddress, Recipient, Recurrence, is_stored_header, meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -365,6 +365,28 @@ pub enum OutboxOp {
         id: String,
         new_reminder_utc: String,
     },
+    /// Create a contact the host wrote locally (#2063,
+    /// `Store::create_local_contact`): `POST /me/contacts` with the row as
+    /// stored at send time, then re-key it to Graph's id
+    /// (`Store::reconcile_created_contact`). A row deleted before the drain,
+    /// or an id already re-keyed (a retry after the re-key), sends nothing.
+    CreateContact {
+        id: String,
+    },
+    /// PATCH the properties in `fields` of a stored contact (#2063,
+    /// `Store::update_contact_fields`), each with its value at send time.
+    /// The id is resolved through `contact_aliases`; one still `local:`, or a
+    /// row gone, sends nothing.
+    UpdateContact {
+        id: String,
+        fields: ContactFieldSet,
+    },
+    /// DELETE a contact the host removed locally (#2063,
+    /// `Store::delete_contact`). A 404 is done. A `local:` id never re-keyed
+    /// sends nothing.
+    DeleteContact {
+        id: String,
+    },
 }
 
 impl OutboxOp {
@@ -391,6 +413,9 @@ impl OutboxOp {
             OutboxOp::SnoozeReminder { .. } => "snoozeReminder",
             OutboxOp::DismissMessageReminder { .. } => "dismissMessageReminder",
             OutboxOp::SnoozeMessageReminder { .. } => "snoozeMessageReminder",
+            OutboxOp::CreateContact { .. } => "createContact",
+            OutboxOp::UpdateContact { .. } => "updateContact",
+            OutboxOp::DeleteContact { .. } => "deleteContact",
         }
     }
 
@@ -481,10 +506,26 @@ impl OutboxOp {
                     ),
                 ),
             ]),
+            OutboxOp::UpdateContact { id, fields } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "fields".to_string(),
+                    Value::Array(
+                        fields
+                            .to_names()
+                            .into_iter()
+                            .map(|n| Value::Str(n.to_string()))
+                            .collect(),
+                    ),
+                ),
+            ]),
             OutboxOp::CreateEvent { id }
             | OutboxOp::DeleteEvent { id }
             | OutboxOp::DismissReminder { id }
-            | OutboxOp::DismissMessageReminder { id } => Value::Object(vec![
+            | OutboxOp::DismissMessageReminder { id }
+            | OutboxOp::CreateContact { id }
+            | OutboxOp::DeleteContact { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
@@ -638,6 +679,20 @@ impl OutboxOp {
                 id: id()?,
                 new_reminder_utc: v.get("newReminderUtc")?.as_str()?.to_string(),
             }),
+            "createContact" => Some(OutboxOp::CreateContact { id: id()? }),
+            // A row without `fields` is corrupt: every `updateContact` ever
+            // queued has them.
+            "updateContact" => Some(OutboxOp::UpdateContact {
+                id: id()?,
+                fields: ContactFieldSet::from_names(
+                    &v.get("fields")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>(),
+                ),
+            }),
+            "deleteContact" => Some(OutboxOp::DeleteContact { id: id()? }),
             _ => None,
         }
     }
@@ -1673,7 +1728,10 @@ impl Store {
                 | OutboxOp::ForwardEvent { .. }
                 | OutboxOp::UpdateEventSeries { .. }
                 | OutboxOp::DismissReminder { .. }
-                | OutboxOp::SnoozeReminder { .. } => None,
+                | OutboxOp::SnoozeReminder { .. }
+                | OutboxOp::CreateContact { .. }
+                | OutboxOp::UpdateContact { .. }
+                | OutboxOp::DeleteContact { .. } => None,
             })
             .map(|id| self.current_id(&id))
             .collect::<Result<_, _>>()?;
@@ -3291,26 +3349,7 @@ impl Store {
     /// All queued ops, oldest (lowest `seq`) first — the order the sync
     /// engine should drain them in.
     pub fn pending_ops(&self) -> Result<Vec<OutboxRow>, StoreError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT seq, payload, attempts FROM outbox ORDER BY seq ASC")?;
-        let rows = stmt
-            .query_map([], |row| {
-                let seq: i64 = row.get(0)?;
-                let payload: String = row.get(1)?;
-                let attempts: i64 = row.get(2)?;
-                Ok((seq, payload, attempts))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(seq, payload, attempts)| {
-                let v = json::parse(&payload).map_err(|e| StoreError::Decode(e.to_string()))?;
-                let op = OutboxOp::from_json(&v).ok_or_else(|| {
-                    StoreError::Decode(format!("unrecognized outbox payload: {payload}"))
-                })?;
-                Ok(OutboxRow { seq, op, attempts })
-            })
-            .collect()
+        pending_ops_on(&self.conn)
     }
 
     /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
@@ -4490,60 +4529,423 @@ impl Store {
         Ok(())
     }
 
-    /// Replaces the whole stored Contacts-folder set (#1934) in one
-    /// transaction with `contacts`, what `GraphClient::contacts` fetched:
-    /// a contact no longer in the folder stops counting for `is_contact`.
-    /// Each address is trimmed and its ASCII letters lowercased
-    /// (`folder_contact_key`); blank
-    /// ones and ones without an `@` are dropped (a contact saved from the
-    /// directory can carry an Exchange X500 address, `/o=ExchangeLabs/...`,
-    /// which no sender address ever equals); duplicates collapse, the first
-    /// non-empty name winning. An empty slice empties the set. Never touches
+    /// Replaces the stored Contacts folder (#1934, #2063) in one transaction
+    /// with `contacts`, what `GraphClient::contacts` fetched: every stored
+    /// contact Graph no longer lists is removed (and stops counting for
+    /// `is_contact`), every listed one written, keyed by its Graph id, except
+    /// where a local write has not reached Graph yet:
+    ///
+    /// - a `local:` row (a create not sent yet) is never removed;
+    /// - a contact a queued `UpdateContact` names (its id resolved through
+    ///   `contact_aliases`) keeps its stored row: the server's version would
+    ///   undo the edit before the PATCH sends it;
+    /// - a contact a queued `DeleteContact` names is not written back.
+    ///
+    /// The queue is read inside the same transaction. A repeated id keeps its
+    /// first record. The legacy #1934 address table is emptied. Never touches
     /// `contacts` (people and mined correspondents).
-    pub fn replace_folder_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
+    pub fn replace_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
-        tx.execute("DELETE FROM folder_contacts", [])?;
-        for c in contacts {
-            let address = folder_contact_key(&c.address);
-            if address.is_empty() || !address.contains('@') {
+        let mut edited = HashSet::new();
+        let mut deleted = HashSet::new();
+        for row in pending_ops_on(&tx)? {
+            match row.op {
+                OutboxOp::UpdateContact { id, .. } => {
+                    edited.insert(resolve_contact_id_on(&tx, &id)?);
+                }
+                OutboxOp::DeleteContact { id } => {
+                    deleted.insert(resolve_contact_id_on(&tx, &id)?);
+                }
+                _ => {}
+            }
+        }
+        let mut seen = HashSet::new();
+        let listed: Vec<&FolderContact> = contacts
+            .iter()
+            .filter(|c| !c.id.is_empty() && seen.insert(c.id.as_str()))
+            .collect();
+        let stored: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM contact_records")?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        for id in &stored {
+            if !seen.contains(id.as_str()) && !id.starts_with("local:") && !edited.contains(id) {
+                tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+            }
+        }
+        for c in listed {
+            if deleted.contains(&c.id) {
                 continue;
             }
-            tx.execute(
-                "INSERT INTO folder_contacts (address, name) VALUES (?1, ?2)
-                 ON CONFLICT(address) DO UPDATE SET
-                     name = CASE WHEN folder_contacts.name = '' THEN excluded.name
-                                 ELSE folder_contacts.name END",
-                params![address, c.name.trim()],
-            )?;
+            if edited.contains(&c.id) && read_contact_on(&tx, &c.id)?.is_some() {
+                continue;
+            }
+            write_contact_on(&tx, &c.id, &c.change_key, &c.fields)?;
         }
+        tx.execute("DELETE FROM folder_contacts", [])?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Whether `address` is in the user's own Contacts folder, as the last
-    /// successful fetch stored it (`replace_folder_contacts`): an exact
-    /// match ignoring ASCII case and surrounding whitespace, never a
-    /// substring (`folder_contact_key`).
+    /// Every stored contact of the Contacts folder (#2063), ordered for a
+    /// list: by `file_as`, or `display_name` where `file_as` is empty,
+    /// ignoring ASCII case, then by id. A contact created locally is listed
+    /// under its `local:` id until its create reaches Graph.
+    pub fn folder_contacts(&self) -> Result<Vec<FolderContact>, StoreError> {
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM contact_records
+                 ORDER BY CASE WHEN file_as <> '' THEN file_as ELSE display_name END
+                          COLLATE NOCASE, id",
+            )?;
+            stmt.query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.extend(read_contact_on(&self.conn, &id)?);
+        }
+        Ok(out)
+    }
+
+    /// One stored contact by id (#2063): its Graph id, or the `local:` id it
+    /// was created under (followed through `contact_aliases` once its create
+    /// re-keyed it). `None` when no such contact is stored.
+    pub fn folder_contact(&self, id: &str) -> Result<Option<FolderContact>, StoreError> {
+        let id = resolve_contact_id_on(&self.conn, id)?;
+        read_contact_on(&self.conn, &id)
+    }
+
+    /// Writes a new contact locally (#2063) under a fresh `local:` id, which
+    /// it returns: the optimistic half of `SyncCommand::CreateContact`.
+    pub fn create_local_contact(&self, fields: &ContactFields) -> Result<String, StoreError> {
+        let id = local_draft_id();
+        let tx = self.write_tx()?;
+        write_contact_on(&tx, &id, "", fields)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Writes an edit of a stored contact (#2063, the optimistic half of
+    /// `SyncCommand::UpdateContact`) and returns the properties it changed:
+    /// what the PATCH sends. Empty when nothing changed or no such contact is
+    /// stored (then nothing is written). `id` may be the `local:` id the
+    /// contact was created under. The stored `change_key` is kept.
+    pub fn update_contact_fields(
+        &self,
+        id: &str,
+        fields: &ContactFields,
+    ) -> Result<ContactFieldSet, StoreError> {
+        let tx = self.write_tx()?;
+        let id = resolve_contact_id_on(&tx, id)?;
+        let Some(old) = read_contact_on(&tx, &id)? else {
+            return Ok(ContactFieldSet::default());
+        };
+        let changed = ContactFieldSet::changed(&old.fields, fields);
+        if !changed.is_empty() {
+            write_contact_on(&tx, &id, &old.change_key, fields)?;
+            tx.commit()?;
+        }
+        Ok(changed)
+    }
+
+    /// Removes a stored contact (#2063, the optimistic half of
+    /// `SyncCommand::DeleteContact`; its email rows go with it). `id` may be
+    /// the `local:` id it was created under. Whether a row was removed.
+    pub fn delete_contact(&self, id: &str) -> Result<bool, StoreError> {
+        let id = resolve_contact_id_on(&self.conn, id)?;
+        let n = self
+            .conn
+            .execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+        Ok(n > 0)
+    }
+
+    /// Writes one contact as Graph has it (#2063): the record a refused
+    /// write's re-read brought back, replacing the stored row (or adding it
+    /// back after a refused delete).
+    pub fn put_folder_contact(&self, contact: &FolderContact) -> Result<(), StoreError> {
+        let tx = self.write_tx()?;
+        write_contact_on(&tx, &contact.id, &contact.change_key, &contact.fields)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Re-keys a contact created locally to the id Graph gave it (#2063), in
+    /// one transaction: the row and its email rows (`ON UPDATE CASCADE`) move
+    /// to `created.id`, `change_key` is Graph's, and `display_name` /
+    /// `file_as` take Graph's computed values where the stored ones are
+    /// empty. No other field is overwritten: an edit made while the POST was
+    /// in flight is kept, and its queued `UpdateContact` sends it. The alias
+    /// `local_id → created.id` is recorded even when the row is gone (deleted
+    /// before Graph answered), so a `DeleteContact` queued by the `local:` id
+    /// still reaches the Graph contact.
+    pub fn reconcile_created_contact(
+        &self,
+        local_id: &str,
+        created: &FolderContact,
+    ) -> Result<(), StoreError> {
+        let tx = self.write_tx()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM contact_records WHERE id = ?1)",
+            params![local_id],
+            |r| r.get(0),
+        )?;
+        if exists && local_id != created.id {
+            // A stale row under the Graph id cannot be Graph's newer copy of
+            // a contact it only just created; the local row wins.
+            tx.execute(
+                "DELETE FROM contact_records WHERE id = ?1",
+                params![created.id],
+            )?;
+            tx.execute(
+                "UPDATE contact_records SET
+                     id = ?2,
+                     change_key = ?3,
+                     display_name = CASE WHEN display_name = '' THEN ?4 ELSE display_name END,
+                     file_as = CASE WHEN file_as = '' THEN ?5 ELSE file_as END
+                 WHERE id = ?1",
+                params![
+                    local_id,
+                    created.id,
+                    created.change_key,
+                    created.fields.display_name,
+                    created.fields.file_as
+                ],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO contact_aliases (local_id, id) VALUES (?1, ?2)
+             ON CONFLICT(local_id) DO UPDATE SET id = excluded.id",
+            params![local_id, created.id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The id the contact `id` names is stored under now (#2063): the Graph
+    /// id a `local:` id was re-keyed to (`reconcile_created_contact`), else
+    /// `id` itself.
+    pub fn resolve_contact_id(&self, id: &str) -> Result<String, StoreError> {
+        resolve_contact_id_on(&self.conn, id)
+    }
+
+    /// Whether `address` is in the user's own Contacts folder, as stored
+    /// (`replace_contacts`, and the local writes since): an exact match
+    /// ignoring ASCII case and surrounding whitespace, never a substring
+    /// (`folder_contact_key`), against any address of any stored contact.
     /// `/me/people` and mined correspondents (`contacts`) never count. A
-    /// blank address is `false`.
+    /// blank address is `false`. A database from before #2063 also answers
+    /// from #1934's address table until the first records fetch empties it.
     ///
-    /// The set is refreshed by the engine's full pass only (startup,
+    /// The folder is refreshed by the engine's full pass only (startup,
     /// `Refresh`, sign-in, a pass `needs_full_pass` asks for), never by a
     /// periodic tick: in a long-running session a contact removed from the
-    /// folder can keep counting for days, until the next full pass. A failed
-    /// fetch (no `Contacts.Read`, offline) keeps the last stored set.
+    /// folder elsewhere can keep counting for days, until the next full
+    /// pass. A failed fetch (no `Contacts.Read`, offline) keeps the last
+    /// stored set. A contact created or deleted here counts at once.
     pub fn is_contact(&self, address: &str) -> Result<bool, StoreError> {
         let address = folder_contact_key(address);
         if address.is_empty() {
             return Ok(false);
         }
         let found: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM folder_contacts WHERE address = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM contact_emails WHERE address_key = ?1)
+                 OR EXISTS(SELECT 1 FROM folder_contacts WHERE address = ?1)",
             params![address],
             |row| row.get(0),
         )?;
         Ok(found)
     }
+}
+
+/// All queued ops on `conn`, oldest first (`Store::pending_ops`).
+fn pending_ops_on(conn: &Connection) -> Result<Vec<OutboxRow>, StoreError> {
+    let mut stmt = conn.prepare("SELECT seq, payload, attempts FROM outbox ORDER BY seq ASC")?;
+    let rows = stmt
+        .query_map([], |row| {
+            let seq: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let attempts: i64 = row.get(2)?;
+            Ok((seq, payload, attempts))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(seq, payload, attempts)| {
+            let v = json::parse(&payload).map_err(|e| StoreError::Decode(e.to_string()))?;
+            let op = OutboxOp::from_json(&v).ok_or_else(|| {
+                StoreError::Decode(format!("unrecognized outbox payload: {payload}"))
+            })?;
+            Ok(OutboxRow { seq, op, attempts })
+        })
+        .collect()
+}
+
+/// The id the contact `id` names is stored under now, on `conn`
+/// (`Store::resolve_contact_id`).
+fn resolve_contact_id_on(conn: &Connection, id: &str) -> Result<String, StoreError> {
+    let aliased: Option<String> = conn
+        .query_row(
+            "SELECT id FROM contact_aliases WHERE local_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(aliased.unwrap_or_else(|| id.to_string()))
+}
+
+/// Inserts or replaces the contact `id` on `conn` with `fields`, and
+/// rewrites its email rows. An upsert, not `INSERT OR REPLACE`, which would
+/// delete the row first.
+fn write_contact_on(
+    conn: &Connection,
+    id: &str,
+    change_key: &str,
+    f: &ContactFields,
+) -> Result<(), StoreError> {
+    let b = &f.business_address;
+    let h = &f.home_address;
+    conn.execute(
+        "INSERT INTO contact_records (
+             id, change_key, given_name, middle_name, surname, display_name, file_as,
+             business_phones, home_phones, mobile_phone, company_name, job_title, department,
+             business_street, business_city, business_state, business_postal_code,
+             business_country, home_street, home_city, home_state, home_postal_code,
+             home_country, birthday, personal_notes, categories)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+         ON CONFLICT(id) DO UPDATE SET
+             change_key = excluded.change_key, given_name = excluded.given_name,
+             middle_name = excluded.middle_name, surname = excluded.surname,
+             display_name = excluded.display_name, file_as = excluded.file_as,
+             business_phones = excluded.business_phones, home_phones = excluded.home_phones,
+             mobile_phone = excluded.mobile_phone, company_name = excluded.company_name,
+             job_title = excluded.job_title, department = excluded.department,
+             business_street = excluded.business_street,
+             business_city = excluded.business_city,
+             business_state = excluded.business_state,
+             business_postal_code = excluded.business_postal_code,
+             business_country = excluded.business_country,
+             home_street = excluded.home_street, home_city = excluded.home_city,
+             home_state = excluded.home_state, home_postal_code = excluded.home_postal_code,
+             home_country = excluded.home_country, birthday = excluded.birthday,
+             personal_notes = excluded.personal_notes, categories = excluded.categories",
+        params![
+            id,
+            change_key,
+            &f.given_name,
+            &f.middle_name,
+            &f.surname,
+            &f.display_name,
+            &f.file_as,
+            encode_categories(&f.business_phones),
+            encode_categories(&f.home_phones),
+            &f.mobile_phone,
+            &f.company_name,
+            &f.job_title,
+            &f.department,
+            &b.street,
+            &b.city,
+            &b.state,
+            &b.postal_code,
+            &b.country_or_region,
+            &h.street,
+            &h.city,
+            &h.state,
+            &h.postal_code,
+            &h.country_or_region,
+            &f.birthday,
+            &f.personal_notes,
+            encode_categories(&f.categories),
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM contact_emails WHERE contact_id = ?1",
+        params![id],
+    )?;
+    for (position, e) in f.email_addresses.iter().enumerate() {
+        let key = folder_contact_key(&e.address);
+        let key = if key.contains('@') {
+            key
+        } else {
+            String::new()
+        };
+        conn.execute(
+            "INSERT INTO contact_emails (contact_id, position, name, address, address_key)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, position as i64, e.name, e.address, key],
+        )?;
+    }
+    Ok(())
+}
+
+/// The stored contact `id` on `conn`, with its email rows in order.
+fn read_contact_on(conn: &Connection, id: &str) -> Result<Option<FolderContact>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT id, change_key, given_name, middle_name, surname, display_name, file_as,
+                    business_phones, home_phones, mobile_phone, company_name, job_title,
+                    department, business_street, business_city, business_state,
+                    business_postal_code, business_country, home_street, home_city,
+                    home_state, home_postal_code, home_country, birthday, personal_notes,
+                    categories
+             FROM contact_records WHERE id = ?1",
+            params![id],
+            |r| {
+                let s = |i: usize| r.get::<_, String>(i);
+                Ok(FolderContact {
+                    id: s(0)?,
+                    change_key: s(1)?,
+                    fields: ContactFields {
+                        given_name: s(2)?,
+                        middle_name: s(3)?,
+                        surname: s(4)?,
+                        display_name: s(5)?,
+                        file_as: s(6)?,
+                        email_addresses: Vec::new(),
+                        business_phones: decode_categories(&s(7)?),
+                        home_phones: decode_categories(&s(8)?),
+                        mobile_phone: s(9)?,
+                        company_name: s(10)?,
+                        job_title: s(11)?,
+                        department: s(12)?,
+                        business_address: PhysicalAddress {
+                            street: s(13)?,
+                            city: s(14)?,
+                            state: s(15)?,
+                            postal_code: s(16)?,
+                            country_or_region: s(17)?,
+                        },
+                        home_address: PhysicalAddress {
+                            street: s(18)?,
+                            city: s(19)?,
+                            state: s(20)?,
+                            postal_code: s(21)?,
+                            country_or_region: s(22)?,
+                        },
+                        birthday: s(23)?,
+                        personal_notes: s(24)?,
+                        categories: decode_categories(&s(25)?),
+                    },
+                })
+            },
+        )
+        .optional()?;
+    let Some(mut c) = row else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT name, address FROM contact_emails WHERE contact_id = ?1 ORDER BY position",
+    )?;
+    c.fields.email_addresses = stmt
+        .query_map(params![id], |r| {
+            Ok(Recipient {
+                name: r.get(0)?,
+                address: r.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(Some(c))
 }
 
 /// The key `folder_contacts` stores an address under, and `is_contact`
@@ -6860,11 +7262,76 @@ mod tests {
         assert_eq!(bob.frequency, 1);
     }
 
+    /// A contact record with one address, its id derived from it.
     fn fc(name: &str, address: &str) -> FolderContact {
+        contact_record(&format!("C-{}", address.trim()), name, &[address])
+    }
+
+    fn contact_record(id: &str, display_name: &str, addresses: &[&str]) -> FolderContact {
         FolderContact {
-            name: name.into(),
-            address: address.into(),
+            id: id.into(),
+            change_key: format!("ck-{id}"),
+            fields: ContactFields {
+                display_name: display_name.into(),
+                email_addresses: addresses
+                    .iter()
+                    .map(|a| Recipient {
+                        name: display_name.into(),
+                        address: (*a).into(),
+                    })
+                    .collect(),
+                ..ContactFields::default()
+            },
         }
+    }
+
+    fn full_fields() -> ContactFields {
+        ContactFields {
+            given_name: "Ann".into(),
+            middle_name: "B".into(),
+            surname: "Cole".into(),
+            display_name: "Ann Cole".into(),
+            file_as: "Cole, Ann".into(),
+            email_addresses: vec![
+                Recipient {
+                    name: "Ann".into(),
+                    address: "Ann@X.com".into(),
+                },
+                Recipient {
+                    name: "Home".into(),
+                    address: "ann@home.example".into(),
+                },
+            ],
+            business_phones: vec!["+1 555 0100".into(), "+1 555 0101".into()],
+            home_phones: vec!["+1 555 0200".into()],
+            mobile_phone: "+1 555 0300".into(),
+            company_name: "Contoso".into(),
+            job_title: "Engineer".into(),
+            department: "R&D".into(),
+            business_address: PhysicalAddress {
+                street: "1 Main St".into(),
+                city: "Springfield".into(),
+                state: "IL".into(),
+                postal_code: "62701".into(),
+                country_or_region: "United States".into(),
+            },
+            home_address: PhysicalAddress {
+                street: "2 Elm St".into(),
+                city: "Shelbyville".into(),
+                ..PhysicalAddress::default()
+            },
+            birthday: "1980-05-17".into(),
+            personal_notes: "likes tea".into(),
+            categories: vec!["Friends".into(), "Work".into()],
+        }
+    }
+
+    fn contact_ids(s: &Store) -> Vec<String> {
+        s.folder_contacts()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect()
     }
 
     #[test]
@@ -6879,8 +7346,7 @@ mod tests {
             well_known_name: Some("inbox".into()),
         })
         .unwrap();
-        s.replace_folder_contacts(&[fc("Ann", "Ann@X.com")])
-            .unwrap();
+        s.replace_contacts(&[fc("Ann", "Ann@X.com")]).unwrap();
         // A `/me/people` person and a mined sender are not Contacts.
         s.upsert_contact(&Contact {
             name: "Bob".into(),
@@ -6939,7 +7405,7 @@ mod tests {
     #[test]
     fn is_contact_folds_ascii_case_only() {
         let s = Store::open_in_memory().unwrap();
-        s.replace_folder_contacts(&[fc("Kate", "kate@x.com"), fc("Ä", "Ärger@x.com")])
+        s.replace_contacts(&[fc("Kate", "kate@x.com"), fc("Ä", "Ärger@x.com")])
             .unwrap();
         // U+212A KELVIN SIGN lowercases to ASCII `k` in Unicode: no match.
         assert!(!s.is_contact("\u{212A}ate@x.com").unwrap());
@@ -6951,47 +7417,41 @@ mod tests {
     }
 
     #[test]
-    fn replace_folder_contacts_drops_absent_and_blank() {
+    fn replace_contacts_drops_absent_and_never_matches_blank() {
         let s = Store::open_in_memory().unwrap();
-        s.replace_folder_contacts(&[fc("A", "a@x.com"), fc("B", "b@x.com")])
+        s.replace_contacts(&[fc("A", "a@x.com"), fc("B", "b@x.com")])
             .unwrap();
         assert!(s.is_contact("a@x.com").unwrap());
         assert!(s.is_contact("b@x.com").unwrap());
 
-        s.replace_folder_contacts(&[fc("B", "b@x.com"), fc("Blank", "  ")])
+        s.replace_contacts(&[fc("B", "b@x.com"), fc("Blank", "  ")])
             .unwrap();
         assert!(!s.is_contact("a@x.com").unwrap());
         assert!(s.is_contact("b@x.com").unwrap());
-        let rows: i64 = s
-            .conn
-            .query_row("SELECT COUNT(*) FROM folder_contacts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
+        assert!(!s.is_contact("").unwrap());
+        assert_eq!(
+            contact_ids(&s),
+            ["C-b@x.com", "C-"],
+            "a blank address is kept"
+        );
 
-        s.replace_folder_contacts(&[]).unwrap();
+        s.replace_contacts(&[]).unwrap();
         assert!(!s.is_contact("b@x.com").unwrap());
+        assert!(contact_ids(&s).is_empty());
 
-        // Duplicates collapse (first non-empty name wins); an X500 address
-        // (a directory-saved contact) is not stored.
+        // Two contacts may share an address; an X500 address (a
+        // directory-saved contact) is stored for display, never matched.
         let x500 = "/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=ann";
-        s.replace_folder_contacts(&[
-            fc("", "B@x.com"),
-            fc("Bea", " b@X.com "),
-            fc("Other", "b@x.com"),
-            fc("Ann", x500),
+        s.replace_contacts(&[
+            contact_record("C1", "Bea", &[" b@X.com "]),
+            contact_record("C2", "Other", &["b@x.com"]),
+            contact_record("C3", "Ann", &[x500]),
         ])
         .unwrap();
-        let rows: Vec<(String, String)> = s
-            .conn
-            .prepare("SELECT address, name FROM folder_contacts")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(rows, vec![("b@x.com".to_string(), "Bea".to_string())]);
         assert!(s.is_contact("B@X.COM").unwrap());
         assert!(!s.is_contact(x500).unwrap());
+        let ann = s.folder_contact("C3").unwrap().unwrap();
+        assert_eq!(ann.fields.email_addresses[0].address, x500);
     }
 
     #[test]
@@ -7006,15 +7466,374 @@ mod tests {
         let path = dir.join("mail.db");
         {
             let s = Store::open(&path).unwrap();
-            s.conn.execute_batch("DROP TABLE folder_contacts").unwrap();
+            s.conn
+                .execute_batch(
+                    "DROP TABLE contact_emails; DROP TABLE contact_records;
+                     DROP TABLE contact_aliases; DROP TABLE folder_contacts;",
+                )
+                .unwrap();
         }
         let s = Store::open(&path).unwrap();
         assert!(!s.is_contact("ann@x.com").unwrap());
-        s.replace_folder_contacts(&[fc("Ann", "ann@x.com")])
-            .unwrap();
+        assert!(s.folder_contacts().unwrap().is_empty());
+        s.replace_contacts(&[fc("Ann", "ann@x.com")]).unwrap();
         assert!(s.is_contact("ann@x.com").unwrap());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_contact_reads_legacy_folder_contacts_until_the_first_replace() {
+        let s = Store::open_in_memory().unwrap();
+        // What #1934 stored, on a database the records have not reached yet.
+        s.conn
+            .execute(
+                "INSERT INTO folder_contacts (address, name) VALUES ('ann@x.com', 'Ann')",
+                [],
+            )
+            .unwrap();
+        assert!(s.is_contact("ANN@x.com").unwrap(), "no window of false");
+        assert!(s.folder_contacts().unwrap().is_empty());
+        // The first records fetch replaces it.
+        s.replace_contacts(&[fc("Bob", "bob@x.com")]).unwrap();
+        assert!(!s.is_contact("ann@x.com").unwrap());
+        assert!(s.is_contact("bob@x.com").unwrap());
+        let legacy: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM folder_contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(legacy, 0);
+    }
+
+    #[test]
+    fn replace_contacts_stores_records_and_drops_absent() {
+        let s = Store::open_in_memory().unwrap();
+        let ann = FolderContact {
+            id: "C1".into(),
+            change_key: "ck1".into(),
+            fields: full_fields(),
+        };
+        let bob = contact_record("C2", "Bob", &["bob@x.com"]);
+        s.replace_contacts(&[ann.clone(), bob.clone(), contact_record("C1", "dup", &[])])
+            .unwrap();
+        assert_eq!(
+            s.folder_contact("C1").unwrap(),
+            Some(ann.clone()),
+            "every field"
+        );
+        assert_eq!(s.folder_contact("C2").unwrap(), Some(bob));
+        assert!(s.is_contact("ann@home.example").unwrap());
+
+        // Bob is gone from the folder; Ann changed.
+        let mut ann2 = ann.clone();
+        ann2.change_key = "ck2".into();
+        ann2.fields.job_title = "Manager".into();
+        ann2.fields.email_addresses.pop();
+        ann2.fields.home_phones.clear();
+        s.replace_contacts(&[ann2.clone()]).unwrap();
+        assert_eq!(contact_ids(&s), ["C1"]);
+        assert_eq!(s.folder_contact("C1").unwrap(), Some(ann2));
+        assert!(!s.is_contact("bob@x.com").unwrap());
+        assert!(
+            !s.is_contact("ann@home.example").unwrap(),
+            "its email row went"
+        );
+        let emails: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM contact_emails", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(emails, 1);
+    }
+
+    #[test]
+    fn folder_contacts_orders_by_file_as_then_display_name() {
+        let s = Store::open_in_memory().unwrap();
+        let with_file_as = |id: &str, display: &str, file_as: &str| {
+            let mut c = contact_record(id, display, &[]);
+            c.fields.file_as = file_as.into();
+            c
+        };
+        s.replace_contacts(&[
+            with_file_as("C1", "Zed Adams", "adams, zed"),
+            with_file_as("C2", "carol", ""),
+            with_file_as("C3", "Bob", ""),
+            with_file_as("C4", "Aaron", "Young, Aaron"),
+            with_file_as("C0", "bob", ""),
+        ])
+        .unwrap();
+        assert_eq!(contact_ids(&s), ["C1", "C0", "C3", "C2", "C4"]);
+    }
+
+    #[test]
+    fn folder_contact_by_id_and_by_local_alias() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        assert!(local.starts_with("local:"), "{local}");
+        assert_eq!(
+            s.folder_contact(&local).unwrap().unwrap().fields,
+            full_fields()
+        );
+        assert!(s.is_contact("ann@x.com").unwrap(), "counts at once");
+        assert_eq!(s.resolve_contact_id(&local).unwrap(), local);
+
+        let mut created = contact_record("G1", "", &[]);
+        created.change_key = "ckG".into();
+        s.reconcile_created_contact(&local, &created).unwrap();
+        assert_eq!(s.resolve_contact_id(&local).unwrap(), "G1");
+        let by_local = s.folder_contact(&local).unwrap().unwrap();
+        assert_eq!(by_local.id, "G1");
+        assert_eq!(s.folder_contact("G1").unwrap(), Some(by_local));
+        assert!(s.folder_contact("nope").unwrap().is_none());
+
+        // Edits and deletes by the `local:` id reach the re-keyed row.
+        let mut f = full_fields();
+        f.job_title = "Manager".into();
+        assert_eq!(
+            s.update_contact_fields(&local, &f).unwrap(),
+            ContactFieldSet::JOB_TITLE
+        );
+        assert_eq!(
+            s.folder_contact("G1").unwrap().unwrap().fields.job_title,
+            "Manager"
+        );
+        assert!(s.delete_contact(&local).unwrap());
+        assert!(s.folder_contact("G1").unwrap().is_none());
+        assert!(!s.is_contact("ann@x.com").unwrap(), "its email rows went");
+        assert!(!s.delete_contact(&local).unwrap());
+    }
+
+    #[test]
+    fn update_contact_fields_returns_only_changed() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[FolderContact {
+            id: "C1".into(),
+            change_key: "ck1".into(),
+            fields: full_fields(),
+        }])
+        .unwrap();
+        assert_eq!(
+            s.update_contact_fields("C1", &full_fields()).unwrap(),
+            ContactFieldSet::default(),
+            "nothing changed"
+        );
+        let mut f = full_fields();
+        f.surname = "Cole-Smith".into();
+        f.business_address.postal_code = "62702".into();
+        f.email_addresses[1].address = "ann@new.example".into();
+        f.birthday.clear();
+        let mut want = ContactFieldSet::SURNAME;
+        want.insert(ContactFieldSet::BUSINESS_ADDRESS);
+        want.insert(ContactFieldSet::EMAIL_ADDRESSES);
+        want.insert(ContactFieldSet::BIRTHDAY);
+        assert_eq!(s.update_contact_fields("C1", &f).unwrap(), want);
+        let stored = s.folder_contact("C1").unwrap().unwrap();
+        assert_eq!(stored.fields, f);
+        assert_eq!(stored.change_key, "ck1", "kept");
+        assert!(s.is_contact("ann@new.example").unwrap());
+        assert!(!s.is_contact("ann@home.example").unwrap());
+        // No such contact: nothing written, nothing changed.
+        assert!(s.update_contact_fields("C9", &f).unwrap().is_empty());
+        assert!(s.folder_contact("C9").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_created_contact_rekeys_and_keeps_local_edits() {
+        let s = Store::open_in_memory().unwrap();
+        let mut f = full_fields();
+        f.display_name.clear();
+        f.file_as.clear();
+        let local = s.create_local_contact(&f).unwrap();
+        // An edit while the POST was in flight.
+        let mut edited = f.clone();
+        edited.job_title = "Manager".into();
+        s.update_contact_fields(&local, &edited).unwrap();
+
+        let created = FolderContact {
+            id: "G1".into(),
+            change_key: "ckG".into(),
+            fields: ContactFields {
+                display_name: "Ann Cole".into(),
+                file_as: "Cole, Ann".into(),
+                job_title: "Engineer".into(),
+                ..f.clone()
+            },
+        };
+        s.reconcile_created_contact(&local, &created).unwrap();
+        assert!(s.folder_contact("G1").unwrap().is_some());
+        assert_eq!(contact_ids(&s), ["G1"], "the local row is gone");
+        let row = s.folder_contact("G1").unwrap().unwrap();
+        assert_eq!(row.change_key, "ckG");
+        assert_eq!(row.fields.job_title, "Manager", "the local edit is kept");
+        assert_eq!(
+            row.fields.display_name, "Ann Cole",
+            "Graph's, the local one empty"
+        );
+        assert_eq!(row.fields.file_as, "Cole, Ann");
+        // The email rows followed the re-key.
+        assert!(s.is_contact("ann@x.com").unwrap());
+        let keyed: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM contact_emails WHERE contact_id = 'G1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keyed, 2);
+
+        // A stored name is not overwritten by Graph's.
+        let local2 = s.create_local_contact(&full_fields()).unwrap();
+        let mut created2 = created.clone();
+        created2.id = "G2".into();
+        created2.fields.display_name = "Graph's name".into();
+        s.reconcile_created_contact(&local2, &created2).unwrap();
+        assert_eq!(
+            s.folder_contact("G2").unwrap().unwrap().fields.display_name,
+            "Ann Cole"
+        );
+    }
+
+    #[test]
+    fn reconcile_created_contact_of_a_deleted_row_still_aliases() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        assert!(s.delete_contact(&local).unwrap());
+        s.reconcile_created_contact(&local, &contact_record("G1", "Ann", &[]))
+            .unwrap();
+        assert!(s.folder_contacts().unwrap().is_empty(), "no row comes back");
+        assert_eq!(s.resolve_contact_id(&local).unwrap(), "G1");
+    }
+
+    #[test]
+    fn replace_contacts_keeps_rows_with_pending_ops() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[
+            contact_record("E1", "Edited", &["e@x.com"]),
+            contact_record("D1", "Deleted", &["d@x.com"]),
+            contact_record("R1", "Removed elsewhere", &["r@x.com"]),
+            contact_record("P1", "Plain", &["p@x.com"]),
+        ])
+        .unwrap();
+        // A create not sent yet, an edit queued by a local id since
+        // re-keyed, and a delete.
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        s.enqueue_op(&OutboxOp::CreateContact { id: local.clone() })
+            .unwrap();
+        let edited_local = s.create_local_contact(&ContactFields::default()).unwrap();
+        s.reconcile_created_contact(&edited_local, &contact_record("G2", "", &[]))
+            .unwrap();
+        let mut e = contact_record("E1", "Edited here", &["e@x.com"]).fields;
+        let changed = s.update_contact_fields("E1", &e).unwrap();
+        s.enqueue_op(&OutboxOp::UpdateContact {
+            id: "E1".into(),
+            fields: changed,
+        })
+        .unwrap();
+        e.job_title = "Lead".into();
+        let changed = s.update_contact_fields(&edited_local, &e).unwrap();
+        s.enqueue_op(&OutboxOp::UpdateContact {
+            id: edited_local.clone(),
+            fields: changed,
+        })
+        .unwrap();
+        s.delete_contact("D1").unwrap();
+        s.enqueue_op(&OutboxOp::DeleteContact { id: "D1".into() })
+            .unwrap();
+
+        // Graph's answer: none of the local writes yet, and R1 gone.
+        s.replace_contacts(&[
+            contact_record("E1", "Edited", &["e@x.com"]),
+            contact_record("D1", "Deleted", &["d@x.com"]),
+            contact_record("G2", "", &[]),
+            contact_record("P1", "Plain (renamed)", &["p@x.com"]),
+        ])
+        .unwrap();
+        let mut ids = contact_ids(&s);
+        ids.sort();
+        let mut want = vec!["E1".to_string(), "G2".into(), "P1".into(), local.clone()];
+        want.sort();
+        assert_eq!(
+            ids, want,
+            "R1 removed, D1 not written back, the local row kept"
+        );
+        assert_eq!(
+            s.folder_contact("E1").unwrap().unwrap().fields.display_name,
+            "Edited here",
+            "the queued edit is not undone"
+        );
+        assert_eq!(
+            s.folder_contact("G2").unwrap().unwrap().fields.job_title,
+            "Lead"
+        );
+        assert_eq!(
+            s.folder_contact("P1").unwrap().unwrap().fields.display_name,
+            "Plain (renamed)"
+        );
+        assert!(!s.is_contact("d@x.com").unwrap());
+
+        // With the queue empty, the server's version wins again.
+        for row in s.pending_ops().unwrap() {
+            s.drop_op(row.seq);
+        }
+        s.replace_contacts(&[contact_record("E1", "Edited", &["e@x.com"])])
+            .unwrap();
+        let mut ids = contact_ids(&s);
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["E1".to_string(), local],
+            "a local row is never removed"
+        );
+        assert_eq!(
+            s.folder_contact("E1").unwrap().unwrap().fields.display_name,
+            "Edited"
+        );
+    }
+
+    #[test]
+    fn contact_ops_round_trip_json() {
+        let mut fields = ContactFieldSet::SURNAME;
+        fields.insert(ContactFieldSet::HOME_ADDRESS);
+        let ops = [
+            OutboxOp::CreateContact {
+                id: "local:ab".into(),
+            },
+            OutboxOp::UpdateContact {
+                id: "G1".into(),
+                fields,
+            },
+            OutboxOp::DeleteContact { id: "G1".into() },
+        ];
+        for op in ops {
+            let back = OutboxOp::from_json(&json::parse(&op.to_json().to_string()).unwrap());
+            assert_eq!(back, Some(op));
+        }
+        assert_eq!(
+            OutboxOp::UpdateContact {
+                id: "G1".into(),
+                fields
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"updateContact","id":"G1","fields":["surname","homeAddress"]}"#
+        );
+        // An unknown name is dropped; a row without `fields` is corrupt.
+        let v = json::parse(r#"{"kind":"updateContact","id":"G1","fields":["surname","later"]}"#)
+            .unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::UpdateContact {
+                id: "G1".into(),
+                fields: ContactFieldSet::SURNAME
+            })
+        );
+        let v = json::parse(r#"{"kind":"updateContact","id":"G1"}"#).unwrap();
+        assert_eq!(OutboxOp::from_json(&v), None);
+        // Contact ops name no message.
+        let s = Store::open_in_memory().unwrap();
+        s.enqueue_op(&OutboxOp::DeleteContact { id: "G1".into() })
+            .unwrap();
+        assert!(s.pending_message_ids().unwrap().is_empty());
     }
 }
 

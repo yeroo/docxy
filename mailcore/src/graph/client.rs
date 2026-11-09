@@ -9,11 +9,11 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, Calendar, DeltaPage, Event, EventDeltaItem,
-    EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder, MasterCategory, Me,
-    MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person, REMINDER_SET_PROP,
-    REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit, plain_to_html,
-    to_utc,
+    AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, DeltaPage, Event,
+    EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder,
+    MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
+    PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
+    ScheduleEntry, SearchHit, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -437,6 +437,170 @@ impl EventFieldSet {
                 set.insert(*g);
             }
         }
+        set
+    }
+}
+
+/// The properties of a contact a create or update sends (#2063), one bit per
+/// Graph property: an update sends only the ones an edit changed
+/// (`Store::update_contact_fields` returns them). Each JSON name is the
+/// Graph property's, which a queued `OutboxOp::UpdateContact` stores: the
+/// names never change (see `docs/claude/mail.md`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContactFieldSet(u32);
+
+impl ContactFieldSet {
+    pub const GIVEN_NAME: ContactFieldSet = ContactFieldSet(1 << 0);
+    pub const MIDDLE_NAME: ContactFieldSet = ContactFieldSet(1 << 1);
+    pub const SURNAME: ContactFieldSet = ContactFieldSet(1 << 2);
+    pub const DISPLAY_NAME: ContactFieldSet = ContactFieldSet(1 << 3);
+    pub const FILE_AS: ContactFieldSet = ContactFieldSet(1 << 4);
+    pub const EMAIL_ADDRESSES: ContactFieldSet = ContactFieldSet(1 << 5);
+    pub const BUSINESS_PHONES: ContactFieldSet = ContactFieldSet(1 << 6);
+    pub const HOME_PHONES: ContactFieldSet = ContactFieldSet(1 << 7);
+    pub const MOBILE_PHONE: ContactFieldSet = ContactFieldSet(1 << 8);
+    pub const COMPANY_NAME: ContactFieldSet = ContactFieldSet(1 << 9);
+    pub const JOB_TITLE: ContactFieldSet = ContactFieldSet(1 << 10);
+    pub const DEPARTMENT: ContactFieldSet = ContactFieldSet(1 << 11);
+    pub const BUSINESS_ADDRESS: ContactFieldSet = ContactFieldSet(1 << 12);
+    pub const HOME_ADDRESS: ContactFieldSet = ContactFieldSet(1 << 13);
+    pub const BIRTHDAY: ContactFieldSet = ContactFieldSet(1 << 14);
+    pub const PERSONAL_NOTES: ContactFieldSet = ContactFieldSet(1 << 15);
+    pub const CATEGORIES: ContactFieldSet = ContactFieldSet(1 << 16);
+
+    /// Every property.
+    pub const ALL: ContactFieldSet = ContactFieldSet((1 << 17) - 1);
+
+    /// Each property and its JSON (Graph) name, in bit order. Never rename
+    /// one: a queued op stores them.
+    const NAMES: [(ContactFieldSet, &'static str); 17] = [
+        (Self::GIVEN_NAME, "givenName"),
+        (Self::MIDDLE_NAME, "middleName"),
+        (Self::SURNAME, "surname"),
+        (Self::DISPLAY_NAME, "displayName"),
+        (Self::FILE_AS, "fileAs"),
+        (Self::EMAIL_ADDRESSES, "emailAddresses"),
+        (Self::BUSINESS_PHONES, "businessPhones"),
+        (Self::HOME_PHONES, "homePhones"),
+        (Self::MOBILE_PHONE, "mobilePhone"),
+        (Self::COMPANY_NAME, "companyName"),
+        (Self::JOB_TITLE, "jobTitle"),
+        (Self::DEPARTMENT, "department"),
+        (Self::BUSINESS_ADDRESS, "businessAddress"),
+        (Self::HOME_ADDRESS, "homeAddress"),
+        (Self::BIRTHDAY, "birthday"),
+        (Self::PERSONAL_NOTES, "personalNotes"),
+        (Self::CATEGORIES, "categories"),
+    ];
+
+    pub fn contains(self, other: ContactFieldSet) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn insert(&mut self, other: ContactFieldSet) {
+        self.0 |= other.0;
+    }
+
+    pub fn remove(&mut self, other: ContactFieldSet) {
+        self.0 &= !other.0;
+    }
+
+    pub fn union(self, other: ContactFieldSet) -> ContactFieldSet {
+        ContactFieldSet(self.0 | other.0)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The JSON names of the properties in the set, in bit order.
+    pub fn to_names(self) -> Vec<&'static str> {
+        Self::NAMES
+            .iter()
+            .filter(|(g, _)| self.contains(*g))
+            .map(|(_, n)| *n)
+            .collect()
+    }
+
+    /// The set the names spell; an unknown name is dropped.
+    pub fn from_names<S: AsRef<str>>(names: &[S]) -> ContactFieldSet {
+        let mut set = ContactFieldSet::default();
+        for name in names {
+            if let Some((g, _)) = Self::NAMES.iter().find(|(_, n)| *n == name.as_ref()) {
+                set.insert(*g);
+            }
+        }
+        set
+    }
+
+    /// The properties of `f` that hold something: what a create sends.
+    pub fn non_empty(f: &ContactFields) -> ContactFieldSet {
+        let mut set = ContactFieldSet::default();
+        let mut put = |g: ContactFieldSet, has: bool| {
+            if has {
+                set.insert(g);
+            }
+        };
+        put(Self::GIVEN_NAME, !f.given_name.is_empty());
+        put(Self::MIDDLE_NAME, !f.middle_name.is_empty());
+        put(Self::SURNAME, !f.surname.is_empty());
+        put(Self::DISPLAY_NAME, !f.display_name.is_empty());
+        put(Self::FILE_AS, !f.file_as.is_empty());
+        put(
+            Self::EMAIL_ADDRESSES,
+            f.email_addresses
+                .iter()
+                .any(|e| !e.address.trim().is_empty()),
+        );
+        put(Self::BUSINESS_PHONES, !f.business_phones.is_empty());
+        put(Self::HOME_PHONES, !f.home_phones.is_empty());
+        put(Self::MOBILE_PHONE, !f.mobile_phone.is_empty());
+        put(Self::COMPANY_NAME, !f.company_name.is_empty());
+        put(Self::JOB_TITLE, !f.job_title.is_empty());
+        put(Self::DEPARTMENT, !f.department.is_empty());
+        put(Self::BUSINESS_ADDRESS, !f.business_address.is_empty());
+        put(Self::HOME_ADDRESS, !f.home_address.is_empty());
+        put(Self::BIRTHDAY, !f.birthday.is_empty());
+        put(Self::PERSONAL_NOTES, !f.personal_notes.is_empty());
+        put(Self::CATEGORIES, !f.categories.is_empty());
+        set
+    }
+
+    /// The properties whose values differ between `a` and `b`: what an
+    /// update sends.
+    pub fn changed(a: &ContactFields, b: &ContactFields) -> ContactFieldSet {
+        let mut set = ContactFieldSet::default();
+        let mut put = |g: ContactFieldSet, differs: bool| {
+            if differs {
+                set.insert(g);
+            }
+        };
+        put(Self::GIVEN_NAME, a.given_name != b.given_name);
+        put(Self::MIDDLE_NAME, a.middle_name != b.middle_name);
+        put(Self::SURNAME, a.surname != b.surname);
+        put(Self::DISPLAY_NAME, a.display_name != b.display_name);
+        put(Self::FILE_AS, a.file_as != b.file_as);
+        put(
+            Self::EMAIL_ADDRESSES,
+            a.email_addresses != b.email_addresses,
+        );
+        put(
+            Self::BUSINESS_PHONES,
+            a.business_phones != b.business_phones,
+        );
+        put(Self::HOME_PHONES, a.home_phones != b.home_phones);
+        put(Self::MOBILE_PHONE, a.mobile_phone != b.mobile_phone);
+        put(Self::COMPANY_NAME, a.company_name != b.company_name);
+        put(Self::JOB_TITLE, a.job_title != b.job_title);
+        put(Self::DEPARTMENT, a.department != b.department);
+        put(
+            Self::BUSINESS_ADDRESS,
+            a.business_address != b.business_address,
+        );
+        put(Self::HOME_ADDRESS, a.home_address != b.home_address);
+        put(Self::BIRTHDAY, a.birthday != b.birthday);
+        put(Self::PERSONAL_NOTES, a.personal_notes != b.personal_notes);
+        put(Self::CATEGORIES, a.categories != b.categories);
         set
     }
 }
@@ -1695,43 +1859,91 @@ impl GraphClient {
         Ok(people)
     }
 
-    /// GET `/me/contacts` (the default Contacts folder, #1934), 200 a page,
-    /// following `@odata.nextLink` (a relative path or a full URL, as
-    /// `calendar_view` does) until Graph stops sending one. Returns one
-    /// `FolderContact` per non-blank address of every contact (a contact
-    /// holds up to three `emailAddresses`), with the contact's
-    /// `displayName`. Any page's failure is an `Err`, never a partial list,
-    /// so a caller that replaces its stored set never drops contacts it
-    /// did not get to see. Requires `Contacts.Read`, which
-    /// `AuthConfig::default()` does not ask for: a host that wants
-    /// `Store::is_contact` adds it to its scope, and a token without it
-    /// gets a 403 here.
+    /// GET `/me/contacts` (the default Contacts folder, #1934, #2063), 200 a
+    /// page, following `@odata.nextLink` (a relative path or a full URL, as
+    /// `calendar_view` does) until Graph stops sending one. Returns every
+    /// contact as a record with the fields a contact form edits
+    /// (`CONTACT_SELECT`); an item without an `id` is skipped. Any page's
+    /// failure is an `Err`, never a partial list, so a caller that replaces
+    /// its stored set never drops contacts it did not get to see. Requires
+    /// `Contacts.Read`, which `AuthConfig::default()` does not ask for: a
+    /// host that wants `Store::is_contact` or the records adds it to its
+    /// scope, and a token without it gets a 403 here.
     pub fn contacts(&self) -> Result<Vec<FolderContact>, GraphError> {
-        let mut target = "/me/contacts?$top=200&$select=displayName,emailAddresses".to_string();
+        let mut target = format!("/me/contacts?$top=200&$select={CONTACT_SELECT}");
         let mut out = Vec::new();
         loop {
             let resp = self.send(Method::Get, &target, None, &[])?;
             let v = parse_body(resp)?;
-            for c in value_array(&v, "value")? {
-                let name = c.get("displayName").and_then(Value::as_str).unwrap_or("");
-                let addresses = c.get("emailAddresses").and_then(Value::as_array);
-                for e in addresses.into_iter().flatten() {
-                    let address = e.get("address").and_then(Value::as_str).unwrap_or("");
-                    if address.trim().is_empty() {
-                        continue;
-                    }
-                    out.push(FolderContact {
-                        name: name.to_string(),
-                        address: address.to_string(),
-                    });
-                }
-            }
+            out.extend(
+                value_array(&v, "value")?
+                    .iter()
+                    .filter_map(FolderContact::from_json),
+            );
             match v.get("@odata.nextLink").and_then(Value::as_str) {
                 Some(next) => target = next.to_string(),
                 None => break,
             }
         }
         Ok(out)
+    }
+
+    /// GET `/me/contacts/{id}` with the same `$select` as `contacts` (#2063):
+    /// one record, to bring a contact back to the server's version after a
+    /// refused write. A 404 is `NotFound`.
+    pub fn contact(&self, id: &str) -> Result<FolderContact, GraphError> {
+        let path = format!(
+            "/me/contacts/{}?$select={CONTACT_SELECT}",
+            encode_path_segment(id)
+        );
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        FolderContact::from_json(&v).ok_or_else(|| GraphError::Parse("malformed contact".into()))
+    }
+
+    /// POST `/me/contacts` with the properties of `fields` that hold
+    /// something (#2063); returns the created contact as Graph answers it
+    /// (its id, `changeKey`, and the `displayName` / `fileAs` Graph
+    /// computes). Requires `Contacts.ReadWrite`: a token with only
+    /// `Contacts.Read` gets `Http { status: 403, .. }`.
+    pub fn create_contact(&self, fields: &ContactFields) -> Result<FolderContact, GraphError> {
+        let body = contact_body_json(fields, ContactFieldSet::non_empty(fields));
+        let resp = self.send(Method::Post, "/me/contacts", Some(body), &[])?;
+        let v = parse_body(resp)?;
+        FolderContact::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed created contact".into()))
+    }
+
+    /// PATCH `/me/contacts/{id}` with only the properties in `set`, each with
+    /// its value in `fields` (#2063). An empty set sends nothing. Graph's
+    /// answer body is not read: the PATCH was applied. Requires
+    /// `Contacts.ReadWrite`.
+    pub fn update_contact(
+        &self,
+        id: &str,
+        fields: &ContactFields,
+        set: ContactFieldSet,
+    ) -> Result<(), GraphError> {
+        if set.is_empty() {
+            return Ok(());
+        }
+        let path = format!("/me/contacts/{}", encode_path_segment(id));
+        self.send(
+            Method::Patch,
+            &path,
+            Some(contact_body_json(fields, set)),
+            &[],
+        )?;
+        Ok(())
+    }
+
+    /// DELETE `/me/contacts/{id}` (#2063). A 404 is `NotFound`, as every
+    /// call returns it: the outbox treats it as done. Requires
+    /// `Contacts.ReadWrite`.
+    pub fn delete_contact(&self, id: &str) -> Result<(), GraphError> {
+        let path = format!("/me/contacts/{}", encode_path_segment(id));
+        self.send(Method::Delete, &path, None, &[])?;
+        Ok(())
     }
 
     /// POST `/me/messages/{id}/attachments` with an inline
@@ -2245,6 +2457,111 @@ fn draft_body_json(
         ("bccRecipients".to_string(), recipients_json(bcc)),
     ])
     .to_string()
+}
+
+/// The `$select` of `contacts` and `contact` (#2063): the id, the change
+/// key and every property `ContactFieldSet` names.
+const CONTACT_SELECT: &str = "id,changeKey,givenName,middleName,surname,displayName,fileAs,\
+emailAddresses,businessPhones,homePhones,mobilePhone,companyName,jobTitle,department,\
+businessAddress,homeAddress,birthday,personalNotes,categories";
+
+/// The JSON body of a contact create or update (#2063): the properties in
+/// `set`, each with its value in `f`. A string goes as given (`""` clears
+/// it), a list whole, an address as its full five-key object, the
+/// `emailAddresses` as `[{name, address}]` without blank addresses, and the
+/// birthday as noon UTC of its day (so no client's zone shows the day
+/// before), `null` when `""`.
+pub(crate) fn contact_body_json(f: &ContactFields, set: ContactFieldSet) -> String {
+    let has = |g: ContactFieldSet| set.contains(g);
+    let mut obj: Vec<(String, Value)> = Vec::new();
+    let mut put = |k: &str, v: Value| obj.push((k.to_string(), v));
+    let text = |s: &str| Value::Str(s.to_string());
+    let list = |l: &[String]| Value::Array(l.iter().map(|s| Value::Str(s.clone())).collect());
+    let address = |a: &PhysicalAddress| {
+        Value::Object(vec![
+            ("street".to_string(), text(&a.street)),
+            ("city".to_string(), text(&a.city)),
+            ("state".to_string(), text(&a.state)),
+            ("postalCode".to_string(), text(&a.postal_code)),
+            ("countryOrRegion".to_string(), text(&a.country_or_region)),
+        ])
+    };
+    let strings = [
+        (ContactFieldSet::GIVEN_NAME, "givenName", &f.given_name),
+        (ContactFieldSet::MIDDLE_NAME, "middleName", &f.middle_name),
+        (ContactFieldSet::SURNAME, "surname", &f.surname),
+        (
+            ContactFieldSet::DISPLAY_NAME,
+            "displayName",
+            &f.display_name,
+        ),
+        (ContactFieldSet::FILE_AS, "fileAs", &f.file_as),
+    ];
+    for (g, k, v) in strings {
+        if has(g) {
+            put(k, text(v));
+        }
+    }
+    if has(ContactFieldSet::EMAIL_ADDRESSES) {
+        let emails = f
+            .email_addresses
+            .iter()
+            .filter(|e| !e.address.trim().is_empty())
+            .map(|e| {
+                Value::Object(vec![
+                    ("name".to_string(), text(&e.name)),
+                    ("address".to_string(), text(e.address.trim())),
+                ])
+            })
+            .collect();
+        put("emailAddresses", Value::Array(emails));
+    }
+    if has(ContactFieldSet::BUSINESS_PHONES) {
+        put("businessPhones", list(&f.business_phones));
+    }
+    if has(ContactFieldSet::HOME_PHONES) {
+        put("homePhones", list(&f.home_phones));
+    }
+    let more = [
+        (
+            ContactFieldSet::MOBILE_PHONE,
+            "mobilePhone",
+            &f.mobile_phone,
+        ),
+        (
+            ContactFieldSet::COMPANY_NAME,
+            "companyName",
+            &f.company_name,
+        ),
+        (ContactFieldSet::JOB_TITLE, "jobTitle", &f.job_title),
+        (ContactFieldSet::DEPARTMENT, "department", &f.department),
+    ];
+    for (g, k, v) in more {
+        if has(g) {
+            put(k, text(v));
+        }
+    }
+    if has(ContactFieldSet::BUSINESS_ADDRESS) {
+        put("businessAddress", address(&f.business_address));
+    }
+    if has(ContactFieldSet::HOME_ADDRESS) {
+        put("homeAddress", address(&f.home_address));
+    }
+    if has(ContactFieldSet::BIRTHDAY) {
+        let b = if f.birthday.is_empty() {
+            Value::Null
+        } else {
+            text(&format!("{}T12:00:00Z", f.birthday))
+        };
+        put("birthday", b);
+    }
+    if has(ContactFieldSet::PERSONAL_NOTES) {
+        put("personalNotes", text(&f.personal_notes));
+    }
+    if has(ContactFieldSet::CATEGORIES) {
+        put("categories", list(&f.categories));
+    }
+    Value::Object(obj).to_string()
 }
 
 /// Serializes an `EventInput` to the JSON body shared by `create_event` and
@@ -5512,7 +5829,7 @@ mod tests {
     }
 
     #[test]
-    fn contacts_follows_next_links_and_keeps_every_address() {
+    fn contacts_follows_next_links_and_keeps_every_contact() {
         // The page-2 route is listed first: the fake server answers the first
         // route whose path_prefix matches (see
         // `calendar_view_follows_next_link_pagination`).
@@ -5523,7 +5840,7 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body: r#"{"value":[
-                    {"displayName":"Erin","emailAddresses":[{"name":"Erin","address":"Erin@X.com"}]}
+                    {"id":"C3","displayName":"Erin","emailAddresses":[{"name":"Erin","address":"Erin@X.com"}]}
                 ]}"#
                 .into(),
             },
@@ -5533,28 +5850,25 @@ mod tests {
                 status: 200,
                 headers: vec![],
                 body: r#"{"value":[
-                    {"displayName":"Dave Doe","emailAddresses":[{"name":"Dave","address":"dave@x.com"},{"name":"Dave home","address":"dave@home.example"}]},
-                    {"displayName":"No Address","emailAddresses":[]},
-                    {"displayName":"Blank","emailAddresses":[{"name":"Blank","address":"  "}]},
-                    {"displayName":"Missing field"}
+                    {"id":"C1","displayName":"Dave Doe","emailAddresses":[{"name":"Dave","address":"dave@x.com"},{"name":"Dave home","address":"dave@home.example"}]},
+                    {"id":"C2","displayName":"No Address","emailAddresses":[]},
+                    {"displayName":"No id"}
                 ],"@odata.nextLink":"/me/contacts?$skip=200"}"#
                 .into(),
             },
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let got = c.contacts().unwrap();
-        let pairs: Vec<(&str, &str)> = got
+        let ids: Vec<&str> = got.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["C1", "C2", "C3"], "an item without an id is skipped");
+        let addresses: Vec<&str> = got[0]
+            .fields
+            .email_addresses
             .iter()
-            .map(|f| (f.name.as_str(), f.address.as_str()))
+            .map(|e| e.address.as_str())
             .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("Dave Doe", "dave@x.com"),
-                ("Dave Doe", "dave@home.example"),
-                ("Erin", "Erin@X.com"),
-            ]
-        );
+        assert_eq!(addresses, ["dave@x.com", "dave@home.example"]);
+        assert_eq!(got[0].fields.email_addresses[1].name, "Dave home");
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2);
         assert!(
@@ -5564,11 +5878,340 @@ mod tests {
         );
         assert!(reqs[0].path.contains("$top=200"), "{}", reqs[0].path);
         assert!(
-            reqs[0].path.contains("$select=displayName,emailAddresses"),
+            reqs[0].path.contains(&format!("$select={CONTACT_SELECT}")),
             "{}",
             reqs[0].path
         );
         assert_eq!(reqs[1].path, "/me/contacts?$skip=200");
+    }
+
+    #[test]
+    fn contacts_parses_every_record_field() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/contacts".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"value":[
+                {"id":"C1","changeKey":"CK1","givenName":"Ann","middleName":"B","surname":"Cole",
+                 "displayName":"Ann Cole","fileAs":"Cole, Ann",
+                 "emailAddresses":[{"name":"Ann","address":"ann@x.com"},{"address":"ann@home.example"}],
+                 "businessPhones":["+1 555 0100","+1 555 0101"],"homePhones":["+1 555 0200"],
+                 "mobilePhone":"+1 555 0300","companyName":"Contoso","jobTitle":"Engineer",
+                 "department":"R&D",
+                 "businessAddress":{"street":"1 Main St","city":"Springfield","state":"IL","postalCode":"62701","countryOrRegion":"United States"},
+                 "homeAddress":{"street":"2 Elm St","city":"Shelbyville"},
+                 "birthday":"1980-05-17T11:59:00Z","personalNotes":"likes tea",
+                 "categories":["Friends","Work"]},
+                {"id":"C2","changeKey":null,"givenName":null,"emailAddresses":null,
+                 "businessPhones":null,"businessAddress":null,"homeAddress":{},
+                 "birthday":null},
+                {"id":"C3","birthday":"not a date"}
+            ]}"#
+            .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.contacts().unwrap();
+        let ann = &got[0];
+        assert_eq!(ann.id, "C1");
+        assert_eq!(ann.change_key, "CK1");
+        let f = &ann.fields;
+        assert_eq!(
+            (
+                f.given_name.as_str(),
+                f.middle_name.as_str(),
+                f.surname.as_str()
+            ),
+            ("Ann", "B", "Cole")
+        );
+        assert_eq!(f.display_name, "Ann Cole");
+        assert_eq!(f.file_as, "Cole, Ann");
+        assert_eq!(
+            f.email_addresses,
+            vec![
+                Recipient {
+                    name: "Ann".into(),
+                    address: "ann@x.com".into()
+                },
+                Recipient {
+                    name: "".into(),
+                    address: "ann@home.example".into()
+                },
+            ]
+        );
+        assert_eq!(f.business_phones, ["+1 555 0100", "+1 555 0101"]);
+        assert_eq!(f.home_phones, ["+1 555 0200"]);
+        assert_eq!(f.mobile_phone, "+1 555 0300");
+        assert_eq!(f.company_name, "Contoso");
+        assert_eq!(f.job_title, "Engineer");
+        assert_eq!(f.department, "R&D");
+        assert_eq!(
+            f.business_address,
+            PhysicalAddress {
+                street: "1 Main St".into(),
+                city: "Springfield".into(),
+                state: "IL".into(),
+                postal_code: "62701".into(),
+                country_or_region: "United States".into(),
+            }
+        );
+        assert_eq!(f.home_address.street, "2 Elm St");
+        assert_eq!(f.home_address.city, "Shelbyville");
+        assert_eq!(f.home_address.postal_code, "");
+        assert_eq!(f.birthday, "1980-05-17", "the date part only");
+        assert_eq!(f.personal_notes, "likes tea");
+        assert_eq!(f.categories, ["Friends", "Work"]);
+        // Null and missing read as empty.
+        assert_eq!(
+            got[1],
+            FolderContact {
+                id: "C2".into(),
+                ..FolderContact::default()
+            }
+        );
+        assert_eq!(got[2].fields.birthday, "", "not a date");
+    }
+
+    #[test]
+    fn contact_gets_one_record_and_404_is_not_found() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts/gone".into(),
+                status: 404,
+                headers: vec![],
+                body: "{}".into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/contacts/C%2F1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"C/1","changeKey":"CK","displayName":"Ann"}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.contact("C/1").unwrap();
+        assert_eq!(got.id, "C/1");
+        assert_eq!(got.fields.display_name, "Ann");
+        assert!(matches!(c.contact("gone"), Err(GraphError::NotFound)));
+        let reqs = srv.requests();
+        assert!(
+            reqs[0]
+                .path
+                .starts_with(&format!("/me/contacts/C%2F1?$select={CONTACT_SELECT}")),
+            "{}",
+            reqs[0].path
+        );
+    }
+
+    fn sample_contact_fields() -> ContactFields {
+        ContactFields {
+            given_name: "Ann".into(),
+            surname: "Cole".into(),
+            email_addresses: vec![
+                Recipient {
+                    name: "Ann".into(),
+                    address: " ann@x.com ".into(),
+                },
+                Recipient {
+                    name: "Blank".into(),
+                    address: "  ".into(),
+                },
+            ],
+            business_phones: vec!["+1 555 0100".into()],
+            home_address: PhysicalAddress {
+                city: "Shelbyville".into(),
+                ..PhysicalAddress::default()
+            },
+            birthday: "1980-05-17".into(),
+            categories: vec!["Friends".into()],
+            ..ContactFields::default()
+        }
+    }
+
+    #[test]
+    fn create_contact_posts_the_nonempty_fields_and_parses_the_answer() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/contacts".into(),
+            status: 201,
+            headers: vec![],
+            body: r#"{"id":"G1","changeKey":"CK1","givenName":"Ann","surname":"Cole",
+                      "displayName":"Ann Cole","fileAs":"Cole, Ann"}"#
+                .into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let created = c.create_contact(&sample_contact_fields()).unwrap();
+        assert_eq!(created.id, "G1");
+        assert_eq!(created.change_key, "CK1");
+        assert_eq!(created.fields.display_name, "Ann Cole");
+        assert_eq!(created.fields.file_as, "Cole, Ann");
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/contacts");
+        let sent = json::parse(&reqs[0].body).unwrap();
+        let Value::Object(entries) = &sent else {
+            panic!("{}", reqs[0].body)
+        };
+        let keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "givenName",
+                "surname",
+                "emailAddresses",
+                "businessPhones",
+                "homeAddress",
+                "birthday",
+                "categories"
+            ],
+            "only the non-empty properties"
+        );
+        let emails = sent
+            .get("emailAddresses")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(emails.len(), 1, "the blank address is dropped");
+        assert_eq!(
+            emails[0].get("address").and_then(Value::as_str),
+            Some("ann@x.com")
+        );
+        assert_eq!(emails[0].get("name").and_then(Value::as_str), Some("Ann"));
+        let home = sent.get("homeAddress").unwrap();
+        assert_eq!(
+            home.get("city").and_then(Value::as_str),
+            Some("Shelbyville")
+        );
+        assert_eq!(home.get("street").and_then(Value::as_str), Some(""));
+        assert_eq!(
+            sent.get("birthday").and_then(Value::as_str),
+            Some("1980-05-17T12:00:00Z"),
+            "noon UTC of the day"
+        );
+    }
+
+    #[test]
+    fn update_contact_patches_only_the_given_fields() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/contacts/G%2F1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"G/1"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let mut f = sample_contact_fields();
+        f.birthday.clear();
+        f.job_title = "".into();
+        let mut set = ContactFieldSet::BIRTHDAY;
+        set.insert(ContactFieldSet::JOB_TITLE);
+        c.update_contact("G/1", &f, set).unwrap();
+        // An empty set sends nothing.
+        c.update_contact("G/1", &f, ContactFieldSet::default())
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/contacts/G%2F1");
+        assert_eq!(reqs[0].body, r#"{"jobTitle":"","birthday":null}"#);
+    }
+
+    #[test]
+    fn delete_contact_404_is_not_found() {
+        let srv = FakeServer::start_limited(vec![
+            (
+                Route {
+                    method: "DELETE".into(),
+                    path_prefix: "/me/contacts/G1".into(),
+                    status: 204,
+                    headers: vec![],
+                    body: "".into(),
+                },
+                Some(1),
+            ),
+            (
+                Route {
+                    method: "DELETE".into(),
+                    path_prefix: "/me/contacts/G1".into(),
+                    status: 404,
+                    headers: vec![],
+                    body: "{}".into(),
+                },
+                None,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.delete_contact("G1").unwrap();
+        assert!(matches!(c.delete_contact("G1"), Err(GraphError::NotFound)));
+        assert_eq!(srv.requests()[0].method, "DELETE");
+    }
+
+    #[test]
+    fn contact_403_on_write_is_http_403() {
+        let denied = |method: &str| Route {
+            method: method.into(),
+            path_prefix: "/me/contacts".into(),
+            status: 403,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorAccessDenied","message":"Access is denied."}}"#.into(),
+        };
+        let srv = FakeServer::start(vec![denied("POST"), denied("PATCH"), denied("DELETE")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let f = sample_contact_fields();
+        let is_403 =
+            |r: Result<(), GraphError>| matches!(r, Err(GraphError::Http { status: 403, .. }));
+        assert!(is_403(c.create_contact(&f).map(|_| ())));
+        assert!(is_403(c.update_contact("G1", &f, ContactFieldSet::SURNAME)));
+        assert!(is_403(c.delete_contact("G1")));
+        let err = c.delete_contact("G1").unwrap_err().to_string();
+        assert_eq!(err, "HTTP 403: Access is denied.");
+    }
+
+    #[test]
+    fn contact_field_set_names_round_trip() {
+        let names = ContactFieldSet::ALL.to_names();
+        assert_eq!(names.len(), 17);
+        assert_eq!(ContactFieldSet::from_names(&names), ContactFieldSet::ALL);
+        let mut set = ContactFieldSet::SURNAME;
+        set.insert(ContactFieldSet::HOME_ADDRESS);
+        assert_eq!(set.to_names(), ["surname", "homeAddress"]);
+        assert_eq!(
+            ContactFieldSet::from_names(&["surname", "nickName", "homeAddress"]),
+            set,
+            "an unknown name is dropped"
+        );
+        // The names are Graph's, which `contact_body_json` sends.
+        let body = contact_body_json(&ContactFields::default(), ContactFieldSet::ALL);
+        let v = json::parse(&body).unwrap();
+        for n in names {
+            assert!(v.get(n).is_some(), "{n} in {body}");
+        }
+    }
+
+    #[test]
+    fn contact_field_set_changed_and_non_empty() {
+        let a = sample_contact_fields();
+        assert_eq!(ContactFieldSet::changed(&a, &a), ContactFieldSet::default());
+        let mut b = a.clone();
+        b.home_address.state = "IL".into();
+        b.categories.clear();
+        let mut want = ContactFieldSet::HOME_ADDRESS;
+        want.insert(ContactFieldSet::CATEGORIES);
+        assert_eq!(ContactFieldSet::changed(&a, &b), want);
+        assert_eq!(
+            ContactFieldSet::non_empty(&ContactFields::default()),
+            ContactFieldSet::default()
+        );
+        // An address list of blanks only is empty.
+        let blanks = ContactFields {
+            email_addresses: vec![Recipient {
+                name: "x".into(),
+                address: " ".into(),
+            }],
+            ..ContactFields::default()
+        };
+        assert!(ContactFieldSet::non_empty(&blanks).is_empty());
     }
 
     #[test]

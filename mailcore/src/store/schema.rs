@@ -104,14 +104,74 @@ CREATE TABLE IF NOT EXISTS contacts (
     relevance  INTEGER
 );
 
--- The user's own Contacts folder (`/me/contacts`, #1934), one row per
--- lowercased address, replaced whole by every successful fetch
--- (`Store::replace_folder_contacts`). Apart from `contacts` on purpose: that
--- table is `/me/people` and mined correspondents, autocomplete only, while
--- this one answers `Store::is_contact` for a trust decision.
+-- #1934's Contacts-folder addresses, one row per lowercased address. Legacy
+-- since #2063: nothing writes it any more, `Store::replace_contacts` empties
+-- it, and `Store::is_contact` still reads it, so a database from before the
+-- records keeps its trust answers until their first fetch.
 CREATE TABLE IF NOT EXISTS folder_contacts (
     address TEXT PRIMARY KEY,
     name    TEXT NOT NULL DEFAULT ''
+);
+
+-- The user's own Contacts folder (`/me/contacts`, #1934, #2063), one row per
+-- contact keyed by Graph `id` (or a `local:` id until its create reaches
+-- Graph), replaced by every successful fetch (`Store::replace_contacts`)
+-- except where a queued contact op protects a row. Apart from `contacts` on
+-- purpose: that table is `/me/people` and mined correspondents,
+-- autocomplete only, while this one answers `Store::is_contact` for a trust
+-- decision. The phone and category lists are `\u{1f}`-joined
+-- (`encode_categories`).
+CREATE TABLE IF NOT EXISTS contact_records (
+    id                   TEXT PRIMARY KEY,
+    change_key           TEXT NOT NULL DEFAULT '',
+    given_name           TEXT NOT NULL DEFAULT '',
+    middle_name          TEXT NOT NULL DEFAULT '',
+    surname              TEXT NOT NULL DEFAULT '',
+    display_name         TEXT NOT NULL DEFAULT '',
+    file_as              TEXT NOT NULL DEFAULT '',
+    business_phones      TEXT NOT NULL DEFAULT '',
+    home_phones          TEXT NOT NULL DEFAULT '',
+    mobile_phone         TEXT NOT NULL DEFAULT '',
+    company_name         TEXT NOT NULL DEFAULT '',
+    job_title            TEXT NOT NULL DEFAULT '',
+    department           TEXT NOT NULL DEFAULT '',
+    business_street      TEXT NOT NULL DEFAULT '',
+    business_city        TEXT NOT NULL DEFAULT '',
+    business_state       TEXT NOT NULL DEFAULT '',
+    business_postal_code TEXT NOT NULL DEFAULT '',
+    business_country     TEXT NOT NULL DEFAULT '',
+    home_street          TEXT NOT NULL DEFAULT '',
+    home_city            TEXT NOT NULL DEFAULT '',
+    home_state           TEXT NOT NULL DEFAULT '',
+    home_postal_code     TEXT NOT NULL DEFAULT '',
+    home_country         TEXT NOT NULL DEFAULT '',
+    birthday             TEXT NOT NULL DEFAULT '',
+    personal_notes       TEXT NOT NULL DEFAULT '',
+    categories           TEXT NOT NULL DEFAULT ''
+);
+
+-- A contact's `emailAddresses`, in order. `address_key` is the
+-- `folder_contact_key` `is_contact` matches on, `''` for a blank address or
+-- one without an `@` (kept for display, never matched). The rows follow a
+-- re-keyed contact (`ON UPDATE CASCADE`, `reconcile_created_contact`).
+CREATE TABLE IF NOT EXISTS contact_emails (
+    contact_id  TEXT NOT NULL
+                REFERENCES contact_records(id) ON DELETE CASCADE ON UPDATE CASCADE,
+    position    INTEGER NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    address     TEXT NOT NULL DEFAULT '',
+    address_key TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (contact_id, position)
+);
+CREATE INDEX IF NOT EXISTS contact_emails_key ON contact_emails(address_key);
+
+-- The Graph id a created contact's `local:` id was re-keyed to
+-- (`reconcile_created_contact`, #2063), so an op or a host holding the
+-- `local:` id still reaches it. No foreign key: an alias outlives the row,
+-- so a delete queued by the `local:` id still reaches the Graph contact.
+CREATE TABLE IF NOT EXISTS contact_aliases (
+    local_id TEXT PRIMARY KEY,
+    id       TEXT NOT NULL
 );
 
 -- `fetched_as` is the format `FetchBody` asked Graph for (`text`/`html`,
