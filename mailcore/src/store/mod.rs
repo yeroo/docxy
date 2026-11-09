@@ -3811,8 +3811,16 @@ impl Store {
     ) -> Result<EventFieldSet, StoreError> {
         check_event_zones(f)?;
         let tx = self.write_tx()?;
-        let old = event_for_send_on(&tx, id)?
+        let mut old = event_for_send_on(&tx, id)?
             .ok_or_else(|| StoreError::Sql(format!("no event stored for {id}")))?;
+        // An occurrence with no body of its own shows its master's (#2064,
+        // `Store::event_body`): compare the edit against that, so a form
+        // that leaves it alone does not mark `BODY`. Only here: the send
+        // (`event_for_send`) reads the row's own body, so a cleared body
+        // is sent cleared (r4).
+        if old.body_html.is_empty() {
+            old.body_html = event_body_on(&tx, id)?.unwrap_or_default();
+        }
         let stored_attendees = event_attendees_on(&tx, id)?;
         let mut changed = EventFieldSet::default();
         let mut mark = |group: EventFieldSet, differs: bool| {
@@ -5863,11 +5871,6 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
     let Some(mut data) = row else {
         return Ok(None);
     };
-    // An occurrence's body is its master's (#2064), as `Store::event_body`
-    // shows it, so an edit that leaves it alone does not mark `BODY`.
-    if data.body_html.is_empty() {
-        data.body_html = event_body_on(conn, id)?.unwrap_or_default();
-    }
     data.attendees = event_attendees_on(conn, id)?
         .into_iter()
         .map(|a| AttendeeInput {
@@ -12001,7 +12004,8 @@ mod calendar_tests {
         // Its master gone, an occurrence reads its own empty body.
         s.delete_event("M").unwrap();
         assert_eq!(s.event_body("O1").unwrap().as_deref(), Some(""));
-        // `event_for_send` reads the same body.
+        // `event_for_send` reads the row's own body, never the master's
+        // (r4: a cleared body is sent cleared).
         s.conn
             .execute("UPDATE events SET body_html = '' WHERE id = 'O2'", [])
             .unwrap();
@@ -12097,6 +12101,45 @@ mod calendar_tests {
         assert_eq!(
             s.update_event_fields("O1", &edit).unwrap(),
             EventFieldSet::SUBJECT
+        );
+    }
+
+    /// Clearing a filled occurrence's shown body (#2064 r4): `BODY` is
+    /// marked, and the send reads the row's own (now empty) body, not the
+    /// master's. Until the next sync stores the occurrence as an
+    /// exception, `event_body` still shows the master's.
+    #[test]
+    fn update_event_fields_clearing_an_occurrences_body_sends_it_empty() {
+        let s = series_store();
+        assert_eq!(s.event_for_send("O1").unwrap().unwrap().body_html, "");
+        let o = row(&s, "O1");
+        let edit = LocalEventFields {
+            subject: o.subject.clone(),
+            start_utc: o.start_utc.clone(),
+            end_utc: o.end_utc.clone(),
+            location: o.location.clone(),
+            body_html: String::new(),
+            attendees: s
+                .event_attendees("O1")
+                .unwrap()
+                .into_iter()
+                .map(|a| AttendeeInput {
+                    name: a.name,
+                    addr: a.addr,
+                    r#type: a.r#type,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.update_event_fields("O1", &edit).unwrap(),
+            EventFieldSet::BODY
+        );
+        assert_eq!(s.event_for_send("O1").unwrap().unwrap().body_html, "");
+        assert_eq!(
+            s.event_body("O1").unwrap().as_deref(),
+            Some("<p>Join the standup</p>"),
+            "the known transient"
         );
     }
 
