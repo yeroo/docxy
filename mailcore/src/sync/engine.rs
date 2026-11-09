@@ -51,8 +51,8 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
-    MeetingMessageType, Message, Recipient, ScheduleEntry, SearchHit,
+    AutomaticReplies, DeltaItem, DeltaPage, Event, EventDeltaItem, MailFolder, Me, MeetingMessage,
+    MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry, SearchHit,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
@@ -1076,9 +1076,14 @@ pub(crate) fn spawn_with_bases(
     )
 }
 
-/// [`spawn_with_bases`] with the engine's [`EngineOptions`].
+/// [`spawn_with_bases`] with the engine's [`EngineOptions`]. Public but
+/// hidden from the docs (#2054): the test seam for
+/// [`crate::testserver`], so a crate built on mailcore can point the whole
+/// engine (Graph and auth) at a `FakeServer`'s `base_url` in its own tests.
+/// Hosts use [`spawn`] or [`spawn_with_options`].
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_with_bases_and_options(
+pub fn spawn_with_bases_and_options(
     store_path: PathBuf,
     token_path: PathBuf,
     cfg: AuthConfig,
@@ -2330,6 +2335,7 @@ impl Engine {
         let mut new_ids = Vec::new();
         loop {
             let page = self.with_auth(|c| c.delta(cursor.clone()))?;
+            self.note_expand_refused(folder_id, &page);
             walked += self.merge_delta_items(folder_id, &page.items, cutoff, protect, &mut new_ids);
             match page.next_link {
                 Some(next) => {
@@ -2388,10 +2394,28 @@ impl Engine {
         new_ids: &mut Vec<String>,
     ) -> u64 {
         let note_new = self.config.options.prefetch_body_days > 0;
+        // A folder whose first call found the reminder expand refused
+        // (#2054): its links carry none, so an item without the reminder
+        // keeps the stored one. A store error reads as marked, which only
+        // keeps reminders.
+        let unasked = self
+            .store
+            .reminder_expand_refused(folder_id)
+            .unwrap_or(true);
         let mut upserts = 0;
         for item in items {
             match item {
                 DeltaItem::Upsert(m, fields) => {
+                    let marked;
+                    let fields = if unasked {
+                        marked = MessageFields {
+                            reminder_unasked: true,
+                            ..*fields
+                        };
+                        &marked
+                    } else {
+                        fields
+                    };
                     if let Some(cut) = cutoff {
                         if !m.received.is_empty() && m.received.as_str() < cut {
                             continue;
@@ -2442,6 +2466,19 @@ impl Engine {
     /// it in the statement that writes.
     fn protected_ids(&self) -> Result<Vec<String>, StoreError> {
         self.store.pending_message_ids()
+    }
+
+    /// Marks `folder_id` when `page` came from a first call whose reminder
+    /// `$expand` Graph refused (#2054, `DeltaPage::expand_refused`), so its
+    /// later pages and rounds, on links that carry no expand, keep the
+    /// stored reminders too. A store failure is surfaced; the page's own
+    /// items are marked `reminder_unasked` either way.
+    fn note_expand_refused(&mut self, folder_id: &str, page: &DeltaPage) {
+        if page.expand_refused {
+            if let Err(e) = self.store.mark_reminder_expand_refused(folder_id) {
+                self.emit(SyncEvent::Error(e.to_string()));
+            }
+        }
     }
 
     /// The quarantine reconverge is over: the flag is cleared, in memory and
@@ -2616,6 +2653,7 @@ impl Engine {
                 return;
             }
         };
+        self.note_expand_refused(&id, &page);
         let cutoff = self.backfill_cutoff();
         let page_scope = if cutoff.is_some() {
             SCOPE_WINDOW
@@ -2923,10 +2961,11 @@ impl Engine {
             )));
             return;
         }
-        // As `snooze_reminder`: `to_utc` never fails, so the result must
-        // read as a time.
-        let utc = crate::graph::model::to_utc(&new_reminder_utc, "UTC");
-        if crate::store::iso8601_to_unix_secs(&utc).is_none() {
+        // Read as Graph's reminder times are (`reminder_time`): a time with
+        // a numeric offset is refused, as `to_utc` would drop the offset
+        // without applying it.
+        let utc = crate::graph::model::reminder_time(&new_reminder_utc);
+        if utc.is_empty() {
             self.emit(SyncEvent::Error(format!(
                 "snooze message reminder {id}: not a UTC time: {new_reminder_utc:?}"
             )));
@@ -4768,13 +4807,21 @@ impl Engine {
     /// and merges it into the folder its row is in (#2054: after a refused
     /// message reminder op, whose optimistic write Graph never made), with
     /// `merge_message_unless_edited`, so a draft's unsaved edit is never
-    /// overwritten. A row that is gone is left gone; any failure is ignored
+    /// overwritten. A row another queued op names (`protected_ids`) is left
+    /// alone, as is a row that is gone; any failure is ignored
     /// (the refusal's `Error` is already out, and a later delta corrects
     /// what changes).
     fn reread_message(&mut self, id: &str) {
         let Ok(current) = self.store.current_id(id) else {
             return;
         };
+        // Another queued op still owns the row (a `SetFlag` behind the
+        // refused op, say): its optimistic write must stand until it
+        // drains, as a fresh delta leaves it (`protected_ids`).
+        match self.protected_ids() {
+            Ok(ids) if ids.binary_search(&current).is_err() => {}
+            _ => return,
+        }
         let Ok(Some(row)) = self.store.message_row(&current) else {
             return;
         };
@@ -17593,11 +17640,13 @@ mod tests {
         }
 
         #[test]
-        fn refused_expand_still_syncs_the_folder() {
-            // The first call (with the expand) answers 400 once; its retry
-            // without the expand gets the page.
+        fn refused_expand_still_syncs_the_folder_and_keeps_its_reminders() {
+            // F1's first call (with the expand) answers 400 once; its retry
+            // without the expand gets a page whose M1 carries no reminder,
+            // and so does the next round on the link minted from it.
             let link = "/me/mailFolders/F1/messages/delta?token=D-F1";
-            let extra = vec![
+            let plain_m1 = message_json("M1", false, true, &[]);
+            let mut routes = vec![
                 (
                     route(
                         "GET",
@@ -17612,14 +17661,17 @@ mod tests {
                     "GET",
                     "/me/mailFolders/F1/messages/delta?$",
                     200,
-                    &delta_page(&[message_json("M9", false, false, &[])], link),
+                    &delta_page(
+                        &[plain_m1.clone(), message_json("M9", false, false, &[])],
+                        link,
+                    ),
                 ),
+                route("GET", link, 200, &delta_page(&[plain_m1], link)),
             ];
-            let mut routes = extra;
             routes.extend(folder_routes(INBOX, &[], &[]));
             let srv = FakeServer::start_limited(routes);
             let (handle, store_path, dir) =
-                spawn_fast(&srv, "msg-reminder-no-expand", HOUR, None, |_| {});
+                spawn_fast(&srv, "msg-reminder-no-expand", TICK, None, seed_m1);
             let store = Store::open(&store_path).unwrap();
             assert!(wait_until(ENGINE_WAIT, || store
                 .message_exists("M9")
@@ -17634,7 +17686,96 @@ mod tests {
             assert_eq!(firsts.len(), 2, "{firsts:?}");
             assert!(firsts[0].contains("&$expand="));
             assert!(!firsts[1].contains("$expand"));
+            // The folder is marked, and the stored reminder survived the
+            // fallback's page and then a round on its link.
+            assert!(store.reminder_expand_refused("F1").unwrap());
+            assert!(wait_until(TICK_WAIT, || srv
+                .requests()
+                .iter()
+                .any(|r| r.path == link)));
+            reminder_barrier(&handle);
+            let r = m1(&store);
+            assert!(
+                r.is_reminder_on,
+                "kept through the fallback and the link round"
+            );
+            assert_eq!(r.reminder_signal_at, "2026-11-08T10:15:00Z");
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            // Clearing the links clears the mark: the next first call asks
+            // for the reminder again.
+            store.clear_delta_links().unwrap();
+            assert!(!store.reminder_expand_refused("F1").unwrap());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_refused_reminder_op_does_not_re_read_a_row_another_op_owns() {
+            // Queued offline: dismiss M1, then unflag it. Graph refuses the
+            // dismiss (400) and answers the unflag with a 500, so the unflag
+            // still waits: the re-read must not put Graph's flagged M1, its
+            // reminder on, back over it.
+            let extra = vec![
+                (
+                    route(
+                        "PATCH",
+                        "/me/messages/M1",
+                        400,
+                        r#"{"error":{"code":"ErrorInvalidProperty","message":"Bad property"}}"#,
+                    )
+                    .0,
+                    Some(1),
+                ),
+                route("PATCH", "/me/messages/M1", 500, ""),
+                route(
+                    "GET",
+                    "/me/messages/M1?$select=",
+                    200,
+                    &reminded_json("M1", true, "2026-11-08T10:15:00Z"),
+                ),
+            ];
+            let mut routes = extra;
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "msg-reminder-reread-owned", HOUR, None, |s| {
+                    seed_m1(s);
+                    s.dismiss_message_reminder("M1");
+                    s.set_flag("M1", false);
+                    s.enqueue_op(&OutboxOp::DismissMessageReminder { id: "M1".into() })
+                        .unwrap();
+                    s.enqueue_op(&OutboxOp::SetFlag {
+                        id: "M1".into(),
+                        flagged: false,
+                    })
+                    .unwrap();
+                });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || patches(&srv).len() == 2));
+            reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert_eq!(
+                queued_ops(&store),
+                [OutboxOp::SetFlag {
+                    id: "M1".into(),
+                    flagged: false,
+                }],
+                "the dismiss dropped, the unflag waiting"
+            );
+            let r = m1(&store);
+            assert!(!r.is_flagged && !r.is_reminder_on, "{r:?}");
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select=")),
+                "no re-read: {:?}",
+                srv.requests()
+            );
+            assert!(
+                store
+                    .due_message_reminders("2026-11-08T12:00:00Z")
+                    .unwrap()
+                    .is_empty()
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -17692,7 +17833,8 @@ mod tests {
                          ALTER TABLE messages DROP COLUMN is_reminder_on;
                          ALTER TABLE messages DROP COLUMN reminder_at;
                          ALTER TABLE messages DROP COLUMN reminder_signal_at;
-                         ALTER TABLE messages DROP COLUMN flag_due_at;",
+                         ALTER TABLE messages DROP COLUMN flag_due_at;
+                         ALTER TABLE folders DROP COLUMN reminder_expand_refused;",
                     )
                     .unwrap();
             }
@@ -17815,6 +17957,11 @@ mod tests {
                 (
                     snooze("M1", "10:15"),
                     r#"snooze message reminder M1: not a UTC time: "10:15""#,
+                ),
+                // An offset would be dropped without being applied.
+                (
+                    snooze("M1", "2026-11-08T10:15:00+02:00"),
+                    r#"snooze message reminder M1: not a UTC time: "2026-11-08T10:15:00+02:00""#,
                 ),
             ] {
                 handle.cmd_tx.send(cmd).unwrap();

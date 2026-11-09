@@ -6,9 +6,10 @@
 //! Binds an ephemeral loopback port, speaks just enough HTTP/1.1 to serve
 //! canned [`Route`] responses and record the requests it received. One
 //! request per connection, no keep-alive — this is test infrastructure for
-//! `auth`, `graph`, and `sync` tests (mailcore's or a client's: point a
-//! `GraphClient` or the sync engine's Graph base URL at `base_url`), not a
-//! general-purpose server.
+//! `auth`, `graph`, and `sync` tests (mailcore's or a client's: pass
+//! `base_url` to `GraphClient::new`, or as the Graph and auth bases of the
+//! hidden `sync::engine::spawn_with_bases_and_options`), not a general-purpose
+//! server.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};

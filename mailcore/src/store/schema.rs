@@ -30,7 +30,11 @@ CREATE TABLE IF NOT EXISTS folders (
     backfill_link   TEXT,
     backfill_synced INTEGER NOT NULL DEFAULT 0,
     history_scope   TEXT,
-    backfill_scope  TEXT
+    backfill_scope  TEXT,
+    -- A first delta call of this folder found Graph refusing the reminder
+    -- `$expand` (#2054), so its links carry none: its items never write the
+    -- reminder columns. Cleared with the links (`Store::clear_delta_links`).
+    reminder_expand_refused INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (

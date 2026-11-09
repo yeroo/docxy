@@ -21,9 +21,11 @@
 //! `SaveDraft`/`SendDraft` do for drafts.
 //!
 //! The message ops (`MarkRead`, `SetFlag`, `SetCategories`, `Move`,
-//! `Delete`) read the store only to resolve their id (`Store::current_id`)
-//! at apply time, so an op queued with an id an earlier op moved reaches
-//! the message (#1896). `Move` hands the id Graph minted back to the
+//! `Delete`, and #2054's `DismissMessageReminder` / `SnoozeMessageReminder`)
+//! read the store only to resolve their id (`Store::current_id`) at apply
+//! time, so an op queued with an id an earlier op moved reaches the
+//! message (#1896). `Delete` and the two reminder ops send nothing for an
+//! id that still resolves to `local:` (never on Graph). `Move` hands the id Graph minted back to the
 //! caller ([`Applied::Moved`]), which re-keys the store: a store failure
 //! there must not turn into a retry of a move Graph already made.
 

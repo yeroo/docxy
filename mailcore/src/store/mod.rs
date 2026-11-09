@@ -57,6 +57,8 @@ pub enum StoreError {
     /// recognized `OutboxOp` shape. This should only happen if the row was
     /// written by something other than `enqueue_op`.
     Decode(String),
+    /// An argument the store cannot use (#2054: a time that is not one).
+    Invalid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -64,6 +66,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Sql(msg) => write!(f, "sqlite error: {msg}"),
             StoreError::Decode(msg) => write!(f, "outbox decode error: {msg}"),
+            StoreError::Invalid(msg) => f.write_str(msg),
         }
     }
 }
@@ -1848,18 +1851,20 @@ impl Store {
     /// The flagged messages, in any folder, whose reminder is on and due at
     /// or before `now_utc` (#2054): their next signal time
     /// (`reminder_signal_at`, else `reminder_at` when Graph sent no signal
-    /// time) is not after it. Soonest first, then by id. `now_utc` is
-    /// normalised like every stored time (`to_utc`), as they compare as
-    /// text. A client polls it, as it reads events for their reminders.
+    /// time) is not after it. Soonest first, then by id. `now_utc` is read
+    /// as a reminder time is (`model::reminder_time`: UTC, `Z` or no
+    /// suffix, a fraction allowed) and normalised like every stored time,
+    /// as they compare as text; one it cannot read (an offset, not a time)
+    /// is a `StoreError::Invalid`, so a caller's bug shows. A client polls
+    /// it, as it reads events for their reminders.
     pub fn due_message_reminders(&self, now_utc: &str) -> Result<Vec<MessageRow>, StoreError> {
-        let now = crate::graph::model::to_utc(now_utc, "UTC");
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {MESSAGE_ROW_COLUMNS} FROM messages
-             WHERE is_flagged = 1 AND is_reminder_on = 1
-               AND COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) <> ''
-               AND COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) <= ?1
-             ORDER BY COALESCE(NULLIF(reminder_signal_at, ''), reminder_at), id"
-        ))?;
+        let now = crate::graph::model::reminder_time(now_utc);
+        if now.is_empty() {
+            return Err(StoreError::Invalid(format!(
+                "due message reminders: not a UTC time: {now_utc:?}"
+            )));
+        }
+        let mut stmt = self.conn.prepare(&due_message_reminders_sql())?;
         let rows = stmt
             .query_map(params![now], map_message_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1980,6 +1985,40 @@ impl Store {
         Ok(link)
     }
 
+    /// Marks `folder_id` as read without the reminder `$expand` (#2054):
+    /// a first delta call of it found Graph refusing the expand, so the
+    /// links Graph mints for it carry none. Until its links are cleared
+    /// (`clear_delta_links`, the #2054 migration: the only paths that
+    /// reset `delta_link`), the engine merges its delta items as
+    /// `MessageFields::reminder_unasked`, keeping the stored reminders.
+    pub fn mark_reminder_expand_refused(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET reminder_expand_refused = 1 WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `folder_id` is marked by
+    /// [`Store::mark_reminder_expand_refused`]; false for an unknown folder.
+    pub fn reminder_expand_refused(&self, folder_id: &str) -> Result<bool, StoreError> {
+        let marked = self
+            .conn
+            .query_row(
+                "SELECT reminder_expand_refused FROM folders WHERE id = ?1",
+                params![folder_id],
+                |r| r.get::<_, bool>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(marked)
+    }
+
     /// Stores the delta link for a folder (used to resume delta sync).
     pub fn set_delta_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
         self.conn.execute(
@@ -1997,6 +2036,10 @@ impl Store {
     ///
     /// It also clears every folder's backfill (#1871): its link, count and
     /// scope, so each folder runs its head and then its full delta again.
+    /// It clears every folder's refused-expand mark (#2054,
+    /// [`Store::mark_reminder_expand_refused`]) with them, so each next
+    /// first call asks for the reminder again.
+    ///
     /// And it marks a reconverge pending (`meta.reconverge_pending`, read by
     /// [`Store::reconverge_pending`]), in the same transaction, so an engine
     /// restarted before the reconverge ends still runs it without the
@@ -2006,7 +2049,7 @@ impl Store {
         tx.execute(
             "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                                 backfill_synced = 0, history_scope = NULL,
-                                backfill_scope = NULL",
+                                backfill_scope = NULL, reminder_expand_refused = 0",
             [],
         )?;
         tx.execute(
@@ -4880,6 +4923,7 @@ fn migrate_message_reminders(conn: &Connection) -> Result<bool, StoreError> {
          ALTER TABLE messages ADD COLUMN reminder_at TEXT NOT NULL DEFAULT '';
          ALTER TABLE messages ADD COLUMN reminder_signal_at TEXT NOT NULL DEFAULT '';
          ALTER TABLE messages ADD COLUMN flag_due_at TEXT NOT NULL DEFAULT '';
+         ALTER TABLE folders ADD COLUMN reminder_expand_refused INTEGER NOT NULL DEFAULT 0;
          UPDATE folders SET delta_link = NULL, backfill_link = NULL,
                             backfill_synced = 0, history_scope = NULL,
                             backfill_scope = NULL;",
@@ -5237,6 +5281,23 @@ const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from
     is_read, is_flagged, has_attachments, importance, preview, is_draft,
     bcc_recipients, is_meeting_request, categories,
     is_reminder_on, reminder_at, reminder_signal_at, flag_due_at";
+
+/// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
+/// reminder is on and whose next signal (`reminder_signal_at`, else
+/// `reminder_at`), bound once as `due`, is set and not after `?1`. The
+/// `is_reminder_on = 1` term lets SQLite use the partial
+/// `idx_messages_reminder`; a test checks the plan.
+fn due_message_reminders_sql() -> String {
+    format!(
+        "SELECT {MESSAGE_ROW_COLUMNS} FROM (
+             SELECT *, COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) AS due
+             FROM messages
+             WHERE is_flagged = 1 AND is_reminder_on = 1
+         )
+         WHERE due <> '' AND due <= ?1
+         ORDER BY due, id"
+    )
+}
 
 /// `Store::message_rows`'s statement (#2053): the rows whose id is in the
 /// JSON array `?1`. SQLite plans the `IN` subquery as one primary-key
@@ -13312,6 +13373,86 @@ mod message_reminder_tests {
                 .unwrap()
                 .is_empty()
         );
+        // A `now` that is not a UTC time is the caller's bug: an error, not
+        // an empty list (an offset would be dropped without being applied).
+        for bad in ["2026-11-08T12:00:00+02:00", "garbage", ""] {
+            assert!(
+                matches!(s.due_message_reminders(bad), Err(StoreError::Invalid(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_merge_read_without_the_reminder_keeps_it() {
+        // `reminder_unasked` (#2054: Graph refused the expand): a complete
+        // item without the key keeps the stored reminder; one with it writes.
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message(
+            "F",
+            &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
+        )
+        .unwrap();
+        let complete = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"flagged"}}"#,
+        )
+        .unwrap();
+        let m = Message::from_json(&complete).unwrap();
+        let mut fields = MessageFields::of(&complete);
+        fields.reminder_unasked = true;
+        s.merge_message("F", &m, &fields).unwrap();
+        let r = row(&s, "M1");
+        assert_eq!(r.subject, "new");
+        assert_eq!(
+            (
+                r.is_reminder_on,
+                r.reminder_at.as_str(),
+                r.reminder_signal_at.as_str()
+            ),
+            (true, "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z")
+        );
+        assert_eq!(r.flag_due_at, "", "the due time still follows the flag");
+        // An unasked item that carries the key writes it.
+        let carried = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"flagged"},
+                "singleValueExtendedProperties":[]}"#,
+        )
+        .unwrap();
+        let mut fields = MessageFields::of(&carried);
+        fields.reminder_unasked = true;
+        assert!(fields.writes_reminder());
+        // The flag still rules: unflagged, the kept reminder is off.
+        let unflagged = crate::json::parse(
+            r#"{"id":"M1","subject":"new","from":{"emailAddress":{"address":"a@x"}},
+                "receivedDateTime":"2026-11-01T00:00:00Z","flag":{"flagStatus":"notFlagged"}}"#,
+        )
+        .unwrap();
+        let mut fields = MessageFields::of(&unflagged);
+        fields.reminder_unasked = true;
+        s.merge_message("F", &Message::from_json(&unflagged).unwrap(), &fields)
+            .unwrap();
+        assert!(!row(&s, "M1").is_reminder_on);
+    }
+
+    #[test]
+    fn the_expand_refused_mark_goes_with_the_links() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        assert!(!s.reminder_expand_refused("NOPE").unwrap());
+        s.mark_reminder_expand_refused("F").unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        assert!(!s.reminder_expand_refused("G").unwrap());
+        // Links set or replaced keep it; clearing them clears it.
+        s.set_delta_link("F", "LINK").unwrap();
+        s.set_head_link("F", "HEAD").unwrap();
+        assert!(s.reminder_expand_refused("F").unwrap());
+        s.clear_delta_links().unwrap();
+        assert!(!s.reminder_expand_refused("F").unwrap());
     }
 
     #[test]
@@ -13320,11 +13461,8 @@ mod message_reminder_tests {
         let plan: Vec<String> = s
             .conn
             .prepare(&format!(
-                "EXPLAIN QUERY PLAN SELECT {MESSAGE_ROW_COLUMNS} FROM messages
-                 WHERE is_flagged = 1 AND is_reminder_on = 1
-                   AND COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) <> ''
-                   AND COALESCE(NULLIF(reminder_signal_at, ''), reminder_at) <= ?1
-                 ORDER BY COALESCE(NULLIF(reminder_signal_at, ''), reminder_at), id"
+                "EXPLAIN QUERY PLAN {}",
+                due_message_reminders_sql()
             ))
             .unwrap()
             .query_map(["2026-11-08T12:00:00Z"], |r| r.get::<_, String>(3))
@@ -13368,13 +13506,15 @@ mod message_reminder_tests {
                      ALTER TABLE messages DROP COLUMN is_reminder_on;
                      ALTER TABLE messages DROP COLUMN reminder_at;
                      ALTER TABLE messages DROP COLUMN reminder_signal_at;
-                     ALTER TABLE messages DROP COLUMN flag_due_at;",
+                     ALTER TABLE messages DROP COLUMN flag_due_at;
+                     ALTER TABLE folders DROP COLUMN reminder_expand_refused;",
                 )
                 .unwrap();
         }
         let s = Store::open(&path).unwrap();
-        // The columns are there, empty.
+        // The columns are there, empty, and no folder is marked.
         assert_eq!(reminder(&row(&s, "M1")), (false, "", "", ""));
+        assert!(!s.reminder_expand_refused("F").unwrap());
         // Every folder's delta and backfill state is reset, with no
         // reconverge (nothing was quarantined).
         for f in ["F", "G"] {

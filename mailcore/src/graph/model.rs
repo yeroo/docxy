@@ -218,7 +218,7 @@ pub fn parse_message_reminder(v: &Value) -> (bool, String, String) {
 /// read (#2054). Only a time ending in `Z` or with nothing after its
 /// seconds (a fraction allowed) is read: `to_utc` drops a numeric offset
 /// without applying it, which would give the wrong time.
-fn reminder_time(s: &str) -> String {
+pub(crate) fn reminder_time(s: &str) -> String {
     let s = s.trim();
     let bare = s.strip_suffix('Z').unwrap_or(s);
     let Some((_, time)) = bare.split_once('T') else {
@@ -361,6 +361,11 @@ pub struct MessageFields {
     /// `singleValueExtendedProperties`, from which the reminder is read
     /// (#2054).
     pub reminder: bool,
+    /// Not a key: the item came from a request that did not ask for the
+    /// reminder (#2054: Graph refused the `$expand`, or a delta link minted
+    /// from such a call), so its lack of `singleValueExtendedProperties`
+    /// says nothing. Never set by `of` or `all`.
+    pub reminder_unasked: bool,
 }
 
 impl MessageFields {
@@ -384,6 +389,7 @@ impl MessageFields {
             odata_type: has("@odata.type"),
             categories: has("categories"),
             reminder: has("singleValueExtendedProperties"),
+            reminder_unasked: false,
         }
     }
 
@@ -407,6 +413,7 @@ impl MessageFields {
             odata_type: true,
             categories: true,
             reminder: true,
+            reminder_unasked: false,
         }
     }
 
@@ -438,9 +445,11 @@ impl MessageFields {
     /// Whether the reminder columns are to be written (#2054). Graph
     /// leaves `singleValueExtendedProperties` out when the expand's filter
     /// matches nothing, so a complete item without it means "no
-    /// reminder"; on a partial item its absence says nothing.
+    /// reminder"; on a partial item, or one read without asking for the
+    /// reminder (`reminder_unasked`), its absence says nothing, and the
+    /// stored reminder is kept. An item carrying the key always writes.
     pub fn writes_reminder(&self) -> bool {
-        self.reminder || !self.is_partial()
+        self.reminder || (!self.is_partial() && !self.reminder_unasked)
     }
 }
 
@@ -914,6 +923,12 @@ pub struct DeltaPage {
     pub items: Vec<DeltaItem>,
     pub next_link: Option<String>,
     pub delta_link: Option<String>,
+    /// The first call asked for the reminder `$expand` and Graph refused it
+    /// (#2054): the page came from the call sent again without it, and
+    /// every upsert's `MessageFields::reminder_unasked` is set. The engine
+    /// marks the folder, as the links Graph mints from this call carry no
+    /// expand either.
+    pub expand_refused: bool,
 }
 
 impl DeltaPage {
@@ -935,7 +950,18 @@ impl DeltaPage {
             items,
             next_link: opt_str_field(v, "@odata.nextLink"),
             delta_link: opt_str_field(v, "@odata.deltaLink"),
+            expand_refused: false,
         })
+    }
+
+    /// Marks every upsert as read without the reminder `$expand`
+    /// (`MessageFields::reminder_unasked`, #2054).
+    pub fn mark_reminder_unasked(&mut self) {
+        for item in &mut self.items {
+            if let DeltaItem::Upsert(_, fields) = item {
+                fields.reminder_unasked = true;
+            }
+        }
     }
 }
 
@@ -3214,5 +3240,15 @@ mod tests {
         .unwrap();
         assert!(MessageFields::of(&partial).writes_reminder());
         assert!(MessageFields::all().reminder);
+        // Read without asking (#2054: the expand refused): a complete item
+        // without the key keeps the stored reminder; one with it writes.
+        let mut unasked = MessageFields::of(&flagged_with(None));
+        unasked.reminder_unasked = true;
+        assert!(!unasked.writes_reminder());
+        let mut unasked = MessageFields::of(&flagged_with(Some("[]")));
+        unasked.reminder_unasked = true;
+        assert!(unasked.writes_reminder());
+        assert!(!MessageFields::of(&flagged_with(None)).reminder_unasked);
+        assert!(!MessageFields::all().reminder_unasked);
     }
 }

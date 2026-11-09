@@ -739,9 +739,12 @@ impl GraphClient {
     /// A first call asks for the reminder too (`MESSAGE_EXPAND`, #2054),
     /// and Graph keeps that in every link it mints from it. Should Graph
     /// refuse the expand there (a 400), the same call is sent once more
-    /// without it, so the folder still syncs, only without reminders until
-    /// its links reset; a 400 with another cause costs that one extra
-    /// request, and the second answer is returned as it is.
+    /// without it, so the folder still syncs, and the page says so
+    /// (`DeltaPage::expand_refused`, its upserts `reminder_unasked`): the
+    /// engine then reads no reminders for that folder until its links
+    /// reset, and keeps the reminders already stored. A 400 with another
+    /// cause costs that one extra request, and the second answer is
+    /// returned as it is.
     pub fn delta(&self, cursor: DeltaCursor) -> Result<DeltaPage, GraphError> {
         let (target, first) = match cursor {
             DeltaCursor::Head { folder_id, since } => {
@@ -764,14 +767,19 @@ impl GraphClient {
             DeltaCursor::Link(url) => (url, false),
         };
         let prefer = [("Prefer", "odata.maxpagesize=50")];
-        let resp = if first {
+        let (resp, expanded) = if first {
             self.get_with_expand(&target, &prefer)?
         } else {
-            self.send(Method::Get, &target, None, &prefer)?
+            (self.send(Method::Get, &target, None, &prefer)?, true)
         };
         let v = parse_body(resp)?;
-        DeltaPage::from_json(&v)
-            .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))
+        let mut page = DeltaPage::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed delta page".to_string()))?;
+        if !expanded {
+            page.expand_refused = true;
+            page.mark_reminder_unasked();
+        }
+        Ok(page)
     }
 
     /// GET `/me/messages/{id}?$select=MESSAGE_SELECT&$expand=MESSAGE_EXPAND`:
@@ -782,11 +790,13 @@ impl GraphClient {
     pub fn get_message(&self, message_id: &str) -> Result<(Message, MessageFields), GraphError> {
         let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT}");
-        let resp = self.get_with_expand(&path, &[])?;
+        let (resp, expanded) = self.get_with_expand(&path, &[])?;
         let v = parse_body(resp)?;
         let m = Message::from_json(&v)
             .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
-        Ok((m, MessageFields::of(&v)))
+        let mut fields = MessageFields::of(&v);
+        fields.reminder_unasked = !expanded;
+        Ok((m, fields))
     }
 
     /// Searches messages on the server (#2006): GET
@@ -845,9 +855,12 @@ impl GraphClient {
     pub fn get_message_hit(&self, message_id: &str) -> Result<SearchHit, GraphError> {
         let message_id = encode_path_segment(message_id);
         let path = format!("/me/messages/{message_id}?$select={MESSAGE_SELECT},parentFolderId");
-        let resp = self.get_with_expand(&path, &[])?;
+        let (resp, expanded) = self.get_with_expand(&path, &[])?;
         let v = parse_body(resp)?;
-        SearchHit::from_json(&v).ok_or_else(|| GraphError::Parse("malformed message".to_string()))
+        let mut hit = SearchHit::from_json(&v)
+            .ok_or_else(|| GraphError::Parse("malformed message".to_string()))?;
+        hit.fields.reminder_unasked = !expanded;
+        Ok(hit)
     }
 
     /// [`GraphClient::get_body_with_headers`] with the headers dropped: the
@@ -966,17 +979,20 @@ impl GraphClient {
     }
 
     /// GETs `target` with the reminder `$expand` (#2054) appended; on a 400,
-    /// sends it once more as it is (`delta`'s doc says why).
+    /// sends it once more as it is (`delta`'s doc says why). The `bool` is
+    /// whether the answer is to the call with the expand: when it is not,
+    /// the caller marks what it parses `MessageFields::reminder_unasked`,
+    /// so its lack of the reminder keeps a stored one.
     fn get_with_expand(
         &self,
         target: &str,
         headers: &[(&str, &str)],
-    ) -> Result<ureq::Response, GraphError> {
+    ) -> Result<(ureq::Response, bool), GraphError> {
         match self.send(Method::Get, &with_expand(target), None, headers) {
-            Err(GraphError::Http { status: 400, .. }) => {
-                self.send(Method::Get, target, None, headers)
-            }
-            other => other,
+            Err(GraphError::Http { status: 400, .. }) => self
+                .send(Method::Get, target, None, headers)
+                .map(|r| (r, false)),
+            other => other.map(|r| (r, true)),
         }
     }
 
@@ -6667,7 +6683,8 @@ mod tests {
             "{}/me/mailFolders/F1/messages/delta?$deltatoken=t",
             srv.base_url
         );
-        c.delta(DeltaCursor::Link(link)).unwrap();
+        let page = c.delta(DeltaCursor::Link(link)).unwrap();
+        assert!(!page.expand_refused, "a link is no first call");
         assert_eq!(
             srv.requests()[0].path,
             "/me/mailFolders/F1/messages/delta?$deltatoken=t"
@@ -6701,6 +6718,12 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.delta_link.as_deref(), Some("http://x/d"));
+        // The page says it was read without the reminder, item by item.
+        assert!(page.expand_refused);
+        assert!(matches!(
+            &page.items[0],
+            crate::graph::model::DeltaItem::Upsert(_, f) if f.reminder_unasked && !f.writes_reminder()
+        ));
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].path, format!("{plain}&$expand={MESSAGE_EXPAND}"));
@@ -6748,6 +6771,10 @@ mod tests {
         let (m, f) = c.get_message("M1").unwrap();
         assert_eq!(m.subject, "Hi");
         assert!(!f.reminder, "no reminder came");
+        assert!(
+            f.reminder_unasked && !f.writes_reminder(),
+            "and it was not asked for"
+        );
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[1].path, plain);
@@ -6769,7 +6796,9 @@ mod tests {
             get_route(&plain, 200, r#"{"id":"M1","parentFolderId":"F2"}"#),
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        assert_eq!(c.get_message_hit("M1").unwrap().folder_id, "F2");
+        let hit = c.get_message_hit("M1").unwrap();
+        assert_eq!(hit.folder_id, "F2");
+        assert!(hit.fields.reminder_unasked);
         assert_eq!(srv.requests()[1].path, plain);
     }
 
@@ -6784,7 +6813,7 @@ mod tests {
         let (m, f) = c.get_message("M1").unwrap();
         assert!(m.is_reminder_on);
         assert_eq!(m.reminder_signal_at, "2026-11-08T10:15:00Z");
-        assert!(f.reminder);
+        assert!(f.reminder && !f.reminder_unasked);
     }
 
     fn ok_patch(path: &str) -> Route {
