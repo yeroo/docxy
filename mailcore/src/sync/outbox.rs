@@ -3309,4 +3309,78 @@ mod tests {
 
         assert!(srv.requests().is_empty());
     }
+
+    // --- A flagged message's reminder (#2054) ------------------------------
+
+    fn patch_route(path: &str) -> Route {
+        Route {
+            method: "PATCH".into(),
+            path_prefix: path.into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn dismiss_message_reminder_patches_the_resolved_id() {
+        let srv = FakeServer::start(vec![patch_route("/me/messages/NEW1")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::DismissMessageReminder { id: "OLD1".into() },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/NEW1");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"false"}]}"#
+        );
+    }
+
+    #[test]
+    fn snooze_message_reminder_patches_the_resolved_id() {
+        let srv = FakeServer::start(vec![patch_route("/me/messages/NEW1")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_moved_old1_to_new1();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::SnoozeMessageReminder {
+                id: "OLD1".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        )
+        .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].path, "/me/messages/NEW1");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8560","value":"2026-11-08T10:15:00Z"}]}"#
+        );
+    }
+
+    #[test]
+    fn message_reminder_op_of_a_local_id_makes_no_request() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        for op in [
+            OutboxOp::DismissMessageReminder {
+                id: "local:never".into(),
+            },
+            OutboxOp::SnoozeMessageReminder {
+                id: "local:never".into(),
+                new_reminder_utc: "2026-11-08T10:15:00Z".into(),
+            },
+        ] {
+            assert_eq!(apply_op(&c, &store, &op), Ok(Applied::Done));
+        }
+        assert!(srv.requests().is_empty());
+    }
 }
