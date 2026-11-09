@@ -1963,3 +1963,102 @@ so the user's other devices follow.
 - `MESSAGE_ROW_COLUMNS` is `map_message_row`'s column list, used by these
   two and `messages_in_folder`; `search`, `draft` and
   `conversations_in_folder` still spell theirs out.
+
+## A flagged message's reminder (#2054)
+
+Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and dismissed, as
+#2025 does for events.
+
+- Where it lives (checked on learn.microsoft.com's Outlook MAPI pages, which cite
+  MS-OXPROPS, 2026-11-09): Graph v1.0 `message` has no reminder property, and
+  `followupFlag` only `flagStatus` and its dates. Outlook keeps it in PSETID_Common
+  (`{00062008-0000-0000-C000-000000000046}`) named properties, which Graph exposes as
+  `singleValueExtendedProperties`: `PidLidReminderSet` (LID `0x8503`, Boolean, on),
+  `PidLidReminderTime` (`0x8502`, SystemTime, what it was set for) and
+  `PidLidReminderSignalTime` (`0x8560`, SystemTime, when it fires next, moved by a
+  snooze). Their Graph ids are `model::REMINDER_SET_PROP`, `REMINDER_TIME_PROP` and
+  `REMINDER_SIGNAL_TIME_PROP`, one source for the parse and the PATCH.
+- Read: `client::MESSAGE_EXPAND` (`$expand=singleValueExtendedProperties($filter=id eq
+  … or …)`, quotes and braces percent-encoded) goes on a delta's first call (`Head`,
+  `Full`), `get_message` and `get_message_hit`, not on search hits (not stored, #2006).
+  Graph keeps a first call's options in every link it mints, so a `Link` is sent as is.
+  Nothing showed delta accepts this exact expand, so a 400 on it (`get_with_expand`)
+  sends the call once more without it: the folder still syncs, without reminders until
+  its links reset. A 400 with another cause costs that one extra request.
+- Parse (`model::parse_message_reminder`), lenient and never an error: property ids
+  match ASCII-case-insensitively (Graph may lower-case the GUID); on is only `"true"`
+  (any case) or JSON `true`; a time is read only when it ends in `Z` or has nothing
+  after its seconds (a fraction allowed): `to_utc` drops a `+02:00` without applying it.
+  `is_reminder_on` needs a readable time too (one with none cannot fire). Outlook's
+  "never" signal, `4501-01-01T00:00:00Z`, parses and is never due. `flag_due_at` is
+  `flag.dueDateTime` in UTC, `""` in a named zone (no zone database here).
+- Store: `messages.is_reminder_on`, `reminder_at`, `reminder_signal_at`,
+  `flag_due_at`, on `Message` and `MessageRow` (there is no `MessageSummary`). A merge
+  writes the reminder columns when `MessageFields::writes_reminder` (the key carried, or
+  a complete item: Graph leaves the key out when the filter matches nothing) and
+  `flag_due_at` with the flag. **Reminder on ⇒ flagged**: the merge ANDs it with the
+  row's resulting flag, and `set_flag(false)` turns it off (times kept), so an unflag or
+  a completed flag stays off even if Exchange keeps `PidLidReminderSet` and a later
+  delta says so.
+- Migration: `migrate_message_reminders` probes `pragma_table_info` in one IMMEDIATE
+  transaction; a store without the columns gets all four and every folder's delta and
+  backfill state cleared (what `clear_delta_links` clears, without
+  `reconverge_pending`), as a pre-#2054 link never carries the expand. A crash cannot
+  leave the columns without the reset; a second connection waits and finds them. The
+  cost is one re-enumeration of the mailbox: fresh deltas report no row as new mail
+  (`new_ids` is filled only on a stored link's round), and a stored body is not fetched
+  again. `idx_messages_reminder` (partial, `WHERE is_reminder_on = 1`) comes after.
+- `Store::due_message_reminders(now_utc)`: flagged rows, any folder, reminder on, whose
+  `COALESCE(NULLIF(reminder_signal_at, ''), reminder_at)` is not empty and not after
+  `now_utc` (normalised with `to_utc`), soonest first then by id. A client polls it.
+- Commands: `SyncCommand::DismissMessageReminder { id }` and `SnoozeMessageReminder {
+  id, new_reminder_utc }` resolve `id` (`current_id`), refuse a `local:` id and a snooze
+  time `iso8601_to_unix_secs` cannot read (`Error("dismiss message reminder {id}: the
+  message is not on the server yet")`, `"snooze message reminder {id}: not a UTC time:
+  …"`), write the store (`Store::dismiss_message_reminder`, `snooze_message_reminder`)
+  and queue `OutboxOp::DismissMessageReminder` / `SnoozeMessageReminder` (kinds
+  `dismissMessageReminder`, `snoozeMessageReminder`; keys `id`, `newReminderUtc`). They
+  are message ops: in `pending_message_ids`, and resolved again when they drain, so they
+  follow a move. The PATCH is `/me/messages/{id}` with
+  `{"singleValueExtendedProperties":[{"id":"Boolean {…} Id 0x8503","value":"false"}]}`, or
+  the `0x8560` SystemTime with the snooze time. No new `SyncEvent`, as for `SetFlag`.
+- Dedupe is #2025's, keyed by `ReminderTarget`: an event's id, or a message as it is
+  stored now, so one queued before a move matches one sent after it, and an event op
+  never matches a message op of the same id.
+- Drain is #2025's (404 silent, any other non-5xx refusal dropped with one `Error`, no
+  quarantine), with one difference, as these ops wrote the store: after such a refusal
+  other than a 404 `reread_message` GETs the message and merges it
+  (`merge_message_unless_edited`) into its row's folder, as no delta re-reports a
+  message Graph never changed. A failed re-read is ignored.
+- `testserver` is a `#[doc(hidden)] pub mod`, so a crate built on mailcore can drive the
+  whole path in its tests: `FakeServer::start` with routes for the delta and the
+  `PATCH /me/messages/`, a `GraphClient::new(&srv.base_url, …)` or the engine's Graph
+  base URL pointed at `srv.base_url`, then `srv.requests()` for the recorded PATCH.
+- Not done: setting a new reminder, task (To Do) reminders, host UI, and
+  `GET /me/reminderView`.
+- Tests: `model.rs` `message_reminder_parses_the_three_properties`,
+  `message_without_reminder_properties_has_none`, `message_reminder_false_is_off`,
+  `message_reminder_with_garbage_times_is_off`,
+  `message_reminder_with_an_offset_time_is_unreadable`,
+  `flag_due_date_time_is_normalised_utc`, `flag_due_in_a_named_zone_is_empty`,
+  `message_fields_reminder_written_only_when_carried_or_complete`; `client.rs`
+  `message_expand_names_the_three_reminder_properties`, the delta / `get_message_hit`
+  URL tests, `get_message_expands_the_reminder`, `delta_link_is_sent_as_it_is`,
+  `delta_head_retries_without_expand_on_400`,
+  `delta_full_retries_without_expand_on_400_only`,
+  `get_message_retries_without_expand_on_400`,
+  `get_message_hit_retries_without_expand_on_400`, `get_message_reads_the_reminder`,
+  `dismiss_message_reminder_patches_reminder_set_false`,
+  `snooze_message_reminder_patches_signal_time`, `message_reminder_refused_is_an_error`;
+  `store` `message_reminder_tests` (round trip through every reader, partial and
+  complete merges, the flag invariant, `set_flag`, the due query and its index, the
+  migration, the op round trip, `pending_message_ids`) and
+  `upsert_writes_every_column`; `outbox.rs`
+  `dismiss_message_reminder_patches_the_resolved_id`,
+  `snooze_message_reminder_patches_the_resolved_id`,
+  `message_reminder_op_of_a_local_id_makes_no_request`; `engine.rs`
+  `tests::message_reminders` (delta store and clear, refused expand, the migrated
+  store's re-enumeration, dismiss, snooze, refusals, 404, 400 with the re-read, dedupe,
+  unflag) and `tests::moved` `message_reminder_ops_queued_behind_a_move_reach_the_new_id`,
+  `message_reminder_commands_by_the_old_id_write_and_reach_the_new_id`,
+  `a_dismiss_by_the_new_id_dedupes_against_one_queued_by_the_old_id`.
