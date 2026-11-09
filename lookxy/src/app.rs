@@ -734,6 +734,9 @@ impl App {
             // lookxy never sends `FetchEventSeries` or `FetchEventInstances`
             // (its agenda edits single events only), so neither lands (#2022).
             SyncEvent::EventSeriesFetched { .. } | SyncEvent::EventInstancesFetched { .. } => {}
+            // lookxy shows no upload progress: its composer closes when Send
+            // is pressed, so nothing is open to show it on (#1941).
+            SyncEvent::AttachmentProgress { .. } => {}
             // A send failed for good: the engine already put the message
             // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
             SyncEvent::SendFailed { error, .. } => {
