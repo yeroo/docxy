@@ -21,6 +21,12 @@
 //! Every file is written atomically (a `.tmp` sibling, then `rename` over
 //! the real path), created 0600 on unix, so a crash mid-write never leaves a
 //! half-written cache. Secrets are never logged by this module.
+//!
+//! The platform store is skipped under mailcore's own `cfg(test)` only. An
+//! embedder's tests that reach the token store (an engine on
+//! `crate::testserver::FakeServer`, say) set `MAILCORE_TOKEN_STORE=file`,
+//! which keeps the token in the file, or they get the developer's keyring
+//! (on Linux, the Secret Service over the session bus).
 
 use crate::auth::TokenSet;
 use crate::json::{self, Value};

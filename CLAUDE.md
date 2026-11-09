@@ -136,6 +136,7 @@ issue number to find its notes.
   a message's list row by id, batched, without its body (#2053),
   a flagged message's reminder, read, stored, snoozed and dismissed (#2054),
   an event's own response time and created time (#2068),
+  a draft's unpushed body kept against a fetched one (#2082),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 

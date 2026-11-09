@@ -10,6 +10,12 @@
 //! `base_url` to `GraphClient::new`, or as the Graph and auth bases of the
 //! hidden `sync::engine::spawn_with_bases_and_options`), not a general-purpose
 //! server.
+//!
+//! A client's tests that reach the token store (an engine signs in, or
+//! saves a refreshed token) set `MAILCORE_TOKEN_STORE=file`: the platform
+//! secret store (the Secret Service on Linux, the Keychain on macOS) is
+//! skipped only under mailcore's own `cfg(test)`, so without it they would
+//! use the developer's keyring (see [`crate::tokencache`]).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
