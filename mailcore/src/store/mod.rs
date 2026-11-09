@@ -3817,7 +3817,8 @@ impl Store {
         // `Store::event_body`): compare the edit against that, so a form
         // that leaves it alone does not mark `BODY`. Only here: the send
         // (`event_for_send`) reads the row's own body, so a cleared body
-        // is sent cleared (r4).
+        // is sent cleared (r4). The row's own body is kept for the write.
+        let own_body = old.body_html.clone();
         if old.body_html.is_empty() {
             old.body_html = event_body_on(&tx, id)?.unwrap_or_default();
         }
@@ -3837,6 +3838,15 @@ impl Store {
         );
         mark(EventFieldSet::LOCATION, f.location != old.location);
         mark(EventFieldSet::BODY, f.body_html != old.body_html);
+        // An edit that leaves the body alone keeps the row's own (r5): for
+        // an occurrence shown its master's body, writing the shown one
+        // would detach it from its master, and would put the master's body
+        // into a row whose queued clear (`BODY`) then sends it.
+        let body_html = if f.body_html != old.body_html {
+            f.body_html.as_str()
+        } else {
+            own_body.as_str()
+        };
         let show_as = non_empty(&f.show_as).unwrap_or(old.show_as.clone());
         mark(EventFieldSet::SHOW_AS, show_as != old.show_as);
         let sensitivity = non_empty(&f.sensitivity).unwrap_or(old.sensitivity.clone());
@@ -3898,7 +3908,9 @@ impl Store {
                 f.end_utc,
                 f.is_all_day,
                 f.location,
-                f.body_html,
+                body_html,
+                // The shown body, the user's: for a filled occurrence that
+                // is its master's, whose link it already has.
                 meeting_link_in(&f.location, &f.body_html).unwrap_or_default(),
                 show_as,
                 sensitivity,
@@ -12001,15 +12013,19 @@ mod calendar_tests {
             .unwrap();
         assert_eq!(s.event_body("O2").unwrap().as_deref(), Some("<p>own</p>"));
         assert_eq!(s.event_body("nope").unwrap(), None);
-        // Its master gone, an occurrence reads its own empty body.
-        s.delete_event("M").unwrap();
-        assert_eq!(s.event_body("O1").unwrap().as_deref(), Some(""));
-        // `event_for_send` reads the row's own body, never the master's
-        // (r4: a cleared body is sent cleared).
+        // `event_for_send` reads the row's own body, never the master's,
+        // which is stored (r4: a cleared body is sent cleared).
         s.conn
             .execute("UPDATE events SET body_html = '' WHERE id = 'O2'", [])
             .unwrap();
+        assert_eq!(
+            s.event_body("O2").unwrap().as_deref(),
+            Some("<p>Join the standup</p>")
+        );
         assert_eq!(s.event_for_send("O2").unwrap().unwrap().body_html, "");
+        // Its master gone, an occurrence reads its own empty body.
+        s.delete_event("M").unwrap();
+        assert_eq!(s.event_body("O1").unwrap().as_deref(), Some(""));
     }
 
     #[test]
@@ -12141,6 +12157,65 @@ mod calendar_tests {
             Some("<p>Join the standup</p>"),
             "the known transient"
         );
+    }
+
+    /// An edit that leaves an occurrence's shown body alone keeps the row's
+    /// own (#2064 r5): a subject-only edit of a filled occurrence keeps
+    /// `''`, so it still follows its master, and one after a queued clear
+    /// does not write the master's body back for the clear to send.
+    #[test]
+    fn update_event_fields_leaving_an_occurrences_body_keeps_its_own() {
+        let s = series_store();
+        let own_body = |id: &str| -> String {
+            s.conn
+                .query_row("SELECT body_html FROM events WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let edit = |s: &Store, id: &str, subject: &str, body: String| {
+            let o = s.event(id).unwrap().unwrap();
+            let f = LocalEventFields {
+                subject: subject.into(),
+                start_utc: o.start_utc.clone(),
+                end_utc: o.end_utc.clone(),
+                location: o.location.clone(),
+                body_html: body,
+                attendees: s
+                    .event_attendees(id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|a| AttendeeInput {
+                        name: a.name,
+                        addr: a.addr,
+                        r#type: a.r#type,
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            s.update_event_fields(id, &f).unwrap()
+        };
+        // Never cleared: a subject-only edit keeps the own `''`.
+        let shown = s.event_body("O2").unwrap().unwrap();
+        assert_eq!(edit(&s, "O2", "Only this", shown), EventFieldSet::SUBJECT);
+        assert_eq!(own_body("O2"), "");
+        assert_eq!(
+            s.event_body("O2").unwrap().as_deref(),
+            Some("<p>Join the standup</p>")
+        );
+        // Cleared, then a subject-only edit from a form showing the
+        // master's body (the transient): the row keeps `''`, so the queued
+        // clear sends `''`.
+        assert_eq!(
+            edit(&s, "O1", "Standup", String::new()),
+            EventFieldSet::BODY
+        );
+        let shown = s.event_body("O1").unwrap().unwrap();
+        assert_eq!(shown, "<p>Join the standup</p>");
+        assert_eq!(edit(&s, "O1", "Renamed", shown), EventFieldSet::SUBJECT);
+        assert_eq!(own_body("O1"), "");
+        assert_eq!(s.event_for_send("O1").unwrap().unwrap().body_html, "");
+        assert_eq!(row(&s, "O1").subject, "Renamed");
     }
 
     #[test]
