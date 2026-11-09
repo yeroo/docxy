@@ -5,8 +5,9 @@
 //! Help and F1 open the editor's manual in a Help tab (#1855,
 //! `help_view`) when one is installed (`help_manual`), else say the
 //! documentation is coming: Help on its own page (the `help` key), F1 on the
-//! active ribbon tab's area page, or on the page of the open dialog
-//! (`dialog:<id>`). Contact
+//! page of the ribbon command under the pointer (#1869, its id, else its
+//! area's), else on the active ribbon tab's area page, or on the page of the
+//! open dialog (`dialog:<id>`). Contact
 //! Support and Feedback open the docxy GitHub new-issue page with the build
 //! pre-filled ([`buildinfo::BuildInfo::feedback_url`]); under the harness the
 //! URL is recorded, not opened, and `last-url` reads it. About docxy suite opens
@@ -164,6 +165,45 @@ pub(crate) fn f1_ask(kind: Option<Kind>, area: &str, help_tab: Option<HelpEditor
     }
 }
 
+/// The prefix of the probe every ribbon command draws (#1869): the
+/// document's and Project's (`rs::Cmd::id`), the sheet's (`SheetCmd::id`), a
+/// gallery's (its id), an extension's and a plugin's. F1 hit-tests the
+/// pointer against them ([`ribbon_cmd_at`]), and the harness aims a pointer at
+/// one (`ribbon-cmd:<id>`).
+pub(crate) const RIBBON_CMD_PROBE: &str = "ribbon-cmd:";
+
+/// The probe name of the ribbon command `id`.
+pub(crate) fn ribbon_cmd_probe(id: &str) -> String {
+    format!("{RIBBON_CMD_PROBE}{id}")
+}
+
+/// The id of the ribbon command whose probe in `frame` (the frame on screen,
+/// in drawn order) contains the pointer `at`, or `None` with the pointer out
+/// of the window (`at` none) or on no command. Where two contain it, the last
+/// drawn wins: the one painted on top.
+pub(crate) fn ribbon_cmd_at(
+    frame: &[(String, Bounds<Pixels>)],
+    at: Option<Point<Pixels>>,
+) -> Option<&str> {
+    let at = at?;
+    frame.iter().rev().find_map(|(name, b)| {
+        name.strip_prefix(RIBBON_CMD_PROBE)
+            .filter(|_| b.contains(&at))
+    })
+}
+
+/// F1 with the pointer on the ribbon command `id` (#1869): its page, else
+/// the area page of the ribbon tab shown (`area`), else the root, in the
+/// manual of the tab's kind; never an error. As Word opens a command's help
+/// from its ScreenTip, without waiting for the tip.
+pub(crate) fn f1_command_ask(kind: Option<Kind>, id: &str, area: &str) -> HelpAsk {
+    HelpAsk {
+        editor: help_view::host::editor_for(kind),
+        id: Some(id.to_string()),
+        area: Some(area.to_string()),
+    }
+}
+
 /// Help › Help (the ribbon's, the sheet's, the macOS menu's): the `help`
 /// command's page, in the manual of the tab's kind, or on a Help tab
 /// (`help_tab`: the macOS menu bar reaches one) in that tab's manual.
@@ -260,21 +300,54 @@ impl Docxy {
         true
     }
 
-    /// F1 with no dialog and no entry owning the keys: the area page of the
+    /// F1 with no dialog and no entry owning the keys: the page of the
+    /// ribbon command under the pointer (#1869), else the area page of the
     /// ribbon tab shown, or the root of the Help tab's manual; with no manual
     /// installed the status line says the documentation is coming.
+    ///
+    /// The command is found in the probes of the frame on screen, never in
+    /// `self.ribbon_flyout`, which F1 has just cleared: a command in an open
+    /// flyout is still found, as it is still on screen.
     pub(crate) fn help_f1(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.keytips = KeyTip::Off;
         let kind = self.tabs.get(self.active).map(|t| t.kind);
-        let ask = f1_ask(
-            kind,
-            crate::ribbon_tab_name(self.ribbon_tab),
-            self.active_help().map(help_view::HelpView::editor),
-        );
+        let area = crate::ribbon_tab_name(self.ribbon_tab);
+        let help_tab = self.active_help().map(help_view::HelpView::editor);
+        // A Help tab's ribbon shows File only; its F1 stays its root.
+        let hovered = help_tab
+            .is_none()
+            .then(|| {
+                let probes = self.probes.borrow();
+                ribbon_cmd_at(probes.on_screen_frame(), self.help_pointer(window))
+                    .map(str::to_string)
+            })
+            .flatten();
+        let ask = match hovered {
+            Some(id) => f1_command_ask(kind, &id, area),
+            None => f1_ask(kind, area, help_tab),
+        };
         if !self.open_help(ask, window, cx) {
             self.set_status(DOCS_COMING);
             self.refocus(window, cx);
         }
+    }
+
+    /// Where the pointer is, for F1 on a hovered ribbon command (#1869), or
+    /// `None` when it is out of the window: gpui keeps the last position
+    /// after the pointer leaves. A move sets `pointer_in_window` and a
+    /// `MouseExited` clears it, but gpui on Windows sends no `MouseExited`
+    /// (its `WM_MOUSELEAVE` only clears the window's hovered flag), so there,
+    /// outside the harness, the platform's hovered flag must hold too. It is
+    /// not read elsewhere: on macOS it only means the window is active, and a
+    /// harness's dispatched pointer events never set it.
+    pub(crate) fn help_pointer(&self, window: &Window) -> Option<Point<Pixels>> {
+        if !self.pointer_in_window {
+            return None;
+        }
+        if cfg!(target_os = "windows") && !self.harness && !window.is_window_hovered() {
+            return None;
+        }
+        Some(window.mouse_position())
     }
 
     /// F1 over the active tab's dialog: its page in a Help tab, when the

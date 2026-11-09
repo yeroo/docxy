@@ -641,6 +641,7 @@ footer editor; `selection-set` refuses while it is open.
 | `fill-handle-into {"probe":"tab-more-item:*","except":["tab-more-item:23"],"inset":4,"within":"A1:T30"}` | select a cell of `within` whose fill-handle point (its bottom-right corner, where `pointer-click {"at":"fill-handle"}` presses) lies inside a probe's drawn bounds inset by `inset` logical pixels on every edge, edges included (#1149). `probe` names one probe, or ends in `*` for every drawn probe it starts, less those in `except`; of several fits, the one nearest its probe's centre. A wildcard lets a case aim at whichever more-tabs item a row line crosses: items and rows differ in height, so one item's inset band can miss every row line. Only cells fully on screen count, and `within` caps the search at 4000 cells, so a case can `snapshot` them all. The selection is set as a click's would be, without a click: an open list stays open and the grid does not scroll. It draws first, like the pointer verbs. Replies `{cell, x, y, probe, item}`, `item` being the more-tabs item under the point as `pointer-click` reports it. With no fit it is refused, giving the probe's bounds raw and inset (a wildcard's: the item nearest a handle) and the nearest cell's handle point and distance |
 | `pointer-drag {"from":"tab-chip:0","to":"tab-chip:2","offset":[6,0]}` | dispatch a real press, 9 pressed moves and a release from the `from` region's centre to the `to` region's centre — plus the optional logical-pixel `offset` on the target. The ninth pressed move lands at the destination, so the drag's handlers see the final cell before the release. gpui arms a drag once a pressed move lands more than 2px from the press, so a from→to distance (including `offset`) of 2px or less acts as a click; longer drags (chip reorder) happen exactly as by pointer. Replies `{from:[x,y], to:[x,y]}` |
 | `pointer-move {"to":"cell:C2"}` | dispatch a real hover (a move with no button held) at the region's centre through gpui's hit testing, as between gestures. Replies `{to:[x,y]}` |
+| `pointer-leave {}` | dispatch a `MouseExited`, as when the pointer crosses the window's edge (#1869): gpui keeps the last position, and F1 then finds no ribbon command under it. Replies `{}` |
 | `pointer-wheel {"region":"backstage-content","dy":-600}` | dispatch a real mouse move and wheel notch at the region's centre through gpui's hit testing (#1028); a negative `dy` (logical pixels) scrolls the content down. Replies `{x, y, dy}`. `"ctrl":true` holds Ctrl for the notch (Ctrl+wheel zooms the Project chart, #1535; a positive `dy` is wheel up). `"shift":true` makes the notch horizontal, `point(dy, 0)` with Shift held, as the X11 and Wayland clients deliver a shifted wheel (#1895; a negative `dy` scrolls the content right; `docs/claude/docx-editing.md`). Refuses under a dialog; does not pre-close menus |
 | `backstage-layout {}` | read the File screen's scroll state (refused while it is closed): `page` (`open`, `new`, `info`, `account`, `export`, or `ext` while an extension tab's own File page shows, #1923), `ext_page` (that page's id, or null), the content pane's `viewport_h`, `content_h`, `scroll_y`, `scrollable`, `at_top`, `scrolled`, `last_item_visible` (true when the page fits or has been scrolled to its end), and the rail's `rail_viewport_h`, `rail_content_h`, `rail_scrollable`, `rail_last_item_visible` (while an extension page shows, the pane's fields are as the suite's page last drew them: that page scrolls itself). Settle with `shot window` first; regions `backstage-content` and `backstage-rail` name the two columns |
 | `backstage-page {"page":"new"}` | switch the File screen's page: `new`, `info` and `export` (a document tab only; Export is Change File Type, #635) and `account` call the rail's handler; `close` presses the rail's Close item (with no tab it does nothing, #806); `open` (the default page) is a setup shortcut with no rail counterpart (the user closes and reopens File; the rail's Open… opens a file picker). Every page starts scrolled to the top. Replies like `backstage-layout`, whose sizes come from the last drawn frame: `shot window` before reading them |
@@ -1704,7 +1705,7 @@ clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
 `project-vbar`, `project-timeline`, `project-timeline-box-left`,
 `project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
 `ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`,
-`gallery-more:<gallery id>`, `ext-ribbon-cmd:<command id>`, `bs-ext:<page id>`,
+`gallery-more:<gallery id>`, `ext-ribbon-cmd:<command id>`, `ribbon-cmd:<command id>`, `bs-ext:<page id>`,
 `ext-page-close:<page id>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
@@ -1739,6 +1740,13 @@ command of an extension's ribbon (#1870): its button, a split's upper half
 or a drop-down, drawn in place or in an open group flyout, or a gallery
 tile drawn in place; an error while it is not drawn (another tab, a
 collapsed group whose flyout is shut, a collapsed ribbon).
+`ribbon-cmd:<command id>` (for example `ribbon-cmd:bold`) is any ribbon
+command (#1869): the document's and Project's by `rs::Cmd::id`, the sheet's
+by `SheetCmd::id`, a gallery by its id, an extension's and a plugin's too;
+a split is the whole split. It is drawn in place or in an open flyout, and is
+an error while it is not drawn. A command drawn twice (a swatch gallery in
+place and in its More flyout) is the first one on screen. A `pointer-move`
+there and a real F1 open the command's page (`docs/claude/help.md`).
 `bs-ext:<page id>` (for example `bs-ext:fx.account`) is an extension tab's
 File rail entry (#1923), an error while File is not up on that tab;
 `ext-page-close:<page id>` is the test extension's File page's Close tab

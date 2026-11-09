@@ -290,6 +290,70 @@ fn help_opens_the_help_commands_page() {
     }
 }
 
+// ---- F1 on a hovered ribbon command (#1869) ---------------------------------
+
+fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<Pixels> {
+    Bounds::new(point(px(x), px(y)), size(px(w), px(h)))
+}
+
+#[test]
+fn ribbon_cmd_at_finds_the_command_under_the_pointer() {
+    let frame = vec![
+        ("ribbon-group:Font".to_string(), rect(0., 0., 200., 90.)),
+        (ribbon_cmd_probe("bold"), rect(10., 10., 22., 22.)),
+        (ribbon_cmd_probe("italic"), rect(34., 10., 22., 22.)),
+        ("ribbon-split:paste".to_string(), rect(300., 0., 40., 90.)),
+    ];
+    let at = |x: f32, y: f32| Some(point(px(x), px(y)));
+    assert_eq!(ribbon_cmd_at(&frame, at(20., 20.)), Some("bold"));
+    assert_eq!(ribbon_cmd_at(&frame, at(40., 30.)), Some("italic"));
+    // In the group but on no command, on another probe, outside all.
+    assert_eq!(ribbon_cmd_at(&frame, at(100., 60.)), None);
+    assert_eq!(ribbon_cmd_at(&frame, at(310., 40.)), None);
+    assert_eq!(ribbon_cmd_at(&frame, at(900., 500.)), None);
+    // The pointer out of the window: no command, wherever it last was.
+    assert_eq!(ribbon_cmd_at(&frame, None), None);
+    // Two commands under the pointer (a flyout drawn over the ribbon): the
+    // last drawn, painted on top.
+    let mut over = frame.clone();
+    over.push((ribbon_cmd_probe("fontcolor"), rect(0., 0., 60., 60.)));
+    assert_eq!(ribbon_cmd_at(&over, at(20., 20.)), Some("fontcolor"));
+    // An extension's own probe is not a second name for the command.
+    let ext = vec![(crate::ext_cmd_probe("fx.reply"), rect(0., 0., 50., 50.))];
+    assert_eq!(ribbon_cmd_at(&ext, at(5., 5.)), None);
+}
+
+#[test]
+fn f1_on_a_hovered_command_opens_its_page() {
+    use helpdocs::Via;
+    let m = word();
+    let ask = f1_command_ask(Some(Kind::Docx), "bold", "Home");
+    assert_eq!(ask.editor, HelpEditor::Word);
+    assert_eq!(page_of(&ask, &m), ("home-font".into(), Via::Exact));
+    let ask = f1_command_ask(Some(Kind::Docx), "table", "Insert");
+    assert_eq!(page_of(&ask, &m), ("tables".into(), Via::Exact));
+    // A command no page keys: its area's page, never an error.
+    let ask = f1_command_ask(Some(Kind::Docx), "symbol", "Insert");
+    assert_eq!(page_of(&ask, &m), ("insert".into(), Via::Area));
+    // Nor an area page: the root.
+    let ask = f1_command_ask(Some(Kind::Docx), "mailmerge", "Mailings");
+    assert_eq!(page_of(&ask, &m), ("welcome".into(), Via::Root));
+    // A disabled command has its page too.
+    let ask = f1_command_ask(Some(Kind::Docx), "showtraining", "Help");
+    assert_eq!(page_of(&ask, &m), ("help".into(), Via::Exact));
+    // The sheet's commands read the Excel manual.
+    let x = crate::help_manual::tests::fixture_bundle(HelpEditor::Excel).manual;
+    let ask = f1_command_ask(Some(Kind::Xlsx), "bold", "Home");
+    assert_eq!(ask.editor, HelpEditor::Excel);
+    assert_eq!(page_of(&ask, &x), ("home".into(), Via::Exact));
+    let ask = f1_command_ask(Some(Kind::Xlsx), "freeze-panes", "View");
+    assert_eq!(page_of(&ask, &x), ("excel".into(), Via::Root));
+    assert_eq!(
+        f1_command_ask(Some(Kind::Project), "gantt", "Task").editor,
+        HelpEditor::Project
+    );
+}
+
 #[test]
 fn f1_over_a_dialog_opens_its_page() {
     use helpdocs::Via;
