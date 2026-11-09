@@ -2341,7 +2341,9 @@ series' first day.
   id, times, `series_master_id`, `event_type`, `calendar_id`, `web_link`,
   `last_modified`, both recurrences, the body and the internal columns.
 - **The body is a reference.** `event_body_on` gives an `occurrence` with no body of
-  its own its stored master's (same calendar). `Store::event_body` uses it, and so
+  its own its stored master's (same calendar). Copying the master's body would have
+  duplicated the Teams HTML of each master into every occurrence. `Store::event_body`
+  uses it, and so
   does `update_event_fields` for its `old` body, so it compares an occurrence edit's
   body against what the host showed: a subject-only edit does not mark `BODY`, and
   the master's HTML is not sent. `event_for_send` reads the row's own body (r4): a
@@ -2353,8 +2355,7 @@ series' first day.
   a filled occurrence keeps `''`, so it still follows its master, and an edit during
   the transient does not write the master's body back for the queued clear to send.
   Its join link is still read from the shown body (the master's link, already
-  copied). Copying it would have duplicated the
-  Teams HTML of each master into every occurrence.
+  copied).
 - **A missing master is fetched** (`Engine::fetch_missing_masters`, after a round
   and before the write). It fetches the masters of the round's occurrences and of
   the calendar's stored blank ones (`Store::blank_occurrence_masters`) that are not
