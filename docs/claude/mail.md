@@ -1938,3 +1938,28 @@ so the user's other devices follow.
   would otherwise be listed beside its local row and could not be opened.
 - lookxy never sends the two commands. Its `on_sync_event` ignores the
   three events.
+
+## Message rows by id (#2053)
+
+- `Store::message_row(id)` is a stored message's `MessageRow`, the row
+  `messages_in_folder` gives for it, whether or not a body is stored
+  (`Store::draft` joins `bodies`, so it is only for a row with one). `None`
+  when no row has the id.
+- `Store::message_rows(ids)` is the batch a client uses to check up to a
+  few hundred server-search hits against the store: the rows of the ids it
+  has, in no particular order, each once; unknown ids are skipped and an
+  empty slice runs nothing.
+- Both take exact current ids, like `message_exists` and `message_folder`:
+  no `local:` or moved-id resolution. Pass a hit's id through
+  `Store::current_id` first.
+- The batch is one statement whose one parameter is the ids as a JSON
+  array (`WHERE id IN (SELECT value FROM json_each(?1))`, as
+  `retain_folders` passes a list), not `IN (?, ?, ...)` chunked under
+  SQLite's variable limit: one statement is one read a concurrent writer
+  cannot shift, with no limit and no chunking. SQLite plans it as one
+  primary-key lookup per id; `message_rows_reads_messages_by_its_primary_key`
+  asserts that plan (`SEARCH messages ... (id=?)`, no `SCAN messages`). The
+  store never runs `ANALYZE`, whose stats could change it.
+- `MESSAGE_ROW_COLUMNS` is `map_message_row`'s column list, used by these
+  two and `messages_in_folder`; `search`, `draft` and
+  `conversations_in_folder` still spell theirs out.
