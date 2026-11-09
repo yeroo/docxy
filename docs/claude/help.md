@@ -23,8 +23,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   walk: a launcher runs an act and carries no id. Their dialogs resolve as
   `dialog:<id>`: `every_dialog_has_a_help_target` reports every catalogued
   dialog's (#1855). `helpdocs::resolve_area` is F1's area-only resolve (the
-  area page, else the root; never a key). Build pinning (#1857) is a later
-  slice.
+  area page, else the root; never a key). The suite shows a bundle's
+  `REVISION` in About and the Help footer (#1857, below).
 - The terminal editors' F1 reader (#1856, notes in
   `docs/claude/terminal-editors.md`; its ratatui side is
   `backstagecore::help`) uses four more modules, all dependency-free. `text::lay` lays a page out as wrapped lines of spans
@@ -95,3 +95,35 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   `tab-list` reports `count`. `uiharness/cases/help-docs.uit` drives it;
   `qa/help-docs.md` is the offline manual case. F1 on a hovered ribbon
   command and on panes is #1869.
+
+## Build-pinned manual revision (#1857)
+
+- `Manual::revision` is `REVISION`'s first line, trimmed; a blank one is
+  `None` (`from_files`), so no reader shows an empty commit.
+  `Manual::short_revision` cuts a commit (all ASCII hex, longer than 7) to
+  7, as `buildinfo`'s `short_commit` does, and keeps anything else (a tag,
+  the fixtures' `...fixture`) whole.
+- `help_manual::Bundle::source` is where it was read from:
+  `Source::Installed` (`read_dir`: `<config root>/docxy/manual/<editor>/`,
+  a harness sandbox, the test fixtures) or `Source::BuiltIn` (the embedded
+  files). `name()` is the harness word (`installed`, `built-in`), `words()`
+  what a person reads (`installed`, `built in`).
+- About docxy suite ends with `word manual`, `excel manual` and
+  `project manual` label rows (`about::manual_rows`): `<revision> (built
+  in)`, `<revision> (installed)`, `unknown revision (<source>)`, or `none`.
+  Copy appends them after `summary:`, labels padded to 16 among themselves.
+  `--version`, the crash log and `buildinfo` are unchanged.
+- Both About and `app-info`'s `manuals` (`about::manuals_json`: per editor
+  `revision`, `short`, `source`, or null) go through the app's
+  `help_bundle`, so they name the manual Help shows, and a harness instance
+  sees only its sandbox. Scripts assert `app-info`, not `dialog-read`: the
+  About rows' indices shift with the build's optional `issue` row.
+- The Help tab's page pane ends in a one-line footer,
+  `help_view::footer_text`: `Word manual · revision 0123abc · built in`
+  (`revision unknown` without one). The body and its scrollbar sit in a
+  relative wrapper above it; the `help-page` probe stays on the whole pane.
+  `help-read` reports `revision`, `source` and `footer`. Asserted in
+  `uiharness/cases/help-docs.uit` and `build-info.uit`.
+- The terminal editors' F1 reader and File › Info do not show it yet:
+  `helpdocs::locate` returns a bare `Manual` with no source, and the
+  reader's footer row holds hints and link notes (a follow-up issue).
