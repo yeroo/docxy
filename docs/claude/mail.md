@@ -2854,12 +2854,16 @@ links in one cheap read.
   read (`message_row`, `message_rows`, `messages_in_folder`, `conversations_in_folder`,
   `search`, `draft`, `due_message_reminders`).
 - `Store::reply_draft_links() -> Vec<(conversation_id, in_reply_to)>`: every row with
-  `is_draft = 1 AND in_reply_to <> ''`, in any folder, each pair once, sorted. A sent
-  draft (`mark_sent`) drops out, and comes back with `return_to_drafts`; a forward and a
-  received reply are never in it. It reads the partial index `idx_messages_reply_drafts`
-  (`ON messages(conversation_id, in_reply_to) WHERE is_draft = 1 AND in_reply_to <> ''`,
-  a covering index). The query's WHERE is spelled as the index's, or SQLite will not use
-  it. The index is created in `Store::init` after the migration, never in `schema.rs`:
+  `is_draft = 1 AND in_reply_to <> ''`, in any folder but the well-known Deleted Items
+  (`LEFT JOIN folders`, `COALESCE(well_known_name, '') <> 'deleteditems'`), each pair
+  once, sorted. A discarded draft moves to Deleted Items with Graph's `isDraft` still
+  true, so without that the original would stay marked after the reply was thrown away.
+  A sent draft (`mark_sent`) drops out and comes back with `return_to_drafts`; a forward
+  and a received reply are never in it. It reads the partial index
+  `idx_messages_reply_drafts` (`ON messages(conversation_id, in_reply_to, folder_id)
+  WHERE is_draft = 1 AND in_reply_to <> ''`; `folder_id` makes it covering for the
+  join). The messages side of the query's WHERE is spelled as the index's, or SQLite
+  will not use it. The index is created in `Store::init` after the migration, never in `schema.rs`:
   that batch runs before the migrations, when an old table has no `in_reply_to`.
 - Migration: `migrate_reply_links`, last in `Store::init`, probes for
   `internet_message_id` in one IMMEDIATE transaction, adds both columns (old rows read
@@ -2868,9 +2872,13 @@ links in one cheap read.
   new mail through it would never get either id, and `isDraft` would stay unread. The
   cost is one more re-enumeration. A pre-#2054 store runs every migration on one open.
 - Readers of `is_draft` that change behaviour:
-  - lookxy (`app.rs`, the list's Enter and cursor) opens an `is_draft` row in compose
-    instead of the reader, so a draft synced from Outlook or the web now opens in
-    compose, as Outlook does. That is a visible host change.
+  - lookxy (`app.rs`, the list's Enter, and its cursor preview and PgUp/PgDn, which
+    skip drafts) sends an `is_draft` row to `open_draft`. A draft synced from Outlook
+    or the web now opens in compose, as Outlook does, once its body is stored. Nothing
+    fetches a draft's body on its own (`body_candidates` and `needs_body` skip drafts),
+    and `Store::draft` joins `bodies`. So `open_draft` opens a draft row with no stored
+    body in the reader, whose `reload_body` sends `FetchBody`, and the next activate
+    opens compose. That is a visible host change.
   - Known limit: `Store::headerless_message_ids` leaves out `is_draft = 1` rows as
     made here. A new row first seen as a partial delta item carrying `isDraft: true`
     and no `receivedDateTime` is never completed by #1899's repair (before this issue a
@@ -2891,11 +2899,13 @@ links in one cheap read.
   `message_select_names_internet_message_id_and_is_draft`,
   `delta_page_reads_internet_message_id_in_reply_to_and_is_draft`; `store`
   `reply_link_tests` (every read path, `draft`'s body after the shifted columns, the
-  merge rule, `reply_draft_links` and its plan, the migration through `Store::open` with
+  merge rule, `reply_draft_links`, Deleted Items left out, its plan, the migration through `Store::open` with
   the index on the migrated table, and its idempotence),
   `a_store_from_before_2054_runs_every_migration_in_order`, `upsert_writes_every_column`;
   `engine.rs` `reply_links::` (a delta of a synced reply draft, an `isDraft: false` item
   over a stored draft and the original; a later round without the property keeping the
   link; ComposeReply and ComposeReplyAll answering M1 with only the POST and the body,
-  and ComposeForward answering nothing), and
+  ComposeForward answering nothing, and a reply to a moved original through
+  `current_id`); lookxy
+  `a_synced_draft_without_a_body_opens_the_reader_then_the_composer`; and
   `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.
