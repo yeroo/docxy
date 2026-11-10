@@ -212,6 +212,44 @@ CREATE TABLE IF NOT EXISTS folder_aliases (
     id     TEXT NOT NULL
 );
 
+-- Every Graph id the store held and no longer does (#2107): a message or a
+-- folder row deleted by any path (a delta `@removed`, a folder cascade, a
+-- refused create's discard, a host's delete on its own connection), or an id
+-- a row was re-keyed away from. Written by triggers on `messages` and
+-- `folders` (`FORGOTTEN_TRIGGERS_SQL`, installed by `Store::init` after the
+-- migrations, as they read `internet_message_id`); a row coming back under
+-- the id clears it. A folder delete's walk of Graph (`delete_allow_check`)
+-- reads it: an item Graph still has that the store once held elsewhere is
+-- not taken. `imid` is a message's `internet_message_id` ('' for a folder,
+-- or a row from before #2096). Pruned to the newest `FORGOTTEN_CAP` rows by
+-- rowid (`INSERT OR REPLACE` gives a re-removed id a fresh one). `local:`
+-- ids, which Graph never had, are not recorded.
+CREATE TABLE IF NOT EXISTS forgotten_ids (
+    kind TEXT NOT NULL,
+    id   TEXT NOT NULL,
+    imid TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (kind, id)
+);
+CREATE INDEX IF NOT EXISTS idx_forgotten_ids_imid ON forgotten_ids(imid) WHERE imid <> '';
+
+-- What a `DeleteFolder` command removed (#2107), per batch (one command,
+-- one batch, one queued `DeleteFolder` per Graph root): every Graph folder
+-- (`kind` 'folder') and every message (`kind` 'message', with its
+-- `internet_message_id`) the store showed in the deleted subtree. The walk
+-- of Graph before each DELETE allows only these, and what the store never
+-- held. Removed once the batch's last op is gone. A folder's `root` is the
+-- batch's root whose DELETE takes it (the nearest root at or above it in the
+-- stored tree): the folder stays hidden from listings only while that root's
+-- op is queued (r2); '' for a message.
+CREATE TABLE IF NOT EXISTS folder_delete_allow (
+    batch TEXT NOT NULL,
+    kind  TEXT NOT NULL,
+    id    TEXT NOT NULL,
+    imid  TEXT NOT NULL DEFAULT '',
+    root  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (batch, kind, id)
+);
+
 -- Contacts a refused write must read again from Graph (#2063), once no
 -- queued contact op names them (`Store::owe_contact_reread`). Persisted, so a
 -- restart before the last such op drains still re-reads.
@@ -499,6 +537,41 @@ CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
     FROM messages WHERE id = old.message_id;
 END;
 "#;
+
+/// The triggers that fill `forgotten_ids` (#2107): a deleted message or
+/// folder row, and an id a re-key leaves, are recorded; a row inserted or
+/// re-keyed under an id clears it. Cascades fire them, as they fire
+/// `messages_fts_ad`. Created by `Store::init` after the migrations (an old
+/// `messages` gets `internet_message_id` there); idempotent.
+pub(crate) const FORGOTTEN_TRIGGERS_SQL: &str = "\
+CREATE TRIGGER IF NOT EXISTS forgotten_messages_ad AFTER DELETE ON messages
+WHEN substr(old.id, 1, 6) <> 'local:' BEGIN
+    INSERT OR REPLACE INTO forgotten_ids(kind, id, imid)
+    VALUES ('message', old.id, old.internet_message_id);
+END;
+CREATE TRIGGER IF NOT EXISTS forgotten_messages_ai AFTER INSERT ON messages BEGIN
+    DELETE FROM forgotten_ids WHERE kind = 'message' AND id = new.id;
+END;
+CREATE TRIGGER IF NOT EXISTS forgotten_messages_au AFTER UPDATE OF id ON messages
+WHEN old.id <> new.id BEGIN
+    DELETE FROM forgotten_ids WHERE kind = 'message' AND id = new.id;
+    INSERT OR REPLACE INTO forgotten_ids(kind, id, imid)
+    SELECT 'message', old.id, old.internet_message_id
+    WHERE substr(old.id, 1, 6) <> 'local:';
+END;
+CREATE TRIGGER IF NOT EXISTS forgotten_folders_ad AFTER DELETE ON folders
+WHEN substr(old.id, 1, 6) <> 'local:' BEGIN
+    INSERT OR REPLACE INTO forgotten_ids(kind, id) VALUES ('folder', old.id);
+END;
+CREATE TRIGGER IF NOT EXISTS forgotten_folders_ai AFTER INSERT ON folders BEGIN
+    DELETE FROM forgotten_ids WHERE kind = 'folder' AND id = new.id;
+END;
+CREATE TRIGGER IF NOT EXISTS forgotten_folders_au AFTER UPDATE OF id ON folders
+WHEN old.id <> new.id BEGIN
+    DELETE FROM forgotten_ids WHERE kind = 'folder' AND id = new.id;
+    INSERT OR REPLACE INTO forgotten_ids(kind, id)
+    SELECT 'folder', old.id WHERE substr(old.id, 1, 6) <> 'local:';
+END;";
 
 /// The trigger that keeps a message's `messages_fts` row in step with an
 /// UPDATE of the columns it reads (#1913): only those. `message_id` is

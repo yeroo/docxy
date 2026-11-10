@@ -13,7 +13,7 @@ use crate::graph::model::{
     EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder,
     MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
     PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
-    ScheduleEntry, SearchHit, plain_to_html, to_utc,
+    ScheduleEntry, SearchHit, SubtreeItems, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -997,6 +997,111 @@ impl GraphClient {
         .to_string();
         let resp = self.send(Method::Post, &path, Some(body), &[])?;
         parse_folder_answer(resp, "moved folder")
+    }
+
+    /// `DELETE /me/mailFolders/{id}` (#2107). A 404 is `NotFound`, as every
+    /// call returns it: the engine treats it as done.
+    pub fn delete_folder(&self, id: &str) -> Result<(), GraphError> {
+        let path = format!("/me/mailFolders/{}", encode_path_segment(id));
+        self.send(Method::Delete, &path, None, &[])?;
+        Ok(())
+    }
+
+    /// Walks what Graph has under the folder `id` before a delete (#2107):
+    /// its messages (`$select=id,internetMessageId`, 1000 a page) and its
+    /// child folders (`childFolders`, as `list_folders` sees them, 100 a
+    /// page), recursively, every list following `@odata.nextLink`. `None`
+    /// when `id` itself answers 404 (already gone). A descendant that
+    /// answers 404 was deleted or moved away meanwhile and is left out with
+    /// what is under it; one whose `childFolderCount` is 0 gets no
+    /// `childFolders` call. Any other failure is an `Err`, never a partial
+    /// walk; an item without an id is a `Parse` error, as it could not be
+    /// checked.
+    pub fn folder_subtree_items(&self, id: &str) -> Result<Option<SubtreeItems>, GraphError> {
+        let mut out = SubtreeItems::default();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(id.to_string());
+        let mut todo: Vec<(String, Option<i64>)> = vec![(id.to_string(), None)];
+        while let Some((folder, child_count)) = todo.pop() {
+            let root = folder == id;
+            let messages = match self.folder_message_ids(&folder) {
+                Ok(m) => m,
+                Err(GraphError::NotFound) if root => return Ok(None),
+                Err(GraphError::NotFound) => continue,
+                Err(e) => return Err(e),
+            };
+            let children = if child_count == Some(0) {
+                Vec::new()
+            } else {
+                match self.child_folder_ids(&folder) {
+                    Ok(c) => c,
+                    Err(GraphError::NotFound) if root => return Ok(None),
+                    Err(GraphError::NotFound) => continue,
+                    Err(e) => return Err(e),
+                }
+            };
+            if !root {
+                out.folders.push(folder);
+            }
+            out.messages.extend(messages);
+            for (child, count) in children.into_iter().rev() {
+                if visited.insert(child.clone()) {
+                    todo.push((child, count));
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Every message of one folder as `(id, internetMessageId)` (#2107).
+    fn folder_message_ids(&self, folder: &str) -> Result<Vec<(String, String)>, GraphError> {
+        let mut target = format!(
+            "/me/mailFolders/{}/messages?$select=id,internetMessageId&$top={UNREAD_IDS_TOP}",
+            encode_path_segment(folder)
+        );
+        let mut out = Vec::new();
+        loop {
+            let resp = self.send(Method::Get, &target, None, &[])?;
+            let v = parse_body(resp)?;
+            for item in value_array(&v, "value")? {
+                let id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| GraphError::Parse(format!("a message in {folder} has no id")))?;
+                let imid = item
+                    .get("internetMessageId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                out.push((id.to_string(), imid.to_string()));
+            }
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) => target = next.to_string(),
+                None => return Ok(out),
+            }
+        }
+    }
+
+    /// One folder's child folders as `(id, childFolderCount)` (#2107).
+    fn child_folder_ids(&self, folder: &str) -> Result<Vec<(String, Option<i64>)>, GraphError> {
+        let mut target = format!(
+            "/me/mailFolders/{}/childFolders?$top=100",
+            encode_path_segment(folder)
+        );
+        let mut out = Vec::new();
+        loop {
+            let page = self.fetch_folder_page(&target)?;
+            if !page.all_have_ids {
+                return Err(GraphError::Parse(format!(
+                    "a child folder of {folder} has no id"
+                )));
+            }
+            out.extend(page.folders.into_iter().map(|(f, c)| (f.id, c)));
+            match page.next_link {
+                Some(next) => target = next,
+                None => return Ok(out),
+            }
+        }
     }
 
     /// GET a folder's `/messages/delta` (a first call, `DeltaCursor::Head`
@@ -6647,6 +6752,156 @@ mod tests {
         assert_eq!(reqs[0].path, "/me/mailFolders/F1/move");
         assert_eq!(reqs[0].body, r#"{"destinationId":"D1"}"#);
         assert_eq!(reqs[1].body, r#"{"destinationId":"msgfolderroot"}"#);
+    }
+
+    #[test]
+    fn delete_folder_sends_delete_and_reports_a_404() {
+        let srv = FakeServer::start_limited(vec![
+            (
+                folder_route("DELETE", "/me/mailFolders/F1", 204, ""),
+                Some(1),
+            ),
+            (
+                folder_route("DELETE", "/me/mailFolders/F1", 404, "{}"),
+                None,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.delete_folder("F1").unwrap();
+        assert!(matches!(c.delete_folder("F1"), Err(GraphError::NotFound)));
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert_eq!(reqs[0].path, "/me/mailFolders/F1");
+    }
+
+    /// #2107: the walk pages each folder's messages and child folders,
+    /// recurses (no `childFolders` call for a leaf), and leaves out a child
+    /// that answers 404.
+    #[test]
+    fn folder_subtree_items_pages_and_skips_a_child_gone() {
+        let child = |id: &str, n: i64| {
+            format!(
+                r#"{{"id":"{id}","displayName":"{id}","parentFolderId":"F","childFolderCount":{n}}}"#
+            )
+        };
+        let srv = FakeServer::start(vec![
+            folder_route(
+                "GET",
+                "/me/mailFolders/F/messages?$skiptoken=2",
+                200,
+                r#"{"value":[{"id":"M2"}]}"#,
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/F/messages?",
+                200,
+                r#"{"value":[{"id":"M1","internetMessageId":"<m1@x>"}],"@odata.nextLink":"/me/mailFolders/F/messages?$skiptoken=2"}"#,
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/F/childFolders?$skiptoken=2",
+                200,
+                &format!(r#"{{"value":[{}]}}"#, child("GONE", 0)),
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/F/childFolders",
+                200,
+                &format!(
+                    r#"{{"value":[{},{}],"@odata.nextLink":"/me/mailFolders/F/childFolders?$skiptoken=2"}}"#,
+                    child("C1", 1),
+                    child("LEAF", 0)
+                ),
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/C1/messages?",
+                200,
+                r#"{"value":[{"id":"M3","internetMessageId":"<m3@x>"}]}"#,
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/C1/childFolders",
+                200,
+                &format!(r#"{{"value":[{}]}}"#, child("C2", 0)),
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/C2/messages?",
+                200,
+                r#"{"value":[]}"#,
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/LEAF/messages?",
+                200,
+                r#"{"value":[{"id":"M4"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let items = c.folder_subtree_items("F").unwrap().unwrap();
+        assert_eq!(items.folders, ["C1", "C2", "LEAF"]);
+        assert_eq!(
+            items.messages,
+            [
+                ("M1".to_string(), "<m1@x>".to_string()),
+                ("M2".to_string(), String::new()),
+                ("M3".to_string(), "<m3@x>".to_string()),
+                ("M4".to_string(), String::new()),
+            ]
+        );
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            paths[0],
+            "/me/mailFolders/F/messages?$select=id,internetMessageId&$top=1000"
+        );
+        assert!(paths.contains(&"/me/mailFolders/F/childFolders?$top=100".to_string()));
+        assert!(paths.contains(
+            &"/me/mailFolders/GONE/messages?$select=id,internetMessageId&$top=1000".to_string()
+        ));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with("/me/mailFolders/LEAF/childFolders"))
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with("/me/mailFolders/C2/childFolders"))
+        );
+    }
+
+    /// #2107: the folder itself gone is `None`; any other failure is an
+    /// error, and an item without an id a `Parse` error.
+    #[test]
+    fn folder_subtree_items_root_gone_errors_and_ids() {
+        let srv = FakeServer::start(vec![
+            folder_route(
+                "GET",
+                "/me/mailFolders/BAD/messages?",
+                200,
+                r#"{"value":[{"subject":"x"}]}"#,
+            ),
+            folder_route("GET", "/me/mailFolders/ERR/messages?", 500, "{}"),
+            folder_route(
+                "GET",
+                "/me/mailFolders/NOKIDS/messages?",
+                200,
+                r#"{"value":[]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.folder_subtree_items("GONE").unwrap(), None);
+        assert!(matches!(
+            c.folder_subtree_items("BAD"),
+            Err(GraphError::Parse(_))
+        ));
+        assert!(matches!(
+            c.folder_subtree_items("ERR"),
+            Err(GraphError::Http { status: 500, .. })
+        ));
+        // Its childFolders answers 404: the folder is gone.
+        assert_eq!(c.folder_subtree_items("NOKIDS").unwrap(), None);
     }
 
     #[test]

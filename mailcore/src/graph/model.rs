@@ -43,6 +43,16 @@ pub struct FolderListing {
     pub complete: bool,
 }
 
+/// What Graph has under a folder a delete is about to take (#2107,
+/// `GraphClient::folder_subtree_items`): every descendant folder's id, and
+/// every message in the folder or a descendant, as `(id,
+/// internetMessageId)` (`''` when Graph gives none).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtreeItems {
+    pub folders: Vec<String>,
+    pub messages: Vec<(String, String)>,
+}
+
 /// An email address with an optional display name, as Graph's
 /// `emailAddress` object.
 #[derive(Debug, Clone, PartialEq, Default)]
