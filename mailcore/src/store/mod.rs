@@ -189,7 +189,8 @@ pub struct MessageRow {
     /// The message's protection (#2088, `Message::protection`): its
     /// Sensitivity, its enabled sensitivity label and whether it is
     /// rights-protected. The default (unprotected) for a row stored before
-    /// it was, until a sync re-reads it. A host's list shows its lock.
+    /// it was, until a sync re-reads it. For a host's list to show a lock
+    /// or a label without opening the message.
     pub protection: MessageProtection,
 }
 

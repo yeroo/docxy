@@ -20687,9 +20687,11 @@ mod tests {
             let (handle, store_path, dir) =
                 spawn_fast(&srv, "protection-later", TICK, None, |_| {});
             let store = Store::open(&store_path).unwrap();
+            // The startup round writes it. Not its read state: the later
+            // round may land before this first look.
             assert!(
                 wait_until(TICK_WAIT, || protection_of(&store, "M1")
-                    == Some((false, labelled.clone()))),
+                    .is_some_and(|(_, p)| p == labelled)),
                 "{:?}",
                 protection_of(&store, "M1")
             );
