@@ -5865,18 +5865,41 @@ fn dispatch_verb(
             Done::ok(Json::Obj(reply))
         }
         // Show a document imported from `html` in the view (#1986), as a
-        // host shows a mail; the reply is `ext-doc-read`'s fields.
+        // host shows a mail, or a named `fixture` with its package
+        // (`sections` or `header-inherit`, #1888); the reply is
+        // `ext-doc-read`'s fields.
         "ext-doc-load" => {
             let fixture = ext_fixture_view(app)?;
-            let html = args
-                .get("html")
-                .and_then(Json::as_str)
-                .ok_or("ext-doc-load takes 'html', the page to import")?;
-            let doc = docxcore::import::html::import_html(html.as_bytes())
-                .map_err(|e| format!("ext-doc-load: {e}"))?;
+            let (doc, pkg) = match (args.get("html"), args.get("fixture")) {
+                (Some(html), None) => {
+                    let html = html.as_str().ok_or("'html' must be a string")?;
+                    let doc = docxcore::import::html::import_html(html.as_bytes())
+                        .map_err(|e| format!("ext-doc-load: {e}"))?;
+                    (doc, None)
+                }
+                (None, Some(name)) => {
+                    let name = name.as_str().ok_or("'fixture' must be a string")?;
+                    let (doc, pkg) = crate::ext_fixture::named_document(name)?;
+                    (doc, Some(pkg))
+                }
+                _ => {
+                    return Err(
+                        "ext-doc-load takes 'html', the page to import, or 'fixture', a document's name"
+                            .into(),
+                    );
+                }
+            };
             let view = fixture.read(cx).doc.clone();
-            view.update(cx, |v, cx| v.set_document(doc, None, cx));
+            view.update(cx, |v, cx| v.set_document(doc, pkg, cx));
             Done::ok(view.read(cx).harness_json(window))
+        }
+        // A painted word of the view (#1888): its box, and in Print Layout
+        // its sheet and its box on it
+        // ([`crate::doc_view::DocView::word_json`]).
+        "ext-doc-word" => {
+            let fixture = ext_fixture_view(app)?;
+            let text = arg_str(args, "text")?;
+            Done::ok(fixture.read(cx).doc.read(cx).word_json(text.trim())?)
         }
         // The view's painted layout (#1986): each top-level paragraph's
         // box, list number and lines, and the document's line pitch
@@ -5912,13 +5935,23 @@ fn dispatch_verb(
             let dark = flag("content_dark")?;
             let editable = flag("editable")?;
             let (inset, page_bg) = ext_doc_page_args(args)?;
+            // Web or Print Layout (#1888).
+            let layout = match args.get("layout") {
+                None => None,
+                Some(v) => Some(match v.as_str() {
+                    Some("web") => crate::ext::DocLayout::Web,
+                    Some("print") => crate::ext::DocLayout::Print,
+                    _ => return Err(r#"'layout' must be "web" or "print""#.into()),
+                }),
+            };
             if mode.is_none()
                 && dark.is_none()
                 && editable.is_none()
                 && inset.is_none()
                 && page_bg.is_none()
+                && layout.is_none()
             {
-                return Err("ext-doc-set takes 'link_click', 'content_dark', 'editable', 'page_inset' and/or 'page_background'".into());
+                return Err("ext-doc-set takes 'link_click', 'content_dark', 'editable', 'page_inset', 'page_background' and/or 'layout'".into());
             }
             let doc = fixture.read(cx).doc.clone();
             doc.update(cx, |v, cx| {
@@ -5936,6 +5969,9 @@ fn dispatch_verb(
                 }
                 if let Some(bg) = page_bg {
                     v.set_page_background(bg, cx);
+                }
+                if let Some(layout) = layout {
+                    v.set_layout(layout, cx);
                 }
             });
             let mut reply = match doc.read(cx).harness_json(window) {

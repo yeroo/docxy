@@ -93,6 +93,7 @@ mod page_number;
 mod page_setup;
 mod pictures;
 mod plugin_ui;
+mod print_sheet;
 mod project;
 mod project_formats;
 mod recent_files;
@@ -43866,13 +43867,10 @@ impl Render for Docxy {
                         let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0); // twips → px @ ~96dpi, zoomed
                         // A dark page sits on a darker canvas, so its edge
                         // shows (#2079).
-                        let canvas = if self.page_is_dark() {
-                            hsla_u(dark_page::CANVAS_DARK)
-                        } else if self.applied == Some(ThemeMode::Dark) {
-                            hsla_u(0x2b2b2b)
-                        } else {
-                            hsla_u(0x9a9a9a)
-                        };
+                        let canvas = hsla_u(print_sheet::canvas_color(
+                            self.page_is_dark(),
+                            self.applied == Some(ThemeMode::Dark),
+                        ));
                         // Each section flows with its own geometry (the PDF
                         // exporter is the oracle; page_flow documents the rules).
                         let pf = tab_page_flow(tab, body);
@@ -43992,14 +43990,8 @@ impl Render for Docxy {
                         let hf_label = tab_label.clone();
                         let same_as_previous = hf_linked;
                         let show_text = hf.is_none_or(|h| h.show_text);
-                        // The middle content of one band: a single flow, or an
-                        // N-column row (each column its own block range) with
-                        // the band's section's own column widths, the space
-                        // after each column, and the rule between them when it
-                        // sets `w:sep`. The ranges are positional — pour
-                        // never skips a column — so column i draws range i,
-                        // and a column the band didn't reach draws empty at
-                        // its configured width.
+                        // The middle content of one band (`print_sheet::band_el`), its
+                        // top-level paragraphs numbered (#746).
                         let line_probe_rc = self.line_probe.clone();
                         let build_band = |band: &page_flow::Band,
                                           sect: &page_flow::SectionBox,
@@ -44032,81 +44024,16 @@ impl Render for Docxy {
                                     rule,
                                 })
                             };
-                            if sect.col_w.len() <= 1 {
-                                let (s, e) = band.cols.first().copied().unwrap_or((0, 0));
-                                let col_ctx = RenderCtx {
-                                    line_width: Some(
-                                        zoom * sect.single_col_w().max(0) as f32 / 15.0,
-                                    ),
-                                    ..ctx
-                                };
-                                let blocks: Vec<AnyElement> = (s..e)
-                                    .map(|i| {
-                                        block_el_numbered(
-                                            &body[i],
-                                            vec![i],
-                                            markers[i].as_deref(),
-                                            col_ctx,
-                                            slot_for(&body[i]),
-                                        )
-                                    })
-                                    .collect();
-                                // One column still draws at the section's
-                                // column width (an explicit single `w:col`),
-                                // which is the full text width for an
-                                // ordinary equal-width section.
-                                return v_flex()
-                                    .w(tw(sect.single_col_w()))
-                                    .flex_none()
-                                    .gap_1()
-                                    .children(blocks)
-                                    .into_any_element();
-                            }
-                            let mut els: Vec<AnyElement> = Vec::new();
-                            for ci in 0..sect.col_w.len() {
-                                if ci > 0 {
-                                    let gap = sect.col_gap.get(ci - 1).copied().unwrap_or(0).max(0);
-                                    let mut g = div()
-                                        .w(tw(gap))
-                                        .flex_none()
-                                        .self_stretch()
-                                        .flex()
-                                        .justify_center();
-                                    if sect.sep {
-                                        g = g.child(div().w(px(1.)).h_full().bg(doc_pal.dim));
-                                    }
-                                    els.push(g.into_any_element());
-                                }
-                                let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
-                                let col_ctx = RenderCtx {
-                                    line_width: Some(zoom * sect.col_w[ci].max(0) as f32 / 15.0),
-                                    ..ctx
-                                };
-                                let blocks: Vec<AnyElement> = (s..e)
-                                    .map(|i| {
-                                        block_el_numbered(
-                                            &body[i],
-                                            vec![i],
-                                            markers[i].as_deref(),
-                                            col_ctx,
-                                            slot_for(&body[i]),
-                                        )
-                                    })
-                                    .collect();
-                                els.push(
-                                    v_flex()
-                                        .w(tw(sect.col_w[ci]))
-                                        .flex_none()
-                                        .gap_1()
-                                        .children(blocks)
-                                        .into_any_element(),
-                                );
-                            }
-                            h_flex()
-                                .w_full()
-                                .items_start()
-                                .children(els)
-                                .into_any_element()
+                            print_sheet::band_el(
+                                band,
+                                sect,
+                                body,
+                                &markers,
+                                ctx,
+                                zoom,
+                                doc_pal.dim,
+                                &slot_for,
+                            )
                         };
                         let sheets: Vec<AnyElement> = pf
                             .pages
@@ -44261,7 +44188,7 @@ impl Render for Docxy {
                                     .bg(sheet)
                                     .text_color(doc_pal.fg)
                                     .border_1()
-                                    .border_color(hsla_u(0xd0d0d0));
+                                    .border_color(hsla_u(print_sheet::SHEET_BORDER));
                                 // Tint the region actively being edited on this page.
                                 let hdr_bg = if edit_hdr_here { tint } else { sheet };
                                 let ftr_bg = if edit_ftr_here { tint } else { sheet };
@@ -44406,30 +44333,15 @@ impl Render for Docxy {
                                     if groups.is_empty() {
                                         continue;
                                     }
-                                    // A footer's flow ends at the footer distance;
-                                    // its top (what `vAnchor="text"` measures
-                                    // from) is the estimated flow height, at least
-                                    // a line, above it (the export measures it).
-                                    let band_top = if is_h {
-                                        page_dist(pi, true)
-                                    } else {
-                                        let flow_h = flow
-                                            .iter()
-                                            .map(|(_, b)| block_height_est(b, hf_w / zoom) * 15.0)
-                                            .sum::<f32>()
-                                            as i32;
-                                        sb.h - page_dist(pi, false) - flow_h.max(264)
-                                    };
-                                    let geom = docxcore::frame::FrameGeom {
-                                        page_w: sb.w,
-                                        page_h: sb.h,
-                                        left: sb.left,
-                                        right: sb.right,
-                                        top: sb.top,
-                                        bottom: sb.bottom,
-                                        band_top,
-                                        even: pf.pages[pi].number % 2 == 0,
-                                    };
+                                    let geom = print_sheet::frame_geom(
+                                        sb,
+                                        is_h,
+                                        page_dist(pi, is_h),
+                                        &flow,
+                                        hf_w,
+                                        zoom,
+                                        pf.pages[pi].number % 2 == 0,
+                                    );
                                     let margins = (
                                         zoom * sb.left as f32 / 15.0,
                                         zoom * sb.right as f32 / 15.0,
@@ -44565,13 +44477,13 @@ impl Render for Docxy {
                             .overflow_scroll()
                             .bg(canvas)
                             .items_start()
-                            .py(px(24.))
+                            .py(px(print_sheet::CANVAS_PAD))
                             .child(
                                 v_flex()
                                     .flex_none()
                                     .min_w_full()
                                     .items_center()
-                                    .gap(px(18.))
+                                    .gap(px(print_sheet::SHEET_GAP))
                                     .children(sheets),
                             )
                             .into_any_element();

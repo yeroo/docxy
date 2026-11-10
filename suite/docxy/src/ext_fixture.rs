@@ -524,6 +524,98 @@ pub(crate) fn fixture_document() -> (Document, Package) {
     (doc, pkg)
 }
 
+/// The fixtures `ext-doc-load {"fixture"}` shows in the view (#1888):
+/// `sections` ([`sections_document`]) and `header-inherit`
+/// (`uiharness/fixtures/header-inherit.docx`, loaded as a document tab
+/// loads it).
+pub(crate) fn named_document(name: &str) -> Result<(Document, Package), String> {
+    match name {
+        "sections" => Ok(sections_document()),
+        "header-inherit" => {
+            let loaded = crate::load_bytes(include_bytes!(
+                "../../../uiharness/fixtures/header-inherit.docx"
+            ));
+            let pkg = loaded.pkg.ok_or("header-inherit.docx did not load")?;
+            Ok((loaded.doc, pkg))
+        }
+        _ => Err(format!(
+            "unknown fixture '{name}': the fixtures are 'sections' and 'header-inherit'"
+        )),
+    }
+}
+
+/// A sectPr: the page size, its margins (`margin` all round, the header and
+/// footer at half of it) and extra children (references first).
+fn sect_pr(refs: &str, w: u32, h: u32, margin: u32, extra: &str) -> String {
+    let orient = if w > h { " w:orient=\"landscape\"" } else { "" };
+    let hf = margin / 2;
+    format!(
+        "<w:sectPr>{refs}<w:pgSz w:w=\"{w}\" w:h=\"{h}\"{orient}/>\
+         <w:pgMar w:top=\"{margin}\" w:right=\"{margin}\" w:bottom=\"{margin}\" w:left=\"{margin}\" \
+         w:header=\"{hf}\" w:footer=\"{hf}\" w:gutter=\"0\"/>{extra}</w:sectPr>"
+    )
+}
+
+/// The `sections` document (#1888): four sections of different geometry,
+/// for Print Layout. Section 1 is a Letter page (1" margins) with the
+/// header "Sections header" and a footer whose text "Sections footer" has
+/// a framed PAGE number at the margin's right beside it; the later
+/// sections link to them. Section 2 (a new page) is landscape Letter with
+/// 0.5" margins; section 3 (a new page) has two columns 0.5" apart with a
+/// rule between them; section 4 follows it on the same page, one column,
+/// so section 3's columns balance. Every word is unique: `Portrait`,
+/// `Landscape`, `ColumnOne`..`ColumnSix`, `After`.
+pub(crate) fn sections_document() -> (Document, Package) {
+    let mut pkg = new_package(Document { body: vec![] });
+    let (hdr, _) = pkg
+        .create_hf_part(true, &para(&run("Sections header")))
+        .expect("the header part is added");
+    let page = "<w:pPr><w:framePr w:wrap=\"around\" w:vAnchor=\"text\" w:hAnchor=\"margin\" w:xAlign=\"right\" w:y=\"1\"/></w:pPr>\
+                <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r><w:r><w:instrText xml:space=\"preserve\"> PAGE </w:instrText></w:r>\
+                <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>1</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+    let (ftr, _) = pkg
+        .create_hf_part(
+            false,
+            &format!("{}{}", para(page), para(&run("Sections footer"))),
+        )
+        .expect("the footer part is added");
+    let refs = format!(
+        "<w:headerReference w:type=\"default\" r:id=\"{hdr}\"/><w:footerReference w:type=\"default\" r:id=\"{ftr}\"/>"
+    );
+    let in_sect = |text: &str, sect: &str| para(&format!("<w:pPr>{sect}</w:pPr>{}", run(text)));
+    let mut body = String::new();
+    body += &in_sect("Portrait", &sect_pr(&refs, 12240, 15840, 1440, ""));
+    body += &in_sect("Landscape", &sect_pr("", 15840, 12240, 720, ""));
+    for i in [
+        "ColumnOne",
+        "ColumnTwo",
+        "ColumnThree",
+        "ColumnFour",
+        "ColumnFive",
+    ] {
+        body += &para(&run(i));
+    }
+    body += &in_sect(
+        "ColumnSix",
+        &sect_pr(
+            "",
+            12240,
+            15840,
+            1440,
+            "<w:cols w:num=\"2\" w:space=\"720\" w:sep=\"1\"/>",
+        ),
+    );
+    body += &para(&run("After"));
+    body += &sect_pr("", 12240, 15840, 1440, "<w:type w:val=\"continuous\"/>");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{body}</w:body></w:document>"
+    );
+    assert!(pkg.set_part("word/document.xml", xml.clone().into_bytes()));
+    let doc = docxcore::load::parse_document_xml(&xml, &pkg.part_rels("word/document.xml"));
+    (doc, pkg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

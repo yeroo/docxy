@@ -1,7 +1,8 @@
 //! A document view an extension tab can embed (#1873): a
 //! [`docxcore::model::Document`] drawn by the suite's own document renderer
 //! in its flow (web layout) style, wrapped to the view's width, with inline
-//! pictures from the package it came with. It selects (press, drag,
+//! pictures from the package it came with, or in Print Layout's page sheets
+//! ([`DocView::set_layout`], #1888). It selects (press, drag,
 //! Shift+press, Ctrl+A) and copies (Ctrl+C: text and RTF, as a document copy
 //! does), scrolls (wheel, Up/Down, Page Up/Down, Home/End) and zooms
 //! (Ctrl+wheel, Ctrl+=, Ctrl+-, Ctrl+0). Read-only by default: it then never
@@ -84,6 +85,33 @@ pub enum LinkClick {
     Click,
 }
 
+/// How the view lays the document out (#1888).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DocLayout {
+    /// The flow (Web Layout) style: the text wraps to the view's width,
+    /// with no pages. The default.
+    #[default]
+    Web,
+    /// Print Layout: page sheets on a grey canvas, each with its section's
+    /// page size, margins, columns, header and footer, split as a document
+    /// tab's Print Layout splits them.
+    Print,
+}
+
+/// One sheet Print Layout drew in the last frame, for the harness: the
+/// header and footer parts it shows, where it painted, and its framed
+/// header/footer paragraphs' boxes (`true`: the header's).
+#[derive(Default)]
+pub(crate) struct SheetProbe {
+    header: Option<String>,
+    footer: Option<String>,
+    bounds: Option<Bounds<Pixels>>,
+    frames: Vec<(bool, Bounds<Pixels>)>,
+}
+
+type Sheets = Rc<RefCell<Vec<SheetProbe>>>;
+
 type LinkFn = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 type ChangeFn = Rc<dyn Fn(&mut App)>;
 
@@ -155,6 +183,13 @@ pub struct DocView {
     /// The view's scrollbars (#2080), the suite's document bars.
     vbar: crate::doc_scrollbar::Bar,
     hbar: crate::doc_scrollbar::Bar,
+    /// Web or Print Layout (#1888).
+    layout: DocLayout,
+    /// The sheets the last Print Layout frame drew (#1888).
+    sheets: Sheets,
+    /// The canvas colour the last Print Layout frame painted, for the
+    /// harness; `None` in Web Layout.
+    painted_canvas: Option<Hsla>,
 }
 
 impl DocView {
@@ -204,6 +239,9 @@ impl DocView {
             hits_painted: Rc::default(),
             vbar: Default::default(),
             hbar: Default::default(),
+            layout: DocLayout::default(),
+            sheets: Sheets::default(),
+            painted_canvas: None,
         }
     }
 
@@ -469,6 +507,33 @@ impl DocView {
     /// [`DocView::set_page_background`] (`None`: the theme's background).
     pub fn page_background(&self) -> Option<Hsla> {
         self.page_bg
+    }
+
+    /// Lay the document out as Web Layout (the default) or Print Layout
+    /// (#1888): page sheets with each section's own page size, margins,
+    /// columns and header/footer, as a document tab's Print Layout draws
+    /// them. Selection, copy, zoom, Find, the editing mode and the link
+    /// callback work the same in both; the headers and footers are drawn
+    /// only (not selected, not followed). The selection and zoom stay, and
+    /// the caret is scrolled into view. [`DocView::set_page_inset`] pads
+    /// Web Layout only: Print Layout's sheets sit on its own canvas.
+    pub fn set_layout(&mut self, layout: DocLayout, cx: &mut Context<Self>) {
+        if set_if_changed(&mut self.layout, layout) {
+            self.reveal = Some(Reveal::Caret);
+            cx.notify();
+        }
+    }
+
+    /// The layout [`DocView::set_layout`] set.
+    pub fn layout(&self) -> DocLayout {
+        self.layout
+    }
+
+    /// How many pages the document has in Print Layout, in either layout,
+    /// so a host can show "N pages" whichever it draws: the same split of
+    /// the live document (all its markup) the sheets use.
+    pub fn page_count(&self) -> usize {
+        print_sheet::page_count(&self.editor, self.pkg.as_ref())
     }
 
     /// The zoom, 1.0 for 100%.
@@ -942,7 +1007,11 @@ impl DocView {
     pub(crate) fn layout_json(&self) -> ctlcore::json::Json {
         use ctlcore::json::Json;
         match self.column.get() {
-            Some(col) if self.painted_gen.get() == Some(self.doc_gen) => {
+            // The dump is the flow view's: Print Layout paints none (#1888).
+            Some(col)
+                if self.layout == DocLayout::Web
+                    && self.painted_gen.get() == Some(self.doc_gen) =>
+            {
                 painted_layout_json(&self.paras.borrow(), f32::from(col.origin.x))
             }
             _ => Json::obj(vec![
@@ -957,6 +1026,9 @@ impl DocView {
         use ctlcore::json::Json;
         let body = &self.editor.doc.body;
         let tables = body.iter().filter(|b| matches!(b, Block::Table(_))).count();
+        // The flow's text column is Web Layout's alone (#1888).
+        let web = self.layout == DocLayout::Web;
+        let text_w = self.text_w.get().filter(|_| web);
         let links = self
             .link_spans()
             .into_iter()
@@ -1000,15 +1072,13 @@ impl DocView {
             ("hbar", crate::doc_scrollbar::bar_json(&self.hbar)),
             (
                 "text_width",
-                self.text_w
-                    .get()
-                    .map_or(Json::Null, |w| Json::Num(f64::from(w.round()))),
+                text_w.map_or(Json::Null, |w| Json::Num(f64::from(w.round()))),
             ),
             (
                 "table_widths",
                 painted_tables_json(
                     &self.tables,
-                    self.text_w.get(),
+                    text_w,
                     self.viewport
                         .get()
                         .map(|v| (f32::from(v.origin.x), f32::from(v.size.width))),
@@ -1047,7 +1117,7 @@ impl DocView {
             ),
             (
                 "column_left",
-                match (self.column.get(), self.viewport.get()) {
+                match (self.column.get().filter(|_| web), self.viewport.get()) {
                     (Some(col), Some(view)) => {
                         Json::Num(f64::from(f32::from(col.origin.x - view.origin.x).round()))
                     }
@@ -1092,7 +1162,107 @@ impl DocView {
             ("can_redo", Json::Bool(self.can_redo())),
             ("can_copy", Json::Bool(self.can_copy())),
             ("find", self.find_json()),
+            (
+                "layout",
+                Json::Str(
+                    match self.layout {
+                        DocLayout::Print => "print",
+                        _ => "web",
+                    }
+                    .into(),
+                ),
+            ),
+            ("page_count", Json::Num(self.page_count() as f64)),
+            ("pages", self.pages_json()),
+            (
+                "canvas_color",
+                self.painted_canvas
+                    .map_or(Json::Null, |c| Json::Str(ink_hex(c))),
+            ),
         ])
+    }
+
+    /// The sheets the last frame painted (#1888), in view-relative px:
+    /// `page` (1-based), `x`, `y`, `w`, `h`, the `header` and `footer`
+    /// parts shown (`null`: none) and `frames`, each framed header/footer
+    /// paragraph's box relative to its sheet (`header`: whether the
+    /// header's; `right`: its right edge). Empty in Web Layout.
+    fn pages_json(&self) -> ctlcore::json::Json {
+        use ctlcore::json::Json;
+        let Some(view) = self.viewport.get() else {
+            return Json::Arr(Vec::new());
+        };
+        let n = |v: Pixels| Json::Num(f64::from(f32::from(v).round()));
+        let name = |s: &Option<String>| s.clone().map_or(Json::Null, Json::Str);
+        let sheets = self.sheets.borrow();
+        let pages = sheets
+            .iter()
+            .enumerate()
+            .filter_map(|(pi, s)| {
+                let b = s.bounds?;
+                let frames = s
+                    .frames
+                    .iter()
+                    .map(|(is_h, f)| {
+                        Json::obj(vec![
+                            ("header", Json::Bool(*is_h)),
+                            ("x", n(f.origin.x - b.origin.x)),
+                            ("y", n(f.origin.y - b.origin.y)),
+                            ("w", n(f.size.width)),
+                            ("h", n(f.size.height)),
+                            ("right", n(f.right() - b.origin.x)),
+                        ])
+                    })
+                    .collect();
+                Some(Json::obj(vec![
+                    ("page", Json::Num((pi + 1) as f64)),
+                    ("x", n(b.origin.x - view.origin.x)),
+                    ("y", n(b.origin.y - view.origin.y)),
+                    ("w", n(b.size.width)),
+                    ("h", n(b.size.height)),
+                    ("header", name(&s.header)),
+                    ("footer", name(&s.footer)),
+                    ("frames", Json::Arr(frames)),
+                ]))
+            })
+            .collect();
+        Json::Arr(pages)
+    }
+
+    /// The first painted word whose text, trimmed, is `text` (#1888): its
+    /// box in view-relative px, and in Print Layout the sheet it is on
+    /// (`page`, 1-based) and its box relative to that sheet (`page_x`,
+    /// `page_y`); those are `null` in Web Layout.
+    pub(crate) fn word_json(&self, text: &str) -> Result<ctlcore::json::Json, String> {
+        use ctlcore::json::Json;
+        let (b, _) = self
+            .word_bounds(text)
+            .ok_or_else(|| format!("no painted word '{text}'"))?;
+        let view = self.viewport.get().ok_or("the view is not drawn yet")?;
+        let n = |v: Pixels| Json::Num(f64::from(f32::from(v).round()));
+        let sheets = self.sheets.borrow();
+        let sheet = sheets.iter().enumerate().find_map(|(pi, s)| {
+            s.bounds
+                .filter(|sb| sb.contains(&b.center()))
+                .map(|sb| (pi, sb))
+        });
+        let (page, page_x, page_y) = match sheet {
+            Some((pi, sb)) => (
+                Json::Num((pi + 1) as f64),
+                n(b.origin.x - sb.origin.x),
+                n(b.origin.y - sb.origin.y),
+            ),
+            None => (Json::Null, Json::Null, Json::Null),
+        };
+        Ok(Json::obj(vec![
+            ("x", n(b.origin.x - view.origin.x)),
+            ("y", n(b.origin.y - view.origin.y)),
+            ("w", n(b.size.width)),
+            ("h", n(b.size.height)),
+            ("page", page),
+            ("page_x", page_x),
+            ("page_y", page_y),
+        ]))
     }
 
     /// The part of the painted `view` a match or the caret is in view in
@@ -1294,23 +1464,90 @@ impl Render for DocView {
             paras: harness().then_some(&self.paras),
             inks: None,
         };
-        let blocks: Vec<AnyElement> = body
-            .iter()
-            .enumerate()
-            .map(|(i, b)| {
-                let ctx = RenderCtx {
-                    gap_below: flow_gap_below(body, i),
-                    ..ctx
-                };
-                block_el(b, vec![i], markers[i].as_deref(), ctx)
-            })
-            .collect();
+        let scroll_area = match self.layout {
+            DocLayout::Print => {
+                // The sheets on the canvas, centred in a column at least as
+                // wide as the view (a sheet wider than the view starts at
+                // the left, #2080), as a document tab's Print Layout.
+                let canvas = hsla_u(print_sheet::canvas_color(
+                    self.content_dark && theme_dark,
+                    theme_dark,
+                ));
+                self.painted_canvas = Some(canvas);
+                let sheets = print_sheets(
+                    &self.editor,
+                    self.pkg.as_ref(),
+                    &markers,
+                    ctx,
+                    bg,
+                    pics.as_ref(),
+                    &self.sheets,
+                );
+                v_flex()
+                    .id("ext-doc-scroll")
+                    .track_scroll(&self.scroll)
+                    .size_full()
+                    .overflow_scroll()
+                    .bg(canvas)
+                    .text_color(pal.fg)
+                    .items_start()
+                    .py(px(print_sheet::CANVAS_PAD))
+                    .child(
+                        v_flex()
+                            .flex_none()
+                            .min_w_full()
+                            .items_center()
+                            .gap(px(print_sheet::SHEET_GAP))
+                            .children(sheets),
+                    )
+            }
+            DocLayout::Web => {
+                self.painted_canvas = None;
+                self.sheets.borrow_mut().clear();
+                let blocks: Vec<AnyElement> = body
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        let ctx = RenderCtx {
+                            gap_below: flow_gap_below(body, i),
+                            ..ctx
+                        };
+                        block_el(b, vec![i], markers[i].as_deref(), ctx)
+                    })
+                    .collect();
+                let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
+                let (column, painted_gen, doc_gen) =
+                    (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
+                v_flex()
+                    .id("ext-doc-scroll")
+                    .track_scroll(&self.scroll)
+                    .size_full()
+                    // Both axes: a table wider than the view scrolls
+                    // sideways (#1895).
+                    .overflow_scroll()
+                    .text_color(pal.fg)
+                    // The host's padding, or the default (#2003).
+                    .pt(inset.top)
+                    .pr(inset.right)
+                    .pb(inset.bottom)
+                    .pl(inset.left)
+                    .children(blocks)
+                    // The text width, inside the padding: a percent width
+                    // resolves against the scroll area, not its extent.
+                    .child(div().relative().w_full().h(px(0.)).child(fit_width_probe(
+                        used_w,
+                        move |b, _| {
+                            text_w.set(Some(f32::from(b.size.width)));
+                            // Prepainted after every block (#1986).
+                            column.set(Some(b));
+                            painted_gen.set(Some(doc_gen));
+                        },
+                    )))
+            }
+        };
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
         let (hbar, vbar) = (self.hbar.clone(), self.vbar.clone());
-        let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
-        let (column, painted_gen, doc_gen) =
-            (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
         div()
             .id("ext-doc-view")
             .font_family(ui_font)
@@ -1355,33 +1592,7 @@ impl Render for DocView {
                     this.release(ev.modifiers, window, cx)
                 }),
             )
-            .child(
-                v_flex()
-                    .id("ext-doc-scroll")
-                    .track_scroll(&self.scroll)
-                    .size_full()
-                    // Both axes: a table wider than the view scrolls
-                    // sideways (#1895).
-                    .overflow_scroll()
-                    .text_color(pal.fg)
-                    // The host's padding, or the default (#2003).
-                    .pt(inset.top)
-                    .pr(inset.right)
-                    .pb(inset.bottom)
-                    .pl(inset.left)
-                    .children(blocks)
-                    // The text width, inside the padding: a percent width
-                    // resolves against the scroll area, not its extent.
-                    .child(div().relative().w_full().h(px(0.)).child(fit_width_probe(
-                        used_w,
-                        move |b, _| {
-                            text_w.set(Some(f32::from(b.size.width)));
-                            // Prepainted after every block (#1986).
-                            column.set(Some(b));
-                            painted_gen.set(Some(doc_gen));
-                        },
-                    ))),
-            )
+            .child(scroll_area)
             .child(
                 canvas(
                     move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| viewport.set(Some(b)),
@@ -1551,6 +1762,218 @@ impl DocView {
             .child(button("ext-doc-find-close", "\u{00d7}", 3, FindPart::Close))
             .into_any_element()
     }
+}
+
+/// Print Layout's sheets of `editor`'s document (#1888), read-only around
+/// the body: each page a sheet of its section's size (`page_bg`, a 1 px
+/// border), its header in the top margin at the header distance, its
+/// footer in the bottom margin, the body's bands between with their own
+/// section's left/right margins and columns (`print_sheet::band_el`, as a
+/// document tab draws them) and the header and footer's framed paragraphs
+/// at their frame. The body draws through `ctx` (the view's click target,
+/// so selection, links and Find work on the pages); the headers and footers
+/// are drawn only. Each sheet records into `probe` what it shows and where
+/// it painted.
+fn print_sheets(
+    editor: &Editor,
+    pkg: Option<&Package>,
+    markers: &[Option<String>],
+    ctx: RenderCtx,
+    page_bg: Hsla,
+    pics: Option<&pictures::Pictures>,
+    probe: &Sheets,
+) -> Vec<AnyElement> {
+    let plan = print_sheet::page_plan(editor, pkg);
+    let sections = editor.sections();
+    let body = &editor.doc.body;
+    let (zoom, pal, meas) = (ctx.zoom, ctx.pal, ctx.meas);
+    let sheet = ctx.tbl.sheet.as_deref();
+    let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0);
+    // A page's column fits its tables and lays its paragraphs out as a
+    // document tab's Print Layout does: no flow spacing, no fitted width.
+    let band_ctx = RenderCtx {
+        fit_width: None,
+        flow: false,
+        gap_below: false,
+        paras: None,
+        ..ctx
+    };
+    // The header/footer distance of each page's section.
+    let dist = |pi: usize, is_h: bool| -> i32 {
+        plan.slots
+            .get(pi)
+            .and_then(|s| sections.get(s.section))
+            .map_or(720, |sect| hf::distance(sect, is_h))
+    };
+    *probe.borrow_mut() = (0..plan.flow.pages.len())
+        .map(|pi| SheetProbe {
+            header: plan.part(pi, true).map(str::to_string),
+            footer: plan.part(pi, false).map(str::to_string),
+            ..SheetProbe::default()
+        })
+        .collect();
+    plan.flow
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(pi, page)| {
+            // The page's own section owns the sheet: its size, top/bottom
+            // margins and header/footer text width; every band draws with
+            // its own section's left/right margins and columns.
+            let sb = &plan.flow.sections[page.bands[0].section];
+            let hf_w = zoom * (sb.w - sb.left - sb.right).max(0) as f32 / 15.0;
+            let vals = plan.page_vals.get(pi);
+            let region = |is_h: bool| {
+                crate::hf_els(
+                    plan.blocks(pi, is_h),
+                    pal,
+                    meas,
+                    hf_w,
+                    sheet,
+                    pictures::scope(pics, plan.part(pi, is_h)),
+                    vals,
+                )
+            };
+            let bands: Vec<AnyElement> = page
+                .bands
+                .iter()
+                .map(|band| {
+                    let bsect = &plan.flow.sections[band.section];
+                    let inner = print_sheet::band_el(
+                        band,
+                        bsect,
+                        body,
+                        markers,
+                        band_ctx,
+                        zoom,
+                        pal.dim,
+                        &|_| None,
+                    );
+                    div()
+                        .w_full()
+                        .pl(tw(bsect.left))
+                        .pr(tw(bsect.right))
+                        .child(div().relative().w_full().child(inner))
+                        .into_any_element()
+                })
+                .collect();
+            let header = div()
+                .relative()
+                .min_h(tw(sb.top))
+                .pt(tw(dist(pi, true)))
+                .pl(tw(sb.left))
+                .pr(tw(sb.right))
+                .children(region(true));
+            let footer = v_flex()
+                .relative()
+                .min_h(tw(sb.bottom))
+                .justify_end()
+                .pb(tw(dist(pi, false)))
+                .pl(tw(sb.left))
+                .pr(tw(sb.right))
+                .children(region(false));
+            let content = div().relative().w_full().flex_1().children(bands);
+            let sheet_el = v_flex()
+                .w(tw(sb.w))
+                .min_h(tw(sb.h))
+                .bg(page_bg)
+                .text_color(pal.fg)
+                .border_1()
+                .border_color(hsla_u(print_sheet::SHEET_BORDER))
+                .child(header)
+                .child(v_flex().flex_1().child(content))
+                .child(footer);
+            // The header and footer's framed paragraphs (a page number in
+            // the margin, #767) at their frame on the sheet.
+            let mut frames: Vec<AnyElement> = Vec::new();
+            for is_h in [true, false] {
+                let blocks = plan.blocks(pi, is_h);
+                let (flow, groups) = docxcore::frame::split_framed(blocks);
+                if groups.is_empty() {
+                    continue;
+                }
+                let geom = print_sheet::frame_geom(
+                    sb,
+                    is_h,
+                    dist(pi, is_h),
+                    &flow,
+                    hf_w,
+                    zoom,
+                    page.number % 2 == 0,
+                );
+                for g in &groups {
+                    let r = docxcore::frame::frame_rect(
+                        g.frame,
+                        &geom,
+                        frame_content_w(g, meas, zoom, sheet, vals),
+                        g.content_h(),
+                    );
+                    let width = zoom * r.w.max(0) as f32 / 15.0;
+                    let paras = g.paras.iter().map(|&(_, p)| {
+                        hf_para_el(
+                            p,
+                            pal,
+                            meas,
+                            width,
+                            zoom,
+                            sheet,
+                            pictures::scope(pics, plan.part(pi, is_h)),
+                            vals,
+                        )
+                    });
+                    let exact = g.frame.h_rule.as_deref() == Some("exact");
+                    let probe = probe.clone();
+                    frames.push(
+                        v_flex()
+                            .absolute()
+                            .left(px(zoom * r.x as f32 / 15.0))
+                            .top(px(zoom * r.y as f32 / 15.0))
+                            .w(px(width))
+                            .when(exact, |d| d.h(tw(r.h)))
+                            .when(!exact, |d| d.min_h(tw(r.h)))
+                            .text_color(pal.fg)
+                            .children(paras)
+                            .child(
+                                canvas(
+                                    move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                                        if let Some(s) = probe.borrow_mut().get_mut(pi) {
+                                            s.frames.push((is_h, b));
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full(),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+            let probe = probe.clone();
+            div()
+                .relative()
+                .w(tw(sb.w))
+                .child(sheet_el)
+                .children(frames)
+                .child(
+                    canvas(
+                        move |b: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            if let Some(s) = probe.borrow_mut().get_mut(pi) {
+                                s.bounds = Some(b);
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full(),
+                )
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// What a scroll-into-view after a render goes to: the caret (a key or a
@@ -2307,6 +2730,15 @@ mod tests {
         assert!(!set_if_changed(&mut bg, Some(hsla_u(0x262626))));
         assert!(set_if_changed(&mut bg, None));
         assert!(!set_if_changed(&mut bg, None));
+    }
+
+    #[test]
+    fn the_layout_is_web_until_set_and_notifies_only_on_a_change_1888() {
+        let mut layout = DocLayout::default();
+        assert_eq!(layout, DocLayout::Web);
+        assert!(set_if_changed(&mut layout, DocLayout::Print));
+        assert!(!set_if_changed(&mut layout, DocLayout::Print));
+        assert!(set_if_changed(&mut layout, DocLayout::Web));
     }
 
     #[test]
