@@ -2899,8 +2899,9 @@ links in one cheap read.
     supported (a follow-up). `open_draft` opens the composer only for a draft whose body
     was written here (`Store::draft_body_is_local`: a body row with `fetched_as IS
     NULL`, which only `update_draft_fields`, `create_local_draft` and a composed
-    reply/forward's `put_body` write; a draft's text body fetched before #1901 is
-    marked fetched by the migration, below). A draft with no body, or with one `FetchBody`
+    reply/forward's `put_body` write; a text body fetched before #1901, in any folder,
+    is marked fetched by `migrate_reply_links`, the Migration bullet above). A draft
+    with no body, or with one `FetchBody`
     stored (Graph's rendering, text under lookxy's `BodyFormat::Text`), opens in the
     reader (`open_message`), which fetches a missing body. So Graph's rendering is
     never edited and saved back over the server's draft. `Store::draft`, which the
