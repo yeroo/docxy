@@ -1055,10 +1055,47 @@ impl GraphClient {
 
     /// Every message of one folder as `(id, internetMessageId)` (#2107).
     fn folder_message_ids(&self, folder: &str) -> Result<Vec<(String, String)>, GraphError> {
-        let mut target = format!(
+        let target = format!(
             "/me/mailFolders/{}/messages?$select=id,internetMessageId&$top={UNREAD_IDS_TOP}",
             encode_path_segment(folder)
         );
+        self.message_id_pages(target, folder)
+    }
+
+    /// Every message Graph holds in `folder` received at or before `before`
+    /// (an ISO-8601 UTC instant), as `(id, internetMessageId)`, 1000 a page,
+    /// following `@odata.nextLink` (#2110: what `EmptyFolder` deletes).
+    /// Deduplicated by id in first-seen order. Any page's failure is an
+    /// `Err`, never a partial list; an item without an id is a `Parse`
+    /// error, as it could not be checked.
+    pub fn folder_messages_before(
+        &self,
+        folder: &str,
+        before: &str,
+    ) -> Result<Vec<(String, String)>, GraphError> {
+        let target = format!(
+            "/me/mailFolders/{}/messages\
+             ?$filter=receivedDateTime%20le%20{before}\
+             &$select=id,internetMessageId&$top={UNREAD_IDS_TOP}",
+            encode_path_segment(folder)
+        );
+        let mut seen = std::collections::HashSet::new();
+        Ok(self
+            .message_id_pages(target, folder)?
+            .into_iter()
+            .filter(|(id, _)| seen.insert(id.clone()))
+            .collect())
+    }
+
+    /// Pages a message listing from `target` (its `$select` has `id` and
+    /// `internetMessageId`) to its end, following `@odata.nextLink`: every
+    /// item as `(id, internetMessageId)`, in order, an item without an id a
+    /// `Parse` error (#2107, #2110).
+    fn message_id_pages(
+        &self,
+        mut target: String,
+        folder: &str,
+    ) -> Result<Vec<(String, String)>, GraphError> {
         let mut out = Vec::new();
         loop {
             let resp = self.send(Method::Get, &target, None, &[])?;
@@ -1366,6 +1403,17 @@ impl GraphClient {
                 "isRead".to_string(),
                 Value::Bool(true),
             )])),
+        }
+    }
+
+    /// DELETE `/me/messages/{id}` as a [`GraphClient::batch`] sub-request
+    /// (#2110): the soft delete `delete_message` sends. Graph answers 204.
+    pub fn delete_message_request(id: &str) -> BatchRequest {
+        BatchRequest {
+            method: "DELETE",
+            url: format!("/me/messages/{}", encode_path_segment(id)),
+            headers: Vec::new(),
+            body: None,
         }
     }
 
@@ -4022,6 +4070,73 @@ mod tests {
              &$select=id&$top=1000"
         );
         assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+    }
+
+    /// #2110: the empty's listing filters on the cutoff, selects both ids,
+    /// follows the next link and dedups by id; an item without an id could
+    /// not be checked, so it fails the listing.
+    #[test]
+    fn folder_messages_before_filters_pages_and_dedups() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"B","internetMessageId":"<b@x>"},{"id":"C"}]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"A","internetMessageId":"<a@x>"},
+                                   {"id":"B","internetMessageId":"<b@x>"}],
+                    "@odata.nextLink":"/me/mailFolders/F%201/messages?$skiptoken=P2"}"#
+                    .into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/BAD/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"A"},{"internetMessageId":"<n@x>"}]}"#.into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let items = c
+            .folder_messages_before("F 1", "2026-11-10T18:00:00Z")
+            .unwrap();
+        let own = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            items,
+            own(&[("A", "<a@x>"), ("B", "<b@x>"), ("C", "")]),
+            "B once"
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0].path,
+            "/me/mailFolders/F%201/messages\
+             ?$filter=receivedDateTime%20le%202026-11-10T18:00:00Z\
+             &$select=id,internetMessageId&$top=1000"
+        );
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+        let r = c.folder_messages_before("BAD", "2026-11-10T18:00:00Z");
+        assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
+    }
+
+    /// #2110: a DELETE sub-request, with no body and no headers.
+    #[test]
+    fn delete_message_request_is_a_delete() {
+        let r = GraphClient::delete_message_request("A/B");
+        assert_eq!(r.method, "DELETE");
+        assert_eq!(r.url, "/me/messages/A%2FB");
+        assert!(r.headers.is_empty() && r.body.is_none());
     }
 
     #[test]
