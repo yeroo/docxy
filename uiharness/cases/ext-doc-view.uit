@@ -10,6 +10,10 @@
 # then Line 1..Line 80). The extension records every link the
 # view hands it (`ext-doc-read` link_calls). Keys go through `real-key`: the
 # `key` verb presses the suite's own handler and never reaches the view.
+# The view's own Find box (#1887) opens on Ctrl+F: `ext-doc-read`'s `find`
+# (open, query, field_focused, count, current, current_path,
+# current_in_view, hits_painted), its regions `ext-doc-find:<field|prev|
+# next|close>` and the input `ext-doc-find` (`pointer-click`, `field-read`).
 # Each test opens its own Mail tab and closes it at the end.
 ext fixture
 
@@ -290,6 +294,214 @@ test issue 2003 the host sets the view's page inset and its dark page's colour, 
   assert reply.page_color is not 262626
   call ext-doc-set {"content_dark":false}
   call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1887 Ctrl+F finds Line 7 in the view, Enter steps to the second match and scrolls it into view
+  # Line 7 is in view without scrolling at this size; Line 70 is not.
+  call window-size {"w":1000,"h":700}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-doc-view"}
+  call real-key {"key":"ctrl+f"}
+  call ext-doc-read {}
+  assert reply.find.open is true
+  assert reply.find.field_focused is true
+  assert reply.find.count is 0
+  call real-type {"text":"Line 7"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.query is Line 7
+  # Line 7 and Line 70..79, the first selected; the others are below the
+  # view, so none paints yet.
+  assert reply.find.count is 11
+  assert reply.find.current is 1
+  assert reply.find.current_path.0 is 14
+  assert reply.find.current_in_view is true
+  assert reply.find.hits_painted is 0
+  assert reply.selection is Line 7
+  assert reply.scroll_y is 0
+  # The suite's own Find bar took none of it.
+  assert find_open is false
+  call real-key {"key":"enter"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.current is 2
+  assert reply.find.current_path.0 is 77
+  assert reply.find.current_in_view is true
+  assert reply.scroll_y is not 0
+  assert reply.selection is Line 7
+  # The match is revealed at the view's bottom edge. Page Down from the
+  # field scrolls the view (the read-only map's key): Line 71.. come into
+  # view and paint as hits, the field keeping the keys.
+  call real-key {"key":"pagedown"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.hits_painted is not 0
+  assert reply.find.field_focused is true
+  call real-key {"key":"shift+enter"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.current is 1
+  assert reply.find.current_path.0 is 14
+  assert reply.find.current_in_view is true
+  call real-key {"key":"f3"}
+  call ext-doc-read {}
+  assert reply.find.current is 2
+  call real-key {"key":"shift+f3"}
+  call real-key {"key":"shift+f3"}
+  shot window
+  call ext-doc-read {}
+  # Back from the first wraps to the last, Line 79, and forward from it
+  # to the first.
+  assert reply.find.current is 11
+  assert reply.find.current_path.0 is 86
+  assert reply.find.current_in_view is true
+  call real-key {"key":"f3"}
+  call ext-doc-read {}
+  assert reply.find.current is 1
+  # Escape closes the box: the match stays selected and nothing is painted.
+  call real-key {"key":"escape"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.open is false
+  assert reply.find.hits_painted is 0
+  assert reply.selection is Line 7
+  assert reply.focused is true
+  # Ctrl+F reopens it on the selected match, the query selected.
+  call real-key {"key":"ctrl+f"}
+  call ext-doc-read {}
+  assert reply.find.open is true
+  assert reply.find.current is 1
+  call field-read {"input":"ext-doc-find"}
+  assert reply.value is Line 7
+  assert reply.focused is true
+  assert reply.selection.1 is 6
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1887 in the editing mode the Find box takes the typing and gives the keys back on a press in the document
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Beta"}
+  # Tab, the document's chords and a field edit never reach the document.
+  call real-key {"key":"tab"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"ctrl+b"}
+  call real-key {"key":"ctrl+z"}
+  call real-key {"key":"backspace"}
+  call real-type {"text":"a"}
+  call ext-doc-read {}
+  assert reply.change_calls is 0
+  assert reply.can_undo is false
+  assert reply.find.query is Beta
+  assert reply.find.count is 1
+  assert reply.find.current is 1
+  assert reply.find.field_focused is true
+  assert reply.selection is Beta
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.paragraphs.1.runs.1.text is Beta
+  assert reply.paragraphs.1.runs.1.bold is true
+  call field-read {"input":"ext-doc-find"}
+  assert reply.value is Beta
+  assert reply.focused is true
+  assert reply.caret is 4
+  # A press in the document gives the keys back; the box stays.
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.find.open is true
+  assert reply.find.field_focused is false
+  call real-type {"text":"!"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  call ext-doc-read {}
+  assert reply.change_calls is not 0
+  assert reply.find.query is Beta
+  # Ctrl+F gives the box the keys again with its text selected.
+  call real-key {"key":"ctrl+f"}
+  call field-read {"input":"ext-doc-find"}
+  assert reply.focused is true
+  assert reply.selection.1 is 4
+  # A click on the field puts the caret at its end; it types there.
+  call pointer-click {"input":"ext-doc-find"}
+  call real-key {"key":"backspace","times":4}
+  call real-type {"text":"Gamma"}
+  call field-read {"input":"ext-doc-find"}
+  assert reply.value is Gamma
+  assert reply.caret is 5
+  call ext-doc-read {}
+  assert reply.selection is Gamma
+  # Escape closes the box and keeps the match; the next Escape is the
+  # editing map's, which collapses the selection.
+  call real-key {"key":"escape"}
+  call ext-doc-read {}
+  assert reply.find.open is false
+  assert reply.selection is Gamma
+  call real-key {"key":"escape"}
+  call ext-doc-read {}
+  assert reply.selection is empty
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1887 the Find box's buttons step and close it, a match past the right edge scrolls into view, Ctrl+W still closes the tab
+  call window-size {"w":600,"h":700}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-doc-view"}
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Line 7"}
+  shot window
+  call pointer-click {"region":"ext-doc-find:next"}
+  call ext-doc-read {}
+  assert reply.find.current is 2
+  assert reply.focused is true
+  call pointer-click {"region":"ext-doc-find:prev"}
+  call pointer-click {"region":"ext-doc-find:prev"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.current is 11
+  assert reply.find.current_in_view is true
+  # Zoomed to 150% from the field (the view's keys), Zeta in the fixed
+  # 12000-twip table's right cell is past the view's right edge (#1895):
+  # the step scrolls sideways to it.
+  call real-key {"key":"ctrl+=","times":5}
+  shot window
+  call ext-doc-read {}
+  assert reply.zoom is 1.5
+  assert reply.scroll_x is 0
+  assert reply.find.field_focused is true
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Zeta"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.count is 1
+  assert reply.find.current_path.0 is 7
+  assert reply.find.current_in_view is true
+  assert reply.scroll_x is not 0
+  assert reply.selection is Zeta
+  call pointer-click {"region":"ext-doc-find:close"}
+  call ext-doc-read {}
+  assert reply.find.open is false
+  assert reply.selection is Zeta
+  # With the box open, Ctrl+W still closes the tab.
+  call real-key {"key":"ctrl+f"}
+  call ext-doc-read {}
+  assert reply.find.open is true
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

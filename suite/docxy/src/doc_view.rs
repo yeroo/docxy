@@ -15,15 +15,20 @@
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]),
 //! whose dark page the host may paint in its own colour
 //! ([`DocView::set_page_background`], #2003). The padding around the
-//! document is the host's to set too ([`DocView::set_page_inset`]).
+//! document is the host's to set too ([`DocView::set_page_inset`]). Ctrl+F
+//! (⌘F on macOS) opens the view's own Find box (#1887, [`find`]): every
+//! match highlighted, Enter / Shift+Enter and F3 / Shift+F3 step through them
+//! and scroll each into view, Escape closes it.
 //!
 //! The renderer is the suite's (`block_el`): only its click target differs
 //! ([`crate::DocTarget::Embed`]), so a document reads here exactly as in a
 //! document tab's Web Layout.
 
 mod edit;
+mod find;
 
 pub use edit::{CaretFormat, DocFormat};
+pub(crate) use find::FindState;
 
 use super::*;
 use docxcore::editor::{Caret, Clip, Editor};
@@ -135,9 +140,18 @@ pub struct DocView {
     /// The editing mode (#1947): off, the view is read-only.
     editable: bool,
     on_change: Option<ChangeFn>,
-    /// A key or host command moved the caret or edited: the next frame
-    /// scrolls the caret into view, once it is painted.
-    reveal: bool,
+    /// A key or host command moved the caret or edited, or a Find step
+    /// went to a match: the next frame scrolls it into view, once it is
+    /// painted.
+    reveal: Option<Reveal>,
+    /// The Find box (#1887).
+    find: find::FindState,
+    /// The box's parts as last painted, for the harness: field, previous,
+    /// next, close.
+    find_rects: Rc<Cell<[Option<Bounds<Pixels>>; 4]>>,
+    /// How many hit quads the last frame painted in view (the current match
+    /// excluded: it is the selection).
+    hits_painted: Rc<Cell<usize>>,
     /// The view's scrollbars (#2080), the suite's document bars.
     vbar: crate::doc_scrollbar::Bar,
     hbar: crate::doc_scrollbar::Bar,
@@ -184,7 +198,10 @@ impl DocView {
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
             editable: false,
             on_change: None,
-            reveal: false,
+            reveal: None,
+            find: find::FindState::default(),
+            find_rects: Rc::default(),
+            hits_painted: Rc::default(),
             vbar: Default::default(),
             hbar: Default::default(),
         }
@@ -203,7 +220,10 @@ impl DocView {
         self.run_styles = RefCell::default();
         self.selecting = false;
         self.press_link = None;
-        self.reveal = false;
+        self.reveal = None;
+        // The box stays open with its query; its current match was the old
+        // document's.
+        self.find.cur = None;
         self.scroll.set_offset(Point::default());
         if self.editable {
             self.seed_styles();
@@ -384,7 +404,7 @@ impl DocView {
     /// After a key or host command: the caret goes into view, and a change
     /// tells the host.
     fn after_edit(&mut self, changed: bool, cx: &mut Context<Self>) {
-        self.reveal = true;
+        self.reveal = Some(Reveal::Caret);
         if changed {
             if let Some(f) = self.on_change.clone() {
                 cx.defer(move |cx| f(cx));
@@ -489,6 +509,7 @@ impl DocView {
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
+        self.find.field_focused = false;
         // Only a press on a painted piece is on a link: beside a row the
         // offset is the row's nearest stop, which may be a link's first or
         // last character the person never pressed.
@@ -540,6 +561,7 @@ impl DocView {
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
+        self.find.field_focused = false;
         place_click_caret(&mut self.editor, Caret::at(path, off), extend, false);
         self.press_link = None;
         cx.notify();
@@ -567,14 +589,47 @@ impl DocView {
 
     // ---- keys, wheel ------------------------------------------------------
 
-    fn key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn key(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Find first (#1887): while its field has the keys, no key reaches
+        // the editing map.
+        match find::find_key(
+            &ev.keystroke,
+            text_input::MACOS,
+            self.find.open,
+            self.find.field_focused,
+        ) {
+            find::FindKey::Pass => {}
+            find::FindKey::Bubble => return,
+            find::FindKey::View => {
+                if self.view_key(ev, cx) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+                return;
+            }
+            k => {
+                self.find_act(k, cx);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if self.editable && self.edit_key(ev, cx) {
             cx.stop_propagation();
             return;
         }
+        if self.view_key(ev, cx) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    /// The read-only view's keys: copy, select all, scroll and zoom.
+    /// Whether it took the key.
+    fn view_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let m = ev.keystroke.modifiers;
         let key = ev.keystroke.key.as_str();
-        let handled = if m.secondary() && !m.alt && !m.function {
+        if m.secondary() && !m.alt && !m.function {
             match key {
                 "c" if !m.shift => {
                     self.write_copy(cx);
@@ -608,12 +663,7 @@ impl DocView {
             }
         } else {
             false
-        };
-        if handled {
-            cx.stop_propagation();
-            cx.notify();
         }
-        let _ = window;
     }
 
     /// A key in the editing mode: whether the editing map took it. A key it
@@ -655,6 +705,11 @@ impl DocView {
     /// Tab and Shift+Tab (action-bound, they never arrive as keys) in the
     /// editing mode: [`edit::tab`]. Read-only, they pass on as before.
     fn tab_action(&mut self, back: bool, cx: &mut Context<Self>) {
+        // The Find box's field has the keys (#1887): a Tab is no tab typed
+        // into the document, in either mode.
+        if self.find.open && self.find.field_focused {
+            return;
+        }
         if !self.editable {
             cx.propagate();
             return;
@@ -662,6 +717,146 @@ impl DocView {
         self.seed_styles();
         let out = edit::tab(&mut self.editor, self.pkg.as_mut(), back);
         self.after_edit(out.changed(), cx);
+    }
+
+    // ---- Find (#1887) -----------------------------------------------------
+
+    /// A key [`find::find_key`] gave Find.
+    fn find_act(&mut self, k: find::FindKey, cx: &mut Context<Self>) {
+        use crate::field_edit::Op;
+        use find::FindKey as K;
+        match k {
+            K::Open => self.open_find(),
+            K::Close => self.close_find(),
+            K::Step { back } => self.find_step(back, false),
+            K::Field(op) => self.find_edit(op.op()),
+            K::Type(text) => self.find_edit(Op::Insert(&text)),
+            K::Copy | K::Cut => {
+                if let Some(text) = self.find.selected_text().map(str::to_owned) {
+                    self.clipboard.write(harness(), text, |text| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text))
+                    });
+                    if k == K::Cut {
+                        self.find_edit(Op::Delete);
+                    }
+                }
+            }
+            K::Paste => {
+                let read = self.clipboard.read(harness(), || {
+                    cx.read_from_clipboard().map(|item| item.text())
+                });
+                if let ClipRead::Text(text) = read {
+                    let line = crate::field_edit::one_line(&text);
+                    if !line.is_empty() {
+                        self.find_edit(Op::Insert(&line));
+                    }
+                }
+            }
+            K::Pass | K::View | K::Swallow | K::Bubble => {}
+        }
+    }
+
+    /// One edit of the box's field: a changed query finds again from the
+    /// top, as the document tab's find bar does while typing.
+    fn find_edit(&mut self, op: crate::field_edit::Op) {
+        if self.find.edit(op) {
+            self.find_step(false, true);
+        }
+    }
+
+    /// Ctrl+F: open the box, seeded with a one-line selection (as the
+    /// document tab's Find), on the match the editor is on if it is on one
+    /// (a reopen after Escape keeps it), else the next from the caret. With
+    /// the box open its field takes the keys again. Either way the field's
+    /// text is selected, so typing replaces it.
+    fn open_find(&mut self) {
+        if !self.find.open {
+            self.find.open = true;
+            self.find.cur = None;
+            let sel = self.editor.selection_text();
+            if !sel.is_empty() && !sel.contains('\n') {
+                self.find.query = sel;
+            }
+            let matches = self.editor.find_visible(&self.find.query, false);
+            match matches.iter().position(|m| self.editor.is_at_found(m)) {
+                Some(i) => self.find.cur = Some((i, matches[i].clone())),
+                None => self.find_step(false, false),
+            }
+        }
+        self.find.focus_select_all();
+    }
+
+    /// Escape or the box's ×: the box closes; the match stays selected and
+    /// the query is kept for the next Ctrl+F.
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.field_focused = false;
+    }
+
+    /// Go to the next (`back`: previous) match, wrapping, and scroll it into
+    /// view; `from_start` searches from the top (typing). The document tab's
+    /// step ([`find_step_in`]). An empty query or one with no match changes
+    /// nothing in the document.
+    fn find_step(&mut self, back: bool, from_start: bool) {
+        let q = self.find.query.clone();
+        if q.is_empty() || self.editor.find_visible(&q, false).is_empty() {
+            self.find.cur = None;
+            return;
+        }
+        let cur = self.find.cur.take();
+        self.find.cur = find_step_in(&mut self.editor, &q, false, cur, back, from_start);
+        if let Some((_, m)) = &self.find.cur {
+            self.reveal = Some(Reveal::Match(Caret::at(m.path.clone(), m.start)));
+        }
+    }
+
+    /// The matches the open box shows (none while closed or empty).
+    fn find_matches(&self) -> Vec<docxcore::editor::FoundMatch> {
+        if !self.find.open || self.find.query.is_empty() {
+            return Vec::new();
+        }
+        self.editor.find_visible(&self.find.query, false)
+    }
+
+    /// A press on the box: it never reaches the document. On the field it
+    /// takes the keys with the caret at the end; on ↑ / ↓ it steps, on ×
+    /// it closes.
+    fn find_press(&mut self, part: FindPart, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        self.focus.focus(window, cx);
+        match part {
+            FindPart::Field => self.find.focus_at_end(),
+            FindPart::Prev => self.find_step(true, false),
+            FindPart::Next => self.find_step(false, false),
+            FindPart::Close => self.close_find(),
+            FindPart::Box => {}
+        }
+        cx.notify();
+    }
+
+    /// The box's state, for the harness's `field-read`.
+    pub(crate) fn find_state(&self) -> &find::FindState {
+        &self.find
+    }
+
+    /// A part of the open box as last painted: `field`, `prev`, `next` or
+    /// `close` (the harness's `ext-doc-find:<part>`).
+    pub(crate) fn find_region(&self, part: &str) -> Result<Bounds<Pixels>, String> {
+        let i = match part {
+            "field" => 0,
+            "prev" => 1,
+            "next" => 2,
+            "close" => 3,
+            _ => {
+                return Err(format!(
+                    "unknown Find box part '{part}': field, prev, next or close"
+                ));
+            }
+        };
+        if !self.find.open {
+            return Err("the Find box is not open: press Ctrl+F in the view".into());
+        }
+        self.find_rects.get()[i].ok_or_else(|| "the Find box is not drawn yet".into())
     }
 
     fn zoom_step(&mut self, dir: i32) -> bool {
@@ -884,13 +1079,11 @@ impl DocView {
                     caret_piece(&self.words, &self.editor.caret),
                     self.viewport.get(),
                 ) {
-                    // Clear of the horizontal bar, as the reveal is.
-                    (Some(piece), Some(view)) => Json::Bool(
-                        reveal_dy(
-                            crate::doc_scrollbar::clear_of_hbar(view, self.hbar.shown()),
-                            piece,
-                        ) == px(0.),
-                    ),
+                    // Clear of the bars and the open Find box, as the
+                    // reveal is.
+                    (Some(piece), Some(view)) => {
+                        Json::Bool(reveal_dy(self.find_view(view), piece) == px(0.))
+                    }
                     _ => Json::Null,
                 },
             ),
@@ -898,6 +1091,46 @@ impl DocView {
             ("can_undo", Json::Bool(self.can_undo())),
             ("can_redo", Json::Bool(self.can_redo())),
             ("can_copy", Json::Bool(self.can_copy())),
+            ("find", self.find_json()),
+        ])
+    }
+
+    /// The part of the painted `view` a match or the caret is in view in
+    /// ([`find::find_view`]).
+    fn find_view(&self, view: Bounds<Pixels>) -> Bounds<Pixels> {
+        find::find_view(view, self.hbar.shown(), self.vbar.shown(), self.find.open)
+    }
+
+    /// `ext-doc-read`'s `find` (#1887): the box, its query, how many
+    /// matches and which is current (1-based), whether that one is in view
+    /// in both axes, and how many hits the last frame painted in view.
+    fn find_json(&self) -> ctlcore::json::Json {
+        use ctlcore::json::Json;
+        let matches = self.find_matches();
+        let current = self.find.current(&self.editor, &matches);
+        let m = current.map(|i| &matches[i]);
+        let in_view = m.and_then(|m| {
+            let piece = caret_piece(&self.words, &Caret::at(m.path.clone(), m.start))?;
+            let view = self.find_view(self.viewport.get()?);
+            Some(reveal_dy(view, piece) == px(0.) && find::reveal_dx(view, piece) == px(0.))
+        });
+        Json::obj(vec![
+            ("open", Json::Bool(self.find.open)),
+            ("query", Json::Str(self.find.query.clone())),
+            ("field_focused", Json::Bool(self.find.field_focused)),
+            ("count", Json::Num(matches.len() as f64)),
+            (
+                "current",
+                current.map_or(Json::Null, |i| Json::Num((i + 1) as f64)),
+            ),
+            (
+                "current_path",
+                m.map_or(Json::Null, |m| {
+                    Json::Arr(m.path.iter().map(|&i| Json::Num(i as f64)).collect())
+                }),
+            ),
+            ("current_in_view", in_view.map_or(Json::Null, Json::Bool)),
+            ("hits_painted", Json::Num(self.hits_painted.get() as f64)),
         ])
     }
 
@@ -998,13 +1231,40 @@ impl Render for DocView {
         let body = &self.editor.doc.body;
         let markers = list_markers(body);
         let target = DocTarget::Embed(cx.entity().downgrade(), self.words.clone());
-        // Editable, the caret draws while the view has the keys (#1947).
-        let caret: &[usize] = if self.editable && self.focus.is_focused(window) {
+        // Editable, the caret draws while the view has the keys (#1947),
+        // not while the Find box's field has them (#1887).
+        let view_focused = self.focus.is_focused(window);
+        let field_keys = self.find.open && self.find.field_focused;
+        let caret: &[usize] = if self.editable && view_focused && !field_keys {
             &self.editor.caret.path
         } else {
             &[]
         };
-        let reveal = std::mem::take(&mut self.reveal).then(|| self.editor.caret.clone());
+        // A caret reveals in y only (#1895); a Find match sideways too.
+        let reveal = self.reveal.take().map(|r| match r {
+            Reveal::Caret => (self.editor.caret.clone(), false),
+            Reveal::Match(at) => (at, true),
+        });
+        // The open box's matches: the current one is the selection, the
+        // others paint over the text (#1887).
+        let matches = self.find_matches();
+        let current = self.find.current(&self.editor, &matches);
+        let hits: Vec<(Vec<usize>, usize, usize)> = matches
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| Some(*i) != current)
+            .map(|(_, m)| (m.path.clone(), m.start, m.end))
+            .collect();
+        let find_box = self
+            .find
+            .open
+            .then(|| self.find_box(matches.len(), current, view_focused, cx));
+        if !self.find.open {
+            self.find_rects.set([None; 4]);
+        }
+        let box_open = self.find.open;
+        let hits_painted = self.hits_painted.clone();
+        hits_painted.set(0);
         let ctx = RenderCtx {
             caret_path: caret,
             caret_off: self.editor.caret.offset,
@@ -1047,7 +1307,7 @@ impl Render for DocView {
             .collect();
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
-        let hbar = self.hbar.clone();
+        let (hbar, vbar) = (self.hbar.clone(), self.vbar.clone());
         let (used_w, text_w) = (self.text_w.get(), self.text_w.clone());
         let (column, painted_gen, doc_gen) =
             (self.column.clone(), self.painted_gen.clone(), self.doc_gen);
@@ -1075,6 +1335,12 @@ impl Render for DocView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                     this.focus.focus(window, cx);
+                    // A press in the document takes the keys from the Find
+                    // box's field; the box stays (#1887).
+                    if this.find.field_focused {
+                        this.find.field_focused = false;
+                        cx.notify();
+                    }
                 }),
             )
             .on_mouse_up(
@@ -1123,13 +1389,28 @@ impl Render for DocView {
                     // frame has drawn by then: a paragraph an Enter just
                     // made among them.
                     move |b, _s, window, _a| {
-                        if let Some(caret) = reveal {
-                            // Clear of the horizontal bar over the view's
-                            // bottom (#2080).
-                            let view = crate::doc_scrollbar::clear_of_hbar(b, hbar.shown());
-                            if reveal_caret(&words, &scroll, view, &caret) {
+                        // Clear of the scroll bars (#2080) and the open Find
+                        // box (#1887).
+                        let view = find::find_view(b, hbar.shown(), vbar.shown(), box_open);
+                        if let Some((at, sideways)) = reveal {
+                            if reveal_caret(&words, &scroll, view, &at, sideways) {
                                 window.request_animation_frame();
                             }
+                        }
+                        if !hits.is_empty() {
+                            let quads: Vec<_> = painted_hits(&words, &hits)
+                                .into_iter()
+                                .filter(|q| q.intersects(&view))
+                                .collect();
+                            hits_painted.set(quads.len());
+                            window.with_content_mask(
+                                Some(ContentMask { bounds: view }),
+                                |window| {
+                                    for q in quads {
+                                        window.paint_quad(fill(q, find::hit_color()));
+                                    }
+                                },
+                            );
                         }
                     },
                 )
@@ -1146,7 +1427,184 @@ impl Render for DocView {
                 &self.hbar,
                 crate::doc_scrollbar::BarColors::of(cx),
             ))
+            // The Find box (#1887), over the bars at the top right.
+            .children(find_box)
     }
+}
+
+impl DocView {
+    /// The Find box: its field, the count, ↑ / ↓ and ×, in the theme's
+    /// chrome (not the page's palette), at the view's top right. A press on
+    /// it never reaches the document; each part records where it painted
+    /// for the harness.
+    fn find_box(
+        &self,
+        count: usize,
+        current: Option<usize>,
+        view_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pal = Pal::of(cx);
+        let field_bg = cx.theme().background;
+        let rects = self.find_rects.clone();
+        let rec = move |i: usize| {
+            let rects = rects.clone();
+            canvas(
+                move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| {
+                    let mut r = rects.get();
+                    r[i] = Some(b);
+                    rects.set(r);
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
+        let press = |part: FindPart| {
+            cx.listener(move |this: &mut Self, _: &MouseDownEvent, window, cx| {
+                this.find_press(part, window, cx)
+            })
+        };
+        let f = &self.find;
+        let focused = f.field_focused && view_focused;
+        let len = f.query.chars().count();
+        let at = char_to_byte(&f.query, f.caret.min(len));
+        let text = div()
+            .flex()
+            .items_center()
+            .text_size(px(13.))
+            .text_color(pal.fg)
+            .when(f.sel && len > 0, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+            .child(SharedString::from(f.query[..at].to_string()))
+            .when(focused, |d| d.child(caret_bar()))
+            .child(SharedString::from(f.query[at..].to_string()));
+        let field = div()
+            .id("ext-doc-find-field")
+            .relative()
+            .child(rec(0))
+            .flex()
+            .items_center()
+            .h(px(22.))
+            .w(px(180.))
+            .px_1p5()
+            .overflow_hidden()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if focused { hsla_u(BRAND) } else { pal.border })
+            .bg(field_bg)
+            .cursor_text()
+            .when(f.query.is_empty() && !focused, |d| {
+                d.child(div().text_size(px(13.)).text_color(pal.dim).child("Find"))
+            })
+            .child(text)
+            .on_mouse_down(MouseButton::Left, press(FindPart::Field));
+        let button = |id: &'static str, glyph: &'static str, i: usize, part: FindPart| {
+            div()
+                .id(id)
+                .relative()
+                .child(rec(i))
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_size(px(14.))
+                .text_color(pal.fg)
+                .hover(|d| d.bg(pal.hover))
+                .child(glyph)
+                .on_mouse_down(MouseButton::Left, press(part))
+        };
+        h_flex()
+            .id("ext-doc-find")
+            .absolute()
+            .top(px(find::BOX_TOP))
+            .right(px(find::BOX_RIGHT))
+            .h(px(find::BOX_H))
+            .items_center()
+            .gap_1()
+            .px_1()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.panel)
+            .shadow_md()
+            // The document under it takes no press, but the wheel still
+            // scrolls it.
+            .block_mouse_except_scroll()
+            .on_mouse_down(MouseButton::Left, press(FindPart::Box))
+            .child(field)
+            .child(
+                div()
+                    .min_w(px(68.))
+                    .text_size(px(11.))
+                    .text_color(pal.dim)
+                    .child(SharedString::from(find::count_text(
+                        &f.query, count, current,
+                    ))),
+            )
+            .child(button("ext-doc-find-prev", "\u{2191}", 1, FindPart::Prev))
+            .child(button("ext-doc-find-next", "\u{2193}", 2, FindPart::Next))
+            .child(button("ext-doc-find-close", "\u{00d7}", 3, FindPart::Close))
+            .into_any_element()
+    }
+}
+
+/// What a scroll-into-view after a render goes to: the caret (a key or a
+/// host command), or a Find match's start (#1887), shown sideways too.
+#[derive(Clone, Debug)]
+enum Reveal {
+    Caret,
+    Match(Caret),
+}
+
+/// A part of the Find box a press landed on (#1887).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FindPart {
+    Box,
+    Field,
+    Prev,
+    Next,
+    Close,
+}
+
+/// The quads highlighting `hits` (`path`, `start`, `end`) over this frame's
+/// painted pieces ([`find::hit_quads`]); a hit whose paragraph painted
+/// nothing has none.
+fn painted_hits(words: &Words, hits: &[(Vec<usize>, usize, usize)]) -> Vec<Bounds<Pixels>> {
+    let words = words.borrow();
+    let mut out = Vec::new();
+    for (path, start, end) in hits {
+        let Some((_, spans)) = words.iter().find(|(p, _)| p == path) else {
+            continue;
+        };
+        let spans = spans.borrow();
+        let pieces: Vec<find::HitPiece> = spans
+            .iter()
+            .map(|w| find::HitPiece {
+                off: w.off,
+                len: w.len,
+                bounds: w.bounds(),
+                unit: matches!(w.shape, SpanShape::Unit(_)),
+            })
+            .collect();
+        out.extend(find::hit_quads(
+            &pieces,
+            *start,
+            *end,
+            |i, c| match &spans[i].shape {
+                SpanShape::Text(layout) => {
+                    let text = layout.text();
+                    let at = find::char_byte(&text, c).min(layout.len());
+                    layout.position_for_index(at).map(|p| p.x)
+                }
+                SpanShape::Unit(_) => None,
+            },
+        ));
+    }
+    out
 }
 
 /// The text and RTF a copy of `editor`'s selection writes (the RTF resolves
@@ -1386,10 +1844,17 @@ fn reveal_dy(view: Bounds<Pixels>, piece: Bounds<Pixels>) -> Pixels {
 }
 
 /// Scroll the view so `caret` is in sight, from this frame's painted pieces,
-/// in y only (a wide table keeps its sideways scroll, #1895); a caret whose
+/// in y only (a wide table keeps its sideways scroll, #1895) unless
+/// `sideways` (a Find match, #1887, shown in x too); a caret whose
 /// paragraph painted nothing has its top-level block followed instead, as a
 /// document tab's Web Layout follows it. Whether it moved (shown next frame).
-fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, caret: &Caret) -> bool {
+fn reveal_caret(
+    words: &Words,
+    scroll: &ScrollHandle,
+    view: Bounds<Pixels>,
+    caret: &Caret,
+    sideways: bool,
+) -> bool {
     let Some(piece) = caret_piece(words, caret) else {
         return caret
             .path
@@ -1397,16 +1862,24 @@ fn reveal_caret(words: &Words, scroll: &ScrollHandle, view: Bounds<Pixels>, care
             .is_some_and(|&b| follow_item_y(scroll, b, view));
     };
     let dy = reveal_dy(view, piece);
-    if dy == px(0.) {
+    let dx = if sideways {
+        find::reveal_dx(view, piece)
+    } else {
+        px(0.)
+    };
+    if dy == px(0.) && dx == px(0.) {
         return false;
     }
     let offset = scroll.offset();
-    let max = scroll.max_offset().y.max(px(0.));
-    let y = (offset.y + dy).clamp(-max, px(0.));
-    if y == offset.y {
+    let max = scroll.max_offset().max(&point(px(0.), px(0.)));
+    let to = point(
+        (offset.x + dx).clamp(-max.x, px(0.)),
+        (offset.y + dy).clamp(-max.y, px(0.)),
+    );
+    if to == offset {
         return false;
     }
-    scroll.set_offset(point(offset.x, y));
+    scroll.set_offset(to);
     true
 }
 

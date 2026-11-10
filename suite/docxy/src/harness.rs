@@ -1695,7 +1695,7 @@ fn region_point(
 
 /// The test extension's view on the active tab (#1873): refused unless the
 /// tab is a Mail tab the harness's test extension draws.
-fn ext_fixture_view(
+pub(crate) fn ext_fixture_view(
     app: &crate::Docxy,
 ) -> Result<gpui::Entity<crate::ext_fixture::FixtureView>, String> {
     let Some(crate::Surface::Ext(e)) = app.tabs.get(app.active).map(|t| &t.surface) else {
@@ -1962,6 +1962,7 @@ fn ext_doc_document_json(
 }
 
 /// A point of the test extension's document view: `view` (its middle),
+/// `find:<field|prev|next|close>` (the open Find box's part, #1887),
 /// `link:<n>` (the n-th painted link span's middle; `link:<n>:left` 8 px left
 /// of it) or `word:<text>` (the
 /// first painted word whose text, trimmed, is `<text>`; `:start` after it is
@@ -1979,6 +1980,10 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
     if part.starts_with("vbar") || part.starts_with("hbar") {
         // The view's scrollbars (#2080).
         return view.bar_region(part).map(|b| b.center());
+    }
+    if let Some(at) = part.strip_prefix("find:") {
+        // The open Find box's field, ↑, ↓ or × (#1887).
+        return view.find_region(at).map(|b| b.center());
     }
     if part == "header" {
         // The fixture's header line, just above the view (#2003).
@@ -2047,7 +2052,7 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             None => b.center(),
         });
     }
-    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left[:<word>], ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
+    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left[:<word>], ext-doc-find:<field|prev|next|close>, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its
@@ -5594,7 +5599,7 @@ fn dispatch_verb(
                 }
                 (Some(input), None) => {
                     let id = input.as_str().ok_or("'input' must be an input id")?;
-                    return Done::ok(crate::inputs::read(app, id)?);
+                    return Done::ok(crate::inputs::read(app, id, cx)?);
                 }
                 _ => {}
             }
@@ -6754,7 +6759,7 @@ fn dispatch_verb(
             if let Some(input) = args.get("input") {
                 let id = input.as_str().ok_or("'input' must be an input id")?;
                 app.refuse_under_dialog()?;
-                let press = crate::inputs::press(app, id)?;
+                let press = crate::inputs::press(app, id, cx)?;
                 let p = press.at;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
