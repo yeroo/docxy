@@ -506,6 +506,35 @@ test issue 1887 the Find box's buttons step and close it, a match past the right
   call tab-list {}
   assert reply.count is 1
 
+test issue 1887 a document tab's Find bar left open takes no key the extension's view passes on
+  open copy:../fixtures/basic.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call real-type {"text":"zz"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is zz
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-click {"region":"ext-doc-view"}
+  # The read-only view passes letters and Escape on: the document tab's
+  # bar, not drawn here, takes neither.
+  call real-type {"text":"ab"}
+  call real-key {"key":"escape"}
+  assert find_open is true
+  call real-key {"key":"ctrl+w"}
+  call tab-select {"tab":"basic.docx"}
+  assert find_open is true
+  call field-read {"input":"doc-find"}
+  assert reply.value is zz
+  call real-key {"key":"escape"}
+  assert find_open is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
 test issue 1873 the view's copy pastes into a document with its bold, as another app's rich copy
   # Last: the document it pastes into stays open (and edited).
   call backstage {"action":"open"}
