@@ -3836,6 +3836,8 @@ impl App {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed message");
@@ -4179,6 +4181,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed invite");
@@ -4604,6 +4608,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .unwrap();
@@ -4844,6 +4850,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed m2");
@@ -4882,6 +4890,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed m3");
@@ -5575,6 +5585,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("update message to has_attachments=true");
@@ -5618,6 +5630,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed message");
@@ -6679,6 +6693,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("mark m1 has_attachments");
@@ -6712,6 +6728,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("mark m2 has_attachments");

@@ -199,6 +199,17 @@ pub struct MessageRow {
     /// `due_message_reminders`' condition). False for any other message, and
     /// for a row stored before it was, until a sync re-reads it.
     pub meeting_reminder_on: bool,
+    /// The message's own Internet message id (#2096,
+    /// `Message::internet_message_id`), what a reply's `in_reply_to` names.
+    /// `""` when Graph sent none, and for a row stored before #2096 until a
+    /// sync re-reads it.
+    pub internet_message_id: String,
+    /// The Internet message id of the message this one answers (#2096,
+    /// `Message::in_reply_to`): set on a reply, and on a reply draft from
+    /// the moment it is composed here. `""` on anything else, and for a row
+    /// stored before #2096 until a sync re-reads it. Never cleared by a
+    /// merge. With `conversation_id`, what `Store::reply_draft_links` reads.
+    pub in_reply_to: String,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -1441,11 +1452,15 @@ impl Store {
         migrate_meeting_message_type(&conn)?;
         migrate_message_protection(&conn)?;
         migrate_meeting_reminder(&conn)?;
+        migrate_reply_links(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_reminder
                  ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
             [],
         )?;
+        // After `migrate_reply_links`, never in `schema.rs`: its batch runs
+        // before the migrations, when an old table lacks `in_reply_to`.
+        conn.execute(REPLY_DRAFTS_INDEX_SQL, [])?;
         Ok(Store { conn })
     }
 
@@ -1577,7 +1592,12 @@ impl Store {
     /// `meeting_message_type` `writes_meeting_type` (#2081: only when
     /// the item carried it) and the protection columns `writes_protection`
     /// (#2088: only when the item carried its class), `meeting_reminder_on`
-    /// `writes_meeting_reminder` (#2089: likewise, and with no flag term).
+    /// `writes_meeting_reminder` (#2089: likewise, and with no flag term),
+    /// `internet_message_id` and `in_reply_to`
+    /// `writes_internet_message_id` / `writes_in_reply_to` (#2096: only
+    /// when carried) **and** only with a non-empty value, so a stored id is
+    /// never cleared, not even by a carried `""` or a `Message` built in
+    /// code (`upsert_message`).
     /// The reminder is on only while the row is flagged (the
     /// stored flag when the item carries none), so an unflag or a completed
     /// flag Graph reports leaves it off even if Exchange kept
@@ -1627,9 +1647,9 @@ impl Store {
                  is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                  meeting_message_type,
                  sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
-                 meeting_reminder_on
+                 meeting_reminder_on, internet_message_id, in_reply_to
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47)
+                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47, ?49, ?51)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -1665,7 +1685,12 @@ impl Store {
                  is_rights_protected = CASE WHEN ?46 THEN excluded.is_rights_protected
                                             ELSE messages.is_rights_protected END,
                  meeting_reminder_on = CASE WHEN ?48 THEN excluded.meeting_reminder_on
-                                            ELSE messages.meeting_reminder_on END
+                                            ELSE messages.meeting_reminder_on END,
+                 internet_message_id = CASE WHEN ?50 AND excluded.internet_message_id <> ''
+                                            THEN excluded.internet_message_id
+                                            ELSE messages.internet_message_id END,
+                 in_reply_to = CASE WHEN ?52 AND excluded.in_reply_to <> ''
+                                    THEN excluded.in_reply_to ELSE messages.in_reply_to END
              WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
@@ -1716,6 +1741,10 @@ impl Store {
                 fields.writes_protection(),
                 m.meeting_reminder_on,
                 fields.writes_meeting_reminder(),
+                m.internet_message_id,
+                fields.writes_internet_message_id(),
+                m.in_reply_to,
+                fields.writes_in_reply_to(),
             ],
         )?;
         Ok(n > 0)
@@ -1927,6 +1956,7 @@ impl Store {
                         meeting_message_type,
                         sensitivity, has_sensitivity_label, sensitivity_label_name,
                         is_rights_protected, meeting_reminder_on,
+                        internet_message_id, in_reply_to,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -1946,7 +1976,8 @@ impl Store {
                     k.is_reminder_on, k.reminder_at, k.reminder_signal_at, k.flag_due_at,
                     k.meeting_message_type,
                     k.sensitivity, k.has_sensitivity_label, k.sensitivity_label_name,
-                    k.is_rights_protected, k.meeting_reminder_on
+                    k.is_rights_protected, k.meeting_reminder_on,
+                    k.internet_message_id, k.in_reply_to
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -2029,6 +2060,22 @@ impl Store {
         let mut stmt = self.conn.prepare(&due_message_reminders_sql())?;
         let rows = stmt
             .query_map(params![now], map_message_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The `(conversation_id, in_reply_to)` of every unsent reply draft, in
+    /// any folder (#2096): rows with `is_draft = 1` and a non-empty
+    /// `in_reply_to`, each pair once, sorted. A host marks a message that
+    /// has an unsent reply draft, as classic Outlook's red `[Draft]` does,
+    /// when its `conversation_id` and `internet_message_id` match a pair,
+    /// without reading the Drafts folder's rows. A sent draft (`mark_sent`)
+    /// and a forward (no In-Reply-To) are left out. Reads the partial index
+    /// `idx_messages_reply_drafts`.
+    pub fn reply_draft_links(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self.conn.prepare(REPLY_DRAFT_LINKS_SQL)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -2517,9 +2564,10 @@ impl Store {
     /// plain-text message (stored as text) and a draft an older build's
     /// `update_draft_fields` left as html content under `content_type =
     /// 'text'`. A draft is a message marked `is_draft` or filed in the
-    /// Drafts folder (the synced one, or the local sentinel): a complete
-    /// delta item resets `is_draft` to 0, as `isDraft` is not in
-    /// `MESSAGE_SELECT`, so the flag alone would not last past a sync.
+    /// Drafts folder (the synced one, or the local sentinel). Since #2096 a
+    /// delta item carries Graph's `isDraft`, but a row stored before then,
+    /// or one a code-built `Message` wrote without the flag, may still read
+    /// 0 in Drafts, so the folder still counts.
     ///
     /// This decides whether an embedder asks; a fetch that comes anyway
     /// still keeps a draft's unpushed body
@@ -6089,6 +6137,52 @@ fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Brings a store from before #2096 up to date: adds
+/// `messages.internet_message_id` and `messages.in_reply_to` (old rows read
+/// `""`) and resets every folder's delta and backfill state and both
+/// expand-refused marks, as `migrate_message_protection` does: a link Graph
+/// minted before then carries the old `$select` (no `internetMessageId`, no
+/// `isDraft`) and the old `$expand` (no `PidTagInReplyToId`), so new mail
+/// through it would never get either id, and a draft made elsewhere would
+/// stay `is_draft = 0`. The cost is one more re-enumeration. Last in
+/// `Store::init`, after every migration whose columns or marks it resets.
+/// One IMMEDIATE transaction that probes for `internet_message_id` first; a
+/// store that has it (every fresh one) is left alone. Returns whether it
+/// migrated.
+fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'internet_message_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN internet_message_id TEXT NOT NULL DEFAULT '';
+         ALTER TABLE messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';
+         UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                            backfill_synced = 0, history_scope = NULL,
+                            backfill_scope = NULL, reminder_expand_refused = 0,
+                            backfill_expand_refused = 0;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The partial index `Store::reply_draft_links` reads (#2096): only unsent
+/// reply drafts, so it stays as small as the Drafts folder's replies. Its
+/// `WHERE` is spelled exactly as the query's, or SQLite would not use it.
+const REPLY_DRAFTS_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_messages_reply_drafts
+     ON messages(conversation_id, in_reply_to) WHERE is_draft = 1 AND in_reply_to <> ''";
+
+/// `Store::reply_draft_links`' statement (#2096), over
+/// `idx_messages_reply_drafts`; a test checks the plan.
+const REPLY_DRAFT_LINKS_SQL: &str = "SELECT DISTINCT conversation_id, in_reply_to FROM messages
+     WHERE is_draft = 1 AND in_reply_to <> ''
+     ORDER BY conversation_id, in_reply_to";
+
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
 /// OS-entropy source the PKCE verifier uses, rather than pulling in a
@@ -6441,11 +6535,11 @@ const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from
     is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
     meeting_message_type,
     sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
-    meeting_reminder_on";
+    meeting_reminder_on, internet_message_id, in_reply_to";
 
 /// How many columns `MESSAGE_ROW_COLUMNS` names: the index of the first
 /// column a query selects after them (`Store::draft`'s body).
-const BODY_AFTER_ROW_COLUMNS: usize = 29;
+const BODY_AFTER_ROW_COLUMNS: usize = 31;
 
 /// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
 /// reminder is on and whose next signal (`reminder_signal_at`, else
@@ -6517,6 +6611,8 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
             is_rights_protected: row.get(27)?,
         },
         meeting_reminder_on: row.get(28)?,
+        internet_message_id: row.get(29)?,
+        in_reply_to: row.get(30)?,
     })
 }
 
@@ -6703,6 +6799,8 @@ mod tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -7264,6 +7362,8 @@ mod tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         s.merge_message("G", &partial, &read_only_fields()).unwrap();
         let after = raw_row(&s, "11");
@@ -7350,6 +7450,8 @@ mod tests {
             is_rights_protected: true,
         };
         m.meeting_reminder_on = true;
+        m.internet_message_id = "<13@x>".into();
+        m.in_reply_to = "<12@x>".into();
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -7392,11 +7494,14 @@ mod tests {
             ("sensitivity_label_name", t("General")),
             ("is_rights_protected", V::Integer(1)),
             ("meeting_reminder_on", V::Integer(1)),
+            ("internet_message_id", t("<13@x>")),
+            ("in_reply_to", t("<12@x>")),
         ];
         expect(&s, "13", &first);
 
         // Over the row, with every column changed (to empty / false where
-        // a value can be), moved to G; bcc (not a Graph column here) kept.
+        // a value can be), moved to G; bcc (not a Graph column here) kept,
+        // and so are the two ids (#2096: a merge never clears a stored one).
         s.conn
             .execute(
                 "UPDATE messages SET bcc_recipients = 'kept' WHERE id = '13'",
@@ -7427,6 +7532,8 @@ mod tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         s.upsert_message("G", &m2).unwrap();
         expect(
@@ -7464,13 +7571,15 @@ mod tests {
                 ("sensitivity_label_name", t("")),
                 ("is_rights_protected", V::Integer(0)),
                 ("meeting_reminder_on", V::Integer(0)),
+                ("internet_message_id", t("<13@x>")),
+                ("in_reply_to", t("<12@x>")),
             ],
         );
     }
 
-    /// The `MessageFields` of a complete Graph item under `MESSAGE_SELECT`:
-    /// every selected key, no `isDraft` (not selected) and no `@odata.type`
-    /// (a plain message).
+    /// The `MessageFields` of a complete Graph item without `isDraft` (one
+    /// built in code; a delta item carries it since #2096) and without
+    /// `@odata.type` (a plain message).
     fn complete_plain_fields() -> MessageFields {
         MessageFields {
             is_draft: false,
@@ -13164,6 +13273,8 @@ mod search_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(
@@ -14034,6 +14145,8 @@ mod local_id_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         s.upsert_message(&folder, &m).unwrap();
         assert_eq!(s.current_id(&local).unwrap(), "G");
@@ -14143,6 +14256,8 @@ mod body_format_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -14850,6 +14965,8 @@ mod kept_body_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -15073,6 +15190,8 @@ mod folder_retain_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -15500,6 +15619,8 @@ mod backfill_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         let all = MessageFields::all();
         assert!(
@@ -15674,6 +15795,8 @@ mod moved_id_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -16043,6 +16166,8 @@ mod message_reminder_tests {
             reminder_at: at.into(),
             reminder_signal_at: signal.into(),
             flag_due_at: "2026-11-09T17:00:00Z".into(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -16719,6 +16844,8 @@ mod meeting_message_type_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -16976,10 +17103,10 @@ mod meeting_message_type_tests {
 
     #[test]
     fn a_store_from_before_2054_runs_every_migration_in_order() {
-        // `migrate_meeting_message_type` and `migrate_message_protection`
-        // (#2088) reset the expand-refused marks that
-        // `migrate_message_reminders` adds, so a store without any of them
-        // opens only with the reminders' run first.
+        // `migrate_meeting_message_type`, `migrate_message_protection`
+        // (#2088) and `migrate_reply_links` (#2096) reset the expand-refused
+        // marks that `migrate_message_reminders` adds, so a store without
+        // any of them opens only with the reminders' run first.
         let dir = std::env::temp_dir().join(format!(
             "lookxy-store-pre-2054-{}-{:?}",
             std::process::id(),
@@ -16999,10 +17126,13 @@ mod meeting_message_type_tests {
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
             // Back to a store from before #2054 (and so before #2081,
-            // #2088 and #2089).
+            // #2088, #2089 and #2096).
             s.conn
                 .execute_batch(
                     "DROP INDEX idx_messages_reminder;
+                     DROP INDEX idx_messages_reply_drafts;
+                     ALTER TABLE messages DROP COLUMN internet_message_id;
+                     ALTER TABLE messages DROP COLUMN in_reply_to;
                      ALTER TABLE messages DROP COLUMN meeting_reminder_on;
                      ALTER TABLE messages DROP COLUMN is_reminder_on;
                      ALTER TABLE messages DROP COLUMN reminder_at;
@@ -17020,9 +17150,13 @@ mod meeting_message_type_tests {
         }
         let s = Store::open(&path).unwrap();
         // Every migration's columns are there; the old row reads empty
-        // reminder fields, no type, no protection and no meeting reminder,
-        // the rest of it kept.
+        // reminder fields, no type, no protection, no meeting reminder and
+        // no ids, the rest of it kept.
         let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!(
+            (row.internet_message_id.as_str(), row.in_reply_to.as_str()),
+            ("", "")
+        );
         assert_eq!(row.meeting_message_type, None);
         assert_eq!(row.protection, MessageProtection::default());
         assert!(!row.meeting_reminder_on);
@@ -17067,6 +17201,7 @@ mod meeting_message_type_tests {
         assert!(!migrate_meeting_message_type(&s.conn).unwrap());
         assert!(!migrate_message_protection(&s.conn).unwrap());
         assert!(!migrate_meeting_reminder(&s.conn).unwrap());
+        assert!(!migrate_reply_links(&s.conn).unwrap());
         s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
@@ -17143,6 +17278,8 @@ mod message_protection_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -17458,6 +17595,8 @@ mod meeting_reminder_tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         }
     }
 
@@ -17708,5 +17847,376 @@ mod meeting_reminder_tests {
             .unwrap();
         assert!(migrate_meeting_reminder(&conn).unwrap());
         assert!(!migrate_meeting_reminder(&conn).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod reply_link_tests {
+    //! Which message a reply draft answers (#2096): each message's Internet
+    //! message id and In-Reply-To through every row read, the merge rule (a
+    //! stored id is never cleared), the migration with its delta reset,
+    //! and `reply_draft_links` over its partial index.
+    use super::*;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, conversation: &str, imid: &str, irt: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: conversation.into(),
+            subject: format!("budget {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-11-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: MessageProtection::default(),
+            meeting_reminder_on: false,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: imid.into(),
+            in_reply_to: irt.into(),
+        }
+    }
+
+    fn draft(id: &str, conversation: &str, irt: &str) -> Message {
+        Message {
+            is_draft: true,
+            ..msg(id, conversation, &format!("<{id}@x>"), irt)
+        }
+    }
+
+    fn ids_of(s: &Store, id: &str) -> (String, String) {
+        let row = s.message_row(id).unwrap().unwrap();
+        (row.internet_message_id, row.in_reply_to)
+    }
+
+    fn pair(a: &str, b: &str) -> (String, String) {
+        (a.to_string(), b.to_string())
+    }
+
+    #[test]
+    fn both_ids_round_trip_on_every_row_read() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let want = [
+            ("M1", "<m1@x>", ""),
+            ("M2", "<m2@x>", "<m1@x>"),
+            ("M3", "", ""),
+        ];
+        for (id, imid, irt) in want {
+            s.upsert_message("F", &msg(id, &format!("C{id}"), imid, irt))
+                .unwrap();
+        }
+        let want: Vec<(String, String, String)> = want
+            .iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+            .collect();
+        let sorted = |rows: Vec<MessageRow>| {
+            let mut got: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r.id, r.internet_message_id, r.in_reply_to))
+                .collect();
+            got.sort();
+            got
+        };
+        for (id, imid, irt) in &want {
+            assert_eq!(ids_of(&s, id), (imid.clone(), irt.clone()), "{id}");
+        }
+        assert_eq!(sorted(s.message_rows(&["M1", "M2", "M3"]).unwrap()), want);
+        assert_eq!(sorted(s.messages_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.conversations_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.search("budget", 50).unwrap()), want);
+        // `due_message_reminders`.
+        let mut r = msg("R1", "CR", "<r1@x>", "<m2@x>");
+        r.is_flagged = true;
+        r.is_reminder_on = true;
+        r.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &r).unwrap();
+        let due = s.due_message_reminders("2026-11-08T12:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            (
+                due[0].internet_message_id.as_str(),
+                due[0].in_reply_to.as_str()
+            ),
+            ("<r1@x>", "<m2@x>")
+        );
+        // `draft`, whose body columns follow the row's.
+        s.upsert_message("F", &draft("D1", "C1", "<m1@x>")).unwrap();
+        s.put_body(
+            "D1",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>hi</p>".into(),
+            },
+        )
+        .unwrap();
+        let (row, body) = s.draft("D1").unwrap().unwrap();
+        assert_eq!(
+            (row.internet_message_id.as_str(), row.in_reply_to.as_str()),
+            ("<D1@x>", "<m1@x>")
+        );
+        assert_eq!(row.subject, "budget D1");
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>hi</p>");
+    }
+
+    #[test]
+    fn a_merge_never_clears_a_stored_id() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &draft("D1", "C1", "<m1@x>")).unwrap();
+        let kept = || pair("<D1@x>", "<m1@x>");
+        // A partial item (`{id, isRead}`) carries neither.
+        let fields = MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        };
+        s.merge_message("F", &msg("D1", "C1", "", ""), &fields)
+            .unwrap();
+        assert_eq!(ids_of(&s, "D1"), kept());
+        // A complete item without the key or the property (read without the
+        // `$expand`, a silently dropped one).
+        let without = MessageFields {
+            internet_message_id: false,
+            in_reply_to: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &draft("D1", "C1", ""), &without)
+            .unwrap();
+        assert_eq!(ids_of(&s, "D1"), kept());
+        // An item carrying `""`, and a `Message` built in code
+        // (`upsert_message`, every field carried), keep it too.
+        s.merge_message("F", &msg("D1", "C1", "", ""), &MessageFields::all())
+            .unwrap();
+        assert_eq!(ids_of(&s, "D1"), kept());
+        s.upsert_message("F", &msg("D1", "C1", "", "")).unwrap();
+        assert_eq!(ids_of(&s, "D1"), kept());
+        // A carried new value writes.
+        s.upsert_message("F", &msg("D1", "C1", "<d1b@x>", "<m9@x>"))
+            .unwrap();
+        assert_eq!(ids_of(&s, "D1"), pair("<d1b@x>", "<m9@x>"));
+        // A carried value the flags say was not carried does not.
+        s.merge_message("F", &msg("D1", "C1", "<no@x>", "<no@x>"), &without)
+            .unwrap();
+        assert_eq!(ids_of(&s, "D1"), pair("<d1b@x>", "<m9@x>"));
+        // A missing row is inserted with what the item has, even on flags
+        // that say it carried nothing (an insert has nothing to keep).
+        s.merge_message("F", &msg("M2", "C2", "<m2@x>", "<m1@x>"), &without)
+            .unwrap();
+        assert_eq!(ids_of(&s, "M2"), pair("<m2@x>", "<m1@x>"));
+        s.merge_message("F", &msg("M3", "C3", "", ""), &MessageFields::all())
+            .unwrap();
+        assert_eq!(ids_of(&s, "M3"), pair("", ""));
+    }
+
+    #[test]
+    fn reply_draft_links_name_unsent_reply_drafts_in_any_folder() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "Drafts");
+        folder(&s, "Inbox");
+        // Two reply drafts in Drafts, one in another folder, and a second
+        // draft answering the same message (the pair comes once).
+        s.upsert_message("Drafts", &draft("D1", "C1", "<m1@x>"))
+            .unwrap();
+        s.upsert_message("Drafts", &draft("D2", "C2", "<m2@x>"))
+            .unwrap();
+        s.upsert_message("Inbox", &draft("D3", "C3", "<m3@x>"))
+            .unwrap();
+        s.upsert_message("Drafts", &draft("D4", "C1", "<m1@x>"))
+            .unwrap();
+        // Left out: a forward draft (no In-Reply-To), a non-draft reply,
+        // and a draft that was sent.
+        s.upsert_message("Drafts", &draft("F1", "C1", "")).unwrap();
+        s.upsert_message("Inbox", &msg("R1", "C1", "<r1@x>", "<m1@x>"))
+            .unwrap();
+        s.upsert_message("Drafts", &draft("S1", "C5", "<m5@x>"))
+            .unwrap();
+        s.mark_sent("S1");
+        assert_eq!(
+            s.reply_draft_links().unwrap(),
+            [
+                pair("C1", "<m1@x>"),
+                pair("C2", "<m2@x>"),
+                pair("C3", "<m3@x>"),
+            ]
+        );
+        // A failed send makes it a draft again (#1874), and it is back.
+        s.return_to_drafts("S1", "Drafts").unwrap();
+        assert!(
+            s.reply_draft_links()
+                .unwrap()
+                .contains(&pair("C5", "<m5@x>"))
+        );
+        assert!(
+            Store::open_in_memory()
+                .unwrap()
+                .reply_draft_links()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reply_draft_links_uses_the_partial_index() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {REPLY_DRAFT_LINKS_SQL}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|p| p.contains("USING COVERING INDEX idx_messages_reply_drafts")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|p| p.trim() == "SCAN messages"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn messages_without_2096_columns_migrate_and_reset_delta_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-reply-links-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            let mut m = draft("M1", "C1", "<m0@x>");
+            m.meeting_reminder_on = true;
+            s.upsert_message("F", &m).unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            s.set_reminder_expand_refused("G", true).unwrap();
+            s.set_backfill_expand_refused("F").unwrap();
+            // Back to a store from before #2096 (after #2089).
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_reply_drafts;
+                     ALTER TABLE messages DROP COLUMN internet_message_id;
+                     ALTER TABLE messages DROP COLUMN in_reply_to;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // The columns are there and the old row reads `""`, the rest of it
+        // kept; the index is made on the migrated table.
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!(
+            (row.internet_message_id.as_str(), row.in_reply_to.as_str()),
+            ("", "")
+        );
+        assert!(row.meeting_reminder_on && row.is_draft);
+        assert_eq!(row.subject, "budget M1");
+        let index: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_messages_reply_drafts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
+        // Every folder's delta and backfill state is reset, the expand
+        // refusals with it, with no reconverge.
+        for f in ["F", "G"] {
+            assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
+            let (backfill, synced, history, scope): (
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = s
+                .conn
+                .query_row(
+                    "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = ?1",
+                    [f],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (backfill, synced, history, scope),
+                (None, 0, None, None),
+                "{f}"
+            );
+            assert!(!s.reminder_expand_refused(f).unwrap(), "{f}");
+            assert!(!s.backfill_expand_refused(f).unwrap(), "{f}");
+        }
+        assert!(!s.reconverge_pending().unwrap());
+        // The ids are written from now on, and a link stored after the
+        // migration survives the next open.
+        s.upsert_message("F", &draft("M1", "C1", "<m0@x>")).unwrap();
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=new")
+        );
+        assert_eq!(ids_of(&s, "M1"), pair("<M1@x>", "<m0@x>"));
+        assert_eq!(s.reply_draft_links().unwrap(), [pair("C1", "<m0@x>")]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_columns_and_is_not_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        assert!(!migrate_reply_links(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_store_without_the_columns_migrates_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE messages DROP COLUMN internet_message_id;
+             ALTER TABLE messages DROP COLUMN in_reply_to;",
+        )
+        .unwrap();
+        assert!(migrate_reply_links(&conn).unwrap());
+        assert!(!migrate_reply_links(&conn).unwrap());
     }
 }

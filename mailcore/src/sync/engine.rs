@@ -4848,7 +4848,27 @@ impl Engine {
     /// and emits `DraftReady` so the UI can open the compose editor on it.
     /// `original` is the message id as the command carried it, unresolved,
     /// and `kind` the answer asked for: the event names its request (#2085).
-    fn store_composed_draft(&mut self, draft: Message, original: &str, kind: DraftKind) {
+    ///
+    /// The stored row is a draft (`is_draft`) whatever the response says: a
+    /// `createReply`/`createReplyAll`/`createForward` result is one by
+    /// definition (#2096). A reply's `in_reply_to` is the original's stored
+    /// `internet_message_id`, so `Store::reply_draft_links` names it at once:
+    /// the POST response carries no extended properties, so Graph's own
+    /// In-Reply-To arrives only with a later delta. A missing original row,
+    /// one without an id, or a store error leaves it `""` (the draft is still
+    /// stored; the next delta fills it). A forward has none: Exchange sets no
+    /// In-Reply-To on one.
+    fn store_composed_draft(&mut self, mut draft: Message, original: &str, kind: DraftKind) {
+        draft.is_draft = true;
+        if matches!(kind, DraftKind::Reply | DraftKind::ReplyAll) {
+            let current = self
+                .store
+                .current_id(original)
+                .unwrap_or_else(|_| original.to_string());
+            if let Ok(Some(row)) = self.store.message_row(&current) {
+                draft.in_reply_to = row.internet_message_id;
+            }
+        }
         let body = match self.with_auth(|c| c.get_body(&draft.id, false)) {
             Ok(b) => b,
             Err(e) => {
@@ -6488,6 +6508,8 @@ mod tests {
                             reminder_at: String::new(),
                             reminder_signal_at: String::new(),
                             flag_due_at: String::new(),
+                            internet_message_id: String::new(),
+                            in_reply_to: String::new(),
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -9711,8 +9733,8 @@ mod tests {
         // `createReply` of a plain-text message comes back as text, stored
         // with no fetch format; a FetchBody over the draft compose just
         // opened would lose the user's edits. The response here carries no
-        // `isDraft` (so `is_draft` is 0, as a later complete delta item
-        // leaves it anyway): the Drafts folder is what marks it a draft.
+        // `isDraft`; the engine marks the composed row a draft anyway
+        // (#2096), and the Drafts folder marks it one too.
         let (srv, handle, store_path, dir) = body_engine(
             "body-reply-draft",
             vec![
@@ -9746,7 +9768,7 @@ mod tests {
         wait_for(&handle.evt_rx, |e| *e == want);
 
         let store = Store::open(&store_path).unwrap();
-        assert!(!store.draft("DRAFT1").unwrap().unwrap().0.is_draft);
+        assert!(store.draft("DRAFT1").unwrap().unwrap().0.is_draft);
         let body = store
             .get_body_for("DRAFT1", BodyFormat::Html)
             .unwrap()
@@ -19849,6 +19871,8 @@ mod tests {
                 reminder_at: String::new(),
                 reminder_signal_at: String::new(),
                 flag_due_at: String::new(),
+                internet_message_id: String::new(),
+                in_reply_to: String::new(),
             },
         )
         .unwrap();
@@ -20708,6 +20732,287 @@ mod tests {
 
     // --- A meeting message's own reminder on its row (#2089) -------------
 
+    mod reply_links {
+        //! Which message a reply draft answers (#2096): the delta brings
+        //! each message's Internet message id, a draft's In-Reply-To and
+        //! Graph's `isDraft`; a reply composed here is linked at once.
+        use super::*;
+
+        /// `message_json` with `extra` (JSON members) appended, in `C-M1`
+        /// when `in_m1` (a reply in M1's conversation).
+        fn item(id: &str, read: bool, extra: &str, in_m1: bool) -> String {
+            let plain = message_json(id, read, false, &[]);
+            let plain = if in_m1 {
+                plain.replace(&format!("\"C-{id}\""), "\"C-M1\"")
+            } else {
+                plain
+            };
+            format!("{},{extra}}}", plain.strip_suffix('}').unwrap())
+        }
+
+        /// A reply draft synced from elsewhere: `isDraft`, its own id and
+        /// its In-Reply-To (Graph's lower-case echo of the tag) naming M1.
+        fn synced_draft(id: &str, read: bool) -> String {
+            item(
+                id,
+                read,
+                &format!(
+                    r#""isDraft":true,"internetMessageId":"<{id}@x>","singleValueExtendedProperties":[{{"id":"String 0x1a","value":"IPM.Note"}},{{"id":"string 0x1042","value":"<M1@x>"}}]"#
+                ),
+                true,
+            )
+        }
+
+        fn inbox_routes(startup: &[String], later: &[String]) -> Vec<(Route, Option<usize>)> {
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas("F1", startup, later));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+            ));
+            routes
+        }
+
+        fn row(store: &Store, id: &str) -> Option<crate::store::MessageRow> {
+            store.message_row(id).unwrap()
+        }
+
+        /// `(is_draft, internet_message_id, in_reply_to)`.
+        fn ids(store: &Store, id: &str) -> Option<(bool, String, String)> {
+            row(store, id).map(|r| (r.is_draft, r.internet_message_id, r.in_reply_to))
+        }
+
+        fn want(draft: bool, imid: &str, irt: &str) -> Option<(bool, String, String)> {
+            Some((draft, imid.to_string(), irt.to_string()))
+        }
+
+        /// The F1 folder, and in it `N1`, stored as a draft (so a complete
+        /// `isDraft: false` item has something to clear).
+        fn seed_n1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 1,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v = crate::json::parse(&message_json("N1", false, false, &[])).unwrap();
+            let mut m = Message::from_json(&v).unwrap();
+            m.is_draft = true;
+            s.upsert_message("F1", &m).unwrap();
+        }
+
+        #[test]
+        fn delta_stores_both_ids_and_graph_s_is_draft() {
+            let startup = [
+                synced_draft("D1", false),
+                // A complete item with `isDraft: false` over a stored draft.
+                item(
+                    "N1",
+                    false,
+                    r#""isDraft":false,"internetMessageId":"<N1@x>""#,
+                    false,
+                ),
+                // The original: its own id, no In-Reply-To.
+                item("M1", false, r#""internetMessageId":"<M1@x>""#, true),
+            ];
+            let srv = FakeServer::start_limited(inbox_routes(&startup, &[]));
+            let (handle, store_path, dir) = spawn_fast(&srv, "reply-links", TICK, None, seed_n1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(
+                wait_until(TICK_WAIT, || ["D1", "M1"]
+                    .iter()
+                    .all(|id| row(&store, id).is_some())
+                    && ids(&store, "N1").is_some_and(|(d, _, _)| !d)),
+                "{:?}",
+                store.messages_in_folder("F1", 10, 0)
+            );
+            assert_eq!(ids(&store, "D1"), want(true, "<D1@x>", "<M1@x>"));
+            assert_eq!(ids(&store, "N1"), want(false, "<N1@x>", ""));
+            assert_eq!(ids(&store, "M1"), want(false, "<M1@x>", ""));
+            assert_eq!(
+                store.reply_draft_links().unwrap(),
+                [("C-M1".to_string(), "<M1@x>".to_string())]
+            );
+            // The delta asked for both, and for the In-Reply-To.
+            let first = srv
+                .requests()
+                .into_iter()
+                .map(|r| r.path)
+                .find(|p| is_delta(p, "F1"))
+                .unwrap();
+            assert!(first.contains("internetMessageId,isDraft"), "{first}");
+            assert!(first.contains("String%200x1042"), "{first}");
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_later_round_without_the_property_keeps_the_link() {
+            let startup = [synced_draft("D1", false)];
+            // The next round: D1 complete, read now, without its extended
+            // properties (no `$expand` on it) and with an empty id.
+            let later = [item(
+                "D1",
+                true,
+                r#""isDraft":true,"internetMessageId":"""#,
+                true,
+            )];
+            let srv = FakeServer::start_limited(inbox_routes(&startup, &later));
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "reply-links-later", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            assert!(
+                wait_until(TICK_WAIT, || row(&store, "D1").is_some_and(|r| r.is_read)),
+                "{:?}",
+                row(&store, "D1")
+            );
+            assert_eq!(ids(&store, "D1"), want(true, "<D1@x>", "<M1@x>"));
+            assert_eq!(
+                store.reply_draft_links().unwrap(),
+                [("C-M1".to_string(), "<M1@x>".to_string())]
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `F1` holding `M1` (conversation `C1`, Internet message id
+        /// `<M1@x>`).
+        fn seed_m1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 1,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v =
+                crate::json::parse(&item("M1", false, r#""internetMessageId":"<M1@x>""#, false))
+                    .unwrap();
+            let mut m = Message::from_json(&v).unwrap();
+            m.conversation_id = "C1".into();
+            s.upsert_message("F1", &m).unwrap();
+        }
+
+        /// A `createReply*`/`createForward` answer for `id`: no `isDraft`
+        /// and no extended properties, as Graph's POST response carries
+        /// none.
+        fn composed(action: &str, id: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: format!("/me/messages/M1/{action}"),
+                    status: 200,
+                    headers: vec![],
+                    body: format!(
+                        r#"{{"id":"{id}","conversationId":"C1","subject":"Re: S M1","from":{{"emailAddress":{{"name":"Me","address":"me@x"}}}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"2026-11-10T00:00:00Z","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","internetMessageId":"<{id}@x>"}}"#
+                    ),
+                },
+                None,
+            )
+        }
+
+        fn body_route(id: &str) -> (Route, Option<usize>) {
+            (
+                get_route(
+                    &body_get_path(id),
+                    200,
+                    r#"{"body":{"contentType":"html","content":"<p>q</p>"}}"#,
+                ),
+                None,
+            )
+        }
+
+        /// The `/me/messages/…` requests from index `from` on.
+        fn message_requests(srv: &FakeServer, from: usize) -> Vec<String> {
+            paths_from(srv, from)
+                .into_iter()
+                .filter(|p| p.starts_with("/me/messages/"))
+                .collect()
+        }
+
+        #[test]
+        fn a_reply_composed_here_answers_its_original_at_once() {
+            // `createReplyAll` ahead of `createReply`: the fake server
+            // matches the first prefix.
+            let mut routes = vec![
+                composed("createReplyAll", "RA1"),
+                composed("createReply", "R1"),
+                composed("createForward", "FW1"),
+                body_route("RA1"),
+                body_route("R1"),
+                body_route("FW1"),
+            ];
+            routes.extend(folder_routes(&[("F1", "Inbox", Some("inbox"))], &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "reply-links-compose", HOUR, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            for (cmd, id, kind) in [
+                (
+                    SyncCommand::ComposeReply {
+                        id: "M1".into(),
+                        all: false,
+                    },
+                    "R1",
+                    "createReply",
+                ),
+                (
+                    SyncCommand::ComposeReply {
+                        id: "M1".into(),
+                        all: true,
+                    },
+                    "RA1",
+                    "createReplyAll",
+                ),
+            ] {
+                let from = srv.requests().len();
+                handle.cmd_tx.send(cmd).unwrap();
+                wait_for(
+                    &handle.evt_rx,
+                    |e| matches!(e, SyncEvent::DraftReady { id: d, .. } if d == id),
+                );
+                // A draft (no `isDraft` came), answering M1, with no
+                // request beyond the POST and the body.
+                assert_eq!(ids(&store, id), want(true, &format!("<{id}@x>"), "<M1@x>"));
+                assert_eq!(
+                    message_requests(&srv, from),
+                    [format!("/me/messages/M1/{kind}"), body_get_path(id)],
+                    "{id}"
+                );
+            }
+            assert_eq!(
+                store.reply_draft_links().unwrap(),
+                [("C1".to_string(), "<M1@x>".to_string())]
+            );
+            // A forward is a draft too, but answers nothing.
+            handle
+                .cmd_tx
+                .send(SyncCommand::ComposeForward { id: "M1".into() })
+                .unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::DraftReady { id, .. } if id == "FW1"),
+            );
+            assert_eq!(ids(&store, "FW1"), want(true, "<FW1@x>", ""));
+            assert_eq!(
+                store.reply_draft_links().unwrap(),
+                [("C1".to_string(), "<M1@x>".to_string())]
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     mod meeting_reminders {
         use super::*;
 
@@ -21301,6 +21606,8 @@ mod tests {
                     reminder_at: "2026-11-08T10:00:00Z".into(),
                     reminder_signal_at: "2026-11-08T10:15:00Z".into(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .unwrap();
@@ -22024,6 +22331,8 @@ mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .unwrap();

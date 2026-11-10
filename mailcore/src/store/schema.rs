@@ -97,7 +97,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- `PidLidReminderSet`, kept apart from the flag's `is_reminder_on`; it
     -- never fires. An old file gets it in `Store::init`, without a delta
     -- reset: the links already carry the `$expand` that brings it.
-    meeting_reminder_on    INTEGER NOT NULL DEFAULT 0
+    meeting_reminder_on    INTEGER NOT NULL DEFAULT 0,
+    -- Which message a reply answers (#2096): the row's own
+    -- `internetMessageId` and its In-Reply-To (`PidTagInReplyToId`), `''`
+    -- when unknown. A merge never clears a stored value. An old file gets
+    -- them in `Store::init`, with a delta reset; the partial index over
+    -- unsent reply drafts is made there too, after that migration.
+    internet_message_id    TEXT NOT NULL DEFAULT '',
+    in_reply_to            TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received
