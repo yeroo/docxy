@@ -471,12 +471,8 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
            COALESCE((SELECT content FROM bodies WHERE message_id = new.id), '');
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
-    DELETE FROM messages_fts WHERE message_id = old.id;
-    INSERT INTO messages_fts(message_id, subject, from_text, body)
-    SELECT new.id, new.subject, new.from_name || ' ' || new.from_addr,
-           COALESCE((SELECT content FROM bodies WHERE message_id = new.id), '');
-END;
+-- messages_fts_au is created by `migrate_fts_update_trigger`
+-- (`MESSAGES_FTS_AU_SQL`), which also replaces an older database's.
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
     DELETE FROM messages_fts WHERE message_id = old.id;
@@ -503,3 +499,18 @@ CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
     FROM messages WHERE id = old.message_id;
 END;
 "#;
+
+/// The trigger that keeps a message's `messages_fts` row in step with an
+/// UPDATE of the columns it reads (#1913): only those. `message_id` is
+/// `UNINDEXED`, so its `DELETE` scans the whole FTS table; firing it on
+/// every UPDATE (a read state, a flag) made marking a folder's 5 000 rows
+/// read quadratic. `id` is listed for a re-key; the body has its own
+/// triggers on `bodies`. Installed by `migrate_fts_update_trigger`.
+pub(crate) const MESSAGES_FTS_AU_SQL: &str = "\
+CREATE TRIGGER messages_fts_au
+AFTER UPDATE OF id, subject, from_name, from_addr ON messages BEGIN
+    DELETE FROM messages_fts WHERE message_id = old.id;
+    INSERT INTO messages_fts(message_id, subject, from_text, body)
+    SELECT new.id, new.subject, new.from_name || ' ' || new.from_addr,
+           COALESCE((SELECT content FROM bodies WHERE message_id = new.id), '');
+END;";
