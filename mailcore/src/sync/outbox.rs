@@ -842,6 +842,8 @@ mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .unwrap();
@@ -3519,6 +3521,8 @@ mod tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -3628,6 +3632,8 @@ mod tests {
             reminder_at: String::new(),
             reminder_signal_at: String::new(),
             flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store

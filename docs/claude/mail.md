@@ -52,8 +52,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   a recorded format must equal it; NULL satisfies both when the body is
   html or a draft's, else counts as asked for text (the old engine always
   did). A draft is `is_draft` or filed in the Drafts folder (synced or the
-  local sentinel): a complete delta item resets `is_draft`, as `isDraft` is
-  not in `MESSAGE_SELECT`. So a draft's local body (a plain-text
+  local sentinel). Before #2096 a complete delta item reset `is_draft`
+  (`isDraft` was not selected); a row from then may still read 0 in
+  Drafts, so the folder still counts. So a draft's local body (a plain-text
   `createReply`, or html an older `update_draft_fields` left under
   `content_type = 'text'`) is never refetched over unsynced edits, a store
   filled as text upgrades one message per `FetchBody`, and a native text
@@ -2294,7 +2295,7 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `message_reminder_with_an_offset_time_is_unreadable`,
   `flag_due_date_time_is_normalised_utc`, `flag_due_in_a_named_zone_is_empty`,
   `message_fields_reminder_written_only_when_carried_or_complete`; `client.rs`
-  `message_expand_names_the_reminder_class_and_protection_properties` (#2088's name), the delta / `get_message_hit`
+  `message_expand_names_every_property` (#2096's name), the delta / `get_message_hit`
   URL tests, `get_message_expands_the_reminder`, `delta_link_is_sent_as_it_is`,
   `delta_head_retries_without_expand_on_400`,
   `delta_full_retries_without_expand_on_400_only`,
@@ -2642,7 +2643,7 @@ message's `MeetingMessageType` (#2024's enum) is stored on its row.
   `message_class_prop_id_matches_its_forms_only`,
   `message_reads_meeting_type_from_class_and_top_level`,
   `writes_meeting_type_only_when_carried`; `client.rs`
-  `message_expand_names_the_reminder_class_and_protection_properties` (#2088's name),
+  `message_expand_names_every_property` (#2096's name),
   `delta_page_reads_each_message_class_as_its_meeting_type`,
   `search_messages_reads_the_meeting_type_of_each_hit`,
   `search_messages_retries_without_expand_on_400`; `store` `meeting_message_type_tests`
@@ -2729,7 +2730,7 @@ protected message without opening it: each `MessageRow` (every read: `message_ro
   `message_protection_is_carried_only_with_the_class`,
   `protection_terms_leave_the_reminder_rule_alone`,
   `sensitivity_prop_id_matches_its_forms_only`; `client.rs`
-  `message_expand_names_the_reminder_class_and_protection_properties` (renamed from
+  `message_expand_names_every_property` (#2096's name; renamed from
   `…_reminder_and_class_properties`), `delta_page_reads_each_message_protection`;
   `store` `message_protection_tests` (every read path, `draft`'s body after the shifted
   columns, an odd stored sensitivity, the merge rule, the migration and its idempotence),
@@ -2805,3 +2806,162 @@ icon without a request per row: each `MessageRow` (every read: `message_row`,
   meeting request with and without the bit, a plain message with the bit and a time, a
   flagged meeting request still due; a later round without the class keeping it and one
   with it clearing it; dismiss, and a refused dismiss re-read on through `get_message`).
+
+## Which message a reply draft answers (#2096)
+
+A host marks a message that has an unsent reply draft, as classic Outlook does with a red
+`[Draft]` before the sender: a draft whose `conversation_id` matches the message's and
+whose In-Reply-To matches the message's Internet message id. The store keeps both ids on
+every row, keeps Graph's `isDraft`, links a reply composed here at once, and offers the
+links in one cheap read.
+
+- Sources: `internetMessageId` and `isDraft`, both added to `client::MESSAGE_SELECT`, and
+  `PidTagInReplyToId` (tag `0x1042`, PT_UNICODE) as `model::IN_REPLY_TO_PROP`
+  (`String 0x1042`), one more `or id eq` term in `client::MESSAGE_EXPAND`, so it rides
+  every request that already sends the expand (a delta's first call, `get_message`,
+  `get_message_hit`, a search's first request), and a refused expand falls back as
+  #2054's does. Rejected: a `$select` of `internetMessageHeaders` (delta does not return
+  it, and it is heavy).
+- Parse (lenient, never an error): `Message::internet_message_id` is `str_field`
+  (`""` when absent or not a string); `model::parse_in_reply_to` is `(carried, value)`,
+  carried when the `singleValueExtendedProperties` array holds an entry
+  `is_in_reply_to_prop` accepts (`String ` in any case, a hex tag equal to `0x1042`;
+  `Integer 0x1042` does not) with a string value. The value is stored as Graph sends
+  it, not trimmed, because a `<…>` id is compared verbatim with `internetMessageId`.
+- Merge: `MessageFields::internet_message_id` (the key as a string) and `in_reply_to`
+  (the parse's carried flag) gate the write, with no "complete item" term (#2081's
+  reason: a silently dropped expand would blank every row). **And** the SQL writes only
+  a non-empty value (`CASE WHEN ?w AND excluded.x <> '' …`), so a stored id is never
+  cleared through a merge: not by a partial item, not by a complete one read without the
+  expand, not by a carried `""`, not by a `Message` built in code (`upsert_message`,
+  `MessageFields::all()`, such as a `createReply` response or one of lookxy's callers).
+  A message's ids never legitimately go from set to empty. An insert writes what the
+  item has.
+- `isDraft`: `MessageFields::writes_is_draft` keeps its rule (`is_draft || !is_partial()`),
+  so a complete delta item now writes Graph's value, and a draft made in Outlook or on the
+  web stays a draft. A code-built complete item without the key still writes its parsed
+  `is_draft`.
+- Composed drafts (`Engine::store_composed_draft`): the row is `is_draft` whatever the
+  POST response says (a `createReply`/`createReplyAll`/`createForward` result is a draft
+  by definition). For `DraftKind::Reply` and `ReplyAll`, `in_reply_to` is the original's
+  stored `internet_message_id`, through `current_id` (#1896), so the link exists with no
+  further request. A missing row, an empty id or a store error leaves it `""`, and the
+  next delta fills it from Graph. A forward gets none, as Exchange sets no In-Reply-To on
+  one.
+- Store: `messages.internet_message_id` and `messages.in_reply_to` (TEXT NOT NULL DEFAULT
+  `''`), the last two of `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 31) and of
+  `conversations_in_folder`'s two spelled lists. `MessageRow` carries both from every row
+  read (`message_row`, `message_rows`, `messages_in_folder`, `conversations_in_folder`,
+  `search`, `draft`, `due_message_reminders`).
+- `Store::reply_draft_links() -> Vec<(conversation_id, in_reply_to)>`: every row with
+  `is_draft = 1 AND in_reply_to <> ''`, in any folder but the well-known Deleted Items
+  (`LEFT JOIN folders`, `COALESCE(well_known_name, '') <> 'deleteditems'`), each pair
+  once, sorted. A discarded draft moves to Deleted Items with Graph's `isDraft` still
+  true, so without that the original would stay marked after the reply was thrown away.
+  A sent draft (`mark_sent`) drops out and comes back with `return_to_drafts`; a forward
+  and a received reply are never in it. It reads the partial index
+  `idx_messages_reply_drafts` (`ON messages(conversation_id, in_reply_to, folder_id)
+  WHERE is_draft = 1 AND in_reply_to <> ''`; `folder_id` makes it covering for the
+  join). The messages side of the query's WHERE is spelled as the index's, or SQLite
+  will not use it. The index is created in `Store::init` after the migration, never in `schema.rs`:
+  that batch runs before the migrations, when an old table has no `in_reply_to`.
+- Migration: `migrate_reply_links`, last in `Store::init`, probes for
+  `internet_message_id` in one IMMEDIATE transaction, adds both columns (old rows read
+  `""`) and resets every folder's delta and backfill state and both expand-refused marks,
+  as #2088's does. A link minted before #2096 carries the old `$select` and `$expand`, so
+  new mail through it would never get either id, and `isDraft` would stay unread. The
+  cost is one more re-enumeration. A pre-#2054 store runs every migration on one open.
+  In the same transaction, a one-off body fix: a draft body an engine from before #1901
+  wrote as compose html under `content_type = 'text'` becomes `html`, so lookxy's text
+  branch does not show (and save) its tags. It touches only a local write (`fetched_as IS
+  NULL`) of a draft row (`is_draft`, or filed in Drafts or the local sentinel, as
+  `get_body_for` decides) whose content starts as `compose_html::to_html` output does
+  (`<p>`, `<ul><li>`, `<ol><li>`). A genuine text body (a plain-text `createReply`), a
+  fetched body and a non-draft body are left alone. Every pre-#1901 store is pre-#2096,
+  so each gets the fix once. Then, in the same transaction, every body still `text`
+  with no recorded format gets `fetched_as = 'text'`, in any folder. Before #1901
+  `FetchBody` stored every body with none. A draft made elsewhere reads `is_draft = 0`
+  until the re-enumeration, wherever it is filed (Drafts, a Drafts subfolder, a user
+  folder, Deleted Items), so a draft-row filter would miss it. Without the fix, a
+  reader's text rendering of such a draft would read as written here
+  (`draft_body_is_local`), open in compose, and save flattened text over the html
+  draft. It leaves out a row holding an unpushed edit (`local_edit > 0`), a `local:`
+  draft, a reconciled one (`local_id`) and a row in the local Drafts sentinel, since
+  all four are compose's own. For a non-draft nothing changes: `None` and `Some("text")`
+  both satisfy only a text ask (`body_satisfies`). The html relabel above keeps its
+  draft-row condition. The accepted cost: a plain-text `createReply` body stored before
+  #2096 opens read-only. Such a draft body satisfies a text ask as before but no longer
+  an html one, so an html embedder fetches it once, and that fetch still keeps an edited
+  or queued draft's body (#2082).
+- Readers of `is_draft` that change behaviour:
+  - lookxy: a draft made in Outlook or on the web opens read-only in the reader, as it
+    did before #2096 (when it read `is_draft = 0`); editing it in lookxy is not
+    supported (a follow-up). `open_draft` opens the composer only for a draft whose body
+    was written here (`Store::draft_body_is_local`: a body row with `fetched_as IS
+    NULL`, which only `update_draft_fields`, `create_local_draft` and a composed
+    reply/forward's `put_body` write; a text body fetched before #1901, in any folder,
+    is marked fetched by `migrate_reply_links`, the Migration bullet above). A draft
+    with no body, or with one `FetchBody`
+    stored (Graph's rendering, text under lookxy's `BodyFormat::Text`), opens in the
+    reader (`open_message`), which fetches a missing body. So Graph's rendering is
+    never edited and saved back over the server's draft. `Store::draft`, which the
+    outbox also reads, is unchanged.
+  - lookxy's list: Enter, and a click on a message row (flat, or a thread's message
+    row; `on_left_click` activates a draft row at once, since the click-to-preview path
+    skips drafts), both go through `open_draft`. A thread header whose latest message
+    is a draft is never previewed, so it never becomes `selected_msg`. Its first click
+    only selects it, and a second click on the same header toggles it, as for any
+    header. "The same header" is `App::last_list_click`, a `ListClick` of the folder,
+    `cursor_target`'s id (the header's latest message) and the header flag, never the
+    row position. A sync reload, a key move or a toggle that puts another header at the
+    clicked row therefore does not count, and any click elsewhere forgets it. Cursor
+    preview and PgUp/PgDn skip drafts, as before.
+  - lookxy's composer honours a local body's type (`draft_rich_text`): an `html` body is
+    parsed as HTML, and any other (a `createReply` of a plain-text message) becomes one
+    paragraph per line, so line breaks and `<alice@x>` survive. Esc on a draft unchanged
+    since `open_draft` opened it (`App::compose_baseline`, a `ComposeSnapshot` of the
+    fields, the body's HTML and the attachments) saves nothing: no `update_draft_fields`,
+    no `SaveDraft`. A `local:` draft still saves, since its Save is what creates it on
+    Graph, and Send always sends.
+  - Known limit: `Store::headerless_message_ids` leaves out `is_draft = 1` rows as
+    made here. A new row first seen as a partial delta item carrying `isDraft: true`
+    and no `receivedDateTime` is never completed by #1899's repair (before this issue a
+    partial item could not carry `isDraft`). Not fixed here, because a fix changes
+    #1899's contract.
+  - The `mark_sent` race (SendDraft's optimistic `is_draft = 0`, then a Drafts delta
+    reporting the draft as 1) adds no new failure mode: the folder already flips back in
+    that race, and the outbox drains before a folder's delta.
+- Not done: editing a draft made elsewhere in lookxy (it opens read-only; a follow-up:
+  fetch it as html for compose and keep that body from the reader's text), any host UI
+  (lookxy's list shows no `[Draft]`), matching on
+  `conversation_id` alone or on a draft's `References`, and backfilling `in_reply_to`
+  from a body fetch's headers (#2015) for rows stored before.
+- Tests: `model.rs` `in_reply_to_prop_id_matches_its_forms_only`,
+  `message_reads_internet_message_id_and_in_reply_to`,
+  `in_reply_to_is_carried_only_with_a_string_entry`,
+  `fields_carry_internet_message_id_only_with_the_key`,
+  `a_complete_item_writes_its_is_draft`; `client.rs`
+  `message_expand_names_every_property`,
+  `message_select_names_internet_message_id_and_is_draft`,
+  `delta_page_reads_internet_message_id_in_reply_to_and_is_draft`; `store`
+  `reply_link_tests` (every read path, `draft`'s body after the shifted columns, the
+  merge rule, `reply_draft_links`, Deleted Items left out, its plan, the migration through `Store::open` with
+  the index on the migrated table, and its idempotence),
+  `a_store_from_before_2054_runs_every_migration_in_order`, `upsert_writes_every_column`;
+  `engine.rs` `reply_links::` (a delta of a synced reply draft, an `isDraft: false` item
+  over a stored draft and the original; a later round without the property keeping the
+  link; ComposeReply and ComposeReplyAll answering M1 with only the POST and the body,
+  ComposeForward answering nothing, and a reply to a moved original through
+  `current_id`); lookxy
+  `a_synced_draft_opens_read_only_in_the_reader`,
+  `one_click_opens_a_synced_draft_in_the_reader`,
+  `a_draft_with_a_local_text_body_opens_in_compose_as_text`,
+  `a_draft_s_html_body_still_opens_as_html`,
+  `esc_on_an_unchanged_draft_saves_nothing_and_after_an_edit_saves`,
+  `esc_on_an_unchanged_new_message_still_saves_it`,
+  `two_clicks_on_a_header_whose_latest_is_a_draft_toggle_it`,
+  `a_click_on_another_header_at_the_same_row_only_selects_it`; store
+  `draft_body_is_local_only_for_a_body_written_here`, and the migration test's two body
+  fixes;
+  and
+  `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.

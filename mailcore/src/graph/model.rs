@@ -273,6 +273,16 @@ pub struct Message {
     /// of [`Message::is_reminder_on`], and it never fires a reminder.
     /// False for any other message.
     pub meeting_reminder_on: bool,
+    /// Graph's `internetMessageId` (#2096): the message's RFC 5322
+    /// `Message-ID`, `<…>` included, as Graph sends it. What a reply's
+    /// In-Reply-To names. `""` when absent or not a string.
+    pub internet_message_id: String,
+    /// The message's In-Reply-To (#2096): `PidTagInReplyToId`
+    /// ([`IN_REPLY_TO_PROP`], which the delta's `$expand` brings), the
+    /// `internet_message_id` of the message a reply answers, as Graph sends
+    /// it (not trimmed): see [`parse_in_reply_to`]. `""` when absent or not
+    /// a string, and on anything that is no reply.
+    pub in_reply_to: String,
 }
 
 impl Message {
@@ -281,6 +291,7 @@ impl Message {
         let (_, meeting_message_type) = parse_meeting_message_type(v);
         let (_, protection) = parse_message_protection(v);
         let (_, meeting_reminder_on) = parse_meeting_reminder(v);
+        let (_, in_reply_to) = parse_in_reply_to(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -312,8 +323,45 @@ impl Message {
             meeting_message_type,
             protection,
             meeting_reminder_on,
+            internet_message_id: str_field(v, "internetMessageId"),
+            in_reply_to,
         })
     }
+}
+
+/// `PidTagInReplyToId` (property tag `0x1042`, PT_UNICODE) as a Graph
+/// extended property id (#2096): the Internet message id of the message a
+/// reply answers, which Exchange sets on a `createReply` /
+/// `createReplyAll` draft and on a reply received.
+pub const IN_REPLY_TO_PROP: &str = "String 0x1042";
+
+/// Whether `id` names [`IN_REPLY_TO_PROP`] (#2096): `String ` (any case)
+/// and a hex tag equal to `0x1042`, so a lower-case echo (`string 0x1042`)
+/// matches. Another type (`Integer 0x1042`) or tag does not.
+pub fn is_in_reply_to_prop(id: &str) -> bool {
+    is_tag_prop(id, "String", 0x1042)
+}
+
+/// A message's In-Reply-To (#2096), and whether the item carried it: the
+/// string value of its `singleValueExtendedProperties` entry for
+/// [`IN_REPLY_TO_PROP`], kept as Graph sends it (a `<…>` id compares
+/// verbatim with `internetMessageId`). No array, no such entry, or a
+/// non-string value is `(false, "")`, never an error. A stored value is
+/// never cleared through a merge (`Store::merge_message`'s non-empty
+/// guard), so not carried and carried `""` both keep it.
+pub fn parse_in_reply_to(v: &Value) -> (bool, String) {
+    v.get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|p| {
+            let id = p.get("id").and_then(Value::as_str)?;
+            if !is_in_reply_to_prop(id) {
+                return None;
+            }
+            p.get("value").and_then(Value::as_str)
+        })
+        .map_or((false, String::new()), |s| (true, s.to_string()))
 }
 
 /// `PidTagMessageClass` (property tag `0x001A`, PT_UNICODE) as a Graph
@@ -902,6 +950,11 @@ pub struct MessageFields {
     /// `PidTagMessageClass` entry (`parse_meeting_reminder`'s carried flag,
     /// the same rule as `protection`).
     pub meeting_reminder: bool,
+    /// `internetMessageId` as a string (#2096).
+    pub internet_message_id: bool,
+    /// The In-Reply-To (#2096): a string `PidTagInReplyToId` entry
+    /// (`parse_in_reply_to`'s carried flag).
+    pub in_reply_to: bool,
 }
 
 impl MessageFields {
@@ -929,6 +982,8 @@ impl MessageFields {
             meeting_type: parse_meeting_message_type(v).0,
             protection: parse_message_protection(v).0,
             meeting_reminder: parse_meeting_reminder(v).0,
+            internet_message_id: v.get("internetMessageId").and_then(Value::as_str).is_some(),
+            in_reply_to: parse_in_reply_to(v).0,
         }
     }
 
@@ -956,6 +1011,8 @@ impl MessageFields {
             meeting_type: true,
             protection: true,
             meeting_reminder: true,
+            internet_message_id: true,
+            in_reply_to: true,
         }
     }
 
@@ -976,10 +1033,11 @@ impl MessageFields {
         self.odata_type || !self.is_partial()
     }
 
-    /// Whether `is_draft` is to be written. `isDraft` is not in
-    /// `MESSAGE_SELECT`, so a complete delta item writes 0 as
-    /// `upsert_message` does (unchanged behaviour); a partial item keeps
-    /// the stored value unless it carries the key.
+    /// Whether `is_draft` is to be written. `isDraft` is in
+    /// `MESSAGE_SELECT` (#2096), so a complete delta item carries Graph's
+    /// value; a complete item without the key (a `Message` built in code,
+    /// as `upsert_message` merges) writes its parsed `is_draft`, and a
+    /// partial item keeps the stored value unless it carries the key.
     pub fn writes_is_draft(&self) -> bool {
         self.is_draft || !self.is_partial()
     }
@@ -1019,6 +1077,20 @@ impl MessageFields {
     /// item that is not a meeting message, or has no set bit, writes false.
     pub fn writes_meeting_reminder(&self) -> bool {
         self.meeting_reminder
+    }
+
+    /// Whether `internet_message_id` may be written (#2096): only when the
+    /// item carried it. The store writes it only when non-empty too, so a
+    /// stored id is never cleared.
+    pub fn writes_internet_message_id(&self) -> bool {
+        self.internet_message_id
+    }
+
+    /// Whether `in_reply_to` may be written (#2096): only when the item
+    /// carried a string `PidTagInReplyToId`. As for the Internet message
+    /// id, the store never clears a stored value.
+    pub fn writes_in_reply_to(&self) -> bool {
+        self.in_reply_to
     }
 }
 
@@ -4558,5 +4630,129 @@ mod tests {
         );
         let m = Message::from_json(&delta_item(None, Some(&props))).unwrap();
         assert!(m.meeting_reminder_on && !m.is_reminder_on);
+    }
+
+    #[test]
+    fn in_reply_to_prop_id_matches_its_forms_only() {
+        for id in [
+            IN_REPLY_TO_PROP,
+            "String 0x1042",
+            "string 0x1042",
+            "STRING 0X1042",
+        ] {
+            assert!(is_in_reply_to_prop(id), "{id:?}");
+        }
+        for id in [
+            "Integer 0x1042",
+            "String 0x1043",
+            "String 0x10420",
+            "String 0x001A",
+            "String 1042",
+            "String {00062008-0000-0000-C000-000000000046} Id 0x1042",
+            "",
+        ] {
+            assert!(!is_in_reply_to_prop(id), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn message_reads_internet_message_id_and_in_reply_to() {
+        let v = parse(
+            r#"{"id":"D1","internetMessageId":"<d1@x>","singleValueExtendedProperties":[
+                {"id":"String 0x001A","value":"IPM.Note"},
+                {"id":"String 0x1042","value":" <m1@x> "}]}"#,
+        )
+        .unwrap();
+        let m = Message::from_json(&v).unwrap();
+        assert_eq!(m.internet_message_id, "<d1@x>");
+        // Kept as Graph sends it, not trimmed.
+        assert_eq!(m.in_reply_to, " <m1@x> ");
+
+        // Absent, or not a string: `""`, never an error.
+        for json in [
+            r#"{"id":"A"}"#,
+            r#"{"id":"A","internetMessageId":null,"singleValueExtendedProperties":[]}"#,
+            r#"{"id":"A","internetMessageId":7,"singleValueExtendedProperties":[
+                {"id":"String 0x1042","value":7}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":{"id":"String 0x1042","value":"<m@x>"}}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x1042","value":"<m@x>"}]}"#,
+        ] {
+            let m = Message::from_json(&parse(json).unwrap()).unwrap();
+            assert_eq!(
+                (m.internet_message_id.as_str(), m.in_reply_to.as_str()),
+                ("", ""),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_reply_to_is_carried_only_with_a_string_entry() {
+        let carried = |json: &str| parse_in_reply_to(&parse(json).unwrap());
+        assert_eq!(
+            carried(r#"{"singleValueExtendedProperties":[{"id":"String 0x1042","value":""}]}"#),
+            (true, String::new())
+        );
+        assert_eq!(
+            carried(
+                r#"{"singleValueExtendedProperties":[{"id":"String 0x1042","value":"<a@x>"}]}"#
+            ),
+            (true, "<a@x>".to_string())
+        );
+        for json in [
+            r#"{}"#,
+            r#"{"singleValueExtendedProperties":[]}"#,
+            r#"{"singleValueExtendedProperties":[{"id":"String 0x001A","value":"IPM.Note"}]}"#,
+            r#"{"singleValueExtendedProperties":[{"id":"String 0x1042"}]}"#,
+            r#"{"singleValueExtendedProperties":[{"id":"String 0x1042","value":true}]}"#,
+            r#"{"singleValueExtendedProperties":[{"value":"<a@x>"}]}"#,
+        ] {
+            assert_eq!(carried(json), (false, String::new()), "{json}");
+            let f = MessageFields::of(&parse(json).unwrap());
+            assert!(!f.writes_in_reply_to(), "{json}");
+        }
+        let f = MessageFields::of(
+            &parse(r#"{"singleValueExtendedProperties":[{"id":"String 0x1042","value":"<a@x>"}]}"#)
+                .unwrap(),
+        );
+        assert!(f.writes_in_reply_to());
+        assert!(MessageFields::all().writes_in_reply_to());
+    }
+
+    #[test]
+    fn fields_carry_internet_message_id_only_with_the_key() {
+        let f = |json: &str| MessageFields::of(&parse(json).unwrap()).writes_internet_message_id();
+        assert!(f(r#"{"internetMessageId":"<a@x>"}"#));
+        assert!(f(r#"{"internetMessageId":""}"#));
+        assert!(!f(r#"{}"#));
+        assert!(!f(r#"{"internetMessageId":null}"#));
+        assert!(!f(r#"{"internetMessageId":7}"#));
+        // A complete item without the key says nothing either: no
+        // "complete item" term.
+        assert!(!f(
+            r#"{"subject":"s","receivedDateTime":"t","from":{"emailAddress":{"address":"a@x"}}}"#
+        ));
+        assert!(MessageFields::all().writes_internet_message_id());
+    }
+
+    #[test]
+    fn a_complete_item_writes_its_is_draft() {
+        // #2096: `isDraft` is selected, so a complete item carries it; one
+        // without the key (code-built) still writes its parsed value.
+        let complete =
+            r#""subject":"s","receivedDateTime":"t","from":{"emailAddress":{"address":"a@x"}}"#;
+        for (json, draft) in [
+            (format!(r#"{{{complete},"isDraft":true}}"#), true),
+            (format!(r#"{{{complete},"isDraft":false}}"#), false),
+            (format!(r#"{{{complete}}}"#), false),
+        ] {
+            let v = parse(&json).unwrap();
+            assert!(MessageFields::of(&v).writes_is_draft(), "{json}");
+            assert_eq!(Message::from_json(&v).unwrap().is_draft, draft, "{json}");
+        }
+        let partial = parse(r#"{"isRead":true}"#).unwrap();
+        assert!(!MessageFields::of(&partial).writes_is_draft());
+        let partial = parse(r#"{"isRead":true,"isDraft":true}"#).unwrap();
+        assert!(MessageFields::of(&partial).writes_is_draft());
     }
 }

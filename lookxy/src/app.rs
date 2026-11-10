@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ui::compose::{Compose, ComposeAction, ComposeField};
+use editcore::model::{Block, RichText, Run};
 use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::client::{AttendeeInput, RsvpKind};
@@ -190,6 +191,17 @@ pub struct App {
     /// the request here; it never performs the action or closes `compose`
     /// itself. `None` in the steady state.
     pub compose_action: Option<crate::ui::compose::ComposeAction>,
+    /// What the composer held when `open_draft` opened it (#2096), so Esc
+    /// on an unchanged draft saves nothing. `None` for a composer opened
+    /// some other way, which then saves as before.
+    pub compose_baseline: Option<ComposeSnapshot>,
+    /// What the last left click on the list landed on (#2096): the folder,
+    /// the row's target and whether it was a thread header. A second click
+    /// on a thread header whose latest message is a draft (never previewed,
+    /// so never `selected_msg`) toggles it only when it lands on the same
+    /// thing, never on whatever row a reload, a move or a toggle put at the
+    /// same position. Any click elsewhere clears it.
+    pub last_list_click: Option<ListClick>,
     /// The top-level view — mail three-pane, or the calendar agenda +
     /// detail (`ui::calendar`). Toggled by `g` (see `toggle_mode`).
     pub mode: Mode,
@@ -528,6 +540,8 @@ impl App {
             test_cmd_rx: None,
             compose: None,
             compose_action: None,
+            compose_baseline: None,
+            last_list_click: None,
             mode: Mode::Mail,
             agenda: Vec::new(),
             agenda_index: 0,
@@ -1601,6 +1615,8 @@ impl App {
 
     fn on_left_click(&mut self, x: u16, y: u16) {
         let pos = Position { x, y };
+        // Only a list click keeps it (below); any other click forgets it.
+        let last_list_click = self.last_list_click.take();
         if self.rail_rect.contains(pos) {
             let row = y.saturating_sub(self.rail_rect.y + 1);
             self.set_mode(if row == 0 { Mode::Mail } else { Mode::Calendar });
@@ -1633,12 +1649,31 @@ impl App {
                 } else {
                     self.msg_index = idx;
                 }
+                let on_header =
+                    self.threaded_active() && matches!(self.selected_row(), Some(Row::Header(_)));
+                let clicked = ListClick {
+                    folder: self.selected_folder.clone(),
+                    target: self.cursor_target().map(|(id, _)| id),
+                    header: on_header,
+                };
+                let again = last_list_click.as_ref() == Some(&clicked);
+                self.last_list_click = Some(clicked);
                 // Click-to-select, click-again-to-open: a second click on the
                 // already-open row activates it (the terminal "double-click").
+                // A draft is never previewed (#2096: a synced draft is
+                // `is_draft`), so:
+                // - a draft's message row (flat, or a thread's message row)
+                //   activates on the first click, as Enter does;
+                // - a thread header whose latest message is a draft only
+                //   selects on the first click, and a second click on the
+                //   same header (same folder, same latest message) activates
+                //   (toggles) it, as for any header.
                 match self.cursor_target() {
                     Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
                         self.activate_selected()
                     }
+                    Some((_, true)) if !on_header => self.activate_selected(),
+                    Some((_, true)) if again => self.activate_selected(),
                     _ => self.preview_selected_message(),
                 }
             }
@@ -3036,19 +3071,41 @@ impl App {
 
     /// Loads draft/reply/forward-draft `id` from the store and opens the
     /// composer on it: `Store::draft` for the message row + body,
-    /// `compose_html::from_html` to parse the body back into an editable
-    /// `RichText`, `editcore::ops::Editor::from` to wrap it. Three callers
-    /// share this: `compose_new` (a just-created empty draft),
-    /// `on_sync_event`'s `DraftReady` handling (a reply/forward draft the
-    /// engine just fetched), and `ui::activate` (resuming a message already
-    /// sitting in Drafts, via `MessageRow::is_draft`). A no-op if the store
-    /// has nothing for `id` — a stale/foreign id, or (for `DraftReady`) a
-    /// race where the row was deleted before this ran.
+    /// `draft_rich_text` to turn the body into an editable `RichText` (an
+    /// html body parsed, a text one line by line),
+    /// `editcore::ops::Editor::from` to wrap it. Three callers share this:
+    /// `compose_new` (a just-created empty draft), `on_sync_event`'s
+    /// `DraftReady` handling (a reply/forward draft the engine just
+    /// fetched), and `ui::activate` (resuming a message already sitting in
+    /// Drafts, via `MessageRow::is_draft`). A no-op if the store has nothing
+    /// for `id` — a stale/foreign id, or (for `DraftReady`) a race where the
+    /// row was deleted before this ran.
+    ///
+    /// Only a draft whose body was written here opens in the composer
+    /// (`Store::draft_body_is_local`: compose's own saves, a new message, a
+    /// composed reply/forward; a text body fetched before #1901, stored
+    /// with no format, is marked fetched by the store's #2096 migration in
+    /// any folder). A draft made in Outlook or on the web (`is_draft` since
+    /// #2096) has no body, or one `FetchBody` stored, which is Graph's
+    /// rendering of it (text, here): it opens read-only in the
+    /// reader (which fetches a missing body), as it did before #2096, so its
+    /// rendering is never saved back over it. Editing such a draft here is
+    /// not supported.
     pub fn open_draft(&mut self, id: &str) {
-        let Ok(Some((row, body))) = self.store.draft(id) else {
+        let local = self.store.draft_body_is_local(id).unwrap_or(false);
+        let found = if local {
+            self.store.draft(id).ok().flatten()
+        } else {
+            None
+        };
+        let Some((row, body)) = found else {
+            if let Ok(Some(_)) = self.store.message_row(id) {
+                self.open_message(id);
+                self.focus = Pane::Reading;
+            }
             return;
         };
-        let editor = Editor::from(compose_html::from_html(&body.content));
+        let editor = Editor::from(draft_rich_text(&body));
         let attachments = self.store.outbound_attachments(&row.id).unwrap_or_default();
         self.compose = Some(Compose {
             to: row.to_recipients,
@@ -3061,6 +3118,7 @@ impl App {
             autocomplete: None,
             attachments,
         });
+        self.compose_baseline = self.compose.as_ref().map(ComposeSnapshot::of);
     }
 
     /// Acts on the last request the compose view's key handling recorded on
@@ -3087,9 +3145,20 @@ impl App {
         let Some(action) = self.compose_action.take() else {
             return;
         };
+        let baseline = self.compose_baseline.take();
         let Some(compose) = self.compose.take() else {
             return;
         };
+        // Esc on a draft nothing was changed in since it opened saves
+        // nothing (#2096): no local write and no `SaveDraft` that would PATCH
+        // the server's draft with what it already has. A `local:` draft
+        // still saves: its Save is what creates it on Graph.
+        if action == ComposeAction::Save
+            && !compose.draft_id.starts_with("local:")
+            && baseline.as_ref() == Some(&ComposeSnapshot::of(&compose))
+        {
+            return;
+        }
         if action == ComposeAction::Discard {
             // Only the files not on the Graph draft yet: one a failed send
             // uploaded stays listed, as Send would still deliver it (#1874).
@@ -3836,6 +3905,8 @@ impl App {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed message");
@@ -4121,6 +4192,71 @@ fn parse_attendee_part(part: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What a left click on the list landed on (#2096, `App::last_list_click`):
+/// the folder shown, the row's target (`cursor_target`'s id: a header's
+/// latest message, else the row's own), and whether it was a thread header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListClick {
+    folder: Option<String>,
+    target: Option<String>,
+    header: bool,
+}
+
+/// Everything Esc's save writes for a draft (#2096): its fields, its body
+/// as the HTML it would save, and its attachments. Equal snapshots at open
+/// and at Esc mean nothing changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposeSnapshot {
+    draft_id: String,
+    subject: String,
+    to: String,
+    cc: String,
+    bcc: String,
+    html: String,
+    attachments: Vec<mailcore::store::OutboundAttachment>,
+}
+
+impl ComposeSnapshot {
+    fn of(c: &Compose) -> ComposeSnapshot {
+        ComposeSnapshot {
+            draft_id: c.draft_id.clone(),
+            subject: c.subject.clone(),
+            to: c.to.clone(),
+            cc: c.cc.clone(),
+            bcc: c.bcc.clone(),
+            html: compose_html::to_html(&c.editor.text),
+            attachments: c.attachments.clone(),
+        }
+    }
+}
+
+/// The compose editor's document for a stored draft body (#2096): an
+/// `html` body is parsed as HTML (`compose_html::from_html`); any other is
+/// plain text, one paragraph per line (`\r\n` or `\n`, an empty line an
+/// empty paragraph), so its line breaks and any `<…>` survive. A text body
+/// is what `FetchBody` stores under lookxy's `BodyFormat::Text` for a draft
+/// synced from elsewhere, and what `createReply` gives for a plain-text
+/// original; parsed as HTML its newlines would fold into spaces and
+/// `<alice@x>` would vanish as a tag, and Save would PATCH that onto Graph.
+fn draft_rich_text(body: &Body) -> RichText {
+    if body.content_type.eq_ignore_ascii_case("html") {
+        return compose_html::from_html(&body.content);
+    }
+    let blocks = body
+        .content
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                Block::Paragraph(Vec::new())
+            } else {
+                Block::Paragraph(vec![Run::plain(line)])
+            }
+        })
+        .collect();
+    RichText { blocks }
+}
+
 /// Builds the initial body HTML for a new message: empty when the signature is
 /// blank; otherwise an empty first paragraph (where the cursor lands), a `--`
 /// separator, then one paragraph per signature line (HTML-escaped). Only new
@@ -4179,6 +4315,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed invite");
@@ -4604,6 +4742,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .unwrap();
@@ -4844,6 +4984,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed m2");
@@ -4882,6 +5024,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed m3");
@@ -5575,6 +5719,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("update message to has_attachments=true");
@@ -5618,6 +5764,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("seed message");
@@ -6679,6 +6827,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("mark m1 has_attachments");
@@ -6712,6 +6862,8 @@ pub(crate) mod tests {
                     reminder_at: String::new(),
                     reminder_signal_at: String::new(),
                     flag_due_at: String::new(),
+                    internet_message_id: String::new(),
+                    in_reply_to: String::new(),
                 },
             )
             .expect("mark m2 has_attachments");
@@ -6828,6 +6980,402 @@ pub(crate) mod tests {
         assert_eq!(compose.cc, "carol@example.com");
         assert_eq!(compose.editor.text.plain(), "Hello");
         assert_eq!(compose.draft_id, id);
+    }
+
+    /// Seeds `d1`, a reply draft made in Outlook on the web and synced as
+    /// a draft (#2096) with no body in the store, into the flat list, and
+    /// returns the receiver of the commands the app sends.
+    fn seed_synced_draft(app: &mut App) -> std::sync::mpsc::Receiver<SyncCommand> {
+        use mailcore::graph::model::{Message, Recipient};
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "d1".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Re: Hello".into(),
+                    from: Recipient {
+                        name: "Me".into(),
+                        address: "me@example.com".into(),
+                    },
+                    to: vec![Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    }],
+                    cc: vec![],
+                    received: "2026-07-16T11:00:00Z".into(),
+                    sent: String::new(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "draft".into(),
+                    is_draft: true,
+                    is_meeting_request: false,
+                    meeting_message_type: None,
+                    protection: Default::default(),
+                    meeting_reminder_on: false,
+                    categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
+                    internet_message_id: "<d1@x>".into(),
+                    in_reply_to: "<m1@x>".into(),
+                },
+            )
+            .unwrap();
+        app.threaded = false;
+        app.reload_messages();
+        app.focus = Pane::List;
+        app.msg_index = app.messages.iter().position(|m| m.id == "d1").unwrap();
+        assert!(app.messages[app.msg_index].is_draft);
+        cmd_rx
+    }
+
+    /// The commands `rx` holds: the ids of its `FetchBody`s, and whether
+    /// any `SaveDraft` or `SendDraft` came.
+    fn drain(rx: &std::sync::mpsc::Receiver<SyncCommand>) -> (Vec<String>, bool) {
+        let mut fetched = Vec::new();
+        let mut saved = false;
+        for c in rx.try_iter() {
+            match c {
+                SyncCommand::FetchBody { id } => fetched.push(id),
+                SyncCommand::SaveDraft { .. } | SyncCommand::SendDraft { .. } => saved = true,
+                _ => {}
+            }
+        }
+        (fetched, saved)
+    }
+
+    /// Stores `d1`'s body as `FetchBody` does: Graph's rendering, recorded
+    /// with the format asked for (lookxy's engine asks for text).
+    fn store_fetched_body(app: &App, format: mailcore::graph::model::BodyFormat, t: &str) {
+        use mailcore::graph::model::Body;
+        let stored = app
+            .store
+            .put_fetched_body_with_headers(
+                "d1",
+                &Body {
+                    content_type: t.into(),
+                    content: SYNCED_DRAFT_TEXT.into(),
+                },
+                format,
+                &[],
+            )
+            .unwrap();
+        assert!(stored);
+    }
+
+    const SYNCED_DRAFT_TEXT: &str = "Hi\r\n\r\nFrom: Alice <alice@x>";
+
+    /// Asserts `d1` is open read-only in the reader, never the composer.
+    fn assert_in_the_reader(app: &App) {
+        assert!(app.compose.is_none());
+        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
+        assert_eq!(app.focus, Pane::Reading);
+    }
+
+    #[test]
+    fn a_synced_draft_opens_read_only_in_the_reader() {
+        use mailcore::graph::model::BodyFormat;
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        // No body yet: the reader opens it and fetches the body once.
+        app.activate_selected();
+        assert_in_the_reader(&app);
+        assert!(app.body_loading);
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // With Graph's rendering stored, as text or html, it still opens in
+        // the reader, never the composer, and nothing is saved back.
+        for (format, t) in [(BodyFormat::Text, "text"), (BodyFormat::Html, "html")] {
+            store_fetched_body(&app, format, t);
+            app.focus = Pane::List;
+            app.activate_selected();
+            assert_in_the_reader(&app);
+            assert_eq!(drain(&cmd_rx), (vec![], false), "{t}");
+        }
+    }
+
+    #[test]
+    fn one_click_opens_a_synced_draft_in_the_reader() {
+        use mailcore::graph::model::BodyFormat;
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let row = 1 + app.msg_index as u16;
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        // One click opens the reader, which fetches the body once.
+        click(&mut app);
+        assert_in_the_reader(&app);
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // With the body fetched, a click still opens the reader.
+        store_fetched_body(&app, BodyFormat::Text, "text");
+        click(&mut app);
+        assert_in_the_reader(&app);
+        assert_eq!(drain(&cmd_rx), (vec![], false));
+    }
+
+    #[test]
+    fn two_clicks_on_a_header_whose_latest_is_a_draft_toggle_it() {
+        // c1 = [m1 10:00, d1 11:00]: the header's latest is the synced draft,
+        // which is never previewed. The first click only selects; the
+        // second on the same row expands, as for any header.
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        app.threaded = true;
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        let Row::Header(t) = app.visible_rows[pos] else {
+            unreachable!()
+        };
+        assert!(!app.threads[t].expanded);
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let row = 1 + pos as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        click(&mut app, row);
+        assert!(!app.threads[t].expanded);
+        assert!(app.compose.is_none() && app.selected_msg.is_none());
+        click(&mut app, row);
+        assert!(app.threads[t].expanded);
+        // Expanding opens the latest message, the synced draft, read-only.
+        assert!(app.compose.is_none());
+        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // A click elsewhere in between forgets the row: the next header
+        // click only selects again.
+        app.threads[t].expanded = false;
+        app.rebuild_visible_rows();
+        app.selected_msg = None;
+        app.focus = Pane::List;
+        click(&mut app, 200); // outside every pane
+        click(&mut app, row);
+        assert!(!app.threads[t].expanded);
+    }
+
+    #[test]
+    fn a_click_on_another_header_at_the_same_row_only_selects_it() {
+        // Header A (c3, newest) at row 0 is clicked; then A leaves the
+        // folder and a reload puts header B (c1, whose latest is the synced
+        // draft d1) at row 0. One click on B selects it and toggles
+        // nothing: the remembered click was A, not "row 0".
+        use mailcore::graph::model::{MailFolder, Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
+        let a = |id: &str, received: &str| Message {
+            id: id.into(),
+            conversation_id: "c3".into(),
+            subject: "Newer".into(),
+            from: Recipient {
+                name: "Carol".into(),
+                address: "carol@example.com".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: received.into(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "a".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+        };
+        app.store
+            .upsert_message("inbox", &a("a1", "2026-07-17T10:00:00Z"))
+            .unwrap();
+        app.store
+            .upsert_message("inbox", &a("a2", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        app.threaded = true;
+        app.reload_messages();
+        let header_at = |app: &App, pos: usize| match app.visible_rows[pos] {
+            Row::Header(t) => Some(t),
+            _ => None,
+        };
+        let t_a = header_at(&app, 0).expect("A's header first");
+        assert!(
+            app.threads[t_a]
+                .thread
+                .messages
+                .iter()
+                .any(|m| m.id == "a2")
+        );
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row: 1,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        click(&mut app); // A: previewed, selected
+        assert_eq!(app.selected_msg.as_deref(), Some("a2"));
+        // A leaves the folder; B is now at row 0.
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "archive".into(),
+                display_name: "Archive".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        app.store.move_message("a1", "archive").unwrap();
+        app.store.move_message("a2", "archive").unwrap();
+        app.reload_messages();
+        let t_b = header_at(&app, 0).expect("B's header first now");
+        assert!(
+            app.threads[t_b]
+                .thread
+                .messages
+                .iter()
+                .any(|m| m.id == "d1")
+        );
+        click(&mut app); // B, first click: selects only
+        assert!(!app.threads[t_b].expanded);
+        assert!(app.compose.is_none());
+        click(&mut app); // B, second click: toggles
+        assert!(app.threads[t_b].expanded);
+    }
+
+    #[test]
+    fn a_draft_with_a_local_text_body_opens_in_compose_as_text() {
+        // A `createReply` of a plain-text message: a body written here, as
+        // text. One paragraph per line, the empty one kept, `<alice@x>`
+        // intact.
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
+        app.store
+            .put_body(
+                "d1",
+                &Body {
+                    content_type: "text".into(),
+                    content: SYNCED_DRAFT_TEXT.into(),
+                },
+            )
+            .unwrap();
+        app.activate_selected();
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.draft_id, "d1");
+        assert_eq!(compose.editor.text.blocks.len(), 3);
+        assert_eq!(
+            compose.editor.text.plain(),
+            SYNCED_DRAFT_TEXT.replace("\r\n", "\n")
+        );
+    }
+
+    #[test]
+    fn a_draft_s_html_body_still_opens_as_html() {
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
+        app.store
+            .put_body(
+                "d1",
+                &Body {
+                    content_type: "HTML".into(),
+                    content: "<p>Thanks</p><p>a &lt;b&gt;</p>".into(),
+                },
+            )
+            .unwrap();
+        app.activate_selected();
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.editor.text.plain(), "Thanks\na <b>");
+    }
+
+    #[test]
+    fn esc_on_an_unchanged_draft_saves_nothing_and_after_an_edit_saves() {
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        let local = Body {
+            content_type: "text".into(),
+            content: SYNCED_DRAFT_TEXT.into(),
+        };
+        app.store.put_body("d1", &local).unwrap();
+        let body = |app: &App| app.store.get_body("d1").unwrap().unwrap();
+
+        // Opened and closed with Esc, untouched: no write, no `SaveDraft`.
+        app.activate_selected();
+        assert!(app.compose.is_some());
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert!(app.compose.is_none());
+        assert_eq!(body(&app), local);
+        assert_eq!(drain(&cmd_rx), (vec![], false));
+
+        // Opened again and edited: Esc saves as before.
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose.as_mut().unwrap().editor.insert_text("!");
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(body(&app).content_type, "html");
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+
+        // A field edit counts too, and Send always sends.
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose.as_mut().unwrap().subject.push('!');
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose_action = Some(ComposeAction::Send);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+    }
+
+    #[test]
+    fn esc_on_an_unchanged_new_message_still_saves_it() {
+        // A `local:` draft's Save is what creates it on Graph.
+        let mut app = App::for_test_with_seeded_store();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+        app.compose_new();
+        assert!(app.compose.is_some());
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
     }
 
     #[test]

@@ -675,18 +675,23 @@ pub struct EventInput {
 
 /// The `$select` fields covering every header field `Message::from_json`
 /// reads, so delta pages carry everything the local store needs without
-/// an extra per-message fetch.
+/// an extra per-message fetch. `internetMessageId` and `isDraft` since
+/// #2096: what a reply's In-Reply-To names, and Graph's draft flag, so a
+/// draft made elsewhere stays a draft.
 const MESSAGE_SELECT: &str = "id,conversationId,subject,from,toRecipients,ccRecipients,\
-receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories";
+receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories,\
+internetMessageId,isDraft";
 
 /// The `$expand` that brings a message's Outlook reminder (#2054), its
-/// message class (#2081) and its protection (#2088): the three
+/// message class (#2081), its protection (#2088) and its In-Reply-To
+/// (#2096): the three
 /// PSETID_Common named properties `Message::from_json` reads
 /// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
 /// the `REMINDER_*_PROP` ids), `PidTagMessageClass` (`MESSAGE_CLASS_PROP`),
 /// from which a meeting message's type is read, and `PidTagSensitivity`,
 /// the `msip_labels` header and `PidNameContentClass`
-/// (`SENSITIVITY_PROP`, `MSIP_LABELS_PROP`, `CONTENT_CLASS_PROP`), filtered
+/// (`SENSITIVITY_PROP`, `MSIP_LABELS_PROP`, `CONTENT_CLASS_PROP`), and
+/// `PidTagInReplyToId` (`IN_REPLY_TO_PROP`), filtered
 /// so nothing else comes. Quotes and braces are percent-encoded, so the URL
 /// goes out as written here. One expand: a 400 on any term sends the call
 /// again without all of them.
@@ -697,10 +702,11 @@ id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x85
 id%20eq%20%27String%200x001A%27%20or%20\
 id%20eq%20%27Integer%200x0036%27%20or%20\
 id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20msip_labels%27%20or%20\
-id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20Content-Class%27)";
+id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20Content-Class%27%20or%20\
+id%20eq%20%27String%200x1042%27)";
 
-/// `target` with the reminder, class and protection `$expand` (#2054,
-/// #2081, #2088) appended.
+/// `target` with the reminder, class, protection and In-Reply-To
+/// `$expand` (#2054, #2081, #2088, #2096) appended.
 fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
@@ -7810,13 +7816,14 @@ mod tests {
     }
 
     #[test]
-    fn message_expand_names_the_reminder_class_and_protection_properties() {
+    fn message_expand_names_every_property() {
         // The `$filter` inside the expand, decoded, is exactly the three
-        // reminder property ids, the message class id and the three
-        // protection ids (#2088) the model reads.
+        // reminder property ids, the message class id, the three
+        // protection ids (#2088) and the In-Reply-To id (#2096) the model
+        // reads.
         use crate::graph::model::{
-            CONTENT_CLASS_PROP, MESSAGE_CLASS_PROP, MSIP_LABELS_PROP, REMINDER_TIME_PROP,
-            SENSITIVITY_PROP,
+            CONTENT_CLASS_PROP, IN_REPLY_TO_PROP, MESSAGE_CLASS_PROP, MSIP_LABELS_PROP,
+            REMINDER_TIME_PROP, SENSITIVITY_PROP,
         };
         let decoded = MESSAGE_EXPAND
             .replace("%20", " ")
@@ -7829,10 +7836,79 @@ mod tests {
                 "singleValueExtendedProperties($filter=id eq '{REMINDER_SET_PROP}' or \
                  id eq '{REMINDER_TIME_PROP}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or \
                  id eq '{MESSAGE_CLASS_PROP}' or id eq '{SENSITIVITY_PROP}' or \
-                 id eq '{MSIP_LABELS_PROP}' or id eq '{CONTENT_CLASS_PROP}')"
+                 id eq '{MSIP_LABELS_PROP}' or id eq '{CONTENT_CLASS_PROP}' or \
+                 id eq '{IN_REPLY_TO_PROP}')"
             )
         );
         assert!(!MESSAGE_EXPAND.contains(' '));
+    }
+
+    #[test]
+    fn message_select_names_internet_message_id_and_is_draft() {
+        // #2096: the Internet message id a reply's In-Reply-To names, and
+        // Graph's draft flag, on every message a select-bearing request
+        // brings.
+        let fields: Vec<&str> = MESSAGE_SELECT.split(',').collect();
+        assert!(fields.contains(&"internetMessageId"), "{MESSAGE_SELECT}");
+        assert!(fields.contains(&"isDraft"), "{MESSAGE_SELECT}");
+        assert!(!MESSAGE_SELECT.contains(' '));
+    }
+
+    #[test]
+    fn delta_page_reads_internet_message_id_in_reply_to_and_is_draft() {
+        // A reply draft synced from elsewhere (its In-Reply-To in Graph's
+        // lower-case echo of the tag), a sent reply without `isDraft`
+        // true, and a message read without the expand: each reads its own
+        // ids and draft flag, and only the first two carry an In-Reply-To.
+        let body = r#"{"value":[
+            {"id":"D1","subject":"Re: a","receivedDateTime":"2026-11-10T00:00:00Z",
+             "from":{"emailAddress":{"name":"Me","address":"me@x"}},
+             "internetMessageId":"<d1@x>","isDraft":true,
+             "singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"string 0x1042","value":"<m1@x>"}]},
+            {"id":"S1","subject":"Re: b","receivedDateTime":"2026-11-10T00:00:00Z",
+             "from":{"emailAddress":{"name":"Me","address":"me@x"}},
+             "internetMessageId":"<s1@x>","isDraft":false,
+             "singleValueExtendedProperties":[
+                {"id":"String 0x1042","value":"<m2@x>"}]},
+            {"id":"N1","subject":"c","receivedDateTime":"2026-11-10T00:00:00Z",
+             "from":{"emailAddress":{"name":"A","address":"a@x"}},
+             "internetMessageId":7}
+            ],"@odata.deltaLink":"http://x/d"}"#;
+        let srv = FakeServer::start(vec![get_route("/me/mailFolders/F1/", 200, body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                crate::graph::model::DeltaItem::Upsert(m, f) => (
+                    m.id.as_str(),
+                    m.internet_message_id.as_str(),
+                    m.in_reply_to.as_str(),
+                    m.is_draft,
+                    f.writes_internet_message_id(),
+                    f.writes_in_reply_to(),
+                    f.writes_is_draft(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("D1", "<d1@x>", "<m1@x>", true, true, true, true),
+                ("S1", "<s1@x>", "<m2@x>", false, true, true, true),
+                ("N1", "", "", false, false, false, true),
+            ]
+        );
+        let path = &srv.requests()[0].path;
+        assert!(path.contains("internetMessageId,isDraft"), "{path}");
+        assert!(
+            path.ends_with(&format!("&$expand={MESSAGE_EXPAND}")),
+            "{path}"
+        );
     }
 
     #[test]
