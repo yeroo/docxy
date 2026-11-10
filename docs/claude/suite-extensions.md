@@ -122,7 +122,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The fixture adds, after the 2x2 table, a 100% table imported from HTML
   (`fitted_html`, with a link to `CELL_URL`; in the model only) and a fixed
   12000-twip table.
-- Out of scope: Print Layout (#1888), keyboard selection in
+- Out of scope: keyboard selection in
   read-only mode (the editing mode has it), table selection zones, a
   context menu, anchor links scrolling inside the view (they reach the
   callback as `#name`), macOS ⌘-key routing for the view (untested).
@@ -342,6 +342,67 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Not done: Replace, Match case and whole words, a host API to open Find
   from an extension's ribbon, F3 with the box closed (it bubbles as before),
   IME and dead keys in the box (the view's plain key-downs, as #1947).
+
+## Print Layout in the embedded view (#1888)
+
+- `DocView::set_layout(DocLayout)` / `layout()`: `DocLayout::Web` (the
+  default, the flow) or `Print` (`#[non_exhaustive]`). The setter notifies
+  only on a change and reveals the caret; the selection, zoom, editing
+  mode and Find box stay. `page_count()` is the Print Layout page count in
+  either layout (`print_sheet::page_count`, the live body, all markup: a
+  document tab's `doc {}` `scroll.page_count` flows the markup view's
+  body, equal for a file without revisions).
+- Sharing, not a second renderer: `print_sheet.rs` holds what both Print
+  Layouts use: `band_el` (Docxy's `build_band` closure moved verbatim; its
+  line-number `slot_for` is a parameter, the view passes `|_| None`),
+  `frame_geom` (a header/footer frame's `FrameGeom`, #767),
+  `canvas_color`, `CANVAS_PAD` (24 px), `SHEET_GAP` (18 px) and
+  `SHEET_BORDER`. Docxy's sheets (header/footer editing, rulers, line
+  numbers, double-clicks, `page_follow`) stay in `Docxy::render`.
+- The view's plan is `print_sheet::page_plan` over its live editor: the
+  flow, slots, parts, the shown parts' blocks and page values. Its last
+  section is `print_sheet::last_sect`: the body's trailing sectPr, else
+  the package's, else `""`. That differs from a tab's `final_sect_pr`,
+  which reads none without a package: a package-less HTML mail keeps its
+  225-twip margins (#1928). The unit tests in `print_sheet/tests.rs` hold
+  the view's plan equal to a document tab's (`tab_page_flow`,
+  `hf::slots_of`, `hf::resolve`) for `header-inherit.docx`,
+  `fixture_document()` and `sections_document()`.
+- `doc_view::print_sheets` draws each page as Docxy does: a sheet of its
+  section's size (`content_look`'s page colour, so the host's
+  `page_background` paints the dark sheet), the header in the top margin
+  at the header distance, the footer in the bottom margin, the bands with
+  their own section's margins and columns, framed header/footer
+  paragraphs at their frame. The body goes through the view's
+  `RenderCtx` with `fit_width: None, flow: false, paras: None`, so
+  selection, links, Find and the caret reveal work on pages unchanged;
+  headers and footers are `hf_els` / `hf_para_el`, drawn only (not in
+  `Words`: not selectable, not followed). Canvas: `CANVAS_DARK` under a
+  dark sheet, `2b2b2b` for a light sheet on a dark theme, else `9a9a9a`.
+  `page_inset` pads Web Layout only. A sheet is at least its page's
+  height (`min_h`): one whose content runs past the flow's estimate
+  grows, as in a document tab.
+- In Print, `text_w`, `column` and `painted_gen` are left as Web set them
+  (Web's table fit wants `text_w` for the switch back); `harness_json`
+  reports `text_width`, `column_left` and `table_widths`' fit against
+  `null`, and `layout_json` answers `painted: false`.
+- Harness: `ext-doc-set {"layout":"web"|"print"}`; `ext-doc-read` adds
+  `layout`, `page_count`, `pages` (each sheet painted last frame: `page`
+  1-based, view-relative `x`/`y`/`w`/`h`, `header`/`footer` part names or
+  null, `frames` relative to the sheet with `header` and `right`) and
+  `canvas_color`; `ext-doc-word {"text"}` gives a painted word's box and,
+  in Print, its `page` and `page_x`/`page_y` on the sheet (the sheet's
+  1 px border counts: a 1" margin is `page_x` 97);
+  `ext-doc-load {"fixture":"sections"|"header-inherit"}`
+  (`ext_fixture::named_document`; `header-inherit` is `include_bytes!` of
+  the fixture, loaded by `load_bytes`). `sections_document()`: Letter
+  with a header and a footer whose PAGE number is framed at the right
+  margin, a landscape section with 0.5" margins, two 3" columns 0.5"
+  apart with `w:sep`, then a continuous one-column section. The
+  `issue 1888` tests in `uiharness/cases/ext-doc-view.uit`.
+- Not done: rulers, line numbers, header/footer editing, selection or
+  links in headers/footers, the document's page colour (#651), the page
+  tip, page navigation or a current-page API, side-by-side pages.
 
 ## Extension ribbons and the suite theme (#1870)
 

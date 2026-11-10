@@ -60,7 +60,7 @@ issue number to find its notes.
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),
   page inset and page background (#2003), its scrollbars (#2080), its Find
-  box (#1887), an extension's ribbon
+  box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab
   (#1923).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
