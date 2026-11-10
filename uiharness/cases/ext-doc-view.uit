@@ -14,6 +14,12 @@
 # (open, query, field_focused, count, current, current_path,
 # current_in_view, hits_painted), its regions `ext-doc-find:<field|prev|
 # next|close>` and the input `ext-doc-find` (`pointer-click`, `field-read`).
+# `ext-doc-set {"layout":"print"}` switches the view to Print Layout
+# (#1888): `ext-doc-read`'s `layout`, `page_count`, `pages` (each painted
+# sheet, its header/footer part and framed paragraphs) and `canvas_color`;
+# `ext-doc-word {"text"}` gives a painted word's sheet and its place on it;
+# `ext-doc-load {"fixture":"sections"|"header-inherit"}` shows a document
+# with sections of their own geometry, or that file.
 # Each test opens its own Mail tab and closes it at the end.
 ext fixture
 
@@ -531,6 +537,248 @@ test issue 1887 a document tab's Find bar left open takes no key the extension's
   assert reply.value is zz
   call real-key {"key":"escape"}
   assert find_open is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1888 the view switches to Print Layout: Letter sheets on the canvas that zoom scales, then back to the flow
+  call window-size {"w":1200,"h":800}
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  # Web Layout (the default) draws no sheets but counts the pages Print
+  # Layout splits the document into.
+  call ext-doc-call {"copy":true}
+  assert reply.layout is web
+  assert reply.page_count is 3
+  assert reply.pages is []
+  assert reply.canvas_color is null
+  assert reply.text_width is not null
+  call ext-doc-set {"layout":"print"}
+  assert reply.layout is print
+  shot window
+  call ext-doc-read {}
+  assert reply.page_count is 3
+  # Letter (12240 x 15840 twips) at zoom 1, 24 px below the canvas's top.
+  # A sheet is at least its page's height: the first two grow with what
+  # they draw (the split estimates heights, as a document tab's does).
+  assert reply.pages.0.page is 1
+  assert reply.pages.0.w is 816
+  assert reply.pages.0.y is 24
+  assert reply.pages.2.h is 1056
+  assert reply.pages.0.header is null
+  assert reply.pages.0.footer is null
+  assert reply.pages.2.page is 3
+  assert reply.canvas_color is 9a9a9a
+  assert reply.page_color is ffffff
+  # The flow's text column is Web Layout's alone.
+  assert reply.text_width is null
+  assert reply.column_left is null
+  call ext-doc-layout {}
+  assert reply.painted is false
+  # The heading starts at the sheet's 1" margin, inside its 1 px border.
+  call ext-doc-word {"text":"Embedded"}
+  assert reply.page is 1
+  assert reply.page_x is 97
+  # The zoom scales the sheets.
+  call pointer-click {"region":"ext-doc-word:Alpha"}
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+="}
+  call real-key {"key":"ctrl+="}
+  shot window
+  call ext-doc-read {}
+  assert reply.zoom is 1.5
+  assert reply.pages.0.w is 1224
+  assert reply.pages.2.h is 1584
+  call real-key {"key":"ctrl+0"}
+  # Back to the flow: no sheets, the text column as before.
+  call ext-doc-set {"layout":"web"}
+  shot window
+  call ext-doc-read {}
+  assert reply.layout is web
+  assert reply.pages is []
+  assert reply.canvas_color is null
+  assert reply.text_width is {ext-doc-call.text_width}
+  call ext-doc-layout {}
+  assert reply.painted is true
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1888 each section's sheet has its own size, margins and columns, and the footer's page number its frame
+  call window-size {"w":1400,"h":900}
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"fixture":"sections"}
+  assert reply.page_count is 3
+  call ext-doc-set {"layout":"print"}
+  shot window
+  call ext-doc-read {}
+  # Section 1: Letter portrait; section 2: landscape; section 3: Letter.
+  assert reply.pages.0.w is 816
+  assert reply.pages.0.h is 1056
+  assert reply.pages.1.w is 1056
+  assert reply.pages.1.h is 816
+  assert reply.pages.2.w is 816
+  # Every page shows section 1's header and footer (linked to).
+  assert reply.pages.0.header is word/header1.xml
+  assert reply.pages.1.header is word/header1.xml
+  assert reply.pages.2.footer is word/footer1.xml
+  # The footer's PAGE number in its frame, at the right margin.
+  assert reply.pages.0.frames.0.header is false
+  assert reply.pages.0.frames.0.right is 720
+  assert reply.pages.1.frames.0.right is 1008
+  # Each sheet's body sits at its own section's margin (1 px border):
+  # 1" on section 1's, 0.5" on the landscape one.
+  call ext-doc-word {"text":"Portrait"}
+  assert reply.page is 1
+  assert reply.page_x is 97
+  call ext-doc-word {"text":"Landscape"}
+  assert reply.page is 2
+  assert reply.page_x is 49
+  # Section 3's two 3" columns, 0.5" apart: the first at the margin, the
+  # second past the gap; section 4 below them, one column.
+  call ext-doc-word {"text":"ColumnOne"}
+  assert reply.page is 3
+  assert reply.page_x is 97
+  call ext-doc-word {"text":"ColumnSix"}
+  assert reply.page is 3
+  assert reply.page_x is 433
+  call ext-doc-word {"text":"After"}
+  assert reply.page is 3
+  assert reply.page_x is 97
+  # The last sheet: its footer and framed page number at the bottom, and
+  # (found by Ctrl+F) its two columns with the rule between them.
+  call pointer-click {"region":"ext-doc-word:Portrait"}
+  call real-key {"key":"end"}
+  shot window
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"ColumnOne"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.current_in_view is true
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1888 a mail with no package keeps its own 15 px page margins in Print Layout, and a dark page its dark canvas
+  call window-size {"w":1200,"h":800}
+  call theme-set {"theme":"dark"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html":"<body><div>Hi there</div><div>Closing line</div></body>"}
+  call ext-doc-set {"layout":"print"}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_count is 1
+  assert reply.pages.0.w is 816
+  # A light page on a dark theme: the dark grey canvas.
+  assert reply.canvas_color is 2b2b2b
+  assert reply.page_color is ffffff
+  call ext-doc-word {"text":"Hi"}
+  assert reply.page is 1
+  assert reply.page_x is 16
+  # Dark mode for content: the dark sheet on the darker canvas.
+  call ext-doc-set {"content_dark":true}
+  shot window
+  call ext-doc-read {}
+  assert reply.canvas_color is 141414
+  assert reply.page_color is not ffffff
+  call ext-doc-set {"content_dark":false}
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1888 on a page a link press reaches the extension's callback, a drag selects and Ctrl+C copies, Ctrl+F finds the last page's line
+  call window-size {"w":1200,"h":800}
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"layout":"print"}
+  shot window
+  call pointer-click {"region":"ext-doc-link:0","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  assert reply.link_calls.0 is https://example.com/docxy
+  assert reply.selection is empty
+  call ext-doc-set {"link_click":"click"}
+  call pointer-click {"region":"ext-doc-link:0"}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  call ext-doc-set {"link_click":"ctrl-click"}
+  # A drag on page 1 selects; Ctrl+C copies its text and RTF.
+  call pointer-drag {"from":"ext-doc-word:Alpha:start","to":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.focused is true
+  assert reply.selection is Alpha Beta Gamma
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is Alpha Beta Gamma
+  assert reply.rtf_bold is Beta
+  # Line 80 is on the last page, far below the view: Find reveals it.
+  call real-key {"key":"ctrl+f"}
+  call real-type {"text":"Line 80"}
+  shot window
+  call ext-doc-read {}
+  assert reply.find.count is 1
+  assert reply.find.current_path.0 is 87
+  assert reply.find.current_in_view is true
+  assert reply.scroll_y is not 0
+  assert reply.selection is Line 80
+  call ext-doc-word {"text":"80"}
+  assert reply.page is 3
+  call real-key {"key":"escape"}
+  # The editing mode types on a page too (back at the top first).
+  call real-key {"key":"home"}
+  call ext-doc-read {}
+  assert reply.scroll_y is 0
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-type {"text":"!"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma!
+  call ext-doc-set {"editable":false}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1888 the view's Print Layout counts and heads the pages as a document tab's for the same file
+  call window-size {"w":1200,"h":800}
+  call theme-set {"theme":"light"}
+  open copy:../fixtures/header-inherit.docx
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.scroll.page_count is 3
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"fixture":"header-inherit"}
+  call ext-doc-set {"layout":"print"}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_count is {doc.scroll.page_count}
+  # The parts the document tab shows on each page (print_sheet's unit
+  # test holds them equal): section 2 links to section 1's header, section
+  # 3 has its own and inherits the footer.
+  assert reply.pages.0.header is word/header1.xml
+  assert reply.pages.1.header is word/header1.xml
+  assert reply.pages.2.header is word/header2.xml
+  assert reply.pages.0.footer is word/footer1.xml
+  assert reply.pages.2.footer is word/footer1.xml
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

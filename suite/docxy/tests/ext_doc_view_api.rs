@@ -71,6 +71,16 @@ fn embed(doc: Document, pkg: Package, cx: &mut App) -> Reader {
         let _bg: Option<Hsla> = v.page_background();
         v.set_page_inset(None, cx);
         v.set_page_background(None, cx);
+        // Print Layout (#1888): page sheets, the page count in either
+        // layout, and back to the flow.
+        v.set_layout(ext::DocLayout::Print, cx);
+        let _pages: usize = v.page_count();
+        let _sheets = match v.layout() {
+            ext::DocLayout::Print => true,
+            // Non-exhaustive: a later layout is another arm.
+            _ => false,
+        };
+        v.set_layout(ext::DocLayout::default(), cx);
     });
     Reader { view, followed }
 }
