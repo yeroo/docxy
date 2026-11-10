@@ -141,6 +141,7 @@ issue number to find its notes.
   a reply/forward draft's DraftReady names its original and kind (#2085),
   each message's meeting message type on its row (#2081),
   each message's protection (sensitivity, label, IRM) on its row (#2088),
+  a meeting message's own reminder on its row (#2089),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 
