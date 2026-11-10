@@ -679,20 +679,28 @@ pub struct EventInput {
 const MESSAGE_SELECT: &str = "id,conversationId,subject,from,toRecipients,ccRecipients,\
 receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories";
 
-/// The `$expand` that brings a message's Outlook reminder (#2054) and its
-/// message class (#2081): the three PSETID_Common named properties
-/// `Message::from_json` reads (`PidLidReminderSet`, `PidLidReminderTime`,
-/// `PidLidReminderSignalTime`, the `REMINDER_*_PROP` ids) and
-/// `PidTagMessageClass` (`MESSAGE_CLASS_PROP`), from which a meeting
-/// message's type is read, filtered so nothing else comes. Quotes and
-/// braces are percent-encoded, so the URL goes out as written here.
+/// The `$expand` that brings a message's Outlook reminder (#2054), its
+/// message class (#2081) and its protection (#2088): the three
+/// PSETID_Common named properties `Message::from_json` reads
+/// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
+/// the `REMINDER_*_PROP` ids), `PidTagMessageClass` (`MESSAGE_CLASS_PROP`),
+/// from which a meeting message's type is read, and `PidTagSensitivity`,
+/// the `msip_labels` header and `PidNameContentClass`
+/// (`SENSITIVITY_PROP`, `MSIP_LABELS_PROP`, `CONTENT_CLASS_PROP`), filtered
+/// so nothing else comes. Quotes and braces are percent-encoded, so the URL
+/// goes out as written here. One expand: a 400 on any term sends the call
+/// again without all of them.
 const MESSAGE_EXPAND: &str = "singleValueExtendedProperties($filter=\
 id%20eq%20%27Boolean%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8503%27%20or%20\
 id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8502%27%20or%20\
 id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8560%27%20or%20\
-id%20eq%20%27String%200x001A%27)";
+id%20eq%20%27String%200x001A%27%20or%20\
+id%20eq%20%27Integer%200x0036%27%20or%20\
+id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20msip_labels%27%20or%20\
+id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20Content-Class%27)";
 
-/// `target` with the reminder and class `$expand` (#2054, #2081) appended.
+/// `target` with the reminder, class and protection `$expand` (#2054,
+/// #2081, #2088) appended.
 fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
@@ -7802,9 +7810,14 @@ mod tests {
     }
 
     #[test]
-    fn message_expand_names_the_reminder_and_class_properties() {
+    fn message_expand_names_the_reminder_class_and_protection_properties() {
         // The `$filter` inside the expand, decoded, is exactly the three
-        // reminder property ids and the message class id the model reads.
+        // reminder property ids, the message class id and the three
+        // protection ids (#2088) the model reads.
+        use crate::graph::model::{
+            CONTENT_CLASS_PROP, MESSAGE_CLASS_PROP, MSIP_LABELS_PROP, REMINDER_TIME_PROP,
+            SENSITIVITY_PROP,
+        };
         let decoded = MESSAGE_EXPAND
             .replace("%20", " ")
             .replace("%27", "'")
@@ -7814,12 +7827,76 @@ mod tests {
             decoded,
             format!(
                 "singleValueExtendedProperties($filter=id eq '{REMINDER_SET_PROP}' or \
-                 id eq '{}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or id eq '{}')",
-                crate::graph::model::REMINDER_TIME_PROP,
-                crate::graph::model::MESSAGE_CLASS_PROP
+                 id eq '{REMINDER_TIME_PROP}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or \
+                 id eq '{MESSAGE_CLASS_PROP}' or id eq '{SENSITIVITY_PROP}' or \
+                 id eq '{MSIP_LABELS_PROP}' or id eq '{CONTENT_CLASS_PROP}')"
             )
         );
         assert!(!MESSAGE_EXPAND.contains(' '));
+    }
+
+    #[test]
+    fn delta_page_reads_each_message_protection() {
+        // The protection comes back in the expand beside the class (Graph's
+        // short tag form, a lower-cased GUID, a string Sensitivity): each
+        // item reads its own, and every item carried the class, so each
+        // writes, the plain one its default.
+        use crate::graph::model::{MessageProtection, Sensitivity};
+        let body = r#"{"value":[
+            {"id":"M1","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"String {00020386-0000-0000-c000-000000000046} Name msip_labels",
+                 "value":"MSIP_Label_1b2c3d4e-0000-0000-0000-000000000001_Enabled=true; MSIP_Label_1b2c3d4e-0000-0000-0000-000000000001_Name=Confidential"}]},
+            {"id":"M2","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"Integer 0x36","value":"3"}]},
+            {"id":"M3","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"String {00020386-0000-0000-c000-000000000046} Name content-class",
+                 "value":"rpmsg.message"}]},
+            {"id":"M4","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"}]}
+            ],"@odata.deltaLink":"http://x/d"}"#;
+        let srv = FakeServer::start(vec![get_route("/me/mailFolders/F1/", 200, body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                crate::graph::model::DeltaItem::Upsert(m, f) => {
+                    (m.id.as_str(), m.protection.clone(), f.writes_protection())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let labelled = MessageProtection {
+            has_label: true,
+            label_name: "Confidential".into(),
+            ..Default::default()
+        };
+        let confidential = MessageProtection {
+            sensitivity: Sensitivity::Confidential,
+            ..Default::default()
+        };
+        let irm = MessageProtection {
+            is_rights_protected: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            got,
+            [
+                ("M1", labelled, true),
+                ("M2", confidential, true),
+                ("M3", irm, true),
+                ("M4", MessageProtection::default(), true),
+            ]
+        );
+        assert!(
+            srv.requests()[0]
+                .path
+                .ends_with(&format!("&$expand={MESSAGE_EXPAND}"))
+        );
     }
 
     #[test]

@@ -117,6 +117,7 @@ mod tests {
             bcc_recipients: String::new(),
             is_meeting_request: false,
             meeting_message_type: None,
+            protection: Default::default(),
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
