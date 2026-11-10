@@ -3065,15 +3065,19 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   reached Graph is its own queued op, sent after it under the Graph id. A queued op on a folder
   still `local:` (its create was refused and discarded) sends nothing. A create under a parent,
   or a move into a dest, that is still `local:` is refused (`Parse`). A message `Move` into a
-  folder still `local:` sends nothing. That folder's create was refused, or the folder was
-  deleted before its create was sent. Either way the store dropped the folder with the message
-  and started a mail reconverge, which brings the message back where Graph has it. A folder
-  move is sent even when its row is gone, as long as its id is not `local:`: a delete of the
-  Graph folder it was moved under took the row, and that delete, queued after the move, must
-  find it there on Graph too. A move under a `local:` dest can never be sent: when that
-  folder (or one above it) is deleted, `delete_folder` drops the move and queues a
-  `DeleteFolder` of its own for the moved Graph folder (`delete_roots`), carrying its part of
-  the snapshot (no row is in two snapshots), so a refusal restores it under its old parent.
+  folder still `local:` sends nothing; it is only a guard. When the store removes such a
+  folder (its create refused, or the folder deleted before its create was sent) it drops
+  every queued message move into it, whatever the folder still holds. A draft moved there is
+  filed back in Drafts on a refused create (a delete refuses to take one), and other mail
+  comes back by a mail reconverge, where Graph has it. A folder move is sent even when its
+  row is gone, as long as its id is not `local:`: a delete of the Graph folder it was moved
+  under took the row, and that delete, queued after the move, must find it there on Graph
+  too. A move under a `local:` dest can never be sent: `delete_folder` drops every queued
+  `MoveFolder` into a `local:` folder it removes, wherever the moved folder is now (deleted
+  itself, or moved on). A Graph folder still under the removed one also loses its other
+  queued moves and gets a `DeleteFolder` of its own (`delete_roots`), carrying its part of the
+  snapshot (no row is in two snapshots). Its snapshot row takes the parent Graph has it under
+  (the first dropped move's `prev_parent`), so a refusal restores it there.
 - A move whose answer has a new id re-keys the folder like a create, and also clears
   `delta_link` and the backfill columns, since the links name the old id; phase 1 runs again.
   The answer's parent is stored only while the stored parent is still the one the op wrote (a
@@ -3098,9 +3102,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `FolderWriteFailed { id, write, status, error }`, `Error("{create|rename|move|delete} folder
   {id}: {error}")` and `FoldersUpdated` are sent. There are no five attempts and no
   quarantine. The status comes from `refused_write_status`, shared with the contact writes.
-  A refused create removes its `local:` folder and the `local:` folders under it
-  (`discard_local_folder`). A folder Graph has that was moved under it is left for its own
-  queued move's refusal. Mail Graph does not have in them (`unsent_mail_in_on`, the predicate
+  A refused create removes its `local:` folder and the `local:` folders reached from it
+  through `local:` parents only (`discard_local_folder`, `local_subtree_ids_on`). A folder
+  Graph has that was moved under it is left for its own queued move's refusal, and so is a
+  `local:` folder created under that one, whose create still goes to Graph under it. Mail Graph does not have in them (`unsent_mail_in_on`, the predicate
   a delete's `HoldsUnsentMail` uses: a `local:` id, `local_edit > 0`, or a queued
   `SaveDraft`/`SendDraft`) is first filed back in Drafts (or the drafts sentinel), its own save
   or send still queued, with `MessagesUpdated` for that folder. Any other message moved into
@@ -3110,6 +3115,15 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
   puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
   messages come back with the next pass's delta.
+- A refused move out of F with a delete of F (or a folder above F, in the store or in a queued
+  delete's snapshot) still queued: on Graph the folder never left F, so `DELETE F` would take
+  it and its mail, although the user moved it out first. That delete is refused locally
+  before it goes (`refuse_deletes_above`, no Graph call): dropped, its snapshot restored,
+  `FolderWriteFailed { id: F, write: Delete, status: None, error: "a folder moved out of it
+  could not be moved" }` and its `Error`, ahead of the move's own; then the folder reverts
+  under the restored F. The user can delete again. A refusal may drop ops a drain has
+  already read (this delete, a refused create's message moves), so the drain checks that
+  each op is still queued (`Store::has_op`) before it sends it.
 - Known revert limits, healed by the next listing once no op protects the row: `prev` values
   are not chained (op1 A→B refused while op2 B→C waits leaves op2's `prev` B, a name Graph
   never had), and a `local:` child created before its parent's delete is not restored (its
@@ -3148,7 +3162,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `deleting_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
   `a_queued_delete_names_every_folder_it_removed`,
   `a_refused_create_files_unsent_mail_back_in_drafts`,
-  `a_graph_folder_moved_under_a_deleted_local_folder_gets_its_own_delete`); `outbox.rs`
+  `a_graph_folder_moved_under_a_deleted_local_folder_gets_its_own_delete`,
+  `deleting_a_local_folder_drops_every_move_into_it`); `outbox.rs`
   `create_folder_reconciles_the_local_id`,
   `create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
   `create_folder_under_a_parent_that_never_reached_graph_is_refused`,
@@ -3170,7 +3185,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `deleting_a_folder_above_a_local_folder_holding_moved_mail_brings_it_back`,
   `a_folder_moved_under_a_deleted_folder_goes_with_it`,
   `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
-  `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph`).
+  `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph`,
+  `a_refused_move_out_of_a_folder_refuses_the_queued_delete_of_its_old_parent`,
+  `a_refused_delete_of_a_folder_moved_under_a_deleted_local_folder_restores_it`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
