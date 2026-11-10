@@ -3019,3 +3019,128 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `contact_match_reads_a_null_argument_as_empty`; unchanged
   `search_contacts_ranks_prefix_first_then_frequency` and
   `search_contacts_treats_underscore_literally`.
+
+## Folder writes: create, rename, move, delete (#1910)
+
+- `SyncCommand::{CreateFolder { parent, name }, RenameFolder { id, name }, MoveFolder { id,
+  dest }, DeleteFolder { id }}`. Each command's store write is one IMMEDIATE transaction that
+  writes the folder row(s) and queues the op (as the contact writes, #2063 r1), then
+  `FoldersUpdated` and a drain. Graph: `POST /me/mailFolders` (`parent: None`) or
+  `POST /me/mailFolders/{parent}/childFolders` with `{"displayName"}`;
+  `PATCH /me/mailFolders/{id}` with `{"displayName"}`; `POST /me/mailFolders/{id}/move` with
+  `{"destinationId"}`, `"msgfolderroot"` for `dest: None`; `DELETE /me/mailFolders/{id}`
+  (`GraphClient::{create,rename,move,delete}_folder`; an answer without an id is `Parse`).
+- Store (`Store::{create_local_folder, rename_folder, move_folder, delete_folder}`,
+  crate-private: hosts use the commands). Each returns `FolderWriteResult::{Written(id),
+  Unchanged, Refused(FolderRefusal)}`. A rename writes only `display_name`, a move only
+  `parent_id`, so `sort_order`, `is_expanded` and the delta link stay. The same name or the
+  same parent is `Unchanged`: nothing is queued and no event is sent. A folder made at the top
+  (and a move to the top) stores the root id the listing gives top folders
+  (`root_folder_id_on`: the parent most stored folders share that is not itself stored; NULL
+  before any listing). Graph's move answer then stores the real one.
+- Refused by the store, with nothing written or queued: an unknown id, parent or dest; the
+  drafts sentinel (`local:drafts-pending`) as any of them, since Graph never had it; a move
+  into the folder itself or a folder under it (the stored `parent_id` would hold a cycle); and
+  a delete whose subtree holds mail Graph does not have (`HoldsUnsentMail`). That is a
+  `local:` message, one a queued `SaveDraft`/`SendDraft` names (resolved through `current_id`),
+  or one with `local_edit > 0` (#2082). The cascade would lose it for good even though Graph
+  refuses the delete: `SendDraft` re-files the draft into Sent Items at command time, and its
+  op reads the row at send time (`ensure_draft_on_graph`). This is not a well-known-folder
+  rule. The engine never refuses a folder for being well known; Graph does. Reported as
+  `FolderWriteFailed { status: None }` plus `Error`; its `id` is the folder named, or a
+  create's parent.
+- A created folder lives under a `local:` id (`local_draft_id`) until its create reaches Graph.
+  `Store::reconcile_created_folder` then re-keys it (`rekey_folder_on`): the row,
+  `messages.folder_id` and the children's `parent_id`. Foreign keys are deferred to the commit
+  (`PRAGMA defer_foreign_keys`, as `messages.folder_id` has no `ON UPDATE CASCADE`), so the
+  row keeps every column, including ones added later. A stale row already under the new id
+  hands its messages and children to the kept row before it goes. `folder_aliases (old_id →
+  id)` records it, also when the row was deleted first. `Store::current_folder_id` resolves an
+  old id in one lookup: a re-key re-points the aliases that named the old id. Every folder op,
+  the message `Move` command and op (`dest`), `SyncFolder`, `SetFastFolders` and a scoped
+  `SearchMessages` resolve through it. `SyncEvent::FolderCreated { local_id, id }` and
+  `FoldersUpdated` follow a create, and the engine's fast folders are mapped through the alias.
+- `CreateFolder` sends the name it was created with. A rename or move made before the create
+  reached Graph is its own queued op, sent after it under the Graph id. A queued op on a folder
+  still `local:` (its create was refused and discarded) sends nothing. A create under a parent,
+  or a move into a dest, that is still `local:` is refused (`Parse`). A message `Move` into a
+  folder still `local:` sends nothing.
+- A move whose answer has a new id re-keys the folder like a create, and also clears
+  `delta_link` and the backfill columns, since the links name the old id; phase 1 runs again.
+  The answer's parent is stored only while the stored parent is still the one the op wrote (a
+  later queued move keeps its own). `Applied::FoldersChanged` then sends `FoldersUpdated`.
+- Delete: the folder and every folder under it go in one statement (recursive CTE on
+  `parent_id`), and their messages go by `ON DELETE CASCADE` (bodies, attachments, search
+  rows), with the delta links, as `retain_folders` removes them (#1886). The op carries a
+  snapshot of the removed rows that are not `local:` (`FolderSnapshot`: name, parent, counts,
+  well-known name, `sort_order`, `is_expanded`). A 404 is success. Soft delete (hidden rows)
+  was rejected: every message reader would need a filter. "Delete to Deleted Items" is a
+  `MoveFolder` there.
+- Refusals: 401, a throttle (429 and 503), transport and other 5xx keep the op queued and in
+  order, as for every op. Anything else (4xx, a rename's or move's 404, `Parse`) is final at
+  once (`refuse_folder_write`): the op is dropped, the store reverted, and
+  `FolderWriteFailed { id, write, status, error }`, `Error("{create|rename|move|delete} folder
+  {id}: {error}")` and `FoldersUpdated` are sent. There are no five attempts and no
+  quarantine. A refused create removes its `local:` folder and the `local:` folders under it
+  (`discard_local_folder`). A folder Graph has that was moved under it is left for its own
+  queued move's refusal. If a message had been moved into the discarded folder, the mail
+  reconverges as after a quarantine (delta links cleared), so it comes back where Graph has
+  it. A refused rename or move puts `prev_name` / `prev_parent` back only while the stored
+  value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
+  puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
+  messages come back with the next pass's delta.
+- Known revert limits, healed by the next listing once no op protects the row: `prev` values
+  are not chained (op1 A→B refused while op2 B→C waits leaves op2's `prev` B, a name Graph
+  never had), and a `local:` child created before its parent's delete is not restored (its
+  create sent nothing).
+- While an op is queued, a sync pass does not undo it (`sync_folders` reads
+  `Store::queued_folder_writes` first). A listed folder named by a queued delete, or under one
+  in the listing, is not upserted. One a queued rename names keeps its stored name, and one a
+  queued move names its stored parent; counts and the well-known name still update. A stored
+  `local:` folder is kept without a `folder_exists` GET. No Graph read is sent for a `local:`
+  folder: the pass's delta loop skips it (and so, now, the drafts sentinel, which used to get
+  a delta Graph could only refuse), `refresh_folder` (`SyncFolder`, fast ticks) sends nothing for it, and a
+  search scoped to it answers `MessageSearchResults` with no hits and sends no request. The
+  backfill needs a delta link, which such a folder never has.
+- A deferred op in the tests is answered 500, not 503: a 503 is a throttle, retried at once.
+- lookxy ignores `FolderCreated` and `FolderWriteFailed`: it has no folder management.
+- Tests: `client.rs` `create_folder_posts_top_level_and_child`,
+  `create_folder_answer_without_an_id_is_a_parse_error`,
+  `rename_folder_patches_display_name`, `move_folder_posts_destination_and_root`,
+  `delete_folder_sends_delete_and_404_is_not_found`; store `folder_write_tests`
+  (`folder_ops_round_trip_json`, `folder_writes_queue_their_op_in_the_same_transaction`,
+  `create_at_the_top_stores_the_listed_root_as_parent`,
+  `folder_writes_refuse_unknown_folders_and_the_drafts_sentinel`,
+  `move_into_itself_or_a_folder_inside_it_is_refused`,
+  `rename_and_move_keep_sort_order_and_expanded`,
+  `delete_folder_removes_subtree_messages_and_delta_links`,
+  `delete_folder_holding_unsent_mail_is_refused`,
+  `reconcile_created_folder_rekeys_messages_children_and_aliases`,
+  `reconcile_keeps_the_mail_of_a_stale_row_under_the_graph_id`,
+  `reconcile_of_a_deleted_row_still_aliases`, `current_folder_id_follows_chained_aliases`,
+  `a_move_answered_with_a_new_id_rekeys_and_clears_the_links`,
+  `a_move_answer_gives_the_parent_unless_a_later_move_wrote_one`,
+  `revert_folder_name_keeps_a_later_rename`, `revert_folder_parent_keeps_a_later_move`,
+  `discard_local_folder_leaves_folders_graph_has`); `outbox.rs`
+  `create_folder_reconciles_the_local_id`,
+  `create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
+  `create_folder_under_a_parent_that_never_reached_graph_is_refused`,
+  `rename_and_move_after_a_create_reach_the_graph_id`,
+  `move_folder_stores_the_answer_and_refuses_a_local_dest`, `delete_folder_404_is_success`,
+  `message_move_into_a_created_folder_sends_its_graph_id`; `engine.rs` `folder_writes`
+  (`create_folder_round_trip_at_the_top_and_under_a_parent`,
+  `rename_folder_patches_and_keeps_local_state`,
+  `move_folder_to_the_top_and_under_a_folder_stores_graphs_answer`,
+  `delete_folder_removes_children_and_messages_and_404_is_success`,
+  `rename_move_and_message_move_queued_behind_a_deferred_create_follow_it`,
+  `refused_folder_writes_revert_and_report`,
+  `refused_create_of_a_folder_holding_moved_mail_reconverges`,
+  `a_sync_pass_keeps_folder_writes_still_queued`,
+  `folder_commands_the_store_refuses_report_and_queue_nothing`,
+  `delete_of_sent_items_holding_a_queued_send_is_refused_and_the_send_goes_out`,
+  `fast_folders_follow_a_created_folder`).
+- Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
+  (a retry may 409 on the name Graph already has; the refusal discards the local row and the
+  next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
+  other mailboxes; returning the `local:` id synchronously (a host finds the new row on
+  `FoldersUpdated`; `FolderCreated` names both ids).
