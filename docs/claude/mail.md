@@ -2543,3 +2543,24 @@ series' first day.
   before the back-off, then `Refresh`: the PATCH before `/send` carries the user's body).
   `engine.rs` `a_kept_draft_body_is_prefetched_once_not_in_a_loop` (one body GET for the
   protected row in a run).
+
+## DraftReady names its request (#2085)
+
+- `SyncEvent::DraftReady { id, original, kind }`: `id` is the stored draft, `original`
+  the message id exactly as the `ComposeReply` / `ComposeForward` command carried it, and
+  `kind` (`DraftKind::Reply`, `ReplyAll`, `Forward`) the answer asked for. A host that
+  stopped waiting for a request (a timeout, the form closed) compares them with the
+  request it waits for now and drops a late draft of an earlier one: a failed request
+  emits no `DraftReady`, and no failure event names the request (a transport error emits
+  only `State(Offline)`, when the engine was not offline already; a throttle at most a
+  `State` change, and the request is not retried; others an `Error` or the sign-in
+  events), so "late" and "failed" cannot be told apart otherwise, and two
+  answers in one conversation share `conversation_id`.
+- `original` is never rewritten. Graph is addressed by `current_id` (an id from before a
+  move, #1896), as every other message command is, but `compose_reply` /
+  `compose_forward` pass the command's own id to `store_composed_draft` for the event.
+- lookxy opens every draft it is handed (`{ id, .. }`).
+- Tests: `engine.rs` `compose_draft_ready_names_its_original_and_kind` (M1 reply, M2
+  reply all, M3 forward, three events in order); `moved::`
+  `compose_reply_by_the_old_id_after_a_move_names_the_old_id` (`createReply` POSTs to
+  `NEW1`, the event names `OLD1`).
