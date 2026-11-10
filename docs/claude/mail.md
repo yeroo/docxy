@@ -3115,19 +3115,38 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
   puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
   messages come back with the next pass's delta.
-- A refused move out of F with a delete of F (or a folder above F, in the store or in a queued
-  delete's snapshot) still queued: on Graph the folder never left F, so `DELETE F` would take
-  it and its mail, although the user moved it out first. That delete is refused locally
-  before it goes (`refuse_deletes_above`, no Graph call): dropped, its snapshot restored,
-  `FolderWriteFailed { id: F, write: Delete, status: None, error: "a folder moved out of it
-  could not be moved" }` and its `Error`, ahead of the move's own; then the folder reverts
-  under the restored F. The user can delete again. A refusal may drop ops a drain has
-  already read (this delete, a refused create's message moves), so the drain checks that
-  each op is still queued (`Store::has_op`) before it sends it.
+- **Deletes and the moves before them (r4).** A folder or message moved out of F, with F then
+  deleted, is still in F on Graph until its move lands; `DELETE F` would take it and its mail
+  although the user moved it out first. A move op does not record its source folder, and
+  parents change while ops wait, so one ordering rule guards every path instead of parent
+  tracking:
+  - R1: a `DeleteFolder` is sent only when no message `Move` or `MoveFolder` with a smaller
+    `seq` is still queued (`moves_queued_before`). Otherwise the drain skips it, it stays
+    queued in place, and the drain goes on. Typically an earlier move got a 4xx and is kept
+    for its next attempt.
+  - R2: a move that leaves the outbox without reaching Graph refuses locally every
+    `DeleteFolder` queued after it (`refuse_deletes_queued_after`, no Graph call). That covers
+    a `MoveFolder` refused for good, a message `Move` quarantined after `MAX_OP_ATTEMPTS`, a
+    move that sent nothing (`Applied::MoveNotSent`: a `local:` folder or dest), and moves the
+    store dropped with a removed `local:` folder (`delete_folder` and `discard_local_folder`
+    return their seqs). Each refused delete is dropped and its snapshot restored, and it is
+    reported as `FolderWriteFailed { id, write: Delete, status: None, error: "a move queued
+    before it did not reach the server" }` plus its `Error`, ahead of the move's own failure,
+    with one `FoldersUpdated`. A delete that `delete_folder` queued itself (from
+    `queued_from` on) is not refused by the moves it dropped. A delete of a `local:` folder
+    sends nothing and has an empty snapshot, so it is left.
+  - This is deliberately conservative: an unrelated delete queued after a failed move is
+    refused too, and so is one that already took the moved folder with it. The user deletes
+    again; the alternative is mail deleted on Graph. Nothing extra is persisted: the refusal
+    happens when the move leaves the outbox, and the deletes are still queued then.
+  - A refusal may drop ops a drain has already read (a delete, a refused create's message
+    moves), so the drain checks that each op is still queued (`Store::has_op`) before it sends
+    it.
 - Known revert limits, healed by the next listing once no op protects the row: `prev` values
-  are not chained (op1 A→B refused while op2 B→C waits leaves op2's `prev` B, a name Graph
-  never had), and a `local:` child created before its parent's delete is not restored (its
-  create sent nothing).
+  are not chained (op1 A→B refused while op2 B→C waits leaves op2's `prev` B, a name or parent
+  Graph never had, possibly a removed `local:` folder), and a `local:` child created before
+  its parent's delete is not restored (its create sent nothing). Neither reaches Graph: no
+  delete goes out past a move that did not land (R1, R2).
 - While an op is queued, a sync pass does not undo it (`sync_folders` reads
   `Store::queued_folder_writes` first). A listed folder named by a queued delete, or by its
   `removed` snapshot, or under one in the listing, is not upserted. The snapshot covers a
@@ -3187,7 +3206,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
   `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph`,
   `a_refused_move_out_of_a_folder_refuses_the_queued_delete_of_its_old_parent`,
-  `a_refused_delete_of_a_folder_moved_under_a_deleted_local_folder_restores_it`).
+  `a_refused_delete_of_a_folder_moved_under_a_deleted_local_folder_restores_it`,
+  `a_folder_moved_through_a_deleted_local_folder_keeps_its_old_parents_delete_back`,
+  `a_refused_create_keeps_the_delete_of_the_folder_its_moved_mail_left`,
+  `a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
