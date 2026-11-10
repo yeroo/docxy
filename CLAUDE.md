@@ -140,6 +140,7 @@ issue number to find its notes.
   a draft's unpushed body kept against a fetched one (#2082),
   a reply/forward draft's DraftReady names its original and kind (#2085),
   each message's meeting message type on its row (#2081),
+  each message's protection (sensitivity, label, IRM) on its row (#2088),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877).
 
