@@ -19031,6 +19031,9 @@ mod meeting_message_type_tests {
                 .execute_batch(
                     "DROP INDEX idx_messages_reminder;
                      DROP INDEX idx_messages_reply_drafts;
+                     DROP TRIGGER forgotten_messages_ad;
+                     DROP TRIGGER forgotten_messages_ai;
+                     DROP TRIGGER forgotten_messages_au;
                      ALTER TABLE messages DROP COLUMN internet_message_id;
                      ALTER TABLE messages DROP COLUMN in_reply_to;
                      ALTER TABLE messages DROP COLUMN meeting_reminder_on;
@@ -20139,10 +20142,14 @@ mod reply_link_tests {
                 )
                 .unwrap();
             local_id = local;
-            // Back to a store from before #2096 (after #2089).
+            // Back to a store from before #2096 (after #2089), so from
+            // before #2107's triggers too.
             s.conn
                 .execute_batch(
                     "DROP INDEX idx_messages_reply_drafts;
+                     DROP TRIGGER forgotten_messages_ad;
+                     DROP TRIGGER forgotten_messages_ai;
+                     DROP TRIGGER forgotten_messages_au;
                      ALTER TABLE messages DROP COLUMN internet_message_id;
                      ALTER TABLE messages DROP COLUMN in_reply_to;",
                 )
@@ -20158,6 +20165,24 @@ mod reply_link_tests {
         );
         assert!(row.meeting_reminder_on && row.is_draft);
         assert_eq!(row.subject, "budget M1");
+        // #2107's triggers are made after the migration that adds the
+        // column they read: a delete now leaves a tombstone.
+        s.conn
+            .execute(
+                "UPDATE messages SET internet_message_id = '<m1@x>' WHERE id = 'M1'",
+                [],
+            )
+            .unwrap();
+        s.delete_message("M1").unwrap();
+        let imid: String = s
+            .conn
+            .query_row(
+                "SELECT imid FROM forgotten_ids WHERE kind = 'message' AND id = 'M1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(imid, "<m1@x>");
         // The one-off body fixes: `(content_type, fetched_as, local)`.
         let body = |id: &str| -> (String, Option<String>, bool) {
             let (t, f) = s
