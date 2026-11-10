@@ -3070,10 +3070,15 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   write, status, error }`, `Error("{create|rename|move} folder {id}: {error}")` and
   `FoldersUpdated` are sent. There are no five attempts and no quarantine. The status comes from
   `refused_write_status`, shared with the contact writes.
-- A refused create removes its `local:` folder and the `local:` folders reached from it through
-  `local:` parents only (`discard_local_folder`, `local_subtree_ids_on`). A folder Graph has that
-  was moved under it is left for its own queued move's refusal, and so is a `local:` folder
-  created under that one, whose create still goes to Graph under it. Mail Graph does not have in
+- A refused create removes its `local:` folder and the `local:` folders created under it,
+  found by their queued creates' parents, wherever they sit now (`discard_local_folder`,
+  `refused_creates_on`, r10). Their creates are dropped, and each is reported:
+  `FolderWriteFailed { write: Create, status: None, error: "its parent folder could not be
+  created" }` plus its `Error`, after the refused folder's own, before the one `FoldersUpdated`.
+  A folder only moved under the refused one stays, with everything under it: a Graph folder, or
+  a `local:` one created elsewhere, whose create still goes to Graph where it was created. Its
+  queued move into the refused folder is refused next (`Parse`: the destination never reached
+  Graph) and reverts it to its `prev_parent`; until then it shows at the top. Mail Graph does not have in
   them (`unsent_mail_in_on`: a `local:` id, `local_edit > 0`, or a queued `SaveDraft`/`SendDraft`)
   is first filed back in Drafts (or the drafts sentinel), its own save or send still queued, with
   `MessagesUpdated` for that folder. Every queued message move into them is dropped, and when
@@ -3108,6 +3113,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `rename_and_move_keep_sort_order_and_expanded`,
   `discarding_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
   `a_refused_create_files_unsent_mail_back_in_drafts`,
+  `a_refused_create_discards_what_was_created_under_it_not_what_was_moved_there`,
   `reconcile_created_folder_rekeys_messages_children_and_aliases`,
   `reconcile_keeps_the_mail_of_a_stale_row_under_the_graph_id`,
   `reconcile_of_a_row_gone_still_aliases`, `current_folder_id_follows_chained_aliases`,
@@ -3130,6 +3136,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `has_op` skip), `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
   `a_sync_pass_keeps_folder_writes_still_queued`,
   `folder_commands_the_store_refuses_report_and_queue_nothing`,
+  `a_folder_only_moved_under_a_refused_create_keeps_its_own_create`,
+  `a_folder_created_under_a_refused_create_is_reported`,
   `fast_folders_follow_a_created_folder`).
 - Not done: deleting a folder (#2107); a lookxy folder-management UI; dedup of a create retried
   after a lost POST answer (a retry may 409 on the name Graph already has; the refusal discards
