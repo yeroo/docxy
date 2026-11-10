@@ -5388,6 +5388,16 @@ pub(crate) struct QueuedFolderWrites {
     pub emptied: HashSet<String>,
 }
 
+/// What an `EmptyFolder` run does with the ids its check refused
+/// (`Store::empty_refused`, #2110 r1).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EmptyRefused {
+    /// Allowed by the batch and stored in the folder again: deleted.
+    pub delete: Vec<String>,
+    /// Shown elsewhere or removed: kept, and reported.
+    pub kept: usize,
+}
+
 /// What `Store::delete_folder` removed besides the folder (#2107).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct FolderDelete {
@@ -5881,6 +5891,52 @@ impl Store {
         clear_folder_links_on(&tx, folder)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Sorts the ids of an `EmptyFolder` run's listing that
+    /// `delete_allow_check` refused (#2110 r1). An id stored in another
+    /// folder (or not stored: a tombstone, an internet message id held
+    /// elsewhere) is kept, as the store shows it elsewhere or removed it:
+    /// [`EmptyRefused::kept`]. An id stored in `folder` itself is
+    /// - kept, unreported, when it is unsent (`unsent_mail_in_on`): the
+    ///   command's own choice;
+    /// - deleted when the batch allows it ([`EmptyRefused::delete`]): mail
+    ///   the user emptied that another path (a fetch of a stale search hit,
+    ///   a list row read by id) stored there again before the run;
+    /// - else kept, unreported: mail that came into the folder after the
+    ///   command (moved in by a later op), which is not the command's.
+    pub(crate) fn empty_refused(
+        &self,
+        batch: &str,
+        folder: &str,
+        refused: &[String],
+    ) -> Result<EmptyRefused, StoreError> {
+        let conn = &self.conn;
+        let unsent: HashSet<String> = unsent_mail_in_on(conn, &[folder.to_string()])?
+            .into_iter()
+            .collect();
+        let mut allowed: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM folder_delete_allow WHERE batch = ?1 AND kind = 'message'",
+            )?;
+            let ids = stmt
+                .query_map(params![batch], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in ids {
+                allowed.insert(current_id_on(conn, &id)?);
+                allowed.insert(id);
+            }
+        }
+        let mut out = EmptyRefused::default();
+        for id in refused {
+            if self.message_folder(id)?.as_deref() != Some(folder) {
+                out.kept += 1;
+            } else if !unsent.contains(id) && allowed.contains(id) {
+                out.delete.push(id.clone());
+            }
+        }
+        Ok(out)
     }
 
     /// Whether `id` (resolved through `folder_aliases`) is a folder a queued

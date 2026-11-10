@@ -3394,11 +3394,12 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
 
   With 1 000 rows the per-row triggers took 0.17 s and `empty_folder` 0.01 s. The schema change
   makes lookxy's connection re-prepare its statements once, which is harmless.
-- The command emits `MessagesUpdated { folder }`, then `FoldersUpdated` and a drain
-  (`folder_command`). With `subfolders`, each folder stored right under it (read before the
-  write) is then deleted by `Engine::delete_folder`. Its `DeleteFolder` is queued after the
-  `EmptyFolder` and waits for it. Each child is refused or not on its own, and is reported as
-  #2107 reports it.
+- The command emits `MessagesUpdated { folder }`, then `FoldersUpdated` and a drain. With
+  `subfolders`, each folder stored right under it (read before the write) is deleted from the
+  store too (`Engine::delete_folder_write`, the store half of `delete_folder`), before the one
+  drain (r1): the children leave the UI at once, and their `DeleteFolder`s, queued after the
+  `EmptyFolder` and waiting for it, survive a restart. Each child is refused or not on its own,
+  and is reported as #2107 reports it.
 - The drain (`run_empty_folder`, never `apply_op`, which answers it `Parse`; `folder_op()` leaves
   it out). Like a `DeleteFolder`, it waits until no older op is queued (`has_older_op`, no
   attempt, no back-off). The drain passes a non-final 4xx, so without this a move into the folder
@@ -3409,9 +3410,15 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `@odata.nextLink`, deduplicated, an item without an id `Parse`), all before the first DELETE,
   since deleting while paging shifts the pages. It then checks them with
   `Store::delete_allow_check(batch, &[], items)`.
-  - An id refused there that the store holds in this very folder is the unsent mail the command
-    kept, its own choice: left alone and not reported.
-  - Any other refused id is kept, as the store shows it elsewhere or removed it.
+  - The refused ids are sorted by `Store::empty_refused` (r1). One stored in another folder, or
+    not stored (a tombstone, an internet message id held elsewhere), is kept and reported: the
+    store shows it elsewhere or removed it.
+  - One stored in this very folder that is unsent (`unsent_mail_in_on`) is the command's own
+    choice: left alone and not reported.
+  - One stored in this folder that the batch allows (mail the user emptied that a fetch of a
+    stale search hit or a list row by id stored there again) is deleted with the rest.
+  - One stored in this folder that the batch does not allow came in after the command (a later
+    move): left alone, not reported.
   - The rest go 20 a `$batch` (`GraphClient::delete_message_request`: `DELETE /me/messages/{id}`,
     the soft delete `OutboxOp::Delete` sends), through `bulk_batches`, the loop
     `run_mark_folder_read` now shares (`BulkRun` has a `kind`, `kept` and `rows_deleted`).
@@ -3448,7 +3455,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (the internet-message-id rule then finds no row or tombstone). Don't "fix" that clearing.
 - Known shapes: mail moved into the folder on Graph by a rule or another client after the
   command, with an old `receivedDateTime`, is deleted (never held, before the cutoff), as #1913
-  marks it read. While the op is queued no new mail shows in the folder (often Inbox, a fast
+  marks it read. The cutoff takes this client's clock (r1-m2): with it Δ ahead of Graph's, mail
+  delivered to the folder up to Δ after the command passes the filter and, never held, is
+  deleted unseen. A server time source (the `Date` header) would close it; none is read today. While the op is queued no new mail shows in the folder (often Inbox, a fast
   folder); a long throttled run makes that visible. A long run holds every op queued behind it,
   as #1913's does. Another client changing the folder between the listing and the deletes is out
   of scope, as are "empty to Deleted Items" (a move), `permanentDelete`, emptying subfolders'
@@ -3470,6 +3479,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `empty_folder_waits_for_an_older_move_into_it_and_deletes_it_under_its_new_id`,
   `empty_folder_keeps_unsent_drafts_and_reports_nothing`,
   `empty_folder_refusals_report_and_restart_the_folder_delta`, `empty_folder_survives_a_restart`,
-  `empty_folder_with_subfolders_deletes_the_children`,
+  `empty_folder_with_subfolders_deletes_the_children` (the children gone before the run's
+  listing answers), `an_emptied_message_stored_again_in_the_folder_is_deleted`,
   `a_delete_of_the_folder_drops_its_queued_empty`,
   `empty_folder_of_an_unknown_folder_reports_and_queues_nothing`).

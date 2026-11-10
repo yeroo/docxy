@@ -618,8 +618,10 @@ pub enum SyncCommand {
     /// those of what stayed, and the op is queued
     /// ([`SyncEvent::MessagesUpdated`], then [`SyncEvent::FoldersUpdated`]).
     /// Then, once no older op is queued, the engine pages every message
-    /// Graph holds there, received at or before the command (mail that
-    /// comes later stays), keeps each one the store shows elsewhere (a move
+    /// Graph holds there, received at or before the command's cutoff (the
+    /// later of this client's clock and the newest stored message: with a
+    /// clock ahead of Graph's, mail delivered up to that skew after the
+    /// command is deleted too; later mail stays), keeps each one the store shows elsewhere (a move
     /// out still unsent or refused, a lost move answer) or still holds in
     /// the folder (the unsent mail), and deletes the rest through
     /// `POST /$batch`, 20 a batch, waiting out a throttled one's
@@ -4302,17 +4304,29 @@ impl Engine {
         id: &str,
         result: Result<FolderWriteResult, StoreError>,
     ) {
+        if self.folder_written(write, id, result) {
+            self.emit(SyncEvent::FoldersUpdated);
+            self.drain_queued();
+        }
+    }
+
+    /// Whether a folder command's store write wrote (and queued its op);
+    /// a refusal or a store error is reported (`FolderWriteFailed` +
+    /// `Error`), `Unchanged` is nothing.
+    fn folder_written(
+        &self,
+        write: FolderWrite,
+        id: &str,
+        result: Result<FolderWriteResult, StoreError>,
+    ) -> bool {
         let error = match result {
-            Ok(FolderWriteResult::Written(_)) => {
-                self.emit(SyncEvent::FoldersUpdated);
-                self.drain_queued();
-                return;
-            }
-            Ok(FolderWriteResult::Unchanged) => return,
+            Ok(FolderWriteResult::Written(_)) => return true,
+            Ok(FolderWriteResult::Unchanged) => return false,
             Ok(FolderWriteResult::Refused(r)) => r.to_string(),
             Err(e) => e.to_string(),
         };
         self.report_folder_failure(id, write, None, error);
+        false
     }
 
     /// A folder op Graph refused for good (#1910): drop it and revert its
@@ -4404,6 +4418,15 @@ impl Engine {
     /// with them from outside the subtree is reported. A store refusal is
     /// `FolderWriteFailed` + `Error`.
     fn delete_folder(&mut self, id: &str) {
+        let result = self.delete_folder_write(id);
+        self.folder_command(FolderWrite::Delete, id, result);
+    }
+
+    /// `delete_folder` without its events and drain (#2110 r1: an empty's
+    /// `subfolders` writes every delete before it drains): the store write,
+    /// the fast folders, a mail reconverge, and the reports of the `local:`
+    /// folders removed from outside the subtree.
+    fn delete_folder_write(&mut self, id: &str) -> Result<FolderWriteResult, StoreError> {
         let (result, removed) = match self.store.delete_folder(id) {
             Ok((r, d)) => (Ok(r), d),
             Err(e) => (Err(e), FolderDelete::default()),
@@ -4422,7 +4445,7 @@ impl Engine {
                 );
             }
         }
-        self.folder_command(FolderWrite::Delete, id, result);
+        result
     }
 
     /// Runs a queued `DeleteFolder` (#2107). A folder still `local:` (its
@@ -4750,8 +4773,11 @@ impl Engine {
     /// (`Store::empty_folder`), then `MessagesUpdated` for the folder,
     /// `FoldersUpdated` and a drain; a store refusal is `FolderWriteFailed`
     /// and `Error`. With `subfolders`, each folder stored right under it
-    /// (read before the write) is then deleted as `delete_folder` deletes
-    /// it: its `DeleteFolder` is queued after the empty, so it waits for it.
+    /// (read before the write) is deleted from the store too, as
+    /// `delete_folder` deletes it (each refused or not on its own), before
+    /// the one drain (r1): the children leave the UI at once, and their
+    /// `DeleteFolder`s, queued after the empty and waiting for it, survive
+    /// a restart.
     fn empty_folder(&mut self, folder: &str, subfolders: bool) {
         let children: Vec<String> = if subfolders {
             let parent = self
@@ -4771,18 +4797,20 @@ impl Engine {
         let r = self
             .store
             .empty_folder(folder, &unix_to_iso8601(now_unix()));
-        let written = matches!(r, Ok(FolderWriteResult::Written(_)));
         if let Ok(FolderWriteResult::Written(id)) = &r {
             self.emit(SyncEvent::MessagesUpdated {
                 folder_id: id.clone(),
             });
         }
-        self.folder_command(FolderWrite::Empty, folder, r);
-        if written {
-            for child in children {
-                self.delete_folder(&child);
-            }
+        if !self.folder_written(FolderWrite::Empty, folder, r) {
+            return;
         }
+        for child in children {
+            let r = self.delete_folder_write(&child);
+            self.folder_written(FolderWrite::Delete, &child, r);
+        }
+        self.emit(SyncEvent::FoldersUpdated);
+        self.drain_queued();
     }
 
     /// Runs a queued `EmptyFolder` (#2110). A folder still `local:` (its
@@ -4821,19 +4849,29 @@ impl Engine {
                     return self.empty_call_failed(seq, &folder, batch, e);
                 }
             };
-            let mut todo = VecDeque::new();
-            let mut kept = 0;
-            for (id, _) in items {
-                if !refused.contains(&id) {
-                    todo.push_back(id);
-                } else if self.store.message_folder(&id).ok().flatten().as_deref()
-                    != Some(folder.as_str())
-                {
-                    kept += 1;
+            // A refused id the batch allows that is stored in the folder
+            // again is deleted; one shown elsewhere is kept and reported;
+            // the folder's unsent mail, and mail come into it since, is
+            // left alone (`Store::empty_refused`, r1).
+            let refused_ids: Vec<String> = items
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|id| refused.contains(*id))
+                .cloned()
+                .collect();
+            let split = match self.store.empty_refused(batch, &folder, &refused_ids) {
+                Ok(split) => split,
+                Err(e) => {
+                    let e = GraphError::Parse(e.to_string());
+                    return self.empty_call_failed(seq, &folder, batch, e);
                 }
-                // Else the store holds it in this folder: unsent mail the
-                // command kept, its own choice, not reported.
-            }
+            };
+            let kept = split.kept;
+            let todo: VecDeque<String> = items
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| !refused.contains(id) || split.delete.contains(id))
+                .collect();
             self.bulk = Some(BulkRun {
                 seq,
                 kind: BulkKind::Delete,
@@ -30802,8 +30840,42 @@ mod tests {
                 stop(handle, dir);
             }
 
+            /// r1-M1: an emptied message another path (a fetch, a list row
+            /// by id) stored in the folder again before the run is deleted
+            /// with the rest, its row too, and nothing is reported.
+            #[test]
+            fn an_emptied_message_stored_again_in_the_folder_is_deleted() {
+                let mut writes = vec![
+                    once("GET", LIST, 500, "busy"),
+                    once("GET", LIST, 200, &items_page(&strings(&["M1", "M2"]), None)),
+                    once("POST", "/$batch", 200, &ok_batch(2)),
+                ];
+                writes.extend(inbox_deltas(&["M1", "M2"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-stored-again", world(writes, TREE, &[]), None);
+                empty_inbox(&handle);
+                assert!(wait_until(ENGINE_WAIT, || !listings(&srv).is_empty()));
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "deferred by the 500");
+                assert!(mail_in(&store, "INBOX").is_empty());
+                // Stored again, as a fetch of a stale search hit would.
+                let v = crate::json::parse(&full_message_json("M1", "M1", "2026-07-16T10:00:00Z"))
+                    .unwrap();
+                let m = crate::graph::model::Message::from_json(&v).unwrap();
+                store.upsert_message("INBOX", &m).unwrap();
+                assert_eq!(mail_in(&store, "INBOX"), ["M1"]);
+                // The outbox back-off passes; the run lists and deletes.
+                wait_drained(&store);
+                assert_eq!(deleted(&srv), ["M1", "M2"]);
+                assert!(!store.message_exists("M1").unwrap(), "its row went too");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
             /// Criterion 10: with `subfolders`, Inbox's child PROJ (and SUB
-            /// under it) is deleted after the empty, by its own op.
+            /// under it) is deleted after the empty, by its own op; r1-m1:
+            /// the children leave the store, and their op is queued, before
+            /// the run's first request (its listing answers after 2 s).
             #[test]
             fn empty_folder_with_subfolders_deletes_the_children() {
                 let proj_messages = "/me/mailFolders/PROJ/messages?$select=";
@@ -30825,14 +30897,46 @@ mod tests {
                     write("DELETE", "/me/mailFolders/PROJ", 204, ""),
                 ];
                 writes.extend(inbox_deltas(&["M1"]));
-                let (srv, handle, store, dir) =
-                    engine("empty-subfolders", world(writes, TREE, &[]), None);
+                let paced = world(writes, TREE, &[])
+                    .into_iter()
+                    .map(|(r, n)| {
+                        let delay = if r.path_prefix == LIST {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, n, delay)
+                    })
+                    .collect();
+                let srv = FakeServer::start_paced(paced);
+                let (handle, store_path, dir) =
+                    spawn_fast(&srv, "empty-subfolders", HOUR, None, |_| {});
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                let store = Store::open(&store_path).unwrap();
+                assert!(row(&store, "PROJ").is_some());
                 send(
                     &handle,
                     SyncCommand::EmptyFolder {
                         folder: "INBOX".into(),
                         subfolders: true,
                     },
+                );
+                // While the run's listing is still unanswered.
+                assert!(wait_until(ENGINE_WAIT, || !listings(&srv).is_empty()));
+                assert!(row(&store, "PROJ").is_none() && row(&store, "SUB").is_none());
+                let queued: Vec<OutboxOp> = store
+                    .pending_ops()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.op)
+                    .collect();
+                assert!(
+                    matches!(
+                        &queued[..],
+                        [OutboxOp::EmptyFolder { .. }, OutboxOp::DeleteFolder { id, .. }]
+                            if id == "PROJ"
+                    ),
+                    "{queued:?}"
                 );
                 wait_requests(&srv, "DELETE", "/me/mailFolders/PROJ", 1);
                 wait_drained(&store);
