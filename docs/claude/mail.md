@@ -2978,13 +2978,20 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `register_contact_match` registers it at the end of `Store::init`, so every connection has
   it: the engine's, a host's, the tests'. A NULL argument reads as `''` and never fails the
   query. The rank lives in `contact_match_rank`.
-- The fold, `fold_contact_text`, applies to the query and to both columns: Unicode
-  `to_lowercase`, then `ς` → `σ`. `to_lowercase` applies Final_Sigma, so `ΟΔΥΣ` lowercases to
-  `οδυς`, and without that step it is never found in `οδυσσέας`. Unicode case folding does the
-  same.
+- The fold, `fold_contact_text`, applies to the query and to both columns: Turkish `İ` → `i`,
+  then Unicode `to_lowercase`, then `ς` → `σ`. `to_lowercase` writes `İ` as `i` + U+0307, so
+  `ilk` would never find `İlker`. It also applies Final_Sigma, so `ΟΔΥΣ` lowercases to `οδυς`,
+  which is never found in `οδυσσέας` without the last step. Unicode case folding does the same
+  with `ς`.
 - Rank `0` is a word-prefix match. The query starts the folded name, or starts right after a
-  character that is not `char::is_alphanumeric` (a space, `-`, `'`, `,`), or does the same in
-  the address' local part (before its first `@`). The domain never counts, or `li` would rank
+  separator, or does the same in the address' local part (before its first `@`). A separator
+  is a character that is neither `char::is_alphanumeric` nor `continues_a_word`: a space, `-`,
+  `'`, `’`, `,`, `(`. `continues_a_word` holds the common blocks of combining marks (Latin,
+  Cyrillic, Hebrew points, Arabic harakat, Indic viramas and nuktas, Thai marks), ZWNJ/ZWJ and
+  variation selectors, which are not alphanumeric but do not end a word. std has no general
+  category lookup, so these are ranges. Punctuation inside those blocks (Hebrew maqaf, the
+  Indic dandas) still separates. So `pek` in `İpek`, `lise` in an NFD `E\u{301}lise`, and the
+  letters after a virama or a ZWNJ are mid-word. The domain never counts, or `li` would rank
   every `@linkedin.com` row first. A name that is itself an address (an `@` and no whitespace)
   takes the address rule. Every char boundary is tried, so a mid-word occurrence does not hide
   a later word-start one. Rank `1` is any other literal occurrence; NULL is no match. After the
@@ -3006,7 +3013,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
 - Tests: store `search_contacts_folds_any_script`,
   `search_contacts_ranks_word_prefix_with_name_prefix`,
   `search_contacts_empty_query_and_negative_limit`,
-  `all_contacts_lists_every_row_in_rank_order`, `contact_match_rank_word_starts_and_fold`,
+  `all_contacts_lists_every_row_in_rank_order`,
+  `search_contacts_finds_a_turkish_dotted_capital_by_any_case`,
+  `contact_match_rank_word_starts_and_fold`,
   `contact_match_reads_a_null_argument_as_empty`; unchanged
   `search_contacts_ranks_prefix_first_then_frequency` and
   `search_contacts_treats_underscore_literally`.

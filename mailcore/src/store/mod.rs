@@ -4662,16 +4662,17 @@ impl Store {
     /// Ranked autocomplete matches for `query`, matched case-insensitively
     /// against name and address in any script (#1890).
     ///
-    /// Both sides are folded in Rust (`fold_contact_text`: Unicode
-    /// `to_lowercase`, final `ς` as `σ`) by the `contact_match` SQL
-    /// function, never by SQLite's `lower()`/`LIKE`, which fold ASCII only
-    /// in this ICU-less bundled build. The match is a literal substring
+    /// Both sides are folded in Rust (`fold_contact_text`: Turkish `İ` as
+    /// `i`, Unicode `to_lowercase`, final `ς` as `σ`) by the `contact_match`
+    /// SQL function, never by SQLite's `lower()`/`LIKE`, which fold ASCII
+    /// only in this ICU-less bundled build. The match is a literal substring
     /// (`_`, `%` and `\` are plain characters).
     ///
     /// A word-prefix match ranks first: the query starts the name or the
-    /// address, or starts right after a character that is not alphanumeric
-    /// (a space, `-`, `'`, `,` …) in the name or in the address' local part
-    /// (before its `@`; never in the domain). A name that is itself an
+    /// address, or starts right after a separator (a character that is not
+    /// alphanumeric: a space, `-`, `'`, `’`, `,` …; a combining mark or a
+    /// zero-width joiner is not one) in the name or in the address' local
+    /// part (before its `@`; never in the domain). A name that is itself an
     /// address (an `@`, no whitespace) takes the address rule. Any other
     /// occurrence ranks after those. Then Graph relevance (lower first,
     /// nulls last), frequency (higher first), recency, name.
@@ -5464,29 +5465,70 @@ fn contact_from_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
 }
 
 /// Contact search's case fold (#1890), for the query and both columns
-/// alike: Unicode `to_lowercase`, then a final sigma `ς` as `σ`, as
-/// Unicode case folding does. `to_lowercase` alone writes a capital `Σ`
-/// that ends a word as `ς`, so `ΟΔΥΣ` (`οδυς`) would never be found in
-/// `Οδυσσέας` (`οδυσσέας`). Spelling equivalences (`ß`/`ss`), accents and
-/// Unicode normalisation are not folded.
+/// alike: Turkish dotted capital `İ` as plain `i`, then Unicode
+/// `to_lowercase`, then a final sigma `ς` as `σ`. `to_lowercase` alone
+/// writes `İ` as `i` + U+0307 (so `ilk` would never find `İlker`) and a
+/// capital `Σ` that ends a word as `ς` (so `ΟΔΥΣ`, `οδυς`, would never be
+/// found in `Οδυσσέας`, `οδυσσέας`). Spelling equivalences (`ß`/`ss`),
+/// accents and Unicode normalisation are not folded.
 fn fold_contact_text(s: &str) -> String {
-    s.to_lowercase().replace('ς', "σ")
+    s.replace('İ', "i").to_lowercase().replace('ς', "σ")
+}
+
+/// Whether `c`, not alphanumeric itself, belongs to the character before
+/// it rather than separating words: a combining mark (Latin, Cyrillic,
+/// Hebrew points, Arabic harakat, Indic viramas and nuktas, Thai marks) or
+/// a zero-width (non-)joiner or variation selector. std has no general
+/// category lookup, so these are the common blocks' ranges; punctuation
+/// inside them (Hebrew maqaf and sof pasuq, Arabic ayah signs, the Indic
+/// dandas) is left out and still separates.
+fn continues_a_word(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036F}'
+        | '\u{0483}'..='\u{0489}'
+        | '\u{0591}'..='\u{05BD}'
+        | '\u{05BF}'
+        | '\u{05C1}'..='\u{05C2}'
+        | '\u{05C4}'..='\u{05C5}'
+        | '\u{05C7}'
+        | '\u{0610}'..='\u{061A}'
+        | '\u{064B}'..='\u{065F}'
+        | '\u{0670}'
+        | '\u{06D6}'..='\u{06DC}'
+        | '\u{06DF}'..='\u{06E8}'
+        | '\u{06EA}'..='\u{06ED}'
+        | '\u{0900}'..='\u{0963}'
+        | '\u{0966}'..='\u{0DFF}'
+        | '\u{0E31}'
+        | '\u{0E34}'..='\u{0E3A}'
+        | '\u{0E47}'..='\u{0E4E}'
+        | '\u{1AB0}'..='\u{1AFF}'
+        | '\u{1DC0}'..='\u{1DFF}'
+        | '\u{200C}'..='\u{200D}'
+        | '\u{20D0}'..='\u{20FF}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FE20}'..='\u{FE2F}')
 }
 
 /// Whether `q` occurs in `hay` at a word start lying before byte `end`: at
-/// 0, or right after a character that is not alphanumeric. Every char
-/// boundary is tried, so an earlier mid-word occurrence never hides a later
-/// word-start one.
+/// 0, or right after a separator, a character that is neither alphanumeric
+/// nor `continues_a_word` (after a combining mark or a joiner the word goes
+/// on). Every char boundary is tried, so an earlier mid-word occurrence
+/// never hides a later word-start one.
 fn has_word_prefix(hay: &str, q: &str, end: usize) -> bool {
-    let mut prev_alnum = false;
+    let mut in_word = false;
     for (i, c) in hay.char_indices() {
         if i >= end {
             break;
         }
-        if !prev_alnum && hay[i..].starts_with(q) {
+        if !in_word && hay[i..].starts_with(q) {
             return true;
         }
-        prev_alnum = c.is_alphanumeric();
+        if c.is_alphanumeric() {
+            in_word = true;
+        } else if !continues_a_word(c) {
+            in_word = false;
+        }
     }
     false
 }
@@ -8358,12 +8400,49 @@ mod tests {
         assert_eq!(rank("Οδυσσέας", "o@x.com", "ΟΔΥΣ"), Some(0));
         assert_eq!(rank("Οδυσσέας", "o@x.com", "δυσσεας"), None); // accents are kept
         assert_eq!(rank("Οδυσσέας", "o@x.com", "δυσσέας"), Some(1));
-        // Lowercasing that changes the length never panics: `İ` becomes
-        // `i` + U+0307, `ß` stays `ß` (and does not match `ss`).
+        // `İ` folds to a plain `i` (`to_lowercase` alone gives `i` + U+0307);
+        // `ß` stays `ß` (and does not match `ss`). Neither panics.
+        assert_eq!(fold_contact_text("İlker"), "ilker");
         assert_eq!(rank("İstanbul Ali", "i@x.com", "ali"), Some(0));
         assert_eq!(rank("İstanbul", "i@x.com", "i"), Some(0));
+        assert_eq!(rank("İlker", "i@x.com", "ilk"), Some(0));
         assert_eq!(rank("Straße", "s@x.com", "STRASSE"), None);
         assert_eq!(rank("Straße", "s@x.com", "STRAßE"), Some(0));
+        // A combining mark or a joiner never opens a word: the word goes on.
+        assert_eq!(rank("İpek", "i@x.com", "pek"), Some(1));
+        assert_eq!(rank("i\u{307}pek", "i@x.com", "pek"), Some(1));
+        assert_eq!(rank("E\u{301}lise Martin", "e@x.com", "lise"), Some(1));
+        assert_eq!(rank("E\u{301}lise Martin", "e@x.com", "mart"), Some(0));
+        // Devanagari क्षमा: क, virama U+094D, then षमा.
+        assert_eq!(rank("क्षमा", "k@x.com", "षमा"), Some(1));
+        // Persian نیک‌نام: a ZWNJ inside one word.
+        assert_eq!(rank("نیک\u{200C}نام", "n@x.com", "نام"), Some(1));
+        // Real separators still open words, `’` too.
+        assert_eq!(rank("Sean O’Brien", "s@x.com", "brien"), Some(0));
+        assert_eq!(rank("Wei (Li)", "w@x.com", "li"), Some(0));
+        assert_eq!(rank("", "wei.li@x.com", "li"), Some(0));
+        // A separator after a mark still separates.
+        assert_eq!(rank("Re\u{301} Li", "r@x.com", "li"), Some(0));
+    }
+
+    #[test]
+    fn search_contacts_finds_a_turkish_dotted_capital_by_any_case() {
+        // #1890 r1: `to_lowercase` writes `İ` as `i` + U+0307, so `ilk` was
+        // not in "i̇lker kaya" and only a query typed with `İ` found it.
+        let s = Store::open_in_memory().unwrap();
+        // The address holds no "ilk", so only the name can find the row.
+        s.upsert_contact(&search_contact("İlker Kaya", "kaya@x.com", 1))
+            .unwrap();
+        // A frequent mid-word "ilk", found by every spelling, ranks after.
+        s.upsert_contact(&search_contact("Bilkis Ay", "bilkis@x.com", 9))
+            .unwrap();
+        for q in ["ilk", "İlk", "ILK"] {
+            assert_eq!(
+                found_addresses(&s, q, 6),
+                ["kaya@x.com", "bilkis@x.com"],
+                "query {q:?}"
+            );
+        }
     }
 
     #[test]
