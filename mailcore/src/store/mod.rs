@@ -2503,6 +2503,33 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the folder tree owes a complete listing (#1910 r6): Graph
+    /// refused a folder write, whose revert may show a parent or name Graph
+    /// does not have. The engine refuses folder deletes until the next
+    /// complete listing clears it. Persisted in `meta`.
+    pub(crate) fn relist_owed(&self) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'relist_owed')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Sets or clears [`Store::relist_owed`].
+    pub(crate) fn set_relist_owed(&self, owed: bool) -> Result<(), StoreError> {
+        if owed {
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('relist_owed', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )?;
+        } else {
+            self.conn
+                .execute("DELETE FROM meta WHERE key = 'relist_owed'", [])?;
+        }
+        Ok(())
+    }
+
     /// Stores a folder's head delta link (#1871: its recent mail, run in
     /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
     /// whether its walk's first call was refused the reminder `$expand`
@@ -5333,11 +5360,13 @@ pub(crate) enum FolderRefusal {
     /// into Sent Items), or one with an unpushed edit (`local_edit`, #2082).
     /// The cascade would lose it for good.
     HoldsUnsentMail,
-    /// A delete while a mail reconverge is pending (the engine refuses it,
-    /// #1910 r5): a move that failed may have left mail shown out of the
-    /// folder it is still in on Graph, and the reconverge never reads a
-    /// folder whose delete is queued, so a held delete would take that
-    /// mail. The host deletes again once the reconverge is done.
+    /// A delete while the store may not show what Graph has (the engine
+    /// refuses it, #1910 r5, r6): a mail reconverge is pending (its reads
+    /// not all done), or the folder tree owes a complete listing after a
+    /// refused folder write. A move that failed may have left mail or a
+    /// folder shown out of the folder it is still in on Graph, and the
+    /// reconverge never reads a folder whose delete is queued, so a held
+    /// delete would take it. The host deletes again later.
     Rereading,
 }
 
@@ -5353,7 +5382,8 @@ impl std::fmt::Display for FolderRefusal {
             }
             FolderRefusal::HoldsUnsentMail => f.write_str("folder holds unsent mail"),
             FolderRefusal::Rereading => f.write_str(
-                "mail is being read again from the server; delete again once it is done",
+                "folders and mail are being read again from the server; \
+                 delete again once that is done",
             ),
         }
     }
@@ -20585,6 +20615,24 @@ mod folder_write_tests {
             .collect();
         assert_eq!(moves, [Some("ARCH".to_string())], "(b)");
         assert_eq!(row(&s, "OTHER").unwrap().parent_id.as_deref(), Some("ARCH"));
+    }
+
+    #[test]
+    fn relist_owed_survives_reopening_the_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-relist-owed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        assert!(!Store::open(&path).unwrap().relist_owed().unwrap());
+        Store::open(&path).unwrap().set_relist_owed(true).unwrap();
+        assert!(Store::open(&path).unwrap().relist_owed().unwrap());
+        Store::open(&path).unwrap().set_relist_owed(false).unwrap();
+        assert!(!Store::open(&path).unwrap().relist_owed().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -585,10 +585,22 @@ pub enum SyncCommand {
     MoveFolder { id: String, dest: Option<String> },
     /// Delete a mail folder (#1910): the store drops it, its child folders,
     /// their messages and delta links at once, then
-    /// `DELETE /me/mailFolders/{id}` (a 404 is success). A folder holding
-    /// mail Graph does not have (an unsent or unsaved draft, a send queued
-    /// into Sent Items) is refused at once: "delete to Deleted Items" is a
-    /// [`SyncCommand::MoveFolder`] there.
+    /// `DELETE /me/mailFolders/{id}` (a 404 is success). "Delete to Deleted
+    /// Items" is a [`SyncCommand::MoveFolder`] there. Refused at once
+    /// ([`SyncEvent::FolderWriteFailed`] with no status, nothing queued):
+    /// - a folder holding mail Graph does not have (an unsent or unsaved
+    ///   draft, a send queued into Sent Items);
+    /// - any delete while the store may not show what Graph has: (a) a mail
+    ///   reconverge is pending (after a quarantine, or after mail went with
+    ///   a refused or deleted `local:` folder), (b) until every folder's
+    ///   read in that reconverge has completed (a failed phase 1, a parked
+    ///   walk), or (c) Graph refused a folder create, rename or move since
+    ///   the last complete folder listing.
+    ///
+    /// No event says when deletes are safe again: the host retries after
+    /// its next [`SyncEvent::FoldersUpdated`], or the user deletes again.
+    /// A delete is also held in the outbox while a move queued before it
+    /// waits, and refused when such a move does not reach Graph.
     DeleteFolder { id: String },
     /// Exit the sync thread cleanly.
     Shutdown,
@@ -1440,6 +1452,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
     };
     // A quarantine reconverge an earlier run left unfinished (#1871).
     let reconverge_pending = store.reconverge_pending().unwrap_or(false);
+    // A complete listing an earlier run still owed (#1910 r6).
+    let relist_owed = store.relist_owed().unwrap_or(false);
     let mut engine = Engine {
         store,
         token: None,
@@ -1450,6 +1464,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backoff: BACKOFF_MIN,
         backfill_done: false,
         reconverge_pending,
+        relist_owed,
         calendar_reset_owed: false,
         masters_not_found: HashSet::new(),
         masters_skipped: HashSet::new(),
@@ -1505,11 +1520,22 @@ struct Engine {
     /// removed locally — including messages that have since aged past the
     /// sliding window. Cleared once a pass ran every folder's delta and no
     /// folder's backfill remains (#1871: old mail comes back through the
-    /// backfill), else by the backfill step that completes the last folder,
-    /// or by the one that parks the last walk left (parked walks do not
-    /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
+    /// backfill), else by the backfill step that completes the last folder
+    /// (`backfill_remains`; `end_reconverge`). It ends only once every
+    /// stored Graph folder has
+    /// a delta link and a complete history, parked walks and folders whose
+    /// phase 1 failed included (#1910 r6): folder deletes are refused while
+    /// it is set, as the store may still show mail out of the folder Graph
+    /// has it in. Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
+    /// Graph refused a folder create, rename or move since the last
+    /// complete listing (#1910 r6): a revert may show a parent or a name
+    /// Graph does not have (two refused moves of one folder revert to the
+    /// first one's dest). Folder deletes are refused while it is set; a
+    /// complete, non-empty listing clears it. Persisted
+    /// (`Store::relist_owed`).
+    relist_owed: bool,
     /// The calendars owe a reset: initial rounds over every window. Owed
     /// when a series edit went through (#2022), and when a `RespondEvent`
     /// was refused (#2023), whose host may have written the status itself
@@ -2218,7 +2244,7 @@ impl Engine {
                 // folder it is still in on Graph until the reconverge runs,
                 // and the reconverge never reads a folder whose delete is
                 // queued: a delete now would take that mail on Graph.
-                if self.reconverge_pending {
+                if self.deletes_unsafe() {
                     let r = Ok(FolderWriteResult::Refused(FolderRefusal::Rereading));
                     self.folder_command(FolderWrite::Delete, &id, r);
                     return;
@@ -2588,6 +2614,9 @@ impl Engine {
                         Ok(removed) => changed |= removed > 0,
                         Err(e) => self.emit(SyncEvent::Error(e.to_string())),
                     }
+                    // Every folder no queued op protects now has Graph's
+                    // parent and name (#1910 r6).
+                    self.set_relist_owed(false);
                 }
                 // The folders have been enumerated at least once: a pass no
                 // longer needs to be a full one for them (`needs_full_pass`).
@@ -3019,10 +3048,30 @@ impl Engine {
     }
 
     /// Whether some folder's backfill is still to run, not counting a
-    /// parked one: a page that fails is parked, and a parked walk must not
-    /// hold a reconverge (and its persisted flag) open. A store error
-    /// counts as none.
+    /// parked one: a page that fails is parked. A store error counts as
+    /// none.
+    ///
+    /// While a reconverge is pending it asks more (#1910 r6): every stored
+    /// Graph folder (not `local:`, nor the drafts sentinel) must have a
+    /// delta link and a complete history, so a folder whose phase 1 failed,
+    /// or whose walk is parked, keeps the reconverge open until a later
+    /// pass reads it. Folder deletes are refused meanwhile: the store may
+    /// still show mail out of the folder Graph has it in, and the age
+    /// cutoff stays off so mail older than the window comes back too.
     fn backfill_remains(&self) -> bool {
+        if self.reconverge_pending {
+            let whole = self.whole_mailbox();
+            return self
+                .store
+                .folder_histories()
+                .map(|hs| {
+                    hs.iter().any(|h| {
+                        !h.folder_id.starts_with("local:")
+                            && (!h.has_delta_link || !history_complete(h.scope.as_deref(), whole))
+                    })
+                })
+                .unwrap_or(false);
+        }
         self.incomplete_histories()
             .map(|h| h.iter().any(|h| !self.parked.contains(&h.folder_id)))
             .unwrap_or(false)
@@ -3047,8 +3096,10 @@ impl Engine {
             .find(|h| !self.parked.contains(&h.folder_id))
     }
 
-    /// Parks `folder_id`'s backfill until the next pass. A reconverge whose
-    /// only walks left are parked ends here (`backfill_remains`).
+    /// Parks `folder_id`'s backfill until the next pass. Outside a
+    /// reconverge nothing else follows. A reconverge is checked here too,
+    /// but a parked walk keeps it open since #1910 r6 (`backfill_remains`):
+    /// it ends once a later pass completes the walk.
     fn park(&mut self, folder_id: &str) {
         if !self.parked.iter().any(|f| f == folder_id) {
             self.parked.push(folder_id.to_string());
@@ -4079,6 +4130,11 @@ impl Engine {
             .current_folder_id(queued_id)
             .unwrap_or_else(|_| queued_id.to_string());
         self.store.drop_op(row.seq);
+        // A revert may show a parent or name Graph does not have: deletes
+        // wait for the next complete listing (R3).
+        if !matches!(write, FolderWrite::Delete) {
+            self.set_relist_owed(true);
+        }
         match &row.op {
             OutboxOp::CreateFolder { .. } => {
                 let discard = self.store.discard_local_folder(&id).unwrap_or_default();
@@ -4135,6 +4191,22 @@ impl Engine {
             error,
         });
         self.emit(SyncEvent::Error(line));
+    }
+
+    /// Whether the store may not show what Graph has (#1910 r5, r6): a mail
+    /// reconverge is pending (its reads not all done), or the folder tree
+    /// owes a complete listing after a refused folder write. A folder
+    /// delete then is refused at once (R3).
+    fn deletes_unsafe(&self) -> bool {
+        self.reconverge_pending || self.relist_owed
+    }
+
+    /// Records [`Engine::relist_owed`], in memory and in the store.
+    fn set_relist_owed(&mut self, owed: bool) {
+        if self.relist_owed != owed {
+            self.relist_owed = owed;
+            let _ = self.store.set_relist_owed(owed);
+        }
     }
 
     /// Whether a message `Move` or a `MoveFolder` queued before `seq` is
@@ -24744,15 +24816,20 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// A parked walk holds a reconverge open (#1910 r6, which reversed
+        /// #1871's rule): until every folder's read completes, the store may
+        /// show mail out of the folder Graph has it in, and folder deletes
+        /// are refused meanwhile. The next pass retries the walk; its
+        /// completion ends the reconverge.
         #[test]
-        fn a_parked_walk_does_not_hold_a_reconverge_open() {
+        fn a_parked_walk_holds_a_reconverge_open_until_it_completes() {
             let bad = r#"{"error":{"code":"ErrorInvalidRequest","message":"bad page"}}"#;
             let srv = FakeServer::start_paced(mailbox(
                 &[Fold {
                     pages: pages_of("F1", 3),
                     ..inbox()
                 }],
-                vec![(route(&page_link("F1", 2), 400, bad), None)],
+                vec![(route(&page_link("F1", 2), 400, bad), Some(1))],
                 Duration::ZERO,
             ));
             let dir = new_dir("bf-reconverge-parked");
@@ -24763,13 +24840,38 @@ mod tests {
                 &handle.evt_rx,
                 |e| matches!(e, SyncEvent::Error(m) if m.contains("bad page")),
             );
+            // Parked: nothing runs until the next pass, and the reconverge
+            // stays open; a folder delete is refused meanwhile, with no
+            // request.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(store_in(&dir).reconverge_pending().unwrap());
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            handle
+                .cmd_tx
+                .send(SyncCommand::DeleteFolder { id: "F1".into() })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert!(
+                seen.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::FolderWriteFailed {
+                        write: FolderWrite::Delete,
+                        status: None,
+                        ..
+                    }
+                )),
+                "{seen:?}"
+            );
+            assert!(!srv.requests().iter().any(|r| r.method == "DELETE"));
+            assert!(store_in(&dir).has_folder("F1").unwrap());
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
             assert!(
                 wait_until(ENGINE_WAIT, || !store_in(&dir)
                     .reconverge_pending()
                     .unwrap()),
-                "the reconverge ended with only a parked walk left"
+                "the walk completed on the next pass, ending the reconverge"
             );
-            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            assert_ne!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
             stop(handle);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -27606,6 +27708,10 @@ mod tests {
                 Some("PROJ")
             );
 
+            // The refusals above owe a complete listing before any delete
+            // (R3): a pass lists the folders.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
             store.set_folder_expanded("ARCH", true).unwrap();
             assert_eq!(mail_in(&store, "ARCH"), ["A1"]);
             send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
@@ -28253,7 +28359,7 @@ mod tests {
         }
 
         const REREADING: &str =
-            "mail is being read again from the server; delete again once it is done";
+            "folders and mail are being read again from the server; delete again once that is done";
 
         #[test]
         fn a_delete_after_a_quarantined_move_waits_for_the_reconverge() {
@@ -28425,6 +28531,151 @@ mod tests {
             assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "ARCH") == ["A1"]));
             wait_drained(&store);
             assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_delete_waits_while_a_reconverge_read_failed() {
+            // A1's move out of ARCH is quarantined; in the reconverge's pass
+            // ARCH's first delta answers 500, so the store still shows A1 in
+            // OTHER: the reconverge stays open and a delete is refused.
+            let first = "/me/mailFolders/ARCH/messages/delta?$";
+            let link = "/me/mailFolders/ARCH/messages/delta?token=D-ARCH";
+            let page = delta_page(
+                &[full_message_json("A1", "A1", "2026-07-16T10:00:00Z")],
+                link,
+            );
+            let mut routes = vec![
+                (get_route(first, 200, &page), Some(1)),
+                (get_route(first, 500, "busy"), Some(1)),
+            ];
+            routes.extend(world(
+                vec![
+                    write("POST", "/me/messages/A1/move", 404, "{}"),
+                    write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                ],
+                TREE,
+                &[("ARCH", "A1")],
+            ));
+            let (srv, handle, store, dir) = engine("folder-delete-read-failed", routes, None);
+            assert_eq!(mail_in(&store, "ARCH"), ["A1"]);
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "A1".into(),
+                    dest: "OTHER".into(),
+                },
+            );
+            wait_requests(&srv, "POST", "/me/messages/A1/move", 1);
+            let mut quarantined = false;
+            for _ in 1..MAX_OP_ATTEMPTS {
+                send(&handle, SyncCommand::Refresh);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                if seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")))
+                {
+                    quarantined = true;
+                    break;
+                }
+            }
+            assert!(quarantined);
+            // The reconverge's pass: ARCH's read fails.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert_eq!(
+                srv.requests()
+                    .iter()
+                    .filter(|r| r.path.starts_with(first))
+                    .count(),
+                2
+            );
+            assert_eq!(mail_in(&store, "OTHER"), ["A1"], "still the stale view");
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            assert_eq!(
+                wait_store_refused(&handle),
+                SyncEvent::FolderWriteFailed {
+                    id: "ARCH".into(),
+                    write: FolderWrite::Delete,
+                    status: None,
+                    error: REREADING.into(),
+                }
+            );
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0);
+
+            // The next pass reads ARCH: A1 is back there, and a delete goes.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert_eq!(mail_in(&store, "ARCH"), ["A1"]);
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            wait_requests(&srv, "DELETE", "/me/mailFolders/ARCH", 1);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_delete_waits_for_a_listing_after_refused_moves() {
+            // SUB is under PROJ. It is moved to ARCH, then to OTHER, and
+            // Graph refuses both: the revert shows it under ARCH, while
+            // Graph has it under PROJ. Deleting PROJ waits for a listing.
+            let mv = "/me/mailFolders/SUB/move";
+            let (srv, handle, store, dir) = engine(
+                "folder-delete-after-refused-moves",
+                world(
+                    vec![
+                        once("POST", mv, 500, "busy"),
+                        write("POST", mv, 409, EXISTS),
+                        write("DELETE", "/me/mailFolders/PROJ", 204, ""),
+                    ],
+                    TREE,
+                    &[("SUB", "S1")],
+                ),
+                None,
+            );
+            for dest in ["ARCH", "OTHER"] {
+                send(
+                    &handle,
+                    SyncCommand::MoveFolder {
+                        id: "SUB".into(),
+                        dest: Some(dest.into()),
+                    },
+                );
+            }
+            wait_queued(&store, 2);
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert_eq!(
+                failures(&seen),
+                [
+                    ("SUB".to_string(), FolderWrite::Move, Some(409)),
+                    ("SUB".to_string(), FolderWrite::Move, Some(409)),
+                ]
+            );
+            assert_eq!(
+                row(&store, "SUB").unwrap().parent_id.as_deref(),
+                Some("ARCH"),
+                "the unchained revert"
+            );
+            send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+            assert_eq!(
+                wait_store_refused(&handle),
+                SyncEvent::FolderWriteFailed {
+                    id: "PROJ".into(),
+                    write: FolderWrite::Delete,
+                    status: None,
+                    error: REREADING.into(),
+                }
+            );
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/PROJ"), 0);
+
+            // A complete listing puts SUB back under PROJ; a delete goes.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert_eq!(
+                row(&store, "SUB").unwrap().parent_id.as_deref(),
+                Some("PROJ")
+            );
+            send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+            wait_requests(&srv, "DELETE", "/me/mailFolders/PROJ", 1);
             stop(handle, dir);
         }
 
