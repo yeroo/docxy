@@ -23,12 +23,19 @@
 # highlighted runs left out) against the ground under it: `all_readable`
 # is every run at 4.5:1 or more. Each read follows a `shot`, which waits
 # for the frame after the change.
+#
+# `theme-set` applies the theme to the window at once, not at its next
+# frame: its `applied` is the window's applied theme, which Switch Modes
+# reads, so a Switch Modes click right after it takes (#2095: the click
+# was a no-op when no frame came between them). Auto's is not asserted, as
+# it is the runner's OS appearance.
 
 test issue 2079 a dark theme draws the document as Word's dark mode does, every run readable
   open copy:../fixtures/dark-mode.docx
   assert view.layout is web
   call window-size {"w":1100,"h":900}
   call theme-set {"theme":"dark"}
+  assert reply.applied is dark
   # Web Layout: the dark-grey page, every run readable on what it sits on.
   shot window
   call doc {}
@@ -72,9 +79,11 @@ test issue 2079 Switch Modes shows the light page on a dark theme, and a light t
   open copy:../fixtures/dark-mode.docx
   call window-size {"w":1100,"h":900}
   call theme-set {"theme":"dark"}
+  assert reply.applied is dark
+  # Switch Modes straight after the theme change, no frame between (#2095).
+  call ribbon-click {"tab":"View","command":"Switch Modes"}
   call ribbon-click {"tab":"View","command":"Print Layout"}
   assert view.layout is print
-  call ribbon-click {"tab":"View","command":"Switch Modes"}
   # Print Layout's white sheet, as before #2079.
   shot window
   call doc {}
@@ -98,6 +107,7 @@ test issue 2079 Switch Modes shows the light page on a dark theme, and a light t
   assert reply.inks.all_readable is true
   # A light theme: the light page, Switch Modes disabled and unchecked.
   call theme-set {"theme":"light"}
+  assert reply.applied is light
   shot window
   call doc {}
   assert reply.page_mode is light
