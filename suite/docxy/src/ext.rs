@@ -26,8 +26,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A view of a document an extension's view may embed (#1873): the suite's
-/// own document renderer in web layout, with selection, copy, zoom,
-/// scrolling and hyperlinks handed to the extension; read-only unless made
+/// own document renderer in web layout or Print Layout
+/// ([`DocView::set_layout`], #1888), with selection, copy, zoom, scrolling,
+/// Find (#1887) and hyperlinks handed to the extension; read-only unless made
 /// editable ([`DocView::set_editable`], #1947), when it types and edits and
 /// takes the host ribbon's [`DocFormat`] commands. See [`DocView::new`].
 pub use crate::doc_view::{CaretFormat, DocFormat, DocLayout, DocView, LinkClick};
