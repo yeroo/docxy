@@ -3069,8 +3069,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   deleted before its create was sent. Either way the store dropped the folder with the message
   and started a mail reconverge, which brings the message back where Graph has it. A folder
   move is sent even when its row is gone, as long as its id is not `local:`: a delete of the
-  folder it was moved under took the row, and that delete, queued after the move, must find
-  it there on Graph too.
+  Graph folder it was moved under took the row, and that delete, queued after the move, must
+  find it there on Graph too. A move under a `local:` dest can never be sent: when that
+  folder (or one above it) is deleted, `delete_folder` drops the move and queues a
+  `DeleteFolder` of its own for the moved Graph folder (`delete_roots`), carrying its part of
+  the snapshot (no row is in two snapshots), so a refusal restores it under its old parent.
 - A move whose answer has a new id re-keys the folder like a create, and also clears
   `delta_link` and the backfill columns, since the links name the old id; phase 1 runs again.
   The answer's parent is stored only while the stored parent is still the one the op wrote (a
@@ -3097,8 +3100,13 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   quarantine. The status comes from `refused_write_status`, shared with the contact writes.
   A refused create removes its `local:` folder and the `local:` folders under it
   (`discard_local_folder`). A folder Graph has that was moved under it is left for its own
-  queued move's refusal. If a message had been moved into the discarded folder, its queued ops
-  go and the mail reconverges, as for a delete, so it comes back where Graph has it. A refused rename or move puts `prev_name` / `prev_parent` back only while the stored
+  queued move's refusal. Mail Graph does not have in them (`unsent_mail_in_on`, the predicate
+  a delete's `HoldsUnsentMail` uses: a `local:` id, `local_edit > 0`, or a queued
+  `SaveDraft`/`SendDraft`) is first filed back in Drafts (or the drafts sentinel), its own save
+  or send still queued, with `MessagesUpdated` for that folder. Any other message moved into
+  the discarded folder loses its queued ops, and the mail reconverges as for a delete, so it
+  comes back where Graph has it. A refused rename or move puts `prev_name` / `prev_parent`
+  back only while the stored
   value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
   puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
   messages come back with the next pass's delta.
@@ -3138,7 +3146,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `revert_folder_name_keeps_a_later_rename`, `revert_folder_parent_keeps_a_later_move`,
   `discard_local_folder_leaves_folders_graph_has`,
   `deleting_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
-  `a_queued_delete_names_every_folder_it_removed`); `outbox.rs`
+  `a_queued_delete_names_every_folder_it_removed`,
+  `a_refused_create_files_unsent_mail_back_in_drafts`,
+  `a_graph_folder_moved_under_a_deleted_local_folder_gets_its_own_delete`); `outbox.rs`
   `create_folder_reconciles_the_local_id`,
   `create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
   `create_folder_under_a_parent_that_never_reached_graph_is_refused`,
@@ -3158,7 +3168,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `fast_folders_follow_a_created_folder`,
   `deleting_a_local_folder_holding_moved_mail_brings_it_back`,
   `deleting_a_folder_above_a_local_folder_holding_moved_mail_brings_it_back`,
-  `a_folder_moved_under_a_deleted_folder_goes_with_it`).
+  `a_folder_moved_under_a_deleted_folder_goes_with_it`,
+  `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
+  `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
