@@ -2878,22 +2878,36 @@ links in one cheap read.
   `get_body_for` decides) whose content starts as `compose_html::to_html` output does
   (`<p>`, `<ul><li>`, `<ol><li>`). A genuine text body (a plain-text `createReply`), a
   fetched body and a non-draft body are left alone. Every pre-#1901 store is pre-#2096,
-  so each gets the fix once.
+  so each gets the fix once. Then, in the same transaction, a draft row's body still
+  `text` with no recorded format gets `fetched_as = 'text'`. Before #1901 `FetchBody`
+  stored every body with none, so a reader's text rendering of a draft made elsewhere
+  would otherwise read as written here (`draft_body_is_local`) once the re-enumeration
+  makes the row `is_draft`, open in compose, and save flattened text over the html
+  draft. It leaves out a row holding an unpushed edit (`local_edit > 0`), a `local:`
+  draft and a reconciled one (`local_id`), since all three are compose's own. The
+  accepted cost: a plain-text `createReply` body stored before #2096 opens read-only.
+  Such a body satisfies a text ask as before but no longer an html one
+  (`body_satisfies`: a recorded format must match), so an html embedder fetches it once,
+  and that fetch still keeps an edited or queued draft's body (#2082).
 - Readers of `is_draft` that change behaviour:
   - lookxy: a draft made in Outlook or on the web opens read-only in the reader, as it
     did before #2096 (when it read `is_draft = 0`); editing it in lookxy is not
     supported (a follow-up). `open_draft` opens the composer only for a draft whose body
     was written here (`Store::draft_body_is_local`: a body row with `fetched_as IS
     NULL`, which only `update_draft_fields`, `create_local_draft` and a composed
-    reply/forward's `put_body` write). A draft with no body, or with one `FetchBody`
+    reply/forward's `put_body` write; a draft's text body fetched before #1901 is
+    marked fetched by the migration, below). A draft with no body, or with one `FetchBody`
     stored (Graph's rendering, text under lookxy's `BodyFormat::Text`), opens in the
     reader (`open_message`), which fetches a missing body. So Graph's rendering is
     never edited and saved back over the server's draft. `Store::draft`, which the
     outbox also reads, is unchanged.
   - lookxy's list: Enter, and a click on a message row (flat, or a thread's message
     row; `on_left_click` activates a draft row at once, since the click-to-preview path
-    skips drafts), both go through `open_draft`. A click on a thread header still only
-    selects and toggles. Cursor preview and PgUp/PgDn skip drafts, as before.
+    skips drafts), both go through `open_draft`. A thread header whose latest message
+    is a draft is never previewed, so it never becomes `selected_msg`. Its first click
+    only selects it, and a second click on the same list row (`App::last_list_click`;
+    any click elsewhere forgets it) toggles it, as for any header. Cursor preview and
+    PgUp/PgDn skip drafts, as before.
   - lookxy's composer honours a local body's type (`draft_rich_text`): an `html` body is
     parsed as HTML, and any other (a `createReply` of a plain-text message) becomes one
     paragraph per line, so line breaks and `<alice@x>` survive. Esc on a draft unchanged
@@ -2936,7 +2950,9 @@ links in one cheap read.
   `a_draft_with_a_local_text_body_opens_in_compose_as_text`,
   `a_draft_s_html_body_still_opens_as_html`,
   `esc_on_an_unchanged_draft_saves_nothing_and_after_an_edit_saves`,
-  `esc_on_an_unchanged_new_message_still_saves_it`; store
-  `draft_body_is_local_only_for_a_body_written_here`, and the migration test's body fix;
+  `esc_on_an_unchanged_new_message_still_saves_it`,
+  `two_clicks_on_a_header_whose_latest_is_a_draft_toggle_it`; store
+  `draft_body_is_local_only_for_a_body_written_here`, and the migration test's two body
+  fixes;
   and
   `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.
