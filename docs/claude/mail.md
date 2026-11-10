@@ -546,10 +546,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   correct rows the dropped op left wrong, drafts included, still skipping
   `protected_ids`). It is cleared only when a pass ran
   every folder's delta and no folder's backfill remains, else by the step
-  that completes the last folder, or by the one that parks the last walk
-  left: parked walks do not count (`backfill_remains`), so a page that
-  fails (it is parked) cannot hold the reconverge, and the cutoff, off for
-  good. It is persisted (`meta.reconverge_pending`,
+  that completes the last folder. Since #1910 r6 every stored Graph
+  folder must have a delta link and a complete history, parked walks and
+  failed phase-1 deltas included (`backfill_remains`): a folder delete is
+  refused while it is set, as the store may still show mail out of the
+  folder Graph has it in. A page that keeps failing therefore holds the
+  reconverge, and the cutoff, off until a later pass reads it (#1871
+  first let a parked walk end it). It is persisted (`meta.reconverge_pending`,
   set by `clear_delta_links` in the same transaction, loaded by `run`,
   cleared by `Engine::end_reconverge`), so an engine restarted in the
   middle still runs the walks without the cutoff.
@@ -3139,17 +3142,34 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
     refused too, and so is one that already took the moved folder with it. The user deletes
     again; the alternative is mail deleted on Graph. Nothing extra is persisted: the refusal
     happens when the move leaves the outbox, and the deletes are still queued then.
-  - R3 (r5): a `DeleteFolder` command while a mail reconverge is pending is refused at once
-    (`FolderRefusal::Rereading`, `status: None`, "mail is being read again from the server;
-    delete again once it is done"). R2 sees only the deletes queued when the move leaves the
-    outbox. After a quarantined move, or a move dropped with a refused or deleted `local:`
-    folder, the store still shows the message out of the folder Graph has it in until the
-    reconverge's pass. Holding a delete issued in that window does not help: the reconverge
-    never reads a folder whose delete is queued (the pass reads stored folders, and the listing
-    skips it), so the message is never shown back there and the held `DELETE` would take it on
-    Graph while it is still shown in its stale folder. After the pass it is shown where Graph
-    has it, and a new delete takes what the user sees. Starvation: deletes are refused for as
-    long as the reconverge runs, its backfill included, after any quarantine. That is the safe
+  - R3 (r5, r6): a `DeleteFolder` command is refused at once (`FolderRefusal::Rereading`,
+    `status: None`, "folders and mail are being read again from the server; delete again once
+    that is done") while the store may not show what Graph has (`deletes_unsafe`):
+    - (a) a mail reconverge is pending (`reconverge_pending`, persisted);
+    - (b) a reconverge's reads are not all done. While `reconverge_pending` is set,
+      `backfill_remains` counts every stored Graph folder (not `local:`, not the sentinel)
+      without a delta link (a phase 1 that failed without a fatal error) or without a complete
+      history, parked walks included. So the reconverge, and its age cutoff being off, lasts
+      until a later pass has read them all. This reverses #1871's rule that a parked walk does
+      not hold a reconverge open (`a_parked_walk_holds_a_reconverge_open_until_it_completes`).
+      A separate "reread owed" flag was rejected: in window mode the cutoff would apply again
+      once the reconverge ended, and mail older than the window would never come back;
+    - (c) Graph refused a folder create, rename or move since the last complete listing
+      (`relist_owed`, persisted in `meta`). A revert can show a parent Graph does not have:
+      two refused moves of one folder revert it to the first move's dest. `sync_folders`
+      clears it after a complete, non-empty listing, which rewrites every folder no queued op
+      protects. This covers the unchained `prev` limit for deletes, without chaining.
+    R2 sees only the deletes queued when the move leaves the outbox. After a quarantined move,
+    or a move dropped with a refused or deleted `local:` folder, the store still shows the
+    message out of the folder Graph has it in until the reconverge has read that folder.
+    Holding a delete issued in that window does not help: the reconverge never reads a folder
+    whose delete is queued (the pass reads stored folders, and the listing skips it), so the
+    message is never shown back there, and the held `DELETE` would take it on Graph while it
+    is still shown in its stale folder. Once the reads are done it is shown where Graph has it,
+    and a new delete takes what the user sees. No event says deletes are safe again; the host
+    retries after a later `FoldersUpdated`. Starvation: a delete can be refused until the next
+    complete read (every folder's, after any quarantine) or the next complete listing. A
+    folder whose read keeps failing (a persistent 403) keeps deletes refused. That is the safe
     side.
   - A refusal may drop ops a drain has already read (a delete, a refused create's message
     moves), so the drain checks that each op is still queued (`Store::has_op`) before it sends
@@ -3224,7 +3244,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it`,
   `a_delete_after_a_quarantined_move_waits_for_the_reconverge`,
   `a_delete_after_a_refused_create_took_moved_mail_waits_for_the_reconverge`,
-  `deleting_a_local_folder_refuses_the_delete_its_moved_mail_left`).
+  `deleting_a_local_folder_refuses_the_delete_its_moved_mail_left`,
+  `a_delete_waits_while_a_reconverge_read_failed`,
+  `a_delete_waits_for_a_listing_after_refused_moves`; and `backfill`
+  `a_parked_walk_holds_a_reconverge_open_until_it_completes`; store
+  `relist_owed_survives_reopening_the_store`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
