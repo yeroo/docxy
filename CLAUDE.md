@@ -144,7 +144,8 @@ issue number to find its notes.
   each message's protection (sensitivity, label, IRM) on its row (#2088),
   a meeting message's own reminder on its row (#2089),
   a reply draft's In-Reply-To, each message's Internet message id, `isDraft` kept (#2096),
-  folders created, renamed and moved through the outbox (#1910), deleting one is #2107,
+  folders created, renamed and moved through the outbox (#1910), a folder deleted only
+  after a walk of Graph finds nothing the store shows elsewhere (#2107),
   a whole folder marked read on the server through `$batch` (#1913),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`

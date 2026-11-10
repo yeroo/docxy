@@ -3029,7 +3029,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   with `{"displayName"}`; `PATCH /me/mailFolders/{id}` with `{"displayName"}`;
   `POST /me/mailFolders/{id}/move` with `{"destinationId"}`, `"msgfolderroot"` for `dest: None`
   (`GraphClient::{create,rename,move}_folder`; an answer without an id is `Parse`).
-- Deleting a folder: #2107 (split from #1910 after review).
+- Deleting a folder: see "Delete a folder (#2107)" below (split from #1910 after review).
 - Store (`Store::{create_local_folder, rename_folder, move_folder}`, crate-private, as are their
   result types: hosts use the commands; `current_folder_id` is public). Each returns
   `FolderWriteResult::{Written(id), Unchanged, Refused(FolderRefusal)}`. A rename writes only
@@ -3139,11 +3139,107 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_folder_only_moved_under_a_refused_create_keeps_its_own_create`,
   `a_folder_created_under_a_refused_create_is_reported`,
   `fast_folders_follow_a_created_folder`).
-- Not done: deleting a folder (#2107); a lookxy folder-management UI; dedup of a create retried
+- Not done: a lookxy folder-management UI; dedup of a create retried
   after a lost POST answer (a retry may 409 on the name Graph already has; the refusal discards
   the local row and the next listing brings Graph's folder); `GET /me/mailFolders/delta`; search
   folders; folders in other mailboxes; returning the `local:` id synchronously (a host finds the
   new row on `FoldersUpdated`; `FolderCreated` names both ids).
+
+## Delete a folder (#2107)
+
+- `SyncCommand::DeleteFolder { id }`. The rule: a folder delete never takes, on Graph, an item
+  the store shows elsewhere. #1910's review found a new hole after each guard that trusted the
+  store's state at send time, so this does not trust it: it records what the user saw once, and
+  checks Graph's real contents against it right before the DELETE.
+- Store (`Store::delete_folder`, one IMMEDIATE transaction): `id` and its subtree go (rows,
+  mail, delta links; the mail by cascade). Refused, nothing written: an unknown folder, the
+  drafts sentinel as `id` or in the subtree, and unsent mail in it (`unsent_mail_in_on`:
+  `FolderRefusal::UnsentMail(n)`, "it holds n unsent message(s)"); refusing loses nothing,
+  keeping would mean moving drafts first. The `local:` folders in it, plus those created under
+  them and moved out since (`refused_creates_on`, reported like #1910 r10 with "its parent
+  folder was deleted"), never reached Graph: their creates and other ops go
+  (`drop_folder_ops_on`), Graph mail moved into them is dropped as a refused create drops it
+  (`drop_local_folder_mail_on`, then a mail reconverge), and every queued `MoveFolder` into one
+  goes, wherever the moved folder is now; the folder's next queued move inherits its
+  `prev_parent`, and with none a folder outside the subtree is put back under it. Queued
+  `MarkFolderRead`s of the subtree go too. The Graph roots are `id` (when Graph has it) and each
+  Graph folder moved locally under a removed `local:` one: one `OutboxOp::DeleteFolder { id,
+  batch }` each, sharing a `batch`.
+- The allow-list (`folder_delete_allow`, per batch): every Graph folder and every message
+  (with its `internet_message_id`) the subtree showed, written before the rows go.
+- Tombstones (`forgotten_ids`): triggers on `messages` and `folders`
+  (`schema::FORGOTTEN_TRIGGERS_SQL`, made in `Store::init` after the migrations) record every
+  Graph id a row was deleted under (any path: delta `@removed`, a cascade, a discard, a host's
+  delete on its own connection) or re-keyed away from, with the message's internet message
+  id; a row back under the id clears it. `local:` ids are not recorded. The batch's own items
+  are cleared again by the delete. Pruned to the newest `FORGOTTEN_CAP` (100 000) by rowid at
+  each delete and on open: an item pushed out by 100 000 later removals before its folder's
+  delete is the residual risk, and the internet-message-id check still catches it while any
+  row or tombstone holds that id.
+- The drain (`run_delete_folder`, never `apply_op`, which answers it `Parse`): a
+  `DeleteFolder` waits until no older op is queued (skipped with no attempt and no back-off;
+  the next drain looks again), so a move queued before it lands or is given up first. A root
+  still `local:` sends nothing. Then `GraphClient::folder_subtree_items` walks Graph's
+  subtree (messages `$select=id,internetMessageId&$top=1000`, `childFolders` as
+  `list_folders` sees them, no call for a leaf; `None` when the folder answers 404, which is
+  done; a descendant's 404 leaves it out; any other failure an error, an item without an id
+  `Parse`), and `Store::delete_allow_check` judges each item: allowed when the batch has it
+  (through `moved_ids` / `folder_aliases`) and no row holds it now, or when the store never
+  held it (no row, alias, tombstone or queued op naming it: mail never synced, or come since).
+  Graph mints a new message id on a move (no `ImmutableId`), so a move whose answer was lost
+  leaves an id the store never saw: per non-empty internet message id, the walked items are
+  refused when they outnumber the batch's allowed ones and a row or a tombstone holds that id
+  (a copy a rule filed beside its original passes; a copy not synced yet beside a stored one
+  is a false refusal, on the safe side). Anything refused: no DELETE, `FolderWriteFailed {
+  status: None, error: "it holds n item(s) the store shows elsewhere or removed" }` (a
+  tombstone can also be the user's own message delete whose op was quarantined). Else
+  `DELETE /me/mailFolders/{id}`; 2xx or 404 is done.
+- Failures: auth, throttle and transport stop the drain; another 5xx defers it (attempts
+  bumped, never quarantined); a 4xx or `Parse` refuses it (`refuse_folder_delete`): the op
+  goes (the batch's allow-list with its last op), `FolderWriteFailed { write: Delete }` +
+  `Error` + `FoldersUpdated`, and a listing after the drain (`relist_after_drain`) brings the
+  folders back where Graph has them; their mail follows with their next delta (no link). A
+  throttle mid-walk restarts the walk at the next drain. A well-known folder is walked before
+  Graph refuses its DELETE: accepted.
+- While a batch has an op queued (`QueuedFolderWrites::deleted`, `Store::folder_being_deleted`),
+  a listing skips its folders and every folder Graph lists under one (a folder kept by a
+  queued move elsewhere stays where it is); a scoped search answers no hits with no request.
+  The fast folders lose the removed ids at the command; fast ticks and `SyncFolder` already
+  read only stored folders. A refused move whose `prev_parent` a delete removed (or that is
+  tombstoned) is not reverted (`revert_folder_parent`): the folder stays where the user saw it.
+- Graph semantics: the docs say only that `DELETE` deletes the folder (204);
+  `POST .../permanentDelete` is the hard delete. The folder leaves the tree; should Graph place
+  it under Deleted Items instead, the next listing shows it there. A UI that wants "delete to
+  Deleted Items" sends `MoveFolder` there. The engine does not refuse well-known folders: Graph
+  does.
+- Known shapes: a folder (or message) whose move into the deleted tree is refused stays on
+  Graph where it was and comes back with the listing once the batch ends. The empty shell of a
+  folder whose `MoveFolder` answer was lost and that was then moved back is not detected (the
+  mail inside is, by its internet message ids). Another client changing Graph between the
+  walk and the DELETE is out of scope. Hidden folders are never listed, so never held.
+- Tests: store `folder_delete_tests` (`delete_folder_op_round_trips_json`,
+  `delete_folder_drops_the_subtree_and_records_its_batch`, `delete_folder_refuses_unsent_mail`,
+  `delete_folder_refuses_the_drafts_sentinel_and_unknown_folders`,
+  `deleting_a_local_folder_queues_nothing_and_drops_the_mail_moved_into_it`,
+  `a_graph_folder_moved_under_a_deleted_local_folder_is_its_own_root`,
+  `a_move_into_a_deleted_local_folder_is_dropped_and_its_prev_parent_inherited`,
+  `delete_folder_drops_a_queued_mark_folder_read_of_the_subtree`,
+  `the_walk_allows_what_the_store_never_held`, `the_walk_refuses_an_item_a_row_shows_elsewhere`,
+  `the_walk_refuses_what_the_store_held_and_no_longer_shows`,
+  `the_walk_counts_internet_message_ids`, `a_revert_into_a_deleted_parent_leaves_the_folder`,
+  `a_batch_ends_with_its_last_op`, `forgotten_ids_record_every_removal_path`); `client.rs`
+  `delete_folder_sends_delete_and_reports_a_404`,
+  `folder_subtree_items_pages_and_skips_a_child_gone`,
+  `folder_subtree_items_root_gone_errors_and_ids`; `engine.rs` `folder_writes::delete_folder`
+  (`delete_folder_walks_graph_then_deletes`, `a_folder_already_gone_is_done`,
+  `a_refused_delete_reports_and_lists_the_folders_back`,
+  `a_5xx_or_a_throttle_keeps_the_delete_queued`,
+  `a_folder_moved_into_the_deleted_one_goes_with_it`,
+  `a_refused_move_out_keeps_the_delete_from_taking_the_folder`,
+  `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_by_its_own_op`,
+  `nothing_is_read_for_a_folder_being_deleted`,
+  `a_queued_mark_folder_read_of_the_subtree_is_dropped`, `the_delete_waits_for_older_ops`,
+  `a_folder_whose_move_in_was_refused_comes_back`).
 
 ## Mark a folder read (#1913)
 
