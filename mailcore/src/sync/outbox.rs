@@ -48,6 +48,12 @@ pub enum Applied {
     /// A `CreateContact` reached Graph and the store re-keyed the contact
     /// created as `local_id` to `id` (#2063). The caller reports it.
     ContactCreated { local_id: String, id: String },
+    /// A `CreateFolder` reached Graph and the store re-keyed the folder
+    /// created as `local_id` to `id` (#1910). The caller reports it.
+    FolderCreated { local_id: String, id: String },
+    /// A `MoveFolder`'s answer changed the stored folder (its parent, or a
+    /// new id, #1910): the caller emits `FoldersUpdated`.
+    FoldersChanged,
 }
 
 /// The id the message `id` names is stored under now (#1884, #1896).
@@ -66,10 +72,24 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
     match op {
         OutboxOp::Move { id, dest } => {
             let old_id = resolve(store, id)?;
-            let new_id = client.move_message(&old_id, dest)?;
+            // A folder created locally is sent under its Graph id (#1910).
+            // One still `local:` never reached Graph (its create was
+            // refused): nothing is sent, and the refusal's reconverge
+            // brings the message back where Graph has it.
+            let dest = store.current_folder_id(dest).map_err(store_err)?;
+            if dest.starts_with("local:") {
+                return Ok(Applied::Done);
+            }
+            let new_id = client.move_message(&old_id, &dest)?;
             Ok(Applied::Moved { old_id, new_id })
         }
         OutboxOp::CreateContact { id } => create_contact(client, store, id),
+        OutboxOp::CreateFolder { id, parent, name } => {
+            create_folder(client, store, id, parent.as_deref(), name)
+        }
+        OutboxOp::MoveFolder {
+            id, dest, parent, ..
+        } => move_folder(client, store, id, dest.as_deref(), parent.as_deref()),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -100,6 +120,85 @@ fn create_contact(client: &GraphClient, store: &Store, id: &str) -> Result<Appli
     })
 }
 
+/// The folder `id` names as stored now (#1910): `None` when it is still
+/// `local:` (its create never reached Graph) or no row has it, so the op
+/// sends nothing.
+fn graph_folder(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
+    let id = store.current_folder_id(id).map_err(store_err)?;
+    if id.starts_with("local:") || !store.has_folder(&id).map_err(store_err)? {
+        return Ok(None);
+    }
+    Ok(Some(id))
+}
+
+/// `CreateFolder` (#1910): POST the op's name under its parent (resolved
+/// now; one still `local:` never reached Graph, so this create is refused
+/// as `Parse`), then re-key the row. A row deleted before the drain sends
+/// nothing, nor does an id that already resolves to a Graph id (a retry
+/// after the re-key).
+fn create_folder(
+    client: &GraphClient,
+    store: &Store,
+    id: &str,
+    parent: Option<&str>,
+    name: &str,
+) -> Result<Applied, GraphError> {
+    if store.current_folder_id(id).map_err(store_err)? != id
+        || !store.has_folder(id).map_err(store_err)?
+    {
+        return Ok(Applied::Done);
+    }
+    let parent = parent
+        .map(|p| store.current_folder_id(p).map_err(store_err))
+        .transpose()?;
+    if parent.as_deref().is_some_and(|p| p.starts_with("local:")) {
+        return Err(GraphError::Parse(
+            "parent folder never reached Graph".to_string(),
+        ));
+    }
+    let created = client.create_folder(parent.as_deref(), name)?;
+    store
+        .reconcile_created_folder(id, &created)
+        .map_err(store_err)?;
+    Ok(Applied::FolderCreated {
+        local_id: id.to_string(),
+        id: created.id,
+    })
+}
+
+/// `MoveFolder` (#1910): POST the move with the dest resolved now (one
+/// still `local:` never reached Graph: refused as `Parse`), then store
+/// Graph's answer (`Store::apply_moved_folder`). A folder still `local:`,
+/// or gone, sends nothing.
+fn move_folder(
+    client: &GraphClient,
+    store: &Store,
+    id: &str,
+    dest: Option<&str>,
+    parent: Option<&str>,
+) -> Result<Applied, GraphError> {
+    let Some(target) = graph_folder(store, id)? else {
+        return Ok(Applied::Done);
+    };
+    let dest = dest
+        .map(|d| store.current_folder_id(d).map_err(store_err))
+        .transpose()?;
+    if dest.as_deref().is_some_and(|d| d.starts_with("local:")) {
+        return Err(GraphError::Parse(
+            "destination folder never reached Graph".to_string(),
+        ));
+    }
+    let answer = client.move_folder(&target, dest.as_deref())?;
+    let changed = store
+        .apply_moved_folder(&target, parent, &answer)
+        .map_err(store_err)?;
+    Ok(if changed {
+        Applied::FoldersChanged
+    } else {
+        Applied::Done
+    })
+}
+
 /// `apply_op` for every op but `Move`.
 fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
     match op {
@@ -108,7 +207,26 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         OutboxOp::SetCategories { id, categories } => {
             client.set_message_categories(&resolve(store, id)?, categories)
         }
-        OutboxOp::Move { .. } => unreachable!("apply_op handles Move"),
+        OutboxOp::Move { .. } | OutboxOp::CreateFolder { .. } | OutboxOp::MoveFolder { .. } => {
+            unreachable!("apply_op handles it")
+        }
+        OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
+            Some(id) => client.rename_folder(&id, name),
+            None => Ok(()),
+        },
+        // A 404 is done: the folder is gone either way. A folder never
+        // re-keyed (still `local:`) never reached Graph; its row is gone
+        // already, so the id is all there is to resolve.
+        OutboxOp::DeleteFolder { id, .. } => {
+            let id = store.current_folder_id(id).map_err(store_err)?;
+            if id.starts_with("local:") {
+                return Ok(());
+            }
+            match client.delete_folder(&id) {
+                Err(GraphError::NotFound) => Ok(()),
+                r => r,
+            }
+        }
         OutboxOp::Delete { id } => {
             // A reconciled draft's `local:` id is deleted under its Graph id
             // (#1884), a moved message's old id under its new one (#1896).

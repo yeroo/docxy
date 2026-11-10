@@ -420,6 +420,99 @@ pub enum OutboxOp {
     DeleteContact {
         id: String,
     },
+    /// Create a mail folder the host made locally (#1910,
+    /// `Store::create_local_folder`): `POST /me/mailFolders` (or the
+    /// parent's `childFolders`) with `name`, then re-key the `local:` row
+    /// `id` to Graph's id (`Store::reconcile_created_folder`). `parent` is
+    /// the stored parent at command time (`None`: the top), resolved again
+    /// through `folder_aliases` at send time. A row gone, or an id already
+    /// re-keyed, sends nothing.
+    CreateFolder {
+        id: String,
+        parent: Option<String>,
+        name: String,
+    },
+    /// PATCH a folder's `displayName` to `name` (#1910,
+    /// `Store::rename_folder`); `prev_name` is what the store held before,
+    /// for the revert of a refusal. A `local:` id never re-keyed sends
+    /// nothing.
+    RenameFolder {
+        id: String,
+        name: String,
+        prev_name: String,
+    },
+    /// Move a folder under `dest` (#1910, `Store::move_folder`; `None`: the
+    /// top of the mailbox, `msgfolderroot`). `parent` is the `parent_id` the
+    /// command stored and `prev_parent` the one before it, for the revert
+    /// of a refusal. A `local:` id never re-keyed sends nothing.
+    MoveFolder {
+        id: String,
+        dest: Option<String>,
+        parent: Option<String>,
+        prev_parent: Option<String>,
+    },
+    /// DELETE a folder (#1910, `Store::delete_folder`), which the command
+    /// removed locally with its subtree; `removed` is a snapshot of the
+    /// removed rows Graph has (not `local:` ones), put back if Graph
+    /// refuses. A 404 is done.
+    DeleteFolder {
+        id: String,
+        removed: Vec<FolderSnapshot>,
+    },
+}
+
+/// A folder row as a refused `DeleteFolder` puts it back (#1910): what the
+/// listing gives plus the local state (`sort_order`, `is_expanded`). No
+/// delta link: the next pass's delta brings its messages back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FolderSnapshot {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub display_name: String,
+    pub total_count: i64,
+    pub unread_count: i64,
+    pub well_known_name: Option<String>,
+    pub sort_order: Option<i64>,
+    pub is_expanded: bool,
+}
+
+impl FolderSnapshot {
+    fn to_json(&self) -> Value {
+        Value::Object(vec![
+            ("id".to_string(), Value::Str(self.id.clone())),
+            ("parentId".to_string(), optional_str(&self.parent_id)),
+            (
+                "displayName".to_string(),
+                Value::Str(self.display_name.clone()),
+            ),
+            ("total".to_string(), Value::Num(self.total_count as f64)),
+            ("unread".to_string(), Value::Num(self.unread_count as f64)),
+            (
+                "wellKnownName".to_string(),
+                optional_str(&self.well_known_name),
+            ),
+            (
+                "sortOrder".to_string(),
+                self.sort_order
+                    .map_or(Value::Null, |n| Value::Num(n as f64)),
+            ),
+            ("expanded".to_string(), Value::Bool(self.is_expanded)),
+        ])
+    }
+
+    fn from_json(v: &Value) -> Option<FolderSnapshot> {
+        let opt = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Some(FolderSnapshot {
+            id: v.get("id")?.as_str()?.to_string(),
+            parent_id: opt("parentId"),
+            display_name: v.get("displayName")?.as_str()?.to_string(),
+            total_count: v.get("total").and_then(Value::as_i64).unwrap_or(0),
+            unread_count: v.get("unread").and_then(Value::as_i64).unwrap_or(0),
+            well_known_name: opt("wellKnownName"),
+            sort_order: v.get("sortOrder").and_then(Value::as_i64),
+            is_expanded: v.get("expanded").and_then(Value::as_bool).unwrap_or(false),
+        })
+    }
 }
 
 impl OutboxOp {
@@ -449,6 +542,10 @@ impl OutboxOp {
             OutboxOp::CreateContact { .. } => "createContact",
             OutboxOp::UpdateContact { .. } => "updateContact",
             OutboxOp::DeleteContact { .. } => "deleteContact",
+            OutboxOp::CreateFolder { .. } => "createFolder",
+            OutboxOp::RenameFolder { .. } => "renameFolder",
+            OutboxOp::MoveFolder { .. } => "moveFolder",
+            OutboxOp::DeleteFolder { .. } => "deleteFolder",
         }
     }
 
@@ -561,6 +658,42 @@ impl OutboxOp {
             | OutboxOp::DeleteContact { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
+            ]),
+            OutboxOp::CreateFolder { id, parent, name } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("parent".to_string(), optional_str(parent)),
+                ("name".to_string(), Value::Str(name.clone())),
+            ]),
+            OutboxOp::RenameFolder {
+                id,
+                name,
+                prev_name,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("name".to_string(), Value::Str(name.clone())),
+                ("prevName".to_string(), Value::Str(prev_name.clone())),
+            ]),
+            OutboxOp::MoveFolder {
+                id,
+                dest,
+                parent,
+                prev_parent,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("dest".to_string(), optional_str(dest)),
+                ("parent".to_string(), optional_str(parent)),
+                ("prevParent".to_string(), optional_str(prev_parent)),
+            ]),
+            OutboxOp::DeleteFolder { id, removed } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                (
+                    "removed".to_string(),
+                    Value::Array(removed.iter().map(FolderSnapshot::to_json).collect()),
+                ),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -726,6 +859,36 @@ impl OutboxOp {
                 ),
             }),
             "deleteContact" => Some(OutboxOp::DeleteContact { id: id()? }),
+            "createFolder" => Some(OutboxOp::CreateFolder {
+                id: id()?,
+                parent: v.get("parent").and_then(Value::as_str).map(str::to_string),
+                name: v.get("name")?.as_str()?.to_string(),
+            }),
+            "renameFolder" => Some(OutboxOp::RenameFolder {
+                id: id()?,
+                name: v.get("name")?.as_str()?.to_string(),
+                prev_name: v.get("prevName")?.as_str()?.to_string(),
+            }),
+            "moveFolder" => Some(OutboxOp::MoveFolder {
+                id: id()?,
+                dest: v.get("dest").and_then(Value::as_str).map(str::to_string),
+                parent: v.get("parent").and_then(Value::as_str).map(str::to_string),
+                prev_parent: v
+                    .get("prevParent")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            // A snapshot row that does not parse makes the whole row
+            // corrupt, as a recipient without an address does.
+            "deleteFolder" => Some(OutboxOp::DeleteFolder {
+                id: id()?,
+                removed: v
+                    .get("removed")?
+                    .as_array()?
+                    .iter()
+                    .map(FolderSnapshot::from_json)
+                    .collect::<Option<Vec<_>>>()?,
+            }),
             _ => None,
         }
     }
@@ -1840,7 +2003,11 @@ impl Store {
                 | OutboxOp::SnoozeReminder { .. }
                 | OutboxOp::CreateContact { .. }
                 | OutboxOp::UpdateContact { .. }
-                | OutboxOp::DeleteContact { .. } => None,
+                | OutboxOp::DeleteContact { .. }
+                | OutboxOp::CreateFolder { .. }
+                | OutboxOp::RenameFolder { .. }
+                | OutboxOp::MoveFolder { .. }
+                | OutboxOp::DeleteFolder { .. } => None,
             })
             .map(|id| self.current_id(&id))
             .collect::<Result<_, _>>()?;
@@ -5129,6 +5296,620 @@ impl Store {
         )?;
         Ok(found)
     }
+}
+
+/// Why the store refused a folder command (#1910): nothing was written or
+/// queued, and no request goes to Graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderRefusal {
+    /// No stored folder has this id (after `folder_aliases`).
+    Unknown(String),
+    /// The local drafts sentinel (`local:drafts-pending`), which Graph
+    /// never had: it is never renamed, moved, deleted or a parent.
+    DraftsSentinel,
+    /// A move into the folder itself or a folder inside it: the stored
+    /// `parent_id` would hold a cycle.
+    IntoItself,
+    /// A delete whose subtree holds mail Graph does not have: a `local:`
+    /// message, one a queued `SaveDraft`/`SendDraft` names (a send re-filed
+    /// into Sent Items), or one with an unpushed edit (`local_edit`, #2082).
+    /// The cascade would lose it for good.
+    HoldsUnsentMail,
+}
+
+impl std::fmt::Display for FolderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FolderRefusal::Unknown(id) => write!(f, "no folder {id}"),
+            FolderRefusal::DraftsSentinel => {
+                f.write_str("the local drafts folder is not on the server")
+            }
+            FolderRefusal::IntoItself => {
+                f.write_str("a folder cannot move into itself or a folder inside it")
+            }
+            FolderRefusal::HoldsUnsentMail => f.write_str("folder holds unsent mail"),
+        }
+    }
+}
+
+/// What a folder command did to the store (#1910).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderWriteResult {
+    /// The row was written and its op queued in the same transaction; the
+    /// folder's id as stored now (a create's new `local:` id).
+    Written(String),
+    /// Nothing to do (the same name, the same parent): nothing queued.
+    Unchanged,
+    Refused(FolderRefusal),
+}
+
+/// The folders queued folder ops name (#1910), each id resolved through
+/// `folder_aliases`: what a listing must not undo (`sync_folders`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct QueuedFolderWrites {
+    pub renamed: HashSet<String>,
+    pub moved: HashSet<String>,
+    pub deleted: HashSet<String>,
+}
+
+/// Folder writes (#1910). Each command's write is one IMMEDIATE transaction
+/// that writes the row(s) and queues the op, so no listing sees the change
+/// without the op that protects it.
+impl Store {
+    /// Whether a folder row has exactly this id (#1910).
+    pub fn has_folder(&self, id: &str) -> Result<bool, StoreError> {
+        folder_exists_on(&self.conn, id)
+    }
+
+    /// The id the folder `id` is stored under now: the Graph id a `local:`
+    /// id was re-keyed to, or the id Graph answered a move with
+    /// (`folder_aliases`), else `id` itself.
+    pub fn current_folder_id(&self, id: &str) -> Result<String, StoreError> {
+        current_folder_id_on(&self.conn, id)
+    }
+
+    /// Adds a folder named `name` under `parent` (`None`: the top of the
+    /// mailbox, stored under the root id the listing gives top folders, see
+    /// `root_folder_id_on`) with a fresh `local:` id, and queues its
+    /// `CreateFolder`. `parent` is resolved through `folder_aliases`; an
+    /// unknown parent or the drafts sentinel is refused.
+    pub(crate) fn create_local_folder(
+        &self,
+        parent: Option<&str>,
+        name: &str,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let parent = match parent {
+            Some(p) => {
+                let p = current_folder_id_on(&tx, p)?;
+                if let Some(r) = check_folder_on(&tx, &p)? {
+                    return Ok(FolderWriteResult::Refused(r));
+                }
+                Some(p)
+            }
+            None => None,
+        };
+        let stored_parent = match &parent {
+            Some(p) => Some(p.clone()),
+            None => root_folder_id_on(&tx)?,
+        };
+        let id = local_draft_id();
+        tx.execute(
+            "INSERT INTO folders (id, parent_id, display_name) VALUES (?1, ?2, ?3)",
+            params![id, stored_parent, name],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::CreateFolder {
+                id: id.clone(),
+                parent,
+                name: name.to_string(),
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Renames a stored folder and queues its `RenameFolder`. Writes only
+    /// `display_name`. The same name is `Unchanged`.
+    pub(crate) fn rename_folder(
+        &self,
+        id: &str,
+        name: &str,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let prev: String = tx.query_row(
+            "SELECT display_name FROM folders WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if prev == name {
+            return Ok(FolderWriteResult::Unchanged);
+        }
+        tx.execute(
+            "UPDATE folders SET display_name = ?2 WHERE id = ?1",
+            params![id, name],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::RenameFolder {
+                id: id.clone(),
+                name: name.to_string(),
+                prev_name: prev,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Moves a stored folder under `dest` (`None`: the top of the mailbox)
+    /// and queues its `MoveFolder`. Writes only `parent_id`. Refused: an
+    /// unknown id or dest, the drafts sentinel as either, and a dest that
+    /// is the folder or inside it. A folder already there is `Unchanged`.
+    pub(crate) fn move_folder(
+        &self,
+        id: &str,
+        dest: Option<&str>,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let dest = match dest {
+            Some(d) => {
+                let d = current_folder_id_on(&tx, d)?;
+                if let Some(r) = check_folder_on(&tx, &d)? {
+                    return Ok(FolderWriteResult::Refused(r));
+                }
+                if subtree_ids_on(&tx, &id)?.contains(&d) {
+                    return Ok(FolderWriteResult::Refused(FolderRefusal::IntoItself));
+                }
+                Some(d)
+            }
+            None => None,
+        };
+        let prev: Option<String> = tx.query_row(
+            "SELECT parent_id FROM folders WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let parent = match &dest {
+            Some(d) => {
+                if prev.as_deref() == Some(d.as_str()) {
+                    return Ok(FolderWriteResult::Unchanged);
+                }
+                Some(d.clone())
+            }
+            None => {
+                if is_top_level_on(&tx, prev.as_deref())? {
+                    return Ok(FolderWriteResult::Unchanged);
+                }
+                root_folder_id_on(&tx)?
+            }
+        };
+        tx.execute(
+            "UPDATE folders SET parent_id = ?2 WHERE id = ?1",
+            params![id, parent],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::MoveFolder {
+                id: id.clone(),
+                dest,
+                parent,
+                prev_parent: prev,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Removes a stored folder and every folder under it, and queues its
+    /// `DeleteFolder` with a snapshot of the removed rows Graph has. Their
+    /// messages go by `ON DELETE CASCADE` (bodies, attachments, search
+    /// rows) and their delta links with the rows, as `retain_folders`
+    /// removes a folder deleted on the server (#1886). Refused, before
+    /// anything is written, when the subtree holds mail Graph does not have
+    /// ([`FolderRefusal::HoldsUnsentMail`]).
+    pub(crate) fn delete_folder(&self, id: &str) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let subtree = ids_json(&subtree_ids_on(&tx, &id)?);
+        let mut drafts = Vec::new();
+        for row in pending_ops_on(&tx)? {
+            if let OutboxOp::SaveDraft { id } | OutboxOp::SendDraft { id } = row.op {
+                drafts.push(current_id_on(&tx, &id)?);
+            }
+        }
+        let unsent: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages
+                 WHERE folder_id IN (SELECT value FROM json_each(?1))
+                   AND (substr(id, 1, 6) = 'local:'
+                        OR local_edit > 0
+                        OR id IN (SELECT value FROM json_each(?2))))",
+            params![subtree, ids_json(&drafts)],
+            |r| r.get(0),
+        )?;
+        if unsent {
+            return Ok(FolderWriteResult::Refused(FolderRefusal::HoldsUnsentMail));
+        }
+        let removed = {
+            let mut stmt = tx.prepare(
+                "SELECT id, parent_id, display_name, total_count, unread_count,
+                        well_known_name, sort_order, is_expanded
+                 FROM folders
+                 WHERE id IN (SELECT value FROM json_each(?1))
+                   AND substr(id, 1, 6) <> 'local:'
+                 ORDER BY id",
+            )?;
+            stmt.query_map(params![subtree], |r| {
+                Ok(FolderSnapshot {
+                    id: r.get(0)?,
+                    parent_id: r.get(1)?,
+                    display_name: r.get(2)?,
+                    total_count: r.get(3)?,
+                    unread_count: r.get(4)?,
+                    well_known_name: r.get(5)?,
+                    sort_order: r.get(6)?,
+                    is_expanded: r.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
+            params![subtree],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::DeleteFolder {
+                id: id.clone(),
+                removed,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Re-keys a folder created locally to the id Graph gave it (#1910), in
+    /// one transaction (`rekey_folder_on`): its messages and child folders
+    /// follow, and every other column (name and parent as stored, which a
+    /// later queued rename or move sends, `sort_order`, `is_expanded`) is
+    /// kept. The alias `local_id → created.id` is recorded even when the row
+    /// is gone. Whether a row was re-keyed.
+    pub(crate) fn reconcile_created_folder(
+        &self,
+        local_id: &str,
+        created: &MailFolder,
+    ) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        let exists = folder_exists_on(&tx, local_id)?;
+        if exists {
+            rekey_folder_on(&tx, local_id, &created.id, false)?;
+        }
+        record_folder_alias_on(&tx, local_id, &created.id)?;
+        tx.commit()?;
+        Ok(exists)
+    }
+
+    /// Stores what Graph answered a folder move with (#1910): its parent,
+    /// while the stored parent is still the one the op wrote (`parent`; a
+    /// later queued move keeps its own), and its id, re-keying the folder
+    /// when the answer's differs. A re-key clears the folder's delta and
+    /// backfill links, which name the old id, so its history runs again
+    /// against the new one. Whether the store changed.
+    pub(crate) fn apply_moved_folder(
+        &self,
+        id: &str,
+        parent: Option<&str>,
+        answer: &MailFolder,
+    ) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        let stored: Option<Option<String>> = tx
+            .query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut changed = false;
+        if let Some(stored) = stored {
+            let written = parent.map(|p| current_folder_id_on(&tx, p)).transpose()?;
+            if stored == written && answer.parent_id.is_some() && stored != answer.parent_id {
+                tx.execute(
+                    "UPDATE folders SET parent_id = ?2 WHERE id = ?1",
+                    params![id, answer.parent_id],
+                )?;
+                changed = true;
+            }
+            if answer.id != id {
+                rekey_folder_on(&tx, &id, &answer.id, true)?;
+                changed = true;
+            }
+        }
+        if answer.id != id {
+            record_folder_alias_on(&tx, &id, &answer.id)?;
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Removes a folder whose create Graph refused (#1910) and the `local:`
+    /// folders under it, queueing nothing. A folder Graph has that was
+    /// moved under it locally is left: its own queued move is refused next
+    /// and reverts it. Whether a message went with them (one moved there
+    /// locally, which only a mail reconverge brings back). An id that is
+    /// not `local:`, or the drafts sentinel, removes nothing.
+    pub(crate) fn discard_local_folder(&self, id: &str) -> Result<bool, StoreError> {
+        if !id.starts_with("local:") || id == LOCAL_DRAFTS_SENTINEL_FOLDER_ID {
+            return Ok(false);
+        }
+        let tx = self.write_tx()?;
+        let local: Vec<String> = subtree_ids_on(&tx, id)?
+            .into_iter()
+            .filter(|f| f.starts_with("local:") && f != LOCAL_DRAFTS_SENTINEL_FOLDER_ID)
+            .collect();
+        let local = ids_json(&local);
+        let had_mail: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages
+                 WHERE folder_id IN (SELECT value FROM json_each(?1)))",
+            params![local],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
+            params![local],
+        )?;
+        tx.commit()?;
+        Ok(had_mail)
+    }
+
+    /// Puts a refused rename's previous name back (#1910), only while the
+    /// stored name is still the one the op wrote (`attempted`): a later
+    /// queued rename is kept, and the next listing corrects anything else.
+    /// Whether it wrote.
+    pub(crate) fn revert_folder_name(
+        &self,
+        id: &str,
+        prev: &str,
+        attempted: &str,
+    ) -> Result<bool, StoreError> {
+        let id = self.current_folder_id(id)?;
+        let n = self.conn.execute(
+            "UPDATE folders SET display_name = ?2 WHERE id = ?1 AND display_name = ?3",
+            params![id, prev, attempted],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Puts a refused move's previous parent back (#1910), only while the
+    /// stored parent is still the one the op wrote (`attempted`), each id
+    /// resolved through `folder_aliases`. Whether it wrote.
+    pub(crate) fn revert_folder_parent(
+        &self,
+        id: &str,
+        prev: Option<&str>,
+        attempted: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        let prev = prev.map(|p| current_folder_id_on(&tx, p)).transpose()?;
+        let attempted = attempted
+            .map(|p| current_folder_id_on(&tx, p))
+            .transpose()?;
+        let n = tx.execute(
+            "UPDATE folders SET parent_id = ?2 WHERE id = ?1 AND parent_id IS ?3",
+            params![id, prev, attempted],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Puts back the folder rows a refused delete removed (#1910), with
+    /// their `sort_order` and `is_expanded`; a row stored again since (a
+    /// listing) is left. No delta link: the next pass's delta brings their
+    /// messages back from Graph, which still has them. Whether any came
+    /// back.
+    pub(crate) fn restore_folders(&self, rows: &[FolderSnapshot]) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        let mut restored = false;
+        for f in rows {
+            restored |= tx.execute(
+                "INSERT OR IGNORE INTO folders
+                     (id, parent_id, display_name, total_count, unread_count,
+                      well_known_name, sort_order, is_expanded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    f.id,
+                    f.parent_id,
+                    f.display_name,
+                    f.total_count,
+                    f.unread_count,
+                    f.well_known_name,
+                    f.sort_order,
+                    f.is_expanded as i64
+                ],
+            )? > 0;
+        }
+        tx.commit()?;
+        Ok(restored)
+    }
+
+    /// The folders a queued rename, move or delete names (#1910), resolved
+    /// through `folder_aliases`.
+    pub(crate) fn queued_folder_writes(&self) -> Result<QueuedFolderWrites, StoreError> {
+        let mut q = QueuedFolderWrites::default();
+        for row in pending_ops_on(&self.conn)? {
+            let (id, set) = match row.op {
+                OutboxOp::RenameFolder { id, .. } => (id, &mut q.renamed),
+                OutboxOp::MoveFolder { id, .. } => (id, &mut q.moved),
+                OutboxOp::DeleteFolder { id, .. } => (id, &mut q.deleted),
+                _ => continue,
+            };
+            set.insert(current_folder_id_on(&self.conn, &id)?);
+        }
+        Ok(q)
+    }
+}
+
+/// `Store::current_folder_id` on `conn`.
+fn current_folder_id_on(conn: &Connection, id: &str) -> Result<String, StoreError> {
+    let aliased: Option<String> = conn
+        .query_row(
+            "SELECT id FROM folder_aliases WHERE old_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(aliased.unwrap_or_else(|| id.to_string()))
+}
+
+fn folder_exists_on(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE id = ?1)",
+        params![id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Why `id` cannot be a folder command's folder, parent or dest: the drafts
+/// sentinel, or no such folder. `None` when it can.
+fn check_folder_on(conn: &Connection, id: &str) -> Result<Option<FolderRefusal>, StoreError> {
+    if id == LOCAL_DRAFTS_SENTINEL_FOLDER_ID {
+        return Ok(Some(FolderRefusal::DraftsSentinel));
+    }
+    if !folder_exists_on(conn, id)? {
+        return Ok(Some(FolderRefusal::Unknown(id.to_string())));
+    }
+    Ok(None)
+}
+
+/// `id` and every stored folder under it (`parent_id`), `id` first.
+/// `UNION` stops at a cycle.
+fn subtree_ids_on(conn: &Connection, id: &str) -> Result<Vec<String>, StoreError> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE sub(id) AS (
+             SELECT ?1
+             UNION
+             SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
+         )
+         SELECT id FROM sub",
+    )?;
+    let ids = stmt
+        .query_map(params![id], |r| r.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(ids)
+}
+
+/// The id the listing gives top folders as their parent (Graph's
+/// `msgfolderroot`, which is never listed): the parent most stored folders
+/// share that is not itself stored. `None` before any listing; lookxy's
+/// folder tree shows a folder under either at the top.
+fn root_folder_id_on(conn: &Connection) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT parent_id FROM folders
+             WHERE parent_id IS NOT NULL
+               AND parent_id NOT IN (SELECT id FROM folders)
+             GROUP BY parent_id
+             ORDER BY COUNT(*) DESC, parent_id
+             LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// Whether a folder whose parent is `parent` is at the top: no parent, or
+/// one that is not a stored folder (the root).
+fn is_top_level_on(conn: &Connection, parent: Option<&str>) -> Result<bool, StoreError> {
+    match parent {
+        None => Ok(true),
+        Some(p) => Ok(!folder_exists_on(conn, p)?),
+    }
+}
+
+/// `ids` as a JSON array, for `json_each`.
+fn ids_json(ids: &[String]) -> String {
+    Value::Array(ids.iter().map(|id| Value::Str(id.clone())).collect()).to_string()
+}
+
+/// Re-keys the folder `old` to `new` on `conn` (a transaction): the row,
+/// its messages (`folder_id`) and its child folders (`parent_id`). A stale
+/// row already under `new` gives its messages and children to the kept row
+/// first, so none is cascaded away, then goes. `messages.folder_id` has no
+/// `ON UPDATE CASCADE`, so foreign keys are deferred to the commit
+/// (`defer_foreign_keys` resets itself there). `clear_links` also clears
+/// the delta and backfill state (a move's new id: the links name the old).
+fn rekey_folder_on(
+    conn: &Connection,
+    old: &str,
+    new: &str,
+    clear_links: bool,
+) -> Result<(), StoreError> {
+    if old == new {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA defer_foreign_keys = ON")?;
+    conn.execute(
+        "UPDATE messages SET folder_id = ?1 WHERE folder_id = ?2",
+        params![old, new],
+    )?;
+    conn.execute(
+        "UPDATE folders SET parent_id = ?1 WHERE parent_id = ?2",
+        params![old, new],
+    )?;
+    conn.execute("DELETE FROM folders WHERE id = ?1", params![new])?;
+    conn.execute(
+        "UPDATE folders SET id = ?2 WHERE id = ?1",
+        params![old, new],
+    )?;
+    conn.execute(
+        "UPDATE messages SET folder_id = ?2 WHERE folder_id = ?1",
+        params![old, new],
+    )?;
+    conn.execute(
+        "UPDATE folders SET parent_id = ?2 WHERE parent_id = ?1",
+        params![old, new],
+    )?;
+    if clear_links {
+        conn.execute(
+            "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                 backfill_synced = 0, history_scope = NULL, backfill_scope = NULL,
+                 reminder_expand_refused = 0, backfill_expand_refused = 0
+             WHERE id = ?1",
+            params![new],
+        )?;
+    }
+    Ok(())
+}
+
+/// Records `old → new` in `folder_aliases`, and points every alias that
+/// named `old` at `new`, so one lookup resolves any old id.
+fn record_folder_alias_on(conn: &Connection, old: &str, new: &str) -> Result<(), StoreError> {
+    if old == new {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE folder_aliases SET id = ?2 WHERE id = ?1",
+        params![old, new],
+    )?;
+    conn.execute("DELETE FROM folder_aliases WHERE old_id = ?1", params![new])?;
+    conn.execute(
+        "INSERT INTO folder_aliases (old_id, id) VALUES (?1, ?2)
+         ON CONFLICT(old_id) DO UPDATE SET id = excluded.id",
+        params![old, new],
+    )?;
+    Ok(())
 }
 
 /// `Store::enqueue_op` on `conn` (the store's connection or a transaction).
@@ -18877,5 +19658,544 @@ mod reply_link_tests {
         .unwrap();
         assert!(migrate_reply_links(&conn).unwrap());
         assert!(!migrate_reply_links(&conn).unwrap());
+    }
+}
+
+/// Folder writes through the outbox (#1910).
+#[cfg(test)]
+mod folder_write_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    fn listed(id: &str, parent: Option<&str>, name: &str) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: name.into(),
+            parent_id: parent.map(str::to_string),
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        }
+    }
+
+    /// A mailbox as a listing stores it: Inbox and Archive under ROOT, A
+    /// under Inbox, B under A.
+    fn mailbox() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        for (id, parent) in [
+            ("INBOX", "ROOT"),
+            ("ARCH", "ROOT"),
+            ("A", "INBOX"),
+            ("B", "A"),
+        ] {
+            s.upsert_folder(&listed(id, Some(parent), id)).unwrap();
+        }
+        s
+    }
+
+    fn message(s: &Store, id: &str, folder: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id) VALUES (?1, ?2)",
+                params![id, folder],
+            )
+            .unwrap();
+    }
+
+    fn row(s: &Store, id: &str) -> Option<FolderRow> {
+        s.folders().unwrap().into_iter().find(|f| f.id == id)
+    }
+
+    fn folder_of(s: &Store, message: &str) -> Option<String> {
+        s.conn
+            .query_row(
+                "SELECT folder_id FROM messages WHERE id = ?1",
+                params![message],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn ops(s: &Store) -> Vec<OutboxOp> {
+        s.pending_ops().unwrap().into_iter().map(|r| r.op).collect()
+    }
+
+    fn written(r: FolderWriteResult) -> String {
+        match r {
+            FolderWriteResult::Written(id) => id,
+            other => panic!("not written: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folder_ops_round_trip_json() {
+        let snapshot = FolderSnapshot {
+            id: "A".into(),
+            parent_id: Some("INBOX".into()),
+            display_name: "A \"x\"".into(),
+            total_count: 4,
+            unread_count: 2,
+            well_known_name: Some("archive".into()),
+            sort_order: Some(3),
+            is_expanded: true,
+        };
+        for op in [
+            OutboxOp::CreateFolder {
+                id: "local:1".into(),
+                parent: Some("P".into()),
+                name: "N".into(),
+            },
+            OutboxOp::CreateFolder {
+                id: "local:1".into(),
+                parent: None,
+                name: "N".into(),
+            },
+            OutboxOp::RenameFolder {
+                id: "F".into(),
+                name: "New".into(),
+                prev_name: "Old".into(),
+            },
+            OutboxOp::MoveFolder {
+                id: "F".into(),
+                dest: Some("D".into()),
+                parent: Some("D".into()),
+                prev_parent: Some("P".into()),
+            },
+            OutboxOp::MoveFolder {
+                id: "F".into(),
+                dest: None,
+                parent: None,
+                prev_parent: None,
+            },
+            OutboxOp::DeleteFolder {
+                id: "A".into(),
+                removed: vec![
+                    snapshot.clone(),
+                    FolderSnapshot {
+                        parent_id: None,
+                        well_known_name: None,
+                        sort_order: None,
+                        is_expanded: false,
+                        ..snapshot.clone()
+                    },
+                ],
+            },
+        ] {
+            let text = op.to_json().to_string();
+            let back = OutboxOp::from_json(&json::parse(&text).unwrap());
+            assert_eq!(back.as_ref(), Some(&op), "{text}");
+        }
+    }
+
+    #[test]
+    fn folder_writes_queue_their_op_in_the_same_transaction() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(Some("A"), "New").unwrap());
+        assert!(local.starts_with("local:"), "{local}");
+        written(s.rename_folder("A", "A2").unwrap());
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        written(s.delete_folder("ARCH").unwrap());
+        assert_eq!(
+            ops(&s),
+            [
+                OutboxOp::CreateFolder {
+                    id: local.clone(),
+                    parent: Some("A".into()),
+                    name: "New".into(),
+                },
+                OutboxOp::RenameFolder {
+                    id: "A".into(),
+                    name: "A2".into(),
+                    prev_name: "A".into(),
+                },
+                OutboxOp::MoveFolder {
+                    id: "B".into(),
+                    dest: Some("ARCH".into()),
+                    parent: Some("ARCH".into()),
+                    prev_parent: Some("A".into()),
+                },
+                OutboxOp::DeleteFolder {
+                    id: "ARCH".into(),
+                    removed: vec![
+                        FolderSnapshot {
+                            id: "ARCH".into(),
+                            parent_id: Some("ROOT".into()),
+                            display_name: "ARCH".into(),
+                            total_count: 0,
+                            unread_count: 0,
+                            well_known_name: None,
+                            sort_order: None,
+                            is_expanded: false,
+                        },
+                        FolderSnapshot {
+                            id: "B".into(),
+                            parent_id: Some("ARCH".into()),
+                            display_name: "B".into(),
+                            total_count: 0,
+                            unread_count: 0,
+                            well_known_name: None,
+                            sort_order: None,
+                            is_expanded: false,
+                        },
+                    ],
+                },
+            ]
+        );
+        let new = row(&s, &local).unwrap();
+        assert_eq!(new.parent_id.as_deref(), Some("A"));
+        assert_eq!(new.display_name, "New");
+        assert_eq!(
+            s.queued_folder_writes().unwrap(),
+            QueuedFolderWrites {
+                renamed: ["A".to_string()].into(),
+                moved: ["B".to_string()].into(),
+                deleted: ["ARCH".to_string()].into(),
+            }
+        );
+    }
+
+    #[test]
+    fn create_at_the_top_stores_the_listed_root_as_parent() {
+        let s = mailbox();
+        let top = written(s.create_local_folder(None, "Top").unwrap());
+        assert_eq!(row(&s, &top).unwrap().parent_id.as_deref(), Some("ROOT"));
+        assert_eq!(
+            ops(&s)[0],
+            OutboxOp::CreateFolder {
+                id: top,
+                parent: None,
+                name: "Top".into(),
+            }
+        );
+        // Before any listing there is no root to give it.
+        let empty = Store::open_in_memory().unwrap();
+        let top = written(empty.create_local_folder(None, "Top").unwrap());
+        assert_eq!(row(&empty, &top).unwrap().parent_id, None);
+    }
+
+    #[test]
+    fn folder_writes_refuse_unknown_folders_and_the_drafts_sentinel() {
+        let s = mailbox();
+        let sentinel = s.drafts_folder_id().unwrap();
+        assert_eq!(sentinel, LOCAL_DRAFTS_SENTINEL_FOLDER_ID);
+        assert_eq!(row(&s, &sentinel).unwrap().parent_id, None);
+        let unknown = || FolderWriteResult::Refused(FolderRefusal::Unknown("NOPE".into()));
+        let drafts = FolderWriteResult::Refused(FolderRefusal::DraftsSentinel);
+        assert_eq!(s.create_local_folder(Some("NOPE"), "x").unwrap(), unknown());
+        assert_eq!(s.rename_folder("NOPE", "x").unwrap(), unknown());
+        assert_eq!(s.move_folder("NOPE", None).unwrap(), unknown());
+        assert_eq!(s.move_folder("A", Some("NOPE")).unwrap(), unknown());
+        assert_eq!(s.delete_folder("NOPE").unwrap(), unknown());
+        assert_eq!(s.create_local_folder(Some(&sentinel), "x").unwrap(), drafts);
+        assert_eq!(s.rename_folder(&sentinel, "x").unwrap(), drafts);
+        assert_eq!(s.move_folder(&sentinel, Some("A")).unwrap(), drafts);
+        assert_eq!(s.move_folder("A", Some(&sentinel)).unwrap(), drafts);
+        assert_eq!(s.delete_folder(&sentinel).unwrap(), drafts);
+        assert!(ops(&s).is_empty());
+        let kept = row(&s, &sentinel).unwrap();
+        assert_ne!(kept.display_name, "x");
+        assert_eq!(kept.parent_id, None);
+    }
+
+    #[test]
+    fn move_into_itself_or_a_folder_inside_it_is_refused() {
+        let s = mailbox();
+        let into = FolderWriteResult::Refused(FolderRefusal::IntoItself);
+        assert_eq!(s.move_folder("A", Some("A")).unwrap(), into);
+        assert_eq!(s.move_folder("A", Some("B")).unwrap(), into);
+        assert_eq!(s.move_folder("INBOX", Some("B")).unwrap(), into);
+        assert!(ops(&s).is_empty());
+        assert_eq!(row(&s, "A").unwrap().parent_id.as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn rename_and_move_keep_sort_order_and_expanded() {
+        let s = mailbox();
+        s.set_folder_expanded("A", true).unwrap();
+        s.conn
+            .execute("UPDATE folders SET sort_order = 7 WHERE id = 'A'", [])
+            .unwrap();
+        s.set_delta_link("A", "LINK").unwrap();
+        written(s.rename_folder("A", "Renamed").unwrap());
+        written(s.move_folder("A", None).unwrap());
+        let a = row(&s, "A").unwrap();
+        assert_eq!(a.display_name, "Renamed");
+        assert_eq!(a.parent_id.as_deref(), Some("ROOT"), "the top");
+        assert!(a.is_expanded);
+        assert_eq!(a.sort_order, Some(7));
+        assert_eq!(a.delta_link.as_deref(), Some("LINK"));
+        // Nothing to do: nothing queued.
+        assert_eq!(
+            s.rename_folder("A", "Renamed").unwrap(),
+            FolderWriteResult::Unchanged
+        );
+        assert_eq!(
+            s.move_folder("A", None).unwrap(),
+            FolderWriteResult::Unchanged
+        );
+        assert_eq!(
+            s.move_folder("B", Some("A")).unwrap(),
+            FolderWriteResult::Unchanged
+        );
+        assert_eq!(ops(&s).len(), 2);
+    }
+
+    #[test]
+    fn delete_folder_removes_subtree_messages_and_delta_links() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(Some("B"), "L").unwrap());
+        for id in ["A", "B"] {
+            s.set_delta_link(id, "LINK").unwrap();
+        }
+        message(&s, "m-a", "A");
+        message(&s, "m-b", "B");
+        message(&s, "m-inbox", "INBOX");
+        s.set_folder_expanded("B", true).unwrap();
+        written(s.delete_folder("A").unwrap());
+        for id in ["A", "B", local.as_str()] {
+            assert!(row(&s, id).is_none(), "{id} removed");
+        }
+        assert_eq!(folder_of(&s, "m-a"), None);
+        assert_eq!(folder_of(&s, "m-b"), None);
+        assert_eq!(folder_of(&s, "m-inbox").as_deref(), Some("INBOX"));
+        let Some(OutboxOp::DeleteFolder { id, removed }) = ops(&s).pop() else {
+            panic!("no delete queued")
+        };
+        assert_eq!(id, "A");
+        let ids: Vec<&str> = removed.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["A", "B"], "the local: folder is not snapshot");
+
+        // A refused delete puts the rows back with their local state, and
+        // without a delta link.
+        assert!(s.restore_folders(&removed).unwrap());
+        let b = row(&s, "B").unwrap();
+        assert_eq!(b.parent_id.as_deref(), Some("A"));
+        assert!(b.is_expanded);
+        assert_eq!(b.delta_link, None);
+        assert!(row(&s, "A").is_some());
+        assert!(!s.restore_folders(&removed).unwrap(), "already back");
+    }
+
+    #[test]
+    fn delete_folder_holding_unsent_mail_is_refused() {
+        let unsent = FolderWriteResult::Refused(FolderRefusal::HoldsUnsentMail);
+        // A local draft, in a folder under the one deleted.
+        let s = mailbox();
+        message(&s, "local:d1", "B");
+        assert_eq!(s.delete_folder("A").unwrap(), unsent);
+        // A send queued: SendDraft re-filed the draft into this folder.
+        let s = mailbox();
+        message(&s, "G1", "ARCH");
+        s.enqueue_op(&OutboxOp::SendDraft { id: "G1".into() })
+            .unwrap();
+        assert_eq!(s.delete_folder("ARCH").unwrap(), unsent);
+        // A queued save by the `local:` id a draft was reconciled from.
+        let s = mailbox();
+        message(&s, "G2", "ARCH");
+        s.conn
+            .execute(
+                "UPDATE messages SET local_id = 'local:x' WHERE id = 'G2'",
+                [],
+            )
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SaveDraft {
+            id: "local:x".into(),
+        })
+        .unwrap();
+        assert_eq!(s.delete_folder("ARCH").unwrap(), unsent);
+        // An unpushed edit (#2082).
+        let s = mailbox();
+        message(&s, "G3", "ARCH");
+        s.conn
+            .execute("UPDATE messages SET local_edit = 2 WHERE id = 'G3'", [])
+            .unwrap();
+        assert_eq!(s.delete_folder("ARCH").unwrap(), unsent);
+        assert!(row(&s, "ARCH").is_some());
+        assert_eq!(folder_of(&s, "G3").as_deref(), Some("ARCH"));
+        assert_eq!(ops(&s).len(), 0);
+        // Mail Graph has, with other ops queued, is no reason.
+        let s = mailbox();
+        message(&s, "G4", "ARCH");
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "G4".into(),
+            read: true,
+        })
+        .unwrap();
+        written(s.delete_folder("ARCH").unwrap());
+    }
+
+    #[test]
+    fn reconcile_created_folder_rekeys_messages_children_and_aliases() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
+        let child = written(s.create_local_folder(Some(&local), "Kid").unwrap());
+        message(&s, "m1", &local);
+        s.set_folder_expanded(&local, true).unwrap();
+        written(s.rename_folder(&local, "Renamed").unwrap());
+        assert!(
+            s.reconcile_created_folder(&local, &listed("G1", Some("INBOX"), "New"))
+                .unwrap()
+        );
+        assert!(row(&s, &local).is_none());
+        let g = row(&s, "G1").unwrap();
+        assert_eq!(g.display_name, "Renamed", "a later rename is kept");
+        assert_eq!(g.parent_id.as_deref(), Some("INBOX"));
+        assert!(g.is_expanded);
+        assert_eq!(folder_of(&s, "m1").as_deref(), Some("G1"));
+        assert_eq!(row(&s, &child).unwrap().parent_id.as_deref(), Some("G1"));
+        assert_eq!(s.current_folder_id(&local).unwrap(), "G1");
+        assert_eq!(s.current_folder_id("G1").unwrap(), "G1");
+        assert_eq!(
+            s.queued_folder_writes().unwrap().renamed,
+            ["G1".to_string()].into(),
+            "a queued op by the local: id resolves"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_the_mail_of_a_stale_row_under_the_graph_id() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(None, "New").unwrap());
+        s.upsert_folder(&listed("G1", Some("ROOT"), "stale"))
+            .unwrap();
+        s.upsert_folder(&listed("UNDER", Some("G1"), "under"))
+            .unwrap();
+        message(&s, "m-stale", "G1");
+        message(&s, "m-local", &local);
+        s.reconcile_created_folder(&local, &listed("G1", Some("ROOT"), "New"))
+            .unwrap();
+        assert_eq!(row(&s, "G1").unwrap().display_name, "New", "local wins");
+        assert_eq!(folder_of(&s, "m-stale").as_deref(), Some("G1"));
+        assert_eq!(folder_of(&s, "m-local").as_deref(), Some("G1"));
+        assert_eq!(row(&s, "UNDER").unwrap().parent_id.as_deref(), Some("G1"));
+    }
+
+    #[test]
+    fn reconcile_of_a_deleted_row_still_aliases() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(None, "New").unwrap());
+        written(s.delete_folder(&local).unwrap());
+        assert!(
+            !s.reconcile_created_folder(&local, &listed("G1", Some("ROOT"), "New"))
+                .unwrap()
+        );
+        assert!(row(&s, "G1").is_none());
+        assert_eq!(s.current_folder_id(&local).unwrap(), "G1");
+    }
+
+    #[test]
+    fn current_folder_id_follows_chained_aliases() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(None, "New").unwrap());
+        s.reconcile_created_folder(&local, &listed("G1", Some("ROOT"), "New"))
+            .unwrap();
+        // Graph answers a move with a new id.
+        let changed = s
+            .apply_moved_folder(&local, Some("ARCH"), &listed("G2", Some("ARCH"), "New"))
+            .unwrap();
+        assert!(changed);
+        assert_eq!(s.current_folder_id(&local).unwrap(), "G2");
+        assert_eq!(s.current_folder_id("G1").unwrap(), "G2");
+        assert!(row(&s, "G2").is_some());
+        // And back to an id it had.
+        s.apply_moved_folder("G2", None, &listed("G1", Some("ROOT"), "New"))
+            .unwrap();
+        assert_eq!(s.current_folder_id(&local).unwrap(), "G1");
+        assert_eq!(s.current_folder_id("G2").unwrap(), "G1");
+        assert_eq!(s.current_folder_id("G1").unwrap(), "G1", "no cycle");
+    }
+
+    #[test]
+    fn a_move_answered_with_a_new_id_rekeys_and_clears_the_links() {
+        let s = mailbox();
+        s.set_delta_link("B", "LINK").unwrap();
+        s.set_folder_expanded("B", true).unwrap();
+        s.upsert_folder(&listed("C", Some("B"), "C")).unwrap();
+        message(&s, "m1", "B");
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        assert!(
+            s.apply_moved_folder("B", Some("ARCH"), &listed("B2", Some("ARCH"), "B"))
+                .unwrap()
+        );
+        assert!(row(&s, "B").is_none());
+        let b = row(&s, "B2").unwrap();
+        assert_eq!(b.parent_id.as_deref(), Some("ARCH"));
+        assert!(b.is_expanded);
+        assert_eq!(b.delta_link, None, "the link names the old id");
+        assert_eq!(folder_of(&s, "m1").as_deref(), Some("B2"));
+        assert_eq!(row(&s, "C").unwrap().parent_id.as_deref(), Some("B2"));
+        assert_eq!(s.current_folder_id("B").unwrap(), "B2");
+    }
+
+    #[test]
+    fn a_move_answer_gives_the_parent_unless_a_later_move_wrote_one() {
+        let s = mailbox();
+        written(s.move_folder("A", None).unwrap());
+        // Graph's root id replaces the one the store guessed.
+        assert!(
+            s.apply_moved_folder("A", Some("ROOT"), &listed("A", Some("REALROOT"), "A"))
+                .unwrap()
+        );
+        assert_eq!(row(&s, "A").unwrap().parent_id.as_deref(), Some("REALROOT"));
+        // A later queued move wrote its own parent: kept.
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        written(s.move_folder("B", Some("INBOX")).unwrap());
+        assert!(
+            !s.apply_moved_folder("B", Some("ARCH"), &listed("B", Some("ARCH"), "B"))
+                .unwrap()
+        );
+        assert_eq!(row(&s, "B").unwrap().parent_id.as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn revert_folder_name_keeps_a_later_rename() {
+        let s = mailbox();
+        written(s.rename_folder("A", "One").unwrap());
+        assert!(s.revert_folder_name("A", "A", "One").unwrap());
+        assert_eq!(row(&s, "A").unwrap().display_name, "A");
+        written(s.rename_folder("A", "One").unwrap());
+        written(s.rename_folder("A", "Two").unwrap());
+        assert!(!s.revert_folder_name("A", "A", "One").unwrap());
+        assert_eq!(row(&s, "A").unwrap().display_name, "Two");
+    }
+
+    #[test]
+    fn revert_folder_parent_keeps_a_later_move() {
+        let s = mailbox();
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        assert!(
+            s.revert_folder_parent("B", Some("A"), Some("ARCH"))
+                .unwrap()
+        );
+        assert_eq!(row(&s, "B").unwrap().parent_id.as_deref(), Some("A"));
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        written(s.move_folder("B", Some("INBOX")).unwrap());
+        assert!(
+            !s.revert_folder_parent("B", Some("A"), Some("ARCH"))
+                .unwrap()
+        );
+        assert_eq!(row(&s, "B").unwrap().parent_id.as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn discard_local_folder_leaves_folders_graph_has() {
+        let s = mailbox();
+        let local = written(s.create_local_folder(None, "New").unwrap());
+        let kid = written(s.create_local_folder(Some(&local), "Kid").unwrap());
+        written(s.move_folder("B", Some(&local)).unwrap());
+        message(&s, "m-b", "B");
+        assert!(!s.discard_local_folder(&local).unwrap(), "no mail went");
+        assert!(row(&s, &local).is_none());
+        assert!(row(&s, &kid).is_none());
+        assert!(row(&s, "B").is_some(), "its own move's refusal reverts it");
+        assert_eq!(folder_of(&s, "m-b").as_deref(), Some("B"));
+
+        let local = written(s.create_local_folder(None, "New").unwrap());
+        message(&s, "m-moved", &local);
+        assert!(s.discard_local_folder(&local).unwrap());
+        assert_eq!(folder_of(&s, "m-moved"), None);
+        assert!(!s.discard_local_folder("A").unwrap(), "not local:");
+        assert!(row(&s, "A").is_some());
     }
 }

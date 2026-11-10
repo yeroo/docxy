@@ -800,6 +800,10 @@ impl App {
             // (#2063) and has nothing to re-key or report.
             | SyncEvent::ContactCreated { .. }
             | SyncEvent::ContactWriteFailed { .. }
+            // lookxy has no folder management, so it never creates,
+            // renames, moves or deletes a folder (#1910).
+            | SyncEvent::FolderCreated { .. }
+            | SyncEvent::FolderWriteFailed { .. }
             | SyncEvent::FolderProgress { .. }
             // lookxy has no meeting banner yet, so it never asks for a
             // message's meeting type or a Remove from Calendar (#2024).

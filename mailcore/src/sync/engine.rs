@@ -56,13 +56,13 @@ use crate::graph::model::{
     SearchHit,
 };
 use crate::store::{
-    CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
-    NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store,
-    StoreError, SyncedCalendar,
+    CalendarRound, FetchedCalendar, FolderHistory, FolderRow, FolderWriteResult,
+    LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment, OutboxOp,
+    OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
 use crate::tokencache;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -559,8 +559,59 @@ pub enum SyncCommand {
     /// [`SyncEvent::ContactsUpdated`]. A 404 is success (already gone). As
     /// `CreateContact`, the next drain sends the op without the command. Needs `Contacts.ReadWrite`, as `CreateContact`.
     DeleteContact { id: String },
+    /// Create a mail folder named `name` under `parent` (#1910; `None`: the
+    /// top of the mailbox). The store has it at once under a `local:` id
+    /// ([`SyncEvent::FoldersUpdated`]); `POST /me/mailFolders` (or the
+    /// parent's `childFolders`) follows through the outbox, and once Graph
+    /// answers the row is re-keyed to Graph's id
+    /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`). Anything aimed at
+    /// the `local:` id meanwhile (a rename, a move, a child folder, a
+    /// message moved into it) follows it (`Store::current_folder_id`). An
+    /// unknown parent or the drafts sentinel is refused at once
+    /// ([`SyncEvent::FolderWriteFailed`] with no status).
+    CreateFolder {
+        parent: Option<String>,
+        name: String,
+    },
+    /// Rename a mail folder (#1910): the store at once, then
+    /// `PATCH /me/mailFolders/{id}` with `displayName`. `sort_order` and
+    /// `is_expanded` are kept. The same name does nothing.
+    RenameFolder { id: String, name: String },
+    /// Move a mail folder under `dest` (#1910; `None`: the top of the
+    /// mailbox, `msgfolderroot`): the store at once, then
+    /// `POST /me/mailFolders/{id}/move`; Graph's answer gives the stored
+    /// parent, and the id if it differs. A dest that is the folder or one
+    /// inside it is refused at once.
+    MoveFolder { id: String, dest: Option<String> },
+    /// Delete a mail folder (#1910): the store drops it, its child folders,
+    /// their messages and delta links at once, then
+    /// `DELETE /me/mailFolders/{id}` (a 404 is success). A folder holding
+    /// mail Graph does not have (an unsent or unsaved draft, a send queued
+    /// into Sent Items) is refused at once: "delete to Deleted Items" is a
+    /// [`SyncCommand::MoveFolder`] there.
+    DeleteFolder { id: String },
     /// Exit the sync thread cleanly.
     Shutdown,
+}
+
+/// Which folder write [`SyncEvent::FolderWriteFailed`] reports (#1910).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderWrite {
+    Create,
+    Rename,
+    Move,
+    Delete,
+}
+
+impl FolderWrite {
+    fn verb(self) -> &'static str {
+        match self {
+            FolderWrite::Create => "create",
+            FolderWrite::Rename => "rename",
+            FolderWrite::Move => "move",
+            FolderWrite::Delete => "delete",
+        }
+    }
 }
 
 /// Which contact write [`SyncEvent::ContactWriteFailed`] reports (#2063).
@@ -699,6 +750,34 @@ pub enum SyncEvent {
         /// edit is not lost silently; `None` for a delete (and for a row
         /// already gone).
         attempted: Option<FolderContact>,
+    },
+    /// A folder created locally reached Graph (#1910): the row created as
+    /// `local_id` is stored as `id` now, with its messages and child
+    /// folders. The `local:` id still resolves (`Store::current_folder_id`).
+    /// [`SyncEvent::FoldersUpdated`] follows.
+    FolderCreated { local_id: String, id: String },
+    /// A folder write was refused (#1910): by Graph for good (any failure
+    /// but a 401, a throttle, a transport error or a 5xx, which keep the op
+    /// queued; a 404 on a rename or move too, but never on a delete), or by
+    /// the store at once (`status: None`, nothing queued: an unknown
+    /// folder, the drafts sentinel, a move into itself, a delete of a
+    /// folder holding unsent mail). Graph's refusal is final at once and
+    /// reverts the store: a refused create removes its `local:` folder (a
+    /// message moved into it comes back by a mail reconverge), a rename or
+    /// move puts the previous name or parent back, a delete puts the folder
+    /// rows back (their messages come back with the next pass). A
+    /// [`SyncEvent::Error`] follows, `"{create|rename|move|delete} folder
+    /// {id}: {error}"`, then [`SyncEvent::FoldersUpdated`] after a revert.
+    FolderWriteFailed {
+        /// The folder's id as stored when it failed (the Graph id once a
+        /// create re-keyed it); for a create the store refused, its parent.
+        id: String,
+        write: FolderWrite,
+        /// The HTTP status Graph answered (`NotFound` is `Some(404)`);
+        /// `None` when the store refused it, or no status explains it.
+        status: Option<u16>,
+        /// The error, one line.
+        error: String,
     },
     /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
     /// its free/busy grid.
@@ -1023,6 +1102,39 @@ fn contact_op(op: &OutboxOp) -> Option<(ContactWrite, &str)> {
         OutboxOp::CreateContact { id } => Some((ContactWrite::Create, id)),
         OutboxOp::UpdateContact { id, .. } => Some((ContactWrite::Update, id)),
         OutboxOp::DeleteContact { id } => Some((ContactWrite::Delete, id)),
+        _ => None,
+    }
+}
+
+/// Whether the listed folder `id`, or a listed folder above it, is one a
+/// queued delete names (#1910): the listing must not bring it back.
+fn under_deleted(
+    id: &str,
+    parents: &HashMap<&str, Option<&str>>,
+    deleted: &HashSet<String>,
+) -> bool {
+    let mut at = Some(id);
+    // The walk is bounded by the listing's size, so a cycle cannot hang it.
+    for _ in 0..=parents.len() {
+        let Some(cur) = at else {
+            return false;
+        };
+        if deleted.contains(cur) {
+            return true;
+        }
+        at = parents.get(cur).copied().flatten();
+    }
+    false
+}
+
+/// The write and the folder a folder op (#1910) names, as it was queued;
+/// `None` for every other op.
+fn folder_op(op: &OutboxOp) -> Option<(FolderWrite, &str)> {
+    match op {
+        OutboxOp::CreateFolder { id, .. } => Some((FolderWrite::Create, id)),
+        OutboxOp::RenameFolder { id, .. } => Some((FolderWrite::Rename, id)),
+        OutboxOp::MoveFolder { id, .. } => Some((FolderWrite::Move, id)),
+        OutboxOp::DeleteFolder { id, .. } => Some((FolderWrite::Delete, id)),
         _ => None,
     }
 }
@@ -1851,6 +1963,9 @@ impl Engine {
                 // is a NOT NULL foreign key) must be surfaced, not swallowed.
                 // `id`/`dest` are message/folder ids, never secrets.
                 let id = self.store.current_id(&id).unwrap_or(id);
+                // A folder created here may have been re-keyed since the
+                // host read its id (#1910).
+                let dest = self.store.current_folder_id(&dest).unwrap_or(dest);
                 if let Err(e) = self.store.move_message(&id, &dest) {
                     self.emit(SyncEvent::Error(format!(
                         "local move of {id} to {dest} failed: {e}"
@@ -2066,6 +2181,23 @@ impl Engine {
                     self.emit(SyncEvent::ContactsUpdated);
                 }
             }
+            SyncCommand::CreateFolder { parent, name } => {
+                let r = self.store.create_local_folder(parent.as_deref(), &name);
+                let id = parent.unwrap_or_default();
+                self.folder_command(FolderWrite::Create, &id, r);
+            }
+            SyncCommand::RenameFolder { id, name } => {
+                let r = self.store.rename_folder(&id, &name);
+                self.folder_command(FolderWrite::Rename, &id, r);
+            }
+            SyncCommand::MoveFolder { id, dest } => {
+                let r = self.store.move_folder(&id, dest.as_deref());
+                self.folder_command(FolderWrite::Move, &id, r);
+            }
+            SyncCommand::DeleteFolder { id } => {
+                let r = self.store.delete_folder(&id);
+                self.folder_command(FolderWrite::Delete, &id, r);
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2104,7 +2236,9 @@ impl Engine {
                 return;
             }
         };
-        for f in &folders {
+        // A `local:` folder (one created here whose create has not reached
+        // Graph, #1910, or the drafts sentinel) has nothing on the server.
+        for f in folders.iter().filter(|f| !f.id.starts_with("local:")) {
             if !self.checkpoint() || !self.sync_folder_delta(&f.id) {
                 return;
             }
@@ -2157,6 +2291,11 @@ impl Engine {
     /// surfaced and skipped. Returns `false` when the caller must stop (an
     /// auth, throttle or transport failure, already handled by `react`).
     fn refresh_folder(&mut self, folder_id: &str) -> bool {
+        // A folder created here that has not reached Graph yet (#1910) has
+        // nothing there to read.
+        if folder_id.starts_with("local:") {
+            return true;
+        }
         if !self.sync_folder_delta(folder_id) {
             return false;
         }
@@ -2177,6 +2316,13 @@ impl Engine {
     /// sync cut short keeps the state its failure set (Offline,
     /// SignInRequired, or settled by a throttle).
     fn sync_one_folder(&mut self, id: &str) {
+        // A folder created under a `local:` id is synced under Graph's once
+        // re-keyed (#1910).
+        let id = self
+            .store
+            .current_folder_id(id)
+            .unwrap_or_else(|_| id.to_string());
+        let id = id.as_str();
         match self.store.folders() {
             Ok(folders) if folders.iter().any(|f| f.id == id) => {}
             Ok(_) => {
@@ -2196,7 +2342,13 @@ impl Engine {
         self.set_state(SyncState::Syncing);
         if self.drain_outbox().carry_on()
             && self.refresh_if_calendar_reset_owed()
-            && self.refresh_folder(id)
+            // The drain may have re-keyed it (#1910).
+            && self.refresh_folder(
+                &self
+                    .store
+                    .current_folder_id(id)
+                    .unwrap_or_else(|_| id.to_string()),
+            )
         {
             self.clear_backoff();
             self.settle_state();
@@ -2342,8 +2494,42 @@ impl Engine {
         match self.with_auth(|c| c.list_folders()) {
             Ok(listing) => {
                 let mut changed = false;
+                // A folder write still queued (#1910) is not undone by the
+                // listing: a pending rename keeps its name, a pending move
+                // its parent, and a pending delete's folder (and any listed
+                // folder under it) stays gone. The commands that queue them
+                // run on this thread, so the queue cannot change meanwhile.
+                let queued = match self.store.queued_folder_writes() {
+                    Ok(q) => q,
+                    Err(e) => {
+                        self.emit(SyncEvent::Error(e.to_string()));
+                        return true;
+                    }
+                };
+                let stored: HashMap<String, FolderRow> = self
+                    .store
+                    .folders()
+                    .map(|f| f.into_iter().map(|f| (f.id.clone(), f)).collect())
+                    .unwrap_or_default();
+                let parents: HashMap<&str, Option<&str>> = listing
+                    .folders
+                    .iter()
+                    .map(|f| (f.id.as_str(), f.parent_id.as_deref()))
+                    .collect();
                 for f in &listing.folders {
-                    changed |= self.store.upsert_folder(f).unwrap_or(false);
+                    if under_deleted(&f.id, &parents, &queued.deleted) {
+                        continue;
+                    }
+                    let mut f = f.clone();
+                    if let Some(row) = stored.get(&f.id) {
+                        if queued.renamed.contains(&f.id) {
+                            f.display_name = row.display_name.clone();
+                        }
+                        if queued.moved.contains(&f.id) {
+                            f.parent_id = row.parent_id.clone();
+                        }
+                    }
+                    changed |= self.store.upsert_folder(&f).unwrap_or(false);
                 }
                 if let Some(drafts) = listing
                     .folders
@@ -2388,11 +2574,19 @@ impl Engine {
     fn folders_to_keep(&mut self, listed: &[MailFolder]) -> (Vec<String>, bool) {
         let mut keep: Vec<String> = listed.iter().map(|f| f.id.clone()).collect();
         let missing: Vec<String> = match self.store.folders() {
-            Ok(stored) => stored
-                .into_iter()
-                .map(|f| f.id)
-                .filter(|id| id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID && !keep.contains(id))
-                .collect(),
+            Ok(stored) => {
+                let ids: Vec<String> = stored
+                    .into_iter()
+                    .map(|f| f.id)
+                    .filter(|id| id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID && !keep.contains(id))
+                    .collect();
+                // A folder created here (#1910) is never listed before its
+                // create reaches Graph: kept without asking.
+                let (local, missing): (Vec<String>, Vec<String>) =
+                    ids.into_iter().partition(|id| id.starts_with("local:"));
+                keep.extend(local);
+                missing
+            }
             Err(e) => {
                 self.emit(SyncEvent::Error(e.to_string()));
                 return (keep, true);
@@ -3549,6 +3743,15 @@ impl Engine {
                         Applied::ContactCreated { local_id, id } => {
                             self.emit(SyncEvent::ContactCreated { local_id, id });
                         }
+                        Applied::FolderCreated { local_id, id } => {
+                            self.follow_folder_rekeys();
+                            self.emit(SyncEvent::FolderCreated { local_id, id });
+                            self.emit(SyncEvent::FoldersUpdated);
+                        }
+                        Applied::FoldersChanged => {
+                            self.follow_folder_rekeys();
+                            self.emit(SyncEvent::FoldersUpdated);
+                        }
                         Applied::Done => {}
                     }
                     // The last queued op for a contact a refusal left owed.
@@ -3594,6 +3797,12 @@ impl Engine {
                     // A contact op (#2063): the first refusal is final.
                     if contact_op(&row.op).is_some() {
                         self.refuse_contact_write(&row, &other);
+                        continue;
+                    }
+                    // A folder op (#1910) too: retrying a 400 or a 409
+                    // changes nothing, and the revert is exact.
+                    if folder_op(&row.op).is_some() {
+                        self.refuse_folder_write(&row, &other);
                         continue;
                     }
                     // A reminder op (#2025) wrote nothing locally, and a
@@ -3759,6 +3968,106 @@ impl Engine {
             write.verb()
         )));
         self.emit(SyncEvent::ContactsUpdated);
+    }
+
+    /// A folder command's store write (#1910): `FoldersUpdated` and a drain
+    /// when it wrote and queued its op, nothing when there was nothing to
+    /// do, and `FolderWriteFailed` + `Error` when the store refused it
+    /// (nothing queued). `id` is the folder the command named (a create's
+    /// parent).
+    fn folder_command(
+        &mut self,
+        write: FolderWrite,
+        id: &str,
+        result: Result<FolderWriteResult, StoreError>,
+    ) {
+        let error = match result {
+            Ok(FolderWriteResult::Written(_)) => {
+                self.emit(SyncEvent::FoldersUpdated);
+                self.drain_queued();
+                return;
+            }
+            Ok(FolderWriteResult::Unchanged) => return,
+            Ok(FolderWriteResult::Refused(r)) => r.to_string(),
+            Err(e) => e.to_string(),
+        };
+        self.emit(SyncEvent::FolderWriteFailed {
+            id: id.to_string(),
+            write,
+            status: None,
+            error: error.clone(),
+        });
+        self.emit(SyncEvent::Error(format!(
+            "{} folder {id}: {error}",
+            write.verb()
+        )));
+    }
+
+    /// A folder op Graph refused for good (#1910): drop it and revert its
+    /// store write, then report it ([`SyncEvent::FolderWriteFailed`], an
+    /// `Error` line, `FoldersUpdated`). A refused create removes its
+    /// `local:` folder; when a message had been moved into it, the mail
+    /// reconverges as after a quarantine (every delta link cleared), so the
+    /// message comes back in the folder Graph has it in.
+    fn refuse_folder_write(&mut self, row: &OutboxRow, err: &GraphError) {
+        let Some((write, queued_id)) = folder_op(&row.op) else {
+            return;
+        };
+        let id = self
+            .store
+            .current_folder_id(queued_id)
+            .unwrap_or_else(|_| queued_id.to_string());
+        self.store.drop_op(row.seq);
+        match &row.op {
+            OutboxOp::CreateFolder { .. } => {
+                if self.store.discard_local_folder(&id).unwrap_or(false) {
+                    let _ = self.store.clear_delta_links();
+                    self.backfill_done = false;
+                    self.reconverge_pending = true;
+                }
+            }
+            OutboxOp::RenameFolder {
+                name, prev_name, ..
+            } => {
+                let _ = self.store.revert_folder_name(&id, prev_name, name);
+            }
+            OutboxOp::MoveFolder {
+                parent,
+                prev_parent,
+                ..
+            } => {
+                let _ =
+                    self.store
+                        .revert_folder_parent(&id, prev_parent.as_deref(), parent.as_deref());
+            }
+            OutboxOp::DeleteFolder { removed, .. } => {
+                let _ = self.store.restore_folders(removed);
+            }
+            _ => {}
+        }
+        let error = err.to_string();
+        self.emit(SyncEvent::FolderWriteFailed {
+            id: id.clone(),
+            write,
+            status: contact_write_status(err),
+            error: error.clone(),
+        });
+        self.emit(SyncEvent::Error(format!(
+            "{} folder {id}: {error}",
+            write.verb()
+        )));
+        self.emit(SyncEvent::FoldersUpdated);
+    }
+
+    /// Maps the fast folders (`SetFastFolders`) through `folder_aliases`
+    /// after a folder re-key (#1910), so a folder the host chose under its
+    /// `local:` id keeps its fast ticks under Graph's.
+    fn follow_folder_rekeys(&mut self) {
+        for id in &mut self.fast_folders {
+            if let Ok(current) = self.store.current_folder_id(id) {
+                *id = current;
+            }
+        }
     }
 
     /// Re-reads every owed contact (`Store::owe_contact_reread`, #2063)
@@ -4079,7 +4388,25 @@ impl Engine {
             });
             return false;
         }
-        match self.with_auth(|c| c.search_messages(folder_id.as_deref(), &query, top)) {
+        // A folder created here is searched under its Graph id; one whose
+        // create has not reached Graph has nothing there (#1910).
+        let scope = match folder_id.as_deref() {
+            Some(f) => Some(
+                self.store
+                    .current_folder_id(f)
+                    .unwrap_or_else(|_| f.to_string()),
+            ),
+            None => None,
+        };
+        if scope.as_deref().is_some_and(|f| f.starts_with("local:")) {
+            self.emit(SyncEvent::MessageSearchResults {
+                query,
+                folder_id,
+                hits: Vec::new(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.search_messages(scope.as_deref(), &query, top)) {
             Ok(hits) => {
                 self.emit(SyncEvent::MessageSearchResults {
                     query,
