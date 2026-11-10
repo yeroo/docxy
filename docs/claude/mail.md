@@ -458,10 +458,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   but never over a local edit. That rule holds for every delta that starts
   fresh and so carries every message it covers, not only what changed (a
   head, a small folder's inline full delta, a backfill page:
-  `merge_delta_items` with `protect`): it skips every id a queued outbox op
-  names (`Store::pending_message_ids`, `Engine::protected_ids`: an
-  optimistic write waiting after a 5xx, and a deleted message is not put
-  back), and merges every other row with
+  `merge_delta_items` with `protect`): it merges nothing over an id a
+  queued outbox op names (`Store::pending_message_ids`,
+  `Engine::protected_ids`: an optimistic write waiting after a 5xx, and a
+  deleted message is not put back). Since #1910 r7 such a message is still
+  re-filed to the folder Graph reports it in (`Store::refile_message`:
+  `folder_id` only, an existing row only), unless a queued message `Move`,
+  `SaveDraft` or `SendDraft` still decides its folder
+  (`Store::messages_with_a_queued_move`, read once per page). A protected
+  message in another folder with no move queued can only come from a move
+  that did not land (quarantined, dropped with a `local:` folder) or one
+  made on another client; keeping it out of Graph's folder would let a
+  folder delete take it there. It merges every other row with
   `Store::merge_message_unless_edited`, which leaves a draft with an
   unsaved edit (below) alone in the same statement as the write, so a
   compose save on lookxy's connection during the fetch is never lost;
@@ -3166,7 +3174,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
     whose delete is queued (the pass reads stored folders, and the listing skips it), so the
     message is never shown back there, and the held `DELETE` would take it on Graph while it
     is still shown in its stale folder. Once the reads are done it is shown where Graph has it,
-    and a new delete takes what the user sees. No event says deletes are safe again; the host
+    a message a queued field op protects included (r7: the fresh read re-files it, keeping
+    the op's optimistic edit, unless a queued move still decides its folder), and a new
+    delete takes what the user sees. No event says deletes are safe again; the host
     retries after a later `FoldersUpdated`. Starvation: a delete can be refused until the next
     complete read (every folder's, after any quarantine) or the next complete listing. A
     folder whose read keeps failing (a persistent 403) keeps deletes refused. That is the safe
@@ -3248,7 +3258,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_delete_waits_while_a_reconverge_read_failed`,
   `a_delete_waits_for_a_listing_after_refused_moves`; and `backfill`
   `a_parked_walk_holds_a_reconverge_open_until_it_completes`; store
-  `relist_owed_survives_reopening_the_store`).
+  `relist_owed_survives_reopening_the_store`,
+  `queued_moves_and_drafts_decide_a_folder_and_refile_moves_only_the_folder`; engine
+  `a_reconverge_refiles_a_protected_message_its_quarantined_move_left_elsewhere`,
+  `a_protected_message_with_a_queued_move_is_not_refiled`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
