@@ -5281,6 +5281,10 @@ pub(crate) struct LocalFolderDiscard {
     /// The folder unsent mail in them was filed back in (Drafts, or the
     /// drafts sentinel).
     pub refiled_into: Option<String>,
+    /// The other `local:` folders it removed (#1910 r10): created under the
+    /// refused one, so their creates could never reach Graph. The engine
+    /// reports each.
+    pub also_discarded: Vec<String>,
 }
 
 /// The folders queued folder ops name (#1910), each id resolved through
@@ -5513,10 +5517,12 @@ impl Store {
     }
 
     /// Removes a folder whose create Graph refused (#1910) and the `local:`
-    /// folders reached from it through `local:` parents
-    /// (`local_subtree_ids_on`), queueing nothing. A folder Graph has that
-    /// was moved under it locally is left, with everything under that
-    /// folder: its own queued move is refused next and reverts it. Mail
+    /// folders created under it (`refused_creates_on`: by their queued
+    /// creates' parents, wherever they sit now; their creates are dropped),
+    /// queueing nothing. A folder only moved under it (a `local:` one
+    /// created elsewhere, or one Graph has) is left, with everything under
+    /// it: its own queued move into the refused folder is refused next and
+    /// reverts it, and its create still goes to Graph. Mail
     /// Graph does not have (`unsent_mail_in_on`: a draft moved there) is
     /// first filed back in Drafts (or the drafts sentinel before Drafts is
     /// stored), its own `SaveDraft`/`SendDraft` still queued. Any other
@@ -5530,7 +5536,7 @@ impl Store {
             return Ok(out);
         }
         let tx = self.write_tx()?;
-        let local = local_subtree_ids_on(&tx, id)?;
+        let local = refused_creates_on(&tx, id)?;
         let unsent = unsent_mail_in_on(&tx, &local)?;
         if !unsent.is_empty() {
             let drafts = drafts_folder_id_on(&tx)?;
@@ -5542,10 +5548,21 @@ impl Store {
             out.refiled_into = Some(drafts);
         }
         out.had_mail = drop_local_folder_mail_on(&tx, &local)?;
-        let local = ids_json(&local);
+        for row in pending_ops_on(&tx)? {
+            if let OutboxOp::CreateFolder { id: created, .. } = &row.op
+                && local.contains(created)
+            {
+                tx.execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])?;
+            }
+        }
+        for other in local.iter().filter(|l| *l != id) {
+            if folder_exists_on(&tx, other)? {
+                out.also_discarded.push(other.clone());
+            }
+        }
         tx.execute(
             "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
-            params![local],
+            params![ids_json(&local)],
         )?;
         tx.commit()?;
         Ok(out)
@@ -5637,25 +5654,32 @@ fn unsent_mail_in_on(conn: &Connection, folders: &[String]) -> Result<Vec<String
     Ok(ids)
 }
 
-/// `id` and the `local:` folders under it reached through `local:`
-/// parents only (#1910): a Graph folder moved under it, and anything under
-/// that, stays (its move is refused next and reverts it, and a `local:`
-/// folder created under it still goes to Graph under it). Never the drafts
-/// sentinel.
-fn local_subtree_ids_on(conn: &Connection, id: &str) -> Result<Vec<String>, StoreError> {
-    let mut stmt = conn.prepare(
-        "WITH RECURSIVE sub(id) AS (
-             SELECT ?1
-             UNION
-             SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id
-             WHERE substr(f.id, 1, 6) = 'local:' AND f.id <> ?2
-         )
-         SELECT id FROM sub",
-    )?;
-    let ids = stmt
-        .query_map(params![id, LOCAL_DRAFTS_SENTINEL_FOLDER_ID], |r| r.get(0))?
-        .collect::<Result<Vec<String>, _>>()?;
-    Ok(ids)
+/// `id` (a `local:` folder whose create Graph refused) and every `local:`
+/// folder whose queued `CreateFolder` names, through the queued creates'
+/// parents, `id` as its parent (#1910 r10): their creates could never reach
+/// Graph. Where they sit now does not matter: one created elsewhere and
+/// only moved under `id` keeps its own create, and one created under `id`
+/// and moved away still could not be created.
+fn refused_creates_on(conn: &Connection, id: &str) -> Result<Vec<String>, StoreError> {
+    let mut creates: Vec<(String, Option<String>)> = Vec::new();
+    for row in pending_ops_on(conn)? {
+        if let OutboxOp::CreateFolder { id, parent, .. } = row.op {
+            let parent = parent.map(|p| current_folder_id_on(conn, &p)).transpose()?;
+            creates.push((id, parent));
+        }
+    }
+    let mut set = vec![id.to_string()];
+    loop {
+        let before = set.len();
+        for (created, parent) in &creates {
+            if !set.contains(created) && parent.as_ref().is_some_and(|p| set.contains(p)) {
+                set.push(created.clone());
+            }
+        }
+        if set.len() == before {
+            return Ok(set);
+        }
+    }
 }
 
 /// Before the `local:` folders `local` are removed (#1910, a refused
@@ -19871,7 +19895,7 @@ mod folder_write_tests {
         assert!(discard.had_mail, "M went with L");
         assert!(folder_of(&s, "M").is_none());
         let left: Vec<&'static str> = ops(&s).iter().map(|op| op.kind()).collect();
-        assert_eq!(left, ["createFolder", "setFlag"], "M's ops go, N's stays");
+        assert_eq!(left, ["setFlag"], "M's ops (and L's create) go, N's stays");
         // A local folder with no mail drops nothing.
         let s = mailbox();
         let local = written(s.create_local_folder(None, "Empty").unwrap());
@@ -19881,7 +19905,46 @@ mod folder_write_tests {
         })
         .unwrap();
         assert!(!s.discard_local_folder(&local).unwrap().had_mail);
-        assert_eq!(ops(&s).len(), 2, "N's op is kept");
+        assert_eq!(ops(&s).len(), 1, "N's op is kept");
+    }
+
+    #[test]
+    fn a_refused_create_discards_what_was_created_under_it_not_what_was_moved_there() {
+        // Case A: Y, created under INBOX, is only moved under X: it stays,
+        // with its own create, and its move into X is refused next.
+        let s = mailbox();
+        let x = written(s.create_local_folder(None, "X").unwrap());
+        let y = written(s.create_local_folder(Some("INBOX"), "Y").unwrap());
+        written(s.move_folder(&y, Some(&x)).unwrap());
+        let discard = s.discard_local_folder(&x).unwrap();
+        assert!(discard.also_discarded.is_empty());
+        assert!(row(&s, &x).is_none());
+        assert!(row(&s, &y).is_some(), "Y stays");
+        assert!(
+            ops(&s).iter().any(|op| matches!(
+                op,
+                OutboxOp::CreateFolder { id, parent, .. }
+                    if *id == y && parent.as_deref() == Some("INBOX")
+            )),
+            "Y's own create stays"
+        );
+        // Case B: Y, created under X and moved to the top, could never be
+        // created: it goes too, reported, with its create.
+        let s = mailbox();
+        let x = written(s.create_local_folder(None, "X").unwrap());
+        let y = written(s.create_local_folder(Some(&x), "Y").unwrap());
+        let z = written(s.create_local_folder(Some(&y), "Z").unwrap());
+        written(s.move_folder(&y, None).unwrap());
+        let discard = s.discard_local_folder(&x).unwrap();
+        assert_eq!(discard.also_discarded, [y.clone(), z.clone()]);
+        assert!(row(&s, &y).is_none());
+        assert!(row(&s, &z).is_none());
+        assert!(
+            !ops(&s)
+                .iter()
+                .any(|op| matches!(op, OutboxOp::CreateFolder { .. })),
+            "their creates go"
+        );
     }
 
     #[test]
@@ -19920,6 +19983,7 @@ mod folder_write_tests {
             LocalFolderDiscard {
                 had_mail: true,
                 refiled_into: Some(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string()),
+                also_discarded: vec![kid.clone()],
             }
         );
         assert_eq!(
@@ -19934,8 +19998,8 @@ mod folder_write_tests {
         let left: Vec<&'static str> = ops(&s).iter().map(|op| op.kind()).collect();
         assert_eq!(
             left,
-            ["createFolder", "createFolder", "saveDraft"],
-            "the draft's save stays; both moves into L go"
+            ["saveDraft"],
+            "the draft's save stays; both moves into L, and both creates, go"
         );
 
         // With Drafts stored, they go there.

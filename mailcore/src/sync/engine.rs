@@ -2476,11 +2476,13 @@ impl Engine {
                         return true;
                     }
                 };
-                let stored: HashMap<String, FolderRow> = self
-                    .store
-                    .folders()
-                    .map(|f| f.into_iter().map(|f| (f.id.clone(), f)).collect())
-                    .unwrap_or_default();
+                let stored: HashMap<String, FolderRow> = match self.store.folders() {
+                    Ok(f) => f.into_iter().map(|f| (f.id.clone(), f)).collect(),
+                    Err(e) => {
+                        self.emit(SyncEvent::Error(e.to_string()));
+                        return true;
+                    }
+                };
                 for f in &listing.folders {
                     let mut f = f.clone();
                     if let Some(row) = stored.get(&f.id) {
@@ -3968,7 +3970,10 @@ impl Engine {
     /// drafts sentinel), with `MessagesUpdated` for that folder, and when
     /// other mail had been moved into it, the mail reconverges as after a
     /// quarantine (every delta link cleared), so it comes back in the
-    /// folder Graph has it in. A refused rename or move reverts best effort
+    /// folder Graph has it in. The `local:` folders created under it go too,
+    /// each reported (`FolderWriteFailed` with no status, "its parent folder
+    /// could not be created"); one only moved under it stays, and its move
+    /// there is refused next. A refused rename or move reverts best effort
     /// (`prev` values are not chained); the next listing corrects the rest.
     fn refuse_folder_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = folder_op(&row.op) else {
@@ -3979,9 +3984,11 @@ impl Engine {
             .current_folder_id(queued_id)
             .unwrap_or_else(|_| queued_id.to_string());
         self.store.drop_op(row.seq);
+        let mut also_discarded = Vec::new();
         match &row.op {
             OutboxOp::CreateFolder { .. } => {
                 let discard = self.store.discard_local_folder(&id).unwrap_or_default();
+                also_discarded = discard.also_discarded;
                 if discard.had_mail {
                     self.start_mail_reconverge();
                 }
@@ -4007,6 +4014,16 @@ impl Engine {
             _ => {}
         }
         self.report_folder_failure(&id, write, refused_write_status(err), err.to_string());
+        // The `local:` folders created under a refused create went with it
+        // (`Store::discard_local_folder`): each is reported, none silently.
+        for other in &also_discarded {
+            self.report_folder_failure(
+                other,
+                FolderWrite::Create,
+                None,
+                "its parent folder could not be created".to_string(),
+            );
+        }
         self.emit(SyncEvent::FoldersUpdated);
     }
 
@@ -27548,6 +27565,151 @@ mod tests {
                 !srv.requests().iter().any(|r| r.path.ends_with("/move")),
                 "the move into L is never sent"
             );
+            stop(handle, dir);
+        }
+
+        /// The `FolderWriteFailed` events in `seen`, as (id, write, status).
+        fn failures(seen: &[SyncEvent]) -> Vec<(String, FolderWrite, Option<u16>)> {
+            seen.iter()
+                .filter_map(|e| match e {
+                    SyncEvent::FolderWriteFailed {
+                        id, write, status, ..
+                    } => Some((id.clone(), *write, *status)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_folder_only_moved_under_a_refused_create_keeps_its_own_create() {
+            // X (top) and Y (under INBOX) are created while X's create waits
+            // behind a 500; Y is moved under X. Graph refuses X (409): Y's
+            // create still goes under INBOX, and its move into X is refused.
+            let top = "/me/mailFolders";
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-moved-under-refused",
+                world(
+                    vec![
+                        write("POST", child, 201, &answer("GY", "INBOX")),
+                        once("POST", top, 500, "busy"),
+                        write("POST", top, 409, EXISTS),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: None,
+                    name: "X".into(),
+                },
+            );
+            wait_requests(&srv, "POST", top, 1);
+            let x = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "Y".into(),
+                },
+            );
+            wait_queued(&store, 2);
+            let y = local_folders(&store).into_iter().find(|f| *f != x).unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: y.clone(),
+                    dest: Some(x.clone()),
+                },
+            );
+            wait_queued(&store, 3);
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            wait_drained(&store);
+            assert_eq!(
+                failures(&seen),
+                [
+                    (x.clone(), FolderWrite::Create, Some(409)),
+                    ("GY".to_string(), FolderWrite::Move, None),
+                ]
+            );
+            let order: Vec<(String, String)> = writes_sent(&srv)
+                .into_iter()
+                .map(|(m, p, _)| (m, p))
+                .collect();
+            let want = [("POST", top), ("POST", top), ("POST", child)]
+                .map(|(m, p)| (m.to_string(), p.to_string()));
+            assert_eq!(order, want, "no move of Y into X is sent");
+            let gy = row(&store, "GY").unwrap();
+            assert_eq!(gy.display_name, "Y");
+            assert_eq!(gy.parent_id.as_deref(), Some("INBOX"));
+            assert!(row(&store, &x).is_none());
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_folder_created_under_a_refused_create_is_reported() {
+            // Y is created under X, then moved to the top, while X's create
+            // waits behind a 500. Graph refuses X: Y could never be created.
+            let top = "/me/mailFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-created-under-refused",
+                world(
+                    vec![
+                        once("POST", top, 500, "busy"),
+                        write("POST", top, 409, EXISTS),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: None,
+                    name: "X".into(),
+                },
+            );
+            wait_requests(&srv, "POST", top, 1);
+            let x = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some(x.clone()),
+                    name: "Y".into(),
+                },
+            );
+            wait_queued(&store, 2);
+            let y = local_folders(&store).into_iter().find(|f| *f != x).unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: y.clone(),
+                    dest: None,
+                },
+            );
+            wait_queued(&store, 3);
+
+            send(&handle, SyncCommand::Refresh);
+            let (_, seen) = wait_refused(&handle);
+            wait_drained(&store);
+            assert_eq!(
+                failures(&seen),
+                [
+                    (x.clone(), FolderWrite::Create, Some(409)),
+                    (y.clone(), FolderWrite::Create, None),
+                ]
+            );
+            assert!(seen.contains(&SyncEvent::Error(format!(
+                "create folder {y}: its parent folder could not be created"
+            ))));
+            assert!(row(&store, &y).is_none());
+            assert_eq!(writes_sent(&srv).len(), 2, "only X's creates");
             stop(handle, dir);
         }
 

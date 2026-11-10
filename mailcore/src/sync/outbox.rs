@@ -202,7 +202,8 @@ fn move_folder(
     })
 }
 
-/// `apply_op` for every op but `Move`.
+/// `apply_op` for every op it does not handle itself (`Move`, `CreateContact`,
+/// `CreateFolder`, `MoveFolder`).
 fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
     match op {
         OutboxOp::MarkRead { id, read } => client.mark_read(&resolve(store, id)?, *read),
