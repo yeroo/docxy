@@ -29107,6 +29107,63 @@ mod tests {
                 stop(handle, dir);
             }
 
+            /// r2: a batch's roots hide only their own folders. PROJ's
+            /// DELETE is refused while ARCH's (its own root, its move into
+            /// PROJ dropped) is deferred by a 500: the relist brings PROJ
+            /// and SUB back at once, and ARCH stays hidden and queued.
+            #[test]
+            fn a_refused_root_is_listed_back_while_another_root_waits() {
+                let child = "/me/mailFolders/INBOX/childFolders";
+                let mut writes = vec![
+                    once("POST", child, 500, "busy"),
+                    write("POST", child, 201, &answer("G1", "INBOX")),
+                ];
+                writes.extend(proj_walk(&[], &[("SUB", 0)]));
+                writes.extend(walk("ARCH", &[], &[]));
+                writes.push(write("DELETE", DELETE_PROJ, 403, BAD));
+                writes.push(write("DELETE", "/me/mailFolders/ARCH", 500, "busy"));
+                let (srv, handle, store, dir) =
+                    engine("folder-delete-two-roots", world(writes, TREE, &[]), None);
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: Some("INBOX".into()),
+                        name: "G1".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", child, 1);
+                send(
+                    &handle,
+                    SyncCommand::MoveFolder {
+                        id: "ARCH".into(),
+                        dest: Some("PROJ".into()),
+                    },
+                );
+                send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+                barrier(&handle);
+                send(&handle, SyncCommand::Refresh);
+                wait_requests(&srv, "DELETE", "/me/mailFolders/ARCH", 1);
+                assert!(wait_until(ENGINE_WAIT, || row(&store, "SUB")
+                    .is_some_and(|f| f.parent_id.as_deref() == Some("PROJ"))));
+                assert_eq!(
+                    row(&store, "PROJ").unwrap().parent_id.as_deref(),
+                    Some("INBOX")
+                );
+                barrier(&handle);
+                assert!(row(&store, "ARCH").is_none(), "ARCH's delete still waits");
+                let queued: Vec<OutboxOp> = store
+                    .pending_ops()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.op)
+                    .collect();
+                assert!(
+                    matches!(queued.as_slice(), [OutboxOp::DeleteFolder { id, .. }] if id == "ARCH"),
+                    "{queued:?}"
+                );
+                stop(handle, dir);
+            }
+
             /// Cases 4 and 27 (r1): ARCH's move into PROJ is still queued
             /// (behind a deferred create) when PROJ is deleted. The move,
             /// whose row is gone, could only send nothing, so it is dropped

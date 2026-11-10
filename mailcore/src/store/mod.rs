@@ -5893,12 +5893,35 @@ impl Store {
         let batch = local_draft_id().replacen("local:", "delete:", 1);
         if !roots.is_empty() {
             let subtree_json = ids_json(&subtree);
-            tx.execute(
-                "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id)
-                 SELECT ?1, 'folder', value FROM json_each(?2)
-                 WHERE substr(value, 1, 6) <> 'local:'",
-                params![batch, subtree_json],
-            )?;
+            // Each Graph folder with the root whose DELETE takes it: the
+            // nearest root at or above it. A Graph folder's chain up the
+            // subtree reaches one: `id`, or one under a `local:` folder.
+            for f in subtree.iter().filter(|f| !f.starts_with("local:")) {
+                let mut at = f.clone();
+                let mut seen = HashSet::new();
+                let root = loop {
+                    if roots.contains(&at) {
+                        break at;
+                    }
+                    if !seen.insert(at.clone()) {
+                        break f.clone();
+                    }
+                    let parent: Option<String> = tx.query_row(
+                        "SELECT parent_id FROM folders WHERE id = ?1",
+                        params![at],
+                        |r| r.get(0),
+                    )?;
+                    match parent {
+                        Some(p) if subtree.contains(&p) => at = p,
+                        _ => break f.clone(),
+                    }
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id, root)
+                     VALUES (?1, 'folder', ?2, ?3)",
+                    params![batch, f, root],
+                )?;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id, imid)
                  SELECT ?1, 'message', id, internet_message_id FROM messages
@@ -6083,15 +6106,18 @@ impl Store {
     }
 }
 
-/// The folders the batches of the queued `DeleteFolder`s removed (#2107),
-/// resolved through `folder_aliases`.
+/// The folders the queued `DeleteFolder`s will take (#2107), resolved
+/// through `folder_aliases`: each allow-listed folder whose own root's op
+/// is still queued (r2: a refused root's folders are listed back while
+/// another root of its batch waits).
 fn deleting_folders_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT a.id FROM folder_delete_allow a
          WHERE a.kind = 'folder'
            AND EXISTS(SELECT 1 FROM outbox o
                       WHERE o.op = 'deleteFolder'
-                        AND json_extract(o.payload, '$.batch') = a.batch)",
+                        AND json_extract(o.payload, '$.batch') = a.batch
+                        AND json_extract(o.payload, '$.id') = a.root)",
     )?;
     let ids = stmt
         .query_map([], |r| r.get::<_, String>(0))?
@@ -21517,8 +21543,15 @@ mod folder_delete_tests {
         );
         assert!(s.has_older_op(roots[1].0).unwrap());
         assert!(!s.has_older_op(roots[0].0).unwrap());
+        // r2: each folder is hidden while its own root's op is queued.
+        assert!(s.folder_being_deleted("A").unwrap());
+        assert!(
+            !s.folder_being_deleted(&l).unwrap(),
+            "local: is never allow-listed"
+        );
         s.finish_folder_delete(roots[0].0, &batch).unwrap();
         assert!(!allow(&s, &batch).is_empty());
+        assert!(!s.folder_being_deleted("A").unwrap());
         assert!(s.folder_being_deleted("B").unwrap());
         s.finish_folder_delete(roots[1].0, &batch).unwrap();
         assert!(allow(&s, &batch).is_empty());

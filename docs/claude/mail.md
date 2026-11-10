@@ -3206,8 +3206,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   folders back where Graph has them; their mail follows with their next delta (no link). A
   throttle mid-walk restarts the walk at the next drain. A well-known folder is walked before
   Graph refuses its DELETE: accepted.
-- While a batch has an op queued (`QueuedFolderWrites::deleted`, `Store::folder_being_deleted`),
-  a listing skips its folders and every folder Graph lists under one (a folder kept by a
+- Each allow-listed folder records its `root` (the nearest root at or above it in the stored
+  tree). While that root's op is queued (`QueuedFolderWrites::deleted`,
+  `Store::folder_being_deleted`; r2: not while only another root of the batch is, so a refused
+  root's folders come back at once), a listing skips the folder and every folder Graph lists
+  under one (a folder kept by a
   queued move elsewhere stays where it is); a scoped search answers no hits with no request.
   The fast folders lose the removed ids at the command; fast ticks and `SyncFolder` already
   read only stored folders. A refused move whose `prev_parent` a delete removed (or that is
@@ -3245,7 +3248,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_by_its_own_op`,
   `nothing_is_read_for_a_folder_being_deleted`,
   `a_queued_mark_folder_read_of_the_subtree_is_dropped`, `the_delete_waits_for_older_ops`,
-  `a_folder_whose_move_in_is_still_queued_is_deleted_where_it_is`), store
+  `a_folder_whose_move_in_is_still_queued_is_deleted_where_it_is`,
+  `a_refused_root_is_listed_back_while_another_root_waits`), store
   `a_graph_folder_with_a_queued_move_into_the_subtree_is_its_own_root`.
 - `SyncEvent::FolderWriteFailed` for a delete: a 404 is done, not a failure; `status: None`
   is the store's refusal (unsent mail too) or the walk's; a refusal is followed by a relist,

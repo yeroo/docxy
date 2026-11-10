@@ -237,12 +237,16 @@ CREATE INDEX IF NOT EXISTS idx_forgotten_ids_imid ON forgotten_ids(imid) WHERE i
 -- (`kind` 'folder') and every message (`kind` 'message', with its
 -- `internet_message_id`) the store showed in the deleted subtree. The walk
 -- of Graph before each DELETE allows only these, and what the store never
--- held. Removed once the batch's last op is gone.
+-- held. Removed once the batch's last op is gone. A folder's `root` is the
+-- batch's root whose DELETE takes it (the nearest root at or above it in the
+-- stored tree): the folder stays hidden from listings only while that root's
+-- op is queued (r2); '' for a message.
 CREATE TABLE IF NOT EXISTS folder_delete_allow (
     batch TEXT NOT NULL,
     kind  TEXT NOT NULL,
     id    TEXT NOT NULL,
     imid  TEXT NOT NULL DEFAULT '',
+    root  TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (batch, kind, id)
 );
 
