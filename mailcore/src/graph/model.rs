@@ -626,8 +626,9 @@ fn reminder_set(value: Option<&Value>) -> bool {
 /// [`MeetingMessageType::from_message_class`] applies to each of its
 /// classes. So a request, a cancellation, a response and a meeting forward
 /// notification (`IPM.Schedule.Meeting.Notification.Forward`, which has no
-/// `MeetingMessageType`) are meetings; `IPM.Schedule.Meeting.` and
-/// `IPM.Schedule.MeetingX` are not.
+/// `MeetingMessageType`) are meeting classes; `IPM.Schedule.Meeting.` and
+/// `IPM.Schedule.MeetingX` are not (though [`parse_meeting_reminder`] still
+/// calls an item a meeting message by its `@odata.type`).
 fn is_meeting_class(class: &str) -> bool {
     const BASE: &str = "IPM.Schedule.Meeting";
     let Some(head) = class.get(..BASE.len()) else {
@@ -4431,6 +4432,14 @@ mod tests {
         assert_eq!(parse_meeting_reminder(&v), (true, false));
         let v = delta_item(Some("#microsoft.graph.message"), Some(&props));
         assert_eq!(parse_meeting_reminder(&v), (true, false));
+        // The type wins over a string class that is not a meeting class:
+        // the two halves are ORed.
+        for c in ["IPM.Note", "IPM.Schedule.MeetingX"] {
+            let props = format!("[{},{}]", class(c), prop(REMINDER_SET_PROP, r#""true""#));
+            let v = delta_item(Some("#microsoft.graph.eventMessageRequest"), Some(&props));
+            assert_eq!(parse_meeting_reminder(&v), (true, true), "{c}");
+            assert!(Message::from_json(&v).unwrap().meeting_reminder_on, "{c}");
+        }
     }
 
     #[test]

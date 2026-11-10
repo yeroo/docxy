@@ -2762,11 +2762,13 @@ icon without a request per row: each `MessageRow` (every read: `message_row`,
   is needed: this one never fires. A meeting message is a string class `is_meeting_class`
   accepts (`IPM.Schedule.Meeting`, or it plus `.` and at least one character, ASCII case
   ignored, not trimmed: `from_message_class`'s subclass rule), or an `@odata.type`
-  starting `#microsoft.graph.eventMessage` (which matters only when the class entry has
-  no string value). The class half covers the forward notification
+  starting `#microsoft.graph.eventMessage`, which makes the item a meeting message
+  whenever the class does not: a class entry with no string value, or a string
+  `is_meeting_class` rejects (`IPM.Note`, `IPM.Schedule.MeetingX`). The class half covers
+  the forward notification
   (`IPM.Schedule.Meeting.Notification.Forward`), which has no `MeetingMessageType`, so the
   rule does not key on `meeting_message_type`; `@odata.type` alone is absent on a partial
-  item. A carried plain message writes false.
+  item. A carried message that is neither writes false.
 - Store: `messages.meeting_reminder_on` (INTEGER NOT NULL DEFAULT 0), the last of
   `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 29) and of `conversations_in_folder`'s
   two spelled lists. `merge_message` writes it on `MessageFields::writes_meeting_reminder`
